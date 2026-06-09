@@ -1,0 +1,37 @@
+[package]
+name = "choz"
+version = "0.1.0"
+edition = "2021"
+description = "A terminal-based audio plugin host — like Carla for the terminal"
+
+[dependencies]
+# UI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Concurrency
+parking_lot = "0.12"
+flume = "0.11"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Audio I/O — ALSA + JACK backends (both work through PipeWire compatibility)
+cpal = { version = "0.15", features = ["jack"] }
+jack = "0.11"
+
+# MIDI
+midir = "0.10"
+
+# Plugin loading
+libloading = "0.8"
+
+# Utilities
+anyhow = "1"
+thiserror = "2"
+directories = "5"
