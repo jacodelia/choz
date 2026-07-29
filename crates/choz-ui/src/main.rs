@@ -2891,8 +2891,8 @@ fn handle_modal_key(app: &mut App, key: KeyCode) {
     app.refresh_modal();
 }
 
-/// Keys for the INPUTS panel: an input list on top, the active tab's SF2
-/// presets below. `←`/`→` pick which of the two the cursor drives.
+/// Keys for the INPUTS panel: the list of note inputs (MIDI ports + OSC).
+/// Presets moved out to the RACK's `[2:BANK/PRESET]` modal.
 fn handle_source_keys(app: &mut App, key: KeyCode) {
     match key {
         KeyCode::Up => app.input_cursor = app.input_cursor.saturating_sub(1),

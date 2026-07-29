@@ -1,20 +1,20 @@
 # choz — Roadmap
 
-Estado y pasos para continuar. Última actualización: 2026-07-28.
+Estado y pasos para continuar. Última actualización: 2026-07-29.
 
 ## Estado actual (lo que ya funciona)
 
 - **Workspace 4 crates**: `choz-ports` (traits RT), `choz-engine` (audio/DSP/MIDI/registry), `choz-plugin-clap` (CLAP host, feature `clap`), `choz-ui` (binario `choz`). Ver [architecture.md](architecture.md).
 - **Engine RT-safe**: callback sin locks ni alloc. Modelo **rack multi-source = `Vec<Slot>`** (`Slot{source, fx}`), mixer que suma todos los slots. Handoff por ring `EngineCommand` + ring `Retired` para drops fuera del RT.
 - **Fuentes reales**: WAV (`hound`), SF2 (`oxisynth`), CLAP instrument (`clack-host`). Cada una = un slot/tab en el RACK, con su cadena FX propia.
-- **31 FX DSP** built-in verificados (smoke test; los 27 originales + Protocosmos / Space Echo / Reverse Delay / Z5 Texture importados de seqterm) + **CLAP audio-effects** hosteados en la cadena FX (al final del modal ADD FX) **con sus parámetros reales**: nombres/rangos leídos del plugin (`read_params`), knobs normalizados 0..1, y cambios en vivo por `EngineCommand::SetFxParam` (no se reinstancia el plugin al mover un knob).
+- **32 FX DSP** built-in verificados (smoke test; los 27 originales + Protocosmos / Space Echo / Reverse Delay / Z5 Texture importados de seqterm + los pedales AMBER FANG / VELVET FUZZ) + **CLAP audio-effects** hosteados en la cadena FX (al final del modal ADD FX) **con sus parámetros reales**: nombres/rangos leídos del plugin (`read_params`), knobs normalizados 0..1, y cambios en vivo por `EngineCommand::SetFxParam` (no se reinstancia el plugin al mover un knob).
 - **Mixer por slot**: gain, pan constant-power, mute y solo (solo se resuelve en UI → mute efectivo al engine). Teclas `-`/`+`, `,`/`.`, `m`, `S`; también rueda/click.
 - **MIDI hardware** (`midir`): conecta todos los puertos menos los desactivados (`c` en el panel INPUTS), **ruteo por-entrada** (cada nota va solo a las tabs ligadas a esa entrada).
 - **OSC** (`rosc`): listener UDP (9000 por defecto, `--osc-port N`). Notas (`/note`, `/note/on`, `/note/off`) + **control remoto**: `/mix/<tab>/{gain,pan,mute}` y `/fx/<tab>/<fx>/<param>`. Comparte el canal `flume` con MIDI (`InputEvent::{Note,Control}`).
 - **SF2 presets**: `sources::list_sf2_presets` (via `soundfont`) lista los programas; `AudioSource::program_change` (RT-safe) los cambia por slot.
 - **UI**: menú superior (F10/mouse), RACK con tabs por source (`[`/`]` o click), FX por-slot editable, piano QWERTY, About con imagen (`ratatui-image`), log a `~/.local/state/choz/choz.log`. **Todos los modales** (source, ADD FX, salida, bank/preset, MIDI learn, browser, params del instrumento) usan el mismo widget `views/modal.rs`: barra de desplazamiento, chips de filtro, botones SELECT/CANCEL y rueda/click de ratón.
 - **Cache de scan CLAP**: `<state dir>/plugins.json`; `r` en SYNTH fuerza rescan. Ahorra ~236 ms de arranque.
-- **Verificación**: `cargo build --workspace` + `--features clap` limpio, **94 tests** (101 con `--features clap`) (incluye tests de runtime contra plugins `.clap` y SoundFonts reales cuando están instalados; si no, se saltan), `clippy -D warnings` = 0. CI en `.github/workflows/ci.yml`.
+- **Verificación**: `cargo build --workspace` + `--features clap` limpio, **128 tests** (135 con `--features clap`) (incluye tests de runtime contra plugins `.clap` y SoundFonts reales cuando están instalados; si no, se saltan), `clippy -D warnings` = 0. CI en `.github/workflows/ci.yml`.
 
 ## Modelo objetivo (flujo final pedido)
 
