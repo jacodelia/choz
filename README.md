@@ -303,6 +303,10 @@ See [docs/architecture.md](docs/architecture.md) for the module map, thread mode
 data flow and plugin architecture, and [docs/roadmap.md](docs/roadmap.md) for the
 session-by-session state and what is next.
 
+## Layout
+
+![Layout](docs/layout.png)
+
 ## License
 
 MIT — 2026
