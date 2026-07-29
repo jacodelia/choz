@@ -1,0 +1,27 @@
+[package]
+name = "choz-ui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "choz"
+path = "src/main.rs"
+
+[features]
+default = []
+# Real CLAP plugin hosting (forwards through the engine).
+clap = ["choz-engine/clap"]
+
+[dependencies]
+choz-engine.workspace = true
+anyhow.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+flume.workspace = true
+midir.workspace = true
+libc = "0.2"
+ratatui-image = "8"
+image = { version = "0.25", default-features = false }
+serde_yaml = "0.9"

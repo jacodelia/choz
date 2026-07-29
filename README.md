@@ -4,35 +4,72 @@ A terminal-based audio plugin host — like [Carla](https://kx.studio/Applicatio
 
 Built with Rust, ratatui, and cpal. Provides a TUI for managing audio sources and real-time FX chains.
 
+## Status
+
+choz is early-stage. The FX engine and TUI are real and working; audio
+**sources** are still being built out. See the tables below for what works today
+versus what is planned.
+
 ## Features
 
-- **Terminal UI** with mouse and keyboard support
-- **Audio sources**: MIDI, SoundFonts (SF2/SF3), audio files (WAV), synthesizer plugins
+### Working today
+
+- **Terminal UI** with full mouse and keyboard support, incl. a top **menu bar** (`F10` or click: File / Source / FX / Transport / Help) — every action is reachable by mouse
+- **About dialog** with an in-terminal image logo rendered via [ratatui-image](https://github.com/benjajaja/ratatui-image) (Help → About)
 - **27 FX processors**: delay, reverb, compressor, limiter, gate, expander, EQ, filters, chorus, flanger, phaser, bitcrusher, vinyl sim, cassette sim, tube saturation, stereo widener, isolator, looper, sidechain ducking, panner, and more
-- **Up to 8 FX slots** per chain with parameter automation
-- **Real-time audio** via cpal (ALSA, WASAPI, CoreAudio)
-- **Plugin scanning**: LADSPA, DSSI, SFZ, SF2, JSFX discovery
-- **Low latency**: fixed buffer size, zero-allocation audio callback
+- **INPUTS → RACK model**: the left panel lists note inputs (every MIDI port, plus OSC). `Enter` on one creates a rack tab bound to it; pick its instrument (SF2 / WAV / CLAP synth) from the tab's `INSTR` line. Switch tabs with `[` / `]` or by clicking; `✕` (or `Backspace`) removes one.
+- **Per-input routing**: notes from an input reach only the tabs bound to that input, so two controllers can drive two different instruments at once. The QWERTY piano always plays the active tab.
+- **Selectable audio output**: `o` in the transport panel lists the backend's output devices; switching reloads the rack onto the new stream.
+- **Per-slot FX**: up to 5 FX per source with live parameter tweaking
+- **Per-slot mixer**: gain, constant-power pan, mute and solo on every rack slot (`-`/`+`, `,`/`.`, `m`, `S`, or scroll/click the strip)
+- **Real-time audio** via cpal (ALSA / JACK, auto-detected through PipeWire)
+- **RT-safe engine**: lock-free, zero-allocation audio callback (chains built on the UI thread, handed over an `rtrb` ring)
+- **WAV file playback** as an audio source (`choz path/to/file.wav`, or browse in the SOURCE panel)
+- **SF2 SoundFont synthesis** (via [oxisynth](https://github.com/PolyMeilex/OxiSynth)) — browse an `.sf2` in the SOURCE panel, then play it with the computer keyboard (`a w s e d f t g y h u j k`, one octave from C4)
+- **SF2 preset selection**: the INPUTS panel's lower half lists every program in the active tab's SoundFont (`→` to focus it, `↑↓`, `Enter` to switch)
+- **Hardware MIDI input** (via [midir](https://github.com/Boddlnagg/midir)) — connects every MIDI input port at startup; toggle individual ports with `c` in the INPUTS panel (`r` rescans)
+- **OSC input** over UDP (port 9000, or `--osc-port N`): notes (`/note <note> <vel>`, `/note/on`, `/note/off`) as an input like any other, plus remote control — `/mix/<tab>/gain|pan|mute` and `/fx/<tab>/<fx>/<param>` (all indices 1-based, as drawn)
+- **CLAP hosting** (via [clack-host](https://github.com/prokopyl/clack), behind `--features clap`) — instruments from the tab's `3:SYNTH` picker; CLAP *audio effects* at the bottom of the ADD FX list, **with their own parameters** on the knobs (names and ranges read from the plugin; changes go straight to the running plugin)
+- **Cached plugin scan**: the CLAP scan (~236 ms for 20 plugins here) is cached in `~/.local/state/choz/plugins.json` and reused until a plugin directory changes; `r` in the SYNTH panel forces a rescan
+- **Plugin *scanning*** for other formats (discovery only): LADSPA, DSSI, SFZ, SF2, JSFX
+
+### Planned (not yet implemented)
+
+- **Hosting for non-CLAP formats** (LADSPA/DSSI/LV2/VST) — scanned but not instantiated
+- **Plugin GUIs** — parameters are edited on choz's knobs (first 7 of an effect); CLAP *instruments* don't expose theirs yet
+- **Parameter automation**
+- **Per-channel routing inside one port** — routing is per input port, not per MIDI channel
+
+> The default source is a 440 Hz test tone until you load a WAV or SF2.
 
 ## Screenshot
 
 ```
-┌─ SOURCE [ACTIVE] ───────────┐ ┌─ FX CHAIN ───────────────────────────────────────┐
-│ Now: MIDI                     │ │  ←→=select FX  ↑↓=param  wheel=value  a=add d=del │
-│                               │ │   1:DELAY   2:REVERB   [+ ADD]                   │
-│  MIDI   SFZ   AUDIO   SYNTH   │ │                                                  │
-│                               │ │  ROUTING: IN -> 1:DELAY -> 2:REVERB -> OUT       │
-│ Available MIDI ports:         │ │  [████████]  [████    ]                          │
-│   0: default                  │ │   ↑0.95         ↙0.35                            │
-│                               │ │   Feedback      Wet                              │
-│                               │ │                                                  │
-│ Output: MIDI passthrough      │ │   ON  <-MOVE  DEL                               │
-└───────────────────────────────┘ └──────────────────────────────────────────────────┘
-┌─ TRANSPORT ───────────────────────────────────────────────────────────────────────┐
-│  [SPACE]   [S] STOP   PLAYING                                                     │
-└────────────────────────────────────────────────────────────────────────────────────┘
- choz v0.1 | SOURCE: MIDI | FX: 2 slots | ▶ PLAYING | Tab=switch q=quit
+ FILE  RACK  FX  TRANSPORT  HELP
+┌─ INPUTS [ACTIVE] ───────────┐ ┌─ RACK ───────────────────────────────────────────┐
+│ TAB: 1/2 SF2:FluidR3 ← LPK25│ │  SF2:FluidR3 ✕   ⊘WAV:loop ✕                     │
+│ ↑↓ · Enter=bind tab · c=on/…│ │  VOL [▓▓▓▓░░░░] 1.00  PAN L───●───R C   MUTE SOLO │
+│ ✓ MIDI LPK25    → tab 1     │ │  INSTR SF2:FluidR3          1:SF2  2:WAV  3:SYNTH │
+│ · MIDI Midi Through         │ │  ←→=FX ↑↓=param wheel=value a=add d=del -/+=vol   │
+│ ✓ OSC  OSC      → tab 2     │ │   1:DELAY  2:REVERB  [+ ADD]                      │
+│                             │ │  ROUTING: IN -> 1:DELAY -> 2:REVERB -> OUT        │
+│ PRESETS (→ to select)       │ │  [████████]  [████    ]                           │
+│ 000:000 Yamaha Grand Piano  │ │   ↑0.95         ↙0.35                             │
+│ 000:001 Bright Yamaha Grand │ │   Feedback      Wet                               │
+│ 000:002 Electric Piano      │ │   ON  <-MOVE  DEL                                 │
+└─────────────────────────────┘ └──────────────────────────────────────────────────┘
+                                ┌─ TRANSPORT ──────────────────────────────────────┐
+                                │  [ ▶ PLAY ]     [ ■ STOP ]                        │
+                                │   ■ STOPPED  |  [Space]=play  [S]=stop            │
+                                │   OUT  cpal_client_out  [o=change]                │
+                                └──────────────────────────────────────────────────┘
+ choz v0.1 | JACK backend | RACK: 1/2 SF2:FluidR3 ← LPK25 | FX: 2 | ■ STOPPED | F10=menu Tab=switch q=quit
 ```
+
+### Known issues
+
+- Some plugins crash inside their own teardown (`ZaMaximX2` segfaults in `deactivate`, reproducible with a bare CLAP host). choz therefore stops processing and **deliberately leaks** a plugin instead of destroying it; the memory comes back when choz exits. Set `CHOZ_CLAP_STRICT_TEARDOWN=1` to do the proper teardown instead.
+- A plugin that emits NaN before its parameters are set (`ZamEQ2` does) is muted for that block rather than sent to the output device.
 
 ## Requirements
 
@@ -105,14 +142,25 @@ RUST_LOG=debug cargo run
 |-----|---------|--------|
 | `Tab` | Global | Cycle focus: Source → FX Chain → Transport |
 | `q` | Global | Quit |
-| `←` `→` | Source | Select category / FX slot |
-| `↑` `↓` | Source / FX | Navigate ports / parameters |
-| `1` `2` `3` `4` | Source | Select category (MIDI/SF2/AUDIO/SYNTH) |
+| `←` `→` | Inputs | Switch between the input list and the preset list |
+| `↑` `↓` | Inputs / FX | Navigate the list / parameters |
 | `↑` `↓` | FX Chain | Select parameter |
 | `w` / `s` | FX Chain | Increase / decrease parameter |
 | `Space` | FX Chain | Toggle FX enabled |
 | `a` | FX Chain | Add new FX (opens selector) |
 | `d` | FX Chain | Delete selected FX |
+| `[` `]` | RACK | Previous / next source tab |
+| `Backspace` | RACK | Remove the active source (or click the tab's `✕`) |
+| `-` / `+` | RACK | Slot gain down / up |
+| `,` / `.` | RACK | Pan left / right |
+| `m` / `S` | RACK | Mute / solo the slot |
+| `Enter` | Inputs | Bind the selected input to a rack tab (or jump to its tab) |
+| `c` | Inputs | Connect / disconnect the selected input |
+| `r` | Inputs | Rescan and reconnect MIDI ports |
+| `Enter` | Inputs · presets | Load the selected SoundFont program |
+| `1` `2` `3` | RACK | Set the tab's instrument: SF2 / WAV / synth |
+| `r` | Synth picker | Rescan plugins (bypasses the cache) |
+| `o` | Transport | Choose the audio output device |
 | `Esc` | FX Selector | Close selector modal |
 | `Enter` | FX Selector | Confirm FX selection |
 | `Space` | Transport | Toggle play/stop |
@@ -123,7 +171,10 @@ RUST_LOG=debug cargo run
 | Action | Result |
 |--------|--------|
 | Click panel | Focus that panel |
-| Click source category tab | Select category |
+| Click an input | Bind it to a rack tab |
+| Click an input's `✓`/`·` | Connect / disconnect it |
+| Click `1:SF2` / `2:WAV` / `3:SYNTH` | Choose the tab's instrument |
+| Click the `OUT` line | Choose the audio output device |
 | Click FX slot | Select slot + show parameters |
 | Click parameter knob | Select parameter |
 | Scroll on parameter | Adjust value ±0.03 |
@@ -133,6 +184,11 @@ RUST_LOG=debug cargo run
 | Click `DEL` | Delete FX |
 | Click `[SPACE]` / `[S] STOP` | Transport control |
 | Click FX selector item | Choose FX kind |
+| Click RACK tab | Switch active source |
+| Click `✕` on a RACK tab | Remove that source |
+| Scroll on `VOL` / `PAN` | Adjust slot gain / pan |
+| Click `MUTE` / `SOLO` | Toggle slot mute / solo |
+| Click an SF2 preset | Load that program |
 | Click outside modal | Dismiss |
 
 ## Generating a Release
@@ -153,7 +209,7 @@ ls -lh target/release/choz
 VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
 tar -czf choz-${VERSION}-x86_64-linux.tar.gz \
     -C target/release choz \
-    README.md ARCHITECTURE.md
+    README.md docs/architecture.md
 
 # Or use cargo-binstall compatible packaging
 cargo package --no-verify
@@ -235,7 +291,7 @@ src/
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed diagrams (Mermaid) covering:
+See [docs/architecture.md](docs/architecture.md) for detailed diagrams (Mermaid) covering:
 - Module dependency graph
 - Thread architecture (UI + audio callback)
 - Data flow (input → state → render → audio)

@@ -1,0 +1,26 @@
+[package]
+name = "choz-engine"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+# Real CLAP plugin hosting (forwards to choz-plugin-clap).
+clap = ["choz-plugin-clap/clap"]
+
+[dependencies]
+choz-ports.workspace = true
+choz-plugin-clap.workspace = true
+anyhow.workspace = true
+parking_lot.workspace = true
+flume.workspace = true
+rtrb.workspace = true
+hound.workspace = true
+oxisynth.workspace = true
+soundfont.workspace = true
+rosc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+cpal.workspace = true
+jack.workspace = true
+midir.workspace = true
