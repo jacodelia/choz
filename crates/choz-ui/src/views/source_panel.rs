@@ -11,19 +11,21 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph}, Frame,
 };
 
-const PANEL: Color = Color::Rgb(22, 27, 34);
 const ACCENT: Color = Color::Rgb(31, 111, 235);
 const HEADER: Color = Color::Rgb(240, 136, 62);
 
-/// One row of the input list.
-pub struct InputRow<'a> {
-    /// "MIDI" or "OSC".
+/// One row of the input list: a note input (MIDI/OSC), an audio capture pair,
+/// or a section title.
+pub struct InputRow {
+    /// "MIDI", "OSC" or "AUDIO".
     pub kind: &'static str,
-    pub name: &'a str,
+    pub name: String,
     /// Whether choz is currently listening to it.
     pub connected: bool,
     /// Rack tab bound to this input, if any (0-based).
     pub bound_tab: Option<usize>,
+    /// Section titles are dimmed and never selectable.
+    pub header: bool,
 }
 
 /// Panel lines above the input list (active-tab line, scan-button line, hint).
@@ -57,7 +59,7 @@ pub fn draw_input_panel(
         .title_style(Style::default().fg(HEADER))
         .borders(Borders::ALL)
         .border_style(border_style)
-        .style(Style::default().bg(PANEL));
+        .style(super::theme::panel_style());
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -87,7 +89,7 @@ pub fn draw_input_panel(
     // Line 2: hint for the input list.
     lines.push(Line::from(Span::styled(
         if focused {
-            " \u{2191}\u{2193} \u{00B7} Enter=bind tab \u{00B7} c=on/off \u{00B7} r=rescan"
+            " \u{2191}\u{2193} \u{00B7} Enter=use \u{00B7} c=on/off \u{00B7} r=rescan"
         } else {
             " INPUTS (Tab to select)"
         },
@@ -98,6 +100,10 @@ pub fn draw_input_panel(
         lines.push(Line::from(Span::styled("   (no inputs found)", dim)));
     }
     for (i, row) in inputs.iter().enumerate() {
+        if row.header {
+            lines.push(Line::from(Span::styled(format!(" {}", row.name), dim)));
+            continue;
+        }
         let mark = if row.connected { "\u{2713}" } else { "\u{00B7}" };
         let style = if focused && i == input_cursor {
             Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
@@ -125,6 +131,6 @@ pub fn draw_input_panel(
         )));
     }
 
-    f.render_widget(Paragraph::new(lines).style(Style::default().bg(PANEL)), inner);
+    f.render_widget(Paragraph::new(lines).style(super::theme::panel_style()), inner);
     Some(scan_rect)
 }

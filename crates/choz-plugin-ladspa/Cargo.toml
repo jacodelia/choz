@@ -1,0 +1,10 @@
+[package]
+name = "choz-plugin-ladspa"
+version.workspace = true
+edition.workspace = true
+description = "LADSPA and DSSI plugin hosting for choz (the C ABI directly, no SDK)."
+
+[dependencies]
+choz-ports.workspace = true
+anyhow.workspace = true
+libloading = "0.8"

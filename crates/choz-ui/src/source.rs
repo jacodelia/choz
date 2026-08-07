@@ -289,30 +289,33 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
     }
 }
 
-/// A hosted CLAP audio effect: where it lives, what to call it, and the
-/// parameters it exposes (read once when the FX is added).
+/// A hosted plugin audio effect (CLAP, LV2): which plugin it is, what to call
+/// it, and the parameters it exposes (read once when the FX is added).
 #[derive(Debug, Clone)]
-pub struct ClapFx {
+pub struct PluginFx {
+    pub format: choz_engine::PluginFormat,
+    /// The plugin file, or the bundle directory for LV2.
     pub path: PathBuf,
+    /// Plugin id inside that file: CLAP id, LV2 URI.
     pub id: String,
     pub name: String,
-    pub params: Vec<choz_engine::ClapParamInfo>,
+    pub params: Vec<choz_engine::PluginParam>,
 }
 
 /// How many plugin parameters the FX panel shows. The knob row is the limit,
 /// not the plugin: everything past this needs the plugin's own GUI.
 /// ponytail: raise it (or add paging) if someone actually needs more.
-pub const MAX_CLAP_PARAMS: usize = 7;
+pub const MAX_PLUGIN_PARAMS: usize = 7;
 
-/// One entry in the FX chain: either a built-in FX or a hosted CLAP effect.
+/// One entry in the FX chain: either a built-in FX or a hosted plugin effect.
 #[derive(Debug, Clone)]
 pub struct AudioFxEntry {
     pub kind: AudioFxKind,
     pub wet: f32,
     pub enabled: bool,
     pub params: Vec<f32>,
-    /// `Some` when this slot hosts a CLAP effect; `kind` is then unused.
-    pub clap: Option<ClapFx>,
+    /// `Some` when this slot hosts a plugin effect; `kind` is then unused.
+    pub plugin: Option<PluginFx>,
 }
 
 impl AudioFxEntry {
@@ -320,33 +323,33 @@ impl AudioFxEntry {
         let descs = fx_param_descs(kind);
         let params: Vec<f32> = descs.iter().map(|d| d.default).collect();
         let wet = descs.last().filter(|d| d.name == "Wet").map(|d| d.default).unwrap_or(1.0);
-        Self { kind, wet, enabled: true, params, clap: None }
+        Self { kind, wet, enabled: true, params, plugin: None }
     }
 
-    pub fn new_clap(plugin: ClapFx) -> Self {
+    pub fn new_plugin(plugin: PluginFx) -> Self {
         // Knob positions start where the plugin says its defaults are; the
         // trailing knob is choz's own dry/wet.
         let mut params: Vec<f32> = plugin
             .params
             .iter()
-            .take(MAX_CLAP_PARAMS)
+            .take(MAX_PLUGIN_PARAMS)
             .map(|p| p.normalised(p.default) as f32)
             .collect();
         params.push(1.0);
-        Self { kind: AudioFxKind::default(), wet: 1.0, enabled: true, params, clap: Some(plugin) }
+        Self { kind: AudioFxKind::default(), wet: 1.0, enabled: true, params, plugin: Some(plugin) }
     }
 
     /// True when knob `index` is choz's dry/wet rather than a plugin parameter.
     pub fn is_mix_param(&self, index: usize) -> bool {
-        match &self.clap {
-            Some(c) => index == c.params.len().min(MAX_CLAP_PARAMS),
+        match &self.plugin {
+            Some(c) => index == c.params.len().min(MAX_PLUGIN_PARAMS),
             None => false,
         }
     }
 
-    /// Display label: the plugin name for CLAP effects, the FX name otherwise.
+    /// Display label: the plugin name for hosted effects, the FX name otherwise.
     pub fn label(&self) -> &str {
-        match &self.clap {
+        match &self.plugin {
             Some(c) => &c.name,
             None => self.kind.label(),
         }
@@ -355,11 +358,11 @@ impl AudioFxEntry {
     /// Parameters this entry exposes: the plugin's own (capped) plus dry/wet
     /// for a hosted effect, or the static table for a built-in.
     pub fn param_descs(&self) -> Vec<FxParamDesc> {
-        match &self.clap {
+        match &self.plugin {
             Some(c) => c
                 .params
                 .iter()
-                .take(MAX_CLAP_PARAMS)
+                .take(MAX_PLUGIN_PARAMS)
                 .map(|p| FxParamDesc {
                     name: Cow::Owned(p.name.clone()),
                     default: p.normalised(p.default) as f32,
@@ -376,7 +379,8 @@ impl AudioFxEntry {
             enabled: self.enabled,
             wet: self.wet,
             params: self.params.clone(),
-            plugin: self.clap.as_ref().map(|c| choz_engine::fx_chain::ClapFxRef {
+            plugin: self.plugin.as_ref().map(|c| choz_engine::fx_chain::PluginFxRef {
+                format: c.format,
                 path: c.path.clone(),
                 id: c.id.clone(),
             }),
@@ -391,6 +395,6 @@ impl AudioFxEntry {
         for (i, v) in spec.params.iter().enumerate() {
             if let Some(slot) = params.get_mut(i) { *slot = *v; }
         }
-        Some(Self { kind, wet: spec.wet, enabled: spec.enabled, params, clap: None })
+        Some(Self { kind, wet: spec.wet, enabled: spec.enabled, params, plugin: None })
     }
 }

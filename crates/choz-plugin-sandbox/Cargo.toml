@@ -1,0 +1,14 @@
+[package]
+name = "choz-plugin-sandbox"
+version.workspace = true
+edition.workspace = true
+description = "Shared-memory transport for hosting a choz plugin in its own process."
+
+[dependencies]
+anyhow.workspace = true
+libc = "0.2"
+
+# Custom harness: the test re-runs itself as the sandbox child.
+[[test]]
+name = "across_a_process"
+harness = false

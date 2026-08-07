@@ -1,0 +1,492 @@
+//! A plugin playing in a process of its own.
+//!
+//! [`choz_plugin_sandbox`] moves one block of audio across the boundary with a
+//! deadline; this is the pair of ends that use it. The host end is an ordinary
+//! [`AudioSource`], so a rack slot cannot tell the difference — except that
+//! when the plugin dies, the slot goes quiet instead of the app going away.
+//!
+//! The child is the choz binary again, the same trick the scan and probe
+//! workers use: [`sandbox_worker_main`] runs before anything touches a terminal
+//! or an audio device.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use choz_plugin_sandbox::shm::Shm;
+use choz_plugin_sandbox::{Host, Sandbox, region_bytes};
+
+use crate::paths::PluginFormat;
+use crate::sources::AudioSource;
+
+/// Argument that turns the choz binary into a plugin sandbox.
+pub const SANDBOX_WORKER_FLAG: &str = "--choz-sandbox-worker";
+
+/// Interleaved stereo, like every other source in choz.
+const CHANNELS: u32 = 2;
+
+/// How long the audio thread will wait for the child before writing silence,
+/// as a fraction of the block it is rendering. Two thirds leaves room for the
+/// rest of the callback — the other slots still have to be mixed.
+const DEADLINE_SHARE: f64 = 2.0 / 3.0;
+
+/// Everything needed to start the child again after it dies.
+#[derive(Clone)]
+struct ChildSpec {
+    exe: PathBuf,
+    format: PluginFormat,
+    path: PathBuf,
+    id: String,
+    shm_name: String,
+    frames: u32,
+}
+
+impl ChildSpec {
+    fn spawn(&self) -> Result<std::process::Child> {
+        std::process::Command::new(&self.exe)
+            .env(crate::WORKER_ENV, "1")
+            .arg(SANDBOX_WORKER_FLAG)
+            .arg(self.format.label())
+            .arg(&self.path)
+            .arg(&self.id)
+            .arg(&self.shm_name)
+            .arg(self.frames.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .context("cannot start the plugin sandbox")
+    }
+}
+
+/// The host end: a plugin instance living in another process.
+pub struct SandboxedPlugin {
+    bridge: Host,
+    /// Kept for its mapping; dropping it unmaps the region. The name is only
+    /// unlinked at the very end, because a replacement child has to be able to
+    /// open it again.
+    _shm: Shm,
+    /// The live child, shared with the supervisor thread that replaces it.
+    child: Arc<std::sync::Mutex<std::process::Child>>,
+    /// Set on drop so the supervisor stops resurrecting anything.
+    closing: Arc<AtomicBool>,
+    /// Missed blocks and restarts, shared with whoever is showing them. The
+    /// instance itself belongs to the RT thread, so this is all the UI gets.
+    status: choz_ports::SandboxStatus,
+    supervisor: Option<std::thread::JoinHandle<()>>,
+    frames: usize,
+    /// What an instrument gets as input. Allocated once: `render` must not.
+    silence: Vec<f32>,
+    /// Scratch for the input side of an in-place block.
+    tail: Vec<f32>,
+    /// Where the child's answer lands before it is copied out.
+    answer: Vec<f32>,
+    deadline: Duration,
+}
+
+impl SandboxedPlugin {
+    /// Start `path` in its own process and wait for it to answer one block.
+    ///
+    /// Fails if the child can't be spawned or never answers, which is the same
+    /// outcome as a plugin that refuses to instantiate: the caller reports it
+    /// and the slot stays empty.
+    pub fn build(
+        format: PluginFormat,
+        path: &Path,
+        id: &str,
+        sample_rate: u32,
+        frames: u32,
+    ) -> Result<Self> {
+        let exe = std::env::current_exe().context("cannot find the choz binary")?;
+        let name = choz_plugin_sandbox::shm::unique_name(&format!(
+            "sbx-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let shm = Shm::create(&name, region_bytes(frames, CHANNELS))
+            .context("cannot create the shared audio region")?;
+        // SAFETY: the region is ours, freshly sized by `region_bytes`.
+        let bridge = unsafe { Host::create(shm.as_ptr(), frames, CHANNELS, sample_rate) };
+
+        let spec = ChildSpec {
+            exe,
+            format,
+            path: path.to_path_buf(),
+            id: id.to_string(),
+            shm_name: name,
+            frames,
+        };
+        let child = Arc::new(std::sync::Mutex::new(spec.spawn()?));
+
+        let block = frames as usize * CHANNELS as usize;
+        let mut me = Self {
+            bridge,
+            _shm: shm,
+            child: Arc::clone(&child),
+            closing: Arc::new(AtomicBool::new(false)),
+            status: choz_ports::SandboxStatus::default(),
+            supervisor: None,
+            frames: frames as usize,
+            silence: vec![0.0; block],
+            tail: vec![0.0; block],
+            answer: vec![0.0; block],
+            deadline: Duration::from_secs_f64(
+                frames as f64 / sample_rate.max(1) as f64 * DEADLINE_SHARE,
+            ),
+        };
+
+        // Loading a plugin takes as long as it takes (Surge XT is not quick);
+        // only after the first answer is the deadline realtime-sized.
+        let mut first = vec![0.0f32; block];
+        let silence = vec![0.0f32; block];
+        if !me.bridge.exchange(&silence, &mut first, Duration::from_secs(10)) {
+            if let Ok(mut c) = child.lock() {
+                let _ = c.kill();
+            }
+            anyhow::bail!("{} never started in its sandbox", path.display());
+        }
+        me.supervise(spec);
+        Ok(me)
+    }
+
+    /// Blocks the child failed to answer in time. Each one is silence the user
+    /// heard.
+    pub fn missed(&self) -> u64 {
+        self.bridge.missed()
+    }
+
+    /// How many times the plugin has been restarted after crashing.
+    pub fn restarts(&self) -> u64 {
+        self.status.restarts()
+    }
+
+    /// The shared counters, for whoever draws them.
+    pub fn status(&self) -> choz_ports::SandboxStatus {
+        self.status.clone()
+    }
+
+    /// Republish the bridge's missed count. Called at the end of every block:
+    /// a relaxed store is fine on the audio thread.
+    fn publish(&self) {
+        self.status.missed.store(self.bridge.missed(), Ordering::Relaxed);
+    }
+
+    /// The pid of the process currently hosting the plugin.
+    pub fn child_pid(&self) -> u32 {
+        self.child.lock().map(|c| c.id()).unwrap_or(0)
+    }
+
+    /// Watch the child and start a new one when it dies.
+    ///
+    /// This is why a sandboxed plugin is more than a crash shield: a plugin
+    /// that segfaults comes *back*, a fraction of a second later, instead of
+    /// leaving the tab silent until the user reloads it. The audio thread is
+    /// not involved — it just reads silence from `exchange` in the meantime.
+    fn supervise(&mut self, spec: ChildSpec) {
+        let child = Arc::clone(&self.child);
+        let closing = Arc::clone(&self.closing);
+        let restarts = Arc::clone(&self.status.restarts);
+        let handle = std::thread::Builder::new()
+            .name("choz-sandbox-supervisor".into())
+            .spawn(move || {
+                loop {
+                    // `wait` needs the lock only while the child is gone; poll
+                    // instead so `Drop` can still kill it.
+                    let exited = loop {
+                        if closing.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        match child.lock().map(|mut c| c.try_wait()) {
+                            Ok(Ok(Some(status))) => break status,
+                            Ok(Ok(None)) => std::thread::sleep(Duration::from_millis(20)),
+                            // Poisoned or unwaitable: nothing sensible left to do.
+                            _ => return,
+                        }
+                    };
+                    if closing.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    eprintln!("choz: plugin sandbox died ({exited}); restarting it");
+                    match spec.spawn() {
+                        Ok(fresh) => {
+                            if let Ok(mut slot) = child.lock() {
+                                *slot = fresh;
+                            }
+                            restarts.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            eprintln!("choz: cannot restart the plugin sandbox: {e}");
+                            return;
+                        }
+                    }
+                }
+            })
+            .ok();
+        self.supervisor = handle;
+    }
+}
+
+impl SandboxedPlugin {
+    /// One round trip per block, in place. `buf` carries the input over and
+    /// comes back holding the plugin's answer — silence for the blocks the
+    /// child failed to deliver.
+    ///
+    /// Realtime-safe: the wait is bounded and nothing here allocates.
+    fn exchange_block(&mut self, buf: &mut [f32], _sample_rate: u32) {
+        let block = self.frames * CHANNELS as usize;
+        let mut done = 0;
+        while done < buf.len() {
+            let take = (buf.len() - done).min(block);
+            // The input goes through `tail` and the answer lands in `answer`:
+            // the caller's buffer is both source and destination, and the two
+            // sides of the region must not alias.
+            self.tail[..take].copy_from_slice(&buf[done..done + take]);
+            self.tail[take..].fill(0.0);
+            self.bridge.exchange(&self.tail, &mut self.answer, self.deadline);
+            buf[done..done + take].copy_from_slice(&self.answer[..take]);
+            done += take;
+        }
+        self.publish();
+        // A sandboxed plugin is one choz already knows to be badly behaved, so
+        // its output doesn't get to poison the mix either: padthv1 hands back
+        // NaN until it has a patch loaded.
+        for s in buf.iter_mut() {
+            if !s.is_finite() {
+                *s = 0.0;
+            }
+        }
+    }
+}
+
+impl AudioSource for SandboxedPlugin {
+    fn render(&mut self, out: &mut [f32], _sample_rate: u32) -> usize {
+        let block = self.frames * CHANNELS as usize;
+        let mut done = 0;
+        while done < out.len() {
+            let take = (out.len() - done).min(block);
+            if take == block {
+                self.bridge.exchange(
+                    &self.silence,
+                    &mut out[done..done + block],
+                    self.deadline,
+                );
+            } else {
+                // A partial tail: the child only ever processes whole blocks,
+                // so it answers into `answer` and we keep what fits.
+                self.bridge.exchange(&self.silence, &mut self.answer, self.deadline);
+                out[done..done + take].copy_from_slice(&self.answer[..take]);
+            }
+            done += take;
+        }
+        self.publish();
+        // A sandboxed plugin is one choz already knows to be badly behaved, so
+        // its output doesn't get to poison the mix either: padthv1 hands back
+        // NaN until it has a patch loaded.
+        for s in out.iter_mut() {
+            if !s.is_finite() {
+                *s = 0.0;
+            }
+        }
+        out.len() / CHANNELS as usize
+    }
+
+    fn note_on(&mut self, note: u8, velocity: u8) {
+        self.bridge.push_midi([0x90, note & 0x7F, velocity & 0x7F]);
+    }
+
+    fn note_off(&mut self, note: u8) {
+        self.bridge.push_midi([0x80, note & 0x7F, 0]);
+    }
+
+    fn control_change(&mut self, cc: u8, value: u8) {
+        self.bridge.push_midi([0xB0, cc & 0x7F, value & 0x7F]);
+    }
+
+    fn pitch_bend(&mut self, value: u16) {
+        let v = value.min(16383);
+        self.bridge.push_midi([0xE0, (v & 0x7F) as u8, (v >> 7) as u8]);
+    }
+
+    fn set_param(&mut self, index: usize, value: f32) {
+        self.bridge.push_param(index, value);
+    }
+
+    fn plays_on_transport_stop(&self) -> bool {
+        true
+    }
+
+    fn sandbox(&self) -> Option<choz_ports::SandboxStatus> {
+        Some(self.status())
+    }
+}
+
+/// The same plugin, wired into an FX chain instead of a rack slot.
+///
+/// Everything that matters lives in [`SandboxedPlugin`]; this only swaps
+/// silence for the dry signal and mixes the answer back in. Wet/dry is choz's
+/// own, applied here — the child never sees it.
+pub struct SandboxedEffect {
+    inner: SandboxedPlugin,
+    wet: f32,
+    /// The dry block, kept so it can be mixed back after the round trip.
+    dry: Vec<f32>,
+}
+
+impl SandboxedEffect {
+    pub fn build(
+        format: PluginFormat,
+        path: &Path,
+        id: &str,
+        sample_rate: u32,
+        frames: u32,
+    ) -> Result<Self> {
+        let inner = SandboxedPlugin::build(format, path, id, sample_rate, frames)?;
+        Ok(Self { inner, wet: 1.0, dry: vec![0.0; frames as usize * CHANNELS as usize] })
+    }
+}
+
+impl crate::fx::FxProcessor for SandboxedEffect {
+    fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
+        if self.dry.len() < buf.len() {
+            // A block bigger than the region: the round trip chunks it, but the
+            // dry copy has to be able to hold it. Non-RT growth, once.
+            self.dry.resize(buf.len(), 0.0);
+        }
+        self.dry[..buf.len()].copy_from_slice(buf);
+        self.inner.exchange_block(buf, sample_rate);
+        if self.wet < 1.0 {
+            for (out, dry) in buf.iter_mut().zip(&self.dry) {
+                *out = *dry * (1.0 - self.wet) + *out * self.wet;
+            }
+        }
+    }
+
+    fn reset(&mut self) {}
+
+    fn set_mix(&mut self, wet: f32) {
+        self.wet = wet.clamp(0.0, 1.0);
+    }
+
+    fn name(&self) -> &str {
+        "sandboxed plugin"
+    }
+
+    fn set_param(&mut self, index: usize, value: f32) {
+        self.inner.bridge.push_param(index, value);
+    }
+
+    fn sandbox(&self) -> Option<choz_ports::SandboxStatus> {
+        Some(self.inner.status())
+    }
+}
+
+impl Drop for SandboxedPlugin {
+    fn drop(&mut self) {
+        // Order matters: tell the supervisor to stand down *before* the child
+        // dies, or it will helpfully start another one.
+        self.closing.store(true, Ordering::Relaxed);
+        self.bridge.stop();
+        if let Some(t) = self.supervisor.take() {
+            let _ = t.join();
+        }
+        if let Ok(mut child) = self.child.lock() {
+            // It exits on its own once it sees `quit`; kill it if it has
+            // stopped listening — which is exactly the case a sandbox is for.
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            while std::time::Instant::now() < deadline {
+                match child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                    Err(_) => break,
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+// ─── The child ──────────────────────────────────────────────────────────────
+
+/// Load the named plugin and answer blocks until the host says stop. Returns
+/// `false` when the arguments aren't a sandbox invocation.
+///
+/// Call it from `main` beside the scan and probe workers.
+pub fn sandbox_worker_main() -> bool {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 7 || args[1] != SANDBOX_WORKER_FLAG {
+        return false;
+    }
+    let Some(format) = PluginFormat::from_label(&args[2]) else { return true };
+    let (path, id, name) = (Path::new(&args[3]), args[4].as_str(), args[5].as_str());
+    let frames: u32 = args[6].parse().unwrap_or(256);
+
+    if let Err(e) = serve_plugin(format, path, id, name, frames) {
+        eprintln!("choz: sandbox for {}: {e}", path.display());
+    }
+    true
+}
+
+fn serve_plugin(
+    format: PluginFormat,
+    path: &Path,
+    id: &str,
+    shm_name: &str,
+    frames: u32,
+) -> Result<()> {
+    let shm = Shm::attach(shm_name, region_bytes(frames, CHANNELS))
+        .context("cannot attach the shared audio region")?;
+    // SAFETY: same size and layout the host created.
+    let mut sandbox = unsafe { Sandbox::attach(shm.as_ptr(), frames, CHANNELS) };
+    let sample_rate = sandbox.sample_rate();
+
+    // An instrument if it can be one, an effect otherwise — the same order the
+    // load probe uses.
+    let mut source = crate::engine::build_instrument(format, path, id, sample_rate, frames).ok();
+    let mut effect = if source.is_none() {
+        crate::fx_chain::build_plugin_fx_in_process(
+            &crate::fx_chain::PluginFxRef {
+                format,
+                path: path.to_path_buf(),
+                id: id.to_string(),
+            },
+            sample_rate,
+            frames,
+        )
+    } else {
+        None
+    };
+    if source.is_none() && effect.is_none() {
+        anyhow::bail!("nothing loadable at {}", path.display());
+    }
+
+    // The host waits with a deadline, so a slow block costs it silence, not a
+    // stall. Ours is generous: it only bounds "the host went away".
+    while sandbox.serve(Duration::from_secs(5), &mut |input, output, midi, params| {
+        if let Some(src) = source.as_mut() {
+            for (index, value) in params {
+                src.set_param(*index, *value);
+            }
+            for m in midi {
+                match m[0] & 0xF0 {
+                    0x90 if m[2] > 0 => src.note_on(m[1], m[2]),
+                    0x90 | 0x80 => src.note_off(m[1]),
+                    0xB0 => src.control_change(m[1], m[2]),
+                    0xE0 => src.pitch_bend(u16::from(m[1]) | u16::from(m[2]) << 7),
+                    _ => {}
+                }
+            }
+            src.render(output, sample_rate);
+        } else if let Some(fx) = effect.as_mut() {
+            for (index, value) in params {
+                fx.set_param(*index, *value);
+            }
+            output.copy_from_slice(input);
+            fx.process_block(output, sample_rate);
+        }
+    }) {}
+    Ok(())
+}

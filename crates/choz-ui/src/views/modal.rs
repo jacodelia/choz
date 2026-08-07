@@ -120,7 +120,7 @@ pub fn draw_list_modal(f: &mut Frame, m: &mut ListModal, area: Rect, pct: (u16, 
         .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border()))
-        .style(Style::default().bg(PANEL_BG));
+        .style(super::theme::panel_style());
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -199,7 +199,7 @@ pub fn draw_list_modal(f: &mut Frame, m: &mut ListModal, area: Rect, pct: (u16, 
         // Fill the rest of the sidebar column so it reads as one panel.
         for row in m.sidebar.len()..rows {
             f.render_widget(
-                Block::default().style(Style::default().bg(PANEL_BG)),
+                Block::default().style(super::theme::panel_style()),
                 Rect::new(content.x, y + row as u16, sw, 1),
             );
         }
@@ -212,7 +212,7 @@ pub fn draw_list_modal(f: &mut Frame, m: &mut ListModal, area: Rect, pct: (u16, 
     if m.items.is_empty() && rows > 0 {
         f.render_widget(
             Paragraph::new(Span::styled("  (empty)", Style::default().fg(DIM)))
-                .style(Style::default().bg(PANEL_BG)),
+                .style(super::theme::panel_style()),
             list_area,
         );
     }
@@ -256,7 +256,7 @@ pub fn draw_list_modal(f: &mut Frame, m: &mut ListModal, area: Rect, pct: (u16, 
     if !m.note.is_empty() {
         f.render_widget(
             Paragraph::new(Span::styled(m.note.clone(), Style::default().fg(DIM)))
-                .style(Style::default().bg(PANEL_BG)),
+                .style(super::theme::panel_style()),
             Rect::new(content.x, note_y, content.width, 1),
         );
     }
@@ -305,7 +305,7 @@ pub fn draw_list_modal(f: &mut Frame, m: &mut ListModal, area: Rect, pct: (u16, 
                 "\u{2191}\u{2193}=move  wheel=scroll  Enter=select  Esc=cancel",
                 Style::default().fg(DIM),
             ))
-            .style(Style::default().bg(PANEL_BG)),
+            .style(super::theme::panel_style()),
             Rect::new(hint_x, btn_y, content.x + content.width - hint_x, 1),
         );
     }

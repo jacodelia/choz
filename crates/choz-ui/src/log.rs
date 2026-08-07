@@ -1,9 +1,14 @@
-//! Redirect process stderr (fd 2) to a log file before the TUI takes over the
-//! terminal. Every `eprintln!` in the app + any panic message then lands in the
-//! file instead of corrupting the ratatui display.
+//! Point the process's own output at a log file before the TUI takes over the
+//! terminal, so nothing can scribble on the display.
+//!
+//! stderr (fd 2) carries every `eprintln!` and panic message. **stdout (fd 1)
+//! matters just as much**: hosted plugins print their own banners and warnings
+//! there — u-he's synths, fluidsynth, guitarix all do — and fd 1 is exactly
+//! where ratatui draws. So choz keeps a duplicate of the real terminal to draw
+//! through, and hands fd 1 itself to the log.
 
-use std::fs::OpenOptions;
-use std::os::fd::AsRawFd;
+use std::fs::{File, OpenOptions};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 
 /// Log-file location: `<state dir>/choz.log`, next to the plugin cache.
@@ -31,6 +36,30 @@ pub fn redirect_stderr() -> Option<PathBuf> {
 
     eprintln!("\n─── choz started {} ───", timestamp());
     Some(path)
+}
+
+/// Hand fd 1 to the log file and return a duplicate of the real terminal for
+/// the TUI to draw through. Call it *after* any startup `println!`.
+///
+/// On failure the terminal is returned untouched, so choz still draws — it just
+/// keeps sharing fd 1 with whatever a plugin decides to print.
+pub fn take_terminal() -> std::io::Result<File> {
+    // SAFETY: dup(1) returns a fresh fd for the same open file description;
+    // wrapping it in a File gives it an owner that closes it on drop.
+    let dup = unsafe { libc::dup(libc::STDOUT_FILENO) };
+    if dup < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let terminal = unsafe { File::from_raw_fd(dup) };
+
+    if let Ok(file) = OpenOptions::new().create(true).append(true).open(log_path()) {
+        // SAFETY: both are valid open fds; the log file is leaked so its fd
+        // stays alive for the life of the process.
+        if unsafe { libc::dup2(file.as_raw_fd(), libc::STDOUT_FILENO) } >= 0 {
+            std::mem::forget(file);
+        }
+    }
+    Ok(terminal)
 }
 
 /// Seconds since the Unix epoch — a dependency-free timestamp for log separators.

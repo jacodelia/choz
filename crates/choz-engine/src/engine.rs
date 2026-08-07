@@ -25,7 +25,7 @@ type Source = Box<dyn AudioSource>;
 
 /// One rack slot: an audio source plus its own post-source FX chain and mixer
 /// strip. The RT callback mixes every slot's output together.
-struct Slot {
+pub(crate) struct Slot {
     source: Source,
     fx: FxChain,
     /// Linear output gain (0.0..=2.0).
@@ -33,11 +33,27 @@ struct Slot {
     /// Stereo position, -1.0 = hard left, 0.0 = center, 1.0 = hard right.
     pan: f32,
     mute: bool,
+    /// Device output channels this slot's stereo pair lands on, 0-based.
+    /// `(0, 1)` is the first pair; the JACK backend can address every channel
+    /// the interface has, the cpal one clamps everything onto 0/1.
+    out_pair: (usize, usize),
+    /// Device *input* channels feeding this slot instead of its own source.
+    /// `None` = the source plays (an instrument); `Some` = live audio in.
+    /// Registered by the JACK backend now, exposed in the UI in stage 2.
+    in_pair: Option<(usize, usize)>,
 }
 
 impl Slot {
     fn new(source: Source) -> Self {
-        Slot { source, fx: Vec::new(), gain: 1.0, pan: 0.0, mute: false }
+        Slot {
+            source,
+            fx: Vec::new(),
+            gain: 1.0,
+            pan: 0.0,
+            mute: false,
+            out_pair: (0, 1),
+            in_pair: None,
+        }
     }
 
     /// Constant-power pan law → (left, right) channel gains.
@@ -53,12 +69,16 @@ impl Slot {
 /// Commands sent UI → RT over a lock-free ring. Notes name their target slot:
 /// the UI resolves input→slot routing (it owns the input↔slot bindings), so the
 /// RT side never has to know about MIDI ports or OSC.
-enum EngineCommand {
+pub(crate) enum EngineCommand {
     AddSlot(Source),
     RemoveSlot(usize),
     SetSlotSource { slot: usize, source: Source },
     SetSlotFx { slot: usize, fx: FxChain },
     SetSlotMix { slot: usize, gain: f32, pan: f32, mute: bool },
+    /// Which device output channels this slot lands on (0-based).
+    SetSlotOut { slot: usize, left: usize, right: usize },
+    /// Which device input channels feed this slot; `None` = play its source.
+    SetSlotIn { slot: usize, pair: Option<(usize, usize)> },
     SetSlotProgram { slot: usize, bank: u8, preset: u8 },
     /// Live parameter tweak for a slot's *instrument* (hosted plugin).
     SetSlotParam { slot: usize, index: usize, value: f32 },
@@ -67,13 +87,17 @@ enum EngineCommand {
     SetFxParam { slot: usize, fx: usize, index: usize, value: f32 },
     NoteOn { slot: usize, note: u8, vel: u8 },
     NoteOff { slot: usize, note: u8 },
+    /// Pedals, modulation wheel — any control change, unfiltered.
+    ControlChange { slot: usize, cc: u8, value: u8 },
+    /// Pitch bend, raw 14-bit wire value (0..16383, centred at 8192).
+    PitchBend { slot: usize, value: u16 },
 }
 
 /// Items retired by the RT thread, returned to the UI thread to be dropped
 /// off the audio thread (avoids deallocation in the RT context). The payload is
 /// never read — only dropped — which is the whole point.
 #[allow(dead_code)]
-enum Retired {
+pub(crate) enum Retired {
     Slot(Slot),
     Fx(FxChain),
     Source(Source),
@@ -83,6 +107,13 @@ enum Retired {
 /// ponytail: fixed cap keeps `AddSlot` alloc-free; raise it if anyone needs
 /// more than this many simultaneous sources.
 const MAX_SLOTS: usize = 32;
+
+/// Capacity of the UI → RT command ring, and of the retired ring that comes
+/// back. Sized for a burst: a chord plus a fader sweep between two audio
+/// callbacks. ponytail: a full ring still drops commands — and a dropped
+/// note-off is a note that hangs. Raise it if that is ever observed rather than
+/// making the push block the UI.
+const CMD_RING: usize = 512;
 
 /// Which audio backend was selected at startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,18 +139,48 @@ pub struct AudioEngine {
     playing: Arc<AtomicBool>,
     /// Number of rack slots the UI has created (kept in sync with the RT side).
     slot_count: usize,
+    /// Native-editor handle per slot, mirrored with `slot_count`. Taken from
+    /// each source before it moves to the RT thread — that is the only moment
+    /// the UI can still reach it.
+    editors: Vec<Option<choz_ports::EditorHandle>>,
+    /// Same, for each slot's FX chain: `fx_editors[slot][fx]`.
+    fx_editors: Vec<Vec<Option<choz_ports::EditorHandle>>>,
+    /// Counters of the slot's instrument when it plays in its own process,
+    /// taken at the same moment as the editor handle. `None` = in-process.
+    sandboxes: Vec<Option<choz_ports::SandboxStatus>>,
+    /// Same, per FX: `fx_sandboxes[slot][fx]`.
+    fx_sandboxes: Vec<Vec<Option<choz_ports::SandboxStatus>>>,
     /// UI → RT: engine commands (add/remove slot, set fx, notes).
     cmd_tx: rtrb::Producer<EngineCommand>,
     /// RT → UI: retired slots/chains to drop off the audio thread.
     retired_rx: rtrb::Consumer<Retired>,
     /// Name of the output device in use (set once the stream is open).
     output_device: Option<String>,
+    /// Graph node the capture ports are wired to. `None` means "the same node
+    /// as the output", which is right for a duplex interface and gives nothing
+    /// on a card whose capture is a separate node.
+    input_device: Option<String>,
     /// Backend the user asked for: `AUTO`, `JACK`, `PIPEWIRE` or `ALSA`.
     /// `AUTO` keeps the historical behaviour (JACK when PipeWire is up).
     backend_pref: String,
     /// RT endpoints, taken by `start()` and moved into the callback.
     rt_endpoints: Option<RtEndpoints>,
-    _stream: Option<cpal::Stream>,
+    _stream: Option<BackendHandle>,
+    /// Device output channels the running backend gives us. 2 on cpal; the
+    /// interface's real count on the native JACK client.
+    out_channels: usize,
+    /// Device input channels available to slots (native JACK only).
+    in_channels: usize,
+}
+
+/// The live audio connection. Held only to keep it alive: dropping either
+/// variant stops audio, which is the whole point.
+#[allow(dead_code)]
+enum BackendHandle {
+    Cpal(cpal::Stream),
+    /// Native JACK client — the only backend that can address more than two
+    /// device channels.
+    Jack(Box<crate::jack_backend::Handle>),
 }
 
 /// The consumer/producer ends the RT callback owns.
@@ -129,14 +190,55 @@ struct RtEndpoints {
 }
 
 /// State owned by the real-time audio callback. No locks, no allocation.
-struct RtState {
-    playing: Arc<AtomicBool>,
-    cmd_rx: rtrb::Consumer<EngineCommand>,
-    retired_tx: rtrb::Producer<Retired>,
-    slots: Vec<Slot>,
+pub(crate) struct RtState {
+    pub(crate) playing: Arc<AtomicBool>,
+    pub(crate) cmd_rx: rtrb::Consumer<EngineCommand>,
+    pub(crate) retired_tx: rtrb::Producer<Retired>,
+    pub(crate) slots: Vec<Slot>,
     /// Pre-allocated per-slot mix scratch (interleaved stereo).
-    scratch: Vec<f32>,
-    sample_rate: u32,
+    pub(crate) scratch: Vec<f32>,
+    /// One pre-allocated buffer per device output channel. Slots sum into the
+    /// pair they are routed to; the backend copies these to its ports.
+    pub(crate) mix: Vec<Vec<f32>>,
+    /// One pre-allocated buffer per device *input* channel, filled by the
+    /// backend before `render` so a slot can process live audio.
+    pub(crate) capture: Vec<Vec<f32>>,
+    pub(crate) sample_rate: u32,
+}
+
+/// Smallest quantum choz will force on the graph. Forcing 64 frames onto a
+/// class-compliant USB interface stalls its endpoints (`urb status -32`), and on
+/// AMD Renoir xHCI a stalled endpoint can take the whole host controller down
+/// ("HC died"), dropping every USB device until a PCI rebind — see
+/// `docs/usb-xhci-crash.md`. Below this, choz asks and lets the graph decide.
+const MIN_FORCED_QUANTUM: u32 = 128;
+
+/// Tell PipeWire what period to run our node at, before the JACK client exists —
+/// the placement is read at client-open time.
+///
+/// `PIPEWIRE_LATENCY` alone is only a *request*: pipewire-jack opens every JACK
+/// client with `node.lock-quantum` and a `node.force-quantum` inherited from
+/// whatever the graph happened to be running at, and force beats latency. A
+/// client started while the graph sat at 1024 stayed at 1024 (21 ms) no matter
+/// what buffer size the settings asked for. `PIPEWIRE_QUANTUM` writes
+/// `node.force-quantum`/`node.force-rate`, so the configured buffer size is what
+/// actually runs.
+fn request_pipewire_period(buffer_size: u32, sample_rate: u32) {
+    let period = format!("{buffer_size}/{sample_rate}");
+    unsafe { std::env::set_var("PIPEWIRE_LATENCY", &period) };
+    if buffer_size >= MIN_FORCED_QUANTUM {
+        unsafe { std::env::set_var("PIPEWIRE_QUANTUM", &period) };
+        eprintln!("choz: PipeWire period forced to {period} ({:.1} ms)", period_ms(buffer_size, sample_rate));
+    } else {
+        // Leave any inherited force in place rather than pushing the graph below
+        // what the USB bus survives.
+        unsafe { std::env::remove_var("PIPEWIRE_QUANTUM") };
+        eprintln!("choz: PipeWire period requested {period}, not forced (< {MIN_FORCED_QUANTUM} frames)");
+    }
+}
+
+fn period_ms(buffer_size: u32, sample_rate: u32) -> f32 {
+    buffer_size as f32 * 1000.0 / sample_rate.max(1) as f32
 }
 
 // ─── PipeWire / sound server detection ─────────────────────────────────────
@@ -175,22 +277,33 @@ fn detect_sound_server() -> &'static str {
 
 impl AudioEngine {
     pub fn new(sample_rate: u32, buffer_size: u32) -> Self {
-        // Small SPSC rings: a handful of pending rebuilds is plenty for a human
-        // clicking knobs; a full ring just drops the excess without blocking RT.
-        let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(128);
-        let (retired_tx, retired_rx) = rtrb::RingBuffer::new(64);
+        // SPSC rings: a full command ring drops the excess rather than blocking
+        // the RT thread.
+        let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(CMD_RING);
+        // At least as large as the command ring: every command retires at most
+        // one item, so the RT thread can always hand its cast-offs back. A full
+        // retired ring would make it drop them itself — freeing a chain (dlclose
+        // on a hosted plugin) inside the audio callback, which hangs the device.
+        let (retired_tx, retired_rx) = rtrb::RingBuffer::new(CMD_RING);
         Self {
             sample_rate,
             buffer_size,
             backend: AudioBackend::Alsa,
             playing: Arc::new(AtomicBool::new(false)),
             slot_count: 0,
+            editors: Vec::new(),
+            fx_editors: Vec::new(),
+            sandboxes: Vec::new(),
+            fx_sandboxes: Vec::new(),
             cmd_tx,
             retired_rx,
             output_device: None,
+            input_device: None,
             backend_pref: "AUTO".to_string(),
             rt_endpoints: Some(RtEndpoints { cmd_rx, retired_tx }),
             _stream: None,
+            out_channels: 2,
+            in_channels: 0,
         }
     }
 
@@ -203,6 +316,24 @@ impl AudioEngine {
     pub fn start(&mut self) -> Result<()> {
         let sound_server = detect_sound_server();
 
+        // The native JACK client comes first: it is the only backend that can
+        // address every channel of the interface, which is what per-slot output
+        // routing needs. cpal stays as the fallback for boxes without JACK.
+        if self.backend_pref != "ALSA" {
+            match self.start_jack_native() {
+                Ok(()) => {
+                    eprintln!(
+                        "choz: using native JACK client via {sound_server} (sr={}, buf={}, out={} ch, in={} ch, dev={})",
+                        self.sample_rate, self.buffer_size, self.out_channels,
+                        self.in_channels,
+                        self.output_device.as_deref().unwrap_or("default"),
+                    );
+                    return Ok(());
+                }
+                Err(e) => eprintln!("choz: native JACK unavailable ({e}), falling back to cpal..."),
+            }
+        }
+
         // Pick backend + device + config BEFORE we touch the RT ring endpoints,
         // so a failed JACK probe can cleanly fall through to ALSA.
         let (device, config, backend) = self
@@ -214,21 +345,28 @@ impl AudioEngine {
             .take()
             .context("audio engine already started")?;
 
-        let scratch_frames = (self.buffer_size.max(8192) as usize) * 2;
-        let state = RtState {
-            playing: Arc::clone(&self.playing),
-            cmd_rx: ep.cmd_rx,
-            retired_tx: ep.retired_tx,
-            slots: Vec::with_capacity(MAX_SLOTS),
-            scratch: vec![0.0; scratch_frames],
-            sample_rate: self.sample_rate,
-        };
+        let state = self.new_rt_state(ep, 2, 0);
 
-        self.output_device = device.name().ok();
+        // On JACK the wanted name is a graph sink, not a cpal device: keep it
+        // and patch the ports once the stream (and its ports) exist.
+        let wanted = self.output_device.take();
         let stream = build_stream(&device, &config, state)?;
         stream.play().context("failed to start audio stream")?;
-        self._stream = Some(stream);
+        self._stream = Some(BackendHandle::Cpal(stream));
         self.backend = backend;
+        self.out_channels = 2;
+        self.in_channels = 0;
+        self.output_device = match (backend, wanted) {
+            (AudioBackend::Jack, Some(sink)) => match jack_route_to(&sink, CPAL_JACK_CLIENT) {
+                Ok(()) => Some(sink),
+                Err(e) => {
+                    eprintln!("choz: {e}, staying on the default output");
+                    jack_current_sink()
+                }
+            },
+            (AudioBackend::Jack, None) => jack_current_sink(),
+            (_, _) => device.name().ok(),
+        };
         eprintln!(
             "choz: using {} backend via {sound_server} (sr={}, buf={}, out={})",
             backend.label(), self.sample_rate, self.buffer_size,
@@ -237,14 +375,120 @@ impl AudioEngine {
         Ok(())
     }
 
-    /// Output devices offered by the current backend, by name.
-    pub fn output_devices(&self) -> Vec<String> {
-        let host = if self.backend == AudioBackend::Jack {
-            cpal::host_from_id(cpal::HostId::Jack).unwrap_or_else(|_| cpal::default_host())
-        } else {
-            cpal::default_host()
+    /// Open the native JACK client: one port per device channel, wired to the
+    /// wanted sink. Errors here are not fatal — `start` falls back to cpal.
+    fn start_jack_native(&mut self) -> Result<()> {
+        if !pipewire_is_running() && self.backend_pref != "JACK" {
+            anyhow::bail!("no JACK graph detected");
+        }
+        request_pipewire_period(self.buffer_size, self.sample_rate);
+
+        let sink = self.output_device.clone().or_else(jack_current_sink);
+        // An unknown sink still gets a stereo client: the user can patch it.
+        let (outs, sink_ins) = sink
+            .as_deref()
+            .and_then(crate::jack_backend::device_channels)
+            .unwrap_or((2, 0));
+        let source = self.input_device.clone();
+        let ins = match source.as_deref() {
+            Some(name) => crate::jack_backend::capture_channels(name).unwrap_or(0),
+            None => sink_ins,
         };
-        match host.output_devices() {
+
+        let ep = self
+            .rt_endpoints
+            .take()
+            .context("audio engine already started")?;
+        let state = self.new_rt_state(ep, outs.max(2), ins);
+
+        match crate::jack_backend::start(sink.as_deref(), source.as_deref(), outs.max(2), ins, state)
+        {
+            Ok((handle, channels)) => {
+                self._stream = Some(BackendHandle::Jack(Box::new(handle)));
+                self.backend = AudioBackend::Jack;
+                self.out_channels = channels;
+                self.in_channels = ins;
+                self.output_device = sink.or_else(jack_current_sink);
+                Ok(())
+            }
+            Err(e) => {
+                // The endpoints went into the state we just lost. Fresh rings on
+                // both ends put the engine back where `new` left it, so the cpal
+                // path can still start — no slots exist this early, so nothing
+                // queued is lost.
+                let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(CMD_RING);
+                let (retired_tx, retired_rx) = rtrb::RingBuffer::new(CMD_RING);
+                self.cmd_tx = cmd_tx;
+                self.retired_rx = retired_rx;
+                self.rt_endpoints = Some(RtEndpoints { cmd_rx, retired_tx });
+                Err(e)
+            }
+        }
+    }
+
+    /// Rebuild the native client on `sink` with `outs`/`ins` ports. Every slot
+    /// is lost (they live in the old client's RT state), which is why the
+    /// caller is told to reload the rack.
+    fn restart_jack_native(&mut self, sink: Option<&str>, outs: usize, ins: usize) -> Result<()> {
+        let source = self.input_device.clone();
+        // Fresh rings: the old ones belong to the client we are about to drop.
+        let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(CMD_RING);
+        let (retired_tx, retired_rx) = rtrb::RingBuffer::new(CMD_RING);
+        let state = self.new_rt_state(RtEndpoints { cmd_rx, retired_tx }, outs, ins);
+
+        // Drop first: two live clients would fight over the name `choz`, and
+        // the graph would rename the second one. If the new client then fails
+        // to open there is no audio until the next attempt — the error says so.
+        self._stream = None;
+        let (handle, channels) =
+            crate::jack_backend::start(sink, source.as_deref(), outs, ins, state)
+                .context("cannot reopen the JACK client")?;
+
+        self.cmd_tx = cmd_tx;
+        self.retired_rx = retired_rx;
+        self.slot_count = 0;
+        self.editors.clear();
+        self.fx_editors.clear();
+        self.sandboxes.clear();
+        self.fx_sandboxes.clear();
+        self._stream = Some(BackendHandle::Jack(Box::new(handle)));
+        self.out_channels = channels;
+        self.in_channels = ins;
+        self.output_device = sink.map(str::to_string).or_else(jack_current_sink);
+        Ok(())
+    }
+
+    /// RT state sized for `outs` output and `ins` input channels.
+    fn new_rt_state(&self, ep: RtEndpoints, outs: usize, ins: usize) -> RtState {
+        // Frames a callback can ever hand us: the configured buffer, but never
+        // less than 8192 — cpal and PipeWire both hand out bigger blocks than
+        // the size we asked for.
+        let frames = self.buffer_size.max(8192) as usize;
+        RtState {
+            playing: Arc::clone(&self.playing),
+            cmd_rx: ep.cmd_rx,
+            retired_tx: ep.retired_tx,
+            slots: Vec::with_capacity(MAX_SLOTS),
+            scratch: vec![0.0; frames * 2],
+            mix: vec![vec![0.0; frames]; outs.max(2)],
+            capture: vec![vec![0.0; frames]; ins],
+            sample_rate: self.sample_rate,
+        }
+    }
+
+    /// Output devices offered by the current backend, by name.
+    ///
+    /// On JACK the list comes from the graph, not from cpal — cpal's JACK host
+    /// invents a single `cpal_client_out` device, whereas the graph names every
+    /// real sink PipeWire is publishing.
+    pub fn output_devices(&self) -> Vec<String> {
+        if self.backend == AudioBackend::Jack {
+            let sinks = jack_sinks();
+            if !sinks.is_empty() {
+                return sinks;
+            }
+        }
+        match cpal::default_host().output_devices() {
             Ok(devs) => devs.filter_map(|d| d.name().ok()).collect(),
             Err(_) => Vec::new(),
         }
@@ -255,38 +499,96 @@ impl AudioEngine {
         self.output_device.as_deref()
     }
 
-    /// Move playback to `name`. The old stream is torn down, so **every rack
-    /// slot is lost** — the caller must re-add them (the UI owns the rack model
-    /// and reloads it). Returns an error and keeps the old stream if the device
-    /// can't be opened.
-    pub fn set_output_device(&mut self, name: &str) -> Result<()> {
+    /// Graph nodes that publish capture ports, by name. Empty off JACK: cpal
+    /// gives choz no capture at all.
+    pub fn input_devices(&self) -> Vec<String> {
+        if self.backend == AudioBackend::Jack { jack_sources() } else { Vec::new() }
+    }
+
+    /// Node the capture ports are wired to, which is the output's own node
+    /// until the user picks another.
+    pub fn input_device(&self) -> Option<&str> {
+        self.input_device.as_deref().or(self.output_device.as_deref())
+    }
+
+    /// Take audio in from `name`. The client is rebuilt (a different device has
+    /// a different channel count), so **every rack slot is lost** and the caller
+    /// reloads the rack — same contract as [`Self::set_output_device`].
+    pub fn set_input_device(&mut self, name: &str) -> Result<bool> {
+        if !matches!(self._stream, Some(BackendHandle::Jack(_))) {
+            anyhow::bail!("audio input needs the native JACK client");
+        }
+        // The sink may never have been named — PipeWire auto-connects us and
+        // `output_device` stays empty until someone picks one. Reconnect to
+        // whatever we are wired to now.
+        let sink = self.output_device.clone().or_else(jack_current_sink);
+        self.input_device = Some(name.to_string());
+        let ins = crate::jack_backend::capture_channels(name).unwrap_or(0);
+        self.restart_jack_native(sink.as_deref(), self.out_channels, ins).map(|()| true)
+    }
+
+    /// Move playback to `name`. Returns `true` when the stream had to be rebuilt,
+    /// which loses **every rack slot** — the caller must then re-add them (the UI
+    /// owns the rack model and reloads it). On JACK the ports are simply
+    /// re-patched, nothing is lost and `false` comes back. Returns an error and
+    /// keeps the current output if the device can't be opened.
+    pub fn set_output_device(&mut self, name: &str) -> Result<bool> {
+        match self._stream {
+            // Native client. Same channel count → re-patch our ports and keep
+            // playing. A different one (the 2-channel default → a 12-output
+            // interface) needs a new set of ports, so the client is rebuilt and
+            // the caller reloads the rack.
+            Some(BackendHandle::Jack(_)) => {
+                let (outs, sink_ins) = crate::jack_backend::device_channels(name).unwrap_or((2, 0));
+                let ins = match self.input_device.as_deref() {
+                    Some(src) => crate::jack_backend::capture_channels(src).unwrap_or(0),
+                    None => sink_ins,
+                };
+                let outs = outs.max(2);
+                if outs == self.out_channels && ins == self.in_channels {
+                    jack_route_to(name, crate::jack_backend::CLIENT_NAME)?;
+                    self.output_device = Some(name.to_string());
+                    return Ok(false);
+                }
+                return self.restart_jack_native(Some(name), outs, ins).map(|()| true);
+            }
+            Some(BackendHandle::Cpal(_)) if self.backend == AudioBackend::Jack => {
+                jack_route_to(name, CPAL_JACK_CLIENT)?;
+                self.output_device = Some(name.to_string());
+                return Ok(false);
+            }
+            _ => {}
+        }
         let sound_server = detect_sound_server();
         let (device, config, backend) = self
             .pick_backend(sound_server, Some(name))
             .with_context(|| format!("cannot open output device '{name}'"))?;
 
         // Fresh rings: the old ones are owned by the callback we're dropping.
-        let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(128);
-        let (retired_tx, retired_rx) = rtrb::RingBuffer::new(64);
-        let scratch_frames = (self.buffer_size.max(8192) as usize) * 2;
-        let state = RtState {
-            playing: Arc::clone(&self.playing),
-            cmd_rx,
-            retired_tx,
-            slots: Vec::with_capacity(MAX_SLOTS),
-            scratch: vec![0.0; scratch_frames],
-            sample_rate: self.sample_rate,
-        };
+        let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(CMD_RING);
+        // At least as large as the command ring: every command retires at most
+        // one item, so the RT thread can always hand its cast-offs back. A full
+        // retired ring would make it drop them itself — freeing a chain (dlclose
+        // on a hosted plugin) inside the audio callback, which hangs the device.
+        let (retired_tx, retired_rx) = rtrb::RingBuffer::new(CMD_RING);
+        let state = self.new_rt_state(RtEndpoints { cmd_rx, retired_tx }, 2, 0);
         let stream = build_stream(&device, &config, state)?;
         stream.play().context("failed to start audio stream")?;
 
-        self._stream = Some(stream); // drops the previous stream (and its slots)
+        // Drops the previous stream (and its slots).
+        self._stream = Some(BackendHandle::Cpal(stream));
+        self.out_channels = 2;
+        self.in_channels = 0;
         self.cmd_tx = cmd_tx;
         self.retired_rx = retired_rx;
         self.slot_count = 0;
+        self.editors.clear();
+        self.fx_editors.clear();
+        self.sandboxes.clear();
+        self.fx_sandboxes.clear();
         self.backend = backend;
         self.output_device = device.name().ok();
-        Ok(())
+        Ok(true)
     }
 
     /// Choose a working (device, config, backend) without consuming RT state.
@@ -305,6 +607,12 @@ impl AudioEngine {
         self.output_device = Some(name.to_string());
     }
 
+    /// Capture device to wire up when the client opens. Same deal: set it
+    /// before [`Self::start`].
+    pub fn set_input_device_preference(&mut self, name: &str) {
+        self.input_device = Some(name.to_string());
+    }
+
     pub fn backend_preference(&self) -> &str {
         &self.backend_pref
     }
@@ -321,11 +629,7 @@ impl AudioEngine {
         }
         let force_jack = matches!(self.backend_pref.as_str(), "JACK" | "PIPEWIRE");
         if force_jack || pipewire_is_running() {
-            // PIPEWIRE_QUANTUM must be set before the JACK client is created so
-            // PipeWire uses our exact buffer size.
-            let quantum_str = format!("{}/{}", self.buffer_size, self.sample_rate);
-            unsafe { std::env::set_var("PIPEWIRE_QUANTUM", &quantum_str); }
-            eprintln!("choz: PipeWire detected — setting PIPEWIRE_QUANTUM={quantum_str}");
+            request_pipewire_period(self.buffer_size, self.sample_rate);
 
             match self.jack_device_config(want) {
                 Ok((dev, cfg)) => return Ok((dev, cfg, AudioBackend::Jack)),
@@ -338,10 +642,14 @@ impl AudioEngine {
         Ok((dev, cfg, AudioBackend::Alsa))
     }
 
-    fn jack_device_config(&self, want: Option<&str>) -> Result<(cpal::Device, cpal::StreamConfig)> {
+    /// `want` is deliberately ignored here: on JACK the wanted name is a graph
+    /// sink, not one of cpal's devices (cpal only ever offers its own
+    /// `cpal_client_out`). The stream opens on that one device and `start`
+    /// patches its ports onto the wanted sink afterwards.
+    fn jack_device_config(&self, _want: Option<&str>) -> Result<(cpal::Device, cpal::StreamConfig)> {
         let host = cpal::host_from_id(cpal::HostId::Jack)
             .context("JACK host not available (is libjack installed?)")?;
-        let device = named_or_default(&host, want)
+        let device = named_or_default(&host, None)
             .context("no JACK output device found")?;
         let config = pick_config(&device, self.sample_rate, self.buffer_size)?;
         Ok((device, config))
@@ -357,6 +665,27 @@ impl AudioEngine {
     /// Number of rack slots.
     pub fn slot_count(&self) -> usize {
         self.slot_count
+    }
+
+    /// Handle to slot `slot`'s plugin window, when its instrument has one.
+    pub fn slot_editor(&self, slot: usize) -> Option<choz_ports::EditorHandle> {
+        self.editors.get(slot).cloned().flatten()
+    }
+
+    /// Handle to the window of FX `fx` in slot `slot`, when it's a plugin with
+    /// an editor.
+    pub fn fx_editor(&self, slot: usize, fx: usize) -> Option<choz_ports::EditorHandle> {
+        self.fx_editors.get(slot)?.get(fx).cloned().flatten()
+    }
+
+    /// Live counters when slot `slot`'s instrument plays in its own process.
+    pub fn slot_sandbox(&self, slot: usize) -> Option<choz_ports::SandboxStatus> {
+        self.sandboxes.get(slot).cloned().flatten()
+    }
+
+    /// Same for FX `fx` of slot `slot`.
+    pub fn fx_sandbox(&self, slot: usize, fx: usize) -> Option<choz_ports::SandboxStatus> {
+        self.fx_sandboxes.get(slot)?.get(fx).cloned().flatten()
     }
 
     fn drain_retired(&mut self) {
@@ -378,6 +707,10 @@ impl AudioEngine {
             return None;
         }
         let idx = self.slot_count;
+        self.editors.push(source.editor());
+        self.sandboxes.push(source.sandbox());
+        self.fx_editors.push(Vec::new());
+        self.fx_sandboxes.push(Vec::new());
         self.send(EngineCommand::AddSlot(source));
         self.slot_count += 1;
         Some(idx)
@@ -388,6 +721,10 @@ impl AudioEngine {
         if slot < self.slot_count {
             self.send(EngineCommand::RemoveSlot(slot));
             self.slot_count -= 1;
+            self.editors.remove(slot);
+            self.fx_editors.remove(slot);
+            self.sandboxes.remove(slot);
+            self.fx_sandboxes.remove(slot);
         }
     }
 
@@ -397,7 +734,41 @@ impl AudioEngine {
             return;
         }
         let fx = build_chain_from_specs(&specs, self.sample_rate, self.buffer_size);
+        // Last chance to reach the processors: after this they belong to the
+        // RT thread.
+        self.fx_editors[slot] = fx.iter().map(|p| p.editor()).collect();
+        self.fx_sandboxes[slot] = fx.iter().map(|p| p.sandbox()).collect();
         self.send(EngineCommand::SetSlotFx { slot, fx });
+    }
+
+    /// Device output channels the running backend exposes. 2 on cpal; the
+    /// interface's real count under the native JACK client.
+    pub fn output_channels(&self) -> usize {
+        self.out_channels
+    }
+
+    /// Device input channels available as slot sources (native JACK only).
+    pub fn input_channels(&self) -> usize {
+        self.in_channels
+    }
+
+    /// Route slot `slot` to a device output pair, 0-based: `(0, 1)` is the
+    /// first pair, `(4, 5)` the third. Channels past the device's count fold
+    /// onto the last one.
+    pub fn set_slot_out(&mut self, slot: usize, left: usize, right: usize) {
+        if slot >= self.slot_count {
+            return;
+        }
+        self.send(EngineCommand::SetSlotOut { slot, left, right });
+    }
+
+    /// Feed slot `slot` from a device input pair instead of its own source;
+    /// `None` puts its instrument back in charge.
+    pub fn set_slot_in(&mut self, slot: usize, pair: Option<(usize, usize)>) {
+        if slot >= self.slot_count {
+            return;
+        }
+        self.send(EngineCommand::SetSlotIn { slot, pair });
     }
 
     /// Set slot `slot`'s mixer strip: linear `gain`, `pan` (-1 left .. 1 right)
@@ -440,6 +811,8 @@ impl AudioEngine {
         if slot >= self.slot_count {
             return;
         }
+        self.editors[slot] = source.editor();
+        self.sandboxes[slot] = source.sandbox();
         self.send(EngineCommand::SetSlotSource { slot, source });
     }
 
@@ -495,9 +868,8 @@ impl AudioEngine {
         crate::cache::rescan(|| self.scan_plugins(paths))
     }
 
-    /// Add a CLAP instrument slot. Requires the `clap` feature.
-    #[cfg(feature = "clap")]
-    pub fn add_clap(&mut self, path: &std::path::Path, plugin_id: &str) -> Result<Option<usize>> {
+    /// Add a CLAP instrument slot.
+    fn add_clap(&mut self, path: &std::path::Path, plugin_id: &str) -> Result<Option<usize>> {
         let inst = choz_plugin_clap::host::ClapInstrument::build(
             path, plugin_id, self.sample_rate, self.buffer_size,
         )
@@ -505,14 +877,8 @@ impl AudioEngine {
         Ok(self.add_slot(Box::new(inst)))
     }
 
-    #[cfg(not(feature = "clap"))]
-    pub fn add_clap(&mut self, _path: &std::path::Path, _plugin_id: &str) -> Result<Option<usize>> {
-        anyhow::bail!("CLAP support not compiled in (rebuild with --features clap)")
-    }
-
-    /// Load a CLAP instrument as slot `slot`'s source. Requires the `clap` feature.
-    #[cfg(feature = "clap")]
-    pub fn load_clap(&mut self, slot: usize, path: &std::path::Path, plugin_id: &str) -> Result<()> {
+    /// Load a CLAP instrument as slot `slot`'s source.
+    fn load_clap(&mut self, slot: usize, path: &std::path::Path, plugin_id: &str) -> Result<()> {
         let inst = choz_plugin_clap::host::ClapInstrument::build(
             path, plugin_id, self.sample_rate, self.buffer_size,
         )
@@ -521,9 +887,54 @@ impl AudioEngine {
         Ok(())
     }
 
-    #[cfg(not(feature = "clap"))]
-    pub fn load_clap(&mut self, _slot: usize, _path: &std::path::Path, _id: &str) -> Result<()> {
-        anyhow::bail!("CLAP support not compiled in (rebuild with --features clap)")
+    /// Add a hosted plugin instrument as a new slot.
+    pub fn add_plugin(
+        &mut self,
+        format: crate::PluginFormat,
+        path: &std::path::Path,
+        id: &str,
+    ) -> Result<Option<usize>> {
+        refuse_if_quarantined(format, path, id)?;
+        match format {
+            crate::PluginFormat::Clap => self.add_clap(path, id),
+            crate::PluginFormat::Lv2 | crate::PluginFormat::Dssi | crate::PluginFormat::Vst2
+            | crate::PluginFormat::Vst3 | crate::PluginFormat::Sfz => {
+                Ok(self.add_slot(self.build_instrument(format, path, id)?))
+            }
+            _ => anyhow::bail!("{} hosting is not implemented yet", format.label()),
+        }
+    }
+
+    /// Load a hosted plugin instrument as slot `slot`'s source.
+    pub fn load_plugin(
+        &mut self,
+        slot: usize,
+        format: crate::PluginFormat,
+        path: &std::path::Path,
+        id: &str,
+    ) -> Result<()> {
+        refuse_if_quarantined(format, path, id)?;
+        match format {
+            crate::PluginFormat::Clap => self.load_clap(slot, path, id),
+            crate::PluginFormat::Lv2 | crate::PluginFormat::Dssi | crate::PluginFormat::Vst2
+            | crate::PluginFormat::Vst3 | crate::PluginFormat::Sfz => {
+                let inst = self.build_instrument(format, path, id)?;
+                self.set_slot_source(slot, inst);
+                Ok(())
+            }
+            _ => anyhow::bail!("{} hosting is not implemented yet", format.label()),
+        }
+    }
+
+    /// Instantiate a plugin instrument off the RT thread, at this engine's
+    /// sample rate and block size.
+    fn build_instrument(
+        &self,
+        format: crate::PluginFormat,
+        path: &std::path::Path,
+        id: &str,
+    ) -> Result<Box<dyn crate::sources::AudioSource>> {
+        build_hosted_instrument(format, path, id, self.sample_rate, self.buffer_size)
     }
 
     /// Send a note-on to one slot. Input→slot routing lives in the UI.
@@ -535,16 +946,43 @@ impl AudioEngine {
         self.send(EngineCommand::NoteOff { slot, note });
     }
 
+    /// Send a control change to one slot: sustain and the other pedals, the
+    /// modulation wheel, expression. Not filtered — the instrument decides what
+    /// it understands.
+    pub fn control_change(&mut self, slot: usize, cc: u8, value: u8) {
+        self.send(EngineCommand::ControlChange { slot, cc, value });
+    }
+
+    /// Send pitch bend to one slot, as the raw 14-bit wire value.
+    pub fn pitch_bend(&mut self, slot: usize, value: u16) {
+        self.send(EngineCommand::PitchBend { slot, value });
+    }
+
     pub fn set_playing(&self, play: bool) {
         self.playing.store(play, Ordering::Relaxed);
     }
 }
 
 /// Real-time callback body. Runs on the audio thread — no locks, no alloc.
+/// The cpal path: mix into the two channel buffers and interleave them into
+/// the device buffer. Every backend shares [`RtState::apply_commands`] and
+/// [`RtState::render`]; only the hand-off to the device differs.
 fn audio_callback(buf: &mut [f32], state: &mut RtState) {
-    // Apply pending commands to the slot list. Retired slots/chains go back over
-    // retired_tx so they are freed on the UI thread, not here.
-    while let Ok(cmd) = state.cmd_rx.pop() {
+    state.apply_commands();
+    let frames = buf.len() / 2;
+    state.render(frames);
+    for f in 0..frames {
+        buf[f * 2] = state.mix[0][f];
+        buf[f * 2 + 1] = state.mix[1][f];
+    }
+}
+
+impl RtState {
+    /// Apply pending commands to the slot list. Retired slots/chains go back
+    /// over `retired_tx` so they are freed on the UI thread, not here.
+    pub(crate) fn apply_commands(&mut self) {
+        let state = self;
+        while let Ok(cmd) = state.cmd_rx.pop() {
         match cmd {
             EngineCommand::AddSlot(source) => {
                 if state.slots.len() < MAX_SLOTS {
@@ -582,6 +1020,16 @@ fn audio_callback(buf: &mut [f32], state: &mut RtState) {
                     s.mute = mute;
                 }
             }
+            EngineCommand::SetSlotOut { slot, left, right } => {
+                if let Some(s) = state.slots.get_mut(slot) {
+                    s.out_pair = (left, right);
+                }
+            }
+            EngineCommand::SetSlotIn { slot, pair } => {
+                if let Some(s) = state.slots.get_mut(slot) {
+                    s.in_pair = pair;
+                }
+            }
             EngineCommand::SetFxParam { slot, fx, index, value } => {
                 if let Some(p) = state.slots.get_mut(slot).and_then(|s| s.fx.get_mut(fx)) {
                     if index == crate::FX_MIX_PARAM {
@@ -612,35 +1060,84 @@ fn audio_callback(buf: &mut [f32], state: &mut RtState) {
                     s.source.note_off(note);
                 }
             }
+            EngineCommand::ControlChange { slot, cc, value } => {
+                if let Some(s) = state.slots.get_mut(slot) {
+                    s.source.control_change(cc, value);
+                }
+            }
+            EngineCommand::PitchBend { slot, value } => {
+                if let Some(s) = state.slots.get_mut(slot) {
+                    s.source.pitch_bend(value);
+                }
+            }
         }
     }
 
-    buf.fill(0.0);
-    let playing = state.playing.load(Ordering::Relaxed);
-    let n = buf.len().min(state.scratch.len());
-    let sr = state.sample_rate;
+    }
 
-    // Mix every slot: render its source into scratch, run its FX, sum into buf.
-    for slot in state.slots.iter_mut() {
-        // Synths always render (envelope tails / live keys); generators (tone,
-        // WAV) honor the transport play flag.
-        if !playing && !slot.source.plays_on_transport_stop() {
-            continue;
+    /// Copy one capture port's block into the matching input buffer.
+    pub(crate) fn write_capture(&mut self, channel: usize, src: &[f32]) {
+        let Some(dst) = self.capture.get_mut(channel) else { return };
+        let n = src.len().min(dst.len());
+        dst[..n].copy_from_slice(&src[..n]);
+    }
+
+    /// Render `frames` of every slot into [`Self::mix`], one buffer per device
+    /// output channel. Each slot lands on the pair it is routed to, so two
+    /// slots can play out of different jacks of the same interface.
+    pub(crate) fn render(&mut self, frames: usize) {
+        // Destructured so the capture buffers can be read while the slots are
+        // borrowed mutably.
+        let Self { slots, scratch, mix, capture, playing, sample_rate, .. } = self;
+        let last = mix.len().saturating_sub(1);
+        for ch in mix.iter_mut() {
+            let n = frames.min(ch.len());
+            ch[..n].fill(0.0);
         }
-        let sc = &mut state.scratch[..n];
-        sc.fill(0.0);
-        let written = slot.source.render(sc, sr);
-        for s in sc[written * 2..].iter_mut() {
-            *s = 0.0;
-        }
-        for fx in slot.fx.iter_mut() {
-            fx.process_block(sc, sr);
-        }
-        // Muted slots still render (so envelopes/playheads keep moving) but sum
-        // in at zero gain.
-        let (gl, gr) = slot.channel_gains();
-        for (i, (o, s)) in buf[..n].iter_mut().zip(sc.iter()).enumerate() {
-            *o += *s * if i % 2 == 0 { gl } else { gr };
+        let playing = playing.load(Ordering::Relaxed);
+        let n = (frames * 2).min(scratch.len());
+        let sr = *sample_rate;
+
+        for slot in slots.iter_mut() {
+            // Synths always render (envelope tails / live keys); generators
+            // (tone, WAV) honor the transport play flag.
+            if !playing && !slot.source.plays_on_transport_stop() {
+                continue;
+            }
+            let sc = &mut scratch[..n];
+            sc.fill(0.0);
+            match slot.in_pair {
+                // Live audio in: interleave the two capture channels the slot
+                // listens to, then treat it exactly like a rendered source.
+                Some((l, r)) => {
+                    let last_in = capture.len().saturating_sub(1);
+                    if !capture.is_empty() {
+                        let (l, r) = (l.min(last_in), r.min(last_in));
+                        for f in 0..(n / 2) {
+                            sc[f * 2] = capture[l][f];
+                            sc[f * 2 + 1] = capture[r][f];
+                        }
+                    }
+                }
+                None => {
+                    let written = slot.source.render(sc, sr);
+                    for s in sc[written * 2..].iter_mut() {
+                        *s = 0.0;
+                    }
+                }
+            }
+            for fx in slot.fx.iter_mut() {
+                fx.process_block(sc, sr);
+            }
+            // Muted slots still render (so envelopes/playheads keep moving) but
+            // sum in at zero gain. A pair pointing past the device's channels
+            // folds onto the last one rather than going silent.
+            let (gl, gr) = slot.channel_gains();
+            let (l, r) = (slot.out_pair.0.min(last), slot.out_pair.1.min(last));
+            for f in 0..(n / 2) {
+                mix[l][f] += sc[f * 2] * gl;
+                mix[r][f] += sc[f * 2 + 1] * gr;
+            }
         }
     }
 }
@@ -662,6 +1159,126 @@ fn build_stream(
             None,
         )
         .context("failed to build output stream")
+}
+
+/// JACK port type of a mono float audio port (`JACK_DEFAULT_AUDIO_TYPE`).
+pub(crate) const JACK_AUDIO: &str = "32 bit float mono audio";
+
+/// The JACK client cpal registers our output stream under: cpal names its
+/// JACK host `cpal_client` and appends `_out` for the playback device.
+///
+/// ponytail: hard-coded rather than plumbed out of cpal, which never exposes
+/// it. Only wrong if a second choz is already connected, in which case JACK
+/// renames the client and the routing below silently finds no ports.
+const CPAL_JACK_CLIENT: &str = "cpal_client_out";
+
+/// Open a short-lived JACK client just to inspect/patch the graph.
+fn jack_probe(name: &str) -> Result<jack::Client> {
+    let (client, _) = jack::Client::new(name, jack::ClientOptions::NO_START_SERVER)
+        .context("cannot reach the JACK graph")?;
+    Ok(client)
+}
+
+/// Audio sinks the JACK graph exposes, by client name — under PipeWire these
+/// are the real outputs (speakers, HDMI, USB headset), the same list Carla
+/// shows, rather than cpal's single synthetic `cpal_client_out` device.
+fn jack_sinks() -> Vec<String> {
+    let Ok(client) = jack_probe("choz-probe") else {
+        return Vec::new();
+    };
+    let mut sinks: Vec<String> = Vec::new();
+    for port in client.ports(None, Some(JACK_AUDIO), jack::PortFlags::IS_INPUT) {
+        let Some((owner, _)) = port.rsplit_once(':') else { continue };
+        let ours = owner == CPAL_JACK_CLIENT || owner == crate::jack_backend::CLIENT_NAME;
+        if !ours && !sinks.iter().any(|s| s == owner) {
+            sinks.push(owner.to_string());
+        }
+    }
+    sinks
+}
+
+/// Every graph node publishing capture ports — the input-side twin of
+/// [`jack_sinks`]. Monitor ports are excluded there, so a plain sink doesn't
+/// masquerade as a source.
+fn jack_sources() -> Vec<String> {
+    let Ok(client) = jack_probe("choz-probe") else {
+        return Vec::new();
+    };
+    let mut sources: Vec<String> = Vec::new();
+    for port in client.ports(None, Some(JACK_AUDIO), jack::PortFlags::IS_OUTPUT) {
+        if port.contains(":monitor") {
+            continue;
+        }
+        let Some((owner, _)) = port.rsplit_once(':') else { continue };
+        let ours = owner == CPAL_JACK_CLIENT || owner == crate::jack_backend::CLIENT_NAME;
+        if !ours && !sources.iter().any(|s| s == owner) {
+            sources.push(owner.to_string());
+        }
+    }
+    sources
+}
+
+/// The sink our first playback port is wired to, if any — after start-up this
+/// is whatever PipeWire auto-connected us to.
+fn jack_current_sink() -> Option<String> {
+    let client = jack_probe("choz-probe").ok()?;
+    let out = client
+        .ports(None, Some(JACK_AUDIO), jack::PortFlags::IS_OUTPUT)
+        .into_iter()
+        .find(|p| {
+            p.starts_with(&format!("{}:", crate::jack_backend::CLIENT_NAME))
+                || p.starts_with(&format!("{CPAL_JACK_CLIENT}:"))
+        })?;
+    let connected = client.port_by_name(&out)?.get_connections();
+    let (owner, _) = connected.first()?.rsplit_once(':')?;
+    Some(owner.to_string())
+}
+
+/// Point our playback ports at `sink`'s inputs, dropping whatever they were
+/// wired to before (PipeWire auto-connects new clients to the default sink).
+fn jack_route_to(sink: &str, client_name: &str) -> Result<()> {
+    let client = jack_probe("choz-router")?;
+    let ours = crate::jack_backend::in_order(
+        client
+            .ports(None, Some(JACK_AUDIO), jack::PortFlags::IS_OUTPUT)
+            .into_iter()
+            .filter(|p| p.starts_with(&format!("{client_name}:")))
+            .collect(),
+    );
+    if ours.is_empty() {
+        anyhow::bail!("choz has no JACK output ports (is the stream running?)");
+    }
+    let targets = crate::jack_backend::sink_ports(&client, sink);
+    if targets.is_empty() {
+        anyhow::bail!("output '{sink}' has no playback ports");
+    }
+
+    for (out, target) in pair_ports(&ours, &targets) {
+        // Tear the old wiring down first: a port left connected to two sinks
+        // plays through both.
+        if let Some(port) = client.port_by_name(out) {
+            for old in port.get_connections() {
+                let _ = client.disconnect_ports_by_name(out, &old);
+            }
+        }
+        client
+            .connect_ports_by_name(out, target)
+            .with_context(|| format!("cannot connect {out} to {target}"))?;
+    }
+    Ok(())
+}
+
+/// Wire our playback ports to a sink's inputs, in order. A sink with fewer
+/// inputs than we have ports (a mono output fed by our stereo pair) folds the
+/// extras onto its last input rather than dropping them.
+fn pair_ports<'a>(ours: &'a [String], targets: &'a [String]) -> Vec<(&'a str, &'a str)> {
+    ours.iter()
+        .enumerate()
+        .filter_map(|(i, out)| {
+            let t = targets.get(i).or_else(|| targets.last())?;
+            Some((out.as_str(), t.as_str()))
+        })
+        .collect()
 }
 
 /// The named output device, or the host default when `want` is `None` or the
@@ -741,9 +1358,141 @@ fn no_backend_hint(sound_server: &str) -> String {
     )
 }
 
+/// Refuse a plugin that has already been seen to die on its way in. The check
+/// probes it in a child process the first time and remembers the answer, so the
+/// cost is one extra process the first time each plugin is used.
+fn refuse_if_quarantined(
+    format: crate::PluginFormat,
+    path: &std::path::Path,
+    id: &str,
+) -> Result<()> {
+    let verdict = crate::quarantine::check(format, path, id);
+    // It plays, it just can't be destroyed: tell the host crate to leak it
+    // rather than take the app down when the tab is removed.
+    if verdict == crate::quarantine::Verdict::CrashesOnTeardown
+        && format == crate::PluginFormat::Lv2
+    {
+        choz_plugin_lv2::leak_on_teardown(id);
+    }
+    if verdict.loadable() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{} crashes when it is loaded; choz will not host it (see {})",
+        path.display(),
+        crate::cache::state_dir().join("plugin-verdicts.json").display()
+    )
+}
+
+/// Instantiate an instrument for a rack slot, in its own process when the load
+/// probe said this plugin cannot be destroyed safely.
+///
+/// A sandboxed plugin dies with its child, so there is nothing to leak and
+/// nothing to take the app down with it. If the sandbox itself won't start,
+/// choz falls back to hosting in-process — which is what it did before any of
+/// this existed, leak and all.
+pub fn build_hosted_instrument(
+    format: crate::PluginFormat,
+    path: &std::path::Path,
+    id: &str,
+    sr: u32,
+    block: u32,
+) -> Result<Box<dyn crate::sources::AudioSource>> {
+    if crate::quarantine::wants_sandbox(format, path, id) {
+        match crate::sandboxed::SandboxedPlugin::build(format, path, id, sr, block) {
+            Ok(p) => {
+                eprintln!("choz: hosting {} in its own process", path.display());
+                return Ok(Box::new(p));
+            }
+            Err(e) => eprintln!("choz: sandbox for {} failed ({e}); hosting in-process", path.display()),
+        }
+    }
+    build_instrument(format, path, id, sr, block)
+}
+
+/// Instantiate a plugin instrument. `path` is the plugin file, or the bundle
+/// directory for LV2; `id` its URI/label. Non-RT: this loads a shared object.
+/// Always in this process — the sandbox child calls exactly this.
+pub fn build_instrument(
+    format: crate::PluginFormat,
+    path: &std::path::Path,
+    id: &str,
+    sr: u32,
+    block: u32,
+) -> Result<Box<dyn crate::sources::AudioSource>> {
+        let source: Option<Box<dyn crate::sources::AudioSource>> = match format {
+            crate::PluginFormat::Lv2 => choz_plugin_lv2::Lv2Instrument::build(path, id, sr, block)
+                .map(|i| Box::new(i) as Box<dyn crate::sources::AudioSource>),
+            crate::PluginFormat::Dssi => {
+                choz_plugin_ladspa::DssiInstrument::build(path, id, sr, block)
+                    .map(|i| Box::new(i) as Box<dyn crate::sources::AudioSource>)
+            }
+            crate::PluginFormat::Vst2 => choz_plugin_vst2::Vst2Instrument::build(path, sr, block)
+                .map(|i| Box::new(i) as Box<dyn crate::sources::AudioSource>),
+            crate::PluginFormat::Vst3 => choz_plugin_vst3::Vst3Instrument::build(path, sr, block)
+                .map(|i| Box::new(i) as Box<dyn crate::sources::AudioSource>),
+            // Not a plugin at all: a text file pointing at samples, played by
+            // choz's own sampler.
+            crate::PluginFormat::Sfz => match crate::sfz::SfzSampler::build(path, sr) {
+                Ok(s) => Some(Box::new(s) as Box<dyn crate::sources::AudioSource>),
+                Err(e) => {
+                    eprintln!("choz: SFZ {}: {e}", path.display());
+                    None
+                }
+            },
+            _ => None,
+        };
+    source.ok_or_else(|| {
+        anyhow::anyhow!("failed to instantiate {} plugin: {id}", format.label())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The configured buffer size has to reach PipeWire as a *force*, or
+    /// pipewire-jack's inherited `node.force-quantum` wins and the node runs at
+    /// whatever the graph was doing (1024 = 21 ms, unplayable live).
+    #[test]
+    fn forces_the_quantum_only_when_usb_can_take_it() {
+        request_pipewire_period(256, 48000);
+        assert_eq!(std::env::var("PIPEWIRE_LATENCY").as_deref(), Ok("256/48000"));
+        assert_eq!(std::env::var("PIPEWIRE_QUANTUM").as_deref(), Ok("256/48000"));
+
+        // Below the floor choz still asks, but never forces — a 64-frame quantum
+        // is what took the xHCI controller down.
+        request_pipewire_period(64, 48000);
+        assert_eq!(std::env::var("PIPEWIRE_LATENCY").as_deref(), Ok("64/48000"));
+        assert!(std::env::var("PIPEWIRE_QUANTUM").is_err(), "64 frames must not be forced");
+
+        unsafe { std::env::remove_var("PIPEWIRE_LATENCY") };
+    }
+
+    #[test]
+    fn playback_ports_pair_up_and_mono_sinks_fold() {
+        let ours = vec!["cpal_client_out:out_0".into(), "cpal_client_out:out_1".into()];
+        let stereo = vec!["Speaker:playback_FL".into(), "Speaker:playback_FR".into()];
+        assert_eq!(
+            pair_ports(&ours, &stereo),
+            vec![
+                ("cpal_client_out:out_0", "Speaker:playback_FL"),
+                ("cpal_client_out:out_1", "Speaker:playback_FR"),
+            ]
+        );
+
+        let mono = vec!["Beeper:playback_MONO".into()];
+        assert_eq!(
+            pair_ports(&ours, &mono),
+            vec![
+                ("cpal_client_out:out_0", "Beeper:playback_MONO"),
+                ("cpal_client_out:out_1", "Beeper:playback_MONO"),
+            ],
+            "both channels reach a mono sink instead of the right one vanishing"
+        );
+
+        assert!(pair_ports(&ours, &[]).is_empty(), "a sink with no inputs wires nothing");
+    }
 
     /// Adds a constant to every sample — enough to prove the chain ran.
     struct AddFx(f32);
@@ -779,7 +1528,31 @@ mod tests {
         fn plays_on_transport_stop(&self) -> bool { true }
     }
 
+    /// Records the pedal/wheel traffic a slot receives.
+    #[derive(Default)]
+    struct Expressive {
+        ccs: std::sync::Arc<parking_lot::Mutex<Vec<(u8, u8)>>>,
+        bends: std::sync::Arc<parking_lot::Mutex<Vec<u16>>>,
+    }
+    impl AudioSource for Expressive {
+        fn render(&mut self, out: &mut [f32], _sr: u32) -> usize {
+            out.fill(0.0);
+            out.len() / 2
+        }
+        fn control_change(&mut self, cc: u8, value: u8) { self.ccs.lock().push((cc, value)); }
+        fn pitch_bend(&mut self, value: u16) { self.bends.lock().push(value); }
+    }
+
     fn mk_state() -> (rtrb::Producer<EngineCommand>, rtrb::Consumer<Retired>, RtState) {
+        mk_state_ch(2, 0)
+    }
+
+    /// RT state with `outs` output and `ins` input channels, as the backends
+    /// build it.
+    fn mk_state_ch(
+        outs: usize,
+        ins: usize,
+    ) -> (rtrb::Producer<EngineCommand>, rtrb::Consumer<Retired>, RtState) {
         let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(32);
         let (retired_tx, retired_rx) = rtrb::RingBuffer::new(32);
         let state = RtState {
@@ -788,9 +1561,72 @@ mod tests {
             retired_tx,
             slots: Vec::with_capacity(MAX_SLOTS),
             scratch: vec![0.0; 64],
+            mix: vec![vec![0.0; 32]; outs],
+            capture: vec![vec![0.0; 32]; ins],
             sample_rate: 48_000,
         };
         (cmd_tx, retired_rx, state)
+    }
+
+    /// Per-slot output routing: two slots on different pairs of a 6-channel
+    /// interface land on their own channels and nowhere else. This is what
+    /// "MIDI → plugin → out 5/6" rests on.
+    #[test]
+    fn slots_land_on_the_output_pair_they_are_routed_to() {
+        let (mut cmd_tx, _retired, mut state) = mk_state_ch(6, 0);
+        cmd_tx.push(EngineCommand::AddSlot(Box::new(DcSource(0.25)))).unwrap();
+        cmd_tx.push(EngineCommand::AddSlot(Box::new(DcSource(0.5)))).unwrap();
+        cmd_tx.push(EngineCommand::SetSlotOut { slot: 1, left: 4, right: 5 }).unwrap();
+        state.apply_commands();
+        state.render(8);
+
+        // Centred slots come through the constant-power pan law at -3 dB.
+        let c = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((state.mix[0][0] - 0.25 * c).abs() < 1e-6, "slot 0 on the default pair");
+        assert!((state.mix[1][0] - 0.25 * c).abs() < 1e-6);
+        assert_eq!(state.mix[2][0], 0.0, "nothing bleeds onto the untouched pair");
+        assert_eq!(state.mix[3][0], 0.0);
+        assert!((state.mix[4][0] - 0.5 * c).abs() < 1e-6, "slot 1 plays out of 5/6");
+        assert!((state.mix[5][0] - 0.5 * c).abs() < 1e-6);
+    }
+
+    /// A pair pointing past the device's channels folds onto the last one
+    /// instead of panicking or going silent.
+    #[test]
+    fn an_out_of_range_pair_folds_onto_the_last_channel() {
+        let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 0);
+        cmd_tx.push(EngineCommand::AddSlot(Box::new(DcSource(0.5)))).unwrap();
+        cmd_tx.push(EngineCommand::SetSlotOut { slot: 0, left: 8, right: 9 }).unwrap();
+        state.apply_commands();
+        state.render(8);
+        let c = std::f32::consts::FRAC_1_SQRT_2;
+        assert!(
+            (state.mix[1][0] - 2.0 * 0.5 * c).abs() < 1e-6,
+            "both sides summed onto the last channel"
+        );
+    }
+
+    /// A slot fed by a capture pair ignores its own source and runs its FX
+    /// chain over the live audio instead — "AUDIO 1/2 → plugin → out 5/6".
+    #[test]
+    fn a_slot_routed_to_an_input_pair_processes_live_audio() {
+        let (mut cmd_tx, _retired, mut state) = mk_state_ch(4, 2);
+        cmd_tx.push(EngineCommand::AddSlot(Box::new(DcSource(0.9)))).unwrap();
+        cmd_tx.push(EngineCommand::SetSlotIn { slot: 0, pair: Some((0, 1)) }).unwrap();
+        cmd_tx.push(EngineCommand::SetSlotOut { slot: 0, left: 2, right: 3 }).unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotFx { slot: 0, fx: vec![Box::new(AddFx(0.1))] })
+            .unwrap();
+        state.apply_commands();
+        // Hardware input: what the backend copies in before rendering.
+        state.write_capture(0, &[0.2; 8]);
+        state.write_capture(1, &[0.4; 8]);
+        state.render(8);
+
+        let c = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((state.mix[2][0] - 0.3 * c).abs() < 1e-6, "left input + FX, not the source");
+        assert!((state.mix[3][0] - 0.5 * c).abs() < 1e-6, "right input + FX");
+        assert_eq!(state.mix[0][0], 0.0, "and none of it on the default pair");
     }
 
     #[test]
@@ -852,6 +1688,32 @@ mod tests {
     }
 
     #[test]
+    fn pedals_and_wheels_reach_the_targeted_slot_only() {
+        let (mut cmd_tx, _retired, mut state) = mk_state();
+        let quiet = Expressive::default();
+        let played = Expressive::default();
+        let (q_ccs, p_ccs) = (quiet.ccs.clone(), played.ccs.clone());
+        let p_bends = played.bends.clone();
+
+        cmd_tx.push(EngineCommand::AddSlot(Box::new(quiet))).unwrap();
+        cmd_tx.push(EngineCommand::AddSlot(Box::new(played))).unwrap();
+        // Sustain down, modulation wheel up, bend fully up.
+        cmd_tx.push(EngineCommand::ControlChange { slot: 1, cc: 64, value: 127 }).unwrap();
+        cmd_tx.push(EngineCommand::ControlChange { slot: 1, cc: 1, value: 90 }).unwrap();
+        cmd_tx.push(EngineCommand::PitchBend { slot: 1, value: 16383 }).unwrap();
+        // Out-of-range targets are dropped, not panics.
+        cmd_tx.push(EngineCommand::ControlChange { slot: 99, cc: 64, value: 127 }).unwrap();
+        cmd_tx.push(EngineCommand::PitchBend { slot: 99, value: 0 }).unwrap();
+
+        let mut buf = [0.0f32; 8];
+        audio_callback(&mut buf, &mut state);
+
+        assert_eq!(&*p_ccs.lock(), &[(64, 127), (1, 90)], "sustain and mod wheel arrive unfiltered");
+        assert_eq!(&*p_bends.lock(), &[16383]);
+        assert!(q_ccs.lock().is_empty(), "a slot bound to another input stays untouched");
+    }
+
+    #[test]
     fn set_slot_source_swaps_and_retires_the_old_one() {
         let (mut cmd_tx, mut retired_rx, mut state) = mk_state();
         cmd_tx.push(EngineCommand::AddSlot(Box::new(DcSource(0.5)))).unwrap();
@@ -877,4 +1739,3 @@ mod tests {
         assert!(buf.iter().all(|&s| s == 0.0), "empty rack is silent");
     }
 }
-

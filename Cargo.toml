@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/choz-ports", "crates/choz-engine", "crates/choz-plugin-clap", "crates/choz-ui"]
+members = ["crates/choz-ports", "crates/choz-engine", "crates/choz-plugin-clap", "crates/choz-plugin-lv2", "crates/choz-plugin-ladspa", "crates/choz-plugin-vst2", "crates/choz-plugin-vst3", "crates/choz-plugin-sandbox", "crates/choz-ui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,7 +17,9 @@ oxisynth = "0.1"
 soundfont = "0.1"
 rosc = "0.11"
 cpal = { version = "0.15", features = ["jack"] }
-jack = "0.11"
+# `metadata` is what gates `Port::get_connections`, needed to re-patch our
+# playback ports when the user picks a different output.
+jack = { version = "0.11", features = ["metadata"] }
 midir = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,3 +28,8 @@ crossterm = "0.28"
 choz-ports = { path = "crates/choz-ports" }
 choz-engine = { path = "crates/choz-engine" }
 choz-plugin-clap = { path = "crates/choz-plugin-clap" }
+choz-plugin-lv2 = { path = "crates/choz-plugin-lv2" }
+choz-plugin-ladspa = { path = "crates/choz-plugin-ladspa" }
+choz-plugin-vst2 = { path = "crates/choz-plugin-vst2" }
+choz-plugin-vst3 = { path = "crates/choz-plugin-vst3" }
+choz-plugin-sandbox = { path = "crates/choz-plugin-sandbox" }

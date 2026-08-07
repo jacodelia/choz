@@ -9,6 +9,98 @@ use ratatui::style::Color;
 
 use crate::i18n::Lang;
 
+/// A named colour scheme: text, frames and desktop, chosen together.
+///
+/// Same idea as Notepad++'s themes — the point is that the three read well
+/// *as a set*, which is why they are picked together instead of one by one.
+/// The individual colours stay editable afterwards; a theme is a starting
+/// point, not a lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Theme {
+    pub name: &'static str,
+    /// Ordinary interface text.
+    pub text: (u8, u8, u8),
+    /// Panel and modal frames.
+    pub border: (u8, u8, u8),
+    /// The desktop behind everything. `None` leaves the terminal's own
+    /// background alone, which is what a terminal app should do by default.
+    pub desktop: Option<(u8, u8, u8)>,
+}
+
+/// The themes offered in Settings → THEME.
+///
+/// The first one keeps choz's original look and paints no background. The rest
+/// are the classic editor schemes, with the desktop colour taken from the
+/// scheme's own editor background.
+pub const THEMES: &[Theme] = &[
+    Theme {
+        name: "choz (default)",
+        text: (220, 226, 240),
+        border: (99, 101, 108),
+        desktop: None,
+    },
+    Theme {
+        name: "Obsidian",
+        text: (224, 226, 228),
+        border: (91, 106, 114),
+        desktop: Some((41, 49, 52)),
+    },
+    Theme {
+        name: "Zenburn",
+        text: (220, 220, 204),
+        border: (110, 110, 100),
+        desktop: Some((63, 63, 63)),
+    },
+    Theme {
+        name: "Solarized Dark",
+        text: (147, 161, 161),
+        border: (88, 110, 117),
+        desktop: Some((0, 43, 54)),
+    },
+    Theme {
+        name: "Solarized Light",
+        text: (88, 110, 117),
+        border: (147, 161, 161),
+        desktop: Some((253, 246, 227)),
+    },
+    Theme {
+        name: "Monokai",
+        text: (248, 248, 242),
+        border: (117, 113, 94),
+        desktop: Some((39, 40, 34)),
+    },
+    Theme {
+        name: "Deep Black",
+        text: (200, 200, 200),
+        border: (70, 70, 70),
+        desktop: Some((0, 0, 0)),
+    },
+    Theme {
+        name: "Vibrant Ink",
+        text: (255, 255, 255),
+        border: (102, 102, 102),
+        desktop: Some((20, 20, 20)),
+    },
+    Theme {
+        name: "Ruby Blue",
+        text: (255, 255, 255),
+        border: (86, 118, 152),
+        desktop: Some((17, 34, 51)),
+    },
+    Theme {
+        name: "Bespin",
+        text: (186, 174, 156),
+        border: (124, 112, 100),
+        desktop: Some((40, 33, 30)),
+    },
+    Theme {
+        name: "Hello Kitty",
+        text: (60, 40, 50),
+        border: (200, 140, 170),
+        desktop: Some((255, 228, 240)),
+    },
+];
+
 /// Text colours offered in Settings → Text color.
 pub const PALETTE: &[(&str, (u8, u8, u8))] = &[
     ("Default", (220, 226, 240)),
@@ -30,6 +122,11 @@ pub struct AudioSettings {
     pub backend: String,
     /// Output device name, or empty for the system default.
     pub device: String,
+    /// Capture device name, empty = follow the output's own graph node (right
+    /// for a duplex interface, nothing at all on a plain sound card). Added
+    /// later, hence the default.
+    #[serde(default)]
+    pub input_device: String,
     pub sample_rate: u32,
     pub buffer_size: u32,
     /// SF2 synthesis engine. choz only builds `oxisynth`; kept so a project
@@ -48,6 +145,7 @@ impl Default for AudioSettings {
         Self {
             backend: "AUTO".into(),
             device: String::new(),
+            input_device: String::new(),
             sample_rate: 48_000,
             buffer_size: 256,
             sf2_engine: "oxisynth".into(),
@@ -110,6 +208,66 @@ impl OscSettings {
     }
 }
 
+/// How a background image fills the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ImageFit {
+    /// Scale the image to cover the whole screen.
+    #[default]
+    Stretch,
+    /// Repeat the image at its own aspect ratio.
+    Tile,
+}
+
+impl ImageFit {
+    pub fn label(self) -> &'static str {
+        match self {
+            ImageFit::Stretch => "STRETCH",
+            ImageFit::Tile => "TILE",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            ImageFit::Stretch => ImageFit::Tile,
+            ImageFit::Tile => ImageFit::Stretch,
+        }
+    }
+}
+
+/// What sits behind the whole UI.
+///
+/// The terminal's own background is the default: choz paints nothing and the
+/// user's transparency, theme or wallpaper shows through, which is what a
+/// terminal app should do unless asked otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum Background {
+    #[default]
+    Terminal,
+    /// A flat colour under everything.
+    Color((u8, u8, u8)),
+    /// An image, rendered as per-cell background colours so it works on any
+    /// terminal — no sixel or kitty protocol needed.
+    Image {
+        path: std::path::PathBuf,
+        #[serde(default)]
+        fit: ImageFit,
+    },
+}
+
+impl Background {
+    pub fn label(&self) -> String {
+        match self {
+            Background::Terminal => "terminal default".to_string(),
+            Background::Color((r, g, b)) => format!("colour rgb({r},{g},{b})"),
+            Background::Image { path, fit } => format!(
+                "{}  [{}]",
+                path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                fit.label()
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UiSettings {
     /// Text colour, as RGB.
@@ -120,6 +278,18 @@ pub struct UiSettings {
     pub audio: AudioSettings,
     #[serde(default)]
     pub osc: OscSettings,
+    #[serde(default)]
+    pub background: Background,
+    /// Frame colour. Older files have none, and used to derive it by dimming the
+    /// text colour — [`UiSettings::border`] keeps doing that when it is absent,
+    /// so an old `ui.json` still looks the way it did.
+    #[serde(default)]
+    pub border_color: Option<(u8, u8, u8)>,
+    /// Name of the theme the colours came from, for the UI to show which row is
+    /// active. Editing a colour afterwards just leaves it stale, which is why
+    /// the drawing code never reads it.
+    #[serde(default)]
+    pub theme_name: String,
 }
 
 impl Default for UiSettings {
@@ -129,6 +299,9 @@ impl Default for UiSettings {
             language: Lang::from_env(),
             audio: AudioSettings::default(),
             osc: OscSettings::default(),
+            background: Background::default(),
+            border_color: None,
+            theme_name: THEMES[0].name.to_string(),
         }
     }
 }
@@ -137,6 +310,39 @@ impl UiSettings {
     pub fn color(&self) -> Color {
         let (r, g, b) = self.text_color;
         Color::Rgb(r, g, b)
+    }
+
+    /// The frame colour: the stored one, or the historical fallback of the text
+    /// colour at 45% brightness.
+    pub fn border(&self) -> Color {
+        match self.border_color {
+            Some((r, g, b)) => Color::Rgb(r, g, b),
+            None => {
+                let (r, g, b) = self.text_color;
+                let dim = |c: u8| ((c as u32 * 45) / 100) as u8;
+                Color::Rgb(dim(r), dim(g), dim(b))
+            }
+        }
+    }
+
+    /// Apply a whole theme: text, frames and desktop together.
+    ///
+    /// A theme with no desktop colour clears an inherited *colour* background
+    /// but leaves an image alone — someone who picked a wallpaper did not ask
+    /// for it to vanish because they changed the text scheme.
+    pub fn apply_theme(&mut self, theme: &Theme) {
+        self.text_color = theme.text;
+        self.border_color = Some(theme.border);
+        self.theme_name = theme.name.to_string();
+        match (theme.desktop, &self.background) {
+            (Some(rgb), Background::Image { .. }) => {
+                // Keep the picture; the colour would not be visible anyway.
+                let _ = rgb;
+            }
+            (Some(rgb), _) => self.background = Background::Color(rgb),
+            (None, Background::Image { .. }) => {}
+            (None, _) => self.background = Background::Terminal,
+        }
     }
 
     /// Index into [`PALETTE`] of the current colour, if it's one of them.
@@ -175,6 +381,8 @@ impl UiSettings {
     pub fn apply(&self) {
         crate::i18n::set_language(self.language);
         crate::views::theme::set_text_color(self.color());
+        crate::views::theme::set_border_color(self.border());
+        crate::views::theme::set_has_desktop(self.background != Background::Terminal);
     }
 }
 

@@ -1,0 +1,19 @@
+[package]
+name = "choz-plugin-lv2"
+version.workspace = true
+edition = "2024"
+description = "LV2 plugin hosting for choz (pure-Rust TTL parser + the LV2 C ABI, no lilv)."
+
+[dependencies]
+choz-ports.workspace = true
+anyhow.workspace = true
+libloading = "0.8"
+parking_lot.workspace = true
+# Pure-Rust Turtle (RDF) parser for LV2 manifest/plugin .ttl files.
+rio_turtle = "0.8"
+rio_api = "0.8"
+oxiri = "0.2"
+
+[dev-dependencies]
+# Only for examples/ui_probe: a real window to parent the UIs into.
+x11rb = "0.13"

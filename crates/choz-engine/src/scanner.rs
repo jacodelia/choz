@@ -1,4 +1,4 @@
-//! Filesystem discovery for plugin formats: LADSPA, DSSI, LV2, SFZ, SF2, JSFX.
+//! Filesystem discovery for plugin formats: LADSPA, DSSI, LV2, SFZ, SF2.
 //!
 //! Walks the filesystem recognizing each format by its on-disk convention.
 
@@ -27,7 +27,6 @@ fn rule_for(kind: &PluginKind) -> ScanRule {
         PluginKind::Lv2 => ScanRule::BundleDir("lv2"),
         PluginKind::Sfz => ScanRule::Files(&["sfz"]),
         PluginKind::Sf2 => ScanRule::Files(&["sf2", "sf3"]),
-        PluginKind::Jsfx => ScanRule::Files(&["jsfx"]),
         PluginKind::Ladspa | PluginKind::Dssi => ScanRule::Files(dynlib_ext()),
         _ => ScanRule::Files(&[]),
     }
@@ -137,10 +136,6 @@ pub fn default_search_paths(kind: &PluginKind) -> Vec<PathBuf> {
                 p.push(PathBuf::from("/usr/share/sounds/sfz"));
             }
         }
-        PluginKind::Jsfx => {
-            #[cfg(all(unix, not(target_os = "macos")))]
-            { home_join!(".config/REAPER/Effects"); }
-        }
         _ => {}
     }
     p
@@ -176,7 +171,7 @@ impl FileScanHost {
             .file_stem().map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Unknown".into());
         let (is_effect, is_instrument) = match self.kind {
-            PluginKind::Ladspa | PluginKind::Jsfx => (true, false),
+            PluginKind::Ladspa => (true, false),
             PluginKind::Dssi => (false, true),
             PluginKind::Lv2 => (true, true),
             _ => (false, true),

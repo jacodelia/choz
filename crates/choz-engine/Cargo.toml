@@ -3,14 +3,17 @@ name = "choz-engine"
 version.workspace = true
 edition.workspace = true
 
-[features]
-default = []
-# Real CLAP plugin hosting (forwards to choz-plugin-clap).
-clap = ["choz-plugin-clap/clap"]
-
 [dependencies]
 choz-ports.workspace = true
 choz-plugin-clap.workspace = true
+choz-plugin-lv2.workspace = true
+choz-plugin-sandbox.workspace = true
+# SFZ samples are FLAC as often as WAV; symphonia decodes both.
+libc = "0.2"
+symphonia = { version = "0.5", default-features = false, features = ["wav", "flac", "pcm"] }
+choz-plugin-ladspa.workspace = true
+choz-plugin-vst2.workspace = true
+choz-plugin-vst3.workspace = true
 anyhow.workspace = true
 parking_lot.workspace = true
 flume.workspace = true
@@ -24,3 +27,17 @@ serde_json.workspace = true
 cpal.workspace = true
 jack.workspace = true
 midir.workspace = true
+
+# Custom harness: this test re-runs itself as a plugin-scan worker, so it must
+# answer `scan_worker_main` before libtest would eat the arguments.
+[[test]]
+name = "scan_isolation"
+harness = false
+
+[[test]]
+name = "quarantine"
+harness = false
+
+[[test]]
+name = "sandboxed_plugin"
+harness = false

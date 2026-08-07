@@ -25,12 +25,32 @@ pub struct NoteMsg {
     pub vel: u8,
 }
 
-/// A MIDI control-change message, used for MIDI learn (rack faders).
+/// A MIDI control-change message. Drives MIDI learn (rack faders) *and* is
+/// forwarded to the instruments bound to the same input, so pedals (sustain,
+/// sostenuto, soft, expression) and the modulation wheel reach the synth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CcMsg {
     pub source: InputSource,
     pub cc: u8,
     pub value: u8,
+}
+
+/// A pitch-bend message. `value` is the raw 14-bit wire value: 0..16383,
+/// centred at 8192.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BendMsg {
+    pub source: InputSource,
+    pub value: u16,
+}
+
+/// A program change, with the bank the last Bank Select (CC 0 / CC 32) chose.
+/// Controllers send bank select and program change as a set, so they travel
+/// together rather than as three unrelated messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgramMsg {
+    pub source: InputSource,
+    pub bank: u8,
+    pub program: u8,
 }
 
 /// A remote-control message (OSC only): change something the user could also
@@ -48,5 +68,7 @@ pub enum ControlMsg {
 pub enum InputEvent {
     Note(NoteMsg),
     Cc(CcMsg),
+    Program(ProgramMsg),
+    Bend(BendMsg),
     Control(ControlMsg),
 }

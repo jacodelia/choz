@@ -3,8 +3,8 @@
 //! One file holds both halves of the state — the sound (rack tabs, their
 //! instruments, FX chains with every knob, the mixer, MIDI-learn bindings) and
 //! the app configuration (plugin search paths, interface settings, OSC port).
-//! Saving is what's implemented; the structs derive `Deserialize` too, so
-//! loading is a matter of wiring, not of format.
+//! Both directions are wired: `save` writes the file, `load` reads it back and
+//! `App::apply_project` rebuilds the rack from it.
 
 use std::path::{Path, PathBuf};
 
@@ -49,8 +49,18 @@ pub struct Slot {
     pub instrument: Instrument,
     pub mixer: Mixer,
     pub fx: Vec<Fx>,
-    /// MIDI-learn bindings that target this tab: `(cc, what it drives)`.
-    pub midi_learn: Vec<(u8, String)>,
+    /// MIDI-learn bindings that target this tab.
+    pub midi_learn: Vec<Binding>,
+}
+
+/// One MIDI-learn binding. `target` is what gets restored; `label` is written
+/// only so the file reads like the UI does, and is ignored on load.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Binding {
+    pub cc: u8,
+    pub target: crate::LearnTarget,
+    #[serde(default)]
+    pub label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -59,6 +69,14 @@ pub struct Mixer {
     pub pan: f32,
     pub mute: bool,
     pub solo: bool,
+    /// Device output channels this tab plays out of, 0-based. Absent in
+    /// projects saved before per-slot routing existed, which is the first pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_pair: Option<(usize, usize)>,
+    /// Device *input* channels feeding this tab, when it runs on live audio
+    /// instead of its instrument.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_pair: Option<(usize, usize)>,
 }
 
 /// What a tab plays. `kind` is `none` / `sf2` / `wav` / `plugin`.
@@ -96,6 +114,16 @@ pub struct Fx {
 }
 
 impl Project {
+    /// Read a project back. `path` may name the file or the directory holding
+    /// the default one.
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let file = if path.is_dir() { path.join(DEFAULT_NAME) } else { path.to_path_buf() };
+        let text = std::fs::read_to_string(&file)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", file.display()))?;
+        serde_yaml::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("{} is not a choz project: {e}", file.display()))
+    }
+
     /// Write the project to `path`, or to `path/choz-project.yml` when `path`
     /// is a directory.
     pub fn save(&self, path: &Path) -> anyhow::Result<PathBuf> {
@@ -137,7 +165,14 @@ mod tests {
                     preset: Some(4),
                     params: Vec::new(),
                 },
-                mixer: Mixer { gain: 0.8, pan: -0.25, mute: false, solo: false },
+                mixer: Mixer {
+                    gain: 0.8,
+                    pan: -0.25,
+                    mute: false,
+                    solo: false,
+                    out_pair: Some((2, 3)),
+                    in_pair: None,
+                },
                 fx: vec![Fx {
                     kind: "amberfang".into(),
                     enabled: true,
@@ -146,7 +181,11 @@ mod tests {
                     plugin_path: None,
                     plugin_id: None,
                 }],
-                midi_learn: vec![(74, "tab 1 \u{00b7} VOL".into())],
+                midi_learn: vec![Binding {
+                    cc: 74,
+                    target: crate::LearnTarget::Gain(0),
+                    label: "tab 1 \u{00b7} VOL".into(),
+                }],
             }],
         }
     }
@@ -180,6 +219,10 @@ mod tests {
         // An explicit file name is honoured as-is.
         let named = dir.join("my-set.yml");
         assert_eq!(sample().save(&named).unwrap(), named);
+
+        // And what was written loads back identical, by file or by directory.
+        assert_eq!(Project::load(&named).unwrap(), sample());
+        assert_eq!(Project::load(&dir).unwrap(), sample());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

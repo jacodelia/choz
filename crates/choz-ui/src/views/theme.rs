@@ -5,16 +5,32 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use ratatui::style::Color;
+use ratatui::style::{Color, Style};
 
 /// User-selected text colour (packed 0x00RRGGBB), read by every panel through
 /// [`text`]. An atomic keeps it reachable from the draw code without threading
 /// a settings reference through every function.
 static TEXT_COLOR: AtomicU32 = AtomicU32::new(0x00DCE2F0);
+/// Frame colour, same packing. Set from the theme; the panels read it through
+/// [`border`].
+static BORDER_COLOR: AtomicU32 = AtomicU32::new(0x00636568);
+
+fn pack(color: Color) -> Option<u32> {
+    match color {
+        Color::Rgb(r, g, b) => Some(((r as u32) << 16) | ((g as u32) << 8) | b as u32),
+        _ => None,
+    }
+}
 
 pub fn set_text_color(color: Color) {
-    if let Color::Rgb(r, g, b) = color {
-        TEXT_COLOR.store(((r as u32) << 16) | ((g as u32) << 8) | b as u32, Ordering::Relaxed);
+    if let Some(p) = pack(color) {
+        TEXT_COLOR.store(p, Ordering::Relaxed);
+    }
+}
+
+pub fn set_border_color(color: Color) {
+    if let Some(p) = pack(color) {
+        BORDER_COLOR.store(p, Ordering::Relaxed);
     }
 }
 
@@ -24,12 +40,46 @@ pub fn text() -> Color {
     Color::Rgb((packed >> 16) as u8, (packed >> 8) as u8, packed as u8)
 }
 
-/// Panel and modal borders: the text colour, dimmed, so the frame reads as
-/// structure rather than competing with the content.
+/// Whether the user set a desktop background (colour or image).
+///
+/// When they did, panels stop painting their own opaque fill — otherwise the
+/// wallpaper would only ever be visible in the gaps between them, which is not
+/// a wallpaper.
+static HAS_DESKTOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_has_desktop(on: bool) {
+    HAS_DESKTOP.store(on, Ordering::Relaxed);
+}
+
+/// The fill for panel and modal bodies: the solid panel colour normally, and
+/// **no background at all** once a desktop background is in play.
+///
+/// "No background" has to mean *not setting one*. [`Color::Reset`] is not
+/// transparent — it is SGR 49, the terminal's own default background, which
+/// paints straight over the wallpaper. A `Style` with no `bg` leaves whatever
+/// the buffer already holds, which is where the picture is.
+pub fn panel_style() -> Style {
+    if HAS_DESKTOP.load(Ordering::Relaxed) {
+        Style::default()
+    } else {
+        Style::default().bg(PANEL_BG)
+    }
+}
+
+/// Same, for the app-level fill behind the body.
+pub fn app_style() -> Style {
+    if HAS_DESKTOP.load(Ordering::Relaxed) {
+        Style::default()
+    } else {
+        Style::default().bg(APP_BG)
+    }
+}
+
+/// Panel and modal borders. Comes from the theme, so a scheme can give the
+/// frame its own colour instead of a dimmed copy of the text.
 pub fn border() -> Color {
-    let packed = TEXT_COLOR.load(Ordering::Relaxed);
-    let dim = |c: u32| ((c * 45) / 100) as u8;
-    Color::Rgb(dim(packed >> 16 & 0xFF), dim(packed >> 8 & 0xFF), dim(packed & 0xFF))
+    let packed = BORDER_COLOR.load(Ordering::Relaxed);
+    Color::Rgb((packed >> 16) as u8, (packed >> 8) as u8, packed as u8)
 }
 
 // ─── Core palette ──────────────────────────────────────────────────────────

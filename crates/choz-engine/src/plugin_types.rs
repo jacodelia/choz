@@ -17,7 +17,6 @@ pub enum PluginKind {
     Lv2,
     Sfz,
     Sf2,
-    Jsfx,
     Internal,
 }
 
@@ -33,7 +32,6 @@ impl PluginKind {
             Self::Lv2      => "LV2",
             Self::Sfz      => "SFZ",
             Self::Sf2      => "SF2",
-            Self::Jsfx     => "JSFX",
             Self::Internal => "FX",
         }
     }

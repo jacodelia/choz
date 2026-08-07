@@ -1,8 +1,6 @@
 //! Runtime test against a real `.clap` audio effect, when one is installed.
 //! Skipped (passes trivially) on machines without any CLAP effect plugin.
 
-#![cfg(feature = "clap")]
-
 use choz_ports::{AudioSource, FxProcessor};
 
 /// First scannable non-instrument plugin on this machine, if any.

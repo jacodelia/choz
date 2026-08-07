@@ -20,7 +20,6 @@ pub enum PluginFormat {
     Clap,
     Sf2,
     Sfz,
-    Jsfx,
 }
 
 impl PluginFormat {
@@ -34,7 +33,6 @@ impl PluginFormat {
         PluginFormat::Clap,
         PluginFormat::Sf2,
         PluginFormat::Sfz,
-        PluginFormat::Jsfx,
     ];
 
     pub fn label(self) -> &'static str {
@@ -47,7 +45,6 @@ impl PluginFormat {
             PluginFormat::Clap => "CLAP",
             PluginFormat::Sf2 => "SF2",
             PluginFormat::Sfz => "SFZ",
-            PluginFormat::Jsfx => "JSFX",
         }
     }
 
@@ -67,7 +64,6 @@ impl PluginFormat {
             PluginFormat::Clap => Some("CLAP_PATH"),
             PluginFormat::Sf2 => Some("SF2_PATH"),
             PluginFormat::Sfz => Some("SFZ_PATH"),
-            PluginFormat::Jsfx => None,
         }
     }
 
@@ -81,13 +77,27 @@ impl PluginFormat {
             PluginFormat::Clap => (&["clap"], false),
             PluginFormat::Sf2 => (&["sf2", "sf3"], false),
             PluginFormat::Sfz => (&["sfz"], false),
-            PluginFormat::Jsfx => (&["jsfx"], false),
         }
+    }
+
+    /// True for real plugin formats — SF2/SFZ are soundbanks, loaded as files.
+    pub fn is_plugin(self) -> bool {
+        !matches!(self, PluginFormat::Sf2 | PluginFormat::Sfz)
     }
 
     /// True for formats choz can actually load today.
     pub fn is_hosted(self) -> bool {
-        matches!(self, PluginFormat::Clap | PluginFormat::Sf2)
+        matches!(
+            self,
+            PluginFormat::Clap
+                | PluginFormat::Lv2
+                | PluginFormat::Ladspa
+                | PluginFormat::Dssi
+                | PluginFormat::Vst2
+                | PluginFormat::Vst3
+                | PluginFormat::Sf2
+                | PluginFormat::Sfz
+        )
     }
 
     /// Carla-style defaults for this format, plus `$FORMAT_PATH` when set.
@@ -114,7 +124,6 @@ impl PluginFormat {
                 PathBuf::from("/usr/share/soundfonts"),
             ],
             PluginFormat::Sfz => vec![PathBuf::from("/usr/share/sounds/sfz")],
-            PluginFormat::Jsfx => vec![PathBuf::from("/usr/share/jsfx")],
         };
         let user_dirs: Vec<Option<PathBuf>> = match self {
             PluginFormat::Ladspa => vec![user(".ladspa")],
@@ -125,7 +134,6 @@ impl PluginFormat {
             PluginFormat::Clap => vec![user(".clap")],
             PluginFormat::Sf2 => vec![user(".local/share/sounds/sf2"), user(".sounds")],
             PluginFormat::Sfz => vec![user(".sfz")],
-            PluginFormat::Jsfx => vec![user(".jsfx"), user(".config/REAPER/Effects")],
         };
         dirs.extend(user_dirs.into_iter().flatten());
 
@@ -157,9 +165,49 @@ fn yes() -> bool {
 }
 
 /// The whole per-format search-path configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Deserialising goes through [`StoredPaths`], which drops entries naming a
+/// format this build does not know instead of failing the whole file. Without
+/// that, a config written by a build with one more format than this one would
+/// fail to parse as a whole and silently reset the user's hand-edited
+/// directories back to `Default`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(into = "StoredPaths")]
 pub struct PluginPaths {
     pub entries: Vec<(PluginFormat, Vec<SearchDir>)>,
+}
+
+/// On-disk shape: the format is its label, not the enum variant name, so an
+/// unknown one is just a string to skip. `from_label` is case-insensitive, which
+/// is what makes files written before this change (`"Ladspa"`) still load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredPaths {
+    entries: Vec<(String, Vec<SearchDir>)>,
+}
+
+impl From<PluginPaths> for StoredPaths {
+    fn from(p: PluginPaths) -> Self {
+        Self {
+            entries: p
+                .entries
+                .into_iter()
+                .map(|(f, dirs)| (f.label().to_string(), dirs))
+                .collect(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PluginPaths {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let stored = StoredPaths::deserialize(d)?;
+        Ok(PluginPaths {
+            entries: stored
+                .entries
+                .into_iter()
+                .filter_map(|(label, dirs)| Some((PluginFormat::from_label(&label)?, dirs)))
+                .collect(),
+        })
+    }
 }
 
 impl Default for PluginPaths {
@@ -250,7 +298,7 @@ pub struct FoundPlugin {
     pub name: String,
     pub path: PathBuf,
     /// Plugin id within the file; empty for formats where the file *is* the
-    /// plugin (SF2, SFZ, JSFX).
+    /// plugin (SF2, SFZ).
     pub id: String,
     /// True when it makes sound on its own (instrument/soundbank) rather than
     /// processing audio.
@@ -266,6 +314,26 @@ pub fn scan_dir(dir: &Path, format: PluginFormat) -> Vec<FoundPlugin> {
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out.dedup_by(|a, b| a.path == b.path);
     out
+}
+
+/// The single-path counterpart of [`scan_dir`]: describe `path` itself when it
+/// is a file (or bundle) of this format, instead of looking inside it. Used by
+/// the per-entry retry after a scan crash.
+pub fn scan_path(path: &Path, format: PluginFormat) -> Vec<FoundPlugin> {
+    let (exts, bundles) = format.matcher();
+    let matches = path
+        .extension()
+        .is_some_and(|e| exts.iter().any(|x| e.eq_ignore_ascii_case(x)));
+    if matches && path.is_dir() == bundles {
+        return vec![FoundPlugin {
+            format,
+            name: stem(path),
+            path: path.to_path_buf(),
+            id: String::new(),
+            is_instrument: matches!(format, PluginFormat::Sf2 | PluginFormat::Sfz),
+        }];
+    }
+    scan_dir(path, format)
 }
 
 fn scan_into(
@@ -346,6 +414,22 @@ mod tests {
         );
         let clap = PluginFormat::Clap.default_dirs();
         assert!(clap.iter().any(|d| d == Path::new("/usr/lib/clap")));
+    }
+
+    /// A config written by a build that knew one more format must still load,
+    /// keeping every directory the user edited by hand. Dropping the whole file
+    /// would silently reset their paths to the defaults.
+    #[test]
+    fn an_unknown_format_is_skipped_instead_of_failing_the_file() {
+        let json = r#"{"entries":[
+            ["Lv2",[{"path":"/home/me/.lv2","enabled":true}]],
+            ["Fictional",[{"path":"/usr/share/fictional","enabled":true}]],
+            ["Vst2",[{"path":"/home/me/repo","enabled":true}]]
+        ]}"#;
+        let cfg: PluginPaths = serde_json::from_str(json).expect("unknown format must not fail");
+        assert_eq!(cfg.entries.len(), 2, "the unknown one is dropped, the rest survive");
+        assert_eq!(cfg.dirs(PluginFormat::Vst2)[0].path, PathBuf::from("/home/me/repo"));
+        assert_eq!(cfg.dirs(PluginFormat::Lv2)[0].path, PathBuf::from("/home/me/.lv2"));
     }
 
     #[test]

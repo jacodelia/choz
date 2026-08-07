@@ -3,37 +3,141 @@
 //! Trimmed from seqterm's host: choz drives a single MIDI channel with no MPE,
 //! per-note expression, or state persistence.
 
-#![cfg(feature = "clap")]
 
 use std::ffi::CString;
 use std::path::Path;
 
 use clack_host::utils::Cookie;
-use clack_host::events::event_types::{NoteOffEvent, NoteOnEvent, ParamValueEvent};
+use clack_host::events::event_types::{MidiEvent, NoteOffEvent, NoteOnEvent, ParamValueEvent};
 use clack_host::prelude::*;
 
 use choz_ports::{AudioSource, FxProcessor};
 
 use crate::ClapPluginInfo;
 
-// ── Host handler (no host extensions; all callbacks are no-ops) ─────────────
+// ── Host handler ────────────────────────────────────────────────────────────
+//
+// choz declares two host extensions, and both exist for the plugin's window:
+//
+// * `clap.gui` — plugins check the host has it before bothering to build a UI,
+//   and it is how they ask to be resized or report that they closed themselves.
+// * `clap.timer-support` — a CLAP UI does its drawing from `on_timer`, not from
+//   an idle callback like VST2. Without a host timer, a window is created and
+//   then never paints.
+//
+// The registrations land in [`GuiState`], which the editor thread reads to know
+// which timers to tick. See `editor.rs`.
 
-struct ChozShared;
+/// What the plugin asked the host for, on behalf of its window.
+#[derive(Default)]
+pub struct GuiState {
+    /// Registered timers: `(id, period, last fired)`.
+    pub timers: Vec<(u32, std::time::Duration, Option<std::time::Instant>)>,
+    next_timer: u32,
+    /// Set when the plugin reports its window went away on its own.
+    pub closed: bool,
+    /// Last size the plugin asked for, if any.
+    pub requested_size: Option<(u32, u32)>,
+}
+
+impl GuiState {
+    /// Timer ids whose period has elapsed, marking them fired.
+    pub fn due(&mut self) -> Vec<u32> {
+        let now = std::time::Instant::now();
+        let mut out = Vec::new();
+        for (id, period, last) in &mut self.timers {
+            if last.is_none_or(|t| now.duration_since(t) >= *period) {
+                *last = Some(now);
+                out.push(*id);
+            }
+        }
+        out
+    }
+}
+
+pub type SharedGuiState = std::sync::Arc<std::sync::Mutex<GuiState>>;
+
+/// A poisoned lock here means a panic somewhere else; the state is a plain
+/// bookkeeping struct, so carrying on with it is better than taking the app down.
+pub fn lock(s: &SharedGuiState) -> std::sync::MutexGuard<'_, GuiState> {
+    s.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+struct ChozShared {
+    gui: SharedGuiState,
+}
+
 impl<'a> SharedHandler<'a> for ChozShared {
     fn request_restart(&self) {}
     fn request_process(&self) {}
     fn request_callback(&self) {}
 }
 
+impl clack_extensions::gui::HostGuiImpl for ChozShared {
+    fn resize_hints_changed(&self) {}
+
+    fn request_resize(&self, new_size: clack_extensions::gui::GuiSize) -> Result<(), HostError> {
+        // Recorded, not applied: the window lives on choz's editor thread, and
+        // the plugin is free to ask from anywhere.
+        lock(&self.gui).requested_size = Some((new_size.width, new_size.height));
+        Ok(())
+    }
+
+    fn request_show(&self) -> Result<(), HostError> {
+        Ok(())
+    }
+
+    fn request_hide(&self) -> Result<(), HostError> {
+        Ok(())
+    }
+
+    fn closed(&self, _was_destroyed: bool) {
+        lock(&self.gui).closed = true;
+    }
+}
+
+struct ChozMainThread<'a> {
+    shared: &'a ChozShared,
+}
+
+impl<'a> MainThreadHandler<'a> for ChozMainThread<'a> {}
+
+impl clack_extensions::timer::HostTimerImpl for ChozMainThread<'_> {
+    fn register_timer(
+        &mut self,
+        period_ms: u32,
+    ) -> Result<clack_extensions::timer::TimerId, HostError> {
+        let mut g = lock(&self.shared.gui);
+        g.next_timer += 1;
+        let id = g.next_timer;
+        // 30 Hz is the floor every host is expected to allow; a plugin asking
+        // for less than that gets it clamped rather than refused.
+        let period = std::time::Duration::from_millis(period_ms.max(16) as u64);
+        g.timers.push((id, period, None));
+        Ok(clack_extensions::timer::TimerId(id))
+    }
+
+    fn unregister_timer(&mut self, timer_id: clack_extensions::timer::TimerId) -> Result<(), HostError> {
+        lock(&self.shared.gui).timers.retain(|(id, _, _)| *id != timer_id.0);
+        Ok(())
+    }
+}
+
 struct ChozHost;
 impl HostHandlers for ChozHost {
     type Shared<'a> = ChozShared;
-    type MainThread<'a> = ();
+    type MainThread<'a> = ChozMainThread<'a>;
     type AudioProcessor<'a> = ();
+
+    fn declare_extensions(builder: &mut HostExtensions<Self>, _shared: &Self::Shared<'_>) {
+        builder
+            .register::<clack_extensions::gui::HostGui>()
+            .register::<clack_extensions::timer::HostTimer>();
+    }
 }
 
 fn host_info() -> HostInfo {
-    HostInfo::new("choz", "choz", "https://github.com/jorgecodelia/choz", "0.1.0")
+    HostInfo::new("choz", "choz", "https://github.com/jacodelia/choz", "0.1.0")
         .expect("static host info has no interior nul")
 }
 
@@ -115,6 +219,11 @@ enum QueuedEvent {
     NoteOn { key: i16, note_id: i32, velocity: f64 },
     NoteOff { key: i16, note_id: i32 },
     Param { id: u32, value: f64 },
+    /// A raw MIDI 1.0 message (CC, pitch bend) passed straight through. CLAP has
+    /// no native event for pedals or the modulation wheel, so this is the only
+    /// way to reach a plugin's own handling of them. Verified against Surge XT;
+    /// a plugin that declares no MIDI-dialect note port simply ignores these.
+    Midi { data: [u8; 3] },
 }
 
 /// Tracks sounding voices so each note-off targets the right CLAP `note_id`.
@@ -143,14 +252,20 @@ impl NoteRegistry {
 /// Read a plugin's parameter list without activating it. Non-RT: it dlopens the
 /// library and instantiates the plugin, so call it once when the FX is added,
 /// not per block.
-pub fn read_params(path: &Path, plugin_id: &str) -> Vec<crate::ClapParamInfo> {
+pub fn read_params(path: &Path, plugin_id: &str) -> Vec<crate::PluginParam> {
     use clack_extensions::params::{ParamInfoBuffer, PluginParams};
 
     // SAFETY: external library load; clack handles the ABI.
     let Ok(entry) = (unsafe { PluginEntry::load(path) }) else { return Vec::new() };
     let Ok(id) = CString::new(plugin_id) else { return Vec::new() };
     let Ok(mut instance) =
-        PluginInstance::<ChozHost>::new(|_| ChozShared, |_| (), &entry, id.as_c_str(), &host_info())
+        PluginInstance::<ChozHost>::new(
+            |_| ChozShared { gui: Default::default() },
+            |shared| ChozMainThread { shared },
+            &entry,
+            id.as_c_str(),
+            &host_info(),
+        )
     else {
         return Vec::new();
     };
@@ -166,7 +281,7 @@ pub fn read_params(path: &Path, plugin_id: &str) -> Vec<crate::ClapParamInfo> {
         if info.max_value <= info.min_value {
             continue;
         }
-        out.push(crate::ClapParamInfo {
+        out.push(crate::PluginParam {
             id: info.id.into(),
             name: String::from_utf8_lossy(info.name).trim_end_matches('\0').to_string(),
             min: info.min_value,
@@ -197,6 +312,12 @@ struct ClapProc {
     out_buf: Vec<Vec<Vec<f32>>>,
     steady: u64,
     max_frames: u32,
+    /// The plugin + its `clap.gui` vtable, for the editor thread. Emptied in
+    /// `Drop` so an open window stops calling a destroyed instance.
+    gui: crate::editor::SharedGui,
+    /// Built once, here on the building thread: `editor()` handing out a fresh
+    /// one per call would let two windows create two GUIs on one plugin.
+    editor: Option<std::sync::Arc<crate::editor::ClapEditor>>,
 }
 
 // SAFETY: `PluginInstance` is `!Send` because CLAP main-thread callbacks must run
@@ -213,9 +334,11 @@ impl ClapProc {
         let entry = unsafe { PluginEntry::load(path) }.ok()?;
         let id = CString::new(plugin_id).ok()?;
 
+        let gui_state: SharedGuiState = Default::default();
+        let for_shared = gui_state.clone();
         let mut instance = PluginInstance::<ChozHost>::new(
-            |_| ChozShared,
-            |_| (),
+            move |_| ChozShared { gui: for_shared },
+            |shared| ChozMainThread { shared },
             &entry,
             id.as_c_str(),
             &host_info(),
@@ -231,6 +354,19 @@ impl ClapProc {
         let stopped = instance.activate(|_, _| (), config).ok()?;
         let started = stopped.start_processing().ok()?;
 
+        // Looked up here, on the building thread, while the instance is still
+        // reachable — after this it belongs to the audio thread.
+        let gui = {
+            let raw = instance.raw_instance() as *const _;
+            let cell = unsafe { crate::editor::ClapEditor::extension_of(raw) }
+                .map(|gui| crate::editor::GuiCell {
+                    plugin: raw,
+                    gui,
+                    timer: unsafe { crate::editor::ClapEditor::timer_of(raw) },
+                });
+            std::sync::Arc::new(std::sync::Mutex::new(cell))
+        };
+
         let frames = max_block as usize;
         Some(Self {
             processor: Some(started),
@@ -239,6 +375,8 @@ impl ClapProc {
             out_ports: AudioPorts::with_capacity(out_layout.iter().sum(), out_layout.len().max(1)),
             in_buf: alloc_ports(&in_layout, frames),
             out_buf: alloc_ports(&out_layout, frames),
+            gui: gui.clone(),
+            editor: crate::editor::ClapEditor::new(gui, gui_state),
             instance: Some(instance),
             steady: 0,
             max_frames: max_block,
@@ -288,6 +426,9 @@ impl ClapProc {
                         ));
                     }
                 }
+                QueuedEvent::Midi { data } => {
+                    in_ev.push(&MidiEvent::new(0, 0, *data));
+                }
             }
         }
         let input_events = InputEvents::from(&in_ev);
@@ -328,6 +469,9 @@ impl Drop for ClapProc {
     /// (deactivate + destroy), e.g. when checking a plugin's behaviour or
     /// hunting a leak.
     fn drop(&mut self) {
+        // First, and on every path out — including the leak below, where the
+        // instance survives but this struct's pointers do not outlive the slot.
+        *self.gui.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let strict = std::env::var_os("CHOZ_CLAP_STRICT_TEARDOWN").is_some();
         let stopped = self.processor.take().map(|started| started.stop_processing());
 
@@ -354,7 +498,7 @@ pub struct ClapInstrument {
     notes: NoteRegistry,
     /// The plugin's parameters, in the order the UI shows them. `set_param`
     /// indexes this list.
-    params: Vec<crate::ClapParamInfo>,
+    params: Vec<crate::PluginParam>,
 }
 
 impl ClapInstrument {
@@ -371,7 +515,7 @@ impl ClapInstrument {
 
 /// Queue a normalised parameter change for the next block. RT-safe: nothing is
 /// allocated, and a full queue drops the change instead of growing.
-fn queue_param(queue: &mut Vec<QueuedEvent>, params: &[crate::ClapParamInfo], index: usize, value: f32) {
+fn queue_param(queue: &mut Vec<QueuedEvent>, params: &[crate::PluginParam], index: usize, value: f32) {
     let Some(info) = params.get(index) else { return };
     if queue.len() == queue.capacity() {
         return;
@@ -380,6 +524,10 @@ fn queue_param(queue: &mut Vec<QueuedEvent>, params: &[crate::ClapParamInfo], in
 }
 
 impl AudioSource for ClapInstrument {
+    fn editor(&self) -> Option<choz_ports::EditorHandle> {
+        self.proc.editor.clone().map(|e| e as choz_ports::EditorHandle)
+    }
+
     fn render(&mut self, output: &mut [f32], _sample_rate: u32) -> usize {
         let frames = (output.len() / 2).min(self.proc.max_frames as usize);
         for s in output.iter_mut() {
@@ -424,12 +572,32 @@ impl AudioSource for ClapInstrument {
         self.queue.push(QueuedEvent::NoteOff { key: note as i16, note_id });
     }
 
+    fn control_change(&mut self, cc: u8, value: u8) {
+        self.queue_midi([0xB0, cc & 0x7F, value & 0x7F]);
+    }
+
+    fn pitch_bend(&mut self, value: u16) {
+        let v = value.min(16383);
+        self.queue_midi([0xE0, (v & 0x7F) as u8, (v >> 7) as u8]);
+    }
+
     fn set_param(&mut self, index: usize, value: f32) {
         queue_param(&mut self.queue, &self.params, index, value);
     }
 
     fn plays_on_transport_stop(&self) -> bool {
         true
+    }
+}
+
+impl ClapInstrument {
+    /// Queue a raw MIDI message for the next block. RT-safe: a full queue drops
+    /// the message rather than growing.
+    fn queue_midi(&mut self, data: [u8; 3]) {
+        if self.queue.len() == self.queue.capacity() {
+            return;
+        }
+        self.queue.push(QueuedEvent::Midi { data });
     }
 }
 
@@ -441,7 +609,7 @@ pub struct ClapEffect {
     wet: f32,
     /// The plugin's parameters, in the order the UI shows them. `set_param`
     /// indexes this list.
-    params: Vec<crate::ClapParamInfo>,
+    params: Vec<crate::PluginParam>,
     /// Param changes waiting to be handed to the plugin on the next block.
     queue: Vec<QueuedEvent>,
 }
@@ -459,6 +627,10 @@ impl ClapEffect {
 }
 
 impl FxProcessor for ClapEffect {
+    fn editor(&self) -> Option<choz_ports::EditorHandle> {
+        self.proc.editor.clone().map(|e| e as choz_ports::EditorHandle)
+    }
+
     fn process_block(&mut self, buf: &mut [f32], _sample_rate: u32) {
         let chunk = self.proc.max_frames as usize;
         for block in buf.chunks_mut(chunk * CHANNELS) {

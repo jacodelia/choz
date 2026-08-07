@@ -4,16 +4,17 @@ version.workspace = true
 edition.workspace = true
 description = "CLAP plugin hosting for choz (real hosting via clack-host behind the 'clap' feature)."
 
-[features]
-default = []
-# Real CLAP hosting (discovery + instrument audio) via the safe clack-host crate.
-clap = ["dep:clack-host", "dep:clack-extensions"]
-
 [dependencies]
 choz-ports.workspace = true
 anyhow.workspace = true
 serde.workspace = true
-clack-host = { version = "0.1.0", optional = true }
+clack-host = "0.1.0"
+# Same version clack-host itself depends on, so the raw struct layouts match.
+clap-sys = "0.5"
 # audio-ports: needed to match a plugin's real channel counts (mono plugins
 # reject a hardcoded stereo layout).
-clack-extensions = { version = "0.1.0", features = ["audio-ports", "params", "clack-host"], optional = true }
+clack-extensions = { version = "0.1.0", features = ["audio-ports", "params", "gui", "timer", "clack-host"] }
+
+[dev-dependencies]
+# Only for examples/gui_probe: a real window to parent the GUIs into.
+x11rb = "0.13"

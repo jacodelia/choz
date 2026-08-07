@@ -5,7 +5,7 @@
 //! `flume` channel; the UI loop drains that channel and calls `engine.note_on`
 //! (the sole producer of the RT note ring).
 
-pub use crate::input::{CcMsg, InputEvent, InputSource, NoteMsg};
+pub use crate::input::{BendMsg, CcMsg, InputEvent, InputSource, NoteMsg, ProgramMsg};
 
 /// All available MIDI **input** port names (what devices we can listen to).
 pub fn list_input_ports() -> Vec<String> {
@@ -42,7 +42,7 @@ pub fn connect_inputs(
         .ports()
         .iter()
         .filter_map(|p| scan.port_name(p).ok())
-        .filter(|n| !disabled.contains(n))
+        .filter(|n| !is_disabled(n, disabled))
         .collect();
 
     for want in wanted {
@@ -52,6 +52,11 @@ pub fn connect_inputs(
             continue;
         };
         let txc = tx.clone();
+        // Bank Select arrives as its own CC just before the program change, so
+        // the port's last MSB is remembered here to travel with it. ponytail:
+        // MSB only — SF2 banks are 0..128 and the LSB is what this keyboard
+        // (and most others) always leaves at 0.
+        let mut bank = 0u8;
         // Each connection tags its events with its index in `names`, which is
         // the list the caller gets back — so index ↔ port name stay aligned.
         let source = InputSource::Midi(names.len());
@@ -63,9 +68,20 @@ pub fn connect_inputs(
                     Some(Msg::Note { on, note, vel }) => {
                         let _ = txc.send(InputEvent::Note(NoteMsg { source, on, note, vel }));
                     }
-                    // Control changes drive MIDI-learn bindings (rack faders).
+                    // Control changes drive MIDI-learn bindings (rack faders)
+                    // and reach the instrument, which is what makes the pedals
+                    // and the modulation wheel work.
                     Some(Msg::Cc { cc, value }) => {
+                        if cc == 0 {
+                            bank = value;
+                        }
                         let _ = txc.send(InputEvent::Cc(CcMsg { source, cc, value }));
+                    }
+                    Some(Msg::Program { program }) => {
+                        let _ = txc.send(InputEvent::Program(ProgramMsg { source, bank, program }));
+                    }
+                    Some(Msg::Bend { value }) => {
+                        let _ = txc.send(InputEvent::Bend(BendMsg { source, value }));
                     }
                     None => {}
                 }
@@ -82,16 +98,38 @@ pub fn connect_inputs(
     (names, conns)
 }
 
+/// Is this port switched off? midir names a port `"Client:Port n:m"`, so the
+/// saved `"Midi Through"` never matched the full name and the loopback port
+/// stayed connected. A saved entry disables the whole client when it names one.
+fn is_disabled(port: &str, disabled: &[String]) -> bool {
+    disabled.iter().any(|d| port == d || port.starts_with(&format!("{d}:")))
+}
+
 /// A raw MIDI message choz cares about.
 #[derive(Debug, PartialEq, Eq)]
 enum Msg {
     Note { on: bool, note: u8, vel: u8 },
     Cc { cc: u8, value: u8 },
+    /// Pitch bend, as the 14-bit value the wire carries: 0..16383, centred at
+    /// 8192. Kept unsigned because that is what synths take.
+    Bend { value: u16 },
+    /// Program change — the buttons on a controller keyboard usually send these
+    /// (preceded by a Bank Select pair), not CCs.
+    Program { program: u8 },
 }
 
 /// Parse a raw MIDI message. Note-on with velocity 0 is the conventional
-/// note-off. Returns `None` for anything that is neither a note nor a CC.
+/// note-off. Returns `None` for anything choz has no use for (clock, aftertouch,
+/// sysex).
 fn parse(data: &[u8]) -> Option<Msg> {
+    if data.len() < 2 {
+        return None;
+    }
+    // Program change is the one two-byte message choz uses; everything below
+    // needs the second data byte.
+    if data[0] & 0xF0 == 0xC0 {
+        return Some(Msg::Program { program: data[1] & 0x7F });
+    }
     if data.len() < 3 {
         return None;
     }
@@ -99,6 +137,8 @@ fn parse(data: &[u8]) -> Option<Msg> {
         0x90 if data[2] > 0 => Some(Msg::Note { on: true, note: data[1], vel: data[2] }),
         0x80 | 0x90 => Some(Msg::Note { on: false, note: data[1], vel: 0 }),
         0xB0 => Some(Msg::Cc { cc: data[1], value: data[2] }),
+        // LSB first, then MSB — both 7-bit.
+        0xE0 => Some(Msg::Bend { value: (data[1] as u16 & 0x7F) | ((data[2] as u16 & 0x7F) << 7) }),
         _ => None,
     }
 }
@@ -115,5 +155,35 @@ mod tests {
         assert_eq!(parse(&[0xB0, 7, 100]), Some(Msg::Cc { cc: 7, value: 100 }), "CC drives MIDI learn");
         assert_eq!(parse(&[0xF8]), None, "clock is neither");
         assert_eq!(parse(&[0x90, 60]), None, "truncated");
+    }
+
+    /// A Keystation Pro 88 button sends bank select then a two-byte program
+    /// change. Requiring three bytes dropped the program change, so every
+    /// button looked like the same CC 32.
+    #[test]
+    fn parses_two_byte_program_change() {
+        assert_eq!(parse(&[0xC0, 13]), Some(Msg::Program { program: 13 }));
+        assert_eq!(parse(&[0xC5, 0]), Some(Msg::Program { program: 0 }), "channel is ignored");
+        assert_eq!(parse(&[0xC0]), None, "truncated");
+        assert_eq!(parse(&[0xB0, 32, 0]), Some(Msg::Cc { cc: 32, value: 0 }), "bank LSB still a CC");
+    }
+
+    #[test]
+    fn disabled_client_name_matches_full_port_name() {
+        let off = vec!["Midi Through".to_string()];
+        assert!(is_disabled("Midi Through:Midi Through Port-0 14:0", &off));
+        assert!(is_disabled("Midi Through", &off), "bare client name still works");
+        assert!(!is_disabled("Keystation Pro 88:Keystation Pro 88 MIDI 1 36:0", &off));
+        assert!(!is_disabled("Midi Throughput:port 1 20:0", &off), "prefix needs the colon");
+    }
+
+    #[test]
+    fn parses_pitch_bend_as_14_bit_lsb_first() {
+        assert_eq!(parse(&[0xE0, 0, 64]), Some(Msg::Bend { value: 8192 }), "wheel at rest is centre");
+        assert_eq!(parse(&[0xE0, 0, 0]), Some(Msg::Bend { value: 0 }), "fully down");
+        assert_eq!(parse(&[0xE0, 127, 127]), Some(Msg::Bend { value: 16383 }), "fully up");
+        // The LSB is the *first* data byte: swapping them would read 8192 here.
+        assert_eq!(parse(&[0xE0, 64, 0]), Some(Msg::Bend { value: 64 }));
+        assert_eq!(parse(&[0xE5, 0, 64]), Some(Msg::Bend { value: 8192 }), "channel is ignored");
     }
 }

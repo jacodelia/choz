@@ -5,6 +5,7 @@
 //!
 //! UI styling adapted from seqterm.
 
+mod editor;
 mod i18n;
 mod project;
 mod settings;
@@ -21,7 +22,7 @@ use choz_engine::registry::PluginRegistry;
 
 use std::io;
 use std::cell::RefCell;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::{
@@ -83,13 +84,20 @@ struct RackSlot {
     pan: f32,
     mute: bool,
     solo: bool,
+    /// Device output channels this tab plays out of, 0-based. `(0, 1)` is the
+    /// first pair; anything else needs the native JACK backend.
+    out_pair: (usize, usize),
+    /// Device *input* channels feeding this tab, 0-based, or `None` when the
+    /// tab plays its instrument. A tab fed by live audio ignores its
+    /// instrument and runs the capture pair through its FX chain.
+    in_pair: Option<(usize, usize)>,
     /// SF2 slots only: the programs in the loaded SoundFont, and the cursor into
     /// them. Empty for every other source kind.
     presets: Vec<sources::Sf2Preset>,
     preset_cursor: usize,
     /// Plugin-instrument slots only: what the plugin exposes, and the current
     /// knob positions (0..1, same order). Empty for every other source kind.
-    instr_params: Vec<choz_engine::ClapParamInfo>,
+    instr_params: Vec<choz_engine::PluginParam>,
     instr_values: Vec<f32>,
 }
 
@@ -98,6 +106,7 @@ impl RackSlot {
         RackSlot {
             input: None, source, fx_chain: Vec::new(),
             gain: 1.0, pan: 0.0, mute: false, solo: false,
+            out_pair: (0, 1), in_pair: None,
             presets: Vec::new(), preset_cursor: 0,
             instr_params: Vec::new(), instr_values: Vec::new(),
         }
@@ -108,16 +117,45 @@ impl RackSlot {
 #[derive(Debug, Clone)]
 pub struct SynthEntry {
     pub id: String,
-    pub format: String,
+    pub format: choz_engine::PluginFormat,
     pub name: String,
     pub path: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
+    /// The IN drawer (note inputs), only reachable while it is open.
     Source,
     FxChain,
     Transport,
+    /// The OUT drawer (audio output devices), only while it is open.
+    Output,
+}
+
+/// What a row of the OUT drawer points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutTarget {
+    /// A section header — not selectable.
+    None,
+    /// Index into `App::out_devices`.
+    Device(usize),
+    /// Output pair `n`, i.e. device channels `2n` and `2n+1`.
+    Pair(usize),
+}
+
+/// What Enter on an IN drawer row does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InTarget {
+    /// A section header — not selectable.
+    None,
+    /// Index into `App::input_list()`: a note input (MIDI port or OSC).
+    Note(usize),
+    /// Index into `App::in_devices`: where capture comes from.
+    Device(usize),
+    /// Capture pair `n` (device input channels `2n` and `2n+1`) feeds the tab.
+    Capture(usize),
+    /// Back to the tab's own instrument.
+    NoCapture,
 }
 
 /// Which picker the open modal is. Every one of them draws through
@@ -129,8 +167,6 @@ enum ModalKind {
     Source,
     /// Add an FX to the active chain (built-ins, then CLAP effects).
     AddFx,
-    /// Audio output device.
-    Device,
     /// SF2 bank/preset of the active tab.
     Preset,
     /// Pick which rack control the next MIDI CC will drive.
@@ -145,12 +181,34 @@ enum ModalKind {
     AddPath,
     /// Directory picker for File \u{2192} Save project.
     SaveProject,
+    LoadProject,
+    /// Image picker for the desktop background (Settings \u{2192} THEME).
+    Wallpaper,
 }
 
 /// Tabs of the Settings modal, in chip order.
-const SETTINGS_TABS: &[&str] = &["AUDIO", "COLOR", "LANGUAGE"];
+const SETTINGS_TABS: &[&str] = &["AUDIO", "THEME", "LANGUAGE"];
+/// What a row on the THEME tab does when it is picked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThemeRow {
+    /// Index into [`settings::THEMES`].
+    Scheme(usize),
+    /// Cycle terminal default → flat colour of the current scheme.
+    Background,
+    /// Stretch ↔ tile, only present while an image is set.
+    Fit,
+    /// Open the file browser on the project's `assets/`.
+    PickImage,
+    /// Back to the terminal's own background.
+    Clear,
+    /// Apply and leave, for anyone driving the modal from the keyboard: Enter
+    /// on the other rows keeps it open on purpose, so that trying a few schemes
+    /// does not mean reopening Settings each time.
+    Done,
+}
+
 const TAB_AUDIO: usize = 0;
-const TAB_COLOR: usize = 1;
+const TAB_THEME: usize = 1;
 const TAB_LANG: usize = 2;
 
 /// Sub-categories of the AUDIO tab, shown in the modal's sidebar — the same
@@ -160,6 +218,14 @@ const SEC_ENGINE: usize = 0;
 const SEC_PATHS: usize = 1;
 const SEC_OSC: usize = 2;
 
+/// Bank Select MSB/LSB. Never a MIDI-learn source: it only ever precedes a
+/// program change.
+const BANK_SELECT_CCS: [u8; 2] = [0, 32];
+
+/// How many MIDI messages the monitor keeps. A few more than fit on screen, so
+/// the panel still fills up when the terminal is tall.
+const MIDI_LOG_MAX: usize = 64;
+
 /// Editable rows of the Engine section, in display order.
 const ENGINE_ROWS: &[&str] = &["Backend", "Device", "Sample rate", "Buffer size", "SF2 engine"];
 /// Editable rows of the OSC section.
@@ -167,7 +233,7 @@ const OSC_ROWS: &[&str] = &["Enable OSC", "Port mode", "UDP port", "TCP port"];
 
 /// Format chips of the ADD FX modal.
 const FX_FORMATS: &[&str] =
-    &["ALL", "BUILT-IN", "CLAP", "LV2", "VST2", "VST3", "LADSPA", "DSSI", "JSFX"];
+    &["ALL", "BUILT-IN", "CLAP", "LV2", "VST2", "VST3", "LADSPA", "DSSI"];
 
 /// One offer in the ADD FX list: a built-in or a scanned plugin.
 struct FxMenuEntry {
@@ -200,10 +266,15 @@ struct SourceChoice {
 
 #[derive(Debug, Clone)]
 enum SourceAction {
-    Clap { path: std::path::PathBuf, id: String },
+    Plugin {
+        format: choz_engine::PluginFormat,
+        /// Plugin file, or the bundle directory for LV2.
+        path: std::path::PathBuf,
+        id: String,
+    },
     File(std::path::PathBuf),
     /// Open the file browser for this extension instead of loading directly.
-    Browse(&'static str),
+    Browse(&'static [&'static str]),
     /// A format choz can find but not load yet.
     Unsupported(&'static str),
 }
@@ -211,23 +282,35 @@ enum SourceAction {
 /// Formats the SOURCE picker can filter by. Only CLAP/SF2/WAV can actually be
 /// loaded today; the rest are listed so it's obvious what choz doesn't host yet.
 const SOURCE_FORMATS: &[&str] = &[
-    "ALL", "CLAP", "SF2", "WAV", "SFZ", "LV2", "VST2", "VST3", "DSSI", "LADSPA", "JSFX",
+    "ALL", "CLAP", "SF2", "WAV", "SFZ", "LV2", "VST2", "VST3", "DSSI", "LADSPA",
 ];
 
 /// A rack control a MIDI CC can drive, bound by MIDI learn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum LearnTarget {
     Gain(usize),
     Pan(usize),
     FxParam { slot: usize, fx: usize, param: usize },
+    /// A parameter of the tab's own plugin instrument. Any parameter of any
+    /// hosted plugin is bindable, not just the FX chain's.
+    InstrParam { slot: usize, param: usize },
     /// A button rather than a fader: fired by a CC crossing half-scale, so a
     /// pad, a footswitch or the top half of a fader all work.
     Trigger(TriggerAction),
 }
 
+/// The FX unit a target belongs to, or `None` for rack-wide controls. Two
+/// bindings on the same CC may coexist only when they live in different units.
+fn fx_scope(t: &LearnTarget) -> Option<(usize, usize)> {
+    match *t {
+        LearnTarget::FxParam { slot, fx, .. } => Some((slot, fx)),
+        _ => None,
+    }
+}
+
 /// Rack buttons a CC can press. `DEL` is deliberately absent — nothing should
 /// delete an FX because a fader was nudged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum TriggerAction {
     PresetPrev,
     PresetNext,
@@ -329,14 +412,13 @@ struct Modal {
     kind: ModalKind,
     list: views::modal::ListModal,
     sources: Vec<SourceChoice>,
-    devices: Vec<String>,
     targets: Vec<LearnTarget>,
     browser: Option<file_browser::FileBrowser>,
 }
 
 impl Modal {
     fn new(kind: ModalKind, list: views::modal::ListModal) -> Self {
-        Self { kind, list, sources: Vec::new(), devices: Vec::new(), targets: Vec::new(), browser: None }
+        Self { kind, list, sources: Vec::new(), targets: Vec::new(), browser: None }
     }
 }
 
@@ -355,6 +437,13 @@ struct UiLayout {
     menu_bar_rects: Vec<Rect>,
     /// Open dropdown item rects: (real item index, rect).
     menu_item_rects: Vec<(usize, Rect)>,
+    /// The OUT drawer, open or a handle.
+    output_area: Rect,
+    /// Close buttons of the open drawers (`None` while they are shut).
+    in_close_rect: Option<Rect>,
+    out_close_rect: Option<Rect>,
+    /// Device-list rects of the open OUT drawer: (device index, rect).
+    output_item_rects: Vec<(usize, Rect)>,
     /// Input-list rects: (input index, rect).
     input_item_rects: Vec<(usize, Rect)>,
     /// The connect/disconnect mark at the left of each input row.
@@ -372,6 +461,9 @@ struct App {
     source: AudioSource,
     /// Every MIDI input port seen at the last scan (connected or not).
     midi_ports: Vec<String>,
+    /// Decoded background image, rebuilt when the file or the terminal size
+    /// changes. `None` until something needs it.
+    wallpaper: Option<views::background::Wallpaper>,
     /// Ports actually connected, in the order `midi::connect_inputs` returned
     /// them — `InputSource::Midi(i)` indexes into this.
     midi_connected: Vec<String>,
@@ -384,7 +476,7 @@ struct App {
     synth_cursor: usize,
     /// Discovered CLAP *audio effects*, offered in the ADD FX modal after the
     /// built-ins.
-    fx_plugins: Vec<source::ClapFx>,
+    fx_plugins: Vec<source::PluginFx>,
 
     /// Rack slots (one per source). Slot at index i mirrors engine slot i.
     slots: Vec<RackSlot>,
@@ -413,8 +505,25 @@ struct App {
     _midi_conns: Vec<midir::MidiInputConnection<()>>,
     /// MIDI input ports the user switched off; skipped when (re)connecting.
     midi_disabled: Vec<String>,
+    /// When the port list was last polled for hotplug. A controller plugged in
+    /// after startup is invisible until we reconnect, which looked like a dead
+    /// keyboard.
+    midi_scan_at: Instant,
+    /// Last messages seen on any input, oldest first — what the MIDI monitor
+    /// shows. Capped at [`MIDI_LOG_MAX`]; older entries fall off the front.
+    midi_log: std::collections::VecDeque<midi::InputEvent>,
     /// Cursor into the input list.
     input_cursor: usize,
+    /// Side drawers: IN (left, note inputs) and OUT (right, audio devices).
+    /// Both start closed so the RACK owns the whole body.
+    in_open: bool,
+    out_open: bool,
+    /// Output devices as of the last time the OUT drawer was opened — cpal
+    /// enumeration is far too slow to redo every frame.
+    out_devices: Vec<String>,
+    out_cursor: usize,
+    /// Capture devices the graph publishes, for the IN drawer.
+    in_devices: Vec<String>,
     /// Interface settings (text colour, language).
     ui: settings::UiSettings,
     /// Format whose directory list the AddPath browser is feeding.
@@ -425,6 +534,12 @@ struct App {
     port_edit: Option<PortEdit>,
     /// Set when the search paths changed, so closing the modal rescans.
     paths_dirty: bool,
+    /// Load only the rack from the next project, leaving choz's own settings
+    /// (plugin paths, colour, language, audio, OSC) as they are.
+    load_rack_only: bool,
+    /// The plugin's own window, while one is open. At most one at a time:
+    /// two plugin GUIs in a terminal app is more window than anyone asked for.
+    editor: Option<editor::EditorWindow>,
     /// Rack control waiting for a MIDI CC (MIDI learn armed).
     learn: Option<LearnTarget>,
     /// MIDI learn is waiting for the user to *click* the control to bind. While
@@ -435,6 +550,12 @@ struct App {
     mouse: (u16, u16),
     /// MIDI-learn bindings: CC number -> the rack control it drives.
     cc_bindings: Vec<(u8, LearnTarget)>,
+    /// Same, for controller buttons that send program change: program number ->
+    /// the rack button it presses.
+    pc_bindings: Vec<(u8, LearnTarget)>,
+    /// A MIDI/OSC-driven FX parameter changed and the chain has to be rebuilt.
+    /// Coalesced: one rebuild per input drain, never one per message.
+    fx_dirty: bool,
     /// Last value seen per CC, for the rising-edge test button bindings use.
     cc_last: [u8; 128],
     /// UDP port the OSC listener bound to, if it started.
@@ -475,7 +596,7 @@ impl App {
             fx_chain: Vec::new(),
             fx_slot: 0,
             fx_param: 0,
-            focus: Focus::Source,
+            focus: Focus::FxChain,
             modal: None,
             menu: None,
             about_open: false,
@@ -484,8 +605,16 @@ impl App {
             note_tx,
             note_rx,
             _midi_conns: Vec::new(),
+            wallpaper: None,
             midi_disabled: Vec::new(),
+            midi_scan_at: Instant::now(),
+            midi_log: std::collections::VecDeque::new(),
             input_cursor: 0,
+            in_open: false,
+            out_open: false,
+            out_devices: Vec::new(),
+            out_cursor: 0,
+            in_devices: Vec::new(),
             // Loaded here, applied by `main` — `apply()` sets process-wide
             // state (language, text colour) that tests must not inherit.
             ui: settings::UiSettings::load(),
@@ -493,10 +622,14 @@ impl App {
             path_edit: None,
             port_edit: None,
             paths_dirty: false,
+            load_rack_only: false,
+            editor: None,
             learn: None,
             learn_pick: false,
             mouse: (0, 0),
             cc_bindings: Vec::new(),
+            pc_bindings: Vec::new(),
+            fx_dirty: false,
             cc_last: [0; 128],
             osc_port: None,
             osc: None,
@@ -523,20 +656,21 @@ impl App {
             .filter(|p| p.is_instrument)
             .map(|p| SynthEntry {
                 id: p.id.clone(),
-                format: p.format.label().to_string(),
+                format: p.format,
                 name: p.name.clone(),
                 path: p.path.clone(),
             })
             .collect();
-        // Only CLAP effects can be hosted in the chain today; the rest are still
-        // listed in ADD FX (with their format) so it's clear what was found.
+        // Formats choz can host go in the chain; the rest are still listed in
+        // ADD FX (with their format) so it's clear what was found.
         self.fx_plugins = self
             .plugins
             .iter()
-            .filter(|p| !p.is_instrument && p.format == choz_engine::PluginFormat::Clap)
+            .filter(|p| !p.is_instrument && p.format.is_hosted() && p.format.is_plugin())
             // Parameters are read lazily when the effect is added — scanning
             // instantiates enough plugins already.
-            .map(|p| source::ClapFx {
+            .map(|p| source::PluginFx {
+                format: p.format,
                 path: p.path.clone(),
                 id: p.id.clone(),
                 name: p.name.clone(),
@@ -552,12 +686,12 @@ impl App {
         let mut out: Vec<_> = self
             .fx_plugins
             .iter()
-            .map(|p| (choz_engine::PluginFormat::Clap, p.name.clone(), true))
+            .map(|p| (p.format, p.name.clone(), true))
             .collect();
         out.extend(
             self.plugins
                 .iter()
-                .filter(|p| !p.is_instrument && p.format != choz_engine::PluginFormat::Clap)
+                .filter(|p| !p.is_instrument && !(p.format.is_hosted() && p.format.is_plugin()))
                 .map(|p| (p.format, p.name.clone(), false)),
         );
         out
@@ -573,8 +707,9 @@ impl App {
             None => match self.fx_plugins.get(i - ALL_FX_KINDS.len()) {
                 Some(p) => {
                     let mut plugin = p.clone();
-                    plugin.params = choz_engine::read_clap_params(&plugin.path, &plugin.id);
-                    AudioFxEntry::new_clap(plugin)
+                    plugin.params =
+                        choz_engine::read_plugin_params(plugin.format, &plugin.path, &plugin.id);
+                    AudioFxEntry::new_plugin(plugin)
                 }
                 // Past the hosted CLAP effects are the formats choz can scan but
                 // not yet load; say so instead of silently doing nothing.
@@ -608,8 +743,14 @@ impl App {
                     fmt: p.format.label(),
                     label: format!("{}{mark}", p.name),
                     action: match p.format {
-                        choz_engine::PluginFormat::Clap => {
-                            SourceAction::Clap { path: p.path.clone(), id: p.id.clone() }
+                        // SFZ isn't a plugin, but it loads through the same
+                        // path: the engine builds its own sampler for it.
+                        f if f.is_hosted() && f != choz_engine::PluginFormat::Sf2 => {
+                            SourceAction::Plugin {
+                                format: p.format,
+                                path: p.path.clone(),
+                                id: p.id.clone(),
+                            }
                         }
                         choz_engine::PluginFormat::Sf2 => SourceAction::File(p.path.clone()),
                         _ => SourceAction::Unsupported(p.format.label()),
@@ -625,7 +766,10 @@ impl App {
             out.push(SourceChoice {
                 fmt,
                 label: format!("Browse for a .{ext} file..."),
-                action: SourceAction::Browse(ext),
+                action: SourceAction::Browse(match ext {
+                    "sf2" => &["sf2", "sf3"],
+                    _ => &["wav"],
+                }),
             });
             for dir in dirs {
                 for path in scan_files(&dir, ext) {
@@ -663,26 +807,150 @@ impl App {
         self.refresh_modal();
     }
 
-    fn open_device_modal(&mut self) {
-        let Some(engine) = self.audio_engine.as_ref() else { return };
-        let devices = engine.output_devices();
-        if devices.is_empty() {
-            eprintln!("choz: no output devices to choose from");
+    /// What Enter (or a click) on an OUT drawer row does.
+    fn out_targets(&self) -> Vec<(OutTarget, views::drawer::OutRow)> {
+        use views::drawer::OutRow;
+        let live_device = self
+            .audio_engine
+            .as_ref()
+            .and_then(|e| e.output_device())
+            .map(|d| d.to_string());
+        let mut rows = vec![(
+            OutTarget::None,
+            OutRow { label: i18n::t("DEVICE").to_string(), mark: ' ', header: true },
+        )];
+        for (i, name) in self.out_devices.iter().enumerate() {
+            let live = Some(name) == live_device.as_ref();
+            rows.push((
+                OutTarget::Device(i),
+                OutRow {
+                    label: name.clone(),
+                    mark: if live { '\u{2713}' } else { '\u{00B7}' },
+                    header: false,
+                },
+            ));
+        }
+
+        // Channel pairs of the running device. Two channels is one pair, so a
+        // plain stereo card shows a single row and nothing to choose.
+        let channels = self.audio_engine.as_ref().map(|e| e.output_channels()).unwrap_or(2);
+        let active = self.slots.get(self.active_slot).map(|s| s.out_pair);
+        rows.push((
+            OutTarget::None,
+            OutRow { label: format!("CHANNELS ({channels})"), mark: ' ', header: true },
+        ));
+        for pair in 0..(channels / 2) {
+            let (l, r) = (pair * 2, pair * 2 + 1);
+            // Which tabs already play out of this pair, so the routing of the
+            // whole rack is visible at a glance.
+            let tabs: Vec<String> = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.out_pair == (l, r))
+                .map(|(i, _)| format!("{}", i + 1))
+                .collect();
+            let used = if tabs.is_empty() {
+                String::new()
+            } else {
+                format!("  \u{2190} tab {}", tabs.join(","))
+            };
+            rows.push((
+                OutTarget::Pair(pair),
+                OutRow {
+                    label: format!("{}/{}{used}", l + 1, r + 1),
+                    mark: if active == Some((l, r)) { '\u{2713}' } else { '\u{00B7}' },
+                    header: false,
+                },
+            ));
+        }
+        rows
+    }
+
+    /// Act on the OUT drawer row under the cursor.
+    fn out_select(&mut self, row: usize) {
+        let Some((target, _)) = self.out_targets().into_iter().nth(row) else { return };
+        match target {
+            OutTarget::None => {}
+            OutTarget::Device(i) => {
+                if let Some(name) = self.out_devices.get(i).cloned() {
+                    self.set_output_device(&name);
+                    self.refresh_out_devices();
+                }
+            }
+            // Routing is per rack tab: the pair applies to the active one.
+            OutTarget::Pair(pair) => {
+                let (l, r) = (pair * 2, pair * 2 + 1);
+                let idx = self.active_slot;
+                if let Some(slot) = self.slots.get_mut(idx) {
+                    slot.out_pair = (l, r);
+                }
+                if let Some(ref mut engine) = self.audio_engine {
+                    engine.set_slot_out(idx, l, r);
+                }
+            }
+        }
+    }
+
+    /// Push every tab's output routing to the engine — after a rack reload the
+    /// engine slots are new and back on the default pair.
+    fn apply_routing(&mut self) {
+        let outs: Vec<(usize, usize)> = self.slots.iter().map(|s| s.out_pair).collect();
+        let ins: Vec<Option<(usize, usize)>> = self.slots.iter().map(|s| s.in_pair).collect();
+        let Some(ref mut engine) = self.audio_engine else { return };
+        for (i, (l, r)) in outs.into_iter().enumerate() {
+            engine.set_slot_out(i, l, r);
+        }
+        for (i, pair) in ins.into_iter().enumerate() {
+            engine.set_slot_in(i, pair);
+        }
+    }
+
+    /// Open/close the OUT drawer. Opening re-reads the device list (they come
+    /// and go) and parks the cursor on the live one; closing hands focus back
+    /// to the RACK so no panel is left focused off-screen.
+    fn toggle_out_drawer(&mut self) {
+        self.out_open = !self.out_open;
+        if !self.out_open {
+            if self.focus == Focus::Output {
+                self.focus = Focus::FxChain;
+            }
             return;
         }
-        let cursor = engine
-            .output_device()
-            .and_then(|cur| devices.iter().position(|d| d == cur))
+        self.refresh_out_devices();
+        self.out_cursor = self
+            .out_targets()
+            .iter()
+            .position(|(t, _)| *t != OutTarget::None)
             .unwrap_or(0);
-        let mut modal = Modal::new(
-            ModalKind::Device,
-            views::modal::ListModal::new("AUDIO OUTPUT", Vec::new()),
-        );
-        modal.list.note = "  switching reloads every rack tab".to_string();
-        modal.devices = devices;
-        modal.list.cursor = cursor;
-        self.modal = Some(modal);
-        self.refresh_modal();
+        self.focus = Focus::Output;
+    }
+
+    fn refresh_out_devices(&mut self) {
+        let Some(engine) = self.audio_engine.as_ref() else { return };
+        self.out_devices = engine.output_devices();
+        let rows = self.out_targets().len();
+        self.out_cursor = self.out_cursor.min(rows.saturating_sub(1));
+    }
+
+    /// Open/close the IN drawer, same focus rules as the OUT one.
+    fn toggle_in_drawer(&mut self) {
+        self.in_open = !self.in_open;
+        if self.in_open {
+            self.refresh_in_devices();
+            self.input_cursor = self
+                .in_targets()
+                .iter()
+                .position(|(t, _)| *t != InTarget::None)
+                .unwrap_or(0);
+        }
+        self.focus = if self.in_open {
+            Focus::Source
+        } else if self.focus == Focus::Source {
+            Focus::FxChain
+        } else {
+            self.focus
+        };
     }
 
     /// SF2 bank/preset picker for the active tab (RACK's `[BANK/PRESET]`).
@@ -727,6 +995,10 @@ impl App {
                 targets.push(LearnTarget::FxParam { slot, fx, param });
             }
         }
+        let instr_params = self.slots.get(slot).map(|s| s.instr_params.len()).unwrap_or(0);
+        for param in 0..instr_params {
+            targets.push(LearnTarget::InstrParam { slot, param });
+        }
         let mut modal = Modal::new(
             ModalKind::Learn,
             views::modal::ListModal::new("MIDI LEARN", Vec::new()),
@@ -737,15 +1009,145 @@ impl App {
         self.refresh_modal();
     }
 
-    fn open_browser_modal(&mut self, ext: &'static str) {
+    fn open_browser_modal(&mut self, exts: &'static [&'static str]) {
         let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let mut modal = Modal::new(
-            ModalKind::Browser,
-            views::modal::ListModal::new(format!("OPEN .{ext}"), Vec::new()),
-        );
-        modal.browser = Some(file_browser::FileBrowser::open(&start, ext));
+        let title = format!("OPEN .{}", exts.join(" / ."));
+        let mut modal =
+            Modal::new(ModalKind::Browser, views::modal::ListModal::new(title, Vec::new()));
+        modal.browser = Some(file_browser::FileBrowser::open(&start, exts));
         self.modal = Some(modal);
         self.refresh_modal();
+    }
+
+    /// Whether the active tab's instrument has a native window to open.
+    fn has_editor(&self) -> bool {
+        self.editor_handle(None).is_some()
+    }
+
+    /// Same for the selected FX of the active tab's chain.
+    fn has_fx_editor(&self) -> bool {
+        self.editor_handle(Some(self.fx_slot)).is_some()
+    }
+
+    /// Which plugin the active tab's instrument (`None`) or one of its FX
+    /// (`Some(ui index)`) is, as format/path/id — the identity the sandbox
+    /// preference and the crash verdicts are keyed by.
+    fn plugin_ref(
+        &self,
+        fx: Option<usize>,
+    ) -> Option<(choz_engine::PluginFormat, std::path::PathBuf, String)> {
+        match fx {
+            Some(i) => {
+                let p = self.fx_chain.get(i)?.plugin.as_ref()?;
+                Some((p.format, p.path.clone(), p.id.clone()))
+            }
+            None => match &self.source {
+                // The tab only remembers the plugin's id; the scan list is what
+                // knows where it lives.
+                AudioSource::Plugin { id, .. } => {
+                    let e = self.synths.iter().find(|s| s.id == *id)?;
+                    Some((e.format, e.path.clone(), e.id.clone()))
+                }
+                _ => None,
+            },
+        }
+    }
+
+    /// Out-of-process state of the instrument (`None`) or one of the FX, as the
+    /// RACK draws it.
+    fn sbx_state(&self, fx: Option<usize>) -> views::fx_chain_panel::SbxState {
+        let mut state = views::fx_chain_panel::SbxState::default();
+        let Some((format, path, id)) = self.plugin_ref(fx) else { return state };
+        state.available = true;
+        state.on = choz_engine::quarantine::forced(format, &path, &id);
+        let live = self.audio_engine.as_ref().and_then(|e| match fx {
+            None => e.slot_sandbox(self.active_slot),
+            Some(i) => e.fx_sandbox(self.active_slot, self.engine_fx_index(i)?),
+        });
+        if let Some(s) = live {
+            state.live = true;
+            state.missed = s.missed();
+            state.restarts = s.restarts();
+        }
+        state
+    }
+
+    /// Ask for (or stop asking for) this plugin to play in its own process, then
+    /// reload it so the change is audible now rather than next session.
+    fn toggle_sandbox(&mut self, fx: Option<usize>) {
+        let Some((format, path, id)) = self.plugin_ref(fx) else {
+            eprintln!("choz: only a hosted plugin can run in its own process");
+            return;
+        };
+        let on = !choz_engine::quarantine::forced(format, &path, &id);
+        choz_engine::quarantine::set_forced(format, &path, &id, on);
+        eprintln!(
+            "choz: {} will {}run in its own process",
+            path.display(),
+            if on { "" } else { "no longer " }
+        );
+        match fx {
+            // Rebuilding the chain re-reads the policy for every plugin in it.
+            Some(_) => self.rebuild_fx(),
+            None => self.reload_instrument(),
+        }
+    }
+
+    /// Re-instantiate the active tab's plugin instrument, keeping its knobs.
+    /// Used when something about *how* it is hosted changed.
+    fn reload_instrument(&mut self) {
+        let Some((format, path, id)) = self.plugin_ref(None) else { return };
+        let slot = self.active_slot;
+        let values = self.slots.get(slot).map(|s| s.instr_values.clone()).unwrap_or_default();
+        let Some(ref mut engine) = self.audio_engine else { return };
+        if let Err(e) = engine.load_plugin(slot, format, &path, &id) {
+            eprintln!("choz: reloading {}: {e}", path.display());
+            return;
+        }
+        // A fresh instance is back at the plugin's own defaults.
+        for (i, v) in values.iter().enumerate() {
+            engine.set_slot_param(slot, i, *v);
+        }
+    }
+
+    /// The window handle for the active tab's instrument (`None`) or one of its
+    /// FX (`Some(ui index)`).
+    fn editor_handle(&self, fx: Option<usize>) -> Option<choz_ports::EditorHandle> {
+        let engine = self.audio_engine.as_ref()?;
+        match fx {
+            None => engine.slot_editor(self.active_slot),
+            Some(i) => engine.fx_editor(self.active_slot, self.engine_fx_index(i)?),
+        }
+    }
+
+    /// Open a plugin window, or close it if that same plugin's window is
+    /// already up. Only one is open at a time: two plugin GUIs floating over a
+    /// terminal is more window than anyone asked for.
+    fn toggle_editor(&mut self, fx: Option<usize>) {
+        let key = (self.active_slot, fx);
+        if self.editor.as_ref().is_some_and(|w| w.key == key) {
+            self.editor = None;
+            return;
+        }
+        self.editor = None;
+        let Some(handle) = self.editor_handle(fx) else {
+            eprintln!("choz: this plugin has no window");
+            return;
+        };
+        let name = match fx {
+            None => self.instrument_label(),
+            Some(i) => self.fx_chain.get(i).map(|e| e.label().to_string()).unwrap_or_default(),
+        };
+        let title = format!("choz \u{00B7} {name}");
+        self.editor = editor::EditorWindow::open(key, handle, title);
+    }
+
+    /// Drop the window once the user closed it from the window manager, so the
+    /// `[GUI]` button opens a fresh one instead of toggling a dead handle.
+    fn poll_editor(&mut self) {
+        if self.editor.as_ref().is_some_and(|w| !w.is_open()) {
+            self.editor = None;
+        }
     }
 
     /// Parameter editor for the active tab's plugin instrument.
@@ -758,7 +1160,8 @@ impl App {
             ModalKind::InstrParams,
             views::modal::ListModal::new(format!("INSTRUMENT \u{00B7} {}", slot_label(&slot.source)), Vec::new()),
         );
-        modal.list.note = "  \u{2190}\u{2192} change the selected value".to_string();
+        modal.list.note =
+            "  \u{2190}\u{2192} change the selected value \u{00B7} l = learn a CC for it".to_string();
         self.modal = Some(modal);
         self.refresh_modal();
     }
@@ -813,6 +1216,133 @@ impl App {
             }
             _ => "   (0)".to_string(),
         }
+    }
+
+    /// The THEME tab: a colour scheme picker, then the desktop background.
+    ///
+    /// The two halves are separated by a header row, the same trick the plugin
+    /// paths list uses: headers are labels, not options.
+    fn theme_rows(&self) -> Vec<String> {
+        let mut rows: Vec<String> = Vec::with_capacity(settings::THEMES.len() + 5);
+        rows.push("COLOUR SCHEME".to_string());
+        for t in settings::THEMES {
+            let active = t.text == self.ui.text_color
+                && Some(t.border) == self.ui.border_color;
+            let mark = if active { "\u{25CF}" } else { "\u{25CB}" };
+            let swatch = "\u{2588}\u{2588}";
+            rows.push(format!("  {mark} {:<18} {swatch} text  {swatch} frame  {}",
+                t.name,
+                match t.desktop {
+                    Some(_) => format!("{swatch} desktop"),
+                    None => "   (terminal)".to_string(),
+                }));
+        }
+
+        rows.push("DESKTOP".to_string());
+        rows.push(format!("  {:<18} {}", "Background", self.ui.background.label()));
+        if let settings::Background::Image { fit, .. } = &self.ui.background {
+            rows.push(format!("  {:<18} {}   (Enter cycles)", "Fit", fit.label()));
+        }
+        rows.push(format!("  {:<18} {}", "Pick an image...", "Enter opens the browser"));
+        rows.push(format!("  {:<18} {}", "Clear background", "back to the terminal's own"));
+        rows.push(format!("  {:<18} {}", "Apply and close", "keeps theme and background"));
+        rows
+    }
+
+    /// Row index → what it means on the THEME tab. `None` for the headers.
+    fn theme_row(&self, i: usize) -> Option<ThemeRow> {
+        let n = settings::THEMES.len();
+        if i == 0 {
+            return None; // COLOUR SCHEME header
+        }
+        if i <= n {
+            return Some(ThemeRow::Scheme(i - 1));
+        }
+        if i == n + 1 {
+            return None; // DESKTOP header
+        }
+        let has_fit = matches!(self.ui.background, settings::Background::Image { .. });
+        match i - (n + 2) {
+            0 => Some(ThemeRow::Background),
+            1 if has_fit => Some(ThemeRow::Fit),
+            k => match k - usize::from(has_fit) {
+                1 => Some(ThemeRow::PickImage),
+                2 => Some(ThemeRow::Clear),
+                3 => Some(ThemeRow::Done),
+                _ => None,
+            },
+        }
+    }
+
+    /// Enter on a THEME row. Returns whether the modal should close.
+    ///
+    /// Picking a scheme applies and saves at once, like the language tab did —
+    /// but the modal stays open, because the whole point of a theme picker is
+    /// trying a few.
+    fn theme_select(&mut self, i: usize) -> bool {
+        let Some(row) = self.theme_row(i) else { return false };
+        match row {
+            ThemeRow::Scheme(k) => {
+                if let Some(theme) = settings::THEMES.get(k) {
+                    self.ui.apply_theme(theme);
+                    self.apply_ui_settings();
+                }
+            }
+            ThemeRow::Background => {
+                // Only meaningful as a toggle between "no background" and the
+                // current scheme's desktop colour; the image comes from the
+                // browser row below.
+                self.ui.background = match self.ui.background {
+                    settings::Background::Terminal => {
+                        let rgb = settings::THEMES
+                            .iter()
+                            .find(|t| t.name == self.ui.theme_name)
+                            .and_then(|t| t.desktop)
+                            .unwrap_or(self.ui.text_color);
+                        settings::Background::Color(rgb)
+                    }
+                    _ => settings::Background::Terminal,
+                };
+                self.apply_ui_settings();
+            }
+            ThemeRow::Fit => {
+                if let settings::Background::Image { path, fit } = &self.ui.background {
+                    self.ui.background =
+                        settings::Background::Image { path: path.clone(), fit: fit.next() };
+                    self.apply_ui_settings();
+                }
+            }
+            ThemeRow::PickImage => {
+                self.open_wallpaper_browser();
+                return false;
+            }
+            ThemeRow::Clear => {
+                self.ui.background = settings::Background::Terminal;
+                self.apply_ui_settings();
+            }
+            // Everything is applied and saved as it is picked, so there is
+            // nothing left to commit — just leave.
+            ThemeRow::Done => return true,
+        }
+        self.refresh_modal();
+        false
+    }
+
+    /// The image browser, started in the project's `assets/` when it exists —
+    /// that is where the sample wallpapers live — and in the working directory
+    /// otherwise.
+    fn open_wallpaper_browser(&mut self) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let assets = cwd.join("assets");
+        let start = if assets.is_dir() { assets } else { cwd };
+        let mut modal = Modal::new(
+            ModalKind::Wallpaper,
+            views::modal::ListModal::new("BACKGROUND IMAGE", Vec::new()),
+        );
+        modal.browser =
+            Some(file_browser::FileBrowser::open(&start, file_browser::IMAGE_EXTS));
+        self.modal = Some(modal);
+        self.refresh_modal();
     }
 
     /// Which AUDIO sub-category is showing (Engine / Plugin Paths / OSC).
@@ -1219,7 +1749,6 @@ impl App {
                 }
                 self.fx_menu_rows().into_iter().map(|(_, label)| label).collect()
             }
-            ModalKind::Device => self.modal.as_ref().unwrap().devices.clone(),
             ModalKind::Preset => self
                 .slots
                 .get(self.active_slot)
@@ -1235,12 +1764,18 @@ impl App {
                             .iter()
                             .find(|(_, b)| b == t)
                             .map(|(cc, _)| format!("   [CC {cc}]"))
+                            .or_else(|| {
+                                self.pc_bindings
+                                    .iter()
+                                    .find(|(_, b)| b == t)
+                                    .map(|(p, _)| format!("   [PC {p}]"))
+                            })
                             .unwrap_or_default();
                         format!("{}{}", self.learn_label(t), bound)
                     })
                     .collect()
             }
-            ModalKind::Browser => self
+            ModalKind::Browser | ModalKind::Wallpaper => self
                 .modal
                 .as_ref()
                 .unwrap()
@@ -1258,13 +1793,7 @@ impl App {
             {
                 self.osc_rows()
             }
-            ModalKind::PluginPaths if self.settings_tab() == TAB_COLOR => settings::PALETTE
-                .iter()
-                .map(|(name, rgb)| {
-                    let mark = if *rgb == self.ui.text_color { "\u{25CF}" } else { "\u{25CB}" };
-                    format!("  {mark} {name}   \u{2588}\u{2588}\u{2588}\u{2588}  rgb({},{},{})", rgb.0, rgb.1, rgb.2)
-                })
-                .collect(),
+            ModalKind::PluginPaths if self.settings_tab() == TAB_THEME => self.theme_rows(),
             ModalKind::PluginPaths if self.settings_tab() == TAB_LANG => i18n::Lang::ALL
                 .iter()
                 .map(|l| {
@@ -1317,7 +1846,7 @@ impl App {
                 }
                 rows
             }
-            ModalKind::AddPath | ModalKind::SaveProject => self
+            ModalKind::AddPath | ModalKind::SaveProject | ModalKind::LoadProject => self
                 .modal
                 .as_ref()
                 .unwrap()
@@ -1380,7 +1909,7 @@ impl App {
                         .to_string(),
                     Vec::new(),
                 ),
-                (TAB_COLOR, _) => (
+                (TAB_THEME, _) => (
                     "  Enter / SELECT applies the colour to text and borders, and closes"
                         .to_string(),
                     Vec::new(),
@@ -1418,7 +1947,13 @@ impl App {
             if let Some(row) = edit_row {
                 m.list.cursor = row;
             }
-            if let (ModalKind::Browser | ModalKind::AddPath | ModalKind::SaveProject, Some(b)) =
+            if let (
+                ModalKind::Browser
+                | ModalKind::AddPath
+                | ModalKind::SaveProject
+                | ModalKind::LoadProject,
+                Some(b),
+            ) =
                 (m.kind, m.browser.as_ref())
             {
                 m.list.note = format!("  {}", b.dir.display());
@@ -1436,6 +1971,15 @@ impl App {
             LearnTarget::Gain(s) => format!("tab {} \u{00B7} VOL", s + 1),
             LearnTarget::Pan(s) => format!("tab {} \u{00B7} PAN", s + 1),
             LearnTarget::Trigger(action) => action.label(),
+            LearnTarget::InstrParam { slot, param } => {
+                let name = self
+                    .slots
+                    .get(slot)
+                    .and_then(|s| s.instr_params.get(param))
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| format!("p{}", param + 1));
+                format!("INSTR \u{00B7} {name}")
+            }
             LearnTarget::FxParam { slot, fx, param } => {
                 let (label, pname) = self
                     .slots
@@ -1470,8 +2014,8 @@ impl App {
                     .nth(i)
                     .cloned();
                 match choice.map(|c| c.action) {
-                    Some(SourceAction::Clap { path, id }) => {
-                        self.load_clap_source(&path, &id);
+                    Some(SourceAction::Plugin { format, path, id }) => {
+                        self.load_plugin_source(format, &path, &id);
                         true
                     }
                     Some(SourceAction::File(path)) => {
@@ -1496,12 +2040,6 @@ impl App {
                 }
                 None => false,
             },
-            ModalKind::Device => {
-                if let Some(name) = m.devices.get(i).cloned() {
-                    self.set_output_device(&name);
-                }
-                true
-            }
             ModalKind::Preset => {
                 if let Some(slot) = self.slots.get_mut(self.active_slot) {
                     slot.preset_cursor = i;
@@ -1513,7 +2051,8 @@ impl App {
                 self.learn = m.targets.get(i).copied();
                 true
             }
-            ModalKind::Browser => {
+            ModalKind::Browser | ModalKind::Wallpaper => {
+                let wallpaper = m.kind == ModalKind::Wallpaper;
                 let action = self.modal.as_mut().and_then(|m| {
                     let b = m.browser.as_mut()?;
                     b.cursor = i;
@@ -1523,6 +2062,24 @@ impl App {
                     Some(file_browser::Action::EnterDir(d)) => {
                         if let Some(b) = self.modal.as_mut().and_then(|m| m.browser.as_mut()) {
                             b.set_dir(d);
+                        }
+                        self.refresh_modal();
+                        false
+                    }
+                    Some(file_browser::Action::PickFile(path)) if wallpaper => {
+                        // Keep whatever fit was already chosen, so swapping the
+                        // picture does not silently reset tile back to stretch.
+                        let fit = match &self.ui.background {
+                            settings::Background::Image { fit, .. } => *fit,
+                            _ => settings::ImageFit::default(),
+                        };
+                        self.ui.background = settings::Background::Image { path, fit };
+                        self.apply_ui_settings();
+                        // Straight back to the theme tab, where the result shows.
+                        self.open_paths_modal();
+                        if let Some(m) = self.modal.as_mut() {
+                            m.list.filter = TAB_THEME;
+                            m.list.sidebar_focused = false;
                         }
                         self.refresh_modal();
                         false
@@ -1541,14 +2098,7 @@ impl App {
                     return false;
                 }
                 match self.settings_tab() {
-                    TAB_COLOR => {
-                        if let Some(&(_, rgb)) = settings::PALETTE.get(i) {
-                            self.ui.text_color = rgb;
-                            self.apply_ui_settings();
-                        }
-                        // The choice is applied and saved: SELECT means done.
-                        true
-                    }
+                    TAB_THEME => self.theme_select(i),
                     TAB_LANG => {
                         if let Some(&lang) = i18n::Lang::ALL.get(i) {
                             self.ui.language = lang;
@@ -1559,6 +2109,27 @@ impl App {
                     // Enter on the paths tab is handled by `paths_modal_key`
                     // (it toggles a directory), so the modal stays open.
                     _ => false,
+                }
+            }
+            ModalKind::LoadProject => {
+                let picked = self.modal.as_mut().and_then(|m| {
+                    let b = m.browser.as_mut()?;
+                    b.cursor = i;
+                    b.select()
+                });
+                match picked {
+                    Some(file_browser::Action::EnterDir(d)) => {
+                        if let Some(b) = self.modal.as_mut().and_then(|m| m.browser.as_mut()) {
+                            b.set_dir(d);
+                        }
+                        self.refresh_modal();
+                        false
+                    }
+                    Some(file_browser::Action::PickFile(file)) => {
+                        self.load_project_from(&file);
+                        true
+                    }
+                    None => true,
                 }
             }
             ModalKind::SaveProject => {
@@ -1682,9 +2253,18 @@ impl App {
             .collect()
     }
 
-    /// Load a CLAP instrument by path+id into the active tab (SOURCE picker).
-    fn load_clap_source(&mut self, path: &std::path::Path, id: &str) {
-        if let Some(i) = self.synths.iter().position(|s| s.id == id && s.path == path) {
+    /// Load a plugin instrument by path+id into the active tab (SOURCE picker).
+    fn load_plugin_source(
+        &mut self,
+        format: choz_engine::PluginFormat,
+        path: &std::path::Path,
+        id: &str,
+    ) {
+        if let Some(i) = self
+            .synths
+            .iter()
+            .position(|s| s.id == id && s.path == path && s.format == format)
+        {
             self.load_synth(i);
         }
     }
@@ -1735,12 +2315,17 @@ impl App {
                     .map(|e| {
                         let spec = e.to_spec();
                         project::Fx {
-                            kind: if e.clap.is_some() { "clap".into() } else { spec.kind },
+                            // Hosted effects record their host format instead
+                            // of a built-in FX id.
+                            kind: match &e.plugin {
+                                Some(p) => p.format.label().to_lowercase(),
+                                None => spec.kind,
+                            },
                             enabled: spec.enabled,
                             wet: spec.wet,
                             params: spec.params,
-                            plugin_path: e.clap.as_ref().map(|c| c.path.clone()),
-                            plugin_id: e.clap.as_ref().map(|c| c.id.clone()),
+                            plugin_path: e.plugin.as_ref().map(|c| c.path.clone()),
+                            plugin_id: e.plugin.as_ref().map(|c| c.id.clone()),
                         }
                     })
                     .collect();
@@ -1750,10 +2335,15 @@ impl App {
                     .iter()
                     .filter(|(_, t)| match t {
                         LearnTarget::Gain(s) | LearnTarget::Pan(s) => *s == idx,
-                        LearnTarget::FxParam { slot, .. } => *slot == idx,
+                        LearnTarget::FxParam { slot, .. }
+                        | LearnTarget::InstrParam { slot, .. } => *slot == idx,
                         LearnTarget::Trigger(_) => idx == self.active_slot,
                     })
-                    .map(|(cc, t)| (*cc, self.learn_label(t)))
+                    .map(|(cc, t)| project::Binding {
+                        cc: *cc,
+                        target: *t,
+                        label: self.learn_label(t),
+                    })
                     .collect();
                 project::Slot {
                     input: slot.input.as_ref().map(|i| match i {
@@ -1766,6 +2356,8 @@ impl App {
                         pan: slot.pan,
                         mute: slot.mute,
                         solo: slot.solo,
+                        out_pair: Some(slot.out_pair),
+                        in_pair: slot.in_pair,
                     },
                     fx,
                     midi_learn,
@@ -1776,9 +2368,14 @@ impl App {
         project::Project {
             version: 1,
             audio: project::Audio {
-                sample_rate: engine.map(|e| e.sample_rate).unwrap_or(48_000),
-                buffer_size: engine.map(|e| e.buffer_size).unwrap_or(256),
-                backend: engine.map(|e| e.backend.label().to_string()).unwrap_or_default(),
+                // Settings, not the live engine: sample rate, buffer and backend
+                // only take effect on the next start, so the engine still runs
+                // the *previous* values. Saving those threw away the change the
+                // user just made. The device is the other way round — it moves
+                // live, so the engine knows the real one.
+                sample_rate: self.ui.audio.sample_rate,
+                buffer_size: self.ui.audio.buffer_size,
+                backend: self.ui.audio.backend.clone(),
                 output_device: engine.and_then(|e| e.output_device().map(|d| d.to_string())),
                 osc_port: self.osc_port,
                 disabled_midi_inputs: self.midi_disabled.clone(),
@@ -1789,6 +2386,200 @@ impl App {
             },
             plugin_paths: self.plugin_paths.clone(),
             rack,
+        }
+    }
+
+    /// Rebuild everything from a project file: settings first (they decide what
+    /// the rack is rebuilt *into*), then the tabs.
+    ///
+    /// Missing pieces are reported and skipped, never fatal — a project written
+    /// on another machine will be missing plugins, and losing one tab beats
+    /// refusing to open the file.
+    fn apply_project(&mut self, p: project::Project) {
+        // ── Configuration ────────────────────────────────────────────────
+        // Skipped when the user asked for the rack alone: a project written on
+        // another machine carries plugin paths and interface settings that are
+        // right *there*, and taking them over is rarely what you want when you
+        // only came for the sound.
+        if self.load_rack_only {
+            self.apply_project_rack(p);
+            return;
+        }
+        self.plugin_paths = p.plugin_paths.clone();
+        self.plugin_paths.save();
+        self.discover_synths(false);
+
+        self.ui.text_color = p.interface.text_color;
+        if let Some(lang) = i18n::Lang::from_code(&p.interface.language) {
+            self.ui.language = lang;
+        }
+        self.ui.apply();
+        self.ui.save();
+
+        self.midi_disabled = p.audio.disabled_midi_inputs.clone();
+        self.connect_midi();
+        if p.audio.osc_port != self.osc_port {
+            match p.audio.osc_port {
+                Some(port) => self.start_osc(port),
+                None => self.stop_osc(),
+            }
+        }
+
+        self.apply_project_rack(p);
+    }
+
+    /// The sound half of a project: tabs, instruments, FX, mixer, routing and
+    /// MIDI-learn bindings. Nothing here touches choz's own configuration.
+    fn apply_project_rack(&mut self, p: project::Project) {
+        // Drop the live rack first: `rebuild_rack` appends engine slots and
+        // assumes it starts from nothing.
+        while !self.slots.is_empty() {
+            self.remove_slot(self.slots.len() - 1);
+        }
+        self.cc_bindings.clear();
+        self.pc_bindings.clear();
+
+        for (idx, slot) in p.rack.iter().enumerate() {
+            let mut rack = RackSlot::new(AudioSource::Midi);
+            rack.input = slot.input.as_ref().and_then(|s| match s.strip_prefix("MIDI:") {
+                Some(name) => Some(InputRef::Midi(name.to_string())),
+                None if s == "OSC" => Some(InputRef::Osc),
+                None => None,
+            });
+            rack.source = self.project_source(&slot.instrument, idx);
+            if let AudioSource::Sf2 { path, .. } = &rack.source {
+                rack.presets = sources::list_sf2_presets(path).unwrap_or_default();
+                rack.preset_cursor = slot
+                    .instrument
+                    .preset
+                    .map(|pr| rack.presets.iter().position(|x| x.preset == pr).unwrap_or(0))
+                    .unwrap_or(0);
+            }
+            if let AudioSource::Plugin { id, .. } = &rack.source {
+                if let Some(entry) = self.synths.iter().find(|s| s.id == *id) {
+                    rack.instr_params =
+                        choz_engine::read_plugin_params(entry.format, &entry.path, &entry.id);
+                }
+                rack.instr_values = slot.instrument.params.clone();
+            }
+            rack.fx_chain = slot.fx.iter().filter_map(|f| self.project_fx(f)).collect();
+            rack.gain = slot.mixer.gain;
+            rack.pan = slot.mixer.pan;
+            rack.mute = slot.mixer.mute;
+            rack.solo = slot.mixer.solo;
+            rack.out_pair = slot.mixer.out_pair.unwrap_or((0, 1));
+            rack.in_pair = slot.mixer.in_pair;
+            self.slots.push(rack);
+
+            for b in &slot.midi_learn {
+                self.cc_bindings.push((b.cc, b.target));
+            }
+        }
+
+        // The working copy has to point at a real tab before anything draws.
+        self.active_slot = 0;
+        self.source = self.slots.first().map(|s| s.source.clone()).unwrap_or(AudioSource::Midi);
+        self.fx_chain = self.slots.first().map(|s| s.fx_chain.clone()).unwrap_or_default();
+        self.fx_slot = 0;
+        self.fx_param = 0;
+
+        self.rebuild_rack();
+        eprintln!("choz: loaded {} tab(s)", self.slots.len());
+    }
+
+    /// The instrument of a loaded tab. Anything that can't be found any more
+    /// leaves the tab empty rather than failing the whole load.
+    fn project_source(&self, instr: &project::Instrument, tab: usize) -> AudioSource {
+        match instr.kind.as_str() {
+            "sf2" => match &instr.path {
+                Some(path) => AudioSource::Sf2 {
+                    path: path.clone(),
+                    bank: instr.bank.unwrap_or(0),
+                    preset: instr.preset.unwrap_or(0),
+                },
+                None => AudioSource::Midi,
+            },
+            "wav" => match &instr.path {
+                Some(path) => AudioSource::AudioFile { path: path.clone(), looping: true },
+                None => AudioSource::Midi,
+            },
+            "plugin" => {
+                let id = instr.id.clone().unwrap_or_default();
+                match self.synths.iter().find(|s| s.id == id) {
+                    Some(entry) => AudioSource::Plugin {
+                        id,
+                        format: entry.format.label().to_string(),
+                        name: entry.name.clone(),
+                    },
+                    None => {
+                        eprintln!("choz: tab {}: plugin {id} is not installed", tab + 1);
+                        AudioSource::Midi
+                    }
+                }
+            }
+            _ => AudioSource::Midi,
+        }
+    }
+
+    /// One FX of a loaded chain, built-in or hosted. `None` drops the entry.
+    fn project_fx(&self, fx: &project::Fx) -> Option<AudioFxEntry> {
+        let mut entry = match (&fx.plugin_path, &fx.plugin_id) {
+            (Some(path), Some(id)) => {
+                let Some(p) = self
+                    .fx_plugins
+                    .iter()
+                    .find(|p| p.id == *id && p.path == *path)
+                    .or_else(|| self.fx_plugins.iter().find(|p| p.id == *id))
+                else {
+                    eprintln!("choz: FX plugin {id} is not installed");
+                    return None;
+                };
+                let mut plugin = p.clone();
+                plugin.params =
+                    choz_engine::read_plugin_params(plugin.format, &plugin.path, &plugin.id);
+                AudioFxEntry::new_plugin(plugin)
+            }
+            _ => match source::AudioFxKind::from_id(&fx.kind) {
+                Some(kind) => AudioFxEntry::new(kind),
+                None => {
+                    eprintln!("choz: unknown FX '{}'", fx.kind);
+                    return None;
+                }
+            },
+        };
+        entry.enabled = fx.enabled;
+        entry.wet = fx.wet;
+        // Knob count is decided by the plugin/built-in, not the file: an old
+        // project with fewer (or more) values keeps the rest at their defaults.
+        for (i, v) in fx.params.iter().enumerate() {
+            if let Some(slot) = entry.params.get_mut(i) {
+                *slot = *v;
+            }
+        }
+        Some(entry)
+    }
+
+    /// File \u{2192} Open project: pick the file, then rebuild from it.
+    fn open_load_project(&mut self) {
+        let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let mut modal = Modal::new(
+            ModalKind::LoadProject,
+            views::modal::ListModal::new("OPEN PROJECT", Vec::new()),
+        );
+        modal.browser = Some(file_browser::FileBrowser::open(&start, &["yml", "yaml"]));
+        modal.list.actions = vec![(i18n::t("RACK ONLY").to_string(), 'k')];
+        modal.list.note =
+            "  a project also carries plugin paths, colour, language and audio settings"
+                .to_string();
+        self.modal = Some(modal);
+        self.load_rack_only = false;
+        self.refresh_modal();
+    }
+
+    fn load_project_from(&mut self, path: &std::path::Path) {
+        match project::Project::load(path) {
+            Ok(p) => self.apply_project(p),
+            Err(e) => eprintln!("choz: {e}"),
         }
     }
 
@@ -1815,26 +2606,21 @@ impl App {
     // ── MIDI learn ────────────────────────────────────────────────────────
 
     /// Arm pointer learn: the next click on a rack control picks what to bind.
-    /// Bare mouse motion has to be requested from the terminal (crossterm only
-    /// enables drag reporting), so choz turns mode 1003 on here and off again
-    /// when learn ends — outside learn the mouse behaves exactly as before.
+    /// `EnableMouseCapture` already turns on any-motion reporting (mode 1003),
+    /// so learn touches no terminal mode of its own — sending `?1003l` on exit
+    /// killed mouse reporting outright on terminals that keep one mouse-mode.
     fn start_learn_pick(&mut self) {
         if self.slots.is_empty() {
             return;
         }
         self.learn_pick = true;
         self.learn = None;
-        print!("\u{1b}[?1003h");
-        let _ = io::Write::flush(&mut io::stdout());
     }
 
-    /// Leave learn entirely (bound, or cancelled): motion reporting off, normal
-    /// mouse behaviour back.
+    /// Leave learn entirely (bound, or cancelled).
     fn end_learn(&mut self) {
         self.learn_pick = false;
         self.learn = None;
-        print!("\u{1b}[?1003l");
-        let _ = io::Write::flush(&mut io::stdout());
     }
 
     /// What the INPUTS panel should say about learn, if anything.
@@ -1935,8 +2721,23 @@ impl App {
     /// A control change arrived: bind it if learn is armed, otherwise drive
     /// every rack control already bound to that CC.
     fn apply_cc(&mut self, cc: u8, value: u8) {
+        // Bank Select rides along with every program change a controller's
+        // buttons send, so it is the first CC to arrive after arming learn —
+        // and it would steal the binding from the fader the user is moving.
+        // Nothing is ever assigned to it: it carries no position of its own.
+        if BANK_SELECT_CCS.contains(&cc) {
+            return;
+        }
         if let Some(target) = self.learn.take() {
-            self.cc_bindings.retain(|(c, t)| *c != cc && *t != target);
+            // FX bindings are scoped to their FX unit: the same fader can drive
+            // 1:REVERB Room *and* 2:TUBE Drive, and the selected unit decides
+            // which one it moves. Everything else (VOL, PAN, buttons) is one CC
+            // one control, so a new binding evicts the old.
+            let coexists = |t: &LearnTarget| match (fx_scope(t), fx_scope(&target)) {
+                (Some(a), Some(b)) => a != b,
+                _ => false,
+            };
+            self.cc_bindings.retain(|(c, t)| (*c != cc || coexists(t)) && *t != target);
             self.cc_bindings.push((cc, target));
             eprintln!("choz: CC {cc} -> {}", self.learn_label(&target));
             // Assignment done: back to the normal pointer and event flow.
@@ -1967,9 +2768,17 @@ impl App {
                     }
                     self.push_mix();
                 }
+                LearnTarget::InstrParam { slot, param } => {
+                    self.set_slot_instr_param(slot, param, v);
+                }
                 LearnTarget::FxParam { slot, fx, param } => {
                     if slot != self.active_slot {
                         // Only the active tab has a live working copy of its chain.
+                        continue;
+                    }
+                    if fx != self.fx_slot {
+                        // The selected FX unit owns the fader; the same CC bound
+                        // to another unit stays quiet until that unit is picked.
                         continue;
                     }
                     let Some(entry) = self.fx_chain.get_mut(fx) else { continue };
@@ -1979,11 +2788,17 @@ impl App {
                     if is_mix {
                         entry.wet = v;
                     }
-                    if entry.clap.is_some() {
-                        let idx = if is_mix { choz_engine::FX_MIX_PARAM } else { param };
-                        self.set_live_fx_param(fx, idx, v);
-                    } else {
-                        self.rebuild_fx();
+                    let native = entry.plugin.is_none();
+                    let idx = if is_mix { choz_engine::FX_MIX_PARAM } else { param };
+                    self.set_live_fx_param(fx, idx, v);
+                    if native {
+                        // Built-in FX that don't implement `set_param` only pick
+                        // the value up when the chain is rebuilt — but a fader
+                        // sends ~100 CCs a second, and rebuilding per message
+                        // floods the command ring (note-offs get dropped: notes
+                        // hang) and re-instantiates hosted plugins. Mark it and
+                        // rebuild once per drain instead.
+                        self.fx_dirty = true;
                     }
                 }
             }
@@ -2011,10 +2826,119 @@ impl App {
         self.slots.iter().position(|s| s.input.as_ref() == Some(input))
     }
 
+    /// Every row of the IN drawer: the note inputs first, then the audio
+    /// capture pairs of the running device — the same shape the OUT drawer uses
+    /// for playback pairs.
+    fn in_targets(&self) -> Vec<(InTarget, views::source_panel::InputRow)> {
+        use views::source_panel::InputRow;
+        let row = |kind, name: String, connected, bound_tab| InputRow {
+            kind, name, connected, bound_tab, header: false,
+        };
+        let header = |name: &str| InputRow {
+            kind: "", name: name.to_string(), connected: false, bound_tab: None, header: true,
+        };
+        let mut rows = vec![(InTarget::None, header(i18n::t("NOTE IN")))];
+        for (i, input) in self.input_list().iter().enumerate() {
+            rows.push((
+                InTarget::Note(i),
+                row(input.kind(), input.name().to_string(), self.input_is_connected(input), self.bound_tab(input)),
+            ));
+        }
+
+        // Audio in only exists on the native JACK client; cpal gives none, and
+        // then the section is a single "no capture" row.
+        let channels = self.audio_engine.as_ref().map(|e| e.input_channels()).unwrap_or(0);
+        rows.push((InTarget::None, header(&format!("{} ({channels})", i18n::t("AUDIO IN")))));
+        // The capture device is its own choice: on a plain sound card playback
+        // and capture are different graph nodes, so following the output would
+        // leave the rack with no inputs at all.
+        let live_in = self.audio_engine.as_ref().and_then(|e| e.input_device()).map(str::to_string);
+        for (i, name) in self.in_devices.iter().enumerate() {
+            rows.push((
+                InTarget::Device(i),
+                row("AUDIO", name.clone(), Some(name) == live_in.as_ref(), None),
+            ));
+        }
+        let active = self.slots.get(self.active_slot).and_then(|s| s.in_pair);
+        rows.push((
+            InTarget::NoCapture,
+            row("AUDIO", i18n::t("(instrument)").to_string(), active.is_none(), None),
+        ));
+        for pair in 0..(channels / 2) {
+            let (l, r) = (pair * 2, pair * 2 + 1);
+            let tab = self.slots.iter().position(|s| s.in_pair == Some((l, r)));
+            rows.push((
+                InTarget::Capture(pair),
+                row("AUDIO", format!("{}/{}", l + 1, r + 1), active == Some((l, r)), tab),
+            ));
+        }
+        rows
+    }
+
+    /// Act on the IN drawer row under the cursor.
+    fn in_select(&mut self, row: usize) {
+        let Some((target, _)) = self.in_targets().into_iter().nth(row) else { return };
+        match target {
+            InTarget::None => {}
+            InTarget::Note(_) => self.bind_selected_input(),
+            InTarget::Device(i) => {
+                if let Some(name) = self.in_devices.get(i).cloned() {
+                    self.set_input_device(&name);
+                }
+            }
+            InTarget::Capture(pair) => self.set_active_capture(Some((pair * 2, pair * 2 + 1))),
+            InTarget::NoCapture => self.set_active_capture(None),
+        }
+    }
+
+    /// Point choz's capture ports at another device. The JACK client is rebuilt,
+    /// so the rack has to be recreated exactly like an output change.
+    fn set_input_device(&mut self, name: &str) {
+        self.persist_active();
+        match self.audio_engine.as_mut().map(|e| e.set_input_device(name)) {
+            Some(Ok(true)) => self.rebuild_rack(),
+            Some(Ok(false)) => {}
+            Some(Err(e)) => {
+                eprintln!("choz: {e}");
+                return;
+            }
+            None => return,
+        }
+        self.ui.audio.input_device = name.to_string();
+        self.ui.save();
+        self.refresh_in_devices();
+    }
+
+    /// Re-read the capture devices the graph publishes.
+    fn refresh_in_devices(&mut self) {
+        if let Some(engine) = self.audio_engine.as_ref() {
+            self.in_devices = engine.input_devices();
+        }
+    }
+
+    /// Feed the active tab from a capture pair (or put it back on its own
+    /// instrument). A tab can only have one source of sound, so this is a swap.
+    fn set_active_capture(&mut self, pair: Option<(usize, usize)>) {
+        let idx = self.active_slot;
+        let Some(slot) = self.slots.get_mut(idx) else { return };
+        slot.in_pair = pair;
+        if let Some(ref mut engine) = self.audio_engine {
+            engine.set_slot_in(idx, pair);
+        }
+    }
+
+    /// The note input the cursor sits on, if it's on one at all.
+    fn selected_input(&self) -> Option<InputRef> {
+        match self.in_targets().get(self.input_cursor)?.0 {
+            InTarget::Note(i) => self.input_list().get(i).cloned(),
+            _ => None,
+        }
+    }
+
     /// Enter on the input list: jump to the tab already bound to this input, or
     /// create a new (instrument-less) tab bound to it.
     fn bind_selected_input(&mut self) {
-        let Some(input) = self.input_list().get(self.input_cursor).cloned() else { return };
+        let Some(input) = self.selected_input() else { return };
         if let Some(tab) = self.bound_tab(&input) {
             self.switch_slot(tab);
             self.focus = Focus::FxChain;
@@ -2037,7 +2961,7 @@ impl App {
 
     /// `c` on the input list: connect/disconnect that input.
     fn toggle_selected_input(&mut self) {
-        let Some(input) = self.input_list().get(self.input_cursor).cloned() else { return };
+        let Some(input) = self.selected_input() else { return };
         match input {
             InputRef::Midi(name) => {
                 match self.midi_disabled.iter().position(|n| *n == name) {
@@ -2063,24 +2987,25 @@ impl App {
         Some(self.active_slot)
     }
 
-    /// Load the CLAP instrument at `i` into the active tab.
+    /// Load the plugin instrument at `i` into the active tab.
     fn load_synth(&mut self, i: usize) {
         let Some(entry) = self.synths.get(i).cloned() else { return };
         let Some(slot) = self.ensure_slot() else { return };
         let loaded = match self.audio_engine.as_mut() {
-            Some(engine) => engine.load_clap(slot, &entry.path, &entry.id),
+            Some(engine) => engine.load_plugin(slot, entry.format, &entry.path, &entry.id),
             None => return,
         };
         match loaded {
             Ok(()) => {
                 self.set_active_source(AudioSource::Plugin {
                     id: entry.id.clone(),
-                    format: entry.format,
+                    format: entry.format.label().to_string(),
                     name: entry.name,
                 });
                 // Read the plugin's own parameters so the INSTR editor can show
                 // them; knobs start where the plugin says its defaults are.
-                let params = choz_engine::read_clap_params(&entry.path, &entry.id);
+                let params =
+                    choz_engine::read_plugin_params(entry.format, &entry.path, &entry.id);
                 let values = params.iter().map(|p| p.normalised(p.default) as f32).collect();
                 if let Some(s) = self.slots.get_mut(slot) {
                     s.instr_params = params;
@@ -2094,7 +3019,12 @@ impl App {
     /// Set instrument parameter `index` of the active tab to `value` (0..1) and
     /// push it to the live plugin — no reload, like the FX knobs.
     fn set_instr_param(&mut self, index: usize, value: f32) {
-        let slot = self.active_slot;
+        self.set_slot_instr_param(self.active_slot, index, value);
+    }
+
+    /// Same, for a named tab — MIDI learn can drive a plugin on any tab, not
+    /// only the one on screen.
+    fn set_slot_instr_param(&mut self, slot: usize, index: usize, value: f32) {
         let value = value.clamp(0.0, 1.0);
         match self.slots.get_mut(slot).and_then(|s| s.instr_values.get_mut(index)) {
             Some(v) => *v = value,
@@ -2157,6 +3087,24 @@ impl App {
         self.fx_chain = Vec::new();
         self.fx_slot = 0;
         self.fx_param = 0;
+    }
+
+    /// The `+` on the tab bar: a second configuration for the input the active
+    /// tab already listens to. Both tabs stay bound to that port, but only the
+    /// active one is fed (see [`note_targets`]), so switching tabs switches the
+    /// whole instrument + FX + MIDI-learn setup on the same controller.
+    fn add_slot_on_active_input(&mut self) {
+        let input = self.slots.get(self.active_slot).and_then(|s| s.input.clone());
+        if let Some(engine) = self.audio_engine.as_mut() {
+            if engine.add_silent().is_none() {
+                eprintln!("choz: rack full");
+                return;
+            }
+        }
+        self.push_slot(AudioSource::Midi);
+        if let Some(slot) = self.slots.last_mut() {
+            slot.input = input;
+        }
     }
 
     /// Remove the active slot from the rack and the engine.
@@ -2231,19 +3179,50 @@ impl App {
         }
     }
 
-    /// Move audio output to `name` and rebuild the rack on the new stream.
-    /// Switching devices tears the old stream down, so every slot is recreated
-    /// here from the UI's own model (instruments are reloaded from disk).
+    /// A controller button that sends program change instead of CC. The program
+    /// number is the button's identity: learn binds it to a trigger, a bound
+    /// button fires that trigger, and every other program change is ignored —
+    /// the controller does not get to pick the preset on its own.
+    fn apply_program_button(&mut self, program: u8) {
+        // Only buttons (triggers) bind here; a fader target stays armed, so a
+        // stray program change can't steal the binding the user is aiming at.
+        if let Some(target @ LearnTarget::Trigger(_)) = self.learn {
+            self.pc_bindings.retain(|(p, t)| *p != program && *t != target);
+            self.pc_bindings.push((program, target));
+            eprintln!("choz: PC {program} -> {}", self.learn_label(&target));
+            self.end_learn();
+            return;
+        }
+        for (_, target) in self.pc_bindings.clone().iter().filter(|(p, _)| *p == program) {
+            if let LearnTarget::Trigger(action) = *target {
+                self.fire_trigger(action);
+            }
+        }
+    }
+
+    /// Move audio output to `name`, rebuilding the rack when the switch had to
+    /// tear the stream down (every slot goes with it, so they are recreated here
+    /// from the UI's own model and instruments are reloaded from disk). On JACK
+    /// the engine just re-patches ports and there is nothing to rebuild.
     fn set_output_device(&mut self, name: &str) {
         self.persist_active();
-        if let Some(ref mut engine) = self.audio_engine {
-            if let Err(e) = engine.set_output_device(name) {
+        match self.audio_engine.as_mut().map(|e| e.set_output_device(name)) {
+            Some(Ok(true)) => {}
+            Some(Ok(false)) => return,
+            Some(Err(e)) => {
                 eprintln!("choz: {e}");
                 return;
             }
-        } else {
-            return;
+            None => return,
         }
+        self.rebuild_rack();
+    }
+
+    /// Create one engine slot per rack tab and fill it from the UI model:
+    /// instrument, FX chain with its knobs, mixer and routing. The engine side
+    /// is assumed empty — this runs after something dropped it (an output
+    /// device change) or after a project was loaded.
+    fn rebuild_rack(&mut self) {
         let slots = self.slots.clone();
         for (i, slot) in slots.iter().enumerate() {
             let Some(ref mut engine) = self.audio_engine else { return };
@@ -2257,8 +3236,9 @@ impl App {
                 AudioSource::Plugin { id, .. } => {
                     match self.synths.iter().find(|s| s.id == *id) {
                         Some(entry) => {
-                            let (path, id) = (entry.path.clone(), entry.id.clone());
-                            engine.load_clap(i, &path, &id)
+                            let (fmt, path, id) =
+                                (entry.format, entry.path.clone(), entry.id.clone());
+                            engine.load_plugin(i, fmt, &path, &id)
                         }
                         None => Err(anyhow::anyhow!("plugin {id} is no longer available")),
                     }
@@ -2277,6 +3257,9 @@ impl App {
             }
         }
         self.push_mix();
+        // Engine slots are new after a reload, so they start on the default
+        // pair — put every tab back where the user routed it.
+        self.apply_routing();
     }
 
     /// One-line summary of the active tab: position, instrument and bound input.
@@ -2322,6 +3305,11 @@ impl App {
     fn instrument_label(&self) -> String {
         if self.slots.is_empty() {
             return "(no rack tab)".to_string();
+        }
+        // A tab fed by live audio ignores its instrument, so say so instead of
+        // naming a plugin that isn't being heard.
+        if let Some((l, r)) = self.slots.get(self.active_slot).and_then(|s| s.in_pair) {
+            return format!("{} {}/{}", i18n::t("AUDIO IN"), l + 1, r + 1);
         }
         match &self.source {
             AudioSource::Midi => "(none)".to_string(),
@@ -2427,7 +3415,20 @@ impl App {
         // `InputSource::Midi(i)` indexes this list, so it must stay exactly as
         // `connect_inputs` returned it.
         self.midi_connected = connected;
-        self.input_cursor = self.input_cursor.min(self.input_list().len().saturating_sub(1));
+        self.input_cursor = self.input_cursor.min(self.in_targets().len().saturating_sub(1));
+    }
+
+    /// Reconnect when a controller is plugged in or unplugged while choz runs.
+    /// ponytail: polling the port list beats a udev/ALSA-monitor thread — the
+    /// scan is an ALSA client open, cheap at 0.5 Hz.
+    fn poll_midi_hotplug(&mut self) {
+        if self.audio_engine.is_none() || self.midi_scan_at.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.midi_scan_at = Instant::now();
+        if midi::list_input_ports() != self.midi_ports {
+            self.connect_midi();
+        }
     }
 
     /// Start the OSC listener on `port` (0 = let the OS pick). Failure is
@@ -2463,19 +3464,46 @@ impl App {
     /// Forward any received off-thread input (MIDI, OSC): notes go to the rack
     /// tabs bound to their input (real note-offs, so no auto-off tracking
     /// needed), control messages are applied like the equivalent UI action.
+    /// Performance data that rides along with the notes: pedals and wheels.
+    /// Resolved to slots before the engine borrow, like the notes themselves.
     fn drain_midi(&mut self) {
+        enum Expr {
+            Cc(u8, u8),
+            Bend(u16),
+        }
+
         let events: Vec<midi::InputEvent> = self.note_rx.try_iter().collect();
         if events.is_empty() {
             return;
         }
         let mut controls = Vec::new();
         let mut ccs = Vec::new();
-        // Resolve routing first: note_targets borrows self immutably.
+        // Resolve routing first: note_targets borrows self immutably. Pedals,
+        // the modulation wheel and the bend wheel follow the notes they belong
+        // to, so they go to the same slots.
         let mut routed = Vec::new();
+        let mut expression = Vec::new();
+        // Program numbers — the buttons on a controller keyboard. They act on
+        // the rack (via learn bindings), not on the slot's preset, so the input
+        // routing doesn't matter here.
+        let mut programs: Vec<u8> = Vec::new();
         for event in events {
+            // Log first, so the monitor shows everything that arrived, including
+            // messages no slot is bound to.
+            if self.midi_log.len() == MIDI_LOG_MAX {
+                self.midi_log.pop_front();
+            }
+            self.midi_log.push_back(event);
             match event {
                 midi::InputEvent::Note(msg) => routed.push((self.note_targets(msg.source), msg)),
-                midi::InputEvent::Cc(c) => ccs.push(c),
+                midi::InputEvent::Cc(c) => {
+                    expression.push((self.note_targets(c.source), Expr::Cc(c.cc, c.value)));
+                    ccs.push(c);
+                }
+                midi::InputEvent::Bend(b) => {
+                    expression.push((self.note_targets(b.source), Expr::Bend(b.value)));
+                }
+                midi::InputEvent::Program(p) => programs.push(p.program),
                 midi::InputEvent::Control(c) => controls.push(c),
             }
         }
@@ -2489,12 +3517,31 @@ impl App {
                     }
                 }
             }
+            for (targets, e) in expression {
+                for slot in targets {
+                    match e {
+                        Expr::Cc(cc, value) => engine.control_change(slot, cc, value),
+                        Expr::Bend(value) => engine.pitch_bend(slot, value),
+                    }
+                }
+            }
         }
+        for program in programs {
+            self.apply_program_button(program);
+        }
+        // A CC reaching the instrument does not stop it from also driving a
+        // MIDI-learn binding: the same sustain pedal can hold notes *and* be
+        // assigned to a rack control.
         for c in ccs {
             self.apply_cc(c.cc, c.value);
         }
         for c in controls {
             self.apply_control(c);
+        }
+        // One rebuild for the whole batch, whatever it took to dirty the chain.
+        if self.fx_dirty {
+            self.fx_dirty = false;
+            self.rebuild_fx();
         }
     }
 
@@ -2541,11 +3588,11 @@ impl App {
                 if is_mix {
                     entry.wet = value;
                 }
-                if entry.clap.is_some() {
-                    let param = if is_mix { choz_engine::FX_MIX_PARAM } else { p_idx };
-                    self.set_live_fx_param(fx_idx, param, value);
-                } else {
-                    self.rebuild_fx();
+                let native = entry.plugin.is_none();
+                let param = if is_mix { choz_engine::FX_MIX_PARAM } else { p_idx };
+                self.set_live_fx_param(fx_idx, param, value);
+                if native {
+                    self.fx_dirty = true;
                 }
             }
         }
@@ -2584,12 +3631,19 @@ struct Cli {
     /// Whether `--osc-port` was actually passed (it overrides the settings).
     osc_port_given: bool,
     file: Option<std::path::PathBuf>,
+    /// A project file to open at startup.
+    project: Option<std::path::PathBuf>,
 }
 
 impl Cli {
     fn from_args() -> Self {
         let mut cli =
-            Cli { osc_port: choz_engine::osc::DEFAULT_PORT, osc_port_given: false, file: None };
+            Cli {
+                osc_port: choz_engine::osc::DEFAULT_PORT,
+                osc_port_given: false,
+                file: None,
+                project: None,
+            };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -2602,13 +3656,16 @@ impl Cli {
                 },
                 _ => {
                     let path = std::path::PathBuf::from(&arg);
-                    let ext_ok = path.extension().is_some_and(|e| {
-                        e.eq_ignore_ascii_case("wav") || e.eq_ignore_ascii_case("sf2")
-                    });
-                    if ext_ok {
-                        cli.file = Some(path);
-                    } else {
-                        eprintln!("choz: ignoring '{arg}' (expected a .wav or .sf2 file)");
+                    let ext = path
+                        .extension()
+                        .map(|e| e.to_string_lossy().to_lowercase())
+                        .unwrap_or_default();
+                    match ext.as_str() {
+                        "wav" | "sf2" => cli.file = Some(path),
+                        "yml" | "yaml" => cli.project = Some(path),
+                        _ => eprintln!(
+                            "choz: ignoring '{arg}' (expected a .wav, .sf2 or .yml project)"
+                        ),
                     }
                 }
             }
@@ -2618,6 +3675,14 @@ impl Cli {
 }
 
 fn main() -> Result<()> {
+    // Scan worker: a child of this same binary, probing one plugin directory so
+    // a plugin that segfaults doesn't take the app with it. Must come before
+    // anything touches the terminal, the log or the audio device — its stdout
+    // is the result.
+    if choz_engine::worker_main() {
+        return Ok(());
+    }
+
     // Send stderr (all eprintln! + panics) to a log file so it never corrupts
     // the TUI. Tell the user where it is before we grab the terminal.
     if let Some(path) = log::redirect_stderr() {
@@ -2625,9 +3690,11 @@ fn main() -> Result<()> {
     }
 
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
+    // Draw through a private duplicate of the terminal; fd 1 now belongs to the
+    // log, so a chatty plugin can't paint over the UI.
+    let mut screen = io::BufWriter::new(log::take_terminal()?);
+    execute!(screen, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(screen);
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new();
@@ -2635,8 +3702,6 @@ fn main() -> Result<()> {
 
     let result = run_app(&mut terminal, &mut app);
 
-    // Leave any-motion reporting off, whatever state learn was left in.
-    print!("\u{1b}[?1003l");
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -2648,7 +3713,9 @@ fn main() -> Result<()> {
     result
 }
 
-fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
+type Screen = io::BufWriter<std::fs::File>;
+
+fn run_app(terminal: &mut Terminal<CrosstermBackend<Screen>>, app: &mut App) -> Result<()> {
     let splash_start = Instant::now();
     let splash_deadline = splash_start + std::time::Duration::from_secs(3);
 
@@ -2667,6 +3734,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                 if !audio.device.is_empty() {
                     eng.set_output_device_preference(&audio.device);
                 }
+                if !audio.input_device.is_empty() {
+                    eng.set_input_device_preference(&audio.input_device);
+                }
                 if eng.start().is_ok() {
                     app.audio_engine = Some(eng);
                     app.connect_midi();
@@ -2679,6 +3749,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                     }
                     app.apply_osc_settings();
                     app.discover_synths(false);
+                    app.refresh_in_devices();
+                    // A project rebuilds the whole rack, so it goes first and a
+                    // file argument still lands on the tab that ends up active.
+                    if let Some(path) = cli.project {
+                        app.load_project_from(&path);
+                    }
                     if let Some(path) = cli.file {
                         app.load_source(path);
                     }
@@ -2690,8 +3766,10 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
         }
 
         handle_events(app)?;
+        app.poll_midi_hotplug();
         app.drain_midi();
         app.tick_notes();
+        app.poll_editor();
     }
     Ok(())
 }
@@ -2770,12 +3848,18 @@ fn handle_key(app: &mut App, key: KeyCode) {
         return;
     }
 
+    // Drawers: F2 for IN (left), F3 for OUT (right).
+    if key == KeyCode::F(2) {
+        app.toggle_in_drawer();
+        return;
+    }
+    if key == KeyCode::F(3) {
+        app.toggle_out_drawer();
+        return;
+    }
+
     if key == KeyCode::Tab {
-        app.focus = match app.focus {
-            Focus::Source => Focus::FxChain,
-            Focus::FxChain => Focus::Transport,
-            Focus::Transport => Focus::Source,
-        };
+        app.focus = next_focus(app.focus, app.in_open, app.out_open);
         return;
     }
 
@@ -2783,7 +3867,24 @@ fn handle_key(app: &mut App, key: KeyCode) {
         Focus::Source => handle_source_keys(app, key),
         Focus::FxChain => handle_fx_keys(app, key),
         Focus::Transport => handle_transport_keys(app, key),
+        Focus::Output => handle_output_keys(app, key),
     }
+}
+
+/// Tab order, skipping whichever drawer is shut — a closed drawer has nothing
+/// to focus, so Tab must not park on it.
+fn next_focus(focus: Focus, in_open: bool, out_open: bool) -> Focus {
+    let order = [Focus::Source, Focus::FxChain, Focus::Transport, Focus::Output];
+    let open = |f: Focus| match f {
+        Focus::Source => in_open,
+        Focus::Output => out_open,
+        _ => true,
+    };
+    let at = order.iter().position(|f| *f == focus).unwrap_or(1);
+    (1..=order.len())
+        .map(|step| order[(at + step) % order.len()])
+        .find(|f| open(*f))
+        .unwrap_or(Focus::FxChain)
 }
 
 /// Keys for whichever modal is open. Navigation is the same everywhere;
@@ -2868,6 +3969,27 @@ fn handle_modal_key(app: &mut App, key: KeyCode) {
             }
             return;
         }
+        // Take the rack out of the project and leave the settings alone.
+        KeyCode::Char('k') if kind == ModalKind::LoadProject => {
+            app.load_rack_only = !app.load_rack_only;
+            if let Some(m) = app.modal.as_mut() {
+                m.list.note = if app.load_rack_only {
+                    "  RACK ONLY: choz keeps its own paths, colour, language and audio"
+                        .to_string()
+                } else {
+                    "  a project also carries plugin paths, colour, language and audio settings"
+                        .to_string()
+                };
+            }
+            return;
+        }
+        // Learn the parameter under the cursor: any parameter of any hosted
+        // plugin can be driven by a CC, not just the FX chain's.
+        KeyCode::Char('l') if kind == ModalKind::InstrParams => {
+            app.learn = Some(LearnTarget::InstrParam { slot: app.active_slot, param: cursor });
+            app.close_modal();
+            return;
+        }
         // Rescan plugins from the SOURCE / ADD FX pickers.
         KeyCode::Char('r') if matches!(kind, ModalKind::Source | ModalKind::AddFx) => {
             app.discover_synths(true);
@@ -2895,14 +4017,13 @@ fn handle_modal_key(app: &mut App, key: KeyCode) {
 /// Presets moved out to the RACK's `[2:BANK/PRESET]` modal.
 fn handle_source_keys(app: &mut App, key: KeyCode) {
     match key {
-        KeyCode::Up => app.input_cursor = app.input_cursor.saturating_sub(1),
-        KeyCode::Down => {
-            app.input_cursor = (app.input_cursor + 1).min(app.input_list().len().saturating_sub(1));
-        }
-        // Bind the selected input to a rack tab (or jump to its tab).
-        KeyCode::Enter => app.bind_selected_input(),
+        KeyCode::Up => app.input_cursor = in_step(app, -1),
+        KeyCode::Down => app.input_cursor = in_step(app, 1),
+        // Bind a note input to a rack tab, or feed the tab from a capture pair.
+        KeyCode::Enter => app.in_select(app.input_cursor),
         KeyCode::Char('c') => app.toggle_selected_input(),
         KeyCode::Char('r') => app.connect_midi(),
+        KeyCode::Esc => app.toggle_in_drawer(),
         // The QWERTY piano plays the active tab from any panel.
         _ => {
             if let Some(note) = qwerty_note(key) {
@@ -2910,6 +4031,51 @@ fn handle_source_keys(app: &mut App, key: KeyCode) {
             }
         }
     }
+}
+
+/// Keys for the OUT drawer: pick which device the engine plays through.
+fn handle_output_keys(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Up => app.out_cursor = out_step(app, -1),
+        KeyCode::Down => app.out_cursor = out_step(app, 1),
+        KeyCode::Enter => app.out_select(app.out_cursor),
+        KeyCode::Char('r') => app.refresh_out_devices(),
+        KeyCode::Esc => app.toggle_out_drawer(),
+        // The QWERTY piano plays the active tab from any panel.
+        _ => {
+            if let Some(note) = qwerty_note(key) {
+                app.piano_note_on(note);
+            }
+        }
+    }
+}
+
+/// Move a drawer cursor by `step`, stepping over the section headers (which do
+/// nothing when selected) and stopping at the ends of the list.
+fn row_step<T: PartialEq>(rows: &[T], header: &T, start: usize, step: isize) -> usize {
+    let mut i = start as isize;
+    loop {
+        let next = i + step;
+        // Ran off the list with only headers in between: stay put rather than
+        // parking the cursor on a header.
+        if next < 0 || next as usize >= rows.len() {
+            return start;
+        }
+        i = next;
+        if rows[i as usize] != *header {
+            return i as usize;
+        }
+    }
+}
+
+fn out_step(app: &App, step: isize) -> usize {
+    let rows: Vec<OutTarget> = app.out_targets().into_iter().map(|(t, _)| t).collect();
+    row_step(&rows, &OutTarget::None, app.out_cursor, step)
+}
+
+fn in_step(app: &App, step: isize) -> usize {
+    let rows: Vec<InTarget> = app.in_targets().into_iter().map(|(t, _)| t).collect();
+    row_step(&rows, &InTarget::None, app.input_cursor, step)
 }
 
 /// Rack slots a note from `source` should reach.
@@ -2934,12 +4100,21 @@ fn note_targets(
             None => return Vec::new(),
         },
     };
-    bindings
+    let bound: Vec<usize> = bindings
         .iter()
         .enumerate()
         .filter(|(_, b)| **b == Some(&input))
         .map(|(i, _)| i)
-        .collect()
+        .collect();
+    // Several tabs on one port are alternative configurations of it, not a
+    // layer: the active one plays, the others stay silent until clicked. With a
+    // single tab bound this is the same list either way.
+    // When the active tab is elsewhere, the first of the group answers, so a
+    // port is never played by two tabs at once.
+    if bound.len() > 1 {
+        return vec![if bound.contains(&active_slot) { active_slot } else { bound[0] }];
+    }
+    bound
 }
 
 
@@ -2975,7 +4150,9 @@ fn slot_label(source: &AudioSource) -> String {
         AudioSource::Midi => "(empty)".to_string(),
         AudioSource::Sf2 { path, .. } => format!("SF2:{}", file_stem(path)),
         AudioSource::AudioFile { path, .. } => format!("WAV:{}", file_stem(path)),
-        AudioSource::Plugin { name, .. } => format!("CLAP:{name}"),
+        // The format is whatever loaded it — hardcoding CLAP here labelled
+        // every LV2/VST/DSSI/SFZ tab wrong once those formats landed.
+        AudioSource::Plugin { name, format, .. } => format!("{format}:{name}"),
     }
 }
 
@@ -3035,6 +4212,11 @@ fn handle_fx_keys(app: &mut App, key: KeyCode) {
         }
         // Parameters of the tab's own instrument (plugin instruments only).
         KeyCode::Char('p') => app.open_instr_modal(),
+        // The plugin's own window, for plugins that have one.
+        KeyCode::Char('4') | KeyCode::Char('g') => app.toggle_editor(None),
+        KeyCode::Char('G') => app.toggle_editor(Some(app.fx_slot)),
+        KeyCode::Char('x') => app.toggle_sandbox(None),
+        KeyCode::Char('X') => app.toggle_sandbox(Some(app.fx_slot)),
         KeyCode::Char('w') | KeyCode::Char('W') => adjust_fx_param(app, 0.05),
         KeyCode::Char('s') => adjust_fx_param(app, -0.05),
         // Mixer strip of the active slot.
@@ -3080,7 +4262,7 @@ fn adjust_fx_param(app: &mut App, delta: f32) {
     let Some(v) = entry.params.get_mut(param) else { return };
     *v = (*v + delta).clamp(0.0, 1.0);
     let value = *v;
-    let (is_plugin, is_mix) = (entry.clap.is_some(), entry.is_mix_param(param));
+    let (is_plugin, is_mix) = (entry.plugin.is_some(), entry.is_mix_param(param));
     if is_mix {
         entry.wet = value;
     }
@@ -3099,7 +4281,7 @@ fn handle_transport_keys(app: &mut App, key: KeyCode) {
     match key {
         KeyCode::Char(' ') => toggle_play(app),
         KeyCode::Char('s') => stop_play(app),
-        KeyCode::Char('o') => app.open_device_modal(),
+        KeyCode::Char('o') => app.toggle_out_drawer(),
         _ => {}
     }
 }
@@ -3133,7 +4315,9 @@ enum MouseAction {
     FxMoveRight,
     TransportPlay,
     TransportStop,
-    OpenDevicePicker,
+    ToggleInDrawer,
+    ToggleOutDrawer,
+    OutputDevice(usize),
     InputBind(usize),
     InputToggle(usize),
     OpenSourcePicker,
@@ -3141,8 +4325,13 @@ enum MouseAction {
     PresetStep(isize),
     OpenPresetPicker,
     OpenLearnPicker,
+    ToggleEditor,
+    ToggleFxEditor,
+    ToggleSandbox,
+    ToggleFxSandbox,
     RackTab(usize),
     RackTabClose(usize),
+    RackTabAdd,
     MixGain(f32),
     MixPan(f32),
     MixMute,
@@ -3161,7 +4350,18 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                 return MouseAction::TransportStop;
             }
 
+            if layout.in_close_rect.is_some_and(|r| r.contains(pos)) {
+                return MouseAction::ToggleInDrawer;
+            }
+            if layout.out_close_rect.is_some_and(|r| r.contains(pos)) {
+                return MouseAction::ToggleOutDrawer;
+            }
+
             if layout.source_area.contains(pos) {
+                // Shut, the whole strip is the handle: clicking it opens IN.
+                if layout.input_item_rects.is_empty() && layout.input_scan_rect.is_none() {
+                    return MouseAction::ToggleInDrawer;
+                }
                 if layout.input_scan_rect.is_some_and(|r| r.contains(pos)) {
                     return MouseAction::ScanInputs;
                 }
@@ -3187,6 +4387,8 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                             RackButton::Source => MouseAction::OpenSourcePicker,
                             RackButton::Preset => MouseAction::OpenPresetPicker,
                             RackButton::Learn => MouseAction::OpenLearnPicker,
+                            RackButton::Gui => MouseAction::ToggleEditor,
+                            RackButton::Sandbox => MouseAction::ToggleSandbox,
                             RackButton::PresetPrev => MouseAction::PresetStep(-1),
                             RackButton::PresetNext => MouseAction::PresetStep(1),
                         };
@@ -3202,6 +4404,9 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                     if rect.contains(pos) {
                         return MouseAction::RackTab(si);
                     }
+                }
+                if rack.tab_add.is_some_and(|r| r.contains(pos)) {
+                    return MouseAction::RackTabAdd;
                 }
                 if rack.mute.is_some_and(|r| r.contains(pos)) {
                     return MouseAction::MixMute;
@@ -3225,6 +4430,8 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                     (rack.del, MouseAction::FxDelete),
                     (rack.move_left, MouseAction::FxMoveLeft),
                     (rack.move_right, MouseAction::FxMoveRight),
+                    (rack.fx_gui, MouseAction::ToggleFxEditor),
+                    (rack.fx_sandbox, MouseAction::ToggleFxSandbox),
                 ] {
                     if rect.is_some_and(|r| r.contains(pos)) {
                         return action;
@@ -3235,9 +4442,21 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
 
             if layout.transport_area.contains(pos) {
                 if layout.out_device_rect.is_some_and(|r| r.contains(pos)) {
-                    return MouseAction::OpenDevicePicker;
+                    return MouseAction::ToggleOutDrawer;
                 }
                 return MouseAction::FocusPanel(Focus::Transport);
+            }
+
+            if layout.output_area.contains(pos) {
+                if layout.output_item_rects.is_empty() {
+                    return MouseAction::ToggleOutDrawer;
+                }
+                for &(di, rect) in layout.output_item_rects.iter() {
+                    if rect.contains(pos) {
+                        return MouseAction::OutputDevice(di);
+                    }
+                }
+                return MouseAction::FocusPanel(Focus::Output);
             }
 
             MouseAction::None
@@ -3268,11 +4487,12 @@ fn apply_menu_action(app: &mut App, action: menu::MenuAction) {
     use menu::MenuAction as A;
     match action {
         A::None => {}
-        A::OpenWav => app.open_browser_modal("wav"),
-        A::OpenSf2 => app.open_browser_modal("sf2"),
+        A::OpenWav => app.open_browser_modal(&["wav"]),
+        A::OpenSf2 => app.open_browser_modal(&["sf2", "sf3"]),
         A::Quit => app.quit = true,
         A::PluginPaths => app.open_paths_modal(),
         A::SaveProject => app.open_save_project(),
+        A::LoadProject => app.open_load_project(),
         A::RescanPlugins => {
             app.discover_synths(true);
             eprintln!("choz: rescanned plugin paths: {} found", app.plugins.len());
@@ -3411,14 +4631,17 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             app.focus = Focus::Transport;
             stop_play(app);
         }
-        MouseAction::OpenDevicePicker => {
-            app.focus = Focus::Transport;
-            app.open_device_modal();
+        MouseAction::ToggleInDrawer => app.toggle_in_drawer(),
+        MouseAction::ToggleOutDrawer => app.toggle_out_drawer(),
+        MouseAction::OutputDevice(i) => {
+            app.focus = Focus::Output;
+            app.out_cursor = i;
+            app.out_select(i);
         }
         MouseAction::InputBind(i) => {
             app.focus = Focus::Source;
             app.input_cursor = i;
-            app.bind_selected_input();
+            app.in_select(i);
         }
         MouseAction::InputToggle(i) => {
             app.focus = Focus::Source;
@@ -3433,6 +4656,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         MouseAction::PresetStep(d) => app.step_preset(d),
         MouseAction::OpenPresetPicker => app.open_preset_modal(),
         MouseAction::OpenLearnPicker => app.start_learn_pick(),
+        MouseAction::ToggleEditor => app.toggle_editor(None),
+        MouseAction::ToggleFxEditor => app.toggle_editor(Some(app.fx_slot)),
+        MouseAction::ToggleSandbox => app.toggle_sandbox(None),
+        MouseAction::ToggleFxSandbox => app.toggle_sandbox(Some(app.fx_slot)),
         MouseAction::RackTab(i) => {
             app.focus = Focus::FxChain;
             app.switch_slot(i);
@@ -3440,6 +4667,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         MouseAction::RackTabClose(i) => {
             app.focus = Focus::FxChain;
             app.remove_slot(i);
+        }
+        MouseAction::RackTabAdd => {
+            app.focus = Focus::FxChain;
+            app.add_slot_on_active_input();
         }
         MouseAction::MixGain(d) => adjust_gain(app, d),
         MouseAction::MixPan(d) => adjust_pan(app, d),
@@ -3518,14 +4749,19 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                 }
                 None => {
                     if rects.select.is_some_and(|r| r.contains(pos)) {
-                        true
-                    } else {
-                        // Click outside the popup dismisses it.
-                        if !rects.area.is_some_and(|r| r.contains(pos)) {
-                            app.close_modal();
-                        }
+                        // The button means "done": apply what is under the
+                        // cursor and leave, even on tabs where Enter keeps the
+                        // modal open so several things can be set at once.
+                        app.modal_select();
+                        app.close_modal();
+                        app.focus = Focus::FxChain;
                         return;
                     }
+                    // Click outside the popup dismisses it.
+                    if !rects.area.is_some_and(|r| r.contains(pos)) {
+                        app.close_modal();
+                    }
+                    return;
                 }
             };
             if confirm && app.modal_select() {
@@ -3545,6 +4781,11 @@ const INSTR_STEP: f32 = 0.05;
 fn ui(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
+    // Behind everything, before anything else touches the buffer: the panels
+    // above set foreground colours and symbols but leave `bg` alone, so
+    // whatever is painted here shows through.
+    views::background::render(f.buffer_mut(), area, &app.ui.background, &mut app.wallpaper);
+
     // ─── Splash Screen ──────────────────────────────────────────────────
     if !app.splash_done {
         draw_splash(f, &app.splash, area);
@@ -3562,36 +4803,72 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     draw_menu_bar(f, app, menubar_area);
 
+    // IN and OUT are drawers: a 3-wide handle each while closed, a real panel
+    // once open. The RACK takes whatever is left, which is everything when
+    // both are shut.
+    let in_w = views::drawer::drawer_width(app.in_open, body.width, 40, 24);
+    // The right one measures itself against what the left one left behind, so
+    // two open drawers can never squeeze the RACK out of existence.
+    let out_w = views::drawer::drawer_width(app.out_open, body.width.saturating_sub(in_w), 34, 24);
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([
+            Constraint::Length(in_w),
+            Constraint::Min(10),
+            Constraint::Length(out_w),
+        ])
         .split(body);
 
+    // The MIDI monitor takes whatever is left once the rack and the transport
+    // have theirs, up to 8 rows. Below 3 (a border plus one message) it is not
+    // worth the space and disappears entirely.
+    let monitor_height = monitor_rows(body.height);
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(10), Constraint::Length(7)])
+        .constraints([
+            Constraint::Min(10),
+            Constraint::Length(7),
+            Constraint::Length(monitor_height),
+        ])
         .split(chunks[1]);
 
     let source_area = chunks[0];
+    let output_area = chunks[2];
     let fx_chain_area = right_chunks[0];
     let transport_area = right_chunks[1];
+    let monitor_area = right_chunks[2];
 
-    let inputs = app.input_list();
-    let rows: Vec<views::source_panel::InputRow> = inputs
-        .iter()
-        .map(|i| views::source_panel::InputRow {
-            kind: i.kind(),
-            name: i.name(),
-            connected: app.input_is_connected(i),
-            bound_tab: app.bound_tab(i),
-        })
-        .collect();
-    let learn = app.learn_banner();
-    let scan_rect = views::source_panel::draw_input_panel(
-        f, source_area, app.focus == Focus::Source,
-        &rows, app.input_cursor, &app.active_tab_label(), learn.as_deref(),
-    );
-    app.layout.borrow_mut().input_scan_rect = scan_rect;
+    if app.in_open {
+        let rows: Vec<views::source_panel::InputRow> =
+            app.in_targets().into_iter().map(|(_, r)| r).collect();
+        let learn = app.learn_banner();
+        let scan_rect = views::source_panel::draw_input_panel(
+            f, source_area, app.focus == Focus::Source,
+            &rows, app.input_cursor, &app.active_tab_label(), learn.as_deref(),
+        );
+        let close = views::drawer::draw_close_button(f, source_area);
+        let mut layout = app.layout.borrow_mut();
+        layout.input_scan_rect = scan_rect;
+        layout.in_close_rect = close;
+    } else {
+        views::drawer::draw_handle(f, source_area, "IN", false);
+        let mut layout = app.layout.borrow_mut();
+        layout.input_scan_rect = None;
+        layout.in_close_rect = None;
+    }
+
+    if app.out_open {
+        let rows: Vec<views::drawer::OutRow> =
+            app.out_targets().into_iter().map(|(_, r)| r).collect();
+        views::drawer::draw_output_panel(
+            f, output_area, app.focus == Focus::Output, &rows, app.out_cursor,
+        );
+        let close = views::drawer::draw_close_button(f, output_area);
+        app.layout.borrow_mut().out_close_rect = close;
+    } else {
+        views::drawer::draw_handle(f, output_area, "OUT", false);
+        app.layout.borrow_mut().out_close_rect = None;
+    }
 
     let tabs: Vec<String> = app.slots.iter().map(tab_label).collect();
     let mix = app.slots.get(app.active_slot).map(|s| (s.gain, s.pan, s.mute, s.solo));
@@ -3599,17 +4876,23 @@ fn ui(f: &mut Frame, app: &mut App) {
         f, fx_chain_area, &app.fx_chain,
         app.fx_slot, app.fx_param, app.focus == Focus::FxChain,
         &tabs, app.active_slot, mix, &app.instrument_label(),
-        app.active_preset_label().as_deref(),
+        app.active_preset_label().as_deref(), app.has_editor(), app.has_fx_editor(),
+        app.sbx_state(None), app.sbx_state(Some(app.fx_slot)),
     );
     app.layout.borrow_mut().rack = rack;
 
     draw_transport(f, app, transport_area);
 
+    if monitor_area.height > 0 {
+        let log: Vec<midi::InputEvent> = app.midi_log.iter().copied().collect();
+        views::midi_monitor::draw_midi_monitor(f, monitor_area, &log, &app.midi_ports);
+    }
+
     if app.modal.is_some() {
         // The modal owns its scroll state, so it draws from a &mut borrow and
         // stores its hit rects where the mouse handler can find them.
         let mut modal = app.modal.take().unwrap();
-        let pct = if modal.kind == ModalKind::Device { (60, 50) } else { (70, 70) };
+        let pct = (70, 70);
         let rects = views::modal::draw_list_modal(f, &mut modal.list, area, pct);
         app.layout.borrow_mut().modal_rects = rects;
         app.modal = Some(modal);
@@ -3648,7 +4931,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     let play_state = if app.playing { i18n::t("PLAYING") } else { i18n::t("STOPPED") };
 
     let status_text = format!(
-        " choz v0.1 | {} backend | RACK: {} | FX: {} | {play_icon} {play_state} | F10=menu Tab=switch q=quit",
+        " choz v0.1 | {} backend | RACK: {} | FX: {} | {play_icon} {play_state} | F2=IN F3=OUT F10=menu q=quit",
         backend_label,
         app.active_tab_label(),
         app.fx_chain.len(),
@@ -3662,33 +4945,60 @@ fn ui(f: &mut Frame, app: &mut App) {
     );
 
     // ─── Compute layout for mouse hit-testing ──────────────────────────
-    compute_layout(app, area, source_area, fx_chain_area, transport_area);
+    compute_layout(app, area, source_area, fx_chain_area, transport_area, output_area);
 }
 
-fn compute_layout(app: &App, _area: Rect, source_area: Rect, fx_chain_area: Rect, transport_area: Rect) {
+/// Rows the MIDI monitor gets out of a body `height`, after the rack's minimum
+/// (10) and the transport's fixed 7. Capped at 8; anything under 3 is dropped so
+/// a squeezed terminal keeps the rack readable instead of showing a sliver.
+fn monitor_rows(height: u16) -> u16 {
+    let left = height.saturating_sub(10 + 7);
+    if left < 3 { 0 } else { left.min(8) }
+}
+
+fn compute_layout(
+    app: &App,
+    _area: Rect,
+    source_area: Rect,
+    fx_chain_area: Rect,
+    transport_area: Rect,
+    output_area: Rect,
+) {
     let mut layout = app.layout.borrow_mut();
 
     layout.source_area = source_area;
     layout.fx_chain_area = fx_chain_area;
     layout.transport_area = transport_area;
+    layout.output_area = output_area;
 
-    let src_inner = Rect::new(
-        source_area.x + 1,
-        source_area.y + 1,
-        source_area.width.saturating_sub(2),
-        source_area.height.saturating_sub(2),
-    );
+    let inner = |a: Rect| {
+        Rect::new(a.x + 1, a.y + 1, a.width.saturating_sub(2), a.height.saturating_sub(2))
+    };
+
     // Input rows. Line layout must match `draw_input_panel`: the list starts at
     // INPUT_LIST_TOP and the connect mark is the second column of each row.
     use views::source_panel as sp;
     layout.input_item_rects.clear();
     layout.input_mark_rects.clear();
-    let inputs = app.input_list();
-    let list_y = src_inner.y + sp::INPUT_LIST_TOP as u16;
-    for (i, _) in inputs.iter().enumerate() {
-        let y = list_y + i as u16;
-        layout.input_item_rects.push((i, Rect::new(src_inner.x, y, src_inner.width, 1)));
-        layout.input_mark_rects.push((i, Rect::new(src_inner.x, y, 2, 1)));
+    if app.in_open {
+        let src_inner = inner(source_area);
+        let list_y = src_inner.y + sp::INPUT_LIST_TOP as u16;
+        for (i, _) in app.in_targets().iter().enumerate() {
+            let y = list_y + i as u16;
+            layout.input_item_rects.push((i, Rect::new(src_inner.x, y, src_inner.width, 1)));
+            layout.input_mark_rects.push((i, Rect::new(src_inner.x, y, 2, 1)));
+        }
+    }
+
+    // Device rows of the OUT drawer, same deal against `draw_output_panel`.
+    layout.output_item_rects.clear();
+    if app.out_open {
+        let out_inner = inner(output_area);
+        let list_y = out_inner.y + views::drawer::OUTPUT_LIST_TOP as u16;
+        for i in 0..app.out_targets().len() {
+            let y = list_y + i as u16;
+            layout.output_item_rects.push((i, Rect::new(out_inner.x, y, out_inner.width, 1)));
+        }
     }
 
     // Everything inside the RACK panel (tabs, mixer, buttons, FX slots,
@@ -3725,7 +5035,7 @@ fn draw_transport(f: &mut Frame, app: &App, area: Rect) {
         .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_style(border_style)
-        .style(Style::default().bg(PANEL_BG));
+        .style(views::theme::panel_style());
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -3745,7 +5055,7 @@ fn draw_transport(f: &mut Frame, app: &App, area: Rect) {
             play_label,
             Style::default().fg(play_fg).bg(play_bg).add_modifier(Modifier::BOLD),
         )))
-        .style(Style::default().bg(PANEL_BG)),
+        .style(views::theme::panel_style()),
         Rect::new(inner.x + 2, btn_row, play_label.len() as u16, 1),
     );
 
@@ -3759,7 +5069,7 @@ fn draw_transport(f: &mut Frame, app: &App, area: Rect) {
             stop_label,
             Style::default().fg(stop_fg).bg(stop_bg).add_modifier(Modifier::BOLD),
         )))
-        .style(Style::default().bg(PANEL_BG)),
+        .style(views::theme::panel_style()),
         Rect::new(inner.x + 16, btn_row, stop_label.len() as u16, 1),
     );
 
@@ -3775,7 +5085,7 @@ fn draw_transport(f: &mut Frame, app: &App, area: Rect) {
             state_text,
             Style::default().fg(HINT),
         )))
-        .style(Style::default().bg(PANEL_BG)),
+        .style(views::theme::panel_style()),
         Rect::new(inner.x + 2, status_y, inner.width.saturating_sub(4), 1),
     );
 
@@ -3788,20 +5098,28 @@ fn draw_transport(f: &mut Frame, app: &App, area: Rect) {
         .unwrap_or("default");
     let out_rect = Rect::new(inner.x + 2, status_y + 1, inner.width.saturating_sub(4), 1);
     app.layout.borrow_mut().out_device_rect = Some(out_rect);
+    // Which pair the active tab plays out of, so the routing is visible
+    // without opening the drawer.
+    let pair = app
+        .slots
+        .get(app.active_slot)
+        .map(|s| format!("  \u{2192} {}/{}", s.out_pair.0 + 1, s.out_pair.1 + 1))
+        .unwrap_or_default();
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(format!("  {}  ", i18n::t("OUT")), Style::default().fg(HEADER).add_modifier(Modifier::BOLD)),
             Span::styled(device.to_string(), Style::default().fg(views::theme::text())),
-            Span::styled("  [o=change]", Style::default().fg(HINT)),
+            Span::styled(pair, Style::default().fg(HEADER)),
+            Span::styled("  [o/F3=OUT]", Style::default().fg(HINT)),
         ]))
-        .style(Style::default().bg(PANEL_BG)),
+        .style(views::theme::panel_style()),
         out_rect,
     );
 }
 
 fn draw_menu_bar(f: &mut Frame, app: &App, area: Rect) {
     use menu::MenuKind;
-    f.render_widget(Block::default().style(Style::default().bg(PANEL_BG)), area);
+    f.render_widget(Block::default().style(views::theme::panel_style()), area);
 
     let mut rects = Vec::new();
     let mut spans = Vec::new();
@@ -3840,7 +5158,7 @@ fn draw_menu_dropdown(f: &mut Frame, app: &App, state: menu::MenuState, menubar_
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
-        .style(Style::default().bg(PANEL_BG));
+        .style(views::theme::panel_style());
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -3883,7 +5201,7 @@ fn draw_about(f: &mut Frame, app: &App, area: Rect) {
         .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
-        .style(Style::default().bg(PANEL_BG));
+        .style(views::theme::panel_style());
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -3916,7 +5234,7 @@ fn draw_about(f: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled("Esc / [×] to close", Style::default().fg(DIM))),
     ];
     f.render_widget(
-        Paragraph::new(text).style(Style::default().bg(PANEL_BG)),
+        Paragraph::new(text).style(views::theme::panel_style()),
         rows[1].inner(Margin { vertical: 0, horizontal: 1 }),
     );
 }
@@ -3957,6 +5275,18 @@ fn draw_modal_shadow(f: &mut Frame, modal: Rect, screen: Rect) {
 
 #[cfg(test)]
 mod tests {
+
+    /// The monitor must never eat into the rack, and must vanish rather than
+    /// render a useless sliver.
+    #[test]
+    fn midi_monitor_only_takes_the_space_left_over() {
+        assert_eq!(super::monitor_rows(19), 0, "2 spare rows is not worth a panel");
+        assert_eq!(super::monitor_rows(20), 3, "border plus one message");
+        assert_eq!(super::monitor_rows(23), 6);
+        assert_eq!(super::monitor_rows(25), 8, "capped");
+        assert_eq!(super::monitor_rows(60), 8, "a tall terminal grows the rack, not the log");
+        assert_eq!(super::monitor_rows(0), 0, "no underflow on a degenerate size");
+    }
     use super::*;
     use choz_engine::input::InputSource;
     use ratatui::{backend::TestBackend, Terminal};
@@ -3986,7 +5316,8 @@ mod tests {
             let tabs: Vec<String> = app.slots.iter().map(tab_label).collect();
             views::fx_chain_panel::draw_fx_chain_panel(
                 f, f.area(), &app.fx_chain, app.fx_slot, app.fx_param, true,
-                &tabs, app.active_slot, mix, &app.instrument_label(), None,
+                &tabs, app.active_slot, mix, &app.instrument_label(), None, false, false,
+                Default::default(), Default::default(),
             );
         })
         .unwrap();
@@ -4051,10 +5382,10 @@ mod tests {
             name: "Example".into(),
         }));
         app.slots[0].instr_params = vec![
-            choz_engine::ClapParamInfo {
+            choz_engine::PluginParam {
                 id: 0, name: "Cutoff".into(), min: 20.0, max: 20_000.0, default: 20.0,
             },
-            choz_engine::ClapParamInfo {
+            choz_engine::PluginParam {
                 id: 1, name: "Resonance".into(), min: 0.0, max: 1.0, default: 0.0,
             },
         ];
@@ -4099,6 +5430,46 @@ mod tests {
         assert!(screen.contains("Resonance"), "second param missing:\n{screen}");
         // Half of 20..20000 in plain units.
         assert!(screen.contains("10010"), "plain value missing:\n{screen}");
+    }
+
+    /// A tab is labelled with the format that actually loaded it.
+    #[test]
+    fn a_plugin_tab_is_labelled_with_its_own_format() {
+        for (format, expect) in [("LV2", "LV2:Yoshimi"), ("SFZ", "SFZ:Yoshimi")] {
+            let source = AudioSource::Plugin {
+                id: "x".into(),
+                format: format.into(),
+                name: "Yoshimi".into(),
+            };
+            assert_eq!(slot_label(&source), expect);
+        }
+    }
+
+    /// SFZ is not a plugin ABI, but it loads through the same picker entry —
+    /// and must not be labelled "(not hosted yet)" any more.
+    #[test]
+    fn sfz_instruments_are_offered_as_loadable() {
+        let mut app = App::new();
+        app.plugins.push(choz_engine::FoundPlugin {
+            format: choz_engine::PluginFormat::Sfz,
+            id: String::new(),
+            name: "Saw".into(),
+            path: "/lib/Saw.sfz".into(),
+            is_instrument: true,
+        });
+        let choice = app
+            .source_choices()
+            .into_iter()
+            .find(|c| c.label.starts_with("Saw"))
+            .expect("SFZ instrument missing from the picker");
+        assert!(!choice.label.contains("not hosted"), "{}", choice.label);
+        match choice.action {
+            SourceAction::Plugin { format, ref path, .. } => {
+                assert_eq!(format, choz_engine::PluginFormat::Sfz);
+                assert_eq!(path, std::path::Path::new("/lib/Saw.sfz"));
+            }
+            other => panic!("SFZ should load like a plugin, got {other:?}"),
+        }
     }
 
     /// The SOURCE picker filters by format, and every format choz can't host
@@ -4186,6 +5557,174 @@ mod tests {
         assert_eq!(app.slots[0].gain, gain, "an unbound CC is ignored");
     }
 
+    /// Any parameter of any hosted plugin is bindable, not only the FX chain's:
+    /// `l` in the INSTRUMENT editor learns the row under the cursor.
+    #[test]
+    fn midi_learn_binds_a_cc_to_an_instrument_parameter() {
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.slots[0].instr_params = vec![
+            choz_engine::PluginParam { id: 0, name: "Cutoff".into(), min: 0.0, max: 1.0, default: 0.0 },
+            choz_engine::PluginParam { id: 1, name: "Reso".into(), min: 0.0, max: 1.0, default: 0.0 },
+        ];
+        app.slots[0].instr_values = vec![0.0, 0.0];
+
+        app.open_instr_modal();
+        handle_modal_key(&mut app, KeyCode::Down);
+        handle_modal_key(&mut app, KeyCode::Char('l'));
+        assert_eq!(app.learn, Some(LearnTarget::InstrParam { slot: 0, param: 1 }));
+        assert!(app.modal.is_none(), "learning closes the editor");
+
+        app.apply_cc(74, 127);
+        assert_eq!(app.cc_bindings, vec![(74, LearnTarget::InstrParam { slot: 0, param: 1 })]);
+        assert_eq!(app.slots[0].instr_values[1], 0.0, "the binding message doesn't move it");
+
+        app.apply_cc(74, 64);
+        assert!((app.slots[0].instr_values[1] - 64.0 / 127.0).abs() < 1e-6);
+        assert_eq!(app.slots[0].instr_values[0], 0.0, "the other parameter is untouched");
+    }
+
+    /// One fader, two FX units: the selected unit owns it, so the same CC can be
+    /// re-learned per effect instead of the second binding stealing the first.
+    #[test]
+    fn the_same_fader_binds_per_fx_unit_and_only_the_selected_one_moves() {
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.fx_chain.push(AudioFxEntry::new(source::AudioFxKind::Reverb));
+        app.fx_chain.push(AudioFxEntry::new(source::AudioFxKind::Delay));
+
+        // CC 7 → FX 1 param 0, then the *same* CC → FX 2 param 0.
+        app.fx_slot = 0;
+        app.learn = Some(LearnTarget::FxParam { slot: 0, fx: 0, param: 0 });
+        app.apply_cc(7, 0);
+        app.fx_slot = 1;
+        app.learn = Some(LearnTarget::FxParam { slot: 0, fx: 1, param: 0 });
+        app.apply_cc(7, 0);
+        assert_eq!(app.cc_bindings.len(), 2, "the second unit stole the binding: {:?}", app.cc_bindings);
+
+        // FX 2 is selected, so only FX 2 follows the fader.
+        let untouched = app.fx_chain[0].params[0];
+        app.apply_cc(7, 127);
+        assert_eq!(app.fx_chain[0].params[0], untouched, "the unselected unit moved");
+        assert_eq!(app.fx_chain[1].params[0], 1.0);
+
+        // Select FX 1 and the same fader now drives it instead.
+        app.fire_trigger(TriggerAction::FxSelect(0));
+        let held = app.fx_chain[1].params[0];
+        app.apply_cc(7, 64);
+        assert!((app.fx_chain[0].params[0] - 64.0 / 127.0).abs() < 1e-6);
+        assert_eq!(app.fx_chain[1].params[0], held, "the unselected unit moved");
+
+        // A non-FX target on that CC is still one-CC-one-control.
+        app.learn = Some(LearnTarget::Gain(0));
+        app.apply_cc(7, 0);
+        assert_eq!(app.cc_bindings, vec![(7, LearnTarget::Gain(0))]);
+    }
+
+    /// A bound CC arriving over the real MIDI channel has to move the drawn
+    /// mixer strip, not just `slots[i].gain` — CCs are also forwarded to the
+    /// instrument, so "it sounds louder" is not proof the fader followed.
+    #[test]
+    fn a_bound_cc_moves_the_drawn_fader() {
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.cc_bindings.push((74, LearnTarget::Gain(0)));
+
+        app.note_tx
+            .send(midi::InputEvent::Cc(choz_engine::input::CcMsg {
+                source: InputSource::Keyboard,
+                cc: 74,
+                value: 32,
+            }))
+            .unwrap();
+        app.drain_midi();
+
+        let (screen, _) = render_rack(&mut app, 100, 30);
+        assert!(screen.contains("0.50"), "the strip still shows the old gain:\n{screen}");
+    }
+
+    /// What a Keystation button actually sends: bank select, then a program
+    /// change. Neither may steal an armed *fader* learn, and an unbound program
+    /// change must leave the preset alone — the controller doesn't pick sounds.
+    #[test]
+    fn an_unbound_controller_button_leaves_the_preset_alone() {
+        use choz_engine::input::{CcMsg, ProgramMsg};
+
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Sf2 {
+            path: std::path::PathBuf::from("/nonexistent.sf2"),
+            bank: 0,
+            preset: 0,
+        }));
+        app.source = app.slots[0].source.clone();
+        app.learn = Some(LearnTarget::Gain(0));
+
+        let src = InputSource::Keyboard; // routes to the active slot, no port needed
+        for e in [
+            midi::InputEvent::Cc(CcMsg { source: src, cc: 32, value: 0 }),
+            midi::InputEvent::Cc(CcMsg { source: src, cc: 0, value: 0 }),
+            midi::InputEvent::Program(ProgramMsg { source: src, bank: 0, program: 13 }),
+        ] {
+            app.note_tx.send(e).unwrap();
+        }
+        app.drain_midi();
+
+        assert!(app.cc_bindings.is_empty(), "bank select stole the binding: {:?}", app.cc_bindings);
+        assert_eq!(app.learn, Some(LearnTarget::Gain(0)), "learn stays armed for the real fader");
+        assert!(
+            matches!(app.slots[0].source, AudioSource::Sf2 { preset: 0, bank: 0, .. }),
+            "the button picked a preset by itself: {:?}",
+            app.slots[0].source,
+        );
+
+        // The fader that follows is what gets bound.
+        app.note_tx
+            .send(midi::InputEvent::Cc(CcMsg { source: src, cc: 74, value: 100 }))
+            .unwrap();
+        app.drain_midi();
+        assert_eq!(app.cc_bindings, vec![(74, LearnTarget::Gain(0))]);
+    }
+
+    /// Two buttons, learned by the user, step the preset; every other button on
+    /// the controller stays silent.
+    #[test]
+    fn a_learned_program_change_button_steps_the_preset() {
+        use choz_engine::input::ProgramMsg;
+
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Sf2 {
+            path: std::path::PathBuf::from("/nonexistent.sf2"),
+            bank: 0,
+            preset: 0,
+        }));
+        app.slots[0].presets = vec![
+            choz_engine::sources::Sf2Preset { bank: 0, preset: 0, name: "a".into() },
+            choz_engine::sources::Sf2Preset { bank: 0, preset: 7, name: "b".into() },
+        ];
+        app.source = app.slots[0].source.clone();
+
+        let src = InputSource::Keyboard;
+        let press = |app: &mut App, program| {
+            app.note_tx
+                .send(midi::InputEvent::Program(ProgramMsg { source: src, bank: 0, program }))
+                .unwrap();
+            app.drain_midi();
+        };
+
+        // Arm learn on BANK ▶, then press the button that should drive it.
+        app.learn = Some(LearnTarget::Trigger(TriggerAction::PresetNext));
+        press(&mut app, 13);
+        assert_eq!(app.pc_bindings, vec![(13, LearnTarget::Trigger(TriggerAction::PresetNext))]);
+        assert_eq!(app.learn, None);
+        assert_eq!(app.slots[0].preset_cursor, 0, "binding must not press the button");
+
+        press(&mut app, 13);
+        assert_eq!(app.slots[0].preset_cursor, 1, "the bound button steps the preset");
+
+        press(&mut app, 42);
+        assert_eq!(app.slots[0].preset_cursor, 1, "an unbound button does nothing");
+    }
+
     /// Draw the RACK panel over a test backend and return (screen, rects).
     fn render_rack(app: &mut App, w: u16, h: u16) -> (String, RackLayout) {
         let _g = ui_guard();
@@ -4198,6 +5737,8 @@ mod tests {
             rack = views::fx_chain_panel::draw_fx_chain_panel(
                 f, f.area(), &app.fx_chain, app.fx_slot, app.fx_param, true,
                 &tabs, app.active_slot, mix, &app.instrument_label(), preset.as_deref(),
+                app.has_editor(), app.has_fx_editor(),
+                app.sbx_state(None), app.sbx_state(Some(app.fx_slot)),
             );
         })
         .unwrap();
@@ -4230,6 +5771,55 @@ mod tests {
         assert!(screen.contains("SLOT") && screen.contains("DEL"), "slot box missing:\n{screen}");
         let del = rack.del.expect("DEL is clickable");
         assert!(del.y > first_y, "DEL must sit below the knob grid");
+    }
+
+    /// The RACK offers "run this plugin in its own process", the click sticks,
+    /// and the button says which way it is set.
+    #[test]
+    fn the_sandbox_button_toggles_the_plugin_preference() {
+        // `set_forced` writes the real state dir otherwise.
+        sandbox_state_dir();
+        let mut app = app_with_plugin_tab();
+        app.source = app.slots[0].source.clone();
+        app.synths.push(SynthEntry {
+            id: "com.example.synth".into(),
+            format: choz_engine::PluginFormat::Clap,
+            name: "Example".into(),
+            path: std::path::PathBuf::from("/tmp/example.clap"),
+        });
+        let (format, path, id) = app.plugin_ref(None).expect("the tab holds a plugin");
+        choz_engine::quarantine::set_forced(format, &path, &id, false);
+
+        let (screen, rack) = render_rack(&mut app, 120, 30);
+        assert!(screen.contains("SBX"), "no sandbox button drawn:\n{screen}");
+        let btn = rack
+            .buttons
+            .iter()
+            .find(|(b, _)| *b == RackButton::Sandbox)
+            .map(|(_, r)| *r)
+            .expect("the sandbox button is clickable");
+
+        click(&mut app, btn.x, btn.y);
+        assert!(
+            choz_engine::quarantine::forced(format, &path, &id),
+            "clicking it must ask for the sandbox"
+        );
+        // Asking is not the same as running: nothing reloads without an engine.
+        let state = app.sbx_state(None);
+        assert!(state.on && !state.live);
+        assert!(views::fx_chain_panel::sbx_label(state).contains("reload"));
+
+        click(&mut app, btn.x, btn.y);
+        assert!(
+            !choz_engine::quarantine::forced(format, &path, &id),
+            "clicking again must take it back"
+        );
+
+        // A tab with no plugin has no button at all.
+        let mut plain = App::new();
+        plain.slots.push(RackSlot::new(AudioSource::Midi));
+        let (_, rack) = render_rack(&mut plain, 120, 30);
+        assert!(!rack.buttons.iter().any(|(b, _)| *b == RackButton::Sandbox));
     }
 
     /// The chain buttons wrap instead of running off the right edge.
@@ -4425,8 +6015,8 @@ mod tests {
         }
     }
 
-    /// Settings is three tabs: paths, text colour and language. Picking a colour
-    /// or a language applies it and is what the panels then draw with.
+    /// Settings is three tabs: audio, theme and language. Picking a theme sets
+    /// text, frame and desktop together, and the panels draw with all three.
     #[test]
     fn settings_tabs_switch_colour_and_language() {
         use i18n::Lang;
@@ -4436,23 +6026,33 @@ mod tests {
         let mut app = App::new();
         app.open_paths_modal();
         let tabs = app.modal.as_ref().unwrap().list.filters.clone();
-        assert_eq!(tabs, vec!["AUDIO", "COLOR", "LANGUAGE"]);
+        assert_eq!(tabs, vec!["AUDIO", "THEME", "LANGUAGE"]);
 
-        // Colour tab: rows are the palette, Enter applies.
-        app.modal.as_mut().unwrap().list.filter = TAB_COLOR;
+        // Theme tab: a scheme list under a header, then the desktop rows.
+        app.modal.as_mut().unwrap().list.filter = TAB_THEME;
         app.refresh_modal();
         let items = app.modal.as_ref().unwrap().list.items.clone();
-        assert_eq!(items.len(), settings::PALETTE.len());
-        assert!(items[0].contains("Default"));
+        assert_eq!(items[0], "COLOUR SCHEME", "headers label the two halves");
+        assert!(items[1].contains("choz (default)"));
+        assert!(items.iter().any(|i| i == "DESKTOP"));
+
+        // Row 2 is the second scheme (row 0 is the header).
+        let theme = &settings::THEMES[1];
         app.modal.as_mut().unwrap().list.cursor = 2;
-        assert!(app.modal_select(), "SELECT applies the colour and closes the modal");
-        assert_eq!(app.ui.text_color, settings::PALETTE[2].1);
+        assert!(!app.modal_select(), "the modal stays open so several can be tried");
+        assert_eq!(app.ui.text_color, theme.text);
+        assert_eq!(app.ui.border_color, Some(theme.border));
         assert_eq!(views::theme::text(), app.ui.color(), "panels draw with it");
-        // Borders follow the same colour, dimmed.
-        assert_ne!(views::theme::border(), views::theme::text());
-        assert!(matches!(views::theme::border(), ratatui::style::Color::Rgb(r, _, _) if r > 0));
+        assert_eq!(views::theme::border(), app.ui.border(), "and so do the frames");
+        // A scheme with a desktop colour sets the background too.
+        assert_eq!(app.ui.background, settings::Background::Color(theme.desktop.unwrap()));
         // The marker moves to the chosen row.
         assert!(app.modal.as_ref().unwrap().list.items[2].contains('\u{25CF}'));
+
+        // Back to a scheme without a desktop: the background goes with it.
+        app.modal.as_mut().unwrap().list.cursor = 1;
+        app.modal_select();
+        assert_eq!(app.ui.background, settings::Background::Terminal);
 
         // Language tab: every shipped language is listed, Enter switches.
         app.modal.as_mut().unwrap().list.filter = TAB_LANG;
@@ -4466,30 +6066,199 @@ mod tests {
         assert_eq!(i18n::t("SETTINGS"), "AJUSTES", "the interface follows");
         // The tab labels themselves are translated now.
         assert_eq!(app.modal.as_ref().unwrap().list.filters[2], "IDIOMA");
-        assert_eq!(app.modal.as_ref().unwrap().list.filters[1], i18n::t("COLOR"));
+        assert_eq!(app.modal.as_ref().unwrap().list.filters[1], i18n::t("THEME"));
         // `_restore` puts English (and the default colour) back on the way out.
+    }
+
+    /// The desktop rows: toggle a flat colour, pick an image through the file
+    /// browser, cycle its fit, and clear it again.
+    #[test]
+    fn the_theme_tab_sets_a_desktop_image_through_the_browser() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.open_paths_modal();
+        app.modal.as_mut().unwrap().list.filter = TAB_THEME;
+        app.refresh_modal();
+
+        // Find the rows by meaning, not by a hard-coded index.
+        let row_of = |app: &App, want: ThemeRow| -> usize {
+            (0..app.modal.as_ref().unwrap().list.items.len())
+                .find(|&i| app.theme_row(i) == Some(want))
+                .unwrap_or_else(|| panic!("no row for {want:?}"))
+        };
+
+        // "Pick an image..." opens the browser, started in assets/ when it is there.
+        let pick = row_of(&app, ThemeRow::PickImage);
+        app.modal.as_mut().unwrap().list.cursor = pick;
+        app.modal_select();
+        assert_eq!(app.modal.as_ref().unwrap().kind, ModalKind::Wallpaper);
+        let dir = app.modal.as_ref().unwrap().browser.as_ref().unwrap().dir.clone();
+        if std::path::Path::new("assets").is_dir() {
+            assert!(dir.ends_with("assets"), "started in the sample directory: {dir:?}");
+        }
+
+        // Only images are listed — no .rs, no .toml.
+        let entries: Vec<String> = app
+            .modal
+            .as_ref()
+            .unwrap()
+            .browser
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|e| !e.is_dir)
+            .map(|e| e.label.clone())
+            .collect();
+        assert!(
+            entries.iter().all(|e| file_browser::IMAGE_EXTS
+                .iter()
+                .any(|x| e.to_lowercase().ends_with(x))),
+            "only image files: {entries:?}"
+        );
+
+        // Picking one sets it as the background and returns to the theme tab.
+        let Some(img) = app
+            .modal
+            .as_ref()
+            .unwrap()
+            .browser
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .position(|e| !e.is_dir)
+        else {
+            eprintln!("no images in assets/; skipping the rest");
+            return;
+        };
+        app.modal.as_mut().unwrap().list.cursor = img;
+        app.modal_select();
+        let settings::Background::Image { path, fit } = app.ui.background.clone() else {
+            panic!("expected an image, got {:?}", app.ui.background);
+        };
+        assert_eq!(fit, settings::ImageFit::Stretch, "the default fit");
+        assert!(path.is_file(), "{path:?}");
+        assert_eq!(app.modal.as_ref().unwrap().kind, ModalKind::PluginPaths, "back to settings");
+        assert_eq!(app.settings_tab(), TAB_THEME);
+
+        // The fit row only exists once there is an image, and Enter cycles it.
+        let fit_row = row_of(&app, ThemeRow::Fit);
+        app.modal.as_mut().unwrap().list.cursor = fit_row;
+        app.modal_select();
+        assert!(matches!(
+            app.ui.background,
+            settings::Background::Image { fit: settings::ImageFit::Tile, .. }
+        ));
+
+        // And clearing puts the terminal's own background back.
+        let clear = row_of(&app, ThemeRow::Clear);
+        app.modal.as_mut().unwrap().list.cursor = clear;
+        app.modal_select();
+        assert_eq!(app.ui.background, settings::Background::Terminal);
+        assert!(app.theme_row(row_of(&app, ThemeRow::PickImage)).is_some());
+    }
+
+    /// The flow the user asked for: tick a theme, then pick a wallpaper, then
+    /// leave — and the system keeps *both*.
+    #[test]
+    fn a_theme_and_a_wallpaper_survive_leaving_the_modal_together() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.open_paths_modal();
+        app.modal.as_mut().unwrap().list.filter = TAB_THEME;
+        app.refresh_modal();
+
+        let row_of = |app: &App, want: ThemeRow| -> usize {
+            (0..app.modal.as_ref().unwrap().list.items.len())
+                .find(|&i| app.theme_row(i) == Some(want))
+                .unwrap_or_else(|| panic!("no row for {want:?}"))
+        };
+
+        // 1. Tick Obsidian. The modal stays open — it is a checkbox, not a door.
+        let obsidian = settings::THEMES.iter().position(|t| t.name == "Obsidian").unwrap();
+        app.modal.as_mut().unwrap().list.cursor = row_of(&app, ThemeRow::Scheme(obsidian));
+        assert!(!app.modal_select(), "picking a scheme keeps the modal open");
+        assert_eq!(app.ui.text_color, settings::THEMES[obsidian].text);
+
+        // 2. Pick a wallpaper. Back on the theme tab afterwards.
+        app.modal.as_mut().unwrap().list.cursor = row_of(&app, ThemeRow::PickImage);
+        app.modal_select();
+        assert_eq!(app.modal.as_ref().unwrap().kind, ModalKind::Wallpaper);
+        let img = app
+            .modal
+            .as_ref()
+            .unwrap()
+            .browser
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .position(|e| !e.is_dir);
+        let Some(img) = img else {
+            eprintln!("no images in assets/; skipping");
+            return;
+        };
+        app.modal.as_mut().unwrap().list.cursor = img;
+        app.modal_select();
+        assert_eq!(app.settings_tab(), TAB_THEME, "back where we were");
+
+        // 3. "Apply and close" leaves, and the theme did not eat the wallpaper
+        //    nor the wallpaper the theme.
+        app.modal.as_mut().unwrap().list.cursor = row_of(&app, ThemeRow::Done);
+        assert!(app.modal_select(), "SELECT closes the modal");
+
+        assert_eq!(app.ui.text_color, settings::THEMES[obsidian].text, "theme kept");
+        assert_eq!(app.ui.border_color, Some(settings::THEMES[obsidian].border));
+        let settings::Background::Image { fit, .. } = &app.ui.background else {
+            panic!("wallpaper lost: {:?}", app.ui.background);
+        };
+        assert_eq!(*fit, settings::ImageFit::Stretch);
+
+        // And it is on disk, so the next start comes up the same.
+        let saved = settings::UiSettings::load();
+        assert_eq!(saved.text_color, settings::THEMES[obsidian].text);
+        assert!(matches!(saved.background, settings::Background::Image { .. }));
+
+        // Re-ticking the theme afterwards must not throw the wallpaper away.
+        app.open_paths_modal();
+        app.modal.as_mut().unwrap().list.filter = TAB_THEME;
+        app.refresh_modal();
+        app.modal.as_mut().unwrap().list.cursor = row_of(&app, ThemeRow::Scheme(obsidian));
+        app.modal_select();
+        assert!(
+            matches!(app.ui.background, settings::Background::Image { .. }),
+            "a scheme with its own desktop colour still leaves a chosen image alone"
+        );
     }
 
     /// ADD FX has a category sidebar on the left and format chips on top: the
     /// sidebar picks what the list shows, the chips narrow both.
     #[test]
     fn add_fx_sidebar_picks_the_category_and_chips_the_format() {
-        use choz_engine::{FoundPlugin, PluginFormat};
+        use choz_engine::PluginFormat;
         let mut app = App::new();
         app.slots.push(RackSlot::new(AudioSource::Midi));
-        app.plugins.push(FoundPlugin {
+        // Two hosted plugins of different formats: the sidebar has to sort them
+        // into categories guessed from their names, and the format chips have to
+        // narrow both list and sidebar.
+        app.fx_plugins.push(source::PluginFx {
             format: PluginFormat::Lv2,
             name: "Calf Reverb".into(),
             path: "/usr/lib/lv2/calf.lv2".into(),
-            id: String::new(),
-            is_instrument: false,
+            id: "urn:calf:reverb".into(),
+            params: Vec::new(),
         });
-        app.plugins.push(FoundPlugin {
-            format: PluginFormat::Vst2,
+        app.fx_plugins.push(source::PluginFx {
+            format: PluginFormat::Ladspa,
             name: "TapeDelay".into(),
-            path: "/usr/lib/vst/tape.so".into(),
-            id: String::new(),
-            is_instrument: false,
+            path: "/usr/lib/ladspa/tape.so".into(),
+            id: "tape".into(),
+            params: Vec::new(),
         });
         app.open_add_fx_modal();
 
@@ -4509,7 +6278,7 @@ mod tests {
         let items = app.modal.as_ref().unwrap().list.items.clone();
         assert!(items.iter().any(|i| i.contains("[LV2] Calf Reverb")), "{items:#?}");
         assert!(!items.iter().any(|i| i.contains("DELAY")), "only reverbs now: {items:#?}");
-        // The VST2 name says delay, so it sits in DELAY instead.
+        // The LADSPA one is named delay, so it sits in DELAY instead.
         let delay = sidebar.iter().position(|(l, _)| l == "DELAY").unwrap();
         app.modal.as_mut().unwrap().list.sidebar_cursor = delay;
         app.refresh_modal();
@@ -4657,6 +6426,107 @@ mod tests {
         assert!(!items.iter().any(|i| i.contains("DELAY")), "only reverbs now: {items:#?}");
     }
 
+    /// RACK ONLY takes the sound and leaves choz's own settings alone — a
+    /// project written on another machine points at plugin paths that only
+    /// exist there.
+    #[test]
+    fn loading_rack_only_keeps_the_local_settings() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+
+        let mut source = App::new();
+        source.slots.push(RackSlot::new(AudioSource::Midi));
+        source.plugin_paths.dirs_mut(choz_engine::PluginFormat::Clap).clear();
+        source.plugin_paths.dirs_mut(choz_engine::PluginFormat::Clap).push(
+            choz_engine::SearchDir { path: "/somewhere/else".into(), enabled: true },
+        );
+        source.ui.language = i18n::Lang::Ja;
+        let saved = source.project_snapshot();
+
+        let mut app = App::new();
+        let mine = app.plugin_paths.clone();
+        let my_lang = app.ui.language;
+        app.load_rack_only = true;
+        app.apply_project(saved);
+
+        assert_eq!(app.slots.len(), 1, "the rack still comes across");
+        assert_eq!(app.plugin_paths, mine, "plugin paths are untouched");
+        assert_eq!(app.ui.language, my_lang, "so is the language");
+    }
+
+    /// Sample rate, buffer and backend only apply on the next start, so the
+    /// running engine still holds the previous ones. Saving from the engine
+    /// threw away the change the user had just made in the Engine tab.
+    #[test]
+    fn saving_keeps_the_pending_audio_settings_not_the_running_ones() {
+        let _g = ui_guard();
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.ui.audio.buffer_size = 128;
+        app.ui.audio.sample_rate = 96_000;
+        app.ui.audio.backend = "JACK".into();
+
+        let p = app.project_snapshot();
+        assert_eq!(p.audio.buffer_size, 128);
+        assert_eq!(p.audio.sample_rate, 96_000);
+        assert_eq!(p.audio.backend, "JACK");
+    }
+
+    /// And it loads back: a saved project rebuilds the same rack, knobs, mixer,
+    /// routing and MIDI-learn bindings.
+    #[test]
+    fn a_saved_project_loads_back_into_the_same_rack() {
+        let _g = ui_guard();
+        // Loading applies the project's colour and language process-wide, so
+        // this test has to put them back like the other global-state ones.
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Sf2 {
+            path: "/usr/share/sounds/sf2/FluidR3_GM.sf2".into(),
+            bank: 0,
+            preset: 4,
+        }));
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.slots[0].input = Some(InputRef::Midi("Keystation".into()));
+        app.slots[0].gain = 0.8;
+        app.slots[0].pan = -0.25;
+        app.slots[0].mute = true;
+        app.slots[1].out_pair = (2, 3);
+        app.slots[1].in_pair = Some((4, 5));
+        app.source = app.slots[0].source.clone();
+        let mut fx = AudioFxEntry::new(source::AudioFxKind::AmberFang);
+        fx.params[0] = 0.75;
+        fx.enabled = false;
+        app.fx_chain.push(fx);
+        app.cc_bindings.push((74, LearnTarget::Gain(0)));
+
+        let saved = app.project_snapshot();
+
+        let mut loaded = App::new();
+        loaded.apply_project(saved);
+
+        assert_eq!(loaded.slots.len(), 2);
+        assert_eq!(loaded.slots[0].source, app.slots[0].source);
+        assert_eq!(loaded.slots[0].input, Some(InputRef::Midi("Keystation".into())));
+        assert_eq!(loaded.slots[0].gain, 0.8);
+        assert_eq!(loaded.slots[0].pan, -0.25);
+        assert!(loaded.slots[0].mute);
+        assert_eq!(loaded.slots[1].out_pair, (2, 3));
+        assert_eq!(loaded.slots[1].in_pair, Some((4, 5)));
+
+        let chain = &loaded.slots[0].fx_chain;
+        assert_eq!(chain.len(), 1, "the FX chain came back");
+        assert_eq!(chain[0].kind, source::AudioFxKind::AmberFang);
+        assert_eq!(chain[0].params[0], 0.75, "knob positions survive");
+        assert!(!chain[0].enabled, "so does the ON/OFF state");
+        assert_eq!(loaded.cc_bindings, vec![(74, LearnTarget::Gain(0))]);
+        // The working copy has to follow the first tab, or the RACK draws stale.
+        assert_eq!(loaded.source, app.slots[0].source);
+        assert_eq!(loaded.fx_chain.len(), 1);
+    }
+
     /// File → Save project writes one YAML with the sound *and* the config.
     #[test]
     fn saving_a_project_writes_everything_as_yaml() {
@@ -4688,7 +6558,7 @@ mod tests {
         assert!(yaml.contains("kind: amberfang"), "the FX chain and its knobs are in there");
         assert!(yaml.contains("gain: 0.8"));
         assert!(yaml.contains("MIDI:Keystation"));
-        assert!(yaml.contains("- 74"), "MIDI-learn bindings are saved");
+        assert!(yaml.contains("cc: 74"), "MIDI-learn bindings are saved");
         // …and choz's own configuration.
         assert!(yaml.contains("plugin_paths:"));
         assert!(yaml.contains(&format!("language: {}", app.ui.language.code())));
@@ -4948,6 +6818,39 @@ mod tests {
         assert!(app.plugin_paths.dirs(fmt).iter().all(|d| d.enabled));
     }
 
+    /// The `+` on the tab bar adds a second tab on the same input, activates it,
+    /// and leaves it with its own (empty) chain — the first tab's setup is
+    /// untouched and stays silent while the new one is active.
+    #[test]
+    fn the_plus_button_adds_another_tab_on_the_same_input() {
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.slots[0].input = Some(InputRef::Midi("Keystation".into()));
+        app.fx_chain.push(AudioFxEntry::new(source::AudioFxKind::Delay));
+        let (_, rack) = render_rack(&mut app, 100, 30);
+        let plus = rack.tab_add.expect("the + button is drawn and clickable");
+
+        handle_mouse(&mut app, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: plus.x + 1,
+            row: plus.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.slots.len(), 2, "the + appended a tab");
+        assert_eq!(app.active_slot, 1, "the new tab takes over");
+        assert_eq!(app.slots[1].input, app.slots[0].input, "same input as the tab it came from");
+        assert!(app.fx_chain.is_empty(), "the new tab starts with its own empty chain");
+        assert_eq!(app.slots[0].fx_chain.len(), 1, "the first tab kept its FX");
+
+        // One port, two configurations: only the active tab is fed.
+        let connected = vec!["Keystation".to_string()];
+        let bindings: Vec<Option<&InputRef>> =
+            app.slots.iter().map(|s| s.input.as_ref()).collect();
+        assert_eq!(note_targets(&bindings, &connected, 1, InputSource::Midi(0)), vec![1]);
+        assert_eq!(note_targets(&bindings, &connected, 0, InputSource::Midi(0)), vec![0]);
+    }
+
     #[test]
     fn notes_reach_only_the_tabs_bound_to_their_input() {
         let keys = InputRef::Midi("Keystation".to_string());
@@ -4956,7 +6859,11 @@ mod tests {
         let bindings = vec![Some(&keys), Some(&InputRef::Osc), Some(&keys), None];
         let connected = vec!["Keystation".to_string(), "Midi Through".to_string()];
 
-        assert_eq!(note_targets(&bindings, &connected, 3, InputSource::Midi(0)), vec![0, 2]);
+        // Tabs 0 and 2 are two configurations of the same port: one plays at a
+        // time, the active one when it's among them, the first otherwise.
+        assert_eq!(note_targets(&bindings, &connected, 2, InputSource::Midi(0)), vec![2]);
+        assert_eq!(note_targets(&bindings, &connected, 0, InputSource::Midi(0)), vec![0]);
+        assert_eq!(note_targets(&bindings, &connected, 3, InputSource::Midi(0)), vec![0]);
         assert_eq!(note_targets(&bindings, &connected, 3, InputSource::Osc), vec![1]);
         assert!(
             note_targets(&bindings, &connected, 3, InputSource::Midi(1)).is_empty(),
@@ -4976,5 +6883,205 @@ mod tests {
         assert_eq!(note_targets(&bindings, &[], 0, InputSource::Keyboard), vec![0],
             "even a bound tab is playable from the keyboard");
         assert!(note_targets(&[], &[], 0, InputSource::Keyboard).is_empty(), "empty rack");
+    }
+
+    /// The IN drawer holds both kinds of input: note sources first, then the
+    /// audio capture pairs that can feed a tab instead of its instrument.
+    #[test]
+    fn in_drawer_lists_note_inputs_then_audio_capture() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.midi_ports = vec!["Keystation".to_string()];
+
+        // Capture devices are their own rows: on a plain sound card playback and
+        // capture are different graph nodes.
+        app.in_devices = vec!["alsa_input.usb-Scarlett".to_string()];
+
+        let rows = app.in_targets();
+        let targets: Vec<InTarget> = rows.iter().map(|(t, _)| *t).collect();
+        let names: Vec<String> = rows.iter().map(|(_, r)| r.name.clone()).collect();
+        assert_eq!(targets[0], InTarget::None, "section titles are not selectable");
+        assert_eq!(targets[1], InTarget::Note(0));
+        assert_eq!(names[1], "Keystation");
+        // Note inputs, then the AUDIO IN title, then "play the instrument".
+        let audio = targets.iter().position(|t| *t == InTarget::NoCapture).expect("no audio row");
+        let device = targets.iter().position(|t| *t == InTarget::Device(0)).expect("no device row");
+        assert!(device < audio, "the capture device is listed before the tab's own choice");
+        assert_eq!(rows[device].1.name, "alsa_input.usb-Scarlett");
+        assert!(rows[audio].1.connected, "a tab with no capture is on its instrument");
+
+        // Down from the last note input hops over the AUDIO IN header onto the
+        // first row under it.
+        let last_note = targets.iter().rposition(|t| matches!(t, InTarget::Note(_))).unwrap();
+        app.input_cursor = last_note;
+        assert_eq!(in_step(&app, 1), device, "the cursor must not park on a header");
+
+        // Selecting a capture pair swaps the tab onto live audio, and the RACK
+        // says so instead of naming an instrument that isn't heard.
+        app.set_active_capture(Some((2, 3)));
+        assert_eq!(app.slots[0].in_pair, Some((2, 3)));
+        assert!(app.instrument_label().contains("3/4"), "{}", app.instrument_label());
+        app.input_cursor = audio;
+        app.in_select(audio);
+        assert_eq!(app.slots[0].in_pair, None, "back to the instrument");
+    }
+
+    /// The OUT drawer's row model: devices, then the running device's channel
+    /// pairs, with the active tab's pair ticked and its neighbours labelled.
+    #[test]
+    fn out_drawer_lists_devices_then_channel_pairs() {
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.out_devices = vec!["UMC1820".into(), "Headset".into()];
+        app.slots[1].out_pair = (2, 3);
+        app.active_slot = 1;
+
+        let labels: Vec<String> = app.out_targets().iter().map(|(_, r)| r.label.clone()).collect();
+        assert_eq!(labels[0], "DEVICE");
+        assert_eq!(labels[1], "UMC1820");
+        assert!(labels[3].starts_with("CHANNELS"), "channel section: {labels:?}");
+        // No engine in a test, so only the default stereo pair is offered.
+        assert!(labels[4].starts_with("1/2"), "{labels:?}");
+        assert!(labels[4].contains("tab 1"), "tab 1 is still on 1/2: {labels:?}");
+
+        let targets: Vec<OutTarget> = app.out_targets().iter().map(|(t, _)| *t).collect();
+        assert_eq!(targets[0], OutTarget::None, "headers are not selectable");
+        assert_eq!(targets[1], OutTarget::Device(0));
+        assert_eq!(targets[4], OutTarget::Pair(0));
+    }
+
+    /// Enter on a pair row routes the *active* tab there, leaving the others
+    /// alone — that is the whole "[MIDI] → plugin → out 3/4" gesture.
+    #[test]
+    fn selecting_a_pair_routes_only_the_active_tab() {
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 1;
+
+        let pair_row = app
+            .out_targets()
+            .iter()
+            .position(|(t, _)| *t == OutTarget::Pair(0))
+            .expect("a pair row is drawn");
+        app.slots[1].out_pair = (8, 9);
+        app.out_select(pair_row);
+
+        assert_eq!(app.slots[1].out_pair, (0, 1), "active tab moved to pair 1");
+        assert_eq!(app.slots[0].out_pair, (0, 1), "the other tab is untouched");
+    }
+
+    /// The cursor never lands on a section header.
+    #[test]
+    fn the_out_cursor_steps_over_headers() {
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.out_devices = vec!["UMC1820".into()];
+        app.out_cursor = 1; // the device row
+        let next = out_step(&app, 1);
+        assert_eq!(
+            app.out_targets()[next].0,
+            OutTarget::Pair(0),
+            "stepping down skips the CHANNELS header"
+        );
+        assert_eq!(out_step(&app, -1), 1, "and stops at the first row going up");
+    }
+
+    /// Both open drawers carry an ✕ on their outer edge, and clicking it shuts
+    /// that drawer — the mouse-only way back to a full-width RACK.
+    #[test]
+    fn the_close_button_shuts_its_drawer() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.in_open = true;
+        app.out_open = true;
+
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let (in_x, out_x) = {
+            let l = app.layout.borrow();
+            (
+                l.in_close_rect.expect("IN draws a close button"),
+                l.out_close_rect.expect("OUT draws a close button"),
+            )
+        };
+        // On the outer edge of each drawer, not floating in the middle.
+        // Top-right corner of each drawer, clear of the panel title.
+        assert_eq!(in_x.y, app.layout.borrow().source_area.y, "on the top border");
+        assert!(in_x.x > app.layout.borrow().source_area.x + 4, "IN's ✕ is at its right");
+        assert!(out_x.x > app.layout.borrow().output_area.x + 4, "OUT's ✕ is at its right");
+
+        click(&mut app, in_x.x, in_x.y);
+        assert!(!app.in_open, "clicking ✕ shut IN");
+
+        // Shutting IN re-flows the body, so OUT's button has moved: read it
+        // from the fresh layout rather than the stale rect.
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let out_x = app.layout.borrow().out_close_rect.expect("OUT still has its ✕");
+        click(&mut app, out_x.x, out_x.y);
+        assert!(!app.out_open, "clicking ✕ shut OUT");
+    }
+
+    fn click(app: &mut App, x: u16, y: u16) {
+        handle_mouse(
+            app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+        );
+    }
+
+    /// The drawers: shut, both edges are handles and the RACK owns the body;
+    /// F2/F3 open them and Tab only ever lands on an open one.
+    #[test]
+    fn side_drawers_open_close_and_take_focus() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let draw = |app: &mut App, term: &mut Terminal<TestBackend>| {
+            term.draw(|f| ui(f, app)).unwrap();
+            term.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>()
+        };
+
+        let closed = draw(&mut app, &mut term);
+        assert!(!closed.contains("INPUTS"), "IN starts shut:\n{closed}");
+        assert_eq!(app.layout.borrow().source_area.width, views::drawer::HANDLE_W);
+        assert_eq!(app.layout.borrow().output_area.width, views::drawer::HANDLE_W);
+        let rack_full = app.layout.borrow().fx_chain_area.width;
+
+        handle_key(&mut app, KeyCode::F(2));
+        let open_in = draw(&mut app, &mut term);
+        assert!(open_in.contains("INPUTS"), "F2 opens IN:\n{open_in}");
+        assert_eq!(app.focus, Focus::Source);
+        assert!(app.layout.borrow().fx_chain_area.width < rack_full, "the RACK gives way");
+
+        handle_key(&mut app, KeyCode::F(3));
+        let open_out = draw(&mut app, &mut term);
+        assert!(open_out.contains("OUT"), "F3 opens OUT:\n{open_out}");
+        assert_eq!(app.focus, Focus::Output);
+
+        // Esc shuts the focused drawer and hands focus back to the RACK.
+        handle_key(&mut app, KeyCode::Esc);
+        assert!(!app.out_open);
+        assert_eq!(app.focus, Focus::FxChain);
+    }
+
+    #[test]
+    fn tab_never_parks_on_a_closed_drawer() {
+        assert_eq!(next_focus(Focus::FxChain, false, false), Focus::Transport);
+        assert_eq!(next_focus(Focus::Transport, false, false), Focus::FxChain);
+        assert_eq!(next_focus(Focus::Transport, false, true), Focus::Output);
+        assert_eq!(next_focus(Focus::Transport, true, false), Focus::Source);
+        assert_eq!(next_focus(Focus::Output, true, true), Focus::Source);
     }
 }

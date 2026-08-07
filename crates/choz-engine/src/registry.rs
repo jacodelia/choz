@@ -45,7 +45,7 @@ impl PluginRegistry {
         let mut reg = Self::new();
         for kind in [
             PluginKind::Ladspa, PluginKind::Dssi, PluginKind::Sfz,
-            PluginKind::Sf2, PluginKind::Jsfx,
+            PluginKind::Sf2,
         ] {
             reg.register_adapter(Box::new(FileScanHost::new(kind)));
         }
@@ -56,7 +56,7 @@ impl PluginRegistry {
         let mut total = 0;
         for kind in [
             PluginKind::Ladspa, PluginKind::Dssi, PluginKind::Sfz,
-            PluginKind::Sf2, PluginKind::Jsfx,
+            PluginKind::Sf2,
         ] {
             for dir in crate::scanner::default_search_paths(&kind) {
                 total += self.scan(&dir).len();

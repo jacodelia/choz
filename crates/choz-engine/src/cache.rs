@@ -41,20 +41,16 @@ fn cache_is_fresh(dirs: &[PathBuf]) -> bool {
         .all(|dir_at| dir_at <= cached_at)
 }
 
-/// The cache file. `hosted` records whether the build that wrote it had real
-/// CLAP hosting: without the feature a scan only gets filename-derived
-/// metadata (every plugin looks like an instrument), which must never be served
-/// to a build that can do better — or vice versa.
+/// The cache file.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CacheFile {
-    hosted: bool,
     plugins: Vec<FoundPlugin>,
 }
 
 fn read_cache() -> Option<Vec<FoundPlugin>> {
     let data = std::fs::read_to_string(cache_path()).ok()?;
     let cached: CacheFile = serde_json::from_str(&data).ok()?;
-    (cached.hosted == choz_plugin_clap::clap_supported()).then_some(cached.plugins)
+    Some(cached.plugins)
 }
 
 fn write_cache(plugins: &[FoundPlugin]) {
@@ -62,10 +58,7 @@ fn write_cache(plugins: &[FoundPlugin]) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let file = CacheFile {
-        hosted: choz_plugin_clap::clap_supported(),
-        plugins: plugins.to_vec(),
-    };
+    let file = CacheFile { plugins: plugins.to_vec() };
     match serde_json::to_string_pretty(&file) {
         Ok(json) => {
             if let Err(e) = std::fs::write(&path, json) {
@@ -81,8 +74,8 @@ fn write_cache(plugins: &[FoundPlugin]) {
 /// and doesn't care where the plugins come from.
 pub fn cached_or_scan(dirs: &[PathBuf], scan: impl FnOnce() -> Vec<FoundPlugin>) -> Vec<FoundPlugin> {
     if cache_is_fresh(dirs) {
-        // A cache written by the other kind of build reads as `None` here and
-        // falls through to a real scan.
+        // An unreadable or older-format cache reads as `None` and falls through
+        // to a real scan.
         if let Some(plugins) = read_cache() {
             return plugins;
         }
@@ -115,13 +108,12 @@ mod tests {
 
     #[test]
     fn cache_round_trips_through_json() {
-        let file = CacheFile { hosted: true, plugins: sample() };
+        let file = CacheFile { plugins: sample() };
         let json = serde_json::to_string(&file).unwrap();
         let back: CacheFile = serde_json::from_str(&json).unwrap();
         assert_eq!(back.plugins.len(), 1);
         assert_eq!(back.plugins[0].id, "com.acme.thing");
         assert!(back.plugins[0].is_instrument);
-        assert!(back.hosted, "the build flavour is part of the cache");
     }
 
     /// A missing cache is never fresh; once written it's served without
@@ -151,15 +143,13 @@ mod tests {
         let got = rescan(|| { scans += 1; sample() });
         assert_eq!((got.len(), scans), (1, 2));
 
-        // A cache written by the other build flavour holds filename-derived
-        // metadata (everything looks like an instrument), so it's ignored and
-        // rescanned. Same test to keep the XDG_STATE_HOME override in one place.
-        let wrong = CacheFile { hosted: !choz_plugin_clap::clap_supported(), plugins: sample() };
-        std::fs::write(cache_path(), serde_json::to_string(&wrong).unwrap()).unwrap();
-        assert!(read_cache().is_none(), "foreign cache ignored");
+        // A cache in an older/foreign format is ignored and rescanned. Same
+        // test to keep the XDG_STATE_HOME override in one place.
+        std::fs::write(cache_path(), b"{\"hosted\":true}").unwrap();
+        assert!(read_cache().is_none(), "unreadable cache ignored");
         cached_or_scan(&dirs, || { scans += 1; sample() });
         assert_eq!(scans, 3, "a rejected cache forces a rescan");
-        assert!(read_cache().is_some(), "and the rescan rewrites it in our flavour");
+        assert!(read_cache().is_some(), "and the rescan rewrites it");
 
         std::fs::remove_dir_all(&tmp).unwrap();
         match prev {

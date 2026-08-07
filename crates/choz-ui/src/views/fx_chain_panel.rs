@@ -14,7 +14,6 @@ use crate::i18n::t;
 use crate::source::{AudioFxEntry, MAX_FX};
 use crate::views::theme::{border as ui_border, text as ui_text};
 
-const PANEL: Color = Color::Rgb(22, 27, 34);
 const HEADER: Color = Color::Rgb(240, 136, 62);
 const LABEL: Color = Color::Rgb(120, 132, 155);
 const RULE: Color = Color::Rgb(38, 44, 54);
@@ -27,6 +26,9 @@ pub const FX_CELL_W: u16 = 13;
 /// cell after it), in columns.
 pub const TAB_CLOSE_W: u16 = 2;
 
+/// Width of the `+` button that follows the last tab, in columns.
+pub const TAB_ADD_W: u16 = 3;
+
 /// Buttons on the RACK's instrument line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RackButton {
@@ -36,6 +38,10 @@ pub enum RackButton {
     Preset,
     /// Arm MIDI learn.
     Learn,
+    /// Open (or close) the plugin's own window.
+    Gui,
+    /// Ask for (or stop asking for) this plugin to run in its own process.
+    Sandbox,
     /// Previous / next program of the loaded SoundFont.
     PresetPrev,
     PresetNext,
@@ -46,6 +52,8 @@ pub enum RackButton {
 pub struct RackLayout {
     pub tabs: Vec<(usize, Rect)>,
     pub tab_close: Vec<(usize, Rect)>,
+    /// The `+` after the last tab: another configuration on the same input.
+    pub tab_add: Option<Rect>,
     pub gain: Option<Rect>,
     pub pan: Option<Rect>,
     pub mute: Option<Rect>,
@@ -61,6 +69,41 @@ pub struct RackLayout {
     pub move_left: Option<Rect>,
     pub move_right: Option<Rect>,
     pub del: Option<Rect>,
+    /// The selected FX's own window button, when it's a plugin that has one.
+    pub fx_gui: Option<Rect>,
+    /// The selected FX's sandbox toggle, when it's a hosted plugin.
+    pub fx_sandbox: Option<Rect>,
+}
+
+/// How a plugin stands with respect to running in its own process. `on` is what
+/// the user asked for; `live` is what is actually happening right now — they
+/// differ between asking and the next load, and `live` is also true for a
+/// plugin the crash probe isolated on its own.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub struct SbxState {
+    /// This is a hosted plugin, so the toggle means something.
+    pub available: bool,
+    pub on: bool,
+    pub live: bool,
+    /// Blocks the child missed — audible gaps — and crash restarts.
+    pub missed: u64,
+    pub restarts: u64,
+}
+
+/// Button text for a sandbox toggle: the state, and what it has cost.
+pub fn sbx_label(s: SbxState) -> String {
+    if !s.live {
+        return if s.on { " SBX \u{25CF} (reload) ".into() } else { " SBX \u{25CB} ".into() };
+    }
+    let mut label = String::from(" SBX \u{25CF}");
+    if s.missed > 0 {
+        label.push_str(&format!(" {} lost", s.missed));
+    }
+    if s.restarts > 0 {
+        label.push_str(&format!(" {}\u{21BB}", s.restarts));
+    }
+    label.push(' ');
+    label
 }
 
 pub fn knob_indicator(val: f32) -> char {
@@ -87,6 +130,7 @@ const MAX_GAIN: f32 = 2.0;
 pub const BTN_SOURCE: &str = " SOURCE ";
 pub const BTN_PRESET: &str = " BANK/PRESET ";
 pub const BTN_LEARN: &str = " MIDI LEARN ";
+pub const BTN_GUI: &str = " GUI ";
 pub const BTN_PREV: &str = " \u{25C0} ";
 pub const BTN_NEXT: &str = " \u{25B6} ";
 
@@ -141,6 +185,13 @@ pub fn draw_fx_chain_panel(
     instrument: &str,
     // `preset` is the current bank:preset name, when the tab holds a SoundFont.
     preset: Option<&str>,
+    // Whether the tab's instrument has a native window to open.
+    has_gui: bool,
+    // Same for the selected FX in the chain.
+    fx_has_gui: bool,
+    // Out-of-process state of the instrument and of the selected FX.
+    sandbox: SbxState,
+    fx_sandbox: SbxState,
 ) -> RackLayout {
     let has_presets = preset.is_some();
     let mut layout = RackLayout::default();
@@ -155,7 +206,7 @@ pub fn draw_fx_chain_panel(
         .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_style(border_style)
-        .style(Style::default().bg(PANEL));
+        .style(super::theme::panel_style());
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -163,7 +214,7 @@ pub fn draw_fx_chain_panel(
         return layout;
     }
 
-    let bg = Style::default().bg(PANEL);
+    let bg = super::theme::panel_style();
     let put = |f: &mut Frame, line: Line, y: u16| {
         if y < inner.y + inner.height {
             f.render_widget(Paragraph::new(line).style(bg), Rect::new(inner.x, y, inner.width, 1));
@@ -192,7 +243,7 @@ pub fn draw_fx_chain_panel(
     if tabs.is_empty() {
         tab_line.push(Span::styled(
             " (empty rack \u{2014} bind an input on the left) ",
-            Style::default().fg(Color::DarkGray).bg(PANEL),
+            super::theme::panel_style().fg(Color::DarkGray),
         ));
     } else {
         let mut x = inner.x + 1;
@@ -208,6 +259,14 @@ pub fn draw_fx_chain_panel(
             tab_line.push(Span::styled(format!(" {label} "), st));
             tab_line.push(Span::raw(" "));
             x += w + 1;
+        }
+        // `+`: a second configuration for the same input as the active tab.
+        if x + TAB_ADD_W <= inner.x + inner.width {
+            layout.tab_add = Some(Rect::new(x, y, TAB_ADD_W, 1));
+            tab_line.push(Span::styled(
+                " + ",
+                Style::default().fg(Color::Black).bg(Color::Rgb(90, 170, 110)).add_modifier(Modifier::BOLD),
+            ));
         }
     }
     put(f, Line::from(tab_line), y);
@@ -258,21 +317,32 @@ pub fn draw_fx_chain_panel(
 
     // ── Instrument line ────────────────────────────────────────────────────
     let btn_style = Style::default().fg(Color::Black).bg(KNOB).add_modifier(Modifier::BOLD);
+    // A plugin actually running elsewhere gets its own colour: it is the one
+    // thing on this line that says the audio is crossing a process boundary.
+    let sbx_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Rgb(56, 200, 100))
+        .add_modifier(Modifier::BOLD);
     let mut instr_line: Vec<Span> = vec![
         Span::styled(format!("  {} ", t("INSTR")), Style::default().fg(LABEL).add_modifier(Modifier::BOLD)),
         Span::styled(format!("{:<18}", truncate(instrument, 18)), Style::default().fg(ui_text())),
     ];
     let mut bx = inner.x + 2 + 8 + 18;
     for (btn, text) in [
-        (RackButton::Source, Some(BTN_SOURCE)),
+        (RackButton::Source, Some(BTN_SOURCE.to_string())),
         // Bank/preset only exists while the tab holds a SoundFont.
-        (RackButton::Preset, has_presets.then_some(BTN_PRESET)),
-        (RackButton::Learn, Some(BTN_LEARN)),
+        (RackButton::Preset, has_presets.then(|| BTN_PRESET.to_string())),
+        (RackButton::Learn, Some(BTN_LEARN.to_string())),
+        // Only plugins with a native editor get the button.
+        (RackButton::Gui, has_gui.then(|| BTN_GUI.to_string())),
+        // Only a hosted plugin can be moved into a process of its own.
+        (RackButton::Sandbox, sandbox.available.then(|| sbx_label(sandbox))),
     ] {
         let Some(text) = text else { continue };
         let w = text.chars().count() as u16;
         layout.buttons.push((btn, Rect::new(bx, y, w, 1)));
-        instr_line.push(Span::styled(text, btn_style));
+        let style = if btn == RackButton::Sandbox && sandbox.live { sbx_style } else { btn_style };
+        instr_line.push(Span::styled(text, style));
         instr_line.push(Span::raw(" "));
         bx += w + 1;
     }
@@ -490,6 +560,22 @@ pub fn draw_fx_chain_panel(
         button(&mut spans, " DEL ".into(),
                Style::default().fg(Color::White).bg(Color::Rgb(170, 50, 50)).add_modifier(Modifier::BOLD),
                &mut layout.del);
+        // Plugin FX get their own window button; built-ins have nothing to show.
+        if fx_has_gui {
+            button(&mut spans, BTN_GUI.into(),
+                   Style::default().fg(Color::Black).bg(KNOB).add_modifier(Modifier::BOLD),
+                   &mut layout.fx_gui);
+        }
+        // Same toggle as the instrument's, for a plugin effect.
+        if fx_sandbox.available {
+            let style = if fx_sandbox.live {
+                Style::default().fg(Color::Black).bg(Color::Rgb(56, 200, 100))
+            } else {
+                Style::default().fg(Color::Black).bg(KNOB)
+            };
+            button(&mut spans, sbx_label(fx_sandbox), style.add_modifier(Modifier::BOLD),
+                   &mut layout.fx_sandbox);
+        }
         f.render_widget(
             Paragraph::new(Line::from(spans)).style(bg),
             Rect::new(ctrl_inner.x, ctrl_inner.y, ctrl_inner.width, 1),
@@ -500,7 +586,7 @@ pub fn draw_fx_chain_panel(
     // ── Hint, last line of the panel ───────────────────────────────────────
     let hint_y = (inner.y + inner.height).saturating_sub(1).max(y);
     let hint = if focused {
-        "  1=source 2=bank/preset 3=learn p=instr \u{00B7} a=add d=del \u{2190}\u{2192}=FX \u{2191}\u{2193}=param wheel=value \u{00B7} -/+=vol ,/.=pan m=mute S=solo"
+        "  1=source 2=bank/preset 3=learn 4=plugin window p=instr x/X=sandbox \u{00B7} a=add d=del \u{2190}\u{2192}=FX \u{2191}\u{2193}=param wheel=value \u{00B7} -/+=vol ,/.=pan m=mute S=solo"
     } else {
         "  Tab=enter the rack"
     };

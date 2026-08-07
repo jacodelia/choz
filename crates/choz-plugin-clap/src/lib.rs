@@ -25,50 +25,15 @@ pub struct ClapPluginInfo {
     pub is_instrument: bool,
 }
 
-/// One automatable parameter of a hosted CLAP plugin.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ClapParamInfo {
-    /// CLAP parameter id (stable across instances of the same plugin).
-    pub id: u32,
-    pub name: String,
-    pub min: f64,
-    pub max: f64,
-    pub default: f64,
-}
+pub use choz_ports::PluginParam;
 
-impl ClapParamInfo {
-    /// Plain value for a normalised 0..1 knob position.
-    pub fn plain(&self, norm: f64) -> f64 {
-        self.min + norm.clamp(0.0, 1.0) * (self.max - self.min)
-    }
-
-    /// Knob position for a plain value.
-    pub fn normalised(&self, plain: f64) -> f64 {
-        if self.max <= self.min {
-            return 0.0;
-        }
-        ((plain - self.min) / (self.max - self.min)).clamp(0.0, 1.0)
-    }
-}
-
-/// Parameters of the plugin at `path`. Empty without the `clap` feature.
-#[cfg(feature = "clap")]
-pub fn read_params(path: &Path, plugin_id: &str) -> Vec<ClapParamInfo> {
+/// Parameters of the plugin at `path`.
+pub fn read_params(path: &Path, plugin_id: &str) -> Vec<PluginParam> {
     host::read_params(path, plugin_id)
 }
 
-#[cfg(not(feature = "clap"))]
-pub fn read_params(_path: &Path, _plugin_id: &str) -> Vec<ClapParamInfo> {
-    Vec::new()
-}
-
-#[cfg(feature = "clap")]
+pub mod editor;
 pub mod host;
-
-/// Whether this build was compiled with real CLAP hosting.
-pub fn clap_supported() -> bool {
-    cfg!(feature = "clap")
-}
 
 /// Scan a directory tree for `.clap` plugins.
 pub fn scan_directory(dir: &Path) -> Vec<ClapPluginInfo> {
@@ -89,16 +54,12 @@ fn scan_recursive(dir: &Path, out: &mut Vec<ClapPluginInfo>) {
     }
 }
 
-/// Describe every plugin inside a `.clap` file. With the `clap` feature this
-/// dlopens the library and reads the real factory; otherwise a single
-/// filename-derived entry.
-fn describe(path: &Path) -> Vec<ClapPluginInfo> {
-    #[cfg(feature = "clap")]
-    {
-        let real = host::read_descriptors(path);
-        if !real.is_empty() {
-            return real;
-        }
+/// Describe every plugin inside a `.clap` file: the real factory when the
+/// library loads, otherwise a single filename-derived entry.
+pub fn describe(path: &Path) -> Vec<ClapPluginInfo> {
+    let real = host::read_descriptors(path);
+    if !real.is_empty() {
+        return real;
     }
     let name = path
         .file_stem()
@@ -143,8 +104,8 @@ mod tests {
         std::fs::write(base.join("readme.txt"), b"x").unwrap();
 
         let found = scan_directory(&base);
-        // Without the `clap` feature (or on a bogus file) we still get the
-        // filename-derived fallback entry, and never the .txt.
+        // A bogus file still yields the filename-derived fallback entry, and
+        // never the .txt.
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name, "Synth");
 

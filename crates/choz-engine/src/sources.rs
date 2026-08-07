@@ -282,6 +282,18 @@ impl AudioSource for Sf2Synth {
         });
     }
 
+    fn control_change(&mut self, cc: u8, value: u8) {
+        let _ = self.synth.send_event(oxisynth::MidiEvent::ControlChange {
+            channel: 0, ctrl: cc, value,
+        });
+    }
+
+    fn pitch_bend(&mut self, value: u16) {
+        let _ = self.synth.send_event(oxisynth::MidiEvent::PitchBend {
+            channel: 0, value: value.min(16383),
+        });
+    }
+
     fn program_change(&mut self, bank: u8, preset: u8) {
         // RT-safe: this only looks the preset up in the already-loaded font and
         // Arc-clones it into the channel.
@@ -296,6 +308,84 @@ impl AudioSource for Sf2Synth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Peak level of a rendered block — enough to tell "sounding" from "silent".
+    fn peak(s: &mut Sf2Synth, frames: usize) -> f32 {
+        let mut buf = vec![0.0f32; frames * 2];
+        s.render(&mut buf, 48_000);
+        buf.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+    }
+
+    /// The sustain pedal has to actually sustain: without it a note-off kills
+    /// the note, with it held the note keeps ringing past the note-off.
+    #[test]
+    fn sustain_pedal_holds_notes_past_note_off() {
+        let path = std::path::Path::new("/usr/share/sounds/sf2/FluidR3_GM.sf2");
+        if !path.exists() {
+            return; // ponytail: no bundled SF2 to test against, skip rather than fail.
+        }
+        let mut synth = Sf2Synth::load(path, 0, 0, 48_000).expect("load SF2");
+
+        // Baseline: note-off with no pedal, the tail dies out.
+        synth.note_on(60, 110);
+        assert!(peak(&mut synth, 4096) > 0.01, "note must sound");
+        synth.note_off(60);
+        let mut dry = 0.0;
+        for _ in 0..12 {
+            dry = peak(&mut synth, 4096);
+        }
+        assert!(dry < 0.01, "released note should have decayed, peak {dry}");
+
+        // Same again with sustain down: the note is still ringing.
+        synth.control_change(64, 127);
+        synth.note_on(60, 110);
+        assert!(peak(&mut synth, 4096) > 0.01);
+        synth.note_off(60);
+        let mut held = 0.0;
+        for _ in 0..12 {
+            held = peak(&mut synth, 4096);
+        }
+        assert!(held > dry * 10.0, "sustain must hold the note: held {held} vs dry {dry}");
+
+        // Lifting the pedal releases it.
+        synth.control_change(64, 0);
+        let mut after = 0.0;
+        for _ in 0..12 {
+            after = peak(&mut synth, 4096);
+        }
+        assert!(after < held * 0.5, "lifting the pedal releases: {after} vs {held}");
+    }
+
+    #[test]
+    fn pitch_bend_shifts_the_rendered_tone() {
+        let path = std::path::Path::new("/usr/share/sounds/sf2/FluidR3_GM.sf2");
+        if !path.exists() {
+            return;
+        }
+        let mut synth = Sf2Synth::load(path, 0, 0, 48_000).expect("load SF2");
+
+        // Same note, centred vs bent fully up, compared by zero-crossing count:
+        // a raised pitch crosses zero more often over the same window.
+        let crossings = |s: &mut Sf2Synth| {
+            let mut buf = vec![0.0f32; 8192];
+            s.render(&mut buf, 48_000); // discard the attack
+            s.render(&mut buf, 48_000);
+            buf.chunks(2).map(|f| f[0]).collect::<Vec<_>>()
+                .windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count()
+        };
+
+        synth.pitch_bend(8192); // centre
+        synth.note_on(60, 110);
+        let centred = crossings(&mut synth);
+        synth.note_off(60);
+
+        synth.pitch_bend(16383); // fully up
+        synth.note_on(60, 110);
+        let bent = crossings(&mut synth);
+
+        assert!(centred > 0, "note must sound to be measurable");
+        assert!(bent > centred, "bending up must raise the pitch: {bent} vs {centred}");
+    }
 
     #[test]
     fn test_tone_fills_block() {

@@ -67,6 +67,7 @@ pub enum MenuAction {
     PluginPaths,
     RescanPlugins,
     SaveProject,
+    LoadProject,
     About,
 }
 
@@ -75,6 +76,7 @@ static FILE_MENU: &[MenuItem] = &[
     MenuItem::item("Open SF2\u{2026}", "", MenuAction::OpenSf2),
     MenuItem::sep(),
     MenuItem::item("Save project\u{2026}", "", MenuAction::SaveProject),
+    MenuItem::item("Open project\u{2026}", "", MenuAction::LoadProject),
     MenuItem::sep(),
     MenuItem::item("Quit", "q", MenuAction::Quit),
 ];

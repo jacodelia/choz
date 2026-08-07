@@ -7,14 +7,16 @@ pub struct FxSpec {
     pub enabled: bool,
     pub wet: f32,
     pub params: Vec<f32>,
-    /// Set for CLAP audio effects: the `.clap` file and plugin id to host in
-    /// this slot instead of a built-in FX. `kind` is then ignored.
-    pub plugin: Option<ClapFxRef>,
+    /// Set for hosted plugin effects: which plugin to load in this slot
+    /// instead of a built-in FX. `kind` is then ignored.
+    pub plugin: Option<PluginFxRef>,
 }
 
-/// Which CLAP plugin an FX slot hosts.
+/// Which plugin an FX slot hosts: the file (or LV2 bundle directory) and the
+/// id inside it (CLAP plugin id, LV2 URI).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClapFxRef {
+pub struct PluginFxRef {
+    pub format: crate::PluginFormat,
     pub path: std::path::PathBuf,
     pub id: String,
 }
@@ -193,17 +195,77 @@ pub fn build_processor(kind: &str, params: &[f32], sample_rate: u32) -> Option<B
     Some(proc)
 }
 
-/// Build a CLAP audio effect, when the `clap` feature is on. Loading happens
-/// here (UI thread), never on the RT thread.
-#[cfg(feature = "clap")]
-fn build_clap_fx(r: &ClapFxRef, sample_rate: u32, max_block: u32) -> Option<Box<dyn fx::FxProcessor>> {
-    let eff = choz_plugin_clap::host::ClapEffect::build(&r.path, &r.id, sample_rate, max_block)?;
-    Some(Box::new(eff))
+/// Build a hosted plugin effect. Loading happens here (UI thread), never on
+/// the RT thread. `None` for a format this build can't host, or a plugin that
+/// refuses to load.
+pub(crate) fn build_plugin_fx(
+    r: &PluginFxRef,
+    sample_rate: u32,
+    max_block: u32,
+) -> Option<Box<dyn fx::FxProcessor>> {
+    // Same policy as instruments: what the load probe caught dying on teardown
+    // goes in its own process, so removing the effect costs a child — and so
+    // does anything the user asked for by hand.
+    if crate::quarantine::wants_sandbox(r.format, &r.path, &r.id) {
+        match crate::sandboxed::SandboxedEffect::build(
+            r.format,
+            &r.path,
+            &r.id,
+            sample_rate,
+            max_block,
+        ) {
+            Ok(fx) => {
+                eprintln!("choz: hosting {} in its own process", r.path.display());
+                return Some(Box::new(fx));
+            }
+            Err(e) => eprintln!(
+                "choz: sandbox for {} failed ({e}); hosting in-process",
+                r.path.display()
+            ),
+        }
+    }
+    build_plugin_fx_in_process(r, sample_rate, max_block)
 }
 
-#[cfg(not(feature = "clap"))]
-fn build_clap_fx(_r: &ClapFxRef, _sample_rate: u32, _max_block: u32) -> Option<Box<dyn fx::FxProcessor>> {
-    None
+/// Load a plugin effect in this process. The sandbox child calls exactly this.
+pub(crate) fn build_plugin_fx_in_process(
+    r: &PluginFxRef,
+    sample_rate: u32,
+    max_block: u32,
+) -> Option<Box<dyn fx::FxProcessor>> {
+    match r.format {
+        crate::PluginFormat::Clap => build_clap_fx(r, sample_rate, max_block),
+        crate::PluginFormat::Lv2 => Some(Box::new(choz_plugin_lv2::Lv2Effect::build(
+            &r.path,
+            &r.id,
+            sample_rate,
+            max_block,
+        )?)),
+        crate::PluginFormat::Ladspa | crate::PluginFormat::Dssi => {
+            Some(Box::new(choz_plugin_ladspa::LadspaEffect::build(
+                &r.path,
+                &r.id,
+                sample_rate,
+                max_block,
+            )?))
+        }
+        crate::PluginFormat::Vst2 => Some(Box::new(choz_plugin_vst2::Vst2Effect::build(
+            &r.path,
+            sample_rate,
+            max_block,
+        )?)),
+        crate::PluginFormat::Vst3 => Some(Box::new(choz_plugin_vst3::Vst3Effect::build(
+            &r.path,
+            sample_rate,
+            max_block,
+        )?)),
+        _ => None,
+    }
+}
+
+fn build_clap_fx(r: &PluginFxRef, sample_rate: u32, max_block: u32) -> Option<Box<dyn fx::FxProcessor>> {
+    let eff = choz_plugin_clap::host::ClapEffect::build(&r.path, &r.id, sample_rate, max_block)?;
+    Some(Box::new(eff))
 }
 
 pub fn build_chain_from_specs(
@@ -218,7 +280,7 @@ pub fn build_chain_from_specs(
                 Some(r) => {
                     // A hosted plugin keeps its own parameters; hand it the
                     // values the UI is showing so a rebuild doesn't reset them.
-                    let mut p = build_clap_fx(r, sample_rate, max_block)?;
+                    let mut p = build_plugin_fx(r, sample_rate, max_block)?;
                     for (i, v) in s.params.iter().enumerate() {
                         p.set_param(i, *v);
                     }
@@ -246,17 +308,18 @@ mod tests {
         "z5texture", "amberfang", "velvetfuzz",
     ];
 
-    fn spec(kind: &str, plugin: Option<ClapFxRef>) -> FxSpec {
+    fn spec(kind: &str, plugin: Option<PluginFxRef>) -> FxSpec {
         FxSpec { kind: kind.into(), enabled: true, wet: 1.0, params: vec![0.5; 8], plugin }
     }
 
-    /// A CLAP effect that can't be loaded (missing file, or the `clap` feature
-    /// off) is dropped from the chain — the built-ins around it still build.
+    /// A CLAP effect that can't be loaded (missing file) is dropped from the
+    /// chain — the built-ins around it still build.
     #[test]
     fn unloadable_clap_fx_is_skipped() {
         let specs = vec![
             spec("gain", None),
-            spec("", Some(ClapFxRef {
+            spec("", Some(PluginFxRef {
+                format: crate::PluginFormat::Clap,
                 path: "/nonexistent/nope.clap".into(),
                 id: "com.example.nope".into(),
             })),

@@ -7,13 +7,9 @@ edition.workspace = true
 name = "choz"
 path = "src/main.rs"
 
-[features]
-default = []
-# Real CLAP plugin hosting (forwards through the engine).
-clap = ["choz-engine/clap"]
-
 [dependencies]
 choz-engine.workspace = true
+choz-ports.workspace = true
 anyhow.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
@@ -23,5 +19,10 @@ flume.workspace = true
 midir.workspace = true
 libc = "0.2"
 ratatui-image = "8"
-image = { version = "0.25", default-features = false }
+# Background wallpapers. Only the formats the file browser offers.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp"] }
 serde_yaml = "0.9"
+
+# Plugin editors are X11 child windows; only Linux builds get one.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = "0.13"

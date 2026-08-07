@@ -2,37 +2,52 @@
 
 ## Overview
 
-**choz** is a terminal-based audio plugin host inspired by [Carla](https://kx.studio/Applications:Carla). It provides a TUI for managing note inputs (MIDI ports, OSC), instruments (SoundFonts, WAV files, CLAP plugins) and real-time FX chains, feeding a real-time audio engine via [cpal](https://github.com/RustAudio/cpal).
+**choz** is a terminal-based audio plugin host inspired by [Carla](https://kx.studio/Applications:Carla). It provides a TUI for managing note inputs (MIDI ports, OSC), instruments (SoundFonts, SFZ, WAV files, CLAP/LV2/LADSPA/DSSI/VST2/VST3 plugins) and real-time FX chains.
+
+Audio reaches the device one of two ways: a **native JACK client** (`jack_backend.rs`) with one port per device channel — which is what per-slot output routing needs — falling back to [cpal](https://github.com/RustAudio/cpal) in stereo when there is no JACK graph.
 
 The user-facing model is:
 
 ```
-[INPUT]  a MIDI port or OSC, picked in the INPUTS panel
+[INPUT]  a MIDI port or OSC, picked in the IN drawer
    │  Enter binds it to a rack tab
    ▼
 [RACK]   one tab (= one engine slot) per bound input
-   │      · instrument: SF2 / WAV / CLAP synth      ([1:SOURCE])
+   │      · instrument: SF2 / WAV / plugin synth    ([1:SOURCE])
    │      · mixer: gain, pan, mute, solo
    ▼
-[FX]     up to 5 effects in series, built-in or CLAP
+[FX]     up to 5 effects in series, built-in or plugin
    ▼
 [OUT]    the selected output device (all slots summed)
 ```
 
 ## Project Structure
 
-choz is a Cargo **workspace** of four crates (modelled on seqterm's
-`ports` / `engine` / `ui` layout):
+choz is a Cargo **workspace** of nine crates (modelled on seqterm's
+`ports` / `engine` / `ui` layout, one crate per plugin format):
 
-- **`choz-ports`** — the realtime-safe port traits (`FxProcessor`, `AudioSource`).
-  Pure trait definitions, no dependencies. Every other crate builds on it.
+- **`choz-ports`** — the realtime-safe port traits (`FxProcessor`, `AudioSource`),
+  plus `PluginEditor`, `PluginParam` and `SandboxStatus`. Pure trait definitions,
+  no dependencies. Every other crate builds on it.
 - **`choz-engine`** — the RT audio thread, sources, FX DSP, MIDI/OSC input, plugin
   path config and the scan cache. Depends on `choz-ports` + cpal/oxisynth/hound/midir/rosc/rtrb.
-- **`choz-plugin-clap`** — CLAP plugin hosting via `clack-host`, behind the
-  `clap` feature (off by default). Discovery plus instrument (`AudioSource`) and
-  effect (`FxProcessor`) instances, so the engine treats a plugin like anything else.
+- **`choz-plugin-clap`** — CLAP hosting via `clack-host`.
+- **`choz-plugin-lv2`** — LV2 hosting: the LV2 C ABI plus a pure-Rust TTL parser
+  (`rio_turtle`), no lilv and no LV2 SDK.
+- **`choz-plugin-ladspa`** — LADSPA and DSSI hosting (one crate: they share the
+  LADSPA descriptor). DSSI synths are driven with ALSA sequencer events.
+- **`choz-plugin-vst2`** — VST2 hosting through the published binary interface.
+- **`choz-plugin-vst3`** — VST3 hosting through pure-Rust COM bindings (`vst3`).
+  The only hosted format still without a native editor (`IPlugView` not started).
+- **`choz-plugin-sandbox`** — POSIX shared memory plus the block-exchange protocol
+  for running a plugin in its own process. Deliberately split in two: `shm.rs`
+  maps the memory, `bridge.rs` is the protocol over those bytes and can be tested
+  end to end inside one process, on a `Vec<u8>`.
+
+  Every host crate exposes the same shape — `scan_directory`, `read_params`, an
+  instrument (`AudioSource`) and an effect (`FxProcessor`) — so the engine treats
+  any plugin like anything else. None of them is behind a feature flag.
 - **`choz-ui`** — the ratatui TUI binary (`choz`). Depends on `choz-engine`.
-  Its own `clap` feature forwards to `choz-engine/clap`.
 
 ```
 choz/
@@ -51,6 +66,10 @@ choz/
 │   │       ├── fx_chain.rs      # Builds FX processor chains from specs
 │   │       ├── paths.rs         # PluginFormat + per-format scan dirs (Carla-style)
 │   │       ├── cache.rs         # State dir + on-disk plugin scan cache
+│   │       ├── jack_backend.rs  # Native JACK client: one port per device channel
+│   │       ├── sfz.rs           # SFZ parser + 32-voice sampler (samples decoded on load)
+│   │       ├── quarantine.rs    # Probe a plugin in a child process; cache the verdict
+│   │       ├── sandboxed.rs     # AudioSource/FxProcessor backed by a child process
 │   │       ├── registry.rs      # Legacy plugin registry (largely stub)
 │   │       ├── scanner.rs       # Legacy filesystem discovery (largely stub)
 │   │       ├── plugin_types.rs  # Legacy plugin format enum / host port trait
@@ -58,10 +77,35 @@ choz/
 │   ├── choz-plugin-clap/
 │   │   └── src/
 │   │       ├── lib.rs           # Discovery + ClapPluginInfo
-│   │       └── host.rs          # ClapProc, ClapInstrument, ClapEffect
+│   │       ├── host.rs          # ClapProc, ClapInstrument, ClapEffect, host extensions
+│   │       └── editor.rs        # clap.gui window, ticked by the host timer
+│   ├── choz-plugin-lv2/
+│   │   └── src/
+│   │       ├── lib.rs           # Instance, Lv2Instrument, Lv2Effect, features
+│   │       ├── discovery.rs     # Bundle TTL → Lv2PluginInfo + ports
+│   │       ├── ttl.rs           # Turtle/RDF graph
+│   │       ├── editor.rs        # ui:X11UI window, without suil
+│   │       └── lv2_abi.rs       # LV2 C structs (core, urid, atom, midi, options, ui)
+│   ├── choz-plugin-ladspa/
+│   │   └── src/
+│   │       ├── lib.rs           # Instance, LadspaEffect, DssiInstrument
+│   │       └── abi.rs           # LADSPA + DSSI + snd_seq_event_t
+│   ├── choz-plugin-vst2/
+│   │   └── src/
+│   │       ├── lib.rs           # Instance, Vst2Effect, Vst2Instrument
+│   │       └── vst2_abi.rs      # AEffect, opcodes, VstMidiEvent
+│   ├── choz-plugin-vst3/
+│   │   └── src/
+│   │       ├── lib.rs           # Scan, Vst3Effect, Vst3Instrument
+│   │       └── host.rs          # COM plumbing: component/processor/controller
+│   ├── choz-plugin-sandbox/
+│   │   └── src/
+│   │       ├── shm.rs           # POSIX shared memory (shm_open + mmap, unlinked early)
+│   │       └── bridge.rs        # The block-exchange protocol, testable on a Vec<u8>
 │   └── choz-ui/
 │       └── src/
 │           ├── main.rs          # App state, event loop, UI, mouse/keyboard, modals
+│           ├── editor.rs        # X11 window thread hosting a plugin's own GUI
 │           ├── source.rs        # Instrument model, AudioFxKind, FxCategory, param descs
 │           ├── project.rs       # choz-project.yml save model (serde_yaml)
 │           ├── settings.rs      # ui.json: color, language, audio + OSC settings
@@ -73,7 +117,8 @@ choz/
 │           └── views/
 │               ├── mod.rs             # Shared view constants
 │               ├── modal.rs           # THE modal widget (list, sidebar, chips, buttons)
-│               ├── source_panel.rs    # INPUTS panel
+│               ├── drawer.rs          # IN/OUT drawers: handles + output routing
+│               ├── source_panel.rs    # INPUTS panel (inside the IN drawer)
 │               ├── fx_chain_panel.rs  # RACK panel; returns its own RackLayout
 │               ├── splash.rs          # Startup splash
 │               └── theme.rs           # text() / border() colors from settings
@@ -119,13 +164,25 @@ fx/
 graph TD
     ui["choz-ui (binary: choz)"]
     engine["choz-engine"]
-    clap["choz-plugin-clap (feature: clap)"]
-    ports["choz-ports (FxProcessor, AudioSource)"]
+    clap["choz-plugin-clap"]
+    lv2["choz-plugin-lv2"]
+    ladspa["choz-plugin-ladspa (LADSPA + DSSI)"]
+    vst2["choz-plugin-vst2"]
+    vst3["choz-plugin-vst3"]
+    ports["choz-ports (FxProcessor, AudioSource, PluginParam)"]
 
     ui --> engine
     engine --> clap
+    engine --> lv2
+    engine --> ladspa
+    engine --> vst2
+    engine --> vst3
     engine --> ports
     clap --> ports
+    lv2 --> ports
+    ladspa --> ports
+    vst2 --> ports
+    vst3 --> ports
 ```
 
 Inside `choz-ui`:
@@ -154,14 +211,29 @@ graph TD
 
 ## Thread Architecture
 
-choz runs three threads:
+Three threads are always there:
 
 1. **UI thread** (main): the ratatui/crossterm event loop, keyboard and mouse
    input, all `App` state, and the *routing decision* (which slots a note reaches).
-2. **Audio thread** (cpal callback): real-time, lock-free and allocation-free.
-   Sums every slot (source → FX chain → gain/pan) into the output buffer.
+2. **Audio thread** (JACK or cpal callback): real-time, lock-free and
+   allocation-free. Sums every slot (source → FX chain → gain/pan) into the
+   output buffers.
 3. **Input threads**: midir callbacks and the OSC UDP listener, both pushing
    `InputEvent`s into one `flume` channel the UI drains each frame.
+
+Three more come and go:
+
+4. **Editor thread**, while a plugin window is open: owns the X11 connection and
+   pumps the plugin's `idle()` (or its CLAP timers) every 30 ms. All X11 calls
+   stay on it.
+5. **Sandbox supervisor**, one per sandboxed plugin: watches the child process
+   and restarts it if it dies. The audio thread never waits on it — the exchange
+   has its own deadline and reads silence meanwhile.
+6. **Worker processes** (not threads): scanning and load-probing re-run the choz
+   binary with `--choz-scan-worker` / `--choz-probe-worker` /
+   `--choz-sandbox-worker`. Every child carries `CHOZ_WORKER=1`, so a worker never
+   spawns workers — that guard exists because a test binary once forked itself
+   into a process bomb.
 
 Handoff to the audio thread is a **command ring** (`rtrb`), never a lock: the UI
 builds chains and sources, sends them as `EngineCommand`, and anything the audio
@@ -279,18 +351,22 @@ flowchart TB
     MB["Menu bar: FILE · EDIT · HELP (F10)"]
     subgraph Screen
         direction LR
-        subgraph Left["40% width"]
+        subgraph Left["IN drawer (F2) — 3 cols shut, 40% open"]
             SP["INPUTS Panel<br/>SCAN INPUTS button<br/>MIDI ports + OSC, with tab bindings"]
         end
-        subgraph Right["60% width"]
+        subgraph Mid["RACK — everything the drawers leave"]
             FXP["RACK Panel<br/>tabs · mixer strip · INSTR buttons · BANK<br/>FX chain row · knob grid · SLOT buttons"]
             TR["TRANSPORT<br/>[PLAY] [STOP] · OUT device"]
+        end
+        subgraph Right["OUT drawer (F3) — 3 cols shut, 34% open"]
+            OP["Output devices + the device's channel pairs<br/>Enter on a device reloads the rack,<br/>Enter on a pair routes the active tab there"]
         end
     end
     SB["Status Bar: version, backend, active tab, FX count, playback state"]
 
     MB --- Screen
-    Left ~~~ Right
+    Left ~~~ Mid
+    Mid ~~~ Right
     Screen --- SB
 ```
 
@@ -335,7 +411,11 @@ plugin-path list triggers a rescan.
 
 ## Plugin Architecture
 
-Real hosting today is CLAP only, via `clack-host`:
+Hosted formats: CLAP, LV2, LADSPA, DSSI, VST2 and VST3 (plus SF2 soundbanks,
+which are not plugins). `choz_engine::scan_all` asks each host crate for what is
+in its search directories, `AudioEngine::load_plugin(slot, format, path, id)`
+builds an instrument, and `fx_chain::build_plugin_fx` builds an effect. The CLAP
+classes below are the pattern every host follows:
 
 ```mermaid
 classDiagram
@@ -369,30 +449,80 @@ classDiagram
 
 Discovery for every other format is filesystem-only:
 
-- `paths.rs` owns `PluginFormat {LADSPA, DSSI, LV2, VST2, VST3, CLAP, SF2, SFZ, JSFX}`
+- `paths.rs` owns `PluginFormat {LADSPA, DSSI, LV2, VST2, VST3, CLAP, SF2, SFZ}`
   with Carla-style default directories, honouring `LV2_PATH` / `VST_PATH` /
   `VST3_PATH` / `CLAP_PATH` / … , persisted in `<state dir>/plugin-paths.json`.
 - `scan_all()` walks every enabled directory (bundles like `.lv2` / `.vst3` count
   as directories, everything else by extension) and yields `Vec<FoundPlugin>`.
 - `cache.rs` writes that to `<state dir>/plugins.json` and reuses it until a scan
-  directory or the path config is newer. It records `hosted: bool` so a cache
-  written by a non-`clap` build is not trusted by a `clap` build.
-- Formats choz cannot instantiate still appear in the pickers, marked
-  `(not hosted yet)`.
+  directory or the path config is newer.
+- The pickers can still mark an entry `(not hosted yet)`, but nothing triggers it
+  today: every format in `PluginFormat` is hosted. The branch stays for the day a
+  new one is added.
 
 `registry.rs`, `scanner.rs` and `plugin_types.rs` are the earlier, largely stubbed
-plugin infrastructure; the live path is `choz-plugin-clap` + `paths.rs`. They
-should be unified or deleted when LV2/VST hosting lands.
+plugin infrastructure; the live path is the per-format crates plus `paths.rs`.
+Unifying or deleting them is still open (see the roadmap).
+
+### Surviving third-party code
+
+Plugins are C libraries written by other people, and some of them crash. Three
+layers, each measured against what is installed on the dev machine:
+
+1. **Scanning is out of process.** `scan_all` spawns the choz binary itself with
+   `--choz-scan-worker <FORMAT> <dir> <out>`; results come back through a file,
+   because plugins print banners on stdout. If a child dies, the parent retries
+   that directory one entry at a time, losing only the broken plugin.
+2. **Quarantine** (`quarantine.rs`). The first time a plugin is loaded it is tried
+   in a child — instantiate, two blocks, destroy — and the child records how far
+   it got. `CrashesOnLoad` is refused outright; `CrashesOnTeardown` is loaded and
+   then deliberately leaked, because it plays fine and only dies on the way out.
+   Verdicts are cached in `<state dir>/plugin-verdicts.json`.
+3. **Sandbox** (`sandboxed.rs` + `choz-plugin-sandbox`). A plugin can run in its
+   own process, exchanging one block at a time over shared memory. The exchange
+   has a **deadline**: if the child does not answer, the host reads silence and
+   carries on, so a hung plugin costs a click rather than the stream. A supervisor
+   thread restarts a child that dies. Applied automatically to whatever the probe
+   saw die on teardown, and manually per plugin via the `SBX` button
+   (`<state dir>/plugin-sandbox.json`).
+
+Deny-lists remain for two cases the layers above cannot cover, both by name and
+both measured: Carla's own wrappers (they corrupt the allocator rather than
+crash, so there is nothing to catch) and guitarix's X11 UIs (every one of them
+segfaults on instantiate).
+
+### Native plugin windows
+
+`choz_ports::PluginEditor` (`open(parent_xid)`, `idle`, `close`) is implemented by
+whichever host can embed into an X11 window; `AudioSource` and `FxProcessor` both
+expose `editor()`, defaulting to `None`. `choz-ui/src/editor.rs` owns the window:
+a dedicated thread creates it with `x11rb`, hands the XID to the plugin, and
+pumps `idle()` every 30 ms. One window at a time.
+
+| Format | How |
+|---|---|
+| **VST2** | `effEditOpen` / `effEditGetRect` / `effEditIdle`. The `AEffect` is shared with the GUI thread under a mutex that guards *lifetime*, not audio access. |
+| **LV2** | `ui:X11UI`, no suil. The UI is a separate binary that never touches the instance — it writes control values through a host callback, which is why it works with the plugin on the audio thread. |
+| **CLAP** | `clap.gui` through the raw `clap_plugin` pointer (clack's safe wrapper needs a main-thread handle nobody can hold here). Needs two *host* extensions to draw at all: `clap.gui` and `clap.timer-support` — a CLAP UI paints from `on_timer`. |
+| **VST3** | Not started (`IPlugView`). |
+
+The engine captures `editor()` in `add_slot` / `set_slot_source` / `set_slot_fx`
+— the only moment the UI can still touch the processor before the audio thread
+takes it. Every editor holds its plugin behind an `Option` that the instance's
+`Drop` empties, so a window that outlives its slot turns into a no-op instead of
+calling freed memory.
 
 ## Persistence
 
 | File | Contents |
 |------|----------|
 | `<state dir>/choz.log` | Runtime log |
-| `<state dir>/plugins.json` | Plugin scan cache (`Vec<FoundPlugin>` + `hosted`) |
-| `<state dir>/plugin-paths.json` | Per-format scan directories |
+| `<state dir>/plugins.json` | Plugin scan cache (`Vec<FoundPlugin>`) |
+| `<state dir>/plugin-paths.json` | Per-format scan directories, stored by format label |
+| `<state dir>/plugin-verdicts.json` | What the quarantine probe saw for each plugin |
+| `<state dir>/plugin-sandbox.json` | Plugins the user pinned to run sandboxed |
 | `<state dir>/ui.json` | Text color, language, audio settings, OSC settings |
-| `choz-project.yml` | Saved project: rack + full configuration (write-only so far) |
+| `choz-project.yml` | Saved project: rack + full configuration (saved *and* loaded) |
 
 `<state dir>` is `~/.local/state/choz` (`cache::state_dir()` is the single source
 of truth; tests redirect it with `XDG_STATE_HOME`).
@@ -410,7 +540,13 @@ of truth; tests redirect it with `XDG_STATE_HOME`).
 | `rosc` | 0.11 | OSC message parsing |
 | `oxisynth` / `soundfont` | 0.1 | SF2 synthesis and preset listing |
 | `hound` | 3 | WAV decoding |
-| `clack-host` / `clack-extensions` | 0.1 | CLAP hosting (feature `clap`) |
+| `clack-host` / `clack-extensions` | 0.1 | CLAP hosting (`gui` + `timer` extensions) |
+| `clap-sys` | 0.5 | Raw CLAP structs — the same version clack uses |
+| `libloading` | 0.8 | dlopen for the LV2 / LADSPA / VST2 hosts |
+| `rio_turtle` / `rio_api` / `oxiri` | 0.8 / 0.2 | Turtle parsing for LV2 bundle TTL |
+| `vst3` | 0.3 | VST3 COM bindings |
+| `symphonia` | 0.5 | WAV + FLAC decoding for SFZ samples |
+| `x11rb` | 0.13 | The window that hosts a plugin's native GUI |
 | `rtrb` | 0.3 | Lock-free ring buffers for RT handoff |
 | `flume` | 0.11 | Multi-producer channels (MIDI/OSC → UI) |
 | `parking_lot` | 0.12 | Fast synchronization primitives |
