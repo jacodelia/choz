@@ -29,7 +29,7 @@ working, and **CLAP, LV2, LADSPA, DSSI, VST2 and VST3 plugins are really hosted*
 | **LV2**    | ✅ | ✅ | ✅ | ✅ `ui:X11UI`, no suil |
 | **VST2**   | ✅ | ✅ | ✅ | ✅ `effEditOpen` |
 | **CLAP**   | ✅ | ✅ | ✅ | ✅ `clap.gui` + host timer |
-| **VST3**   | ✅ | ✅ | ✅ | ❌ `IPlugView` not started |
+| **VST3**   | ✅ | ✅ | ✅ | ✅ `IPlugView` + Linux run loop |
 | **LADSPA** | ✅ | — | ✅ | ❌ (format has no GUI) |
 | **DSSI**   | ✅ | ✅ | ✅ | ❌ |
 | **SFZ**    | ✅ | ✅ | — | — |
@@ -39,9 +39,20 @@ Plus **32 built-in DSP effects**, and WAV playback as a rack source.
 
 Plugin windows embed into a real X11 window on choz's editor thread — no suil,
 no Steinberg SDK. Verified by counting the parent window's actual X11 children,
-not by trusting return values: **20 of 20 CLAP** plugins installed here open at
-the size they ask for (Surge XT included), and **91 of 98 LV2 editors** swept
-so far (1 opened without producing a window, 4 gave no editor at all).
+not by trusting return values: **20 of 20 CLAP** and **20 of 21 VST3** plugins
+installed here open at the size they ask for (Surge XT included), and **254 of
+259 LV2 editors** in a full sweep with no crashes (the other 5 do not
+instantiate at all — sequencers with no audio output).
+
+Whatever a plugin's window can do, choz can do without opening it: every
+parameter is a knob in the RACK, and MIDI learn binds to those knobs directly.
+Parameters moved *inside* the plugin's window are followed too (VST3
+`IComponentHandler`, VST2 `audioMasterAutomate`, CLAP output events, the LV2 UI
+write callback), so "move that knob, then move a fader" is a complete binding.
+
+Projects save what a parameter list cannot: the plugin's **own state** — the
+patch picked in its browser — through VST2 chunks, VST3 `IComponent::getState`,
+`clap.state` and LV2 `state#interface`.
 
 ### Safety net
 
@@ -55,7 +66,23 @@ three layers, all measured against what is installed here:
   dying on *teardown* means it is loaded and then leaked on purpose.
 - **Sandbox** — a plugin can run in its own process, exchanging audio over shared
   memory with a deadline. If the child dies mid-note, a supervisor thread
-  restarts it: a click instead of a dead tab.
+  restarts it: a click instead of a dead tab. **Its window opens in that process
+  too**, which is where third-party code crashes most.
+
+### Two jobs, one switch
+
+The switch in the top-right corner (`F4`) says which one choz is doing, because
+the two pull the routing in opposite directions:
+
+- **LIVE** — one tab sounds at a time. Tabs are the songs or the patches of a
+  set, and a program change from a controller's buttons steps through them.
+- **MULTI** — every tab sounds at once, each answering **its own MIDI channel**:
+  a multi-timbral module for a DAW's orchestral template (Reaper → choz, the way
+  Kontakt is used).
+
+`PANIC` (in TRANSPORT, or `P` from anywhere) kills every sounding note: a real
+note-off for each note choz knows is down, then the broadcast — the note-offs
+are what a VST3 plugin actually receives, since *all notes off* is a MIDI CC.
 
 ---
 
@@ -117,7 +144,11 @@ headroom for plugin DSP at small buffer sizes.
 | `a` | rack | add an FX to the chain |
 | `g` / `G` | rack | plugin window: instrument / selected FX |
 | `x` / `X` | rack | run that plugin sandboxed |
-| `l` | rack | MIDI learn |
+| `l` | rack | MIDI learn (or click a knob after pressing `MIDI LEARN`) |
+| `k` | rack | move the cursor between the instrument knobs and the FX ones |
+| `p` | rack | full parameter list of the tab's plugin |
+| `P` | anywhere | panic — kill every sounding note |
+| `F4` | anywhere | LIVE ↔ MULTI |
 | `m` / `S` | rack | mute / solo the tab |
 | `c` / `r` | IN drawer | connect-disconnect a port / rescan inputs |
 
@@ -152,11 +183,12 @@ choz/                       9 crates, version 0.1.0
 │   ├── choz-plugin-vst2/   VST2 host — the published binary interface, no SDK
 │   ├── choz-plugin-vst3/   VST3 host — pure-Rust COM bindings, no Steinberg SDK
 │   ├── choz-plugin-sandbox/ Shared-memory transport for out-of-process hosting
+│   │                       (audio blocks and the plugin's window)
 │   └── choz-ui/            The `choz` binary: TUI, rack, modals, drawers,
 │                           projects, settings, i18n, plugin windows
 └── docs/
     ├── architecture.md     How the pieces fit
-    ├── roadmap.md          What is done, what is not, and every session's notes
+    ├── roadmap.md          What is still missing, and the gotchas worth knowing
     ├── audio-latency.md    PipeWire/JACK tuning and how to verify it
     └── usb-xhci-crash.md   The USB controller incident, and what avoids it
 ```
@@ -185,20 +217,20 @@ See [`CHANGELOG.md`](CHANGELOG.md) for what has landed so far.
 ## Tests
 
 ```bash
-cargo test --workspace              # 211 tests
+cargo test --workspace              # 236 tests
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 | Crate | Tests | Covers |
 |---|---|---|
-| `choz-engine` | 107 | 32 FX processors, mixer, sources, SFZ parser, plugin paths, scan cache, OSC socket |
-| `choz-ui` | 76 | Rack layout, modals, mouse hit-testing, MIDI learn, project save/load, i18n, themes and background rendering |
-| `choz-plugin-lv2` | 8 | TTL parsing, hosting installed effects, `worker#schedule`, X11 editor discovery |
-| `choz-plugin-clap` | 8 | Effect runtime against installed plugins |
+| `choz-engine` | 109 | 32 FX processors, mixer, sources, SFZ parser, plugin paths, scan cache, quarantine, sandbox, OSC socket |
+| `choz-ui` | 90 | Rack layout, modals, mouse hit-testing, MIDI learn, note routing in both modes, project save/load, i18n, themes and background rendering |
+| `choz-plugin-lv2` | 10 | TTL parsing, hosting installed effects, `worker#schedule`, X11 editor discovery, state round-trip |
+| `choz-plugin-clap` | 10 | Effect and instrument runtime against installed plugins, window feed |
 | `choz-plugin-ladspa` | 6 | LADSPA + DSSI descriptors and runtime |
-| `choz-plugin-sandbox` | 3 | Shared-memory handshake, deadline behaviour |
-| `choz-plugin-vst2` | 2 | Host callback transport, runtime |
-| `choz-plugin-vst3` | 1 | Factory info, runtime |
+| `choz-plugin-sandbox` | 4 | Shared-memory handshake, deadline behaviour, window request |
+| `choz-plugin-vst2` | 3 | Host callback transport, automation feed, runtime |
+| `choz-plugin-vst3` | 4 | Factory info, parameter changes reaching the processor, run loop, runtime |
 
 Four suites use `harness = false`, because the test binary itself has to be able
 to act as a worker process: `quarantine`, `sandboxed_plugin`, `scan_isolation`
@@ -236,6 +268,9 @@ cargo run -p choz-engine      --example devlist
 | `PIPEWIRE_LATENCY` / `PIPEWIRE_QUANTUM` | Set by choz from the configured buffer size before opening the JACK client. See [`docs/audio-latency.md`](docs/audio-latency.md). |
 | `CHOZ_CLAP_STRICT_TEARDOWN=1` | Destroy CLAP plugins properly instead of leaking the ones known to crash. For debugging. |
 | `CHOZ_LV2_STRICT_TEARDOWN=1` | Same for LV2 — this is how the quarantine probe finds out in the first place. |
+| `CHOZ_KITTY_BG=0` | Draw the wallpaper as cell colours instead of using kitty's graphics protocol. |
+| `CHOZ_PROBE_RUNS=N` | How many times a plugin is probed before it is believed to be safe (default 3 — some crashes are races). |
+| `CHOZ_VST2_DIR=<dir>` | Extra directory for the VST2 runtime tests, where the machine's instruments live. |
 | `LV2_PATH`, `VST_PATH`, `VST3_PATH`, `CLAP_PATH`, `LADSPA_PATH`, `DSSI_PATH`, `SF2_PATH`, `SFZ_PATH` | Override the search path for that format. |
 
 State lives in `~/.local/state/choz/`: `choz.log`, `plugins.json` (scan cache),

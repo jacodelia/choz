@@ -13,13 +13,31 @@ The user-facing model is:
    │  Enter binds it to a rack tab
    ▼
 [RACK]   one tab (= one engine slot) per bound input
-   │      · instrument: SF2 / WAV / plugin synth    ([1:SOURCE])
+   │      · instrument: SF2 / SFZ / WAV / plugin synth   ([1:SOURCE])
+   │      · its parameters as knobs, MIDI-learnable      (INSTRUMENT box)
    │      · mixer: gain, pan, mute, solo
    ▼
 [FX]     up to 5 effects in series, built-in or plugin
    ▼
 [OUT]    the selected output device (all slots summed)
 ```
+
+### Two modes, one switch
+
+A switch in the top-right corner (`F4`, `settings::RackMode`) decides what a note
+does, because the two jobs choz is for pull the routing in opposite directions:
+
+| | **LIVE** | **MULTI** |
+|---|---|---|
+| What sounds | the active tab | every tab at once |
+| What selects it | the bound input; several tabs on one port are alternatives | the **MIDI channel** each tab answers |
+| Program change | selects a tab (a live rig's patch buttons) | ignored — nothing to select |
+| For | playing a set on stage | being a multi-timbral module for a DAW's template |
+
+`App::targets_for(source, channel)` is the only place that reads the mode;
+`note_targets` (LIVE) and `multi_targets` (MULTI) are pure functions with tests.
+Switching mode — or a tab's channel — panics first: the two routings address
+different tabs, so anything held across the change would never get its note-off.
 
 ## Project Structure
 
@@ -38,7 +56,7 @@ choz is a Cargo **workspace** of nine crates (modelled on seqterm's
   LADSPA descriptor). DSSI synths are driven with ALSA sequencer events.
 - **`choz-plugin-vst2`** — VST2 hosting through the published binary interface.
 - **`choz-plugin-vst3`** — VST3 hosting through pure-Rust COM bindings (`vst3`).
-  The only hosted format still without a native editor (`IPlugView` not started).
+  Its editor needs the Linux run loop the format expects the host to provide.
 - **`choz-plugin-sandbox`** — POSIX shared memory plus the block-exchange protocol
   for running a plugin in its own process. Deliberately split in two: `shm.rs`
   maps the memory, `bridge.rs` is the protocol over those bytes and can be tested
@@ -121,7 +139,11 @@ choz/
 │               ├── source_panel.rs    # INPUTS panel (inside the IN drawer)
 │               ├── fx_chain_panel.rs  # RACK panel; returns its own RackLayout
 │               ├── splash.rs          # Startup splash
-│               └── theme.rs           # text() / border() colors from settings
+│               ├── midi_monitor.rs    # What arrived on the note inputs
+│               ├── background.rs      # Desktop: flat colour or image, in cells
+│               ├── kitty_bg.rs        # The same image at real pixel resolution,
+│               │                      # under the cell backgrounds (kitty et al)
+│               └── theme.rs           # Colours, and the wash panels blend with
 ```
 
 FX processors under `crates/choz-engine/src/fx/` (32 built-ins, each with its own tests):
@@ -308,6 +330,14 @@ The RACK panel computes its own hit-test rectangles and returns them as a
 `RackLayout` that `ui()` stores in `UiLayout` — drawing and clicking read the
 same numbers, which is what keeps them from drifting apart.
 
+**A note-off follows its note-on.** Routing depends on which tab is active, so
+`App.sounding` remembers where each note was sent and the release goes there,
+however the rack changed meanwhile. `PANIC` (`EngineCommand::Panic`) is the way
+out when a note is stuck anyway: each engine slot keeps a `u128` of the notes it
+was told to play and gets a real note-off for every one of them, then the
+`all_notes_off()` broadcast — the note-offs are what a VST3 plugin actually
+receives, since *all notes off* is a MIDI CC.
+
 ## FX Chain Processing Pipeline
 
 ```mermaid
@@ -462,7 +492,7 @@ Discovery for every other format is filesystem-only:
 
 `registry.rs`, `scanner.rs` and `plugin_types.rs` are the earlier, largely stubbed
 plugin infrastructure; the live path is the per-format crates plus `paths.rs`.
-Unifying or deleting them is still open (see the roadmap).
+Unifying or deleting them is still open (see [roadmap.md](roadmap.md)).
 
 ### Surviving third-party code
 
@@ -504,13 +534,56 @@ pumps `idle()` every 30 ms. One window at a time.
 | **VST2** | `effEditOpen` / `effEditGetRect` / `effEditIdle`. The `AEffect` is shared with the GUI thread under a mutex that guards *lifetime*, not audio access. |
 | **LV2** | `ui:X11UI`, no suil. The UI is a separate binary that never touches the instance — it writes control values through a host callback, which is why it works with the plugin on the audio thread. |
 | **CLAP** | `clap.gui` through the raw `clap_plugin` pointer (clack's safe wrapper needs a main-thread handle nobody can hold here). Needs two *host* extensions to draw at all: `clap.gui` and `clap.timer-support` — a CLAP UI paints from `on_timer`. |
-| **VST3** | Not started (`IPlugView`). |
+| **VST3** | `IPlugView`, plus the part Linux needs: a VST3 plugin gets no idle callback — it registers timers and file descriptors on the host's `Steinberg::Linux::IRunLoop`, which it finds by querying the `IPlugFrame` it was given. `HostFrame` is both. |
+| **Sandboxed** | The window is opened **by the child process**, embedded into an X11 window choz created — window ids are valid across processes. A GUI that crashes takes the child down, and the supervisor replaces it. |
 
 The engine captures `editor()` in `add_slot` / `set_slot_source` / `set_slot_fx`
 — the only moment the UI can still touch the processor before the audio thread
 takes it. Every editor holds its plugin behind an `Option` that the instance's
 `Drop` empties, so a window that outlives its slot turns into a no-op instead of
-calling freed memory.
+calling freed memory. `param_touch()` and `state()` are captured at the same
+moment, for the same reason.
+
+### Parameters, without opening a window
+
+The RACK draws the tab's instrument parameters as knobs (`draw_knob_box`, shared
+with the FX chain's). They are clickable, they are MIDI-learn targets, and the
+values are what the project saves — so a CC can be bound to any parameter of any
+plugin without waiting for its GUI to build.
+
+When the GUI *is* open, choz follows it: `choz_ports::ParamTouch` reports the
+parameter the user just grabbed **inside the plugin's window**, translated to the
+index choz addresses knobs by. Each format has its own channel for this — VST3
+`IComponentHandler::performEdit`, VST2 `audioMasterAutomate`, CLAP's output event
+stream (read on the audio thread, `try_lock`, never blocking), the LV2 UI's write
+callback — and `App::poll_plugin_touch` turns it into either a learn target or an
+updated value.
+
+### The plugin's own state
+
+Parameter values do not describe a patch. `choz_ports::PluginState` carries the
+opaque blob each format has for that — VST2 chunks, VST3 `IComponent::getState`,
+`clap.state`, LV2 `state#interface` — and the project stores it as base64. On
+rebuild the patch is restored **first** and the knob values applied on top:
+restoring state moves every parameter, so the other order would leave a tab
+sounding like the patch and looking like the knobs.
+
+### The desktop, and why it is two paths
+
+A terminal cell background is **opaque**, which decides everything here:
+
+- **Everywhere**: the image is reduced to cell colours and written into the
+  buffer (`background.rs`, halfblocks — two pixels per cell). Panels then blend
+  the theme's colour with what the picture shows *at that cell*, so they read as
+  translucent (`theme::wash`).
+- **kitty and friends**: the image is handed to the terminal at the window's real
+  pixel size and placed **below the cell backgrounds** (`z < -1073741824`), so it
+  keeps every pixel it had. Panels cannot wash it by painting cells — that would
+  cover it — so the wash is a **second, translucent image** over the first, four
+  pixels per cell and re-sent only when the layout or the opacity changes.
+
+The opacity is one slider (Settings → THEME). Because it lives in the panels and
+not in the image, moving it costs a redraw rather than a decode and a transfer.
 
 ## Persistence
 
@@ -521,8 +594,8 @@ calling freed memory.
 | `<state dir>/plugin-paths.json` | Per-format scan directories, stored by format label |
 | `<state dir>/plugin-verdicts.json` | What the quarantine probe saw for each plugin |
 | `<state dir>/plugin-sandbox.json` | Plugins the user pinned to run sandboxed |
-| `<state dir>/ui.json` | Text color, language, audio settings, OSC settings |
-| `choz-project.yml` | Saved project: rack + full configuration (saved *and* loaded) |
+| `<state dir>/ui.json` | Theme colours, desktop background and its panel opacity, language, audio + OSC settings, LIVE/MULTI |
+| `choz-project.yml` | Saved project: rack (instruments, their state blobs, FX chains, mixer, MIDI channel, learn bindings) + full configuration |
 
 `<state dir>` is `~/.local/state/choz` (`cache::state_dir()` is the single source
 of truth; tests redirect it with `XDG_STATE_HOME`).

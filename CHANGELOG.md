@@ -4,9 +4,10 @@ Todos los cambios notables de choz. Formato basado en
 [Keep a Changelog](https://keepachangelog.com/es/1.1.0/).
 
 El proyecto todavía no publica versiones: hay un solo tramo `Unreleased` desde
-el commit inicial, agrupado por día de trabajo. El detalle largo de cada tanda
-(diagnósticos, medidas, callejones sin salida) vive en
-[docs/roadmap.md](docs/roadmap.md); aquí va sólo qué cambió.
+el commit inicial, agrupado por día de trabajo. **Éste es el historial**: los
+diagnósticos, las medidas y los callejones sin salida se cuentan aquí.
+[docs/roadmap.md](docs/roadmap.md) sólo lleva lo que falta, y
+[docs/architecture.md](docs/architecture.md) cómo encajan las piezas.
 
 ## [Unreleased]
 
