@@ -8,7 +8,15 @@ const SR: u32 = 48_000;
 const BLOCK: u32 = 256;
 
 fn installed() -> Vec<Vst2PluginInfo> {
-    scan_directory(std::path::Path::new("/usr/lib/vst"))
+    let mut found = scan_directory(std::path::Path::new("/usr/lib/vst"));
+    // The stock directory holds only effects on most machines. `CHOZ_VST2_DIR`
+    // points the instrument half of these checks at wherever the user unpacked
+    // theirs (TyrellN6, TripleCheese, Pianoteq…) without hardcoding a path that
+    // means nothing anywhere else.
+    if let Some(extra) = std::env::var_os("CHOZ_VST2_DIR") {
+        found.extend(scan_directory(std::path::Path::new(&extra)));
+    }
+    found
 }
 
 fn sine_block(frames: usize) -> Vec<f32> {
@@ -35,6 +43,73 @@ fn installed_vst2_plugins_scan_host_and_expose_params() {
     for p in &found {
         assert!(!p.name.is_empty(), "{} has no name", p.path.display());
         assert!(p.id.starts_with("vst2:"), "odd id {}", p.id);
+    }
+
+    // An instrument: choz must be able to drive its parameters (that is what a
+    // MIDI-learn binding ends up calling), and it must offer the feed that
+    // reports what the user moves inside its own window.
+    for info in found.iter().filter(|p| p.is_instrument) {
+        let Some(mut inst) = Vst2Instrument::build(&info.path, SR, BLOCK) else { continue };
+        let params = choz_plugin_vst2::read_params(&info.path, "");
+        assert!(!params.is_empty(), "{} exposes no parameters", info.name);
+        assert!(
+            inst.param_touch().is_some(),
+            "{}: no way to report what the user moves in its window",
+            info.name
+        );
+
+        let render = |inst: &mut Vst2Instrument| {
+            let mut buf = vec![0.0f32; BLOCK as usize * 2];
+            let mut peak = 0.0f32;
+            for _ in 0..8 {
+                buf.iter_mut().for_each(|s| *s = 0.0);
+                inst.render(&mut buf, SR);
+                peak = peak.max(buf.iter().fold(0.0f32, |a, s| a.max(s.abs())));
+            }
+            peak
+        };
+        inst.note_on(60, 100);
+        let _ = render(&mut inst);
+        // Sweep a few parameters; at least one has to move the sound, or choz
+        // cannot control this plugin at all.
+        let mut changed = false;
+        for i in 0..params.len().min(12) {
+            inst.set_param(i, 0.0);
+            let low = render(&mut inst);
+            inst.set_param(i, 1.0);
+            let high = render(&mut inst);
+            if (low - high).abs() > 1e-4 {
+                changed = true;
+                break;
+            }
+        }
+        assert!(changed, "{}: no parameter changed the sound", info.name);
+        break;
+    }
+
+    // The plugin's own chunk: a u-he patch is not a list of parameter values,
+    // and a project that only saved the values would reopen on a different
+    // sound. Saved from one instance, restored into a fresh one.
+    for info in found.iter().filter(|p| p.is_instrument) {
+        let Some(mut inst) = Vst2Instrument::build(&info.path, SR, BLOCK) else { continue };
+        let Some(state) = inst.state() else { continue };
+        inst.set_param(0, 0.7);
+        let Some(blob) = state.save() else {
+            // No `effFlagsProgramChunks`: nothing to carry, which is legal.
+            continue;
+        };
+        drop(inst);
+
+        let Some(fresh) = Vst2Instrument::build(&info.path, SR, BLOCK) else { continue };
+        let restored = fresh.state().expect("same plugin, same capability");
+        restored.restore(&blob);
+        assert_eq!(
+            restored.save().map(|b| b.len()),
+            Some(blob.len()),
+            "{}: the chunk did not survive the round trip",
+            info.name
+        );
+        break;
     }
 
     // The first few installed effects load, process, and stay finite.

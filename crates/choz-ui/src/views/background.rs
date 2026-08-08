@@ -31,6 +31,74 @@ use crate::settings::{Background, ImageFit};
 /// cell vertically regardless.
 const FONT_SIZE: (u16, u16) = (8, 16);
 
+/// The last decoded source image, kept whole.
+///
+/// Decoding a photo is by far the slowest step (a JPEG is tens of
+/// milliseconds), and it does not depend on the size, the fit or the theme —
+/// so changing any of those must not pay for it again. That is what made the
+/// FIT toggle feel sticky.
+static SOURCE: std::sync::Mutex<Option<(std::path::PathBuf, std::sync::Arc<image::DynamicImage>)>> =
+    std::sync::Mutex::new(None);
+
+/// Decode `path`, reusing the last decode when it is the same file.
+pub fn decode_cached(path: &std::path::Path) -> Option<std::sync::Arc<image::DynamicImage>> {
+    let mut g = SOURCE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((p, img)) = g.as_ref() {
+        if p == path {
+            return Some(std::sync::Arc::clone(img));
+        }
+    }
+    let img = std::sync::Arc::new(image::open(path).ok()?);
+    *g = Some((path.to_path_buf(), std::sync::Arc::clone(&img)));
+    Some(img)
+}
+
+/// Average colour of the image under each terminal cell.
+///
+/// This is what lets a panel look translucent over the wallpaper: it blends its
+/// own colour with the picture *at that cell* instead of covering it. Building
+/// it is cheap and happens once per image, so the opacity slider changes
+/// nothing about the image itself — which is what keeps it instant.
+pub fn cell_colors(img: &image::RgbaImage, cols: u16, rows: u16) -> Vec<(u8, u8, u8)> {
+    let mut out = Vec::with_capacity(cols as usize * rows as usize);
+    let (cw, ch) = (
+        (img.width() / cols.max(1) as u32).max(1),
+        (img.height() / rows.max(1) as u32).max(1),
+    );
+    for row in 0..rows as u32 {
+        for col in 0..cols as u32 {
+            let (x0, y0) = (col * cw, row * ch);
+            let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+            for y in y0..(y0 + ch).min(img.height()) {
+                for x in x0..(x0 + cw).min(img.width()) {
+                    let p = img.get_pixel(x, y).0;
+                    r += p[0] as u32;
+                    g += p[1] as u32;
+                    b += p[2] as u32;
+                    n += 1;
+                }
+            }
+            let n = n.max(1);
+            out.push(((r / n) as u8, (g / n) as u8, (b / n) as u8));
+        }
+    }
+    out
+}
+
+/// The per-cell colours for the whole screen, repeating the tile as the
+/// renderer does. This is what the panels blend against.
+pub fn backdrop_cells(w: &Wallpaper, area: Rect) -> Vec<(u8, u8, u8)> {
+    let (tw, th) = (w.tile.width.max(1), w.tile.height.max(1));
+    let mut out = Vec::with_capacity(area.width as usize * area.height as usize);
+    for y in 0..area.height {
+        for x in 0..area.width {
+            let idx = (y % th) as usize * tw as usize + (x % tw) as usize;
+            out.push(w.cells.get(idx).copied().unwrap_or((0, 0, 0)));
+        }
+    }
+    out
+}
+
 /// A decoded image, already turned into cells for one specific size.
 ///
 /// Decoding and scaling a JPEG on every frame would be absurd, so this is kept
@@ -40,6 +108,8 @@ pub struct Wallpaper {
     protocol: ratatui_image::protocol::Protocol,
     /// Size of one copy, in cells. Equal to the whole area when stretching.
     tile: Rect,
+    /// One colour per cell of the tile, for the panels to blend against.
+    cells: Vec<(u8, u8, u8)>,
 }
 
 /// Build (or reuse) the protocol for `path` at `area`'s size.
@@ -60,7 +130,7 @@ fn load(
         return None;
     }
 
-    let img = image::open(path).ok()?;
+    let img = decode_cached(path)?;
 
     // One copy covers the whole screen when stretching; a third of the width
     // when tiling, keeping the source's aspect ratio.
@@ -88,6 +158,7 @@ fn load(
         tile.height as u32 * FONT_SIZE.1 as u32,
     );
     let img = img.resize_exact(px.0.max(1), px.1.max(1), image::imageops::FilterType::Lanczos3);
+    let cells = cell_colors(&img.to_rgba8(), tile.width, tile.height);
 
     let mut picker = Picker::from_fontsize(FONT_SIZE);
     // Never a graphics protocol: see the module docs.
@@ -96,7 +167,7 @@ fn load(
     // The image already matches the area exactly, so this is a no-op resize.
     let protocol = picker.new_protocol(img, tile, Resize::Fit(None)).ok()?;
 
-    *cache = Some(Wallpaper { key, protocol, tile });
+    *cache = Some(Wallpaper { key, protocol, tile, cells });
     Some(())
 }
 
@@ -326,6 +397,10 @@ mod tests {
     #[test]
     fn a_panel_drawn_on_top_does_not_erase_the_background() {
         use ratatui::widgets::{Block, Borders, Widget};
+
+        // `has_desktop` is process-wide: without the shared lock another
+        // rendering test can flip it back mid-render.
+        let _g = crate::views::theme::ui_guard();
 
         let a = area(10, 4);
         let mut buf = ratatui::buffer::Buffer::empty(a);

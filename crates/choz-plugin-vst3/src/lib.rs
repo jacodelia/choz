@@ -8,13 +8,15 @@
 //! ```
 //!
 //! The COM plumbing lives in [`host`], ported from seqterm's
-//! `seqterm-plugin-vst3` minus the native editor (choz is a terminal app).
+//! `seqterm-plugin-vst3`; the native window (`IPlugView` + the Linux run loop)
+//! lives in [`editor`].
 
+pub mod editor;
 pub mod host;
 
 use std::path::{Path, PathBuf};
 
-use choz_ports::{AudioSource, FxProcessor, PluginParam};
+use choz_ports::{AudioSource, EditorHandle, FxProcessor, PluginParam, TouchHandle};
 use host::Vst3RealInstance;
 
 /// A discovered VST3 plugin bundle.
@@ -152,6 +154,18 @@ impl FxProcessor for Vst3Effect {
     fn set_param(&mut self, index: usize, value: f32) {
         self.inst.set_param(index as u32, value.clamp(0.0, 1.0));
     }
+
+    fn editor(&self) -> Option<EditorHandle> {
+        self.inst.editor()
+    }
+
+    fn param_touch(&self) -> Option<TouchHandle> {
+        Some(std::sync::Arc::new(self.inst.edit_feed()) as TouchHandle)
+    }
+
+    fn state(&self) -> Option<choz_ports::StateHandle> {
+        self.inst.state()
+    }
 }
 
 /// A live VST3 instrument in a rack slot: notes in, interleaved stereo out.
@@ -200,5 +214,17 @@ impl AudioSource for Vst3Instrument {
 
     fn plays_on_transport_stop(&self) -> bool {
         true
+    }
+
+    fn editor(&self) -> Option<EditorHandle> {
+        self.inst.editor()
+    }
+
+    fn param_touch(&self) -> Option<TouchHandle> {
+        Some(std::sync::Arc::new(self.inst.edit_feed()) as TouchHandle)
+    }
+
+    fn state(&self) -> Option<choz_ports::StateHandle> {
+        self.inst.state()
     }
 }

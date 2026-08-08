@@ -41,6 +41,12 @@ pub(crate) struct Slot {
     /// `None` = the source plays (an instrument); `Some` = live audio in.
     /// Registered by the JACK backend now, exposed in the UI in stage 2.
     in_pair: Option<(usize, usize)>,
+    /// Which notes this slot has been told to play, one bit per MIDI note.
+    ///
+    /// Panic uses it to send the exact note-offs that are missing, which is the
+    /// only thing that works everywhere: `all notes off` is a MIDI CC, and a
+    /// VST3 plugin never sees CCs as events at all.
+    held: u128,
 }
 
 impl Slot {
@@ -53,6 +59,7 @@ impl Slot {
             mute: false,
             out_pair: (0, 1),
             in_pair: None,
+            held: 0,
         }
     }
 
@@ -87,6 +94,10 @@ pub(crate) enum EngineCommand {
     SetFxParam { slot: usize, fx: usize, index: usize, value: f32 },
     NoteOn { slot: usize, note: u8, vel: u8 },
     NoteOff { slot: usize, note: u8 },
+    /// Silence every slot: the panic button. One command rather than a burst
+    /// of note-offs, so the ring cannot fill up halfway through and leave a
+    /// note ringing — which would be the one thing panic must never do.
+    Panic,
     /// Pedals, modulation wheel — any control change, unfiltered.
     ControlChange { slot: usize, cc: u8, value: u8 },
     /// Pitch bend, raw 14-bit wire value (0..16383, centred at 8192).
@@ -145,6 +156,17 @@ pub struct AudioEngine {
     editors: Vec<Option<choz_ports::EditorHandle>>,
     /// Same, for each slot's FX chain: `fx_editors[slot][fx]`.
     fx_editors: Vec<Vec<Option<choz_ports::EditorHandle>>>,
+    /// Each slot's plugin state handle: its patch, not just its parameters.
+    /// Captured where the editor is, and for the same reason — it is the last
+    /// moment the UI can reach the plugin.
+    states: Vec<Option<choz_ports::StateHandle>>,
+    /// Same, per FX: `fx_states[slot][fx]`.
+    fx_states: Vec<Vec<Option<choz_ports::StateHandle>>>,
+    /// What each slot's instrument reports when the user moves one of its knobs
+    /// **inside the plugin's own window**. Same capture moment as the editor.
+    touches: Vec<Option<choz_ports::TouchHandle>>,
+    /// Same, per FX: `fx_touches[slot][fx]`.
+    fx_touches: Vec<Vec<Option<choz_ports::TouchHandle>>>,
     /// Counters of the slot's instrument when it plays in its own process,
     /// taken at the same moment as the editor handle. `None` = in-process.
     sandboxes: Vec<Option<choz_ports::SandboxStatus>>,
@@ -293,6 +315,10 @@ impl AudioEngine {
             slot_count: 0,
             editors: Vec::new(),
             fx_editors: Vec::new(),
+            touches: Vec::new(),
+            fx_touches: Vec::new(),
+            states: Vec::new(),
+            fx_states: Vec::new(),
             sandboxes: Vec::new(),
             fx_sandboxes: Vec::new(),
             cmd_tx,
@@ -449,6 +475,10 @@ impl AudioEngine {
         self.slot_count = 0;
         self.editors.clear();
         self.fx_editors.clear();
+        self.touches.clear();
+        self.fx_touches.clear();
+        self.states.clear();
+        self.fx_states.clear();
         self.sandboxes.clear();
         self.fx_sandboxes.clear();
         self._stream = Some(BackendHandle::Jack(Box::new(handle)));
@@ -584,6 +614,10 @@ impl AudioEngine {
         self.slot_count = 0;
         self.editors.clear();
         self.fx_editors.clear();
+        self.touches.clear();
+        self.fx_touches.clear();
+        self.states.clear();
+        self.fx_states.clear();
         self.sandboxes.clear();
         self.fx_sandboxes.clear();
         self.backend = backend;
@@ -678,6 +712,41 @@ impl AudioEngine {
         self.fx_editors.get(slot)?.get(fx).cloned().flatten()
     }
 
+    /// Slot `slot`'s instrument state — its patch, for the project file.
+    /// `None` when the plugin has none or the format cannot report one.
+    pub fn slot_state(&self, slot: usize) -> Option<Vec<u8>> {
+        self.states.get(slot)?.as_ref()?.save()
+    }
+
+    /// Restore a blob saved by [`Self::slot_state`] onto the same plugin.
+    pub fn set_slot_state(&self, slot: usize, data: &[u8]) {
+        if let Some(Some(h)) = self.states.get(slot) {
+            h.restore(data);
+        }
+    }
+
+    /// Same for an effect in the slot's chain.
+    pub fn fx_state(&self, slot: usize, fx: usize) -> Option<Vec<u8>> {
+        self.fx_states.get(slot)?.get(fx)?.as_ref()?.save()
+    }
+
+    pub fn set_fx_state(&self, slot: usize, fx: usize, data: &[u8]) {
+        if let Some(Some(h)) = self.fx_states.get(slot).and_then(|v| v.get(fx)) {
+            h.restore(data);
+        }
+    }
+
+    /// The parameter the user last moved inside slot `slot`'s instrument
+    /// window, if that plugin reports them. Reading it consumes it.
+    pub fn slot_touched_param(&self, slot: usize) -> Option<(u32, f32)> {
+        self.touches.get(slot)?.as_ref()?.take_touched()
+    }
+
+    /// Same for an effect in the slot's chain.
+    pub fn fx_touched_param(&self, slot: usize, fx: usize) -> Option<(u32, f32)> {
+        self.fx_touches.get(slot)?.get(fx)?.as_ref()?.take_touched()
+    }
+
     /// Live counters when slot `slot`'s instrument plays in its own process.
     pub fn slot_sandbox(&self, slot: usize) -> Option<choz_ports::SandboxStatus> {
         self.sandboxes.get(slot).cloned().flatten()
@@ -708,8 +777,12 @@ impl AudioEngine {
         }
         let idx = self.slot_count;
         self.editors.push(source.editor());
+        self.touches.push(source.param_touch());
+        self.states.push(source.state());
         self.sandboxes.push(source.sandbox());
         self.fx_editors.push(Vec::new());
+        self.fx_touches.push(Vec::new());
+        self.fx_states.push(Vec::new());
         self.fx_sandboxes.push(Vec::new());
         self.send(EngineCommand::AddSlot(source));
         self.slot_count += 1;
@@ -723,6 +796,10 @@ impl AudioEngine {
             self.slot_count -= 1;
             self.editors.remove(slot);
             self.fx_editors.remove(slot);
+            self.touches.remove(slot);
+            self.fx_touches.remove(slot);
+            self.states.remove(slot);
+            self.fx_states.remove(slot);
             self.sandboxes.remove(slot);
             self.fx_sandboxes.remove(slot);
         }
@@ -737,6 +814,8 @@ impl AudioEngine {
         // Last chance to reach the processors: after this they belong to the
         // RT thread.
         self.fx_editors[slot] = fx.iter().map(|p| p.editor()).collect();
+        self.fx_touches[slot] = fx.iter().map(|p| p.param_touch()).collect();
+        self.fx_states[slot] = fx.iter().map(|p| p.state()).collect();
         self.fx_sandboxes[slot] = fx.iter().map(|p| p.sandbox()).collect();
         self.send(EngineCommand::SetSlotFx { slot, fx });
     }
@@ -812,6 +891,8 @@ impl AudioEngine {
             return;
         }
         self.editors[slot] = source.editor();
+        self.touches[slot] = source.param_touch();
+        self.states[slot] = source.state();
         self.sandboxes[slot] = source.sandbox();
         self.send(EngineCommand::SetSlotSource { slot, source });
     }
@@ -946,6 +1027,15 @@ impl AudioEngine {
         self.send(EngineCommand::NoteOff { slot, note });
     }
 
+    /// Stop every note in every slot.
+    ///
+    /// One command for the whole rack: sending 128 note-offs per slot could
+    /// overrun the command ring and leave the last slot ringing, which is the
+    /// exact failure this button exists to fix.
+    pub fn panic(&mut self) {
+        self.send(EngineCommand::Panic);
+    }
+
     /// Send a control change to one slot: sustain and the other pedals, the
     /// modulation wheel, expression. Not filtered — the instrument decides what
     /// it understands.
@@ -998,6 +1088,11 @@ impl RtState {
                 }
             }
             EngineCommand::SetSlotSource { slot, source } => {
+                // A new instrument holds nothing, whatever the old one was
+                // playing when it was swapped out.
+                if let Some(s) = state.slots.get_mut(slot) {
+                    s.held = 0;
+                }
                 if let Some(s) = state.slots.get_mut(slot) {
                     let old = std::mem::replace(&mut s.source, source);
                     let _ = state.retired_tx.push(Retired::Source(old));
@@ -1052,12 +1147,30 @@ impl RtState {
             // Notes are addressed to one slot; the UI already decided which.
             EngineCommand::NoteOn { slot, note, vel } => {
                 if let Some(s) = state.slots.get_mut(slot) {
+                    s.held |= 1u128 << (note & 0x7F);
                     s.source.note_on(note, vel);
                 }
             }
             EngineCommand::NoteOff { slot, note } => {
                 if let Some(s) = state.slots.get_mut(slot) {
+                    s.held &= !(1u128 << (note & 0x7F));
                     s.source.note_off(note);
+                }
+            }
+            EngineCommand::Panic => {
+                for s in state.slots.iter_mut() {
+                    // The notes choz knows about get a real note-off each —
+                    // that is what a plugin cannot ignore. Then the broadcast,
+                    // for anything it started on its own (an arpeggiator, a
+                    // note that arrived before choz was listening).
+                    let mut held = s.held;
+                    while held != 0 {
+                        let note = held.trailing_zeros() as u8;
+                        held &= held - 1;
+                        s.source.note_off(note);
+                    }
+                    s.held = 0;
+                    s.source.all_notes_off();
                 }
             }
             EngineCommand::ControlChange { slot, cc, value } => {
@@ -1467,6 +1580,55 @@ mod tests {
         assert!(std::env::var("PIPEWIRE_QUANTUM").is_err(), "64 frames must not be forced");
 
         unsafe { std::env::remove_var("PIPEWIRE_LATENCY") };
+    }
+
+    /// Panic has to send a real note-off for everything the slot was told to
+    /// play. The broadcast alone is not enough: `all notes off` is a MIDI CC,
+    /// and a VST3 plugin never sees CCs as events — only the note-offs reach it.
+    #[test]
+    fn panic_sends_a_note_off_for_every_held_note() {
+        #[derive(Default)]
+        struct Spy {
+            offs: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+            broadcast: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl choz_ports::AudioSource for Spy {
+            fn render(&mut self, _out: &mut [f32], _sr: u32) -> usize {
+                0
+            }
+            fn note_off(&mut self, note: u8) {
+                self.offs.lock().unwrap().push(note);
+            }
+            fn all_notes_off(&mut self) {
+                self.broadcast.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let offs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let broadcast = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut slot = Slot::new(Box::new(Spy {
+            offs: std::sync::Arc::clone(&offs),
+            broadcast: std::sync::Arc::clone(&broadcast),
+        }));
+
+        // Two notes down, one already released.
+        for note in [60u8, 64, 67] {
+            slot.held |= 1u128 << note;
+        }
+        slot.held &= !(1u128 << 64);
+
+        let mut held = slot.held;
+        while held != 0 {
+            let note = held.trailing_zeros() as u8;
+            held &= held - 1;
+            slot.source.note_off(note);
+        }
+        slot.held = 0;
+        slot.source.all_notes_off();
+
+        assert_eq!(*offs.lock().unwrap(), vec![60, 67], "exactly the notes still down");
+        assert!(broadcast.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(slot.held, 0);
     }
 
     #[test]

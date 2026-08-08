@@ -242,15 +242,14 @@ State lives in `~/.local/state/choz/`: `choz.log`, `plugins.json` (scan cache),
 `plugin-paths.json`, `plugin-verdicts.json`, `plugin-sandbox.json`, `ui.json`.
 
 ---
+### Layout
+
+![SeqTerm Pattern view](docs/layout.png)
+---
 
 ## Credits
 
 - **Jorge Codelia** — author & maintainer
-
----
-### Layout
-
-![SeqTerm Pattern view](docs/layout.png)
 
 ---
 ## License

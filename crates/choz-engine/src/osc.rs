@@ -101,7 +101,7 @@ fn parse(msg: &rosc::OscMessage) -> Option<InputEvent> {
     };
     let key = |i: usize| num(i).map(|v| v.clamp(0.0, 127.0) as u8);
     let note = |on: bool, note: u8, vel: u8| {
-        InputEvent::Note(NoteMsg { source: InputSource::Osc, on, note, vel })
+        InputEvent::Note(NoteMsg { source: InputSource::Osc, channel: 0, on, note, vel })
     };
 
     let addr = msg.addr.trim_end_matches('/');
@@ -146,7 +146,7 @@ mod tests {
     use rosc::{OscMessage, OscType};
 
     fn osc_note(on: bool, note: u8, vel: u8) -> InputEvent {
-        InputEvent::Note(NoteMsg { source: InputSource::Osc, on, note, vel })
+        InputEvent::Note(NoteMsg { source: InputSource::Osc, channel: 0, on, note, vel })
     }
 
     fn msg(addr: &str, args: Vec<OscType>) -> OscMessage {

@@ -37,6 +37,37 @@ impl Verdict {
     pub fn loadable(self) -> bool {
         self != Verdict::CrashesOnLoad
     }
+
+    /// How bad this verdict is. Used to keep the worst of several probes: a
+    /// plugin that crashes *sometimes* has to be treated as one that crashes.
+    fn severity(self) -> u8 {
+        match self {
+            Verdict::Ok => 0,
+            Verdict::CrashesOnTeardown => 1,
+            Verdict::CrashesOnLoad => 2,
+        }
+    }
+}
+
+/// How many times a plugin is probed before it is believed to be fine.
+///
+/// One probe is not enough, and this was measured rather than guessed:
+/// `padthv1` segfaults on teardown in roughly two runs out of three — its Qt
+/// thread racing `cleanup` — so a single sample says `Ok` often enough to cache
+/// the wrong answer, leave the plugin un-sandboxed, and take choz down when the
+/// tab is closed. Three probes cut that to about one in thirty.
+///
+/// Only ever paid once per plugin (the verdict is cached), and a bad verdict
+/// stops the loop early. `CHOZ_PROBE_RUNS` overrides it — a slower machine may
+/// want more samples, and a probe-heavy first run may want fewer.
+const PROBE_RUNS: usize = 3;
+
+fn probe_runs() -> usize {
+    std::env::var("CHOZ_PROBE_RUNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(PROBE_RUNS)
+        .max(1)
 }
 
 /// Argument that turns the choz binary into a load-probe worker.
@@ -84,7 +115,21 @@ pub fn check(format: PluginFormat, path: &Path, id: &str) -> Verdict {
     if let Some(v) = cache.get(&k) {
         return *v;
     }
-    let verdict = probe(format, path, id);
+    // Worst of N: the crashes worth catching are races, and a single sample
+    // that comes back clean is what silently un-sandboxes a plugin that kills
+    // the app two out of three times.
+    let mut verdict = Verdict::Ok;
+    for _ in 0..probe_runs() {
+        let v = probe(format, path, id);
+        if v.severity() > verdict.severity() {
+            verdict = v;
+        }
+        // Nothing worse to find, and the answer is already the strictest one.
+        if verdict == Verdict::CrashesOnLoad || NOT_A_WORKER.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            break;
+        }
+    }
     if verdict != Verdict::Ok {
         eprintln!(
             "choz: {} {} is quarantined: {verdict:?}",
@@ -265,6 +310,27 @@ mod tests {
         assert!(Verdict::Ok.loadable());
         assert!(Verdict::CrashesOnTeardown.loadable(), "it plays; only the drop hurts");
         assert!(!Verdict::CrashesOnLoad.loadable());
+    }
+
+    /// The whole point of probing more than once: one clean run does not clear
+    /// a plugin that died in another.
+    #[test]
+    fn the_worst_of_several_probes_is_the_one_that_counts() {
+        let worst = |vs: &[Verdict]| {
+            vs.iter().copied().fold(Verdict::Ok, |acc, v| {
+                if v.severity() > acc.severity() { v } else { acc }
+            })
+        };
+        assert_eq!(worst(&[Verdict::Ok, Verdict::Ok, Verdict::Ok]), Verdict::Ok);
+        assert_eq!(
+            worst(&[Verdict::Ok, Verdict::CrashesOnTeardown, Verdict::Ok]),
+            Verdict::CrashesOnTeardown,
+            "a teardown crash seen once is a teardown crash"
+        );
+        assert_eq!(
+            worst(&[Verdict::CrashesOnTeardown, Verdict::CrashesOnLoad]),
+            Verdict::CrashesOnLoad,
+        );
     }
 
     #[test]

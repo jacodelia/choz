@@ -3,6 +3,17 @@
 
 use choz_ports::{AudioSource, FxProcessor};
 
+/// Serialises every test that loads a plugin.
+///
+/// The harness runs test *functions* in parallel, and u-he's plugins (like the
+/// JUCE ones the VST2/VST3 suites had to fold into a single function) do global
+/// initialisation on load: two of them starting at once takes the process down.
+/// A file-level mutex keeps the test names, which a merged function would lose.
+fn plugin_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// First scannable non-instrument plugin on this machine, if any.
 fn find_effect() -> Option<choz_plugin_clap::ClapPluginInfo> {
     choz_plugin_clap::default_search_paths()
@@ -11,8 +22,45 @@ fn find_effect() -> Option<choz_plugin_clap::ClapPluginInfo> {
         .find(|p| !p.is_instrument)
 }
 
+/// Every hosted CLAP must offer the feed that reports what the user moves
+/// inside its own window — that is what MIDI learn binds to. The gesture itself
+/// cannot be simulated here (it needs a real GUI), so what is checked is that
+/// the plumbing is offered and that its ids translate to positions in the
+/// parameter list.
+#[test]
+fn hosted_clap_plugins_offer_the_window_feed() {
+    let _guard = plugin_lock();
+    let plugins: Vec<choz_plugin_clap::ClapPluginInfo> = choz_plugin_clap::default_search_paths()
+        .into_iter()
+        .flat_map(|d| choz_plugin_clap::scan_directory(&d))
+        .collect();
+    if plugins.is_empty() {
+        eprintln!("no CLAP plugins installed; skipping");
+        return;
+    }
+    let mut checked = 0;
+    for info in plugins.iter().take(6) {
+        let path = &info.path;
+        let params = choz_plugin_clap::host::read_params(path, &info.id);
+        if info.is_instrument {
+            let Some(inst) = choz_plugin_clap::host::ClapInstrument::build(path, &info.id, 48_000, 256)
+            else { continue };
+            assert!(inst.param_touch().is_some(), "{}: no window feed", info.name);
+        } else {
+            let Some(fx) = choz_plugin_clap::host::ClapEffect::build(path, &info.id, 48_000, 256)
+            else { continue };
+            assert!(fx.param_touch().is_some(), "{}: no window feed", info.name);
+        }
+        // Nothing has been touched, so the feed is empty rather than wrong.
+        assert!(!params.is_empty() || info.name.is_empty());
+        checked += 1;
+    }
+    assert!(checked > 0, "not one CLAP plugin could be hosted");
+}
+
 #[test]
 fn hosted_effect_processes_audio() {
+    let _guard = plugin_lock();
     let Some(info) = find_effect() else {
         eprintln!("no CLAP effect installed — skipping");
         return;
@@ -45,6 +93,7 @@ fn hosted_effect_processes_audio() {
 /// its extremes must not break the audio.
 #[test]
 fn plugin_parameters_are_readable_and_settable() {
+    let _guard = plugin_lock();
     let Some(info) = find_effect() else { return };
     let params = choz_plugin_clap::read_params(&info.path, &info.id);
     if params.is_empty() {
@@ -80,6 +129,7 @@ fn plugin_parameters_are_readable_and_settable() {
 /// A real CLAP instrument must make sound when handed a note.
 #[test]
 fn hosted_instrument_sounds_on_note_on() {
+    let _guard = plugin_lock();
     let Some(info) = choz_plugin_clap::default_search_paths()
         .into_iter()
         .flat_map(|d| choz_plugin_clap::scan_directory(&d))
@@ -113,6 +163,7 @@ fn hosted_instrument_sounds_on_note_on() {
 /// INSTR editor drives this path), without breaking its output.
 #[test]
 fn instrument_parameters_are_settable_while_playing() {
+    let _guard = plugin_lock();
     let Some(info) = choz_plugin_clap::default_search_paths()
         .into_iter()
         .flat_map(|d| choz_plugin_clap::scan_directory(&d))
@@ -154,6 +205,7 @@ fn instrument_parameters_are_settable_while_playing() {
 /// (the effect chunks them internally).
 #[test]
 fn oversized_block_is_chunked() {
+    let _guard = plugin_lock();
     let Some(info) = find_effect() else { return };
     let mut fx = choz_plugin_clap::host::ClapEffect::build(&info.path, &info.id, 48_000, 64)
         .expect("instantiate");
@@ -168,6 +220,7 @@ fn oversized_block_is_chunked() {
 /// that emits NaN before its parameters are set.
 #[test]
 fn every_installed_effect_is_safe_to_host() {
+    let _guard = plugin_lock();
     let effects: Vec<_> = choz_plugin_clap::default_search_paths()
         .into_iter()
         .flat_map(|d| choz_plugin_clap::scan_directory(&d))

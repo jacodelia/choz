@@ -73,6 +73,9 @@ impl InputRef {
 
 #[derive(Clone)]
 struct RackSlot {
+    /// MIDI channel this tab answers in MULTI mode, 1..16. Ignored in LIVE,
+    /// where a tab is picked by its input and by which one is active.
+    channel: u8,
     /// Which note input drives this tab. `None` = only the QWERTY piano (which
     /// always plays the active tab) reaches it.
     input: Option<InputRef>,
@@ -99,16 +102,24 @@ struct RackSlot {
     /// knob positions (0..1, same order). Empty for every other source kind.
     instr_params: Vec<choz_engine::PluginParam>,
     instr_values: Vec<f32>,
+    /// The instrument plugin's own state (its patch), as the project stores it.
+    /// Kept here so a tab survives everything that rebuilds engine slots — an
+    /// output-device change, a project load — with the sound it had.
+    instr_state: Vec<u8>,
 }
 
 impl RackSlot {
     fn new(source: AudioSource) -> Self {
         RackSlot {
+            // Channel 1 until the tab is placed: `push_slot` gives each new
+            // tab the next channel, which is the layout an orchestral template
+            // expects without anyone configuring anything.
+            channel: 1,
             input: None, source, fx_chain: Vec::new(),
             gain: 1.0, pan: 0.0, mute: false, solo: false,
             out_pair: (0, 1), in_pair: None,
             presets: Vec::new(), preset_cursor: 0,
-            instr_params: Vec::new(), instr_values: Vec::new(),
+            instr_params: Vec::new(), instr_values: Vec::new(), instr_state: Vec::new(),
         }
     }
 }
@@ -197,6 +208,9 @@ enum ThemeRow {
     Background,
     /// Stretch ↔ tile, only present while an image is set.
     Fit,
+    /// How strongly the theme's colour washes over the image, `←`/`→`. Only
+    /// present while an image is set: there is nothing to wash otherwise.
+    Tint,
     /// Open the file browser on the project's `assets/`.
     PickImage,
     /// Back to the terminal's own background.
@@ -206,6 +220,11 @@ enum ThemeRow {
     /// does not mean reopening Settings each time.
     Done,
 }
+
+/// Width of the tint slider's bar, in cells.
+const TINT_BAR_WIDTH: usize = 20;
+/// How much one arrow press moves the tint.
+const TINT_STEP: u8 = 5;
 
 const TAB_AUDIO: usize = 0;
 const TAB_THEME: usize = 1;
@@ -452,6 +471,10 @@ struct UiLayout {
     input_scan_rect: Option<Rect>,
     /// The OUT line in the transport panel (click = open the device picker).
     out_device_rect: Option<Rect>,
+    /// The PANIC button in the TRANSPORT panel.
+    panic_rect: Option<Rect>,
+    /// The LIVE/MULTI switch in the top-right corner of the menu bar.
+    mode_switch_rect: Option<Rect>,
     /// About dialog close-button rect.
     about_close_rect: Option<Rect>,
 }
@@ -464,6 +487,19 @@ struct App {
     /// Decoded background image, rebuilt when the file or the terminal size
     /// changes. `None` until something needs it.
     wallpaper: Option<views::background::Wallpaper>,
+    /// The kitty-protocol wallpaper currently on screen, when the terminal can
+    /// draw one. `Some` means the picture lives under the text at real pixel
+    /// resolution and `ui()` must not paint cell backgrounds over it.
+    kitty_bg: Option<views::kitty_bg::Placement>,
+    /// One colour per cell of the transmitted picture, for the panels to blend
+    /// against — under the graphics protocol the buffer itself holds nothing.
+    kitty_cells: Option<Vec<(u8, u8, u8)>>,
+    /// The panel rectangles and how strongly each is washed, filled by `ui()`.
+    /// Under the graphics protocol they become the translucent mask; the
+    /// halfblocks path has already blended them into the cells by then.
+    wash_rects: Vec<(ratatui::layout::Rect, f32)>,
+    /// What the wash mask on screen was built for.
+    kitty_mask: Option<views::kitty_bg::MaskState>,
     /// Ports actually connected, in the order `midi::connect_inputs` returned
     /// them — `InputSource::Midi(i)` indexes into this.
     midi_connected: Vec<String>,
@@ -495,6 +531,15 @@ struct App {
     about_open: bool,
     /// Pre-rendered logo image protocol (ratatui-image), built at startup.
     logo: Option<ratatui_image::protocol::Protocol>,
+    /// Notes sounding right now and **the slots their note-on went to**.
+    ///
+    /// Routing is resolved per event and depends on which tab is active: the
+    /// QWERTY piano always plays the active one, and several tabs on one MIDI
+    /// port take turns. So switching tabs while a key was down sent the
+    /// note-off to a *different* instrument and left the first one ringing —
+    /// which is exactly how TyrellN6 ended up holding a note forever. A
+    /// note-off now follows its note-on.
+    sounding: Vec<(choz_engine::input::InputSource, u8, Vec<usize>)>,
     /// QWERTY-piano notes currently sounding: (midi_note, ticks_until_auto_off).
     active_notes: Vec<(u8, u8)>,
     /// Note events from every off-thread input (hardware MIDI, OSC). Created
@@ -540,6 +585,10 @@ struct App {
     /// The plugin's own window, while one is open. At most one at a time:
     /// two plugin GUIs in a terminal app is more window than anyone asked for.
     editor: Option<editor::EditorWindow>,
+    /// Cursor in the instrument's knob box.
+    instr_param: usize,
+    /// Which knob box the arrows drive.
+    rack_focus: RackFocus,
     /// Rack control waiting for a MIDI CC (MIDI learn armed).
     learn: Option<LearnTarget>,
     /// MIDI learn is waiting for the user to *click* the control to bind. While
@@ -606,6 +655,10 @@ impl App {
             note_rx,
             _midi_conns: Vec::new(),
             wallpaper: None,
+            kitty_bg: None,
+            kitty_cells: None,
+            wash_rects: Vec::new(),
+            kitty_mask: None,
             midi_disabled: Vec::new(),
             midi_scan_at: Instant::now(),
             midi_log: std::collections::VecDeque::new(),
@@ -624,6 +677,9 @@ impl App {
             paths_dirty: false,
             load_rack_only: false,
             editor: None,
+            sounding: Vec::new(),
+            instr_param: 0,
+            rack_focus: RackFocus::default(),
             learn: None,
             learn_pick: false,
             mouse: (0, 0),
@@ -1150,6 +1206,157 @@ impl App {
         }
     }
 
+    /// Move the cursor inside the instrument's knob box, clamped to its ends.
+    fn step_instr_cursor(&mut self, delta: isize) {
+        let n = self.instr_knob_count();
+        if n == 0 {
+            return;
+        }
+        let next = (self.instr_param as isize + delta).clamp(0, n as isize - 1);
+        self.instr_param = next as usize;
+    }
+
+    /// Columns in the instrument's knob box, read back from what was drawn:
+    /// the panel decides how many fit, and up/down should move a whole row.
+    fn instr_cols(&self) -> usize {
+        let layout = self.layout.borrow();
+        let knobs = &layout.rack.instr_knobs;
+        let Some((_, first)) = knobs.first() else { return 1 };
+        knobs.iter().filter(|(_, r)| r.y == first.y).count().max(1)
+    }
+
+    /// Swap the arrows between the two knob boxes. Only useful when the
+    /// instrument has knobs at all.
+    fn toggle_rack_focus(&mut self) {
+        self.rack_focus = match self.rack_focus {
+            RackFocus::Fx if self.instr_knob_count() > 0 => RackFocus::Instrument,
+            _ => RackFocus::Fx,
+        };
+    }
+
+    /// The active tab's instrument parameters as knobs: name and 0..1 position.
+    ///
+    /// This is the panel Carla shows for every plugin — the point being that a
+    /// CC can be learned on any parameter without opening the plugin's own
+    /// window, which for many plugins is the slow part.
+    fn instr_knobs(&self) -> Vec<(String, f32)> {
+        let Some(slot) = self.slots.get(self.active_slot) else { return Vec::new() };
+        slot.instr_params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.name.clone(), slot.instr_values.get(i).copied().unwrap_or(0.0)))
+            .collect()
+    }
+
+    /// How many knobs that box has, for cursor movement.
+    fn instr_knob_count(&self) -> usize {
+        self.slots.get(self.active_slot).map(|s| s.instr_params.len()).unwrap_or(0)
+    }
+
+    /// Publish what the panels should blend against: one colour per cell of the
+    /// picture behind them, plus the theme colour and how strongly it washes.
+    ///
+    /// Both drawing paths feed it. Under the kitty protocol the buffer holds no
+    /// picture at all (it is under the cells), so the grid is the only thing the
+    /// panels can know about what is behind them.
+    fn publish_backdrop(&mut self, area: ratatui::layout::Rect) {
+        let cells = match (&self.ui.background, &self.wallpaper, &self.kitty_cells) {
+            // Halfblocks: the picture is in the buffer, and the cache knows it.
+            (settings::Background::Image { .. }, Some(w), _) if self.kitty_bg.is_none() => {
+                Some(views::background::backdrop_cells(w, area))
+            }
+            // kitty: the grid was computed when the image was transmitted.
+            (settings::Background::Image { .. }, _, Some(c)) if self.kitty_bg.is_some() => {
+                Some(c.clone())
+            }
+            // A flat colour is its own backdrop; no image, nothing to see
+            // through, so panels keep their own solid fill.
+            _ => None,
+        };
+        let graphics = self.kitty_bg.is_some();
+        views::theme::set_backdrop(cells.map(|cells| views::theme::Backdrop {
+            cols: area.width,
+            rows: area.height,
+            cells,
+            tint: self.ui.tint(),
+            graphics,
+        }));
+    }
+
+    /// Follow the knobs the user moves **inside the plugin's own window**.
+    ///
+    /// Two things depend on this, and both were impossible while the plugin's
+    /// GUI had the mouse: keeping choz's copy of the values (and therefore the
+    /// saved project) in step with what the user did in there, and MIDI learn —
+    /// "bind the knob I am touching" needs the plugin to say which one it is.
+    ///
+    /// Only the plugin whose window is open can report anything, so that is the
+    /// only one polled.
+    fn poll_plugin_touch(&mut self) {
+        let Some((slot, fx)) = self.editor.as_ref().map(|w| w.key) else { return };
+        // A drag produces a stream of edits; a handful per frame is plenty to
+        // stay current without spinning here.
+        for _ in 0..16 {
+            let touched = match (self.audio_engine.as_ref(), fx) {
+                (Some(e), None) => e.slot_touched_param(slot),
+                (Some(e), Some(ui_fx)) => match self.engine_fx_index(ui_fx) {
+                    Some(engine_fx) => e.fx_touched_param(slot, engine_fx),
+                    None => return,
+                },
+                (None, _) => None,
+            };
+            let Some((id, value)) = touched else { return };
+            self.record_plugin_edit(slot, fx, id, value);
+        }
+    }
+
+    /// One parameter edit that came from the plugin's window: store the value
+    /// where the project will find it, and finish arming MIDI learn if it is
+    /// waiting for a control.
+    ///
+    /// `index` is a **position in the parameter list**, not the plugin's own
+    /// id: each format's host translates before reporting, because that is the
+    /// only thing the knobs, the learn targets and the saved project speak. A
+    /// CLAP id, an LV2 port number and a VST3 `ParamID` are all arbitrary.
+    fn record_plugin_edit(&mut self, slot: usize, fx: Option<usize>, index: u32, value: f32) {
+        let index = index as usize;
+        let known = match fx {
+            None => self.slots.get(slot).is_some_and(|s| index < s.instr_params.len()),
+            Some(ui_fx) => self
+                .fx_chain
+                .get(ui_fx)
+                .and_then(|e| e.plugin.as_ref())
+                .is_some_and(|p| index < p.params.len()),
+        };
+        if !known {
+            return;
+        }
+
+        match fx {
+            None => {
+                if let Some(v) = self.slots.get_mut(slot).and_then(|s| s.instr_values.get_mut(index))
+                {
+                    *v = value;
+                }
+            }
+            Some(ui_fx) => {
+                if let Some(v) = self.fx_chain.get_mut(ui_fx).and_then(|e| e.params.get_mut(index)) {
+                    *v = value;
+                }
+            }
+        }
+
+        // Learn was armed and is waiting for a control: the knob the user just
+        // grabbed in the plugin's window is the answer.
+        if self.learn_pick && self.learn.is_none() {
+            self.learn = Some(match fx {
+                None => LearnTarget::InstrParam { slot, param: index },
+                Some(ui_fx) => LearnTarget::FxParam { slot, fx: ui_fx, param: index },
+            });
+            self.learn_pick = false;
+        }
+    }
+
     /// Parameter editor for the active tab's plugin instrument.
     fn open_instr_modal(&mut self) {
         let Some(slot) = self.slots.get(self.active_slot) else { return };
@@ -1242,6 +1449,14 @@ impl App {
         rows.push(format!("  {:<18} {}", "Background", self.ui.background.label()));
         if let settings::Background::Image { fit, .. } = &self.ui.background {
             rows.push(format!("  {:<18} {}   (Enter cycles)", "Fit", fit.label()));
+            // A slider, because the useful value is "as much as it takes to read
+            // the knobs" and that is judged by eye, not typed.
+            let pct = self.ui.background_tint.min(100);
+            let filled = (pct as usize * TINT_BAR_WIDTH).div_ceil(100);
+            let bar: String = std::iter::repeat_n('\u{2588}', filled)
+                .chain(std::iter::repeat_n('\u{2591}', TINT_BAR_WIDTH - filled))
+                .collect();
+            rows.push(format!("  {:<18} {bar} {pct:>3}%   (\u{2190}\u{2192})", "Panel opacity"));
         }
         rows.push(format!("  {:<18} {}", "Pick an image...", "Enter opens the browser"));
         rows.push(format!("  {:<18} {}", "Clear background", "back to the terminal's own"));
@@ -1261,11 +1476,14 @@ impl App {
         if i == n + 1 {
             return None; // DESKTOP header
         }
-        let has_fit = matches!(self.ui.background, settings::Background::Image { .. });
+        // With an image set, two extra rows sit between Background and the
+        // rest: the fit and the tint slider.
+        let extra = usize::from(matches!(self.ui.background, settings::Background::Image { .. })) * 2;
         match i - (n + 2) {
             0 => Some(ThemeRow::Background),
-            1 if has_fit => Some(ThemeRow::Fit),
-            k => match k - usize::from(has_fit) {
+            1 if extra > 0 => Some(ThemeRow::Fit),
+            2 if extra > 0 => Some(ThemeRow::Tint),
+            k => match k - extra {
                 1 => Some(ThemeRow::PickImage),
                 2 => Some(ThemeRow::Clear),
                 3 => Some(ThemeRow::Done),
@@ -1312,6 +1530,11 @@ impl App {
                     self.apply_ui_settings();
                 }
             }
+            ThemeRow::Tint => {
+                // Enter steps it too, so the row does something for anyone who
+                // has not noticed the arrows.
+                self.step_tint(TINT_STEP as i16);
+            }
             ThemeRow::PickImage => {
                 self.open_wallpaper_browser();
                 return false;
@@ -1326,6 +1549,24 @@ impl App {
         }
         self.refresh_modal();
         false
+    }
+
+    /// Move the panel opacity by `delta` percent and apply it at once, so the
+    /// slider is judged against the real screen.
+    ///
+    /// Nothing about the picture changes — the wash lives in the panels, not in
+    /// the image — so this is a redraw, not a rebuild. That is the difference
+    /// between a slider that follows the key and one that stutters: the first
+    /// version baked the tint into the image and paid a decode, a Lanczos
+    /// rescale and (under kitty) a multi-megabyte transfer on every press.
+    fn step_tint(&mut self, delta: i16) {
+        let next = (self.ui.background_tint as i16 + delta).clamp(0, 100) as u8;
+        if next == self.ui.background_tint {
+            return;
+        }
+        self.ui.background_tint = next;
+        self.apply_ui_settings();
+        self.refresh_modal();
     }
 
     /// The image browser, started in the project's `assets/` when it exists —
@@ -2283,6 +2524,7 @@ impl App {
                         kind: "none".into(),
                         path: None, id: None, name: None, bank: None, preset: None,
                         params: Vec::new(),
+                        state: String::new(),
                     },
                     AudioSource::Sf2 { path, bank, preset } => project::Instrument {
                         kind: "sf2".into(),
@@ -2292,12 +2534,14 @@ impl App {
                         bank: Some(*bank),
                         preset: Some(*preset),
                         params: Vec::new(),
+                        state: String::new(),
                     },
                     AudioSource::AudioFile { path, .. } => project::Instrument {
                         kind: "wav".into(),
                         path: Some(path.clone()),
                         id: None, name: None, bank: None, preset: None,
                         params: Vec::new(),
+                        state: String::new(),
                     },
                     AudioSource::Plugin { id, name, .. } => project::Instrument {
                         kind: "plugin".into(),
@@ -2307,13 +2551,30 @@ impl App {
                         bank: None,
                         preset: None,
                         params: slot.instr_values.clone(),
+                        // The patch itself: what the parameter list cannot say.
+                        // Asked of the live plugin, so a tab that has been
+                        // edited in its own window saves what is actually
+                        // sounding.
+                        state: engine
+                            .and_then(|e| e.slot_state(idx))
+                            .or_else(|| (!slot.instr_state.is_empty()).then(|| slot.instr_state.clone()))
+                            .map(|b| project::encode_state(&b))
+                            .unwrap_or_default(),
                     },
                 };
                 let fx = slot
                     .fx_chain
                     .iter()
-                    .map(|e| {
+                    .enumerate()
+                    .map(|(ui_fx, e)| {
                         let spec = e.to_spec();
+                        // The engine only holds the *enabled* entries, so the
+                        // index of this one there is how many enabled ones come
+                        // before it — the same arithmetic `engine_fx_index`
+                        // does for the active tab.
+                        let engine_fx = e
+                            .enabled
+                            .then(|| slot.fx_chain[..ui_fx].iter().filter(|x| x.enabled).count());
                         project::Fx {
                             // Hosted effects record their host format instead
                             // of a built-in FX id.
@@ -2326,6 +2587,12 @@ impl App {
                             params: spec.params,
                             plugin_path: e.plugin.as_ref().map(|c| c.path.clone()),
                             plugin_id: e.plugin.as_ref().map(|c| c.id.clone()),
+                            state: engine
+                                .zip(engine_fx)
+                                .and_then(|(eng, i)| eng.fx_state(idx, i))
+                                .or_else(|| (!e.state.is_empty()).then(|| e.state.clone()))
+                                .map(|b| project::encode_state(&b))
+                                .unwrap_or_default(),
                         }
                     })
                     .collect();
@@ -2346,6 +2613,7 @@ impl App {
                     })
                     .collect();
                 project::Slot {
+                    channel: slot.channel,
                     input: slot.input.as_ref().map(|i| match i {
                         InputRef::Midi(name) => format!("MIDI:{name}"),
                         InputRef::Osc => "OSC".to_string(),
@@ -2462,13 +2730,28 @@ impl App {
                 }
                 rack.instr_values = slot.instrument.params.clone();
             }
-            rack.fx_chain = slot.fx.iter().filter_map(|f| self.project_fx(f)).collect();
+            // The patch the plugin was on, kept even when the instrument itself
+            // could not be resolved on this machine — throwing it away would
+            // turn a missing plugin into a lost sound the next time the project
+            // is saved. Restored by `rebuild_rack` once an instance exists; a
+            // blob that no longer decodes is dropped, not fatal.
+            rack.instr_state = project::decode_state(&slot.instrument.state).unwrap_or_default();
+            rack.fx_chain = slot
+                .fx
+                .iter()
+                .filter_map(|f| {
+                    let mut entry = self.project_fx(f)?;
+                    entry.state = project::decode_state(&f.state).unwrap_or_default();
+                    Some(entry)
+                })
+                .collect();
             rack.gain = slot.mixer.gain;
             rack.pan = slot.mixer.pan;
             rack.mute = slot.mixer.mute;
             rack.solo = slot.mixer.solo;
             rack.out_pair = slot.mixer.out_pair.unwrap_or((0, 1));
             rack.in_pair = slot.mixer.in_pair;
+            rack.channel = slot.channel.clamp(1, 16);
             self.slots.push(rack);
 
             for b in &slot.midi_learn {
@@ -2627,6 +2910,9 @@ impl App {
     fn learn_banner(&self) -> Option<String> {
         match (self.learn_pick, self.learn) {
             (_, Some(t)) => Some(format!("move a fader \u{2192} {}", self.learn_label(&t))),
+            (true, None) if self.editor.is_some() => {
+                Some("click a fader, or move a knob in the plugin's window".to_string())
+            }
             (true, None) => Some("click a fader or button".to_string()),
             (false, None) => None,
         }
@@ -2638,6 +2924,14 @@ impl App {
         let layout = self.layout.borrow();
         let rack = &layout.rack;
         let slot = self.active_slot;
+        // The instrument's own knobs are learn targets too — that is the whole
+        // reason the box is there: bind a CC to any plugin parameter without
+        // opening the plugin's window.
+        for &(pi, rect) in rack.instr_knobs.iter() {
+            if rect.contains(pos) {
+                return Some(LearnTarget::InstrParam { slot, param: pi });
+            }
+        }
         if rack.gain.is_some_and(|r| r.contains(pos)) {
             return Some(LearnTarget::Gain(slot));
         }
@@ -3053,8 +3347,95 @@ impl App {
     /// always plays the active tab; hardware inputs only reach the tabs bound
     /// to them.
     fn note_targets(&self, source: choz_engine::input::InputSource) -> Vec<usize> {
+        self.targets_for(source, 0)
+    }
+
+    /// Where an event goes, given the rack's mode. `channel` is the MIDI
+    /// channel it arrived on (0-based); it only matters in MULTI.
+    fn targets_for(&self, source: choz_engine::input::InputSource, channel: u8) -> Vec<usize> {
+        if self.ui.rack_mode == settings::RackMode::Multi {
+            let channels: Vec<u8> = self.slots.iter().map(|s| s.channel).collect();
+            return multi_targets(&channels, self.active_slot, source, channel);
+        }
         let bindings: Vec<Option<&InputRef>> = self.slots.iter().map(|s| s.input.as_ref()).collect();
         note_targets(&bindings, &self.midi_connected, self.active_slot, source)
+    }
+
+    /// Where a note-on should go, remembered so its note-off can follow it.
+    fn start_note(
+        &mut self,
+        source: choz_engine::input::InputSource,
+        channel: u8,
+        note: u8,
+    ) -> Vec<usize> {
+        let targets = self.targets_for(source, channel);
+        // A retrigger without an off (a controller repeating, a held key)
+        // replaces the old entry rather than stacking another.
+        self.sounding.retain(|(s, n, _)| !(*s == source && *n == note));
+        if !targets.is_empty() {
+            self.sounding.push((source, note, targets.clone()));
+        }
+        targets
+    }
+
+    /// Where a note-off should go: wherever its note-on went. Falls back to the
+    /// current routing for a note choz never saw start (a controller plugged in
+    /// mid-note, a stuck key from before a reload).
+    fn end_note(
+        &mut self,
+        source: choz_engine::input::InputSource,
+        channel: u8,
+        note: u8,
+    ) -> Vec<usize> {
+        match self.sounding.iter().position(|(s, n, _)| *s == source && *n == note) {
+            Some(i) => self.sounding.swap_remove(i).2,
+            None => self.targets_for(source, channel),
+        }
+    }
+
+    /// The active tab's MIDI channel, or `None` in LIVE mode where it means
+    /// nothing.
+    fn tab_channel(&self) -> Option<u8> {
+        (self.ui.rack_mode == settings::RackMode::Multi)
+            .then(|| self.slots.get(self.active_slot).map(|s| s.channel))
+            .flatten()
+    }
+
+    /// Step the active tab's MIDI channel, wrapping 16 → 1.
+    fn step_channel(&mut self, delta: i8) {
+        // Notes already sounding were routed by the old channel; leaving them
+        // would strand their note-offs.
+        self.panic();
+        if let Some(slot) = self.slots.get_mut(self.active_slot) {
+            let next = (slot.channel as i8 - 1 + delta).rem_euclid(16) + 1;
+            slot.channel = next as u8;
+        }
+    }
+
+    /// Flip between the live rig and the multi-timbral module.
+    ///
+    /// Everything sounding is cut first: the two modes route notes to different
+    /// tabs, so anything held across the switch would never receive its
+    /// note-off — the same trap that left a note ringing when tabs changed.
+    fn toggle_rack_mode(&mut self) {
+        self.panic();
+        self.ui.rack_mode = self.ui.rack_mode.next();
+        self.ui.save();
+        eprintln!("choz: rack mode {}", self.ui.rack_mode.label());
+    }
+
+    /// Silence everything, everywhere: the panic button.
+    ///
+    /// A stuck note is not always choz's fault — a plugin can lose one on its
+    /// own, and a controller unplugged mid-note never sends its off — so there
+    /// has to be a way out that does not involve restarting the app.
+    fn panic(&mut self) {
+        self.sounding.clear();
+        self.active_notes.clear();
+        if let Some(ref mut engine) = self.audio_engine {
+            engine.panic();
+        }
+        eprintln!("choz: panic \u{2014} all notes off");
     }
 
     /// Push the working copy of the active slot back into `slots`.
@@ -3081,7 +3462,12 @@ impl App {
     /// Append a new slot (mirroring an engine slot just added) and activate it.
     fn push_slot(&mut self, source: AudioSource) {
         self.persist_active();
-        self.slots.push(RackSlot::new(source.clone()));
+        let mut slot = RackSlot::new(source.clone());
+        // Tabs land on consecutive MIDI channels, which is the layout a DAW's
+        // orchestral template sends by default. Past 16 they wrap; a rack that
+        // big is sharing channels on purpose.
+        slot.channel = (self.slots.len() % 16) as u8 + 1;
+        self.slots.push(slot);
         self.active_slot = self.slots.len() - 1;
         self.source = source;
         self.fx_chain = Vec::new();
@@ -3193,9 +3579,22 @@ impl App {
             self.end_learn();
             return;
         }
+        let mut fired = false;
         for (_, target) in self.pc_bindings.clone().iter().filter(|(p, _)| *p == program) {
             if let LearnTarget::Trigger(action) = *target {
                 self.fire_trigger(action);
+                fired = true;
+            }
+        }
+        // Unbound program changes select a tab, which is what a live rig does
+        // with them: PC 0 is tab 1. Only in LIVE — in MULTI the tabs sound
+        // together and there is nothing to select. A binding wins, so anyone
+        // who mapped a button to something else keeps it.
+        if !fired && self.ui.rack_mode == settings::RackMode::Live {
+            let tab = program as usize;
+            if tab < self.slots.len() && tab != self.active_slot {
+                self.panic();
+                self.switch_slot(tab);
             }
         }
     }
@@ -3250,9 +3649,22 @@ impl App {
             let specs: Vec<FxSpec> = slot.fx_chain.iter().map(|e| e.to_spec()).collect();
             if let Some(ref mut engine) = self.audio_engine {
                 engine.set_slot_fx(i, specs);
-                // A reloaded plugin is back at its own defaults.
+                // A reloaded plugin is back at its own defaults. The patch
+                // goes first: restoring state moves every parameter, so the
+                // knob values have to be applied on top of it, not under it.
+                if !slot.instr_state.is_empty() {
+                    engine.set_slot_state(i, &slot.instr_state);
+                }
                 for (p, v) in slot.instr_values.iter().enumerate() {
                     engine.set_slot_param(i, p, *v);
+                }
+                for (ui_fx, entry) in slot.fx_chain.iter().enumerate() {
+                    if entry.state.is_empty() || !entry.enabled {
+                        continue;
+                    }
+                    let engine_fx =
+                        slot.fx_chain[..ui_fx].iter().filter(|x| x.enabled).count();
+                    engine.set_fx_state(i, engine_fx, &entry.state);
                 }
             }
         }
@@ -3385,7 +3797,7 @@ impl App {
     /// note-off. (Terminals don't deliver reliable key-release, so notes are
     /// fixed-length.)
     fn piano_note_on(&mut self, note: u8) {
-        let targets = self.note_targets(choz_engine::input::InputSource::Keyboard);
+        let targets = self.start_note(choz_engine::input::InputSource::Keyboard, 0, note);
         if let Some(ref mut engine) = self.audio_engine {
             for slot in targets {
                 engine.note_on(slot, note, 100);
@@ -3495,9 +3907,17 @@ impl App {
             }
             self.midi_log.push_back(event);
             match event {
-                midi::InputEvent::Note(msg) => routed.push((self.note_targets(msg.source), msg)),
+                midi::InputEvent::Note(msg) => {
+                    // On and off resolve differently on purpose: see `end_note`.
+                    let targets = if msg.on {
+                        self.start_note(msg.source, msg.channel, msg.note)
+                    } else {
+                        self.end_note(msg.source, msg.channel, msg.note)
+                    };
+                    routed.push((targets, msg));
+                }
                 midi::InputEvent::Cc(c) => {
-                    expression.push((self.note_targets(c.source), Expr::Cc(c.cc, c.value)));
+                    expression.push((self.targets_for(c.source, c.channel), Expr::Cc(c.cc, c.value)));
                     ccs.push(c);
                 }
                 midi::InputEvent::Bend(b) => {
@@ -3611,10 +4031,15 @@ impl App {
             }
         }
         if !expired.is_empty() {
-            let targets = self.note_targets(choz_engine::input::InputSource::Keyboard);
+            // Each note goes home to the tab that started it, even if the
+            // active tab changed while it was sounding.
+            let ends: Vec<(u8, Vec<usize>)> = expired
+                .iter()
+                .map(|n| (*n, self.end_note(choz_engine::input::InputSource::Keyboard, 0, *n)))
+                .collect();
             if let Some(ref mut engine) = self.audio_engine {
-                for n in &expired {
-                    for slot in &targets {
+                for (n, targets) in &ends {
+                    for slot in targets {
                         engine.note_off(*slot, *n);
                     }
                 }
@@ -3703,6 +4128,10 @@ fn main() -> Result<()> {
     let result = run_app(&mut terminal, &mut app);
 
     disable_raw_mode()?;
+    // The wallpaper is the terminal's, not the buffer's: leaving the alternate
+    // screen would not remove it.
+    let _ = views::kitty_bg::clear_mask(terminal.backend_mut());
+    let _ = views::kitty_bg::clear(terminal.backend_mut());
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
@@ -3720,6 +4149,37 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Screen>>, app: &mut App) -> 
     let splash_deadline = splash_start + std::time::Duration::from_secs(3);
 
     while !app.quit {
+        // Before drawing: hand the wallpaper to the terminal itself when it can
+        // composite one under the text. Cheap after the first time — `sync`
+        // re-transmits only when the file, the fit or the size changes.
+        let area = terminal.size().map(|s| Rect::new(0, 0, s.width, s.height)).unwrap_or_default();
+        let placed = views::kitty_bg::sync(
+            terminal.backend_mut(),
+            &app.ui.background,
+            area,
+            &mut app.kitty_bg,
+            &mut app.kitty_cells,
+        );
+        if !placed {
+            app.kitty_bg = None;
+        }
+        // The wash for those panels, as a translucent image over the picture —
+        // painting cells here would hide it. One frame behind the layout, which
+        // nobody can see, and skipped entirely when nothing moved.
+        if placed {
+            let (color, alpha) = app.ui.tint();
+            let rects: Vec<_> =
+                app.wash_rects.iter().map(|(r, s)| (*r, s * alpha)).collect();
+            views::kitty_bg::sync_mask(
+                terminal.backend_mut(),
+                area,
+                color,
+                &rects,
+                &mut app.kitty_mask,
+            );
+        } else if app.kitty_mask.take().is_some() {
+            let _ = views::kitty_bg::clear_mask(terminal.backend_mut());
+        }
         terminal.draw(|f| ui(f, app))?;
 
         // Handle splash screen lifecycle
@@ -3770,6 +4230,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Screen>>, app: &mut App) -> 
         app.drain_midi();
         app.tick_notes();
         app.poll_editor();
+        app.poll_plugin_touch();
     }
     Ok(())
 }
@@ -3808,6 +4269,17 @@ fn handle_key(app: &mut App, key: KeyCode) {
     }
     if key == KeyCode::Char('q') && app.modal.is_none() {
         app.quit = true;
+        return;
+    }
+    // Panic is global on purpose: a note stuck under a modal, in a drawer or
+    // with the plugin's window focused still has to be killable from the TUI.
+    if key == KeyCode::Char('P') && app.modal.is_none() {
+        app.panic();
+        return;
+    }
+    // The rack mode switch, from anywhere: it changes what every note does.
+    if key == KeyCode::F(4) && app.modal.is_none() {
+        app.toggle_rack_mode();
         return;
     }
 
@@ -3936,6 +4408,17 @@ fn handle_modal_key(app: &mut App, key: KeyCode) {
                 m.list.cycle_filter(1);
                 m.list.sidebar_cursor = 0;
             }
+        }
+        // The tint slider owns the arrows while the cursor is on it; without
+        // this they would flip to the next Settings tab, which is what the rest
+        // of the rows want.
+        KeyCode::Left | KeyCode::Right
+            if kind == ModalKind::PluginPaths
+                && app.modal.as_ref().is_some_and(|m| m.list.filter == TAB_THEME)
+                && app.theme_row(cursor) == Some(ThemeRow::Tint) =>
+        {
+            let delta = if key == KeyCode::Right { TINT_STEP as i16 } else { -(TINT_STEP as i16) };
+            app.step_tint(delta);
         }
         // Value arrows in the instrument editor; filter chips everywhere else.
         KeyCode::Left | KeyCode::Right => {
@@ -4083,6 +4566,37 @@ fn in_step(app: &App, step: isize) -> usize {
 /// The QWERTY piano always plays the active tab (it has no port of its own);
 /// hardware inputs reach exactly the tabs bound to them, which is what replaced
 /// the old omni broadcast.
+/// Which tabs a note reaches in **MULTI** mode: every tab whose MIDI channel
+/// matches, all sounding at once.
+///
+/// The channel is what selects here, not the port and not which tab is active —
+/// that is the whole difference between driving a rig by hand and being a
+/// multi-timbral module for a DAW. A note from OSC or the QWERTY piano has no
+/// channel of its own, so it goes to the active tab as it always did.
+fn multi_targets(
+    channels: &[u8],
+    active_slot: usize,
+    source: choz_engine::input::InputSource,
+    channel: u8,
+) -> Vec<usize> {
+    use choz_engine::input::InputSource as S;
+    match source {
+        S::Midi(_) => channels
+            .iter()
+            .enumerate()
+            .filter(|(_, ch)| **ch == channel + 1)
+            .map(|(i, _)| i)
+            .collect(),
+        _ => {
+            if active_slot < channels.len() {
+                vec![active_slot]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+}
+
 fn note_targets(
     bindings: &[Option<&InputRef>],
     midi_connected: &[String],
@@ -4198,6 +4712,19 @@ fn handle_fx_keys(app: &mut App, key: KeyCode) {
         KeyCode::Char('[') => { if app.active_slot > 0 { app.switch_slot(app.active_slot - 1); } }
         KeyCode::Char(']') => { app.switch_slot(app.active_slot + 1); }
         KeyCode::Backspace => { app.remove_active_slot(); }
+        // `k` swaps between the instrument's knobs and the FX chain's; the
+        // arrows and w/s then drive whichever box has the cursor.
+        KeyCode::Char('k') => app.toggle_rack_focus(),
+        KeyCode::Left if app.rack_focus == RackFocus::Instrument => app.step_instr_cursor(-1),
+        KeyCode::Right if app.rack_focus == RackFocus::Instrument => app.step_instr_cursor(1),
+        KeyCode::Up if app.rack_focus == RackFocus::Instrument => {
+            let cols = app.instr_cols() as isize;
+            app.step_instr_cursor(-cols);
+        }
+        KeyCode::Down if app.rack_focus == RackFocus::Instrument => {
+            let cols = app.instr_cols() as isize;
+            app.step_instr_cursor(cols);
+        }
         KeyCode::Left => { app.fx_slot = app.fx_slot.saturating_sub(1); app.fx_param = 0; }
         KeyCode::Right
             if app.fx_slot + 1 < app.fx_chain.len() => {
@@ -4257,6 +4784,19 @@ fn adjust_pan(app: &mut App, delta: f32) {
 }
 
 fn adjust_fx_param(app: &mut App, delta: f32) {
+    // The knob keys follow the cursor: with the instrument's box focused they
+    // move an instrument parameter instead of an FX one.
+    if app.rack_focus == RackFocus::Instrument {
+        let param = app.instr_param;
+        let v = app
+            .slots
+            .get(app.active_slot)
+            .and_then(|s| s.instr_values.get(param))
+            .copied()
+            .unwrap_or(0.0);
+        app.set_instr_param(param, v + delta);
+        return;
+    }
     let (fx_idx, param) = (app.fx_slot, app.fx_param);
     let Some(entry) = app.fx_chain.get_mut(fx_idx) else { return };
     let Some(v) = entry.params.get_mut(param) else { return };
@@ -4281,6 +4821,7 @@ fn handle_transport_keys(app: &mut App, key: KeyCode) {
     match key {
         KeyCode::Char(' ') => toggle_play(app),
         KeyCode::Char('s') => stop_play(app),
+        KeyCode::Char('p') => app.panic(),
         KeyCode::Char('o') => app.toggle_out_drawer(),
         _ => {}
     }
@@ -4308,6 +4849,10 @@ enum MouseAction {
     FxSlot(usize),
     FxParam(usize),
     FxParamAdjust(usize, f32),
+    /// A knob in the instrument's own box: select it (and move the cursor
+    /// there), or turn it with the wheel.
+    InstrParamSel(usize),
+    InstrParamAdjust(usize, f32),
     FxAdd,
     FxToggle,
     FxDelete,
@@ -4315,6 +4860,8 @@ enum MouseAction {
     FxMoveRight,
     TransportPlay,
     TransportStop,
+    /// Kill every sounding note, everywhere.
+    Panic,
     ToggleInDrawer,
     ToggleOutDrawer,
     OutputDevice(usize),
@@ -4323,6 +4870,8 @@ enum MouseAction {
     OpenSourcePicker,
     ScanInputs,
     PresetStep(isize),
+    /// Step the active tab's MIDI channel (MULTI mode).
+    ChannelStep(i8),
     OpenPresetPicker,
     OpenLearnPicker,
     ToggleEditor,
@@ -4384,6 +4933,7 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                 for &(btn, rect) in rack.buttons.iter() {
                     if rect.contains(pos) {
                         return match btn {
+                            RackButton::Channel => MouseAction::ChannelStep(1),
                             RackButton::Source => MouseAction::OpenSourcePicker,
                             RackButton::Preset => MouseAction::OpenPresetPicker,
                             RackButton::Learn => MouseAction::OpenLearnPicker,
@@ -4419,6 +4969,11 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                         return MouseAction::FxSlot(i);
                     }
                 }
+                for &(pi, rect) in rack.instr_knobs.iter() {
+                    if rect.contains(pos) {
+                        return MouseAction::InstrParamSel(pi);
+                    }
+                }
                 for &(pi, rect) in rack.params.iter() {
                     if rect.contains(pos) {
                         return MouseAction::FxParam(pi);
@@ -4441,6 +4996,9 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
             }
 
             if layout.transport_area.contains(pos) {
+                if layout.panic_rect.is_some_and(|r| r.contains(pos)) {
+                    return MouseAction::Panic;
+                }
                 if layout.out_device_rect.is_some_and(|r| r.contains(pos)) {
                     return MouseAction::ToggleOutDrawer;
                 }
@@ -4470,6 +5028,11 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                 }
                 if rack.pan.is_some_and(|r| r.contains(pos)) {
                     return MouseAction::MixPan(dir * 0.1);
+                }
+                for &(pi, rect) in rack.instr_knobs.iter() {
+                    if rect.contains(pos) {
+                        return MouseAction::InstrParamAdjust(pi, dir * 0.03);
+                    }
                 }
                 for &(pi, rect) in rack.params.iter() {
                     if rect.contains(pos) {
@@ -4551,6 +5114,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
 
     // Menu closed: a click on a bar title opens it.
     if left {
+        let switch = app.layout.borrow().mode_switch_rect;
+        if switch.is_some_and(|r| r.contains(pos)) {
+            app.toggle_rack_mode();
+            return;
+        }
         let title_hit = app.layout.borrow().menu_bar_rects.iter().position(|r| r.contains(pos));
         if let Some(ti) = title_hit {
             app.menu = Some(menu::MenuState::open(menu::MenuKind::ALL[ti]));
@@ -4581,7 +5149,22 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         }
         MouseAction::FxParam(pi) => {
             app.focus = Focus::FxChain;
+            app.rack_focus = RackFocus::Fx;
             app.fx_param = pi;
+        }
+        MouseAction::InstrParamSel(pi) => {
+            app.focus = Focus::FxChain;
+            app.rack_focus = RackFocus::Instrument;
+            app.instr_param = pi;
+        }
+        MouseAction::InstrParamAdjust(pi, delta) => {
+            let v = app
+                .slots
+                .get(app.active_slot)
+                .and_then(|s| s.instr_values.get(pi))
+                .copied()
+                .unwrap_or(0.0);
+            app.set_instr_param(pi, v + delta);
         }
         MouseAction::FxParamAdjust(pi, delta) => {
             let old_slot = app.fx_slot;
@@ -4591,6 +5174,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             app.fx_slot = old_slot;
             app.fx_param = old_param;
         }
+        MouseAction::Panic => app.panic(),
+        MouseAction::ChannelStep(d) => app.step_channel(d),
         MouseAction::FxAdd => app.open_add_fx_modal(),
         MouseAction::FxToggle => {
             if let Some(entry) = app.fx_chain.get_mut(app.fx_slot) {
@@ -4776,6 +5361,19 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
 /// Knob step of the instrument-parameter editor (left/right arrows).
 const INSTR_STEP: f32 = 0.05;
 
+/// Which of the RACK's two knob boxes the arrows and the highlight belong to.
+///
+/// Carla shows a plugin's parameters as knobs next to the button that opens its
+/// real window; choz does the same, so the RACK now holds two boxes — the
+/// instrument's own parameters and the selected FX's — and one of them has the
+/// cursor. `i` swaps, and clicking a knob in either box moves the focus there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RackFocus {
+    #[default]
+    Fx,
+    Instrument,
+}
+
 // ─── UI Render ─────────────────────────────────────────────────────────────────
 
 fn ui(f: &mut Frame, app: &mut App) {
@@ -4784,7 +5382,16 @@ fn ui(f: &mut Frame, app: &mut App) {
     // Behind everything, before anything else touches the buffer: the panels
     // above set foreground colours and symbols but leave `bg` alone, so
     // whatever is painted here shows through.
-    views::background::render(f.buffer_mut(), area, &app.ui.background, &mut app.wallpaper);
+    // …unless the terminal is already showing the picture underneath at real
+    // pixel resolution (kitty graphics, `z=-1`), in which case painting cells
+    // would cover it.
+    if app.kitty_bg.is_none() {
+        views::background::render(f.buffer_mut(), area, &app.ui.background, &mut app.wallpaper);
+    }
+    // What the panels blend their colour with, so they read as translucent over
+    // the picture. Cheap to publish (a colour per cell) and independent of the
+    // opacity, which is why moving that slider costs nothing.
+    app.publish_backdrop(area);
 
     // ─── Splash Screen ──────────────────────────────────────────────────
     if !app.splash_done {
@@ -4838,6 +5445,22 @@ fn ui(f: &mut Frame, app: &mut App) {
     let transport_area = right_chunks[1];
     let monitor_area = right_chunks[2];
 
+    // Each box gets the theme's colour washed over the picture behind it, so
+    // its labels and knobs read while the wallpaper still shows through. Done
+    // here, before the panels draw, because they leave `bg` alone once a
+    // desktop is set — so the wash survives underneath them.
+    app.wash_rects.clear();
+    for a in [source_area, output_area, fx_chain_area, transport_area, monitor_area] {
+        views::theme::wash(f.buffer_mut(), a);
+        app.wash_rects.push((a, 1.0));
+    }
+    // The bars top and bottom are part of the frame, not of a box: a lighter
+    // wash keeps them legible without turning into two solid stripes.
+    for a in [menubar_area, status_area] {
+        views::theme::wash_weak(f.buffer_mut(), a);
+        app.wash_rects.push((a, views::theme::WEAK_WASH));
+    }
+
     if app.in_open {
         let rows: Vec<views::source_panel::InputRow> =
             app.in_targets().into_iter().map(|(_, r)| r).collect();
@@ -4878,6 +5501,8 @@ fn ui(f: &mut Frame, app: &mut App) {
         &tabs, app.active_slot, mix, &app.instrument_label(),
         app.active_preset_label().as_deref(), app.has_editor(), app.has_fx_editor(),
         app.sbx_state(None), app.sbx_state(Some(app.fx_slot)),
+        app.tab_channel(), &app.instr_knobs(), app.instr_param,
+        app.rack_focus == RackFocus::Instrument,
     );
     app.layout.borrow_mut().rack = rack;
 
@@ -5076,9 +5701,9 @@ fn draw_transport(f: &mut Frame, app: &App, area: Rect) {
     // Row 2: status text
     let status_y = btn_row + 1;
     let state_text = if app.playing {
-        "  ▶ PLAYING  |  [Space]=pause  [S]=stop".to_string()
+        "  ▶ PLAYING  |  [Space]=pause  [S]=stop  [P]=panic".to_string()
     } else {
-        "  ■ STOPPED  |  [Space]=play  [S]=stop".to_string()
+        "  ■ STOPPED  |  [Space]=play  [S]=stop  [P]=panic".to_string()
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -5138,6 +5763,31 @@ fn draw_menu_bar(f: &mut Frame, app: &App, area: Rect) {
         x += w;
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    // The mode switch, hard right: it decides what every note in the rack does,
+    // so it belongs where it is always visible rather than inside a menu.
+    let mode = app.ui.rack_mode;
+    let (live, multi) = (
+        format!(" {} ", settings::RackMode::Live.label()),
+        format!(" {} ", settings::RackMode::Multi.label()),
+    );
+    let w = (live.chars().count() + multi.chars().count()) as u16;
+    if area.width > w + 2 {
+        let sx = area.x + area.width - w - 1;
+        let on = Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD);
+        let off = Style::default().fg(Color::Rgb(150, 155, 165)).bg(Color::Rgb(40, 46, 56));
+        let is_live = mode == settings::RackMode::Live;
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(live.clone(), if is_live { on } else { off }),
+                Span::styled(multi.clone(), if is_live { off } else { on }),
+            ])),
+            Rect::new(sx, area.y, w, 1),
+        );
+        app.layout.borrow_mut().mode_switch_rect = Some(Rect::new(sx, area.y, w, 1));
+    } else {
+        app.layout.borrow_mut().mode_switch_rect = None;
+    }
     app.layout.borrow_mut().menu_bar_rects = rects;
 }
 
@@ -5158,7 +5808,7 @@ fn draw_menu_dropdown(f: &mut Frame, app: &App, state: menu::MenuState, menubar_
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
-        .style(views::theme::panel_style());
+        .style(views::theme::overlay_style());
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -5201,7 +5851,7 @@ fn draw_about(f: &mut Frame, app: &App, area: Rect) {
         .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
-        .style(views::theme::panel_style());
+        .style(views::theme::overlay_style());
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -5318,6 +5968,8 @@ mod tests {
                 f, f.area(), &app.fx_chain, app.fx_slot, app.fx_param, true,
                 &tabs, app.active_slot, mix, &app.instrument_label(), None, false, false,
                 Default::default(), Default::default(),
+                app.tab_channel(), &app.instr_knobs(), app.instr_param,
+                app.rack_focus == RackFocus::Instrument,
             );
         })
         .unwrap();
@@ -5330,13 +5982,13 @@ mod tests {
     /// Language and text colour are process-wide (the draw code reads them from
     /// globals), so the test that switches them and the tests that render have
     /// to take turns.
-    static UI_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn ui_guard() -> std::sync::MutexGuard<'static, ()> {
-        UI_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        // The lock lives in `theme` so the panels' own tests can take it too.
+        views::theme::ui_guard()
     }
 
-    /// Puts the global language and colour back to English/default on drop —
+    /// Puts the global language, colour and desktop flag back to their defaults
+    /// on drop —
     /// including when the test panics, which would otherwise leave every other
     /// rendering test reading a foreign language.
     struct UiRestore;
@@ -5344,6 +5996,7 @@ mod tests {
     impl Drop for UiRestore {
         fn drop(&mut self) {
             i18n::set_language(i18n::Lang::En);
+            views::theme::set_has_desktop(false);
             views::theme::set_text_color(ratatui::style::Color::Rgb(
                 settings::PALETTE[0].1.0,
                 settings::PALETTE[0].1.1,
@@ -5632,6 +6285,7 @@ mod tests {
 
         app.note_tx
             .send(midi::InputEvent::Cc(choz_engine::input::CcMsg {
+                channel: 0,
                 source: InputSource::Keyboard,
                 cc: 74,
                 value: 32,
@@ -5661,8 +6315,8 @@ mod tests {
 
         let src = InputSource::Keyboard; // routes to the active slot, no port needed
         for e in [
-            midi::InputEvent::Cc(CcMsg { source: src, cc: 32, value: 0 }),
-            midi::InputEvent::Cc(CcMsg { source: src, cc: 0, value: 0 }),
+            midi::InputEvent::Cc(CcMsg { source: src, channel: 0, cc: 32, value: 0 }),
+            midi::InputEvent::Cc(CcMsg { source: src, channel: 0, cc: 0, value: 0 }),
             midi::InputEvent::Program(ProgramMsg { source: src, bank: 0, program: 13 }),
         ] {
             app.note_tx.send(e).unwrap();
@@ -5679,7 +6333,7 @@ mod tests {
 
         // The fader that follows is what gets bound.
         app.note_tx
-            .send(midi::InputEvent::Cc(CcMsg { source: src, cc: 74, value: 100 }))
+            .send(midi::InputEvent::Cc(CcMsg { source: src, channel: 0, cc: 74, value: 100 }))
             .unwrap();
         app.drain_midi();
         assert_eq!(app.cc_bindings, vec![(74, LearnTarget::Gain(0))]);
@@ -5739,6 +6393,8 @@ mod tests {
                 &tabs, app.active_slot, mix, &app.instrument_label(), preset.as_deref(),
                 app.has_editor(), app.has_fx_editor(),
                 app.sbx_state(None), app.sbx_state(Some(app.fx_slot)),
+                app.tab_channel(), &app.instr_knobs(), app.instr_param,
+                app.rack_focus == RackFocus::Instrument,
             );
         })
         .unwrap();
@@ -6387,6 +7043,488 @@ mod tests {
     }
 
     /// Clicking a category in the ADD FX sidebar shows that category — through
+    /// The tint slider: it only exists with an image set, the arrows move it,
+    /// and moving it drops the cached picture — a wash baked into the image is
+    /// only visible once the image is rebuilt.
+    #[test]
+    fn the_panel_opacity_slider_moves_without_rebuilding_the_picture() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let mut app = App::new();
+
+        // No image: no slider row at all.
+        app.ui.background = settings::Background::Color((1, 2, 3));
+        assert!(
+            (0..app.theme_rows().len()).all(|i| app.theme_row(i) != Some(ThemeRow::Tint)),
+            "nothing to see through without an image"
+        );
+
+        app.ui.background = settings::Background::Image {
+            path: "/tmp/none.png".into(),
+            fit: settings::ImageFit::Stretch,
+        };
+        let row = (0..app.theme_rows().len())
+            .find(|&i| app.theme_row(i) == Some(ThemeRow::Tint))
+            .expect("the slider is offered once an image is set");
+        assert!(app.theme_rows()[row].contains('%'));
+
+        app.ui.background_tint = 50;
+        app.step_tint(5);
+        assert_eq!(app.ui.background_tint, 55);
+
+        // And it stops at the ends instead of wrapping.
+        app.ui.background_tint = 98;
+        app.step_tint(5);
+        assert_eq!(app.ui.background_tint, 100);
+        app.step_tint(-500);
+        assert_eq!(app.ui.background_tint, 0);
+    }
+
+    /// The wash is what makes a panel readable over a photo *and* keeps the
+    /// photo visible: the cell ends up between the picture's colour and the
+    /// theme's, never at either end unless the slider is.
+    #[test]
+    fn panels_blend_the_theme_colour_over_the_picture() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        let area = ratatui::layout::Rect::new(0, 0, 4, 2);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+
+        views::theme::set_backdrop(Some(views::theme::Backdrop {
+            cols: 4,
+            rows: 2,
+            cells: vec![(200, 200, 200); 8],
+            tint: ((0, 0, 0), 0.5),
+            graphics: false,
+        }));
+        views::theme::wash(&mut buf, ratatui::layout::Rect::new(0, 0, 2, 1));
+
+        assert_eq!(
+            buf[(0, 0)].bg,
+            ratatui::style::Color::Rgb(100, 100, 100),
+            "half of the picture, half of the theme"
+        );
+        assert_eq!(buf[(3, 1)].bg, ratatui::style::Color::Reset, "outside the rect, untouched");
+
+        // Opacity 0 leaves the picture alone; 100 hides it.
+        views::theme::set_backdrop(Some(views::theme::Backdrop {
+            cols: 4,
+            rows: 2,
+            cells: vec![(200, 200, 200); 8],
+            tint: ((10, 20, 30), 1.0),
+            graphics: false,
+        }));
+        views::theme::wash(&mut buf, area);
+        assert_eq!(buf[(3, 1)].bg, ratatui::style::Color::Rgb(10, 20, 30));
+
+        views::theme::set_backdrop(None);
+    }
+
+    /// The whole point of the wash, checked through the real `ui()`: with a
+    /// photo behind it, a panel's cells carry a colour that came from *both*
+    /// the picture and the theme — so the labels read and the wallpaper is
+    /// still visible, and it is not one flat rectangle either.
+    #[test]
+    fn panels_over_a_photo_are_translucent_not_flat() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let Some(photo) = ["assets/wallpaper2.jpg", "assets/wallpaper.png"]
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .find(|p| p.exists())
+        else {
+            return; // no sample image in this checkout
+        };
+
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.ui.background = settings::Background::Image { path: photo, fit: settings::ImageFit::Stretch };
+        app.ui.background_tint = 50;
+        app.ui.theme_name = "Ruby Blue".to_string();
+        views::theme::set_has_desktop(true);
+
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+
+        // Inside the RACK, well away from the borders.
+        let inside: Vec<ratatui::style::Color> =
+            (10..40).map(|x| buf[(x, 12)].bg).collect();
+        assert!(
+            inside.iter().all(|c| *c != ratatui::style::Color::Reset),
+            "a panel over a photo must not leave cells at the terminal default"
+        );
+        let distinct: std::collections::HashSet<_> = inside.iter().collect();
+        assert!(
+            distinct.len() > 1,
+            "the picture has to show through: the panel is one flat colour instead"
+        );
+
+        let (tint, _) = app.ui.tint();
+        assert!(
+            inside.iter().all(|c| *c != ratatui::style::Color::Rgb(tint.0, tint.1, tint.2)),
+            "at 50% nothing should land on the pure theme colour"
+        );
+
+        views::theme::set_backdrop(None);
+    }
+
+    /// A plugin's patch has to survive the project file, and the *values* have
+    /// to land on top of it: restoring state moves every parameter, so applying
+    /// the knobs first would leave the tab sounding like the saved patch and
+    /// looking like the saved knobs.
+    #[test]
+    fn a_plugin_patch_goes_into_the_project_and_comes_back() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            format: "VST3".into(),
+            id: "test:one".into(),
+            name: "Tester".into(),
+        }));
+        app.slots[0].instr_values = vec![0.25];
+        app.slots[0].instr_state = b"a patch, opaque to choz".to_vec();
+        app.slots[0].fx_chain.push({
+            let mut e = source::AudioFxEntry::new(source::AudioFxKind::Delay);
+            e.state = b"fx patch".to_vec();
+            e
+        });
+
+        // The snapshot persists the working copy first, so it has to match the
+        // tab — same as anywhere else that builds a rack by hand.
+        app.source = app.slots[0].source.clone();
+        app.fx_chain = app.slots[0].fx_chain.clone();
+
+        let snap = app.project_snapshot();
+        assert!(!snap.rack[0].instrument.state.is_empty(), "the patch is written out");
+        assert_eq!(
+            project::decode_state(&snap.rack[0].instrument.state).unwrap(),
+            b"a patch, opaque to choz",
+        );
+        assert_eq!(project::decode_state(&snap.rack[0].fx[0].state).unwrap(), b"fx patch");
+
+        // Round trip through YAML and back into a fresh app.
+        let text = serde_yaml::to_string(&snap).unwrap();
+        let parsed: project::Project = serde_yaml::from_str(&text).unwrap();
+        let mut fresh = App::new();
+        fresh.apply_project_rack(parsed);
+        assert_eq!(fresh.slots[0].instr_state, b"a patch, opaque to choz");
+        assert_eq!(fresh.slots[0].fx_chain[0].state, b"fx patch");
+        // The knob values belong to a plugin that is not installed here, so the
+        // tab comes back without an instrument — and the patch is kept anyway,
+        // which is the point: a missing plugin must not quietly erase the sound
+        // from the file the next time it is saved.
+        assert!(fresh.slots[0].instr_values.is_empty());
+    }
+
+    /// The switch itself: drawn hard right on the menu bar, clickable, and it
+    /// saves — the mode is how this machine is set up, not a per-session whim.
+    #[test]
+    fn the_mode_switch_is_in_the_corner_and_clickable() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let screen: String =
+            term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(screen.contains("LIVE") && screen.contains("MULTI"), "no switch drawn");
+
+        let rect = app.layout.borrow().mode_switch_rect.expect("the switch is hit-testable");
+        assert!(
+            rect.x + rect.width >= 118,
+            "it belongs in the top-right corner, not at x={}",
+            rect.x
+        );
+        assert_eq!(rect.y, 0);
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x + 1,
+                row: rect.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.ui.rack_mode, settings::RackMode::Multi);
+        // F4 does the same from the keyboard.
+        handle_key(&mut app, KeyCode::F(4));
+        assert_eq!(app.ui.rack_mode, settings::RackMode::Live);
+    }
+
+    /// The two jobs choz does, and the switch between them.
+    ///
+    /// LIVE: one tab sounds, a program change steps through them — a rig on
+    /// stage. MULTI: every tab answers its own MIDI channel and they all sound
+    /// at once — a multi-timbral module for a DAW's orchestral template.
+    #[test]
+    fn live_picks_one_tab_and_multi_answers_every_channel() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let mut app = App::new();
+        // Three tabs on the same MIDI port, on channels 1, 2 and 3.
+        for _ in 0..3 {
+            app.push_slot(AudioSource::Midi);
+        }
+        app.midi_connected = vec!["Keystation".into()];
+        for slot in app.slots.iter_mut() {
+            slot.input = Some(InputRef::Midi("Keystation".into()));
+        }
+        assert_eq!(
+            app.slots.iter().map(|s| s.channel).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "new tabs land on consecutive channels"
+        );
+
+        let midi = choz_engine::input::InputSource::Midi(0);
+
+        // LIVE: whatever the channel, only the active tab plays.
+        app.ui.rack_mode = settings::RackMode::Live;
+        app.active_slot = 1;
+        assert_eq!(app.targets_for(midi, 0), vec![1]);
+        assert_eq!(app.targets_for(midi, 2), vec![1], "the channel is noise here");
+
+        // …and an unbound program change selects a tab, like a live rig.
+        app.apply_program_button(2);
+        assert_eq!(app.active_slot, 2);
+
+        // MULTI: the channel decides, and the active tab is irrelevant.
+        app.ui.rack_mode = settings::RackMode::Multi;
+        assert_eq!(app.targets_for(midi, 0), vec![0], "channel 1 → the tab set to 1");
+        assert_eq!(app.targets_for(midi, 2), vec![2]);
+        assert_eq!(app.targets_for(midi, 9), Vec::<usize>::new(), "no tab on channel 10");
+
+        // Two tabs sharing a channel sound together — that is the layering the
+        // live mode deliberately refuses.
+        app.slots[2].channel = 1;
+        assert_eq!(app.targets_for(midi, 0), vec![0, 2]);
+
+        // The QWERTY piano has no channel of its own, so it still plays the
+        // tab in front of the user.
+        app.active_slot = 1;
+        assert_eq!(app.targets_for(choz_engine::input::InputSource::Keyboard, 0), vec![1]);
+
+        // And a program change no longer steals a tab: they all sound anyway.
+        app.apply_program_button(0);
+        assert_eq!(app.active_slot, 1);
+    }
+
+    /// The stuck-note bug: routing depends on which tab is active, so a note
+    /// released *after* switching tabs used to send its note-off to the wrong
+    /// instrument and leave the first one ringing forever.
+    #[test]
+    fn a_note_off_goes_to_the_tab_that_started_the_note() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+
+        // Played on tab 1 (the QWERTY piano always follows the active tab)…
+        app.active_slot = 0;
+        let on = app.start_note(choz_engine::input::InputSource::Keyboard, 0, 60);
+        assert_eq!(on, vec![0]);
+
+        // …released after switching to tab 2.
+        app.active_slot = 1;
+        assert_eq!(
+            app.note_targets(choz_engine::input::InputSource::Keyboard),
+            vec![1],
+            "the routing really did move"
+        );
+        assert_eq!(
+            app.end_note(choz_engine::input::InputSource::Keyboard, 0, 60),
+            vec![0],
+            "the note-off has to go back to the tab that is sounding it"
+        );
+
+        // A note choz never saw start still gets the best guess rather than
+        // nothing — a controller plugged in mid-note, say.
+        assert_eq!(app.end_note(choz_engine::input::InputSource::Keyboard, 0, 72), vec![1]);
+
+        // Panic forgets everything it was tracking.
+        app.start_note(choz_engine::input::InputSource::Keyboard, 0, 64);
+        app.active_notes.push((64, 5));
+        app.panic();
+        assert!(app.sounding.is_empty() && app.active_notes.is_empty());
+    }
+
+    /// Carla's generic panel: every plugin gets its parameters as knobs in the
+    /// RACK, so a CC can be learned on any of them **without opening the
+    /// plugin's window** — which for a big synth is the slow part.
+    #[test]
+    fn instrument_knobs_are_drawn_clickable_and_learnable() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            format: "VST2".into(),
+            id: "test:one".into(),
+            name: "Tyrell".into(),
+        }));
+        app.slots[0].instr_params = vec![
+            choz_engine::PluginParam { id: 9, name: "Cutoff".into(), min: 0.0, max: 1.0, default: 0.0 },
+            choz_engine::PluginParam { id: 4, name: "Volume".into(), min: 0.0, max: 1.0, default: 0.5 },
+        ];
+        app.slots[0].instr_values = vec![0.2, 0.6];
+        app.source = app.slots[0].source.clone();
+
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let screen: String =
+            term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(screen.contains("Cutoff"), "the instrument's knobs are not drawn:\n{screen}");
+        assert!(screen.contains("Volume"));
+
+        let knobs = app.layout.borrow().rack.instr_knobs.clone();
+        assert_eq!(knobs.len(), 2, "one clickable cell per parameter");
+
+        // Clicking a knob moves the cursor there and hands the arrows to that
+        // box instead of the FX chain's.
+        let (_, rect) = knobs[1];
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x + 1,
+                row: rect.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.rack_focus, RackFocus::Instrument);
+        assert_eq!(app.instr_param, 1);
+
+        // And `w` turns *that* knob, not an FX one.
+        handle_key(&mut app, KeyCode::Char('w'));
+        assert!(app.slots[0].instr_values[1] > 0.6);
+
+        // Pointer learn picks it without the plugin's window being open.
+        app.start_learn_pick();
+        let target = app.learn_target_at(ratatui::layout::Position {
+            x: rect.x + 1,
+            y: rect.y,
+        });
+        assert_eq!(target, Some(LearnTarget::InstrParam { slot: 0, param: 1 }));
+    }
+
+    /// The whole point of learn-from-the-plugin's-window, end to end in the UI:
+    /// a knob moved inside the plugin picks the target, the next CC binds to
+    /// it, and every CC after that drives that parameter.
+    ///
+    /// The plugin half (a real `audioMasterAutomate` / `performEdit`) is tested
+    /// in the format crates; what is checked here is that choz turns a reported
+    /// touch into a binding, which is the part that did nothing before.
+    #[test]
+    fn a_knob_touched_in_the_plugin_window_is_what_midi_learn_binds() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        // Two parameters, as `read_params` would report them.
+        // Ids that are deliberately not positions: a CLAP id, an LV2 port and a
+        // VST3 ParamID are all arbitrary, and the UI must work off the index the
+        // host translated to.
+        app.slots[0].instr_params = vec![
+            choz_engine::PluginParam { id: 4100, name: "Cutoff".into(), min: 0.0, max: 1.0, default: 0.0 },
+            choz_engine::PluginParam { id: 77, name: "Volume".into(), min: 0.0, max: 1.0, default: 0.5 },
+        ];
+        app.slots[0].instr_values = vec![0.0, 0.5];
+
+        app.start_learn_pick();
+        assert!(app.learn.is_none(), "nothing is chosen until something is touched");
+
+        // The plugin says: the user just moved parameter 1 to 0.8.
+        app.record_plugin_edit(0, None, 1, 0.8);
+        assert_eq!(
+            app.learn,
+            Some(LearnTarget::InstrParam { slot: 0, param: 1 }),
+            "the knob touched in the plugin's window is the one learn takes"
+        );
+        assert_eq!(
+            app.slots[0].instr_values[1], 0.8,
+            "and choz's own copy follows it, so the project saves what was done in there"
+        );
+
+        // The next CC binds; the ones after it drive the parameter.
+        app.apply_cc(74, 100);
+        assert!(app.learn.is_none(), "armed no longer");
+        assert_eq!(app.cc_bindings.len(), 1);
+        app.apply_cc(74, 127);
+        assert_eq!(app.slots[0].instr_values[1], 1.0);
+        app.apply_cc(74, 0);
+        assert_eq!(app.slots[0].instr_values[1], 0.0);
+
+        // A touch with learn disarmed only tracks the value; it must not
+        // silently re-bind anything.
+        app.record_plugin_edit(0, None, 0, 0.25);
+        assert_eq!(app.learn, None);
+        assert_eq!(app.slots[0].instr_values[0], 0.25);
+    }
+
+    /// With a desktop background in play, nothing may punch a hole in it.
+    ///
+    /// A hole is a cell left at `Color::Reset` — SGR 49, the terminal's own
+    /// background, which is not transparent and reads as a grey rectangle over
+    /// the wallpaper. The background renderer paints every cell of the area, so
+    /// any `Reset` left afterwards is a widget that set its own.
+    #[test]
+    fn nothing_punches_a_hole_in_the_desktop() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+
+        // Every state that draws over the body, because those are the ones that
+        // call `Clear` — which resets cells instead of tinting them.
+        type Setup = fn(&mut App);
+        let states: Vec<(&str, Setup)> = vec![
+            ("plain", |_| {}),
+            ("drawers open", |a: &mut App| {
+                a.in_open = true;
+                a.out_open = true;
+            }),
+            ("add fx modal", |a: &mut App| a.open_add_fx_modal()),
+            ("about", |a: &mut App| a.about_open = true),
+            ("menu open", |a: &mut App| a.menu = Some(menu::MenuState::open(menu::MenuKind::File))),
+        ];
+
+        // The real terminal this was measured on, not a token 80x24: the holes
+        // that mattered showed up at full size.
+        let mut term = Terminal::new(TestBackend::new(170, 45)).unwrap();
+        for (name, setup) in states {
+            let mut app = App::new();
+            app.splash_done = true;
+            app.slots.push(RackSlot::new(AudioSource::Midi));
+            app.ui.background = settings::Background::Color((10, 20, 30));
+            views::theme::set_has_desktop(true);
+            setup(&mut app);
+
+            term.draw(|f| ui(f, &mut app)).unwrap();
+            let buf = term.backend().buffer();
+            let holes: Vec<(u16, u16)> = (0..45)
+                .flat_map(|y| (0..170).map(move |x| (x, y)))
+                .filter(|&(x, y)| buf[(x, y)].bg == ratatui::style::Color::Reset)
+                .collect();
+            assert!(
+                holes.is_empty(),
+                "{name}: {} cells reset the background, first at {:?}",
+                holes.len(),
+                &holes[..holes.len().min(8)],
+            );
+        }
+    }
+
     /// the real mouse path, rects and all.
     #[test]
     fn add_fx_categories_are_clickable() {

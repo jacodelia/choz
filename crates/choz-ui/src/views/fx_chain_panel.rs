@@ -32,6 +32,8 @@ pub const TAB_ADD_W: u16 = 3;
 /// Buttons on the RACK's instrument line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RackButton {
+    /// The tab's MIDI channel, shown only in MULTI mode. Clicking steps it.
+    Channel,
     /// Open the source/synth picker.
     Source,
     /// Open the SF2 bank/preset picker (SoundFont tabs only).
@@ -65,6 +67,9 @@ pub struct RackLayout {
     pub fx_add: Option<Rect>,
     /// (parameter index, rect) for the knob cells currently on screen.
     pub params: Vec<(usize, Rect)>,
+    /// Same, for the instrument's own parameters — the generic panel every
+    /// plugin gets whether or not it has a window.
+    pub instr_knobs: Vec<(usize, Rect)>,
     pub on_off: Option<Rect>,
     pub move_left: Option<Rect>,
     pub move_right: Option<Rect>,
@@ -164,10 +169,106 @@ pub fn pan_label(pan: f32) -> String {
 
 /// How many knob columns fit in `width`, and how many rows `n` knobs need.
 /// Exposed so the parameter cursor logic and the tests agree with the drawing.
+/// How many rows of instrument knobs the RACK gives up before scrolling. The
+/// FX chain needs the rest of the panel, and a plugin with a hundred
+/// parameters would otherwise eat the whole thing.
+const INSTR_KNOB_ROWS: usize = 2;
+
 pub fn param_grid(width: u16, n: usize) -> (usize, usize) {
     let cols = (width.saturating_sub(2) / FX_CELL_W).max(1) as usize;
     let rows = n.div_ceil(cols);
     (cols, rows)
+}
+
+/// Draw a bordered box of knobs — one cell per parameter, wrapping onto as many
+/// rows as fit and scrolling to keep the cursor visible.
+///
+/// Shared by the selected FX and by the instrument's own parameters, which is
+/// the point: a plugin's knobs look and behave the same wherever they come
+/// from, so a CC can be learned on any of them without opening a window.
+///
+/// Returns the click rects (parameter index → cell) and the first row below the
+/// box.
+#[allow(clippy::too_many_arguments)]
+fn draw_knob_box(
+    f: &mut Frame,
+    inner: Rect,
+    y: u16,
+    title: &str,
+    values: &[f32],
+    names: &[String],
+    cursor: usize,
+    focused: bool,
+    max_rows: usize,
+    reserve_below: u16,
+) -> (Vec<(usize, Rect)>, u16) {
+    let bg = super::theme::panel_style();
+    let n = values.len();
+    let mut rects = Vec::new();
+    if n == 0 || y + 5 > inner.y + inner.height {
+        return (rects, y);
+    }
+    let (cols, rows_needed) = param_grid(inner.width, n);
+    // 3 rows per knob row, plus the box border.
+    let room = (inner.y + inner.height).saturating_sub(y + reserve_below).max(3) as usize;
+    let rows_shown = (room / 3).clamp(1, rows_needed.max(1)).min(max_rows.max(1));
+    let cursor_row = cursor / cols.max(1);
+    let first_row = cursor_row.saturating_sub(rows_shown.saturating_sub(1));
+
+    let box_h = (rows_shown * 3) as u16 + 2;
+    let box_rect = Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), box_h.min(inner.height));
+    let more = if rows_needed > rows_shown {
+        format!(" ({}/{} rows) ", first_row + rows_shown, rows_needed)
+    } else {
+        String::new()
+    };
+    let block = Block::default()
+        .title(format!(" {title}{more} "))
+        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if focused { SEL } else { RULE }))
+        .style(bg);
+    let param_inner = block.inner(box_rect);
+    f.render_widget(block, box_rect);
+
+    for row in 0..rows_shown {
+        let ry = param_inner.y + (row * 3) as u16;
+        if ry + 2 > param_inner.y + param_inner.height {
+            break;
+        }
+        let (mut knob_spans, mut val_spans, mut name_spans) = (Vec::new(), Vec::new(), Vec::new());
+        for col in 0..cols {
+            let pi = (first_row + row) * cols + col;
+            if pi >= n {
+                break;
+            }
+            let val = values[pi];
+            let is_p = pi == cursor && focused;
+            rects.push((pi, Rect::new(param_inner.x + (col as u16) * FX_CELL_W, ry, FX_CELL_W, 3)));
+            knob_spans.push(Span::styled(
+                format!("{:<width$}", format!("[{}]", knob_arc(val, 8)), width = FX_CELL_W as usize),
+                Style::default().fg(if is_p { SEL } else { KNOB }),
+            ));
+            val_spans.push(Span::styled(
+                format!("{:<width$}", format!(" {}{val:4.2}", knob_indicator(val)), width = FX_CELL_W as usize),
+                Style::default()
+                    .fg(if is_p { SEL } else { ui_text() })
+                    .add_modifier(if is_p { Modifier::BOLD } else { Modifier::empty() }),
+            ));
+            let name = names.get(pi).map(|s| s.as_str()).unwrap_or("?");
+            name_spans.push(Span::styled(
+                format!(" {:<width$}", truncate(name, FX_CELL_W as usize - 2), width = FX_CELL_W as usize - 1),
+                Style::default().fg(if is_p { SEL } else { LABEL }),
+            ));
+        }
+        for (spans, yy) in [(knob_spans, ry), (val_spans, ry + 1), (name_spans, ry + 2)] {
+            f.render_widget(
+                Paragraph::new(Line::from(spans)).style(bg),
+                Rect::new(param_inner.x, yy, param_inner.width, 1),
+            );
+        }
+    }
+    (rects, box_rect.y + box_rect.height)
 }
 
 /// Draw the RACK panel and return its click rects.
@@ -192,6 +293,16 @@ pub fn draw_fx_chain_panel(
     // Out-of-process state of the instrument and of the selected FX.
     sandbox: SbxState,
     fx_sandbox: SbxState,
+    // The tab's MIDI channel (1..16), `None` in LIVE mode where it means
+    // nothing: there, a tab is chosen by its input and by which one is active.
+    channel: Option<u8>,
+    // The instrument's own parameters: name and 0..1 position, in plugin order.
+    // Carla's "generic UI": every plugin gets knobs whether or not it has a
+    // window, so a CC can be learned without opening one.
+    instr_params: &[(String, f32)],
+    instr_cursor: usize,
+    // Which of the two knob boxes the arrows and the highlight belong to.
+    instr_focused: bool,
 ) -> RackLayout {
     let has_presets = preset.is_some();
     let mut layout = RackLayout::default();
@@ -333,6 +444,9 @@ pub fn draw_fx_chain_panel(
         // Bank/preset only exists while the tab holds a SoundFont.
         (RackButton::Preset, has_presets.then(|| BTN_PRESET.to_string())),
         (RackButton::Learn, Some(BTN_LEARN.to_string())),
+        // In MULTI the channel is what decides whether this tab sounds at all,
+        // so it sits on the same line as the instrument it selects.
+        (RackButton::Channel, channel.map(|c| format!(" CH {c:>2} "))),
         // Only plugins with a native editor get the button.
         (RackButton::Gui, has_gui.then(|| BTN_GUI.to_string())),
         // Only a hosted plugin can be moved into a process of its own.
@@ -374,6 +488,34 @@ pub fn draw_fx_chain_panel(
         }
         put(f, Line::from(line), y);
         y += 1;
+    }
+
+    // ── Instrument parameters ──────────────────────────────────────────────
+    if !instr_params.is_empty() {
+        let values: Vec<f32> = instr_params.iter().map(|(_, v)| *v).collect();
+        let names: Vec<String> = instr_params.iter().map(|(n, _)| n.clone()).collect();
+        let (rects, next) = draw_knob_box(
+            f,
+            inner,
+            y,
+            // The title carries the key that hands it the arrows: two knob
+            // boxes on one panel need to say which one is live.
+            &format!(
+                "{} \u{00B7} {}{}",
+                t("INSTRUMENT"),
+                truncate(instrument, 18),
+                if focused && instr_focused { "" } else { "  [k]" }
+            ),
+            &values,
+            &names,
+            instr_cursor,
+            focused && instr_focused,
+            INSTR_KNOB_ROWS,
+            // Leave the FX chain its rule, its buttons and a knob row.
+            9,
+        );
+        layout.instr_knobs = rects;
+        y = next;
     }
 
     // ── FX chain ───────────────────────────────────────────────────────────
@@ -441,79 +583,23 @@ pub fn draw_fx_chain_panel(
         return layout;
     };
 
-    // ── Selected FX: parameters in a bordered box, wrapping over rows ──────
+    // ── Selected FX: the same knob box, from the same helper ──────────────
     let descs = entry.param_descs();
-    let n = descs.len();
-    let (cols, rows_needed) = param_grid(inner.width, n);
-    // 3 rows per knob row, plus the box border.
-    let room = (inner.y + inner.height).saturating_sub(y + 5).max(3) as usize;
-    let rows_shown = (room / 3).clamp(1, rows_needed.max(1));
-    // `param_grid` never returns 0 columns, so this can't divide by zero.
-    let cursor_row = fx_param / cols.max(1);
-    let first_row = cursor_row.saturating_sub(rows_shown.saturating_sub(1));
-
-    let box_h = (rows_shown * 3) as u16 + 2;
-    let box_rect = Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), box_h.min(inner.height));
-    let more = if rows_needed > rows_shown {
-        format!(" ({}/{} rows) ", first_row + rows_shown, rows_needed)
-    } else {
-        String::new()
-    };
-    let param_block = Block::default()
-        .title(format!(" {}:{}{} ", fx_slot + 1, entry.label(), more))
-        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(RULE))
-        .style(bg);
-    let param_inner = param_block.inner(box_rect);
-    f.render_widget(param_block, box_rect);
-
-    for row in 0..rows_shown {
-        let ry = param_inner.y + (row * 3) as u16;
-        if ry + 2 > param_inner.y + param_inner.height {
-            break;
-        }
-        let mut knob_spans: Vec<Span> = Vec::new();
-        let mut val_spans: Vec<Span> = Vec::new();
-        let mut name_spans: Vec<Span> = Vec::new();
-        for col in 0..cols {
-            let pi = (first_row + row) * cols + col;
-            if pi >= n {
-                break;
-            }
-            let val = entry.params.get(pi).copied().unwrap_or(0.0);
-            let is_p = pi == fx_param && focused;
-            layout.params.push((
-                pi,
-                Rect::new(param_inner.x + (col as u16) * FX_CELL_W, ry, FX_CELL_W, 3),
-            ));
-            knob_spans.push(Span::styled(
-                format!("{:<width$}", format!("[{}]", knob_arc(val, 8)), width = FX_CELL_W as usize),
-                Style::default().fg(if is_p { SEL } else { KNOB }),
-            ));
-            val_spans.push(Span::styled(
-                format!("{:<width$}", format!(" {}{val:4.2}", knob_indicator(val)), width = FX_CELL_W as usize),
-                Style::default()
-                    .fg(if is_p { SEL } else { ui_text() })
-                    .add_modifier(if is_p { Modifier::BOLD } else { Modifier::empty() }),
-            ));
-            let name = descs.get(pi).map(|d| d.name.as_ref()).unwrap_or("?");
-            name_spans.push(Span::styled(
-                format!(" {:<width$}", truncate(name, FX_CELL_W as usize - 2), width = FX_CELL_W as usize - 1),
-                Style::default().fg(if is_p { SEL } else { LABEL }),
-            ));
-        }
-        let put_row = |f: &mut Frame, spans: Vec<Span>, yy: u16| {
-            f.render_widget(
-                Paragraph::new(Line::from(spans)).style(bg),
-                Rect::new(param_inner.x, yy, param_inner.width, 1),
-            );
-        };
-        put_row(f, knob_spans, ry);
-        put_row(f, val_spans, ry + 1);
-        put_row(f, name_spans, ry + 2);
-    }
-    y = box_rect.y + box_rect.height;
+    let names: Vec<String> = descs.iter().map(|d| d.name.to_string()).collect();
+    let (rects, next) = draw_knob_box(
+        f,
+        inner,
+        y,
+        &format!("{}:{}", fx_slot + 1, entry.label()),
+        &entry.params,
+        &names,
+        fx_param,
+        focused && !instr_focused,
+        usize::MAX,
+        5,
+    );
+    layout.params = rects;
+    y = next;
 
     // ── Slot controls, in their own box, one blank line below the knobs ────
     if y + 2 < inner.y + inner.height {

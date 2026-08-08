@@ -22,8 +22,11 @@ pub struct Shm {
 }
 
 // SAFETY: the whole point of the region is that two processes touch it. Which
-// bytes each side may write is the bridge's contract, not this type's.
+// bytes each side may write is the bridge's contract, not this type's — and
+// `Shm` itself only ever hands out the base pointer, so sharing the handle
+// between threads adds nothing the two processes were not already doing.
 unsafe impl Send for Shm {}
+unsafe impl Sync for Shm {}
 
 impl Shm {
     /// Create a region called `name` (`/choz-…`, no other slashes) of `len`

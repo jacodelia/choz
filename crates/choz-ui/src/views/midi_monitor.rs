@@ -151,11 +151,11 @@ mod tests {
             line(&e, &ports).spans.iter().map(|s| s.content.to_string()).collect::<String>()
         };
 
-        let sustain = text(InputEvent::Cc(CcMsg { source: src, cc: 64, value: 127 }));
+        let sustain = text(InputEvent::Cc(CcMsg { source: src, channel: 0, cc: 64, value: 127 }));
         assert!(sustain.contains("SUSTAIN"), "got {sustain:?}");
         assert!(sustain.contains("Keystation"), "port is named: {sustain:?}");
 
-        let unknown = text(InputEvent::Cc(CcMsg { source: src, cc: 23, value: 5 }));
+        let unknown = text(InputEvent::Cc(CcMsg { source: src, channel: 0, cc: 23, value: 5 }));
         assert!(unknown.contains("CC 23"), "unnamed controllers fall back to a number");
 
         // A wheel at rest reads 0, not 8192.
@@ -164,7 +164,7 @@ mod tests {
         let down = text(InputEvent::Bend(BendMsg { source: src, value: 0 }));
         assert!(down.contains("-8192"), "got {down:?}");
 
-        let note = text(InputEvent::Note(NoteMsg { source: src, on: true, note: 60, vel: 100 }));
+        let note = text(InputEvent::Note(NoteMsg { source: src, channel: 0, on: true, note: 60, vel: 100 }));
         assert!(note.contains("C4") && note.contains("vel 100"), "got {note:?}");
     }
 
@@ -193,7 +193,7 @@ mod tests {
         let src = InputSource::Midi(0);
         // More messages than the 6 inner rows of an 8-row panel.
         let events: Vec<InputEvent> = (0..20)
-            .map(|i| InputEvent::Note(NoteMsg { source: src, on: true, note: 40 + i, vel: 100 }))
+            .map(|i| InputEvent::Note(NoteMsg { source: src, channel: 0, on: true, note: 40 + i, vel: 100 }))
             .collect();
 
         let screen = render(&events, &ports, 50, 8);
@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn survives_being_squeezed_to_nothing() {
         let src = InputSource::Midi(0);
-        let e = [InputEvent::Note(NoteMsg { source: src, on: true, note: 60, vel: 100 })];
+        let e = [InputEvent::Note(NoteMsg { source: src, channel: 0, on: true, note: 60, vel: 100 })];
         for h in 0..4 {
             render(&e, &[], 30, h);
         }

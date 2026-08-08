@@ -65,8 +65,9 @@ pub struct SandboxedPlugin {
     bridge: Host,
     /// Kept for its mapping; dropping it unmaps the region. The name is only
     /// unlinked at the very end, because a replacement child has to be able to
-    /// open it again.
-    _shm: Shm,
+    /// open it again. In an `Arc` because the window handle held by the UI
+    /// thread keeps the same mapping alive.
+    shm: Arc<Shm>,
     /// The live child, shared with the supervisor thread that replaces it.
     child: Arc<std::sync::Mutex<std::process::Child>>,
     /// Set on drop so the supervisor stops resurrecting anything.
@@ -124,7 +125,7 @@ impl SandboxedPlugin {
         let block = frames as usize * CHANNELS as usize;
         let mut me = Self {
             bridge,
-            _shm: shm,
+            shm: Arc::new(shm),
             child: Arc::clone(&child),
             closing: Arc::new(AtomicBool::new(false)),
             status: choz_ports::SandboxStatus::default(),
@@ -166,6 +167,19 @@ impl SandboxedPlugin {
     /// The shared counters, for whoever draws them.
     pub fn status(&self) -> choz_ports::SandboxStatus {
         self.status.clone()
+    }
+
+    /// A `GUI` button for a plugin that lives in another process.
+    ///
+    /// Always offered: whether the plugin has a window is the child's business,
+    /// and it answers with no size when it has none. Asking is one round trip
+    /// through the region, not a load.
+    pub fn editor_handle(&self) -> choz_ports::EditorHandle {
+        // SAFETY: the link holds a clone of the mapping, so the region outlives
+        // it however the instance ends.
+        let link = unsafe { self.bridge.editor_link() };
+        std::sync::Arc::new(SandboxEditor { link, _shm: Arc::clone(&self.shm) })
+            as choz_ports::EditorHandle
     }
 
     /// Republish the bridge's missed count. Called at the end of every block:
@@ -261,6 +275,34 @@ impl SandboxedPlugin {
     }
 }
 
+/// The `GUI` button of a plugin that lives in another process.
+///
+/// Nothing is opened here: the request crosses the shared region and the child
+/// opens the window itself, in its own process, embedded into the X11 window
+/// choz created. A GUI that crashes therefore kills only the child — which the
+/// supervisor replaces — instead of the whole app.
+struct SandboxEditor {
+    link: choz_plugin_sandbox::bridge::EditorLink,
+    /// Keeps the shared mapping alive while the window can still be asked for.
+    _shm: Arc<Shm>,
+}
+
+impl choz_ports::PluginEditor for SandboxEditor {
+    fn open(&self, parent: u64) -> Option<(u16, u16)> {
+        // Generous: a big synth building its UI for the first time takes a
+        // while, and this runs on the editor thread, never on audio.
+        self.link.editor(Some(parent), Duration::from_secs(5))
+    }
+
+    /// Nothing to pump from here — the child idles its own window on its own
+    /// thread, which is the only place the toolkit can be touched.
+    fn idle(&self) {}
+
+    fn close(&self) {
+        self.link.editor(None, Duration::from_secs(2));
+    }
+}
+
 impl AudioSource for SandboxedPlugin {
     fn render(&mut self, out: &mut [f32], _sample_rate: u32) -> usize {
         let block = self.frames * CHANNELS as usize;
@@ -321,6 +363,10 @@ impl AudioSource for SandboxedPlugin {
     fn sandbox(&self) -> Option<choz_ports::SandboxStatus> {
         Some(self.status())
     }
+
+    fn editor(&self) -> Option<choz_ports::EditorHandle> {
+        Some(self.editor_handle())
+    }
 }
 
 /// The same plugin, wired into an FX chain instead of a rack slot.
@@ -380,6 +426,10 @@ impl crate::fx::FxProcessor for SandboxedEffect {
 
     fn sandbox(&self) -> Option<choz_ports::SandboxStatus> {
         Some(self.inner.status())
+    }
+
+    fn editor(&self) -> Option<choz_ports::EditorHandle> {
+        Some(self.inner.editor_handle())
     }
 }
 
@@ -463,6 +513,18 @@ fn serve_plugin(
         anyhow::bail!("nothing loadable at {}", path.display());
     }
 
+    // The plugin's window, opened **here**, in the child. That is the whole
+    // point: a GUI that segfaults (every guitarix UI does) takes this process
+    // down and the supervisor starts another, instead of taking choz with it.
+    // The X11 window it embeds into belongs to choz — window ids are valid
+    // across processes.
+    let editor = source
+        .as_ref()
+        .and_then(|s| s.editor())
+        .or_else(|| effect.as_ref().and_then(|f| f.editor()));
+    let mut window: Option<EditorThread> = None;
+    let (size_tx, size_rx) = std::sync::mpsc::channel::<(u32, Option<(u16, u16)>)>();
+
     // The host waits with a deadline, so a slow block costs it silence, not a
     // stall. Ours is generous: it only bounds "the host went away".
     while sandbox.serve(Duration::from_secs(5), &mut |input, output, midi, params| {
@@ -487,6 +549,66 @@ fn serve_plugin(
             output.copy_from_slice(input);
             fx.process_block(output, sample_rate);
         }
-    }) {}
+    }) {
+        // Between blocks: the window requests. Opening one can take hundreds of
+        // milliseconds, so it happens on its own thread and the answer comes
+        // back through the channel — the audio rendezvous never waits for a
+        // toolkit.
+        if let Some((seq, parent)) = sandbox.editor_request() {
+            match (parent, editor.clone()) {
+                (Some(parent), Some(handle)) => {
+                    window = Some(EditorThread::start(handle, parent, seq, size_tx.clone()));
+                }
+                _ => {
+                    // Close, or nothing to open: answer at once.
+                    window.take();
+                    sandbox.editor_done(seq, None);
+                }
+            }
+        }
+        while let Ok((seq, size)) = size_rx.try_recv() {
+            sandbox.editor_done(seq, size);
+        }
+    }
     Ok(())
+}
+
+/// The thread that owns the plugin's window inside the child.
+struct EditorThread {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EditorThread {
+    fn start(
+        handle: choz_ports::EditorHandle,
+        parent: u64,
+        seq: u32,
+        tx: std::sync::mpsc::Sender<(u32, Option<(u16, u16)>)>,
+    ) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let join = std::thread::Builder::new()
+            .name("choz-sandbox-editor".into())
+            .spawn(move || {
+                let size = handle.open(parent);
+                let _ = tx.send((seq, size));
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    handle.idle();
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+                handle.close();
+            })
+            .ok();
+        Self { stop, join }
+    }
+}
+
+impl Drop for EditorThread {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
 }

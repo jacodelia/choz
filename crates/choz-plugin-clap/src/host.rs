@@ -295,6 +295,47 @@ pub fn read_params(path: &Path, plugin_id: &str) -> Vec<crate::PluginParam> {
 /// An activated CLAP plugin plus its planar scratch buffers. Shared by the
 /// instrument ([`ClapInstrument`]) and effect ([`ClapEffect`]) wrappers, which
 /// differ only in what they put into `in_buf` and the event list.
+/// What the plugin reports the user is doing **in its own window**.
+///
+/// CLAP has no host callback for this: a plugin announces parameter moves by
+/// pushing `param_value` events into the **output event stream of `process`**.
+/// So this is filled from the audio thread — hence `try_lock` and nothing else:
+/// missing one event of a knob sweep costs nothing, blocking the audio thread
+/// costs a dropout.
+#[derive(Default)]
+pub struct ClapTouch {
+    /// The plugin's own parameter id and the plain value it reported.
+    last: std::sync::Mutex<Option<(u32, f64)>>,
+}
+
+impl ClapTouch {
+    fn record(&self, id: u32, value: f64) {
+        if let Ok(mut g) = self.last.try_lock() {
+            *g = Some((id, value));
+        }
+    }
+
+    fn take(&self) -> Option<(u32, f64)> {
+        self.last.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+/// [`ClapTouch`] as choz sees it: by parameter **index**, normalised 0..1.
+/// CLAP reports its own ids and plain values, so the list that knows both does
+/// the translation — same shape as the LV2 and VST3 hosts.
+pub struct ClapTouchByIndex {
+    raw: std::sync::Arc<ClapTouch>,
+    params: Vec<crate::PluginParam>,
+}
+
+impl choz_ports::ParamTouch for ClapTouchByIndex {
+    fn take_touched(&self) -> Option<(u32, f32)> {
+        let (id, plain) = self.raw.take()?;
+        let index = self.params.iter().position(|p| p.id == id)?;
+        Some((index as u32, self.params[index].normalised(plain) as f32))
+    }
+}
+
 struct ClapProc {
     // Field order matters for drop: processor, then instance, then the entry —
     // the entry owns the dlopen'd library, so letting it go first leaves the
@@ -318,6 +359,8 @@ struct ClapProc {
     /// Built once, here on the building thread: `editor()` handing out a fresh
     /// one per call would let two windows create two GUIs on one plugin.
     editor: Option<std::sync::Arc<crate::editor::ClapEditor>>,
+    /// Parameter moves the plugin reports from its own window.
+    touch: std::sync::Arc<ClapTouch>,
 }
 
 // SAFETY: `PluginInstance` is `!Send` because CLAP main-thread callbacks must run
@@ -369,6 +412,7 @@ impl ClapProc {
 
         let frames = max_block as usize;
         Some(Self {
+            touch: std::sync::Arc::default(),
             processor: Some(started),
             entry: Some(entry),
             in_ports: AudioPorts::with_capacity(in_layout.iter().sum(), in_layout.len().max(1)),
@@ -398,7 +442,7 @@ impl ClapProc {
     /// Run one block. `in_buf` must already hold the input audio; results land
     /// in `out_buf`. Does nothing if the processor failed to start.
     fn process_block(&mut self, frames: usize, queue: &[QueuedEvent]) {
-        let Self { processor, in_ports, out_ports, in_buf, out_buf, steady, .. } = self;
+        let Self { processor, in_ports, out_ports, in_buf, out_buf, steady, touch, .. } = self;
         let Some(proc) = processor.as_mut() else { return };
 
         for port in out_buf.iter_mut() {
@@ -454,6 +498,15 @@ impl ClapProc {
             None,
         );
         *steady += frames as u64;
+
+        // The plugin's answer stream is the only place a CLAP plugin says "the
+        // user moved this knob". Read on the audio thread, never blocking on
+        // it.
+        for event in out_ev.iter() {
+            if let Some(param) = event.as_event::<ParamValueEvent>() {
+                touch.record(param.param_id().map(|i| i.into()).unwrap_or(0), param.value());
+            }
+        }
     }
 }
 
@@ -526,6 +579,18 @@ fn queue_param(queue: &mut Vec<QueuedEvent>, params: &[crate::PluginParam], inde
 impl AudioSource for ClapInstrument {
     fn editor(&self) -> Option<choz_ports::EditorHandle> {
         self.proc.editor.clone().map(|e| e as choz_ports::EditorHandle)
+    }
+
+    fn param_touch(&self) -> Option<choz_ports::TouchHandle> {
+        Some(std::sync::Arc::new(ClapTouchByIndex {
+            raw: std::sync::Arc::clone(&self.proc.touch),
+            params: self.params.clone(),
+        }) as choz_ports::TouchHandle)
+    }
+
+    fn state(&self) -> Option<choz_ports::StateHandle> {
+        Some(std::sync::Arc::new(crate::state::ClapState::new(self.proc.gui.clone()))
+            as choz_ports::StateHandle)
     }
 
     fn render(&mut self, output: &mut [f32], _sample_rate: u32) -> usize {
@@ -629,6 +694,18 @@ impl ClapEffect {
 impl FxProcessor for ClapEffect {
     fn editor(&self) -> Option<choz_ports::EditorHandle> {
         self.proc.editor.clone().map(|e| e as choz_ports::EditorHandle)
+    }
+
+    fn param_touch(&self) -> Option<choz_ports::TouchHandle> {
+        Some(std::sync::Arc::new(ClapTouchByIndex {
+            raw: std::sync::Arc::clone(&self.proc.touch),
+            params: self.params.clone(),
+        }) as choz_ports::TouchHandle)
+    }
+
+    fn state(&self) -> Option<choz_ports::StateHandle> {
+        Some(std::sync::Arc::new(crate::state::ClapState::new(self.proc.gui.clone()))
+            as choz_ports::StateHandle)
     }
 
     fn process_block(&mut self, buf: &mut [f32], _sample_rate: u32) {

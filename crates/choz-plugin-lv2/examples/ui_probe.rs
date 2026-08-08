@@ -1,5 +1,13 @@
 //! Open every installed LV2 X11 UI in a real window and report what happened.
 //! Run with a live DISPLAY: `cargo run -p choz-plugin-lv2 --example ui_probe`.
+//!
+//! The parent window is **created but not mapped** by default, so a full sweep
+//! does not throw hundreds of windows onto the user's session (this machine has
+//! no Xvfb). Embedded children are still created and still counted through
+//! `query_tree`, which is what the numbers here are. Pass `--mapped` for the
+//! higher-fidelity run: choz's real editor thread maps its window before handing
+//! over the XID, and a UI that draws into an unmapped parent could behave
+//! differently.
 
 use choz_ports::{AudioSource, FxProcessor};
 
@@ -22,7 +30,19 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .and_then(|n| n.parse().ok())
         .unwrap_or(0);
-    let only = args.first().filter(|a| *a != "--skip").cloned();
+    let mapped = args.iter().any(|a| a == "--mapped");
+    // `--limit N` stops after N UIs, so a sweep can be run in slices of fresh
+    // processes instead of one that loads hundreds of libraries without ever
+    // unloading them. (Measured: slicing changed none of the numbers here, so
+    // this run is not accumulating state — but it is cheap insurance and makes
+    // a crash cost one slice.)
+    let limit: usize = args
+        .iter()
+        .position(|a| a == "--limit")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(usize::MAX);
+    let only = args.first().filter(|a| !a.starts_with('-')).cloned();
     let mut seen = 0usize;
     let mut opened = 0;
     let mut no_ui = 0;
@@ -30,7 +50,7 @@ fn main() {
 
     // A throwaway X11 window to parent the UIs into.
     let (conn, screen_num) = x11rb::connect(None).expect("no DISPLAY");
-    let win = make_window(&conn, screen_num);
+    let win = make_window(&conn, screen_num, mapped);
 
     for e in std::fs::read_dir("/usr/lib/lv2").unwrap().flatten() {
         let p = e.path();
@@ -51,20 +71,30 @@ fn main() {
             if seen <= skip {
                 continue;
             }
+            if seen > skip + limit {
+                say(format!("LIMIT alcanzado en #{seen}"));
+                return;
+            }
             say(format!("try #{seen} {} [{}]", info.name, info.uri));
             // El plugin tiene que seguir vivo mientras se usa el editor: su Drop
             // vacía los controles compartidos.
             let instrument;
             let effect;
+            // Failing to *load* and having no editor are different answers, and
+            // lumping them together hid what LSP was actually doing.
+            let built;
             let editor = if info.is_instrument {
                 instrument = choz_plugin_lv2::Lv2Instrument::build(&p, &info.uri, 48_000, 256);
+                built = instrument.is_some();
                 instrument.as_ref().and_then(|i| i.editor())
             } else {
                 effect = choz_plugin_lv2::Lv2Effect::build(&p, &info.uri, 48_000, 256);
+                built = effect.is_some();
                 effect.as_ref().and_then(|i| i.editor())
             };
             let Some(ed) = editor else {
-                say(format!("NOEDITOR  {}", info.name));
+                let why = if built { "NOEDITOR" } else { "NOCARGA" };
+                say(format!("{why}  {}", info.name));
                 failed.push(info.name.clone());
                 continue;
             };
@@ -96,7 +126,7 @@ fn main() {
     }
 }
 
-fn make_window(conn: &impl x11rb::connection::Connection, screen_num: usize) -> u32 {
+fn make_window(conn: &impl x11rb::connection::Connection, screen_num: usize, mapped: bool) -> u32 {
     use x11rb::protocol::xproto::*;
     let screen = &conn.setup().roots[screen_num];
     let win = conn.generate_id().unwrap();
@@ -114,9 +144,11 @@ fn make_window(conn: &impl x11rb::connection::Connection, screen_num: usize) -> 
         &CreateWindowAux::new().event_mask(EventMask::EXPOSURE),
     )
     .unwrap();
-    // choz's real editor thread maps the window before handing the XID to the
-    // plugin; a UI that draws into an unmapped parent can fault.
-    conn.map_window(win).unwrap();
+    // Only on request: see the module comment. choz's real editor thread does
+    // map its window before handing the XID to the plugin.
+    if mapped {
+        conn.map_window(win).unwrap();
+    }
     conn.flush().unwrap();
     win
 }

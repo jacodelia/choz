@@ -208,6 +208,41 @@ impl OscSettings {
     }
 }
 
+/// What choz is being used as.
+///
+/// The two jobs are genuinely different and pull the routing in opposite
+/// directions, so they are a switch rather than a guess:
+///
+/// - **LIVE**: one instrument sounds at a time. Tabs are the songs or the
+///   patches of a set, and a controller's buttons (program changes) step
+///   through them. Several tabs can share one port — they are alternatives,
+///   not layers.
+/// - **MULTI**: every tab sounds at once, each answering its own **MIDI
+///   channel**, the way a sampler answers a DAW's orchestral template. This is
+///   the mode for driving choz from Reaper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum RackMode {
+    #[default]
+    Live,
+    Multi,
+}
+
+impl RackMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            RackMode::Live => "LIVE",
+            RackMode::Multi => "MULTI",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            RackMode::Live => RackMode::Multi,
+            RackMode::Multi => RackMode::Live,
+        }
+    }
+}
+
 /// How a background image fills the terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ImageFit {
@@ -290,6 +325,24 @@ pub struct UiSettings {
     /// the drawing code never reads it.
     #[serde(default)]
     pub theme_name: String,
+    /// How strongly the theme's panel colour is washed over a background image,
+    /// 0..100 %. A photo behind the UI is beautiful and unreadable; this is the
+    /// knob that trades one for the other.
+    ///
+    /// It is blended **into the image**, not drawn as a layer, because a
+    /// terminal cell background has no alpha: the only place a partial colour
+    /// can exist is in the picture itself.
+    #[serde(default = "default_tint")]
+    pub background_tint: u8,
+    /// Live rig or multi-timbral module. Saved, because it is a property of how
+    /// this machine is set up, not of a single session.
+    #[serde(default)]
+    pub rack_mode: RackMode,
+}
+
+/// Enough wash to read knobs and labels over a busy photo, without hiding it.
+fn default_tint() -> u8 {
+    45
 }
 
 impl Default for UiSettings {
@@ -302,11 +355,28 @@ impl Default for UiSettings {
             background: Background::default(),
             border_color: None,
             theme_name: THEMES[0].name.to_string(),
+            background_tint: default_tint(),
+            rack_mode: RackMode::default(),
         }
     }
 }
 
 impl UiSettings {
+    /// The colour washed over a background image, and how strongly (0..1).
+    ///
+    /// It is the active theme's desktop colour — the one the scheme already
+    /// uses behind everything — so a tinted photo reads as the same theme
+    /// rather than as a grey filter. Falls back to a neutral dark when the
+    /// scheme paints no desktop of its own.
+    pub fn tint(&self) -> ((u8, u8, u8), f32) {
+        let rgb = THEMES
+            .iter()
+            .find(|t| t.name == self.theme_name)
+            .and_then(|t| t.desktop)
+            .unwrap_or((16, 18, 24));
+        (rgb, self.background_tint.min(100) as f32 / 100.0)
+    }
+
     pub fn color(&self) -> Color {
         let (r, g, b) = self.text_color;
         Color::Rgb(r, g, b)

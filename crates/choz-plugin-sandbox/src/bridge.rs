@@ -51,7 +51,32 @@ pub struct Header {
     pub param_count: AtomicU32,
     pub param_index: [AtomicU32; MAX_PARAMS],
     pub param_value: [AtomicU32; MAX_PARAMS],
+
+    // ── The plugin's window ────────────────────────────────────────────────
+    //
+    // The whole reason a plugin runs in its own process is that it can die
+    // without taking choz with it — and a plugin's GUI is where third-party
+    // code crashes most (every guitarix UI segfaults on this machine). So the
+    // window is opened *by the child*, in the child's process, embedded into an
+    // X11 window choz created: X11 window ids are valid across processes, which
+    // is exactly what plugin bridges have always relied on.
+    /// Bumped by the host to ask for something; the child answers by copying it
+    /// into `editor_ack`.
+    pub editor_seq: AtomicU32,
+    /// What was asked: [`EDITOR_OPEN`] or [`EDITOR_CLOSE`].
+    pub editor_cmd: AtomicU32,
+    /// The X11 window the plugin should embed into.
+    pub editor_parent: AtomicU64,
+    /// Echo of `editor_seq` once the child has acted on it.
+    pub editor_ack: AtomicU32,
+    /// Size the plugin asked for, packed `width << 16 | height`. Zero when it
+    /// did not report one (or has no editor at all).
+    pub editor_size: AtomicU32,
 }
+
+/// `editor_cmd` values.
+pub const EDITOR_CLOSE: u32 = 0;
+pub const EDITOR_OPEN: u32 = 1;
 
 /// MIDI messages that fit in one block. Beyond this the newest are dropped —
 /// the host side is realtime and must not grow anything.
@@ -190,6 +215,44 @@ impl Host {
     }
 
     /// How many blocks the child has failed to answer in time.
+    /// A handle to just the window half of the region.
+    ///
+    /// The instance itself belongs to the audio thread; the `GUI` button is
+    /// pressed on the UI thread. They never touch the same fields — the window
+    /// requests are their own atomics — so this is a second view of the header
+    /// rather than a second host.
+    ///
+    /// # Safety
+    /// The caller must keep the shared mapping alive for as long as the link
+    /// exists (`SandboxedPlugin` holds the `Shm` in an `Arc` for this).
+    pub unsafe fn editor_link(&self) -> EditorLink {
+        EditorLink { header: self.region.header }
+    }
+
+    /// Ask the child to embed its plugin's window into `parent` (an X11 window
+    /// id), or to close it when `parent` is `None`.
+    ///
+    /// Returns the size the plugin asked for, if it reported one before the
+    /// deadline. Called from the UI thread, never from audio: it waits.
+    pub fn editor(&self, parent: Option<u64>, patience: Duration) -> Option<(u16, u16)> {
+        let h = self.region.header();
+        h.editor_size.store(0, Ordering::Relaxed);
+        h.editor_parent.store(parent.unwrap_or(0), Ordering::Relaxed);
+        h.editor_cmd.store(
+            if parent.is_some() { EDITOR_OPEN } else { EDITOR_CLOSE },
+            Ordering::Relaxed,
+        );
+        let seq = h.editor_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        // The child picks the request up between blocks, so the wait is on the
+        // order of one block — but a plugin building its UI can take much
+        // longer, hence the caller's patience.
+        if !wait_until(patience, || h.editor_ack.load(Ordering::Acquire) >= seq) {
+            return None;
+        }
+        let packed = h.editor_size.load(Ordering::Acquire);
+        (packed != 0).then_some(((packed >> 16) as u16, packed as u16))
+    }
+
     pub fn missed(&self) -> u64 {
         self.missed
     }
@@ -241,6 +304,30 @@ impl Sandbox {
     ///
     /// `patience` bounds the wait so a host that dies without saying so doesn't
     /// leave the child spinning forever.
+    /// A pending editor request, if the host made one since the last check.
+    ///
+    /// The child answers it on its own thread — opening a plugin's window can
+    /// take hundreds of milliseconds, and the audio rendezvous must not wait
+    /// for that. [`Self::editor_done`] reports back when it is finished.
+    pub fn editor_request(&self) -> Option<(u32, Option<u64>)> {
+        let h = self.region.header();
+        let seq = h.editor_seq.load(Ordering::Acquire);
+        if seq == h.editor_ack.load(Ordering::Acquire) {
+            return None;
+        }
+        let parent = h.editor_parent.load(Ordering::Relaxed);
+        let open = h.editor_cmd.load(Ordering::Relaxed) == EDITOR_OPEN;
+        Some((seq, (open && parent != 0).then_some(parent)))
+    }
+
+    /// Answer the request `seq`, with the size the plugin asked for.
+    pub fn editor_done(&self, seq: u32, size: Option<(u16, u16)>) {
+        let h = self.region.header();
+        let packed = size.map_or(0, |(w, hgt)| ((w as u32) << 16) | hgt as u32);
+        h.editor_size.store(packed, Ordering::Release);
+        h.editor_ack.store(seq, Ordering::Release);
+    }
+
     pub fn serve(
         &mut self,
         patience: Duration,
@@ -308,9 +395,87 @@ fn wait_until(deadline: Duration, ready: impl Fn() -> bool) -> bool {
     ready()
 }
 
+/// The window half of a live sandbox, usable from the UI thread.
+pub struct EditorLink {
+    header: *mut Header,
+}
+
+// SAFETY: only the editor atomics are touched through this, and atomics are
+// what they are for.
+unsafe impl Send for EditorLink {}
+unsafe impl Sync for EditorLink {}
+
+impl EditorLink {
+    /// Same contract as [`Host::editor`].
+    pub fn editor(&self, parent: Option<u64>, patience: Duration) -> Option<(u16, u16)> {
+        // SAFETY: the mapping outlives the link by construction.
+        let h = unsafe { &*self.header };
+        h.editor_size.store(0, Ordering::Relaxed);
+        h.editor_parent.store(parent.unwrap_or(0), Ordering::Relaxed);
+        h.editor_cmd.store(
+            if parent.is_some() { EDITOR_OPEN } else { EDITOR_CLOSE },
+            Ordering::Relaxed,
+        );
+        let seq = h.editor_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        if !wait_until(patience, || h.editor_ack.load(Ordering::Acquire) >= seq) {
+            return None;
+        }
+        let packed = h.editor_size.load(Ordering::Acquire);
+        (packed != 0).then_some(((packed >> 16) as u16, packed as u16))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The window handshake, in one process on a plain buffer: the host asks,
+    /// the child sees exactly one request, answers with a size, and the host
+    /// reads it back. Nothing here maps memory or spawns anything — which is
+    /// the point of keeping the protocol free of both.
+    #[test]
+    fn the_window_request_crosses_and_comes_back_with_a_size() {
+        let (frames, channels) = (64u32, 2u32);
+        let mut buf = vec![0u8; region_bytes(frames, channels)];
+        // SAFETY: one buffer, both ends, as the other protocol tests do.
+        let host = unsafe { Host::create(buf.as_mut_ptr(), frames, channels, 48_000) };
+        let child = unsafe { Sandbox::attach(buf.as_mut_ptr(), frames, channels) };
+
+        assert!(child.editor_request().is_none(), "nothing asked yet");
+
+        // The host asks from another thread — which is where the `GUI` button
+        // is pressed — while the child side stays here.
+        let link = unsafe { host.editor_link() };
+        let asked =
+            std::thread::spawn(move || link.editor(Some(0xBEEF), Duration::from_secs(2)));
+
+        // The child picks it up and answers.
+        let (seq, parent) = loop {
+            if let Some(req) = child.editor_request() {
+                break req;
+            }
+            std::thread::yield_now();
+        };
+        assert_eq!(parent, Some(0xBEEF), "the X11 window id crosses intact");
+        child.editor_done(seq, Some((640, 480)));
+        assert_eq!(asked.join().unwrap(), Some((640, 480)));
+
+        // Answered means answered: no second request appears out of nowhere.
+        assert!(child.editor_request().is_none());
+
+        // Closing is the same round trip with no parent.
+        let link2 = unsafe { host.editor_link() };
+        let closed = std::thread::spawn(move || link2.editor(None, Duration::from_secs(2)));
+        let (seq, parent) = loop {
+            if let Some(req) = child.editor_request() {
+                break req;
+            }
+            std::thread::yield_now();
+        };
+        assert_eq!(parent, None, "a close carries no window");
+        child.editor_done(seq, None);
+        assert_eq!(closed.join().unwrap(), None);
+    }
 
     /// Both ends in one process, on a plain buffer: the algorithm doesn't care
     /// where the bytes live, which is what makes it testable without a child.

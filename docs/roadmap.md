@@ -1,6 +1,6 @@
 # choz — Roadmap
 
-Estado y pasos para continuar. Última actualización: 2026-08-07.
+Estado y pasos para continuar. Última actualización: 2026-08-08 (sexies).
 Historial completo de cambios en [CHANGELOG.md](../CHANGELOG.md).
 
 ## Estado actual (lo que ya funciona)
@@ -17,9 +17,9 @@ Historial completo de cambios en [CHANGELOG.md](../CHANGELOG.md).
 - **UI**: menú superior (F10/mouse), RACK con tabs por source (`[`/`]` o click), FX por-slot editable, piano QWERTY, About con imagen (`ratatui-image`), log a `~/.local/state/choz/choz.log`. **Todos los modales** (source, ADD FX, salida, bank/preset, MIDI learn, browser, params del instrumento) usan el mismo widget `views/modal.rs`: barra de desplazamiento, chips de filtro, botones SELECT/CANCEL y rueda/click de ratón.
 - **Efectos de plugin en la cadena FX**: CLAP, LV2, LADSPA, DSSI, VST2 y VST3 implementan `FxProcessor` y conviven con los built-ins en ADD FX (chips por formato). Sus parámetros reales (nombres/rangos) salen de `choz_engine::read_plugin_params(format, path, id)`.
 - **Cache de scan multi-formato**: `<state dir>/plugins.json`; `r` en SYNTH fuerza rescan. En esta máquina: **1209 plugins** (611 efectos LV2 + 36 instrumentos LV2, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 instrumentos DSSI, 53 SFZ, 103 SF2). El escaneo corre **fuera de proceso** y la carga pasa por **cuarentena**, así que un plugin roto no se lleva la app.
-- **Ventana nativa del plugin** en VST2 (`effEditOpen`), LV2 (`ui:X11UI` sin suil) y CLAP (`clap.gui` + `clap.timer-support` del host). Botones `GUI` en el RACK. Falta VST3.
-- **Temas y fondo**: once esquemas tipo Notepad++ que fijan texto/marcos/escritorio juntos, y fondo de escritorio en color o imagen (mosaico o estirado), dibujado como color de celda para que funcione en cualquier terminal.
-- **Verificación**: `cargo build --workspace` limpio, **208 tests**, `clippy --workspace --all-targets -D warnings` = 0. Hay tests de runtime por formato (`choz-plugin-*/tests/*_runtime.rs`) contra los plugins instalados en la máquina; si no hay ninguno, se saltan. Los barridos completos (hostear *todos* los efectos instalados) están `#[ignore]`: `cargo test --release -p choz-plugin-lv2 -- --ignored`. CI en `.github/workflows/ci.yml`.
+- **Ventana nativa del plugin** en los cuatro formatos hosteados: VST2 (`effEditOpen`), LV2 (`ui:X11UI` sin suil), CLAP (`clap.gui` + `clap.timer-support` del host) y VST3 (`IPlugView` + `Steinberg::Linux::IRunLoop` implementado por el host). Botones `GUI` en el RACK.
+- **Temas y fondo**: once esquemas tipo Notepad++ que fijan texto/marcos/escritorio juntos, y fondo de escritorio en color o imagen (mosaico o estirado). En kitty (y ghostty/WezTerm) la imagen va por el **protocolo gráfico, a resolución real de píxel y por debajo de los fondos de celda**; en el resto de terminales, como color de celda en halfblocks.
+- **Verificación**: `cargo build --workspace` limpio, **236 tests**, `clippy --workspace --all-targets -D warnings` = 0. Hay tests de runtime por formato (`choz-plugin-*/tests/*_runtime.rs`) contra los plugins instalados en la máquina; si no hay ninguno, se saltan. Los barridos completos (hostear *todos* los efectos instalados) están `#[ignore]`: `cargo test --release -p choz-plugin-lv2 -- --ignored`. CI en `.github/workflows/ci.yml`.
 
 ## Modelo objetivo (flujo final pedido)
 
@@ -505,22 +505,218 @@ Hoy `LearnTarget` (`choz-ui/src/main.rs:248`) cubre `Gain`, `Pan`, `FxParam{slot
 - Cómo se arma el binding: seqterm usa **learn universal** — `Ctrl+L` aprende el parámetro que tenga el foco en la vista activa (`seqterm-ui/src/lib.rs:2505`), sin lista de destinos. En choz el equivalente es armar learn desde el modal `INSTRUMENT` con el cursor sobre la fila, además del picker de destinos que ya existe.
 - Con la ventana nativa abierta el foco lo tiene el plugin, no la TUI: para aprender "el knob que acabo de mover" haría falta escuchar los cambios de parámetro que el plugin reporta (CLAP los manda en el out-event stream, VST2 por `audioMasterAutomate`). Eso es el modo "toca el knob y luego manda el CC", y es lo que hace falta si se quiere mapear desde la GUI.
 
+### Sesión 2026-08-07 (ter) — la ventana de los plugins VST3
+
+Cierra el punto 1 de Pendiente: era el último formato hosteado sin ventana.
+
+- **`choz-plugin-vst3/src/editor.rs`**: `Vst3Editor` implementa `PluginEditor`, con la misma celda compartida que los otros tres formatos (`Arc<Mutex<Option<ViewCell>>>`, vaciada por el `Drop` de la instancia). La secuencia es `setFrame` → `attached(kPlatformTypeX11EmbedWindowID)` → `getSize`; el `GUI` del RACK y `EditorWindow` funcionan sin tocar `choz-ui`.
+- **Lo propio de VST3 en Linux es el run loop.** Un plugin VST3 no recibe idle: registra timers y descriptores en el `Steinberg::Linux::IRunLoop` que obtiene **consultando el `IPlugFrame` que le dio el host**. `HostFrame` es las dos cosas a la vez, y `PluginEditor::idle` es quien dispara los handlers (los fds pasan por `poll(2)` con timeout 0 antes de llamar `onFDIsSet`: un handler tiene derecho a bloquearse en un descriptor que el host declaró listo).
+- **La vista se crea al cargar el plugin**, no al pulsar el botón: el `IEditController` sólo es alcanzable en el hilo que construye la instancia, antes de que se la lleve el RT. Si el plugin no da vista o no soporta X11, no hay celda y por tanto no hay botón `GUI`.
+- **Tres cosas medidas, no adivinadas**:
+  1. **`ComPtr` sobre un handler del plugin lo libera al soltarse.** Cada tick le quitaba una referencia a un objeto ajeno; DPF lo cantó con `Host run loop did not give away timer (refcount -29)`. Se usa `ComRef`, que no toma posesión. Misma trampa acecha en cualquier callback que reciba un puntero COM prestado.
+  2. **`IHostApplication::createInstance` devolvía `kNotImplemented`.** Lo único que un plugin le pide al host es un `IMessage`: es el canal por el que su mitad UI habla con su mitad DSP. Sin él, toda UI de DPF abortaba con `assertion failure: "message != nullptr"` al abrirse. Ahora hay `HostMessage` + `HostAttributeList` (int/float/string UTF-16/binary) de verdad.
+  3. **`removed()` sobre una vista nunca enganchada es un assert duro en DPF.** El `Drop` de la instancia sólo suelta la vista; desengancha `close()`, que es lo que llama el hilo del editor al salir.
+- **`examples/gui_probe`**, con las dos lecciones de las sesiones anteriores incorporadas: el plugin sigue **vivo** mientras se usa su editor, y se cuentan los **hijos X11 reales** (`query_tree`), no los valores de retorno. Además la ventana padre **se crea sin mapear**, así que un barrido no llena el escritorio del usuario — esta máquina no tiene `Xvfb`.
+- **Resultado**: **20 de 21 VST3 instalados abren ventana real** con el tamaño que piden (Surge XT 911x890, los Zam, Pianoteq). El que no la abre es el bundle `arm-64bit` de Pianoteq, que en x86 tampoco carga.
+- 213 tests (dos nuevos, del run loop), clippy `--all-targets -D warnings` limpio.
+- **Sin verificar todavía**: pulsar `GUI` sobre un tab VST3 dentro de la TUI. El probe ejercita el mismo `PluginEditor` que `EditorWindow` conduce, y la captura del handle en el engine es la que ya usan VST2/LV2/CLAP, pero el flujo del botón no se ha visto con un VST3 cargado.
+
+### Sesión 2026-08-07 (quater) — la cuarentena ya no cree a la primera, y los modales tapaban el wallpaper con un agujero
+
+Puntos 3 y 5 de Pendiente.
+
+**Cuarentena (punto 3).** El problema estaba escrito pero sin arreglar: la sonda muestrea **una vez** un crash que es una carrera, y un `Ok` con suerte queda cacheado — el plugin no se sandboxea y cerrar esa tab puede tumbar la app.
+- Medido antes de tocar nada, 15 corridas del worker real sobre padthv1: **murió 14, salió limpio 1**. O sea ~7% de probabilidad de cachear el veredicto equivocado por plugin.
+- `check()` ahora sondea hasta `PROBE_RUNS = 3` veces y se queda con el **peor** veredicto (`Ok` < `CrashesOnTeardown` < `CrashesOnLoad`); corta en cuanto sale `CrashesOnLoad`, que ya es lo más estricto. Con el 7% medido, tres muestras dejan el fallo en ~0,03%.
+- Coste: se paga **una vez por plugin** (el veredicto se cachea) y solo la primera vez que se carga. Medido: 0,21 s por sonda con Surge XT, el instrumento más pesado instalado; 0,00 s con un efecto Zam. `CHOZ_PROBE_RUNS` lo ajusta.
+
+**Fondo de escritorio (punto 5).** Aquí lo interesante es que **la métrica anterior no medía lo que decía**.
+- Las "~212 secuencias SGR 49" son el **epílogo que ratatui emite al final de cada frame** (`ESC[39m ESC[49m ESC[59m ESC[0m ESC[?25l`): crecen con los fps, no con los defectos. Medido ahora: 54 en la fase de splash y 771 en 10 s de UI principal, y ninguna es un agujero.
+- Lo que sí mide es **inspeccionar el buffer**: test `nothing_punches_a_hole_in_the_desktop` (170x45, escritorio puesto, falla con una sola celda en `Color::Reset`), sobre pantalla normal, cajones abiertos, ADD FX, ABOUT y menú desplegado.
+- **Y encontró un defecto real**: los modales hacían `Clear` (que resetea celdas) y luego se dibujaban con `panel_style()`, que con escritorio **no fija fondo** — 612 celdas del color del terminal en medio del wallpaper. Arreglado con `theme::overlay_style()`, opaco siempre: un panel puede ser transparente, un modal no.
+- `UiRestore` (el guard de tests) también devuelve la bandera global de escritorio a su sitio.
+
+**Barrido de editores LV2 (punto 4)**: `examples/ui_probe` crea ahora su ventana padre **sin mapear** por defecto — así se puede barrer las ~340 UIs instaladas sin llenar la sesión del usuario (esta máquina no tiene Xvfb). `--mapped` reproduce la condición real de choz, que sí mapea antes de entregar el XID. Con la ventana padre sin mapear y en rebanadas de 40 (un proceso por rebanada), el barrido completo corre **sin un solo crash**, que es lo que nunca se había conseguido: **de 259 UIs declaradas, 254 abren ventana real, 0 abren sin crearla y 5 no llegan a instanciarse** (B.SEQuencer, MIDI Step Sequencer8x8 y los QMidiArp: no tienen salida de audio, así que choz no los hostea como efecto). Otros 388 plugins no declaran UI X11 en su TTL. **Y el barrido destapó un bug de verdad, que es lo que estaba escondido detrás de la cifra anterior** — ver la sesión (quinquies).
+
+- 218 tests, clippy `--all-targets -D warnings` limpio.
+
+### Sesión 2026-08-07 (quinquies) — el fondo a resolución real, y 135 plugins LV2 que se quedaban sin ventana
+
+Pedido: *"arregla la configuración del background image para que las imágenes se puedan ver en resolución real y no pixeleadas"*.
+
+- **`choz-ui/src/views/kitty_bg.rs`**: el wallpaper deja de pasar por halfblocks cuando el terminal habla el **protocolo gráfico de kitty**. La imagen se decodifica y escala **al tamaño real en píxeles de la ventana** (`crossterm::terminal::window_size`, con 8x16 de reserva), se transmite **una sola vez** en trozos de 4 KB y se coloca sobre toda la rejilla (`c`/`r`).
+- **La clave es el `z`, y no cualquier negativo sirve.** Cualquier `z < 0` deja la imagen debajo del *texto*, pero por debajo de **-1073741824** queda además debajo de los **fondos de celda**. Es el que hace falta: con `z=-1` la foto taparía cada panel y cada resaltado (que son fondos de celda) y la fila seleccionada perdería su color. Con `z=-2000000000` la imagen se ve exactamente donde nadie pintó fondo, que es lo que `theme::panel_style()` ya garantizaba desde la sesión anterior.
+- **No se usa `ratatui-image` para esto**: su backend de kitty coloca las imágenes con *placeholders Unicode escritos en el buffer de celdas*, así que el texto de encima las borra. Por eso el módulo habla el protocolo a mano — y por eso el comentario viejo de `background.rs` ("los protocolos gráficos no sirven para un fondo") era cierto sólo para esa forma de usarlos.
+- Detección por entorno (`KITTY_WINDOW_ID`, `TERM` con "kitty", ghostty, WezTerm) porque choz ya tiene el terminal en crudo y una consulta se colaría en la entrada; `CHOZ_KITTY_BG=0` vuelve a halfblocks, que sigue siendo el camino de todos los demás terminales. Al salir se borra la imagen: es del terminal, no del buffer, y no se va con la pantalla alternativa.
+- Verificado sobre la salida real: una única `a=T` con `s=1360,v=720,c=170,r=45,z=-2000000000,C=1` precedida de su borrado, y ninguna retransmisión por frame. **Falta verlo con los ojos en una kitty de verdad**, que es lo que el usuario tiene.
+
+**El bug que destapó el barrido de editores LV2** (punto 4 de Pendiente, ahora cerrado):
+
+- Primera corrida completa: 124 con ventana y **135 "sin editor"**, casi todos LSP. La primera hipótesis —que un proceso que carga cientos de UIs sin descargarlas se queda sin algo— **era falsa, y medirla la tiró**: barrer en rebanadas de 40 procesos frescos dio exactamente los mismos números, y `LSP Mixer x4 Mono` probado **solo** también fallaba.
+- Causa real: `descriptor_for` recorría `lv2ui_descriptor(0..64)`. **LSP publica un único binario de UI para sus ~390 plugins**, así que todo lo que caía tras el índice 64 no encontraba su descriptor y se quedaba sin ventana en silencio. Ahora el recorrido acaba donde el plugin dice (primer nulo), con un tope de 4096 sólo para que un binario roto no cuelgue choz.
+- Resultado tras el arreglo: **254 de 259 UIs abren ventana real, 0 crashes, 0 sin ventana**; las 5 restantes ni siquiera instancian (secuenciadores sin salida de audio, correctamente rechazados).
+- `ui_probe` ahora distingue **NOCARGA** de **NOEDITOR**. Mezclar "no instancia" con "no ofrece ventana" es lo que mantuvo el bug escondido durante dos sesiones. Test de regresión en `lv2_runtime.rs`: el **último** plugin LSP con UI declarada tiene que devolver editor (no abre ventana: eso necesita DISPLAY).
+
+### Sesión 2026-08-07 (sexies) — los knobs del plugin llegan al DSP, y el tinte de tema sobre el wallpaper
+
+Cuatro peticiones del usuario en una: tinte con opacidad sobre el fondo, los knobs de la GUI de Surge XT que no hacían nada, todos los parámetros editables y guardados, y MIDI learn desde la ventana del plugin.
+
+**1. "Muevo los knobs en la GUI del VST3 y no pasa nada."** Es el bug de la tanda, y la causa es estructural en VST3: la GUI vive en el **edit controller**, un objeto distinto del procesador. Mover un knob llama `IComponentHandler::performEdit` en el **host** — y si el host no lleva ese valor a `ProcessData.inputParameterChanges`, el knob se mueve en pantalla y el DSP nunca se entera. choz no daba handler y mandaba una lista vacía.
+  - `HostComponentHandler` recoge los `performEdit`; `HostParamChanges` deja de ser un stub y publica colas reales (una por parámetro que se mueve, agrupadas en un pool que no vuelve a alojar).
+  - Verificado con **Surge XT Effects VST3**: barrer su parámetro 0 cambia el audio renderizado (test de runtime, sin ventana).
+  - **Segundo bug encontrado en el mismo sitio**: los parámetros se leían por índice y se escribían como si el índice fuera el id. `getParameterInfo(index)` devuelve un `ParamID` **arbitrario**, y todas las llamadas de valor toman ese id — en Surge y en casi todo lo hecho con JUCE eso movía otro parámetro, o ninguno. Ahora se lee una vez la tabla índice→id.
+
+**2. Todos los parámetros editables y guardados.** `MAX_PLUGIN_PARAMS = 7` truncaba la lista **al construir la entrada de FX**, así que un parámetro más allá del séptimo no se podía tocar ni guardar en el proyecto. La constante desaparece: se guardan todos, y la rejilla de knobs ya se envolvía en filas y hacía scroll desde la sesión del 07-28 (ter), así que no había nada que capar.
+
+**3. MIDI learn dentro de la ventana del plugin.** Con la GUI nativa abierta el ratón es del plugin, no de la TUI, así que "aprende el knob que estoy tocando" sólo puede funcionar si el plugin dice cuál es.
+  - Puerto nuevo `choz_ports::ParamTouch` — `take_touched() -> Option<(índice, valor)>`, y leerlo lo consume, para que un gesto viejo no capture un CC que llega mucho después. Lo captura el engine en los mismos puntos que `editor()`/`sandbox()`.
+  - La traducción id→índice vive en el crate del formato (`TouchByIndex`), porque todo lo de arriba —knobs, targets de learn, proyectos guardados— direcciona por posición.
+  - `App::poll_plugin_touch` lo consulta cada vuelta, sólo para el plugin cuya ventana está abierta. Sirve para dos cosas: **MIDI learn** (learn armado + knob tocado = target elegido) y mantener los valores de choz —y por tanto el **proyecto guardado**— al día con lo que se hizo dentro de la GUI.
+  - Hoy lo reporta **VST3**. VST2 (`audioMasterAutomate`), CLAP (stream de eventos de salida) y LV2 (write callback de la UI) tienen su equivalente y quedan pendientes.
+
+**4. Tinte de tema sobre la imagen de fondo, con deslizador.** Un fondo de celda es **opaco**: "un panel translúcido sobre el wallpaper" no existe en un terminal. El único sitio donde puede vivir un color a medias es **dentro de la propia imagen**, así que el color de escritorio del tema se mezcla en los píxeles antes de dibujarlos — mismo `tint_rgba` para el camino halfblocks y para el gráfico de kitty, desde el mismo valor.
+  - Fila `Theme tint` en Settings → THEME con barra y porcentaje, `←/→` en pasos de 5 %. Sólo aparece con una imagen puesta. Al moverlo se tiran los dos cachés (la clave de ambos incluye el tinte), así que se ve al instante.
+  - Por defecto **45 %**: suficiente para leer knobs y etiquetas sobre una foto cargada sin que la foto desaparezca.
+  - **Lo que no se puede hacer así**: tintar cada panel por separado con su propio color. La imagen se transmite entera y una vez; teñir por rectángulo obligaría a retransmitirla en cada frame (megabytes), y con los fondos de celda no hay alfa. Si hace falta, la salida es dejar la imagen sin teñir y que los paneles pinten opaco.
+
+- 220 tests, clippy `--all-targets -D warnings` limpio.
+- **Sin ver a ojo**: el tinte y los knobs de Surge en la TUI real. El sonido sí está medido; la pantalla no.
+
+### Sesión 2026-08-07 (septies) — el deslizador sin lag, y paneles translúcidos con el color del tema
+
+Dos quejas del usuario que resultaron ser la misma decisión mal tomada.
+
+- **El lag**: el tinte se mezclaba dentro de la imagen, así que cada pulsación del deslizador (y cada cambio de FIT) pagaba **decodificar el JPEG + Lanczos3 + retransmitir megabytes** por el protocolo de kitty. La imagen no tenía por qué depender del tinte.
+- **El arreglo es también lo que el usuario pedía después**: el lavado se mueve a los **paneles**. `views::theme::wash(buf, rect)` mezcla el color de escritorio del tema con **lo que la foto muestra en esa celda**, a la opacidad elegida. Mover el deslizador es entonces un redibujado normal — nada se reconstruye — y cada cuadro se ve translúcido, con las letras legibles y el fondo visible.
+- **Cómo sabe un panel lo que hay detrás**: `background::cell_colors` reduce la imagen a **un color por celda** y ambos caminos lo publican (`theme::set_backdrop`). Bajo kitty esto no es una optimización sino la única vía: la imagen está *por debajo* de los fondos de celda y el buffer no la contiene.
+- **La decodificación se cachea aparte** (`decode_cached`, una entrada por ruta). Es el paso caro y no depende del tamaño, del fit ni del tema; sin eso, cambiar FIT seguía costando una decodificación entera.
+- Barras de menú y estado: lavado al 60 %, o dos franjas sólidas cruzarían la imagen.
+- El deslizador pasa a llamarse **`Panel opacity`**; el ajuste guardado sigue siendo `background_tint` en `ui.json`.
+- **Cerrojo de tests compartido**: `views::theme::ui_guard`. `has_desktop` y el backdrop son globales de proceso, y un test de `background` que no lo tomaba fallaba de vez en cuando contra el `UiRestore` de otro.
+- 222 tests, clippy limpio.
+
+### Sesión 2026-08-07 (octies) — el lavado no puede ser un fondo de celda
+
+Reporte del usuario tras la sesión anterior: *"se perdió la resolución de la imagen de background"*. Cierto, y la causa es la misma frase de siempre desde el otro lado: **un fondo de celda es opaco**. Lavar cada panel pintando fondos de celda tapa la imagen que dibuja el terminal y la reduce a un color por celda — la cuadrícula que el protocolo gráfico existía para evitar.
+
+- **kitty: el lavado es una segunda imagen.** Color del tema con canal alfa, colocada con `z` **una unidad por encima de la foto** y aún por debajo de los fondos de celda, así que el terminal compone foto + lavado y el texto se dibuja sobre ambos. La foto se transmite **una vez**; la máscara se re-manda sólo cuando cambian los rectángulos, el color o la opacidad.
+  - Máscara a **4 píxeles por celda** (680×180 contra 1360×720 de la foto): el terminal la escala, y a 1 píxel por celda la interpolación difuminaba el borde de un panel a lo ancho de una celda entera. Sigue siendo ~100× más pequeña que la foto, que es lo que mantiene instantáneo el deslizador.
+  - Los rectángulos los publica `ui()` en `App.wash_rects`; la máscara se manda en el bucle, un fotograma por detrás de la distribución (invisible) y sin recalcular ninguna disposición aparte — el error que el roadmap ya tenía anotado.
+- **halfblocks: mezclar los dos píxeles de la celda.** El `▀` lleva el píxel superior en `fg` y el inferior en `bg`; lavar sólo el fondo tiraba la mitad de la resolución vertical antes de que nada se dibujara encima. Ahora se mezclan los dos y el glifo se deja como está.
+- `theme::Backdrop` gana `graphics: bool`: con la imagen en manos del terminal, `wash` no toca ninguna celda.
+- **Trampa de tests repetida**: `CHOZ_KITTY_BG` es global del proceso y el harness paraleliza por función, así que los dos tests que lo tocaban se pisaban. Fusionados en uno, como ya hubo que hacer con `plugin_scan` y con los runtime de VST2/VST3.
+- 222 tests, clippy limpio. Verificado en la salida real: la foto sale **una** vez a 1360×720, la máscara **una** vez a 680×180, y la UI principal no emite un solo fondo de celda por encima.
+
+### Sesión 2026-08-07 (nonies) — MIDI learn desde la GUI del plugin: faltaban VST2 y LV2
+
+Reporte: *"el botón midi learn aún no afecta la gui de los plugin… traté de asignar el volumen de TyrellN6 con el Keystation sin resultados"*. El mecanismo estaba, pero **sólo VST3 reportaba lo que el usuario tocaba**, y **TyrellN6 es VST2**: no llegaba nada que aprender.
+
+- **VST2**: los movimientos de la GUI llegan por `audioMasterAutomate`. El problema de fondo es que el callback del host en VST2 es un **puntero a función sin contexto**: lo único que identifica al emisor es el `AEffect`. Así que los feeds viven en una tabla indexada por ese puntero, dada de alta al construir la instancia y **borrada en su `Drop`** — otro plugin puede aterrizar en la misma dirección más tarde.
+- **LV2**: la UI ya escribía por el callback del host (es la única forma que tiene de mover un control), así que sólo hubo que anotar el puerto y el valor. `Lv2Touch` traduce **puerto → índice de parámetro** y el valor plano a 0..1: la UI de LV2 habla de puertos y unidades propias, choz de posiciones normalizadas.
+- **Falta CLAP**: reporta los cambios en el stream de eventos de salida del `process`, que corre en el hilo de audio — es el único de los cuatro que exige tocar el camino RT.
+- **Medido con TyrellN6 de verdad** (`CHOZ_VST2_DIR=/ruta cargo test -p choz-plugin-vst2`): carga, expone parámetros, ofrece el feed, y **barrer sus parámetros desde choz cambia el sonido**, que es exactamente lo que hará el CC una vez asignado. La variable de entorno existe porque los directorios estándar de esta máquina sólo tienen efectos Zam; sin ella el test se salta esa mitad y CI sigue verde.
+- Tests nuevos: el callback de VST2 sin plugin (llega al feed correcto, leerlo lo consume, una instancia muerta no cruza feeds) y la cadena entera en la UI (knob tocado → learn elige → CC liga → CC mueve; con learn desarmado sólo se actualiza el valor).
+
+**Cómo se usa**: abrir la ventana del plugin con `GUI`, pulsar `MIDI LEARN`, mover el knob **dentro de la ventana del plugin** y luego el fader del controlador. El banner del panel INPUTS lo dice mientras está armado.
+
+### Sesión 2026-08-08 — CLAP cierra `ParamTouch`, y el patch del plugin entra en el proyecto
+
+- **`ParamTouch` en CLAP** (los cuatro formatos con ventana lo tienen ya, instrumentos y efectos). CLAP no tiene callback de host para esto: el plugin empuja eventos `param_value` en el **stream de salida de `process`**, o sea en el **hilo de audio**. Por eso se lee con `try_lock` y se descarta bajo contención — perder un evento de un barrido de knob no se nota, bloquear el hilo de audio sí.
+- **Bug que sólo se ve al juntar los cuatro**: la UI buscaba el parámetro tocado **por id** cuando cada host ya traduce a **índice**. Con VST3 pasaba desapercibido (sus ids arrancan en 0..n); un id de CLAP o un puerto LV2 son arbitrarios y el knob no se habría encontrado nunca. El test usa ids que a propósito no son posiciones.
+- **Punto 3 de Pendiente, cerrado para tres formatos: el estado del plugin.** `choz_ports::PluginState` (`save`/`restore`), capturado por el engine donde se capturan el editor y el feed — el único momento en que la UI puede alcanzar al plugin antes de que se lo lleve el hilo RT.
+  - **VST2**: chunks (`effGetChunk` devuelve un puntero que es del plugin; se copia antes de soltarlo). **VST3**: `IComponent::getState` sobre el `MemStream` que ya existía, y el `setComponentState` del controller aparte, o su ventana mostraría el patch viejo. **CLAP**: `clap.state`, con los dos callbacks de stream escritos a mano.
+  - **El orden importa al reconstruir un rack**: primero el patch, después los valores de los knobs. Restaurar el estado mueve todos los parámetros, así que al revés la pestaña sonaría al patch guardado y se vería con los knobs guardados.
+  - Se guarda como **base64 en el YAML** (`instrument.state` y el `state` de cada FX): un proyecto sigue siendo un archivo legible y un patch son unos pocos kilobytes.
+  - Un patch cuyo plugin no está en esta máquina **se conserva**: borrarlo convertiría un plugin que falta en un sonido perdido la próxima vez que se guarde.
+  - **Falta LV2**: su extensión `state` necesita además las features de mapeo de rutas.
+- Verificado con plugins reales: un VST3 (mover parámetro → guardar → instancia nueva → mismo blob) y TyrellN6 en VST2 (mismo viaje con su chunk), más el viaje completo por el YAML en la UI.
+- 228 tests, clippy limpio.
+
+### Sesión 2026-08-08 (bis) — el estado de los plugins LV2
+
+Cierra el punto 3 de Pendiente: VST2, VST3, CLAP y ahora LV2 guardan su patch en el proyecto.
+
+- **LV2 no entrega un blob.** El plugin llama de vuelta una vez por propiedad, con un **URID** de clave y otro de tipo. Y un URID **sólo significa algo dentro de una ejecución**: los números los reparte el mapa de este host. Así que lo que se escribe son las **URIs**, resueltas por el mismo store que acuñó los números (`UridStore::uri`), y vueltas a mapear al restaurar.
+- **Formato del blob**: plano y autodescriptivo — `[count]` y luego, por propiedad, clave / tipo / flags / valor con sus longitudes. Nada en él depende del proceso que lo escribió. Un archivo truncado o de otro sitio se rechaza **entero**, en vez de entregarle media propiedad al plugin.
+- Los valores devueltos durante `restore` se aparcan en el mismo `Bag`: el puntero que recibe el plugin tiene que seguir vivo durante toda la llamada.
+- **Lo que no se implementa**: `state:mapPath` (para plugins que guardan rutas de archivos) ni `state:threadSafeRestore`. Un plugin que exija el primero fallará al guardar y choz lo tratará como "sin estado"; el segundo es un apretón de manos que choz no hace — se restaura entre bloques, como con el editor.
+- Medido con los plugins instalados: **3 LV2 guardan y recuperan su estado** a través de una instancia nueva, byte a byte.
+- 230 tests, clippy limpio.
+
+### Sesión 2026-08-08 (ter) — los knobs genéricos del plugin en el RACK
+
+Pedido: *"Carla, al abrir un plugin, muestra knobs y sliders y el engranaje abre la GUI; poné esos knobs sobre FX CHAIN para asignar MIDI sin abrir la ventana"*.
+
+- **Caja `INSTRUMENT` en el panel RACK**, encima de `FX CHAIN`: los parámetros del plugin de la pestaña como knobs, con su nombre y su valor. El botón `GUI` sigue donde estaba — la ventana real es una opción, no el único camino.
+- **Es sobre todo un atajo de MIDI learn**: `learn_target_at` reconoce los rects de esos knobs, así que `MIDI LEARN` → clic en el knob → mover el fader liga el CC **sin abrir la ventana del plugin**, que en un sinte grande es la parte lenta.
+- `k` pasa el cursor de una caja a la otra; las flechas y `w`/`s` actúan sobre la enfocada, y el título muestra `[k]` cuando no lo está. Clic selecciona, rueda gira.
+- **Una sola función dibuja las dos cajas** (`draw_knob_box`): el bloque que dibujaba los knobs del FX se extrajo tal cual, así que ambas heredan el envoltorio en filas y el scroll que sigue al cursor que ya existían. La del instrumento se limita a `INSTR_KNOB_ROWS = 2` filas para no comerse la cadena; el resto se alcanza con el cursor.
+- Test: con una pestaña de plugin y dos parámetros, el render real dibuja sus nombres, deja un rect clicable por knob, el clic mueve el foco y el cursor, `w` gira **ese** knob (no uno del FX) y el puntero de learn devuelve `InstrParam`.
+- **Sin ver a ojo**: la caja con un plugin de verdad cargado en la TUI. El render está cubierto por test y los nombres/valores salen de `read_params`, que sí está medido contra plugins reales.
+- 231 tests, clippy limpio.
+
+### Sesión 2026-08-08 (quater) — la nota congelada y el botón PANIC
+
+Reporte: *"abrí un LV2 e-piano y TyrellN6 en otra pestaña, ambas funcionan, pero TyrellN6 se quedó congelado sonando una nota"*.
+
+- **Causa**: el ruteo de notas se resuelve **por evento** y depende de la pestaña activa — el piano QWERTY toca siempre la activa (`note_targets` lo dice explícitamente), y varias pestañas sobre un mismo puerto MIDI se turnan. Soltar la nota después de cambiar de pestaña mandaba el note-off al **otro** instrumento y dejaba el primero sonando. No es un fallo del plugin.
+- **Arreglo**: `App.sounding` recuerda a qué slots fue cada note-on (`start_note`) y el note-off vuelve a esos mismos (`end_note`); lo que choz nunca vio empezar cae en el ruteo actual, como antes. Vale para el piano QWERTY (incluida su auto-suelta por tiempo) y para el MIDI real.
+- **Botón `PANIC`** en TRANSPORT, tecla `P` global (y `p` con TRANSPORT enfocado):
+  - `EngineCommand::Panic` recorre los slots y manda **un note-off real por cada nota pisada** — el engine lleva un `u128` por slot — y después el `all notes off` general. Los note-offs exactos son lo único que funciona en todos los formatos: `all notes off` es un **CC**, y un VST3 no ve los CC como eventos.
+  - **Un solo comando para todo el rack**, no una ráfaga: llenar el anillo a medias dejaría el último slot sonando, justo lo que el botón existe para evitar.
+  - `AudioSource::all_notes_off()` por defecto = CC 120 + CC 123; SF2 usa `AllSoundOff` de oxisynth (corta las colas), SFZ suelta sus voces.
+  - Cambiar el instrumento de un slot pone su máscara a cero: el nuevo no hereda notas del anterior.
+- **Trampa de tests, otra vez**: añadir un test de runtime CLAP puso dos funciones a cargar plugins de u-he en paralelo y el binario se caía. Mutex de archivo, como en LV2 (VST2/VST3 lo resolvieron fusionando funciones; el mutex conserva los nombres).
+- 233 tests, clippy limpio.
+
+### Sesión 2026-08-08 (quinquies) — LIVE / MULTI
+
+Pedido: *"un switch en la esquina superior derecha para ejecutar choz para un instrumento o para muchas entradas MIDI"* — tocar en vivo cambiando de pestaña con los botones del teclado, o ser un módulo multitímbrico tipo Kontakt para una plantilla orquestal en Reaper.
+
+- Son dos oficios que tiran del ruteo en direcciones opuestas, así que es un **switch**, no una heurística: `settings::RackMode::{Live, Multi}`, guardado en `ui.json`.
+  - **LIVE**: suena una pestaña; varias sobre un puerto son alternativas. **Un program change sin asignar selecciona pestaña** (PC 0 = tab 1) — lo que hace un rig en vivo. Una asignación de MIDI learn gana, para no pisar a quien ya mapeó ese botón.
+  - **MULTI**: todas suenan a la vez, cada una por **su canal MIDI**. Qué pestaña esté activa no interviene.
+- **El canal MIDI ya no se tira.** `parse` lo sacaba del status byte y lo descartaba; ahora viaja en `NoteMsg`/`CcMsg` hasta el ruteo. Sin eso, el modo MULTI no era implementable.
+- **Switch en la barra de menú, pegado a la derecha** (`UiLayout.mode_switch_rect`), clic o `F4`. `App::targets_for(source, channel)` es el único punto que consulta el modo; `note_targets` (LIVE) y `multi_targets` (MULTI) siguen siendo funciones puras con tests.
+- **Cambiar de modo o de canal hace panic primero**: los dos ruteos mandan las notas a pestañas distintas, así que lo que estuviera sonando nunca recibiría su note-off. Es la misma trampa que dejaba notas colgadas al cambiar de pestaña, ahora prevista.
+- Pestañas nuevas en canales consecutivos (1, 2, 3…), botón `CH n` en la línea INSTR solo en MULTI, y el canal va al proyecto con `#[serde(default)]` para los archivos viejos.
+- 235 tests, clippy limpio.
+
+### Sesión 2026-08-08 (sexies) — la ventana del plugin dentro del sandbox
+
+Punto 1 de Pendiente, y la razón por la que el sandbox existe: la GUI es donde más revienta el código de terceros — **las 31 UIs de guitarix segfaultean en esta máquina** — y hasta ahora un editor que caía se llevaba choz.
+
+- **La ventana la abre el hijo, en su proceso.** El transporte gana un canal de control (`editor_seq`/`editor_cmd`/`editor_parent`/`editor_ack`/`editor_size`), mismo estilo de atómicas que el audio.
+- **El XID cruza el proceso**: un identificador de ventana X11 vale en todo el display. choz crea la ventana (título, botón de cierre del WM, tamaño) y el hijo empotra la del plugin dentro — lo que hacen los puentes de plugins desde siempre. No hace falta un protocolo de dibujo.
+- **En el hijo, la ventana tiene su propio hilo.** Abrir la GUI de un sinte grande tarda cientos de milisegundos; el rendezvous de audio no puede esperar a un toolkit. El hilo hace `open`, manda el tamaño por un canal, y luego bombea `idle` cada 30 ms. El bucle de audio sólo mira si hay petición entre bloques.
+- **`SandboxEditor` es un `PluginEditor` como cualquier otro**, así que el botón `GUI` y `EditorWindow` no se enteran. Su `idle` está vacío a propósito: el toolkit sólo se puede tocar desde el hilo del hijo.
+- `Shm` pasa a ser `Arc` y `Sync`: el mango de la ventana lo tiene el hilo de UI y tiene que mantener viva la misma zona compartida.
+- **Lo que queda de este punto**: (1) ofrecer de nuevo los editores de la deny-list (guitarix) **cuando el plugin va sandboxeado** — el mecanismo ya está, falta la política; (2) un plugin sandboxeado sin ventana abre un marco vacío, porque el host no puede saber si la tiene sin preguntarle al hijo, y al capturar el mango el hijo aún está cargando.
+- Tests: el apretón de manos entero sobre un `Vec<u8>` (sin mapear nada ni lanzar procesos) y, con un plugin real en su proceso, que la petición cruza sin que el audio pierda un solo bloque.
+- 236 tests, clippy limpio.
+
 ## Pendiente (en orden de ROI)
 
 Lo hecho vive en las secciones de sesión de arriba; aquí sólo queda lo que falta.
 
-1. **Editor nativo de VST3** — `IPlugView`, sin empezar. Es el único formato hosteado que sigue sin ventana; VST2 (08-03), LV2 (08-06 ter) y CLAP (08-07) ya la tienen.
-   - **Editores en el sandbox**: hoy un editor que revienta se lleva la app, y guitarix revienta siempre. El transporte de `choz-plugin-sandbox` ya existe para DSP; llevar ahí la ventana convertiría la deny-list en innecesaria y cubriría a los desconocidos, que es lo que la cuarentena hace con el hosting.
+1. **Política del editor sandboxeado**: el mecanismo está (08-08 sexies), falta usarlo. (a) Ofrecer los editores que hoy están en la deny-list — guitarix — **cuando el plugin corre sandboxeado**, que es justo lo que el aislamiento hace seguro. (b) Un plugin sandboxeado sin ventana abre un marco vacío: el hijo tendría que publicar "tengo editor" al arrancar y el host esperarlo.
 2. **Mirar con audio real** el modal INSTRUMENT: Surge XT (CLAP), Yoshimi (LV2), WhySynth/hexter (DSSI) y los VST2 nuevos (TyrellN6, TripleCheese).
-3. **La cuarentena muestrea una sola vez un crash que es una carrera.** Medido: `check(padthv1)` devuelve `CrashesOnTeardown` unas dos de cada tres corridas y `Ok` la otra — el segfault es una carrera entre el hilo Qt del plugin y `cleanup`, y el hijo a veces la gana. `LEAKY_URIS` arranca vacía en cada hijo, así que la instancia se destruye siempre: **el no-determinismo es del plugin, no de la sonda**. Consecuencia real, no sólo de test: si la sonda cae en el lado bueno, el veredicto `Ok` queda cacheado, choz no sandboxea el plugin y soltar esa tab puede tumbar la app. Salidas posibles: repetir la sonda N veces y quedarse con el peor veredicto, o tratar `Ok` como provisional y re-sondear si el proceso muere.
-4. **Terminar el barrido de editores LV2.** Quedó a medias: de ~340 UIs se probaron 98 con el probe ya corregido (91 con ventana real, 1 que abre sin crear ventana, 4 sin editor). Falta el resto para tener la cifra completa y saber si el "1 sin ventana" es un caso aislado o un patrón.
-   - **Correr los probes en un display aparte**: `Xvfb :99 -screen 0 1280x800x24 &` y `DISPLAY=:99 cargo run -p choz-plugin-lv2 --example ui_probe`. Abren una ventana por plugin, y sobre la sesión del usuario eso es intolerable — en esta sesión un barrido quedó colgado en segundo plano abriendo ventanas mucho después de terminar el trabajo.
-5. **Quedan zonas que aún resetean el fondo.** Con el wallpaper puesto, la TUI real emite todavía ~212 secuencias SGR 49: el splash (deliberado) y algún widget suelto que fija `bg`. No rompe nada, pero deja recuadros del color del terminal sobre la imagen. Buscarlos con `grep -rn 'bg(' crates/choz-ui/src` y pasarlos a `theme::panel_style()`.
-6. Nice-to-have: paginar knobs de FX cuando el plugin tiene más de 7 params; ruteo por canal MIDI dentro de un puerto; automatización.
+3. **`state:mapPath` para LV2**: un plugin que guarde rutas de archivos (samplers) no puede guardar su estado hoy. Necesita las dos funciones de mapeo de rutas y devolver cadenas que el plugin libera con `free`.
+4. **Mirar el fondo de kitty con los ojos**: la secuencia emitida está verificada byte a byte, pero nadie ha visto todavía la imagen bajo la TUI en una kitty real. Y probar `--mapped` en `ui_probe` alguna vez: el barrido limpio se hizo con la ventana padre sin mapear.
+5. Nice-to-have: ruteo por canal MIDI dentro de un puerto; automatización.
 
 ## Notas / gotchas para el que retome
 
 - **Los probes de editores abren ventanas de verdad.** `examples/ui_probe` (LV2) y `examples/gui_probe` (CLAP) instancian plugins y abren su GUI: usar `Xvfb` (ver Pendiente 4) y **matarlos al terminar**. `sweep.sh` reanuda tras cada segfault por diseño, así que colgado sigue insistiendo indefinidamente. Ningún test abre ventanas, y así debe seguir — `vst2_runtime.rs` lo dice explícitamente donde toca un editor.
+- **En VST3, la GUI no habla con el procesador.** El edit controller reporta al host (`IComponentHandler::performEdit`) y es el host quien lleva el valor al procesador por `inputParameterChanges`. Un host que no lo hace tiene knobs que se mueven sin sonar. Lo mismo con los ids: `getParameterInfo` toma un **índice** y devuelve un **id arbitrario**; confundirlos mueve otro parámetro.
+- **Un valor que no se guarda tampoco se puede editar.** El cap de 7 parámetros truncaba la lista *al construirla*, no sólo al dibujarla: lo que no está en el `Vec` no viaja al proyecto.
+- **Una nota-off tiene que ir a donde fue su nota-on.** El ruteo depende de la pestaña activa, así que resolverlo dos veces (una al pulsar, otra al soltar) deja notas colgadas en cuanto el usuario cambia de tab. `App.sounding` es la memoria; `PANIC` es la salida de emergencia.
+- **Un fondo de celda es opaco, y va por encima de la imagen del protocolo gráfico.** De ahí las dos reglas: en halfblocks la transparencia se mezcla en las celdas (fg *y* bg, o se pierde la mitad de la resolución); bajo kitty **no se tocan las celdas** y el lavado es una segunda imagen con alfa.
+- **Un binario de plugin puede publicar cientos de descriptores.** LSP tiene ~390 UIs en un `.so`. Cualquier bucle `for i in 0..N` sobre `lv2_descriptor`/`lv2ui_descriptor` con N fijo miente en silencio: se recorre hasta el primer nulo, y el tope existe sólo contra un binario roto.
+- **"No carga" y "no tiene ventana" son respuestas distintas.** Un probe que las imprime igual esconde bugs: dos sesiones creyendo que LSP no ofrecía editores cuando en realidad no las estábamos encontrando.
+- **La primera explicación de una medición rara suele ser falsa.** "Un proceso que abre cientos de UIs se queda sin recursos" sonaba bien; barrer en rebanadas de procesos frescos dio los mismos números y la tiró en cinco minutos. Medir la hipótesis cuesta menos que escribirla en el roadmap como si fuera un hecho.
+- **El fondo por protocolo gráfico depende del `z`**: por debajo de -1073741824 la imagen queda bajo los fondos de celda (lo que choz quiere); con `z=-1` taparía paneles y resaltados. Y `ratatui-image` no vale para esto: coloca por placeholders Unicode, que el texto de encima borra.
+- **Un puntero COM prestado no se envuelve en `ComPtr`.** `ComPtr` libera al soltarse, así que cada uso le quita una referencia a un objeto que es del plugin (VST3: los handlers del run loop). Para eso está `ComRef`. Vale para cualquier callback que reciba punteros ajenos.
 - **Un probe que consume el objeto bajo prueba mide otra cosa.** `.and_then(|i| i.editor())` dropea el plugin antes de usar el editor, y el `Drop` vacía la celda compartida: las llamadas salen por la rama "instancia muerta" sin decir nada. Costó una conclusión equivocada entera sobre CLAP.
 - **stdout a un archivo va en bloques.** Un resultado "impreso" pero no volcado se pierde si el proceso siguiente segfaultea. `ui_probe::say()` imprime y hace flush; sin eso una corrida perdió 74 resultados y el total pareció limpio.
 - **El fondo se dibuja antes que nada en `ui()`**, y depende de que los widgets no fijen `bg`. Cualquier panel nuevo debe usar `theme::panel_style()`, no una constante de color ni `Color::Reset`, o abrirá un agujero opaco en el wallpaper.
@@ -557,4 +753,6 @@ tail -f ~/.local/state/choz/choz.log    # ver errores/log en vivo
 Xvfb :99 -screen 0 1280x800x24 &
 DISPLAY=:99 cargo run -p choz-plugin-lv2  --example ui_probe
 DISPLAY=:99 cargo run -p choz-plugin-clap --example gui_probe
+# El de VST3 crea su ventana padre SIN mapear, así que no ensucia el escritorio.
+cargo run -p choz-plugin-vst3 --example gui_probe
 ```

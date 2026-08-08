@@ -53,6 +53,18 @@ pub trait FxProcessor: Send {
         None
     }
 
+    /// Parameters the user moves inside the plugin's own window, when the
+    /// format can report them. Captured at the same moment as [`Self::editor`].
+    fn param_touch(&self) -> Option<TouchHandle> {
+        None
+    }
+
+    /// The plugin's opaque state, for projects that must reopen sounding the
+    /// same. Captured at the same moment as [`Self::editor`].
+    fn state(&self) -> Option<StateHandle> {
+        None
+    }
+
     /// Live counters when this processor is a plugin running in its own
     /// process. Taken once, next to [`FxProcessor::editor`]. Default `None`:
     /// everything else runs in choz's own process.
@@ -82,6 +94,21 @@ pub trait AudioSource: Send {
     /// thread, so implementations must not allocate or block.
     fn control_change(&mut self, _cc: u8, _value: u8) {}
 
+    /// Stop every note this source is playing, right now — the panic button.
+    ///
+    /// The default is the two MIDI messages every synth understands: `all
+    /// sound off` (CC 120) and `all notes off` (CC 123). A source that can do
+    /// better (a sampler that owns its voices, a SoundFont engine with its own
+    /// reset) should override this: a plugin that ignores the CCs is exactly
+    /// the case the button exists for.
+    ///
+    /// Called from the audio thread, so it must not allocate: the two messages
+    /// go through the same queues a note does.
+    fn all_notes_off(&mut self) {
+        self.control_change(120, 0);
+        self.control_change(123, 0);
+    }
+
     /// MIDI pitch bend, as the raw 14-bit wire value: 0..16383, centred at
     /// 8192. Default no-op. RT thread, same constraints as `control_change`.
     fn pitch_bend(&mut self, _value: u16) {}
@@ -107,6 +134,18 @@ pub trait AudioSource: Send {
     /// the source moves to the RT thread. Default `None`: built-in sources have
     /// no native editor.
     fn editor(&self) -> Option<EditorHandle> {
+        None
+    }
+
+    /// Parameters the user moves inside the plugin's own window, when the
+    /// format can report them. Captured at the same moment as [`Self::editor`].
+    fn param_touch(&self) -> Option<TouchHandle> {
+        None
+    }
+
+    /// The plugin's opaque state, for projects that must reopen sounding the
+    /// same. Captured at the same moment as [`Self::editor`].
+    fn state(&self) -> Option<StateHandle> {
         None
     }
 
@@ -164,6 +203,49 @@ pub trait PluginEditor: Send + Sync {
 }
 
 pub type EditorHandle = std::sync::Arc<dyn PluginEditor>;
+
+/// What the plugin's own window reports back: the parameter the user just
+/// grabbed in it.
+///
+/// The point is MIDI learn. With the native editor open the keyboard and mouse
+/// belong to the plugin, not to the TUI, so "bind the control I am touching"
+/// can only work if the plugin says which one that is. Every format has a way
+/// of telling the host (VST3 `IComponentHandler::performEdit`, VST2
+/// `audioMasterAutomate`, CLAP's output event stream, an LV2 UI's write
+/// callback); this is the one shape choz reads them through.
+pub trait ParamTouch: Send + Sync {
+    /// The last parameter the user moved and its new normalised value, or
+    /// `None`. **Reading clears it**, so an old gesture cannot capture a CC
+    /// that arrives much later — and the value is what lets choz keep its own
+    /// knobs (and the saved project) in step with edits made in the plugin's
+    /// window.
+    fn take_touched(&self) -> Option<(u32, f32)>;
+}
+
+pub type TouchHandle = std::sync::Arc<dyn ParamTouch>;
+
+/// A plugin's own opaque state — everything about its sound that is **not** a
+/// parameter value.
+///
+/// Saving the parameter list is not enough: a patch picked in the plugin's
+/// browser, an internal preset, a wavetable, a sample path… none of those are
+/// automatable parameters, and all of them vanish when the tab is rebuilt.
+/// Every format has a blob for exactly this (VST2 chunks, VST3
+/// `IComponent::getState`, `clap.state`), and this is the one shape choz stores
+/// it in.
+///
+/// The handle is captured where [`PluginEditor`] is, and reaches the plugin
+/// through the same shared cell — so it stops working, quietly, once the
+/// instance is gone.
+pub trait PluginState: Send + Sync {
+    /// The plugin's state, or `None` when it has none to give.
+    fn save(&self) -> Option<Vec<u8>>;
+
+    /// Restore a blob produced by [`Self::save`] on this same plugin.
+    fn restore(&self, data: &[u8]);
+}
+
+pub type StateHandle = std::sync::Arc<dyn PluginState>;
 
 // ─── Hosted plugins ─────────────────────────────────────────────────────────
 

@@ -232,4 +232,56 @@ fn x11_editors_are_discovered_and_the_crashing_families_are_not_offered() {
     // And the discovery is not vacuously passing: this machine has plenty.
     let with_ui = all.iter().filter(|p| p.x11_ui.is_some()).count();
     eprintln!("{with_ui} of {} installed LV2 plugins ship an X11 UI", all.len());
+
+    // A bundle that ships ONE UI binary for hundreds of plugins is where an
+    // index cap bites: the editor lookup walks `lv2ui_descriptor(0..)`, and a
+    // plugin sitting past the cap silently got no editor at all. LSP has ~390
+    // of them, so the last one is the regression test. No window is opened —
+    // that needs a DISPLAY, which CI has not got — only the handle is asked for.
+    if let Some(last_lsp) = all.iter().rfind(|p| {
+        p.uri.starts_with("http://lsp-plug.in/plugins/lv2/") && p.x11_ui.is_some()
+    })
+    {
+        let fx = choz_plugin_lv2::Lv2Effect::build(&last_lsp.bundle_dir, &last_lsp.uri, 48_000, 256);
+        let editor = fx.as_ref().and_then(|f| f.editor());
+        assert!(
+            editor.is_some(),
+            "{} declares an X11 UI but got no editor handle",
+            last_lsp.name
+        );
+    }
+}
+
+/// The plugin's own state, which is what a project has to carry beyond the
+/// knob values. Not every LV2 has a `state#interface` — most simple effects
+/// have nothing to say — so the check is over whichever installed plugins do,
+/// and it asserts the blob survives a trip through a fresh instance.
+#[test]
+fn plugins_with_a_state_interface_round_trip_their_patch() {
+    let _guard = plugin_lock();
+    let all = installed();
+    if all.is_empty() {
+        eprintln!("no LV2 plugins installed; skipping");
+        return;
+    }
+
+    let mut tried = 0;
+    for p in all.iter().filter(|p| p.is_effect) {
+        let Some(fx) = Lv2Effect::build(&p.bundle_dir, &p.uri, 48_000, 256) else { continue };
+        let Some(state) = fx.state() else { continue };
+        let Some(blob) = state.save() else { continue }; // no state:interface
+        assert!(!blob.is_empty());
+        drop(fx);
+
+        let Some(fresh) = Lv2Effect::build(&p.bundle_dir, &p.uri, 48_000, 256) else { continue };
+        let restored = fresh.state().expect("same plugin, same capability");
+        restored.restore(&blob);
+        let again = restored.save().expect("state readable after restoring it");
+        assert_eq!(again, blob, "{}: the patch did not survive the round trip", p.name);
+        tried += 1;
+        if tried == 3 {
+            break;
+        }
+    }
+    eprintln!("{tried} LV2 plugin(s) round-tripped their state");
 }

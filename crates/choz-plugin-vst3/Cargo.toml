@@ -10,3 +10,6 @@ anyhow.workspace = true
 libloading = "0.8"
 # Pure-Rust VST3 COM ABI bindings — no SDK headers needed.
 vst3 = "0.3"
+
+[dev-dependencies]
+x11rb = "0.13"

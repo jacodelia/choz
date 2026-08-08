@@ -19,6 +19,8 @@ flume.workspace = true
 midir.workspace = true
 libc = "0.2"
 ratatui-image = "8"
+# Already in the tree via ratatui-image; used directly for the kitty wallpaper.
+base64-simd = "0.8"
 # Background wallpapers. Only the formats the file browser offers.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp"] }
 serde_yaml = "0.9"

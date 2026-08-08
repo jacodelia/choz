@@ -65,17 +65,18 @@ pub fn connect_inputs(
             "choz-in-conn",
             move |_ts, data, _| {
                 match parse(data) {
-                    Some(Msg::Note { on, note, vel }) => {
-                        let _ = txc.send(InputEvent::Note(NoteMsg { source, on, note, vel }));
+                    Some(Msg::Note { channel, on, note, vel }) => {
+                        let _ =
+                            txc.send(InputEvent::Note(NoteMsg { source, channel, on, note, vel }));
                     }
                     // Control changes drive MIDI-learn bindings (rack faders)
                     // and reach the instrument, which is what makes the pedals
                     // and the modulation wheel work.
-                    Some(Msg::Cc { cc, value }) => {
+                    Some(Msg::Cc { channel, cc, value }) => {
                         if cc == 0 {
                             bank = value;
                         }
-                        let _ = txc.send(InputEvent::Cc(CcMsg { source, cc, value }));
+                        let _ = txc.send(InputEvent::Cc(CcMsg { source, channel, cc, value }));
                     }
                     Some(Msg::Program { program }) => {
                         let _ = txc.send(InputEvent::Program(ProgramMsg { source, bank, program }));
@@ -108,8 +109,11 @@ fn is_disabled(port: &str, disabled: &[String]) -> bool {
 /// A raw MIDI message choz cares about.
 #[derive(Debug, PartialEq, Eq)]
 enum Msg {
-    Note { on: bool, note: u8, vel: u8 },
-    Cc { cc: u8, value: u8 },
+    /// `channel` is 0-based, as it is on the wire. It only matters in the
+    /// rack's multi-timbral mode, where one port drives several tabs at once —
+    /// the way a sampler answers a DAW's orchestral template.
+    Note { channel: u8, on: bool, note: u8, vel: u8 },
+    Cc { channel: u8, cc: u8, value: u8 },
     /// Pitch bend, as the 14-bit value the wire carries: 0..16383, centred at
     /// 8192. Kept unsigned because that is what synths take.
     Bend { value: u16 },
@@ -133,10 +137,13 @@ fn parse(data: &[u8]) -> Option<Msg> {
     if data.len() < 3 {
         return None;
     }
+    let channel = data[0] & 0x0F;
     match data[0] & 0xF0 {
-        0x90 if data[2] > 0 => Some(Msg::Note { on: true, note: data[1], vel: data[2] }),
-        0x80 | 0x90 => Some(Msg::Note { on: false, note: data[1], vel: 0 }),
-        0xB0 => Some(Msg::Cc { cc: data[1], value: data[2] }),
+        0x90 if data[2] > 0 => {
+            Some(Msg::Note { channel, on: true, note: data[1], vel: data[2] })
+        }
+        0x80 | 0x90 => Some(Msg::Note { channel, on: false, note: data[1], vel: 0 }),
+        0xB0 => Some(Msg::Cc { channel, cc: data[1], value: data[2] }),
         // LSB first, then MSB — both 7-bit.
         0xE0 => Some(Msg::Bend { value: (data[1] as u16 & 0x7F) | ((data[2] as u16 & 0x7F) << 7) }),
         _ => None,
@@ -149,10 +156,10 @@ mod tests {
 
     #[test]
     fn parses_note_on_off_and_ignores_others() {
-        assert_eq!(parse(&[0x90, 60, 100]), Some(Msg::Note { on: true, note: 60, vel: 100 }));
-        assert_eq!(parse(&[0x90, 60, 0]), Some(Msg::Note { on: false, note: 60, vel: 0 }), "vel0 = note-off");
-        assert_eq!(parse(&[0x80, 60, 40]), Some(Msg::Note { on: false, note: 60, vel: 0 }));
-        assert_eq!(parse(&[0xB0, 7, 100]), Some(Msg::Cc { cc: 7, value: 100 }), "CC drives MIDI learn");
+        assert_eq!(parse(&[0x90, 60, 100]), Some(Msg::Note { channel: 0, on: true, note: 60, vel: 100 }));
+        assert_eq!(parse(&[0x90, 60, 0]), Some(Msg::Note { channel: 0, on: false, note: 60, vel: 0 }), "vel0 = note-off");
+        assert_eq!(parse(&[0x80, 60, 40]), Some(Msg::Note { channel: 0, on: false, note: 60, vel: 0 }));
+        assert_eq!(parse(&[0xB0, 7, 100]), Some(Msg::Cc { channel: 0, cc: 7, value: 100 }), "CC drives MIDI learn");
         assert_eq!(parse(&[0xF8]), None, "clock is neither");
         assert_eq!(parse(&[0x90, 60]), None, "truncated");
     }
@@ -165,7 +172,7 @@ mod tests {
         assert_eq!(parse(&[0xC0, 13]), Some(Msg::Program { program: 13 }));
         assert_eq!(parse(&[0xC5, 0]), Some(Msg::Program { program: 0 }), "channel is ignored");
         assert_eq!(parse(&[0xC0]), None, "truncated");
-        assert_eq!(parse(&[0xB0, 32, 0]), Some(Msg::Cc { cc: 32, value: 0 }), "bank LSB still a CC");
+        assert_eq!(parse(&[0xB0, 32, 0]), Some(Msg::Cc { channel: 0, cc: 32, value: 0 }), "bank LSB still a CC");
     }
 
     #[test]

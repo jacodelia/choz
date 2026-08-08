@@ -75,6 +75,106 @@ pub fn app_style() -> Style {
     }
 }
 
+/// The desktop as seen one colour per cell, and how the panels wash over it.
+///
+/// A terminal cell background is **opaque**: "a translucent panel over the
+/// wallpaper" cannot be expressed as a colour on top. What it *can* be is a
+/// blend — panel colour mixed with what the picture shows at that very cell —
+/// and that is what this table is for. It is filled when the wallpaper is
+/// built (both drawing paths compute it) and read once per cell by [`wash`].
+static DESKTOP_CELLS: std::sync::RwLock<Option<Backdrop>> = std::sync::RwLock::new(None);
+
+pub struct Backdrop {
+    pub cols: u16,
+    pub rows: u16,
+    /// Average colour of the image under each cell, row-major.
+    pub cells: Vec<(u8, u8, u8)>,
+    /// The theme colour panels are washed with, and how strongly (0..1).
+    pub tint: ((u8, u8, u8), f32),
+    /// True when the terminal is drawing the picture itself, at real pixel
+    /// resolution, below the cells.
+    ///
+    /// Then the wash must **not** touch cell backgrounds: an opaque cell hides
+    /// the image, and one colour per cell is exactly the blockiness the
+    /// graphics protocol was there to avoid. The panels are washed by a second,
+    /// translucent image instead — see `views::kitty_bg::sync_mask`.
+    pub graphics: bool,
+}
+
+impl Backdrop {
+    fn at(&self, x: u16, y: u16) -> Option<(u8, u8, u8)> {
+        if x >= self.cols || y >= self.rows {
+            return None;
+        }
+        self.cells.get(y as usize * self.cols as usize + x as usize).copied()
+    }
+}
+
+/// Publish the per-cell picture (and the panel wash) for this screen size.
+/// `None` clears it — no image, no blend, panels go back to their flat colour.
+pub fn set_backdrop(backdrop: Option<Backdrop>) {
+    if let Ok(mut g) = DESKTOP_CELLS.write() {
+        *g = backdrop;
+    }
+}
+
+/// Wash `area` with the theme's panel colour over whatever the picture shows
+/// there, so the text drawn next reads without hiding the wallpaper.
+///
+/// No-op when there is no picture: the panels then paint their own opaque
+/// colour through [`panel_style`], exactly as they always did.
+pub fn wash(buf: &mut ratatui::buffer::Buffer, area: ratatui::layout::Rect) {
+    wash_with(buf, area, 1.0)
+}
+
+/// [`wash`] with the configured opacity scaled by `strength`.
+fn wash_with(buf: &mut ratatui::buffer::Buffer, area: ratatui::layout::Rect, strength: f32) {
+    let Ok(g) = DESKTOP_CELLS.read() else { return };
+    let Some(bd) = g.as_ref() else { return };
+    // The terminal owns the picture: washing cells here would cover it.
+    if bd.graphics {
+        return;
+    }
+    let ((tr, tg, tb), alpha) = bd.tint;
+    let a = (alpha * strength).clamp(0.0, 1.0);
+    let mix = |base: u8, tint: u8| (base as f32 * (1.0 - a) + tint as f32 * a) as u8;
+    let blend = |c: Color| match c {
+        Color::Rgb(r, g, b) => Color::Rgb(mix(r, tr), mix(g, tg), mix(b, tb)),
+        other => other,
+    };
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let Some((br, bg_, bb)) = bd.at(x, y) else { continue };
+            let Some(cell) = buf.cell_mut((x, y)) else { continue };
+            // Halfblocks put the top pixel in `fg` behind a `▀` and the bottom
+            // one in `bg`. Washing only the background would throw away half of
+            // the image's vertical resolution before anything was even drawn on
+            // top, so both are blended and the glyph is left alone.
+            let fg = blend(cell.fg);
+            cell.set_fg(fg);
+            cell.set_bg(Color::Rgb(mix(br, tr), mix(bg_, tg), mix(bb, tb)));
+        }
+    }
+}
+
+/// A softer wash, for the menu and status bars: they are one row each and a
+/// full-strength panel colour there reads as a stripe across the picture.
+pub fn wash_weak(buf: &mut ratatui::buffer::Buffer, area: ratatui::layout::Rect) {
+    wash_with(buf, area, WEAK_WASH)
+}
+
+/// How much of the configured opacity the one-row bars get.
+pub const WEAK_WASH: f32 = 0.6;
+
+/// The fill for anything drawn *over* the body — modals, menus, the About box.
+///
+/// Always opaque, desktop or not: these are preceded by a `Clear`, which resets
+/// the cells it covers, and a wallpaper showing through a modal is a hole, not
+/// a feature. Panels get [`panel_style`]; overlays get this.
+pub fn overlay_style() -> Style {
+    Style::default().bg(PANEL_BG)
+}
+
 /// Panel and modal borders. Comes from the theme, so a scheme can give the
 /// frame its own colour instead of a dimmed copy of the text.
 pub fn border() -> Color {
@@ -125,3 +225,15 @@ pub const SPLASH_GRADIENT: [Color; 12] = [
 // Spinner chars (braille)
 pub const SPINNER: [char; 8] = ['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
 pub const SPINNER_DOTS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// The lock every test that touches the process-wide look has to hold.
+///
+/// Language, text colour, the desktop flag and the backdrop are all globals, so
+/// two rendering tests running in parallel can undo each other's setup. It
+/// lives here rather than in the UI's test module because the panels' own tests
+/// need it too.
+#[cfg(test)]
+pub fn ui_guard() -> std::sync::MutexGuard<'static, ()> {
+    static UI_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    UI_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}

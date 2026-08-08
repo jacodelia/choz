@@ -423,6 +423,12 @@ impl AudioSource for SfzSampler {
         self.voices.retain(|v| v.note != note);
     }
 
+    /// The sampler owns its voices, so panic just drops them. `clear` keeps the
+    /// Vec's buffer, which is what keeps this RT-safe.
+    fn all_notes_off(&mut self) {
+        self.voices.clear();
+    }
+
     fn plays_on_transport_stop(&self) -> bool {
         true
     }

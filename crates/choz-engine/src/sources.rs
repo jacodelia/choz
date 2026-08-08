@@ -282,6 +282,15 @@ impl AudioSource for Sf2Synth {
         });
     }
 
+    /// The SoundFont engine can cut its own voices, which is more than the two
+    /// CCs of the default: `AllSoundOff` kills the tails too, and a panic
+    /// button that leaves a reverb tail ringing has not really panicked.
+    fn all_notes_off(&mut self) {
+        for channel in 0..16 {
+            let _ = self.synth.send_event(oxisynth::MidiEvent::AllSoundOff { channel });
+        }
+    }
+
     fn control_change(&mut self, cc: u8, value: u8) {
         let _ = self.synth.send_event(oxisynth::MidiEvent::ControlChange {
             channel: 0, ctrl: cc, value,

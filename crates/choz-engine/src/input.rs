@@ -20,6 +20,9 @@ pub enum InputSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NoteMsg {
     pub source: InputSource,
+    /// MIDI channel, 0-based. Only the multi-timbral rack mode reads it: in
+    /// live mode a port drives one tab and the channel is noise.
+    pub channel: u8,
     pub on: bool,
     pub note: u8,
     pub vel: u8,
@@ -31,6 +34,8 @@ pub struct NoteMsg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CcMsg {
     pub source: InputSource,
+    /// MIDI channel, 0-based — see [`NoteMsg::channel`].
+    pub channel: u8,
     pub cc: u8,
     pub value: u8,
 }

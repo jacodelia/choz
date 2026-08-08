@@ -302,11 +302,6 @@ pub struct PluginFx {
     pub params: Vec<choz_engine::PluginParam>,
 }
 
-/// How many plugin parameters the FX panel shows. The knob row is the limit,
-/// not the plugin: everything past this needs the plugin's own GUI.
-/// ponytail: raise it (or add paging) if someone actually needs more.
-pub const MAX_PLUGIN_PARAMS: usize = 7;
-
 /// One entry in the FX chain: either a built-in FX or a hosted plugin effect.
 #[derive(Debug, Clone)]
 pub struct AudioFxEntry {
@@ -316,6 +311,9 @@ pub struct AudioFxEntry {
     pub params: Vec<f32>,
     /// `Some` when this slot hosts a plugin effect; `kind` is then unused.
     pub plugin: Option<PluginFx>,
+    /// The plugin's own state (its patch), as the project stores it. Empty for
+    /// built-ins, which have nothing beyond their parameters.
+    pub state: Vec<u8>,
 }
 
 impl AudioFxEntry {
@@ -323,26 +321,33 @@ impl AudioFxEntry {
         let descs = fx_param_descs(kind);
         let params: Vec<f32> = descs.iter().map(|d| d.default).collect();
         let wet = descs.last().filter(|d| d.name == "Wet").map(|d| d.default).unwrap_or(1.0);
-        Self { kind, wet, enabled: true, params, plugin: None }
+        Self { kind, wet, enabled: true, params, plugin: None, state: Vec::new() }
     }
 
     pub fn new_plugin(plugin: PluginFx) -> Self {
         // Knob positions start where the plugin says its defaults are; the
         // trailing knob is choz's own dry/wet.
-        let mut params: Vec<f32> = plugin
-            .params
-            .iter()
-            .take(MAX_PLUGIN_PARAMS)
-            .map(|p| p.normalised(p.default) as f32)
-            .collect();
+        // Every parameter the plugin has, not a prefix of them: a value that is
+        // not stored can be neither edited nor saved with the project. The knob
+        // grid wraps onto as many rows as it needs and scrolls with the cursor,
+        // so there is nothing to cap here.
+        let mut params: Vec<f32> =
+            plugin.params.iter().map(|p| p.normalised(p.default) as f32).collect();
         params.push(1.0);
-        Self { kind: AudioFxKind::default(), wet: 1.0, enabled: true, params, plugin: Some(plugin) }
+        Self {
+            kind: AudioFxKind::default(),
+            wet: 1.0,
+            enabled: true,
+            params,
+            plugin: Some(plugin),
+            state: Vec::new(),
+        }
     }
 
     /// True when knob `index` is choz's dry/wet rather than a plugin parameter.
     pub fn is_mix_param(&self, index: usize) -> bool {
         match &self.plugin {
-            Some(c) => index == c.params.len().min(MAX_PLUGIN_PARAMS),
+            Some(c) => index == c.params.len(),
             None => false,
         }
     }
@@ -355,14 +360,13 @@ impl AudioFxEntry {
         }
     }
 
-    /// Parameters this entry exposes: the plugin's own (capped) plus dry/wet
-    /// for a hosted effect, or the static table for a built-in.
+    /// Parameters this entry exposes: all of the plugin's own plus dry/wet for
+    /// a hosted effect, or the static table for a built-in.
     pub fn param_descs(&self) -> Vec<FxParamDesc> {
         match &self.plugin {
             Some(c) => c
                 .params
                 .iter()
-                .take(MAX_PLUGIN_PARAMS)
                 .map(|p| FxParamDesc {
                     name: Cow::Owned(p.name.clone()),
                     default: p.normalised(p.default) as f32,
@@ -395,6 +399,6 @@ impl AudioFxEntry {
         for (i, v) in spec.params.iter().enumerate() {
             if let Some(slot) = params.get_mut(i) { *slot = *v; }
         }
-        Some(Self { kind, wet: spec.wet, enabled: spec.enabled, params, plugin: None })
+        Some(Self { kind, wet: spec.wet, enabled: spec.enabled, params, plugin: None, state: Vec::new() })
     }
 }

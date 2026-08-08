@@ -70,6 +70,10 @@ pub struct Lv2Editor {
     plugin_uri: CString,
     bundle_path: CString,
     controls: SharedControls,
+    /// The last control port the UI wrote, and the value it wrote — the plain
+    /// one, in the port's own units. Read by MIDI learn and by the UI keeping
+    /// its knobs in step with the plugin's window.
+    touched: Arc<Mutex<Option<(u32, f32)>>>,
     sample_rate: u32,
     /// `None` while closed. The mutex serialises open/idle/close, all of which
     /// arrive on the editor thread, and makes a double `close()` harmless.
@@ -85,6 +89,13 @@ unsafe impl Send for Lv2Editor {}
 unsafe impl Sync for Lv2Editor {}
 
 impl Lv2Editor {
+    /// The last control port the UI wrote, and its value in the port's own
+    /// units. Handed to the instrument/effect, which is where the port index
+    /// can be turned into the parameter index choz addresses knobs by.
+    pub fn touched(&self) -> Arc<Mutex<Option<(u32, f32)>>> {
+        Arc::clone(&self.touched)
+    }
+
     /// Load the UI binary and get it ready to open. `None` if the library or
     /// its descriptor is not usable — the caller then reports no editor at all,
     /// so the button never offers a window that cannot appear.
@@ -110,6 +121,7 @@ impl Lv2Editor {
             plugin_uri: CString::new(plugin_uri).ok()?,
             bundle_path: CString::new(bundle).ok()?,
             controls,
+            touched: Arc::default(),
             sample_rate,
             ui: Mutex::new(None),
             _lib: lib,
@@ -118,10 +130,18 @@ impl Lv2Editor {
 }
 
 /// Walk `lv2ui_descriptor(0..)` for the one whose URI matches.
+///
+/// The walk ends where the plugin says it does — at the first null. The cap is
+/// only there so a broken binary that never returns null cannot hang choz, and
+/// it has to be generous: LSP ships **one** UI binary for its ~390 plugins, so
+/// an earlier limit of 64 silently denied an editor to everything past the 64th
+/// descriptor. That was 135 plugins reported as "no editor" in the sweep.
+const MAX_UI_DESCRIPTORS: u32 = 4096;
+
 fn descriptor_for(lib: &Library, uri: &str) -> Option<*const LV2UI_Descriptor> {
     let entry: libloading::Symbol<Lv2UiDescriptorFn> =
         unsafe { lib.get(LV2UI_DESCRIPTOR_SYM) }.ok()?;
-    for i in 0..64u32 {
+    for i in 0..MAX_UI_DESCRIPTORS {
         let d = unsafe { entry(i) };
         if d.is_null() {
             return None;
@@ -161,6 +181,7 @@ unsafe extern "C" fn write_control(
     if (port_index as usize) < cell.len {
         // SAFETY: index checked against the array the cell describes.
         unsafe { cell.values.add(port_index as usize).write(value) };
+        *editor.touched.lock() = Some((port_index, value));
     }
 }
 

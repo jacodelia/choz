@@ -393,6 +393,7 @@ dependencies = [
  "choz-ports",
  "libloading 0.8.9",
  "vst3",
+ "x11rb",
 ]
 
 [[package]]
@@ -404,6 +405,7 @@ name = "choz-ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64-simd",
  "choz-engine",
  "choz-ports",
  "crossterm",

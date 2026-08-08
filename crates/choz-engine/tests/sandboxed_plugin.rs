@@ -37,6 +37,24 @@ fn main() {
     }
     assert_eq!(plug.missed(), 0, "the child kept up with every block");
 
+    // The plugin's window is opened **by the child**, in the child's process:
+    // that is what stops a crashing GUI from taking choz down. No X11 display
+    // is needed here — what is checked is that the request crosses, the child
+    // acts on it and answers, and that audio keeps flowing meanwhile.
+    {
+        let editor = choz_ports::AudioSource::editor(&plug).expect("a sandboxed plugin offers one");
+        // A window id no server knows: the plugin refuses to embed and the
+        // child says so, which is still a complete round trip.
+        let _ = editor.open(0x1);
+        editor.close();
+
+        let before = plug.missed();
+        for _ in 0..20 {
+            plug.render(&mut out, SR);
+        }
+        assert_eq!(plug.missed(), before, "the window traffic did not disturb the audio");
+    }
+
     // A block smaller than the region still works — the callback decides the
     // size, not us.
     let mut short = vec![0.0f32; 64];

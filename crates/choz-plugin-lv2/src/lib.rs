@@ -16,6 +16,7 @@
 //! choz builds one self-contained instance per rack slot).
 
 pub mod discovery;
+pub mod state;
 pub mod editor;
 pub mod lv2_abi;
 pub mod ttl;
@@ -40,13 +41,21 @@ use lv2_abi::*;
 
 /// Backing store for the `urid:map`/`urid:unmap` host features. Assigns a stable
 /// integer to each URI and keeps the C strings alive for `unmap`.
-struct UridStore {
+pub(crate) struct UridStore {
     map: HashMap<String, u32>,
     names: Vec<CString>, // names[urid - 1]
     next: u32,
 }
 
 impl UridStore {
+    /// The URI a URID stands for, if this store minted it. State has to be
+    /// written down as URIs: the numbers only mean something inside one run.
+    fn uri(&self, urid: u32) -> Option<String> {
+        self.names
+            .get(urid.checked_sub(1)? as usize)
+            .map(|c| c.to_string_lossy().into_owned())
+    }
+
     fn new() -> Self {
         Self { map: HashMap::new(), names: Vec::new(), next: 1 }
     }
@@ -362,6 +371,9 @@ struct Lv2Instance {
     /// Handed to the plugin's own window so it can move control ports. Emptied
     /// in `Drop`, so a window still open when the slot goes away stops writing.
     controls: editor::SharedControls,
+    /// The instance, for saving and restoring its own state. Emptied in `Drop`
+    /// alongside the controls.
+    state: state::SharedState,
 }
 
 // SAFETY: raw pointers into the loaded library are only touched while the
@@ -554,6 +566,7 @@ impl Drop for Lv2Instance {
         // with this struct, so an editor window that is still open must stop
         // reaching into it. This is also why the leak path below still runs it.
         *self.controls.lock() = None;
+        *self.state.lock() = None;
         if leaks_on_teardown(&self.info.uri) {
             eprintln!("choz: leaving {} alive on purpose (it crashes in cleanup)", self.info.uri);
             return;
@@ -638,6 +651,9 @@ fn build_instance(
         found
     };
 
+    // Kept aside: the state blob is written in URIs, and only this store can
+    // turn the plugin's URIDs back into them.
+    let urid_store = Arc::clone(&urids);
     let features = Features::new(urids, sample_rate, block_size);
 
     // Allocate per-port buffers.
@@ -709,6 +725,7 @@ fn build_instance(
         features.worker.iface.set(iface);
     }
 
+    let lib_for_state = Arc::clone(&lib);
     let mut inst = Lv2Instance {
         handle,
         descriptor,
@@ -726,6 +743,12 @@ fn build_instance(
         pending_midi: Vec::with_capacity(MAX_PENDING_MIDI),
         activated: false,
         controls: Arc::new(Mutex::new(None)),
+        state: Arc::new(Mutex::new(Some(state::StateCell {
+            handle,
+            descriptor,
+            urids: urid_store,
+            _lib: lib_for_state,
+        }))),
     };
 
     // After the move into `inst`: the cell records where `control_values` ended
@@ -938,6 +961,32 @@ impl Lv2Instance {
 }
 
 /// A live LV2 instrument in a rack slot: notes in, interleaved stereo out.
+/// The UI's writes, as choz addresses parameters.
+///
+/// An LV2 UI reports the **port** it wrote and the value in the port's own
+/// units; choz's knobs are positions in the parameter list, normalised 0..1.
+/// The translation belongs here, next to the list that knows both.
+struct Lv2Touch {
+    raw: Arc<parking_lot::Mutex<Option<(u32, f32)>>>,
+    params: Vec<PluginParam>,
+}
+
+impl choz_ports::ParamTouch for Lv2Touch {
+    fn take_touched(&self) -> Option<(u32, f32)> {
+        let (port, plain) = self.raw.lock().take()?;
+        let index = self.params.iter().position(|p| p.id == port)?;
+        Some((index as u32, self.params[index].normalised(plain as f64) as f32))
+    }
+}
+
+fn touch_of(
+    editor: &Option<Arc<editor::Lv2Editor>>,
+    params: &[PluginParam],
+) -> Option<choz_ports::TouchHandle> {
+    let ed = editor.as_ref()?;
+    Some(Arc::new(Lv2Touch { raw: ed.touched(), params: params.to_vec() }) as choz_ports::TouchHandle)
+}
+
 pub struct Lv2Instrument {
     inst: Lv2Instance,
     params: Vec<PluginParam>,
@@ -984,6 +1033,15 @@ fn build_editor(inst: &Lv2Instance, sample_rate: u32) -> Option<Arc<editor::Lv2E
 impl AudioSource for Lv2Instrument {
     fn editor(&self) -> Option<choz_ports::EditorHandle> {
         self.editor.clone().map(|e| e as choz_ports::EditorHandle)
+    }
+
+    fn param_touch(&self) -> Option<choz_ports::TouchHandle> {
+        touch_of(&self.editor, &self.params)
+    }
+
+    fn state(&self) -> Option<choz_ports::StateHandle> {
+        Some(Arc::new(state::Lv2State { shared: Arc::clone(&self.inst.state) })
+            as choz_ports::StateHandle)
     }
 
     fn render(&mut self, output: &mut [f32], _sample_rate: u32) -> usize {
@@ -1066,6 +1124,15 @@ impl Lv2Effect {
 impl FxProcessor for Lv2Effect {
     fn editor(&self) -> Option<choz_ports::EditorHandle> {
         self.editor.clone().map(|e| e as choz_ports::EditorHandle)
+    }
+
+    fn param_touch(&self) -> Option<choz_ports::TouchHandle> {
+        touch_of(&self.editor, &self.params)
+    }
+
+    fn state(&self) -> Option<choz_ports::StateHandle> {
+        Some(Arc::new(state::Lv2State { shared: Arc::clone(&self.inst.state) })
+            as choz_ports::StateHandle)
     }
 
     fn process_block(&mut self, buf: &mut [f32], _sample_rate: u32) {

@@ -39,18 +39,56 @@ pub struct Vst2PluginInfo {
     pub is_instrument: bool,
 }
 
+/// What the user moved inside a plugin's own window, per loaded instance.
+///
+/// VST2 announces GUI edits through `audioMasterAutomate`, and the host
+/// callback is a **plain function pointer** with no context of its own — the
+/// only thing it gets is the `AEffect` the call came from. So the feeds are
+/// kept in a table keyed by that pointer, filled when an instance is built and
+/// emptied when it is dropped.
+static TOUCHED: std::sync::Mutex<Vec<(usize, Arc<TouchFeed>)>> = std::sync::Mutex::new(Vec::new());
+
+/// The last parameter the user moved in the plugin's window, and its value.
+#[derive(Default)]
+pub struct TouchFeed {
+    last: std::sync::Mutex<Option<(u32, f32)>>,
+}
+
+impl choz_ports::ParamTouch for TouchFeed {
+    fn take_touched(&self) -> Option<(u32, f32)> {
+        self.last.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+fn touch_feeds() -> std::sync::MutexGuard<'static, Vec<(usize, Arc<TouchFeed>)>> {
+    TOUCHED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Host callback. VST2 requires a plain function pointer, so the answers here
 /// are static; the real sample rate and block size are pushed to the plugin
 /// with `effSetSampleRate`/`effSetBlockSize` right after loading.
 unsafe extern "C" fn host_callback(
-    _effect: AEffectPtr,
+    effect: AEffectPtr,
     opcode: i32,
-    _index: i32,
+    index: i32,
     _value: isize,
     _ptr: *mut c_void,
-    _opt: c_float,
+    opt: c_float,
 ) -> isize {
     match opcode {
+        // The user moved a knob in the plugin's own window. Record it so MIDI
+        // learn can bind that parameter, and so choz's copy of the value (and
+        // the saved project) follows what happened in there.
+        host_opcode::AUTOMATE => {
+            if index >= 0 {
+                let feeds = touch_feeds();
+                if let Some((_, feed)) = feeds.iter().find(|(p, _)| *p == effect as usize) {
+                    *feed.last.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some((index as u32, opt));
+                }
+            }
+            0
+        }
         host_opcode::VERSION => VST_VERSION as isize,
         host_opcode::GET_SAMPLE_RATE => 48_000,
         host_opcode::GET_BLOCK_SIZE => 512,
@@ -174,6 +212,8 @@ struct Instance {
     opened: bool,
     /// The same `AEffect`, reachable from the GUI thread for editor opcodes.
     shared: SharedEffect,
+    /// What the plugin's window reports the user is touching.
+    touch: Arc<TouchFeed>,
 }
 
 /// The `AEffect` shared with the editor's GUI thread. Set to `None` by the
@@ -232,6 +272,66 @@ impl Vst2Editor {
         let w = (r.right - r.left).max(0) as u16;
         let h = (r.bottom - r.top).max(0) as u16;
         (w > 0 && h > 0).then_some((w, h))
+    }
+}
+
+/// The plugin's chunk, reached through the same shared cell as the editor.
+///
+/// VST2 calls it a "chunk": `effGetChunk` hands back a pointer the *plugin*
+/// owns, and `effSetChunk` takes one back. A plugin without the
+/// `effFlagsProgramChunks` flag has no chunk at all and answers 0, which is why
+/// an empty result is normal rather than an error.
+struct Vst2State {
+    shared: SharedEffect,
+}
+
+impl choz_ports::PluginState for Vst2State {
+    fn save(&self) -> Option<Vec<u8>> {
+        let guard = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let cell = guard.as_ref()?;
+        let mut ptr: *mut u8 = std::ptr::null_mut();
+        // SAFETY: live AEffect under the mutex; the plugin writes a pointer to
+        // its own buffer and returns its length.
+        let len = unsafe {
+            match (*cell.effect).dispatcher {
+                Some(d) => d(
+                    cell.effect,
+                    opcode::GET_CHUNK,
+                    0,
+                    0,
+                    &mut ptr as *mut *mut u8 as *mut c_void,
+                    0.0,
+                ),
+                None => 0,
+            }
+        };
+        if len <= 0 || ptr.is_null() {
+            return None;
+        }
+        // SAFETY: the plugin promised `len` readable bytes at `ptr`, and they
+        // are copied before anything else can touch the plugin.
+        Some(unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec())
+    }
+
+    fn restore(&self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let guard = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(cell) = guard.as_ref() else { return };
+        // SAFETY: the plugin copies out of this buffer during the call.
+        unsafe {
+            if let Some(d) = (*cell.effect).dispatcher {
+                d(
+                    cell.effect,
+                    opcode::SET_CHUNK,
+                    0,
+                    data.len() as isize,
+                    data.as_ptr() as *mut c_void,
+                    0.0,
+                );
+            }
+        }
     }
 }
 
@@ -300,7 +400,11 @@ impl Instance {
                 effect,
                 _lib: Arc::clone(&lib),
             }))),
+            touch: Arc::default(),
         };
+        // The host callback has no context but the `AEffect`, so the feed is
+        // registered under that pointer before anything can call back.
+        touch_feeds().push((effect as usize, Arc::clone(&inst.touch)));
         inst.dispatch(opcode::OPEN, 0, 0, std::ptr::null_mut(), 0.0);
         inst.opened = true;
         inst.dispatch(opcode::SET_SAMPLE_RATE, 0, 0, std::ptr::null_mut(), sample_rate as f32);
@@ -321,6 +425,17 @@ impl Instance {
 
     fn is_synth(&self) -> bool {
         unsafe { (*self.effect).flags & flags::IS_SYNTH != 0 }
+    }
+
+    /// The plugin's own chunk: presets and everything else that is not a
+    /// parameter value.
+    fn state(&self) -> Option<choz_ports::StateHandle> {
+        Some(Arc::new(Vst2State { shared: Arc::clone(&self.shared) }) as choz_ports::StateHandle)
+    }
+
+    /// The parameters the user moves inside the plugin's own window.
+    fn param_touch(&self) -> Option<choz_ports::TouchHandle> {
+        Some(Arc::clone(&self.touch) as choz_ports::TouchHandle)
     }
 
     /// Handle to the plugin's own window, or `None` if it has no editor.
@@ -504,6 +619,9 @@ impl Instance {
 
 impl Drop for Instance {
     fn drop(&mut self) {
+        // The callback must not find a feed for an `AEffect` that is going
+        // away — and a later plugin could land on the same address.
+        touch_feeds().retain(|(p, _)| *p != self.effect as usize);
         // Cut the editor thread loose first: past this it can no longer reach
         // the AEffect we are about to close.
         if let Some(cell) = self.shared.lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -568,6 +686,14 @@ impl FxProcessor for Vst2Effect {
 
     fn editor(&self) -> Option<EditorHandle> {
         self.inst.editor()
+    }
+
+    fn param_touch(&self) -> Option<choz_ports::TouchHandle> {
+        self.inst.param_touch()
+    }
+
+    fn state(&self) -> Option<choz_ports::StateHandle> {
+        self.inst.state()
     }
 }
 
@@ -640,6 +766,14 @@ impl AudioSource for Vst2Instrument {
     fn editor(&self) -> Option<EditorHandle> {
         self.inst.editor()
     }
+
+    fn param_touch(&self) -> Option<choz_ports::TouchHandle> {
+        self.inst.param_touch()
+    }
+
+    fn state(&self) -> Option<choz_ports::StateHandle> {
+        self.inst.state()
+    }
 }
 
 #[cfg(test)]
@@ -667,5 +801,38 @@ mod tests {
         assert!(info.sample_rate > 0.0);
         assert!(info.tempo > 0.0);
         assert_eq!(info.flags & time_flags::TEMPO_VALID, time_flags::TEMPO_VALID);
+    }
+}
+
+#[cfg(test)]
+mod touch_tests {
+    use super::*;
+    use choz_ports::ParamTouch;
+
+    /// A knob moved inside the plugin's window arrives as
+    /// `audioMasterAutomate`, and the host callback is a bare function pointer
+    /// — the only thing tying the call to an instance is the `AEffect` it came
+    /// from. This is that lookup, without a plugin: register a feed under a
+    /// pointer, call the callback with it, read the parameter back.
+    #[test]
+    fn automate_lands_in_the_feed_of_the_instance_it_came_from() {
+        let fake = 0xC0FFEE_usize;
+        let feed = Arc::new(TouchFeed::default());
+        touch_feeds().push((fake, Arc::clone(&feed)));
+
+        // SAFETY: the callback only uses the pointer as a key for this opcode.
+        unsafe {
+            host_callback(fake as AEffectPtr, host_opcode::AUTOMATE, 3, 0, std::ptr::null_mut(), 0.75);
+        }
+        assert_eq!(feed.take_touched(), Some((3, 0.75)));
+        // Reading consumes it: an old gesture must not capture a later CC.
+        assert_eq!(feed.take_touched(), None);
+
+        // A call from an instance that is gone must not panic or cross feeds.
+        touch_feeds().retain(|(p, _)| *p != fake);
+        unsafe {
+            host_callback(fake as AEffectPtr, host_opcode::AUTOMATE, 3, 0, std::ptr::null_mut(), 0.5);
+        }
+        assert_eq!(feed.take_touched(), None);
     }
 }

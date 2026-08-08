@@ -46,11 +46,20 @@ pub struct Interface {
 pub struct Slot {
     /// Note input bound to this tab, `"MIDI:<port>"` / `"OSC"` / none.
     pub input: Option<String>,
+    /// MIDI channel this tab answers in MULTI mode, 1..16. Added later, so a
+    /// project written before the mode existed still loads — channel 1 for a
+    /// single tab is the same thing it always did.
+    #[serde(default = "default_channel")]
+    pub channel: u8,
     pub instrument: Instrument,
     pub mixer: Mixer,
     pub fx: Vec<Fx>,
     /// MIDI-learn bindings that target this tab.
     pub midi_learn: Vec<Binding>,
+}
+
+fn default_channel() -> u8 {
+    1
 }
 
 /// One MIDI-learn binding. `target` is what gets restored; `label` is written
@@ -97,6 +106,11 @@ pub struct Instrument {
     /// Plugin instruments: knob positions, 0..1, in the plugin's order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub params: Vec<f32>,
+    /// The plugin's own state, base64. Everything about the sound that is not a
+    /// parameter: the patch picked in its browser, a wavetable, a sample path.
+    /// Written as text so the project stays a readable YAML file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub state: String,
 }
 
 /// One FX in a chain, with every knob as the UI shows it (0..1).
@@ -111,6 +125,9 @@ pub struct Fx {
     pub plugin_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin_id: Option<String>,
+    /// The plugin's own state, base64 — see [`Instrument::state`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub state: String,
 }
 
 impl Project {
@@ -156,6 +173,7 @@ mod tests {
             plugin_paths: choz_engine::PluginPaths::default(),
             rack: vec![Slot {
                 input: Some("MIDI:Keystation".into()),
+                channel: 3,
                 instrument: Instrument {
                     kind: "sf2".into(),
                     path: Some("/usr/share/sounds/sf2/FluidR3_GM.sf2".into()),
@@ -164,6 +182,7 @@ mod tests {
                     bank: Some(0),
                     preset: Some(4),
                     params: Vec::new(),
+                    state: String::new(),
                 },
                 mixer: Mixer {
                     gain: 0.8,
@@ -180,6 +199,7 @@ mod tests {
                     params: vec![0.6, 0.4, 0.7, 1.0],
                     plugin_path: None,
                     plugin_id: None,
+                    state: String::new(),
                 }],
                 midi_learn: vec![Binding {
                     cc: 74,
@@ -225,5 +245,34 @@ mod tests {
         assert_eq!(Project::load(&dir).unwrap(), sample());
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// The plugin state blob as it goes into the YAML file.
+///
+/// Base64 rather than a binary side-car: a project is one file the user can
+/// read, copy and diff, and a patch is a few kilobytes.
+pub fn encode_state(data: &[u8]) -> String {
+    base64_simd::STANDARD.encode_to_string(data)
+}
+
+pub fn decode_state(text: &str) -> Option<Vec<u8>> {
+    (!text.is_empty()).then(|| base64_simd::STANDARD.decode_to_vec(text).ok())?
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    /// The blob has to survive the round trip through the file exactly: a patch
+    /// that comes back one byte short is a plugin that refuses to load it.
+    #[test]
+    fn a_state_blob_round_trips_through_text() {
+        let blob: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        let text = encode_state(&blob);
+        assert!(!text.contains('\n'), "one line, so the YAML stays tidy");
+        assert_eq!(decode_state(&text).unwrap(), blob);
+        assert_eq!(decode_state(""), None);
+        assert_eq!(decode_state("not base64 !!"), None);
     }
 }

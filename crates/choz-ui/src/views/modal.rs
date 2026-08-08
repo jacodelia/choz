@@ -120,7 +120,7 @@ pub fn draw_list_modal(f: &mut Frame, m: &mut ListModal, area: Rect, pct: (u16, 
         .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border()))
-        .style(super::theme::panel_style());
+        .style(super::theme::overlay_style());
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 

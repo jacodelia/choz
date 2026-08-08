@@ -252,3 +252,58 @@ pub type Lv2UiDescriptorFn = unsafe extern "C" fn(index: u32) -> *const LV2UI_De
 pub struct LV2UI_Idle_Interface {
     pub idle: Option<unsafe extern "C" fn(ui: LV2UI_Handle) -> i32>,
 }
+
+// ─── State (ext/state) ──────────────────────────────────────────────────────
+
+pub const LV2_STATE_INTERFACE_URI: &str = "http://lv2plug.in/ns/ext/state#interface";
+
+/// `LV2_State_Status`. Anything non-zero is a failure.
+pub const LV2_STATE_SUCCESS: i32 = 0;
+
+pub type LV2_State_Handle = *mut c_void;
+
+/// What the plugin calls to hand the host one piece of its state
+/// (`LV2_State_Store_Function`). `key` and `type_` are URIDs; the host is
+/// expected to copy the value.
+pub type LV2_State_Store_Function = unsafe extern "C" fn(
+    handle: LV2_State_Handle,
+    key: u32,
+    value: *const c_void,
+    size: usize,
+    type_: u32,
+    flags: u32,
+) -> i32;
+
+/// The other direction (`LV2_State_Retrieve_Function`): the host returns a
+/// pointer it keeps alive for the duration of `restore`.
+pub type LV2_State_Retrieve_Function = unsafe extern "C" fn(
+    handle: LV2_State_Handle,
+    key: u32,
+    size: *mut usize,
+    type_: *mut u32,
+    flags: *mut u32,
+) -> *const c_void;
+
+/// What `extension_data(state#interface)` returns.
+#[repr(C)]
+pub struct LV2_State_Interface {
+    pub save: Option<
+        unsafe extern "C" fn(
+            instance: LV2_Handle,
+            store: LV2_State_Store_Function,
+            handle: LV2_State_Handle,
+            flags: u32,
+            features: *const *const LV2_Feature,
+        ) -> i32,
+    >,
+    pub restore: Option<
+        unsafe extern "C" fn(
+            instance: LV2_Handle,
+            retrieve: LV2_State_Retrieve_Function,
+            handle: LV2_State_Handle,
+            flags: u32,
+            features: *const *const LV2_Feature,
+        ) -> i32,
+    >,
+}
+

@@ -15,10 +15,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use choz_ports::EditorHandle;
 use libloading::Library;
 use vst3::{Class, ComPtr, ComWrapper, Interface};
+
+use crate::editor::{SharedView, Vst3Editor};
 use vst3::Steinberg::*;
 use vst3::Steinberg::Vst::*;
+use vst3::Steinberg::Vst::IAttributeList_::AttrID;
 
 
 type GetFactoryProc = unsafe extern "system" fn() -> *mut IPluginFactory;
@@ -59,8 +63,209 @@ impl IHostApplicationTrait for HostContext {
         }
         kResultOk
     }
-    unsafe fn createInstance(&self, _cid: *mut TUID, _iid: *mut TUID, _obj: *mut *mut c_void) -> tresult {
-        kNotImplemented
+    /// The only thing a plugin asks the host to build is an `IMessage` — that
+    /// is how the two halves of a VST3 plugin (edit controller and processor)
+    /// talk to each other. Returning `kNotImplemented` is what made DPF's UI
+    /// assert `message != nullptr` the moment its editor opened, so a knob in
+    /// the plugin's own window never reached the DSP.
+    unsafe fn createInstance(&self, _cid: *mut TUID, iid: *mut TUID, obj: *mut *mut c_void) -> tresult {
+        if obj.is_null() || iid.is_null() {
+            return kInvalidArgument;
+        }
+        // SAFETY: the plugin passes a readable TUID and a writable out-pointer.
+        let wanted = unsafe { *iid };
+        if wanted != IMessage_iid && wanted != FUnknown_iid {
+            return kNotImplemented;
+        }
+        let msg = ComWrapper::new(HostMessage::new());
+        let Some(ptr) = msg.to_com_ptr::<IMessage>() else { return kInternalError };
+        // The caller owns the reference `to_com_ptr` just took.
+        unsafe { *obj = ptr.into_raw() as *mut c_void };
+        kResultOk
+    }
+}
+
+/// A host-created `IMessage`: an id plus an attribute list, passed between the
+/// plugin's controller and processor through `IConnectionPoint`.
+struct HostMessage {
+    id: std::sync::Mutex<std::ffi::CString>,
+    attrs: ComWrapper<HostAttributeList>,
+}
+
+impl HostMessage {
+    fn new() -> Self {
+        Self {
+            id: std::sync::Mutex::new(std::ffi::CString::default()),
+            attrs: ComWrapper::new(HostAttributeList::default()),
+        }
+    }
+}
+
+impl Class for HostMessage {
+    type Interfaces = (IMessage,);
+}
+
+impl IMessageTrait for HostMessage {
+    unsafe fn getMessageID(&self) -> FIDString {
+        // The pointer stays valid as long as the message does: the CString is
+        // only replaced under the same lock, and a plugin reads the id inside
+        // the callback that received the message.
+        self.id.lock().unwrap_or_else(|e| e.into_inner()).as_ptr()
+    }
+
+    unsafe fn setMessageID(&self, id: FIDString) {
+        let new = if id.is_null() {
+            std::ffi::CString::default()
+        } else {
+            // SAFETY: VST3 message ids are NUL-terminated C strings.
+            unsafe { std::ffi::CStr::from_ptr(id) }.to_owned()
+        };
+        *self.id.lock().unwrap_or_else(|e| e.into_inner()) = new;
+    }
+
+    unsafe fn getAttributes(&self) -> *mut IAttributeList {
+        // Borrowed, not owned: the message holds the only reference.
+        self.attrs
+            .to_com_ptr::<IAttributeList>()
+            .map(|p| p.as_ptr())
+            .unwrap_or(std::ptr::null_mut())
+    }
+}
+
+/// The message's payload. Values are stored by key, exactly as set — no
+/// conversion between the typed getters, which is what the SDK's own
+/// implementation does.
+#[derive(Default)]
+struct HostAttributeList {
+    values: std::sync::Mutex<std::collections::HashMap<Vec<u8>, AttrValue>>,
+}
+
+enum AttrValue {
+    Int(int64),
+    Float(f64),
+    /// UTF-16, NUL-terminated, as VST3 strings are.
+    Text(Vec<u16>),
+    Binary(Vec<u8>),
+}
+
+impl HostAttributeList {
+    fn key(id: AttrID) -> Option<Vec<u8>> {
+        (!id.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(id) }.to_bytes().to_vec())
+    }
+
+    fn set(&self, id: AttrID, value: AttrValue) -> tresult {
+        let Some(key) = Self::key(id) else { return kInvalidArgument };
+        self.values.lock().unwrap_or_else(|e| e.into_inner()).insert(key, value);
+        kResultOk
+    }
+}
+
+impl Class for HostAttributeList {
+    type Interfaces = (IAttributeList,);
+}
+
+impl IAttributeListTrait for HostAttributeList {
+    unsafe fn setInt(&self, id: AttrID, value: int64) -> tresult {
+        self.set(id, AttrValue::Int(value))
+    }
+
+    unsafe fn getInt(&self, id: AttrID, value: *mut int64) -> tresult {
+        let Some(key) = Self::key(id) else { return kInvalidArgument };
+        let g = self.values.lock().unwrap_or_else(|e| e.into_inner());
+        match g.get(&key) {
+            Some(AttrValue::Int(v)) if !value.is_null() => {
+                unsafe { *value = *v };
+                kResultOk
+            }
+            _ => kResultFalse,
+        }
+    }
+
+    unsafe fn setFloat(&self, id: AttrID, value: f64) -> tresult {
+        self.set(id, AttrValue::Float(value))
+    }
+
+    unsafe fn getFloat(&self, id: AttrID, value: *mut f64) -> tresult {
+        let Some(key) = Self::key(id) else { return kInvalidArgument };
+        let g = self.values.lock().unwrap_or_else(|e| e.into_inner());
+        match g.get(&key) {
+            Some(AttrValue::Float(v)) if !value.is_null() => {
+                unsafe { *value = *v };
+                kResultOk
+            }
+            _ => kResultFalse,
+        }
+    }
+
+    unsafe fn setString(&self, id: AttrID, string: *const TChar) -> tresult {
+        if string.is_null() {
+            return kInvalidArgument;
+        }
+        // SAFETY: a VST3 string attribute is NUL-terminated UTF-16.
+        let mut buf = Vec::new();
+        let mut p = string;
+        unsafe {
+            while *p != 0 {
+                buf.push(*p);
+                p = p.add(1);
+            }
+        }
+        buf.push(0);
+        self.set(id, AttrValue::Text(buf))
+    }
+
+    unsafe fn getString(&self, id: AttrID, string: *mut TChar, size_in_bytes: uint32) -> tresult {
+        let Some(key) = Self::key(id) else { return kInvalidArgument };
+        let g = self.values.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(AttrValue::Text(v)) = g.get(&key) else { return kResultFalse };
+        if string.is_null() {
+            return kInvalidArgument;
+        }
+        // `sizeInBytes` counts bytes, and each character is two of them.
+        let room = (size_in_bytes as usize) / 2;
+        if room == 0 {
+            return kResultFalse;
+        }
+        let n = v.len().min(room);
+        // SAFETY: the caller promised `room` characters of writable space.
+        unsafe {
+            for (i, c) in v[..n].iter().enumerate() {
+                *string.add(i) = *c as TChar;
+            }
+            *string.add(n - 1) = 0;
+        }
+        kResultOk
+    }
+
+    unsafe fn setBinary(&self, id: AttrID, data: *const c_void, size_in_bytes: uint32) -> tresult {
+        if data.is_null() {
+            return kInvalidArgument;
+        }
+        // SAFETY: the caller promised `size_in_bytes` readable bytes.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data as *const u8, size_in_bytes as usize) };
+        self.set(id, AttrValue::Binary(bytes.to_vec()))
+    }
+
+    unsafe fn getBinary(
+        &self,
+        id: AttrID,
+        data: *mut *const c_void,
+        size_in_bytes: *mut uint32,
+    ) -> tresult {
+        let Some(key) = Self::key(id) else { return kInvalidArgument };
+        let g = self.values.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(AttrValue::Binary(v)) = g.get(&key) else { return kResultFalse };
+        if data.is_null() || size_in_bytes.is_null() {
+            return kInvalidArgument;
+        }
+        // The pointer stays owned by this list, which is how the SDK's own
+        // attribute list behaves: valid until the attribute is overwritten.
+        unsafe {
+            *data = v.as_ptr() as *const c_void;
+            *size_in_bytes = v.len() as uint32;
+        }
+        kResultOk
     }
 }
 
@@ -87,34 +292,96 @@ impl IEventListTrait for HostEventList {
     unsafe fn addEvent(&self, _e: *mut Event) -> tresult { kNotImplemented }
 }
 
-/// A throwaway value queue: the plugin writes output-automation points here and we
-/// discard them. Some plugins (DPF) require `addParameterData` to return a non-null
-/// queue, so we hand back this shared instance.
-struct HostParamValueQueue;
+/// One parameter change for one block: the id and the value, as a single point
+/// at offset 0.
+///
+/// Not a throwaway any more. A VST3 plugin's GUI lives in the **edit
+/// controller**, which is a different object from the processor: moving a knob
+/// calls `IComponentHandler::performEdit` on the host and nothing else. If the
+/// host does not carry that value into `ProcessData.inputParameterChanges`, the
+/// knob moves on screen and the sound never changes — which is exactly what
+/// Surge XT did here.
+struct HostParamValueQueue {
+    id: std::sync::atomic::AtomicU32,
+    value: std::sync::Mutex<f64>,
+}
+
+impl HostParamValueQueue {
+    fn new() -> Self {
+        Self {
+            id: std::sync::atomic::AtomicU32::new(0),
+            value: std::sync::Mutex::new(0.0),
+        }
+    }
+
+    fn set(&self, id: u32, value: f64) {
+        self.id.store(id, std::sync::atomic::Ordering::Relaxed);
+        *self.value.lock().unwrap_or_else(|e| e.into_inner()) = value;
+    }
+}
 
 impl Class for HostParamValueQueue {
     type Interfaces = (IParamValueQueue,);
 }
 
 impl IParamValueQueueTrait for HostParamValueQueue {
-    unsafe fn getParameterId(&self) -> ParamID { 0 }
-    unsafe fn getPointCount(&self) -> int32 { 0 }
-    unsafe fn getPoint(&self, _index: int32, _off: *mut int32, _value: *mut ParamValue) -> tresult { kResultFalse }
+    unsafe fn getParameterId(&self) -> ParamID {
+        self.id.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    unsafe fn getPointCount(&self) -> int32 { 1 }
+    unsafe fn getPoint(&self, index: int32, off: *mut int32, value: *mut ParamValue) -> tresult {
+        if index != 0 {
+            return kResultFalse;
+        }
+        // The whole change applies at the start of the block: choz has no
+        // sample-accurate automation to place it anywhere else.
+        if !off.is_null() {
+            unsafe { *off = 0 };
+        }
+        if !value.is_null() {
+            unsafe { *value = *self.value.lock().unwrap_or_else(|e| e.into_inner()) };
+        }
+        kResultOk
+    }
+    /// Output automation from the plugin. Accepted and dropped: choz reads the
+    /// same edits through `IComponentHandler`, which is where a GUI reports
+    /// them.
     unsafe fn addPoint(&self, _off: int32, _value: ParamValue, index: *mut int32) -> tresult {
-        if !index.is_null() { *index = 0; }
+        if !index.is_null() { unsafe { *index = 0 }; }
         kResultOk
     }
 }
 
-/// Parameter-change list handed to `ProcessData`. Reports zero *input* changes but
-/// returns a real (discarding) queue from `addParameterData`, which some plugins
-/// (e.g. DPF-based) require to be non-null even with no automation.
+/// The parameter-change list handed to `ProcessData` each block.
+///
+/// Queues are pooled and reused: a block reports the first `active` of them, so
+/// nothing is allocated on the audio thread once the pool has grown to the
+/// number of parameters that move at once.
 struct HostParamChanges {
-    queue: ComWrapper<HostParamValueQueue>,
+    queues: std::sync::Mutex<Vec<ComWrapper<HostParamValueQueue>>>,
+    active: std::sync::atomic::AtomicUsize,
 }
 
 impl HostParamChanges {
-    fn new() -> Self { Self { queue: ComWrapper::new(HostParamValueQueue) } }
+    fn new() -> Self {
+        Self {
+            queues: std::sync::Mutex::new(Vec::new()),
+            active: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Load this block's changes. Grows the pool the first time a new number of
+    /// simultaneous changes shows up, and never shrinks it.
+    fn load(&self, changes: &[(u32, f64)]) {
+        let mut queues = self.queues.lock().unwrap_or_else(|e| e.into_inner());
+        while queues.len() < changes.len() {
+            queues.push(ComWrapper::new(HostParamValueQueue::new()));
+        }
+        for (q, (id, v)) in queues.iter().zip(changes) {
+            q.set(*id, *v);
+        }
+        self.active.store(changes.len(), std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl Class for HostParamChanges {
@@ -122,12 +389,191 @@ impl Class for HostParamChanges {
 }
 
 impl IParameterChangesTrait for HostParamChanges {
-    unsafe fn getParameterCount(&self) -> int32 { 0 }
-    unsafe fn getParameterData(&self, _index: int32) -> *mut IParamValueQueue { std::ptr::null_mut() }
-    unsafe fn addParameterData(&self, _id: *const ParamID, index: *mut int32) -> *mut IParamValueQueue {
-        if !index.is_null() { *index = 0; }
-        self.queue.to_com_ptr::<IParamValueQueue>().map(|p| p.as_ptr()).unwrap_or(std::ptr::null_mut())
+    unsafe fn getParameterCount(&self) -> int32 {
+        self.active.load(std::sync::atomic::Ordering::Relaxed) as int32
     }
+    unsafe fn getParameterData(&self, index: int32) -> *mut IParamValueQueue {
+        if index < 0 || index as usize >= self.active.load(std::sync::atomic::Ordering::Relaxed) {
+            return std::ptr::null_mut();
+        }
+        let queues = self.queues.lock().unwrap_or_else(|e| e.into_inner());
+        queues
+            .get(index as usize)
+            .and_then(|q| q.to_com_ptr::<IParamValueQueue>())
+            .map(|p| p.as_ptr())
+            .unwrap_or(std::ptr::null_mut())
+    }
+    /// The plugin asking for somewhere to write *output* automation. It gets a
+    /// real queue (some DPF plugins insist on a non-null one) whose points are
+    /// discarded.
+    unsafe fn addParameterData(&self, _id: *const ParamID, index: *mut int32) -> *mut IParamValueQueue {
+        if !index.is_null() { unsafe { *index = 0 }; }
+        let mut queues = self.queues.lock().unwrap_or_else(|e| e.into_inner());
+        if queues.is_empty() {
+            queues.push(ComWrapper::new(HostParamValueQueue::new()));
+        }
+        queues[0]
+            .to_com_ptr::<IParamValueQueue>()
+            .map(|p| p.as_ptr())
+            .unwrap_or(std::ptr::null_mut())
+    }
+}
+
+/// The plugin's component and controller, reachable from the UI thread for
+/// state save/restore.
+///
+/// Same contract as the editor's cell: `None` once the instance is gone, so a
+/// project saved after a tab was replaced reads nothing rather than freed
+/// memory.
+pub type SharedState = Arc<std::sync::Mutex<Option<StateCell>>>;
+
+pub struct StateCell {
+    component: ComPtr<IComponent>,
+    controller: Option<ComPtr<IEditController>>,
+    _lib: Arc<Library>,
+}
+
+// SAFETY: only touched under the mutex, from the UI thread, while the instance
+// is alive — which is exactly what `Some` marks.
+unsafe impl Send for StateCell {}
+
+pub struct Vst3State {
+    pub shared: SharedState,
+}
+
+impl choz_ports::PluginState for Vst3State {
+    fn save(&self) -> Option<Vec<u8>> {
+        let guard = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let cell = guard.as_ref()?;
+        let shared = Arc::new(std::sync::Mutex::new((Vec::new(), 0usize)));
+        let stream = ComWrapper::new(MemStream { inner: shared.clone() });
+        let ptr = stream.to_com_ptr::<IBStream>()?;
+        // SAFETY: live component under the mutex; the stream is ours.
+        if unsafe { cell.component.getState(ptr.as_ptr()) } != kResultOk {
+            return None;
+        }
+        let data = shared.lock().unwrap_or_else(|e| e.into_inner()).0.clone();
+        (!data.is_empty()).then_some(data)
+    }
+
+    fn restore(&self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let guard = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(cell) = guard.as_ref() else { return };
+        let feed = |bytes: &[u8]| {
+            let shared = Arc::new(std::sync::Mutex::new((bytes.to_vec(), 0usize)));
+            ComWrapper::new(MemStream { inner: shared }).to_com_ptr::<IBStream>()
+        };
+        // SAFETY: live objects under the mutex.
+        unsafe {
+            if let Some(p) = feed(data) {
+                cell.component.setState(p.as_ptr());
+            }
+            // The controller gets its own rewound stream, or its window shows
+            // the old patch while the processor plays the new one.
+            if let (Some(c), Some(p)) = (&cell.controller, feed(data)) {
+                c.setComponentState(p.as_ptr());
+            }
+        }
+    }
+}
+
+/// What the plugin's own GUI reports back to the host, shared with whoever needs
+/// it: the audio thread (to apply the change) and the UI thread (to know which
+/// parameter the user just grabbed, for MIDI learn).
+#[derive(Clone, Default)]
+pub struct EditFeed {
+    inner: Arc<std::sync::Mutex<EditFeedInner>>,
+}
+
+#[derive(Default)]
+struct EditFeedInner {
+    /// Changes not yet handed to the processor.
+    pending: Vec<(u32, f64)>,
+    /// The last parameter the user moved and its normalised value, in the
+    /// plugin's window or in choz's own editor. Read — and cleared — by MIDI
+    /// learn and by the UI keeping its own knobs in step.
+    last_touched: Option<(u32, f32)>,
+}
+
+/// Cap on changes queued between two blocks. A knob sweep generates a lot of
+/// them; past this the oldest are dropped, because the newest value is the one
+/// that matters.
+const MAX_PENDING_EDITS: usize = 512;
+
+impl EditFeed {
+    fn lock(&self) -> std::sync::MutexGuard<'_, EditFeedInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record a parameter change: it will reach the processor next block, and
+    /// it marks the parameter as the one being touched.
+    pub fn push(&self, id: u32, value: f64) {
+        let mut g = self.lock();
+        g.last_touched = Some((id, value as f32));
+        if g.pending.len() >= MAX_PENDING_EDITS {
+            g.pending.remove(0);
+        }
+        g.pending.push((id, value));
+    }
+
+    /// Take everything queued, for one process block.
+    fn drain(&self, out: &mut Vec<(u32, f64)>) {
+        out.clear();
+        let mut g = self.lock();
+        out.append(&mut g.pending);
+    }
+
+    /// The parameter the user last moved, if any. Cleared by reading, so a
+    /// second call returns `None` until something else is touched.
+    pub fn take_last_touched(&self) -> Option<(u32, f32)> {
+        self.lock().last_touched.take()
+    }
+}
+
+/// The edit feed as choz sees it: **by parameter index**, not by the plugin's
+/// own id. Everything above the host — knob rows, MIDI-learn targets, saved
+/// projects — addresses parameters by their position in the list, so the
+/// translation belongs here, next to the table that knows it.
+pub struct TouchByIndex {
+    feed: EditFeed,
+    ids: Vec<u32>,
+}
+
+impl choz_ports::ParamTouch for TouchByIndex {
+    fn take_touched(&self) -> Option<(u32, f32)> {
+        let (id, value) = self.feed.take_last_touched()?;
+        let index = self.ids.iter().position(|&p| p == id)?;
+        Some((index as u32, value))
+    }
+}
+
+/// The host object a VST3 edit controller reports GUI edits to.
+struct HostComponentHandler {
+    feed: EditFeed,
+}
+
+impl Class for HostComponentHandler {
+    type Interfaces = (IComponentHandler,);
+}
+
+impl IComponentHandlerTrait for HostComponentHandler {
+    /// Start of a gesture (mouse down on a knob). Nothing to do: choz has no
+    /// automation to arm, and the value arrives in `performEdit`.
+    unsafe fn beginEdit(&self, _id: ParamID) -> tresult { kResultOk }
+
+    unsafe fn performEdit(&self, id: ParamID, value_normalized: ParamValue) -> tresult {
+        self.feed.push(id, value_normalized);
+        kResultOk
+    }
+
+    unsafe fn endEdit(&self, _id: ParamID) -> tresult { kResultOk }
+
+    /// The plugin wants the host to re-read something (parameter list, latency,
+    /// …). choz reads parameters on demand, so acknowledging is enough.
+    unsafe fn restartComponent(&self, _flags: int32) -> tresult { kResultOk }
 }
 
 /// A memory-backed `IBStream` for component state get/set. The plugin reads from
@@ -236,8 +682,30 @@ pub struct Vst3RealInstance {
     out_channels: usize,
     /// Host context handed to the plugin; kept alive for the instance's lifetime.
     _ctx: ComWrapper<HostContext>,
-    /// Empty parameter-change list (non-null pointer for `ProcessData`).
+    /// The controller's parameters in order, as `(id, index)` — VST3 parameter
+    /// **ids are not indices**. `getParameterInfo` takes an index and hands
+    /// back an arbitrary `ParamID`, and every value call (`getParamNormalized`,
+    /// `setParamNormalized`, automation queues) takes that id. Surge XT and
+    /// most JUCE plugins number theirs in a way that made "index as id" address
+    /// the wrong parameter, or none at all.
+    param_ids: Vec<u32>,
+    /// The parameter changes handed to the plugin each block.
     param_changes: ComWrapper<HostParamChanges>,
+    /// Edits reported by the plugin's own GUI (and by choz's knobs), on their
+    /// way to the processor.
+    edits: EditFeed,
+    /// Scratch for one block's worth of changes; pre-allocated so `render` does
+    /// not allocate.
+    edit_scratch: Vec<(u32, f64)>,
+    /// The handler the controller reports edits to; kept alive for as long as
+    /// the controller can call it.
+    _handler: ComWrapper<HostComponentHandler>,
+    /// The plugin's `IPlugView`, reachable from the editor thread. Emptied by
+    /// `Drop` before anything is terminated.
+    shared_view: SharedView,
+    /// The component and controller, for saving and restoring the plugin's own
+    /// state. Emptied by `Drop` alongside the view.
+    shared_state: SharedState,
     /// Keeps the `.so` mapped; declared last so it unloads after every COM release.
     _lib: Arc<Library>,
 }
@@ -249,8 +717,10 @@ unsafe impl Send for Vst3RealInstance {}
 impl Vst3RealInstance {
     pub fn load(path: &Path, sample_rate: u32, block: u32) -> Result<Self> {
         let bin = bundle_binary(path);
-        let lib = unsafe { Library::new(&bin) }
-            .with_context(|| format!("load vst3 binary {}", bin.display()))?;
+        let lib = Arc::new(
+            unsafe { Library::new(&bin) }
+                .with_context(|| format!("load vst3 binary {}", bin.display()))?,
+        );
         // Linux VST3 modules MUST be initialised via `ModuleEntry` before the
         // factory is usable — it constructs the module's global state (class info
         // strings, etc.). Skipping it makes `getClassInfo` deref uninitialised
@@ -339,6 +809,32 @@ impl Vst3RealInstance {
             },
         };
 
+        // The parameter table, read once: index → the plugin's own id.
+        let param_ids: Vec<u32> = controller
+            .as_ref()
+            .map(|c| {
+                let n = unsafe { c.getParameterCount() }.max(0);
+                (0..n)
+                    .filter_map(|i| {
+                        let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
+                        // SAFETY: live controller, index in range.
+                        (unsafe { c.getParameterInfo(i, &mut info) } == kResultOk).then_some(info.id)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // The controller reports GUI edits here. Without a handler, a plugin
+        // whose window is open moves its own knobs and the processor never
+        // hears about it.
+        let edits = EditFeed::default();
+        let handler = ComWrapper::new(HostComponentHandler { feed: edits.clone() });
+        if let (Some(c), Some(h)) = (&controller, handler.to_com_ptr::<IComponentHandler>()) {
+            // SAFETY: live controller, and the handler outlives it (both are
+            // owned by this instance, dropped after `terminate`).
+            unsafe { c.setComponentHandler(h.as_ptr()) };
+        }
+
         // Configure processing.
         let mut setup = ProcessSetup {
             processMode: ProcessModes_::kRealtime as int32,
@@ -377,10 +873,29 @@ impl Vst3RealInstance {
             processor.setProcessing(1);
         }
 
+        // The plugin's editor, created once here — the controller is only
+        // reachable on this thread, before the instance moves to the audio one.
+        // A plugin without an X11 view gets no cell, and so no `GUI` button.
+        let shared_view = Arc::new(std::sync::Mutex::new(controller.as_ref().and_then(|c| {
+            // SAFETY: live controller; `createView` returns a +1 reference that
+            // `from_raw` takes over.
+            let raw = unsafe { c.createView(ViewType::kEditor) };
+            let view = unsafe { ComPtr::<IPlugView>::from_raw(raw) }?;
+            Vst3Editor::cell(view, Arc::clone(&lib))
+        })));
+
+        let shared_state = Arc::new(std::sync::Mutex::new(Some(StateCell {
+            component: component.clone(),
+            controller: controller.clone(),
+            _lib: Arc::clone(&lib),
+        })));
+
         let out_bufs = vec![vec![0.0f32; block as usize]; out_channels];
         let in_bufs = vec![vec![0.0f32; block as usize]; in_channels];
         Ok(Self {
-            _lib: Arc::new(lib),
+            _lib: lib,
+            shared_view,
+            shared_state,
             component,
             processor,
             controller,
@@ -393,8 +908,23 @@ impl Vst3RealInstance {
             pending: Vec::new(),
             out_channels,
             _ctx: ctx,
+            param_ids,
             param_changes: ComWrapper::new(HostParamChanges::new()),
+            edits,
+            edit_scratch: Vec::with_capacity(64),
+            _handler: handler,
         })
+    }
+
+    /// The plugin's own state blob: its patch, not just its parameter values.
+    pub fn state(&self) -> Option<choz_ports::StateHandle> {
+        Some(Arc::new(Vst3State { shared: Arc::clone(&self.shared_state) }) as choz_ports::StateHandle)
+    }
+
+    /// Handle to the plugin's own window, or `None` if it has no X11 editor.
+    pub fn editor(&self) -> Option<EditorHandle> {
+        let has_view = self.shared_view.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        has_view.then(|| Vst3Editor::new(Arc::clone(&self.shared_view)) as EditorHandle)
     }
 
     pub fn note_on(&mut self, ch: u8, note: u8, vel: u8) { self.pending.push(note_on_event(ch, note, vel)); }
@@ -443,7 +973,11 @@ impl Vst3RealInstance {
         // Host event list for this block (moves the queued notes in).
         let evlist = ComWrapper::new(HostEventList { events: std::mem::take(&mut self.pending) });
         let ev_ptr = evlist.to_com_ptr::<IEventList>().map(|p| p.as_ptr()).unwrap_or(std::ptr::null_mut());
-        // Non-null (empty) parameter changes — required by some plugins.
+        // Everything the GUI (or a choz knob) changed since the last block, as
+        // real input automation. This is what makes a plugin's own window
+        // actually change the sound.
+        self.edits.drain(&mut self.edit_scratch);
+        self.param_changes.load(&self.edit_scratch);
         let pc_ptr = self.param_changes.to_com_ptr::<IParameterChanges>()
             .map(|p| p.as_ptr()).unwrap_or(std::ptr::null_mut());
 
@@ -475,36 +1009,70 @@ impl Vst3RealInstance {
 
     // ── Parameters (via IEditController) ────────────────────────────────────────
     pub fn param_count(&self) -> u32 {
-        self.controller.as_ref().map(|c| unsafe { c.getParameterCount() } as u32).unwrap_or(0)
+        self.param_ids.len() as u32
     }
-    pub fn get_param(&self, id: u32) -> f32 {
-        self.controller.as_ref().map(|c| unsafe { c.getParamNormalized(id) } as f32).unwrap_or(0.0)
+
+    /// The plugin's id for the parameter at `index`.
+    pub fn param_id(&self, index: u32) -> Option<u32> {
+        self.param_ids.get(index as usize).copied()
     }
-    pub fn set_param(&self, id: u32, value: f32) {
-        if let Some(c) = &self.controller { unsafe { c.setParamNormalized(id, value as f64); } }
+
+    /// Index of a parameter the plugin named by id — the direction a GUI edit
+    /// arrives in.
+    pub fn param_index(&self, id: u32) -> Option<u32> {
+        self.param_ids.iter().position(|&p| p == id).map(|i| i as u32)
     }
-    pub fn param_name(&self, id: u32) -> String {
-        let Some(c) = &self.controller else { return format!("P{id}") };
+
+    pub fn get_param(&self, index: u32) -> f32 {
+        let (Some(c), Some(id)) = (self.controller.as_ref(), self.param_id(index)) else {
+            return 0.0;
+        };
+        unsafe { c.getParamNormalized(id) as f32 }
+    }
+    /// Move a parameter from choz's side (a knob in the RACK, a MIDI-learn
+    /// binding, a project being loaded).
+    ///
+    /// Both halves have to hear about it: the controller so its window shows
+    /// the new position, and the processor so the sound follows. The second one
+    /// only happens through the block's input parameter changes.
+    pub fn set_param(&self, index: u32, value: f32) {
+        let Some(id) = self.param_id(index) else { return };
+        let v = value.clamp(0.0, 1.0) as f64;
+        if let Some(c) = &self.controller { unsafe { c.setParamNormalized(id, v); } }
+        self.edits.push(id, v);
+    }
+
+    /// The feed of edits coming from the plugin's own window, translated to
+    /// parameter indices. Handed to the UI so MIDI learn can bind whatever knob
+    /// the user just grabbed in the plugin's GUI, and so choz's own copy of the
+    /// values follows what happens in there.
+    pub fn edit_feed(&self) -> TouchByIndex {
+        TouchByIndex { feed: self.edits.clone(), ids: self.param_ids.clone() }
+    }
+    pub fn param_name(&self, index: u32) -> String {
+        let Some(c) = &self.controller else { return format!("P{index}") };
         let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
-        if unsafe { c.getParameterInfo(id as int32, &mut info) } == kResultOk {
+        if unsafe { c.getParameterInfo(index as int32, &mut info) } == kResultOk {
             w_arr_to_string(&info.title)
         } else {
-            format!("P{id}")
+            format!("P{index}")
         }
     }
     /// Unit label (e.g. "dB", "Hz") from the parameter's `units`.
-    pub fn param_label(&self, id: u32) -> String {
+    pub fn param_label(&self, index: u32) -> String {
         let Some(c) = &self.controller else { return String::new() };
         let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
-        if unsafe { c.getParameterInfo(id as int32, &mut info) } == kResultOk {
+        if unsafe { c.getParameterInfo(index as int32, &mut info) } == kResultOk {
             w_arr_to_string(&info.units)
         } else {
             String::new()
         }
     }
     /// Formatted display of the current value (via `getParamStringByValue`).
-    pub fn param_display(&self, id: u32) -> String {
-        let Some(c) = &self.controller else { return String::new() };
+    pub fn param_display(&self, index: u32) -> String {
+        let (Some(c), Some(id)) = (self.controller.as_ref(), self.param_id(index)) else {
+            return String::new();
+        };
         let norm = unsafe { c.getParamNormalized(id) };
         let mut s: String128 = unsafe { std::mem::zeroed() };
         if unsafe { c.getParamStringByValue(id, norm, &mut s) } == kResultOk {
@@ -547,6 +1115,13 @@ impl Vst3RealInstance {
 
 impl Drop for Vst3RealInstance {
     fn drop(&mut self) {
+        // Cut the editor thread loose first: past this it can no longer reach
+        // the view (or the controller behind it) we are about to terminate.
+        // Detaching is NOT done here: `removed()` on a view that was never
+        // attached trips a hard assert in DPF plugins, and the editor thread
+        // already calls `close()` on its way out. Releasing the view is enough.
+        drop(self.shared_view.lock().unwrap_or_else(|e| e.into_inner()).take());
+        drop(self.shared_state.lock().unwrap_or_else(|e| e.into_inner()).take());
         unsafe {
             self.processor.setProcessing(0);
             self.component.setActive(0);
@@ -630,4 +1205,55 @@ pub fn factory_info(path: &Path) -> Option<FactoryInfo> {
         }
     }
     Some(FactoryInfo { name, vendor, is_instrument })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The path a knob in the plugin's own window takes: `performEdit` on the
+    /// host handler, then the block's input parameter changes. If this queue
+    /// reports nothing, the GUI moves and the sound does not.
+    #[test]
+    fn a_gui_edit_reaches_the_next_process_block() {
+        let feed = EditFeed::default();
+        let handler = HostComponentHandler { feed: feed.clone() };
+        // SAFETY: plain data; no plugin involved.
+        unsafe {
+            handler.performEdit(7, 0.25);
+            handler.performEdit(9, 0.75);
+        }
+
+        let mut scratch = Vec::new();
+        feed.drain(&mut scratch);
+        assert_eq!(scratch, vec![(7, 0.25), (9, 0.75)]);
+
+        let changes = HostParamChanges::new();
+        changes.load(&scratch);
+        // SAFETY: same, the COM methods here only touch our own fields.
+        unsafe {
+            assert_eq!(changes.getParameterCount(), 2);
+            let queues = changes.queues.lock().unwrap();
+            assert_eq!(queues[1].getParameterId(), 9);
+            let (mut off, mut value) = (-1, 0.0);
+            assert_eq!(queues[1].getPoint(0, &mut off, &mut value), kResultOk);
+            assert_eq!((off, value), (0, 0.75));
+        }
+
+        // Draining leaves nothing behind: the next block must not re-apply it.
+        feed.drain(&mut scratch);
+        assert!(scratch.is_empty());
+    }
+
+    /// MIDI learn asks "what did the user just grab?". Reading consumes the
+    /// answer, so an old touch cannot bind a later CC.
+    #[test]
+    fn the_last_touched_parameter_is_reported_once() {
+        let feed = EditFeed::default();
+        assert_eq!(feed.take_last_touched(), None);
+        feed.push(3, 0.5);
+        feed.push(4, 0.5);
+        assert_eq!(feed.take_last_touched(), Some((4, 0.5)));
+        assert_eq!(feed.take_last_touched(), None);
+    }
 }
