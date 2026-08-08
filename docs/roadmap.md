@@ -91,7 +91,51 @@ tests**, `clippy --workspace --all-targets -D warnings` limpio.
    >
    > Referencia visual: Carla dibuja exactamente esto en su panel genérico.
 
-7. Nice-to-have: ruteo por canal MIDI *dentro* de un puerto en modo LIVE;
+7. **Empaquetado e instalación** (pedido 2026-08-08). Hoy sólo hay
+   `cargo build --release`; falta todo lo que convierte eso en algo instalable:
+
+   - **Un instalador que detecte la versión anterior, la desinstale y ponga la
+     nueva.** Concreto: `.deb` y `.rpm` (con `cargo-deb` / `cargo-generate-rpm`,
+     que ya hacen el reemplazo por versión con las dependencias declaradas) más
+     un `install.sh` para quien no use paquetes. El script tiene que mirar
+     `~/.local/bin/choz` y `/usr/local/bin/choz`, comparar `choz --version`
+     (**que aún no existe: hace falta la bandera**) y quitar la instalación
+     vieja antes de copiar. **Lo que nunca se toca al desinstalar**:
+     `~/.local/state/choz/` — los proyectos, las rutas de plugins y los ajustes
+     del usuario no son parte del paquete.
+   - **Artefactos por arquitectura en cada release**: `x86_64`, y **Raspberry
+     Pi** en `aarch64` (Pi 3/4/5, 64-bit) y `armv7` (Pi 2 y Zero 2 W en sistemas
+     de 32 bits). Se cruza con `cross`, y hay que comprobar dos cosas que en ARM
+     no son gratis: que ALSA/JACK abren con buffers pequeños sin xruns, y que el
+     escaneo de plugins encuentra algo — **los plugins son binarios nativos**, así
+     que una Pi sólo carga plugins compilados para ARM, no los `.so` de x86.
+   - **ESP32: no puede ejecutar choz, y conviene decirlo antes de intentarlo.**
+     Es un microcontrolador sin sistema operativo, con cientos de kilobytes de
+     RAM y sin `dlopen`; choz necesita las tres cosas (hostear plugins *es*
+     cargar código nativo en tiempo de ejecución). Lo que sí encaja, y sería
+     útil de verdad, es un ESP32 **como controlador de choz**: MIDI por USB, o
+     mandando OSC por WiFi al puerto que choz ya escucha (`/note`, `/mix/…`,
+     `/fx/…`). Eso funcionaría hoy sin tocar el código de choz — lo que falta es
+     el firmware de ejemplo y documentarlo. Decidir cuál de las dos cosas se
+     quiere antes de empezar.
+
+8. **choz como aplicación de escritorio** (pedido 2026-08-08): que salga en el
+   menú del sistema y se abra con un clic.
+
+   - Un `choz.desktop` (`Categories=AudioVideo;Audio;`) instalado en
+     `/usr/share/applications` o `~/.local/share/applications`, más un icono en
+     `hicolor`. choz es una TUI, así que hay dos caminos y hay que elegir:
+     `Terminal=true` (el escritorio abre su terminal por defecto, que puede no
+     ser la que el usuario quiere) o un lanzador propio que arranque una terminal
+     buena — **kitty primero**, porque es donde el fondo se ve a resolución real,
+     con `ghostty`/`wezterm`/`alacritty`/`xterm` como alternativas.
+   - El lanzador tiene que fijar un tamaño mínimo de ventana: por debajo de unas
+     100×30 celdas el RACK no cabe y la TUI se ve rota.
+   - Y asociar los proyectos: `application/x-choz-project` para `*.choz.yml`, de
+     modo que abrir un proyecto desde el gestor de archivos lance choz con él —
+     el binario ya acepta la ruta como argumento.
+
+9. Nice-to-have: ruteo por canal MIDI *dentro* de un puerto en modo LIVE;
    automatización; transporte propio (hoy el host VST2 responde 120 BPM fijos a
    `audioMasterGetTime`, marcado `ponytail:`).
 
