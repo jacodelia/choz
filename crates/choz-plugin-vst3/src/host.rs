@@ -659,6 +659,32 @@ fn note_off_event(ch: u8, note: u8) -> Event {
 }
 
 /// A live VST3 instrument instance.
+/// choz's clock as VST3 wants it, filled from [`choz_ports::transport`].
+///
+/// Only what choz actually knows is flagged valid: tempo, the musical position
+/// and 4/4. There is no arrangement here, so no bar position, no cycle and no
+/// SMPTE — a plugin reads a field only when its flag says it is there, and
+/// inventing a bar number is worse than not offering one.
+fn host_process_context() -> ProcessContext {
+    let t = choz_ports::transport();
+    // SAFETY: `ProcessContext` is a plain C struct of numbers; zero is its
+    // "nothing known" state, and every field choz knows is written below.
+    let mut ctx: ProcessContext = unsafe { std::mem::zeroed() };
+    ctx.sampleRate = t.sample_rate() as f64;
+    ctx.projectTimeSamples = t.samples() as TSamples;
+    ctx.continousTimeSamples = t.samples() as TSamples;
+    ctx.projectTimeMusic = t.ppq() as TQuarterNotes;
+    ctx.tempo = t.bpm() as f64;
+    ctx.timeSigNumerator = 4;
+    ctx.timeSigDenominator = 4;
+    ctx.state = ProcessContext_::StatesAndFlags_::kProjectTimeMusicValid
+        | ProcessContext_::StatesAndFlags_::kTempoValid
+        | ProcessContext_::StatesAndFlags_::kTimeSigValid
+        | ProcessContext_::StatesAndFlags_::kContTimeValid
+        | if t.playing() { ProcessContext_::StatesAndFlags_::kPlaying } else { 0 };
+    ctx
+}
+
 pub struct Vst3RealInstance {
     // NOTE: field order = drop order. The COM objects MUST release before the
     // library unloads (dlclose), so `_lib` is declared LAST — otherwise Release()
@@ -713,6 +739,11 @@ pub struct Vst3RealInstance {
 // SAFETY: COM pointers are used only from the single audio-loop thread that owns
 // this instance (mirrors the VST2 host's `unsafe impl Send`).
 unsafe impl Send for Vst3RealInstance {}
+
+/// Most steps worth asking a plugin to name, one `getParamStringByValue` call
+/// each. Beyond this a stepped parameter is a range to slide through, not a
+/// list of choices to pick from.
+const MAX_NAMED_STEPS: u32 = 32;
 
 impl Vst3RealInstance {
     pub fn load(path: &Path, sample_rate: u32, block: u32) -> Result<Self> {
@@ -981,6 +1012,10 @@ impl Vst3RealInstance {
         let pc_ptr = self.param_changes.to_com_ptr::<IParameterChanges>()
             .map(|p| p.as_ptr()).unwrap_or(std::ptr::null_mut());
 
+        // choz's clock. VST3 takes it by pointer per block, and a plugin that
+        // syncs anything reads it there; a null one (which is what this was)
+        // means "the host has no idea what time it is".
+        let mut context = host_process_context();
         let mut data = ProcessData {
             processMode: ProcessModes_::kRealtime as int32,
             symbolicSampleSize: SymbolicSampleSizes_::kSample32 as int32,
@@ -993,7 +1028,7 @@ impl Vst3RealInstance {
             outputParameterChanges: pc_ptr,
             inputEvents: ev_ptr,
             outputEvents: std::ptr::null_mut(),
-            processContext: std::ptr::null_mut(),
+            processContext: &mut context,
         };
         unsafe { self.processor.process(&mut data); }
 
@@ -1058,6 +1093,43 @@ impl Vst3RealInstance {
             format!("P{index}")
         }
     }
+    /// How many positions the parameter has, and their names when it has few
+    /// enough to name.
+    ///
+    /// VST3 counts *intervals*, not positions: `stepCount == 1` is a switch
+    /// with two of them, `n` has `n + 1`. `0` is continuous. The names come from
+    /// `getParamStringByValue`, which is the only way to learn that step 2 of a
+    /// filter-type parameter is called "Bandpass" — the value itself is a
+    /// normalised float like everything else.
+    pub fn param_steps(&self, index: u32) -> (u32, Vec<(f64, String)>) {
+        let Some(c) = &self.controller else { return (0, Vec::new()) };
+        let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
+        if unsafe { c.getParameterInfo(index as int32, &mut info) } != kResultOk {
+            return (0, Vec::new());
+        }
+        let steps = info.stepCount;
+        if steps <= 0 {
+            return (0, Vec::new());
+        }
+        let count = steps as u32 + 1;
+        // A switch draws as a switch and needs no names; a long list of steps
+        // is a fader, and asking a plugin for 128 strings on every load is not
+        // worth what it buys.
+        if count == 2 || count > MAX_NAMED_STEPS {
+            return (count, Vec::new());
+        }
+        let points = (0..count)
+            .filter_map(|k| {
+                let norm = k as f64 / steps as f64;
+                let mut s: String128 = unsafe { std::mem::zeroed() };
+                (unsafe { c.getParamStringByValue(info.id, norm, &mut s) } == kResultOk)
+                    .then(|| (norm, w_arr_to_string(&s)))
+                    .filter(|(_, label)| !label.is_empty())
+            })
+            .collect();
+        (count, points)
+    }
+
     /// Unit label (e.g. "dB", "Hz") from the parameter's `units`.
     pub fn param_label(&self, index: u32) -> String {
         let Some(c) = &self.controller else { return String::new() };
@@ -1255,5 +1327,44 @@ mod tests {
         feed.push(4, 0.5);
         assert_eq!(feed.take_last_touched(), Some((4, 0.5)));
         assert_eq!(feed.take_last_touched(), None);
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    /// A null `processContext` is what choz used to hand every VST3 plugin: it
+    /// means "the host does not know what time it is", and a tempo-synced delay
+    /// falls back to whatever it guesses. This is the same clock the VST2 host
+    /// answers with, in VST3's units.
+    #[test]
+    fn the_process_context_carries_the_host_clock() {
+        let t = choz_ports::transport();
+        t.set_sample_rate(48_000);
+        t.set_bpm(90.0);
+        t.set_playing(true);
+        t.rewind();
+        t.advance(48_000); // one second
+
+        let ctx = host_process_context();
+        assert_eq!(ctx.sampleRate, 48_000.0);
+        assert_eq!(ctx.projectTimeSamples, 48_000);
+        // One second at 90 BPM is a beat and a half.
+        assert!((ctx.projectTimeMusic - 1.5).abs() < 1e-9, "{}", ctx.projectTimeMusic);
+        assert_eq!(ctx.tempo, 90.0);
+        let flags = ProcessContext_::StatesAndFlags_::kTempoValid
+            | ProcessContext_::StatesAndFlags_::kProjectTimeMusicValid
+            | ProcessContext_::StatesAndFlags_::kPlaying;
+        assert_eq!(ctx.state & flags, flags);
+
+        t.set_playing(false);
+        assert_eq!(
+            host_process_context().state & ProcessContext_::StatesAndFlags_::kPlaying,
+            0,
+            "stopped means stopped"
+        );
+        t.set_bpm(choz_ports::Transport::DEFAULT_BPM);
+        t.rewind();
     }
 }

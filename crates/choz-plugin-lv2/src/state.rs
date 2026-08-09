@@ -14,7 +14,7 @@
 //! blocks like everyone else.
 
 use std::ffi::{CStr, CString};
-use std::os::raw::c_void;
+use std::os::raw::{c_char, c_void};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -118,6 +118,98 @@ fn uri_of(store: &Arc<Mutex<crate::UridStore>>, urid: u32) -> Option<String> {
     store.lock().uri(urid)
 }
 
+// ─── Paths (state:mapPath / state:freePath) ─────────────────────────────────
+//
+// A plugin that holds file paths — a sampler, a convolver, an IR loader — is
+// required to hand them through `abstract_path` before storing them, and a good
+// many refuse to save anything at all when the feature is missing. Both
+// directions return a string **the plugin owns**: it frees it with `free()`
+// unless the host also offers `state:freePath`, so the strings have to come
+// from `malloc` and not from Rust's allocator.
+//
+// ponytail: the mapping is the identity — what is stored is the absolute path.
+// Real hosts copy the file into the project's own directory so the project is
+// self-contained; choz's project is a single YAML file with nowhere to put a
+// 300 MB sample library, and a path that still works on this machine beats a
+// state the plugin refused to save. The day projects become directories, this
+// is the one place that has to change.
+
+/// A copy of `s` the plugin can hold and `free()`. Null if the string cannot be
+/// a C string at all, which the callers treat as "no path".
+fn dup_c(s: &CStr) -> *mut c_char {
+    let bytes = s.to_bytes_with_nul();
+    // SAFETY: a `malloc` of the exact length, then filled with exactly that
+    // many bytes, terminator included.
+    unsafe {
+        let out = libc::malloc(bytes.len()) as *mut c_char;
+        if out.is_null() {
+            return std::ptr::null_mut();
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, bytes.len());
+        out
+    }
+}
+
+unsafe extern "C" fn abstract_path_cb(_handle: *mut c_void, path: *const c_char) -> *mut c_char {
+    if path.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: the plugin passes a C string it owns for the duration of the call.
+    dup_c(unsafe { CStr::from_ptr(path) })
+}
+
+unsafe extern "C" fn absolute_path_cb(_handle: *mut c_void, path: *const c_char) -> *mut c_char {
+    if path.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: same contract as above.
+    dup_c(unsafe { CStr::from_ptr(path) })
+}
+
+unsafe extern "C" fn free_path_cb(_handle: *mut c_void, path: *mut c_char) {
+    if !path.is_null() {
+        // SAFETY: every string this host hands out comes from `dup_c`'s malloc.
+        unsafe { libc::free(path as *mut c_void) };
+    }
+}
+
+/// The two path features, alive for one `save` or `restore` call.
+///
+/// Everything the plugin sees points into a heap allocation — the boxes and the
+/// `CString`s — so moving this struct does not move anything under it.
+struct PathFeatures {
+    features: [LV2_Feature; 2],
+    _map: Box<LV2_State_Map_Path>,
+    _free: Box<LV2_State_Free_Path>,
+    _uris: [CString; 2],
+}
+
+impl PathFeatures {
+    fn new() -> Option<Self> {
+        let map_uri = CString::new(LV2_STATE_MAP_PATH_URI).ok()?;
+        let free_uri = CString::new(LV2_STATE_FREE_PATH_URI).ok()?;
+        let map = Box::new(LV2_State_Map_Path {
+            handle: std::ptr::null_mut(),
+            abstract_path: Some(abstract_path_cb),
+            absolute_path: Some(absolute_path_cb),
+        });
+        let free = Box::new(LV2_State_Free_Path {
+            handle: std::ptr::null_mut(),
+            free_path: Some(free_path_cb),
+        });
+        let features = [
+            LV2_Feature { uri: map_uri.as_ptr(), data: &*map as *const _ as *mut c_void },
+            LV2_Feature { uri: free_uri.as_ptr(), data: &*free as *const _ as *mut c_void },
+        ];
+        Some(Self { features, _map: map, _free: free, _uris: [map_uri, free_uri] })
+    }
+
+    /// The null-terminated list `save`/`restore` take.
+    fn list(&self) -> [*const LV2_Feature; 3] {
+        [&self.features[0], &self.features[1], std::ptr::null()]
+    }
+}
+
 /// `extension_data(state#interface)` of a live plugin.
 ///
 /// # Safety
@@ -142,7 +234,9 @@ impl choz_ports::PluginState for Lv2State {
         let save = unsafe { (*iface).save }?;
 
         let mut bag = Bag { props: Vec::new(), urids: Arc::clone(&cell.urids), lent: Vec::new() };
-        let features: [*const LV2_Feature; 1] = [std::ptr::null()];
+        // Without these a sampler stores nothing: the paths are half its state.
+        let paths = PathFeatures::new();
+        let features = paths.as_ref().map(|p| p.list()).unwrap_or([std::ptr::null(); 3]);
         // SAFETY: the plugin calls `store_cb` with our bag for the duration of
         // this call and not after it.
         let status = unsafe {
@@ -172,7 +266,8 @@ impl choz_ports::PluginState for Lv2State {
         let Some(restore) = (unsafe { (*iface).restore }) else { return };
 
         let mut bag = Bag { props, urids: Arc::clone(&cell.urids), lent: Vec::new() };
-        let features: [*const LV2_Feature; 1] = [std::ptr::null()];
+        let paths = PathFeatures::new();
+        let features = paths.as_ref().map(|p| p.list()).unwrap_or([std::ptr::null(); 3]);
         unsafe {
             restore(
                 cell.handle,
@@ -260,6 +355,46 @@ mod tests {
 
     fn prop(key: &str, ty: &str, value: &[u8]) -> Property {
         Property { key: key.into(), type_uri: ty.into(), flags: 3, value: value.to_vec() }
+    }
+
+    /// The strings the two path functions return belong to the plugin, which
+    /// frees them with `free()` — so they have to be `malloc`ed copies, never a
+    /// borrow of what was passed in and never a Rust allocation.
+    #[test]
+    fn a_mapped_path_is_the_plugins_own_malloc_copy() {
+        let src = CString::new("/home/user/samples/kick.wav").unwrap();
+        let null = std::ptr::null_mut();
+
+        let stored = unsafe { abstract_path_cb(null, src.as_ptr()) };
+        assert!(!stored.is_null());
+        assert_ne!(stored.cast_const(), src.as_ptr(), "the plugin must own it");
+        assert_eq!(unsafe { CStr::from_ptr(stored) }, src.as_c_str(), "stored as-is");
+
+        let back = unsafe { absolute_path_cb(null, stored) };
+        assert_eq!(unsafe { CStr::from_ptr(back) }, src.as_c_str(), "and read back as-is");
+
+        // Freed the way the plugin would, whichever of the two ways it uses.
+        unsafe { free_path_cb(null, back) };
+        unsafe { libc::free(stored as *mut c_void) };
+
+        // A plugin asking about nothing gets nothing, and freeing it is a no-op.
+        assert!(unsafe { abstract_path_cb(null, std::ptr::null()) }.is_null());
+        unsafe { free_path_cb(null, std::ptr::null_mut()) };
+    }
+
+    /// `save`/`restore` take a NULL-terminated array, and a plugin that walks
+    /// past the end of it reads whatever follows.
+    #[test]
+    fn the_path_features_are_offered_as_a_terminated_list() {
+        let paths = PathFeatures::new().expect("the two URIs are literals");
+        let list = paths.list();
+        assert!(list[2].is_null(), "terminated");
+        let uri = |f: *const LV2_Feature| unsafe { CStr::from_ptr((*f).uri) }.to_string_lossy().into_owned();
+        assert_eq!(uri(list[0]), LV2_STATE_MAP_PATH_URI);
+        assert_eq!(uri(list[1]), LV2_STATE_FREE_PATH_URI);
+        // The data pointers survive the move out of `new`.
+        let map = unsafe { &*((*list[0]).data as *const LV2_State_Map_Path) };
+        assert!(map.abstract_path.is_some() && map.absolute_path.is_some());
     }
 
     /// The blob is what ends up in the project file, so it has to survive the

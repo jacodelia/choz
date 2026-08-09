@@ -175,6 +175,45 @@ pub fn read_descriptors(path: &Path) -> Vec<ClapPluginInfo> {
     out
 }
 
+/// choz's transport as the event CLAP wants, filled from
+/// [`choz_ports::transport`].
+///
+/// Everything about a loop and a bar is left at zero and unflagged: choz has no
+/// arrangement, so claiming a bar number would be inventing one. What is true —
+/// tempo, position in beats and in seconds, and whether the transport is
+/// rolling — is flagged as valid, and a plugin reads only what is flagged.
+fn host_transport() -> clack_host::events::event_types::TransportEvent {
+    use clack_host::events::event_types::{TransportEvent, TransportFlags};
+    use clack_host::utils::{BeatTime, SecondsTime};
+
+    let t = choz_ports::transport();
+    let beats = t.ppq();
+    let seconds = t.samples() as f64 / t.sample_rate() as f64;
+    let mut flags = TransportFlags::HAS_TEMPO
+        | TransportFlags::HAS_BEATS_TIMELINE
+        | TransportFlags::HAS_SECONDS_TIMELINE
+        | TransportFlags::HAS_TIME_SIGNATURE;
+    if t.playing() {
+        flags |= TransportFlags::IS_PLAYING;
+    }
+    TransportEvent {
+        header: clack_host::events::EventHeader::new_core(0, clack_host::events::EventFlags::empty()),
+        flags,
+        song_pos_beats: BeatTime::from_float(beats),
+        song_pos_seconds: SecondsTime::from_float(seconds),
+        tempo: t.bpm() as f64,
+        tempo_inc: 0.0,
+        loop_start_beats: BeatTime::from_int(0),
+        loop_end_beats: BeatTime::from_int(0),
+        loop_start_seconds: SecondsTime::from_int(0),
+        loop_end_seconds: SecondsTime::from_int(0),
+        bar_start: BeatTime::from_int(0),
+        bar_number: 0,
+        time_signature_numerator: 4,
+        time_signature_denominator: 4,
+    }
+}
+
 // ── Live instrument ─────────────────────────────────────────────────────────
 
 /// Channels choz itself works in (interleaved stereo).
@@ -253,7 +292,12 @@ impl NoteRegistry {
 /// library and instantiates the plugin, so call it once when the FX is added,
 /// not per block.
 pub fn read_params(path: &Path, plugin_id: &str) -> Vec<crate::PluginParam> {
-    use clack_extensions::params::{ParamInfoBuffer, PluginParams};
+    use clack_extensions::params::{ParamInfoBuffer, ParamInfoFlags, PluginParams};
+
+    /// Most steps worth asking a plugin to name. Past this a stepped parameter
+    /// is a range to slide through, not a list of choices to pick from.
+    const MAX_NAMED_STEPS: u32 = 32;
+
 
     // SAFETY: external library load; clack handles the ABI.
     let Ok(entry) = (unsafe { PluginEntry::load(path) }) else { return Vec::new() };
@@ -281,12 +325,44 @@ pub fn read_params(path: &Path, plugin_id: &str) -> Vec<crate::PluginParam> {
         if info.max_value <= info.min_value {
             continue;
         }
+        // CLAP says outright whether a parameter has positions: `IS_STEPPED`
+        // means the value is truncated to an integer, so the range holds one
+        // step per whole number. Two of them is a switch.
+        let stepped = info.flags.contains(ParamInfoFlags::IS_STEPPED);
+        let steps = if stepped {
+            ((info.max_value - info.min_value).round() as i64 + 1).clamp(0, u32::MAX as i64) as u32
+        } else {
+            0
+        };
+        // Named steps, when there are few enough to be a list of choices —
+        // `value_to_text` is what turns step 2 into "Bandpass".
+        let mut points = Vec::new();
+        if (3..=MAX_NAMED_STEPS).contains(&steps) {
+            let mut text = [0u8; 128];
+            for k in 0..steps {
+                let value = info.min_value + k as f64;
+                let Ok(written) = params.value_to_text(&mut handle, info.id, value, &mut text) else {
+                    points.clear();
+                    break;
+                };
+                let label = String::from_utf8_lossy(written).trim_end_matches('\0').trim().to_string();
+                if label.is_empty() {
+                    points.clear();
+                    break;
+                }
+                points.push((value, label));
+            }
+        }
         out.push(crate::PluginParam {
             id: info.id.into(),
             name: String::from_utf8_lossy(info.name).trim_end_matches('\0').to_string(),
             min: info.min_value,
             max: info.max_value,
             default: info.default_value,
+            steps,
+            // CLAP has no unit field: the unit is baked into `value_to_text`.
+            unit: None,
+            points,
         });
     }
     out
@@ -489,13 +565,16 @@ impl ClapProc {
             channels: AudioPortBufferType::f32_output_only(port.iter_mut().map(|b| b.as_mut_slice())),
         }));
 
+        // choz's clock, so a tempo-synced plugin follows the host instead of
+        // guessing. Built per block from atomics: no allocation, no lock.
+        let transport = host_transport();
         let _ = proc.process(
             &input_audio,
             &mut output_audio,
             &input_events,
             &mut output_events,
             Some(*steady),
-            None,
+            Some(&transport),
         );
         *steady += frames as u64;
 
@@ -789,5 +868,36 @@ mod tests {
         assert_eq!(r.take(64), None);
         assert_eq!(r.take(60), Some(a));
         assert!(r.active.is_empty());
+    }
+
+    /// CLAP takes the transport as an event on every block; `None` there means
+    /// "free running", which is what choz used to say. Same clock as the VST2
+    /// and VST3 hosts, in CLAP's fixed-point beats.
+    #[test]
+    fn the_transport_event_carries_the_host_clock() {
+        use clack_host::events::event_types::TransportFlags;
+
+        let t = choz_ports::transport();
+        t.set_sample_rate(48_000);
+        t.set_bpm(90.0);
+        t.set_playing(true);
+        t.rewind();
+        t.advance(48_000); // one second
+
+        let ev = host_transport();
+        assert_eq!(ev.tempo, 90.0);
+        // One second at 90 BPM: a beat and a half, and one second of seconds.
+        assert!((ev.song_pos_beats.to_float() - 1.5).abs() < 1e-6);
+        assert!((ev.song_pos_seconds.to_float() - 1.0).abs() < 1e-6);
+        assert!(ev.flags.contains(TransportFlags::HAS_TEMPO));
+        assert!(ev.flags.contains(TransportFlags::IS_PLAYING));
+        // Nothing is claimed about an arrangement choz does not have.
+        assert!(!ev.flags.contains(TransportFlags::HAS_TIME_SIGNATURE) || ev.time_signature_numerator == 4);
+        assert_eq!(ev.bar_number, 0);
+
+        t.set_playing(false);
+        assert!(!host_transport().flags.contains(TransportFlags::IS_PLAYING));
+        t.set_bpm(choz_ports::Transport::DEFAULT_BPM);
+        t.rewind();
     }
 }

@@ -8,6 +8,8 @@ description = "LV2 plugin hosting for choz (pure-Rust TTL parser + the LV2 C ABI
 choz-ports.workspace = true
 anyhow.workspace = true
 libloading = "0.8"
+# `state:mapPath` hands the plugin strings it frees with `free()`.
+libc = "0.2"
 parking_lot.workspace = true
 # Pure-Rust Turtle (RDF) parser for LV2 manifest/plugin .ttl files.
 rio_turtle = "0.8"

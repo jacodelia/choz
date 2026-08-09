@@ -72,6 +72,60 @@ fn main() {
     a_killed_child_comes_back_by_itself();
     an_effect_processes_through_the_sandbox();
     a_plugin_the_user_asked_for_runs_out_of_process();
+    only_the_sandbox_offers_an_editor_choz_itself_refuses();
+}
+
+/// guitarix's X11 UIs segfault whatever loads them, so choz's own process is
+/// never offered one. A sandbox child is a process choz can afford to lose —
+/// there the editor comes back, and the host learns about it from the child
+/// rather than from its own (refusing) discovery.
+fn only_the_sandbox_offers_an_editor_choz_itself_refuses() {
+    let bundle = std::path::Path::new("/usr/lib/lv2/gxts9.lv2");
+    let uri = "http://guitarix.sourceforge.net/plugins/gxts9#ts9sim";
+    if !bundle.exists() {
+        eprintln!("guitarix not installed; skipping");
+        return;
+    }
+
+    // In here — choz's process — the bundle's editor is hidden.
+    let found = choz_plugin_lv2::discovery::discover_bundle(bundle);
+    let info = found.iter().find(|p| p.uri == uri).expect("gxts9 is in its bundle");
+    assert!(info.x11_ui.is_none(), "choz's own process must not be offered this UI");
+
+    // …which is exactly why it must not be hosted here: the probe child looks
+    // past the deny-list (asking is not opening), sees a window, and that alone
+    // sends the plugin to a process choz can afford to lose.
+    let state = std::env::temp_dir().join(format!("choz_gui_sbx_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&state);
+    std::fs::create_dir_all(&state).unwrap();
+    unsafe { std::env::set_var("XDG_STATE_HOME", &state) };
+    assert!(
+        choz_engine::quarantine::wants_sandbox(PluginFormat::Lv2, bundle, uri),
+        "a plugin with a window belongs in its own process"
+    );
+    let _ = std::fs::remove_dir_all(&state);
+
+    let plug = SandboxedPlugin::build(PluginFormat::Lv2, bundle, uri, SR, FRAMES)
+        .expect("gxts9 should load in its sandbox");
+    assert!(
+        choz_ports::AudioSource::editor(&plug).is_some(),
+        "the child can afford the UI, so the GUI button comes back"
+    );
+    drop(plug);
+
+    // The other half: a sandboxed plugin that has no window must not get a
+    // `GUI` button either, or pressing it opens an empty frame. Ardour's
+    // a-delay ships no X11 UI.
+    let plain = std::path::Path::new("/usr/lib/lv2/a-delay.lv2");
+    if plain.exists() {
+        let plug = SandboxedPlugin::build(PluginFormat::Lv2, plain, "urn:ardour:a-delay", SR, FRAMES)
+            .expect("a-delay should load in its sandbox");
+        assert!(
+            choz_ports::AudioSource::editor(&plug).is_none(),
+            "no window in the child means no button in the host"
+        );
+    }
+    println!("test only_the_sandbox_offers_an_editor_choz_itself_refuses ... ok");
 }
 
 /// The manual half of the policy: a plugin the probe found perfectly healthy
@@ -102,6 +156,14 @@ fn a_plugin_the_user_asked_for_runs_out_of_process() {
     };
     let build = || choz_engine::fx_chain::build_chain_from_specs(&[spec()], SR, FRAMES);
 
+    // ZamComp has a window, and a window is reason enough — so the manual half
+    // is only visible with the automatic one turned off.
+    assert!(
+        choz_engine::quarantine::wants_sandbox(PluginFormat::Vst2, path, ""),
+        "a plugin with a GUI is isolated on its own"
+    );
+    unsafe { std::env::set_var("CHOZ_SANDBOX_GUI", "0") };
+
     // Nothing wrong with it, so nothing sandboxes it on its own.
     assert!(!choz_engine::quarantine::wants_sandbox(PluginFormat::Vst2, path, ""));
     let chain = build();
@@ -125,6 +187,7 @@ fn a_plugin_the_user_asked_for_runs_out_of_process() {
 
     choz_engine::quarantine::set_forced(PluginFormat::Vst2, path, "", false);
     assert!(!choz_engine::quarantine::forced(PluginFormat::Vst2, path, ""));
+    unsafe { std::env::remove_var("CHOZ_SANDBOX_GUI") };
     let _ = std::fs::remove_dir_all(&state);
     println!("test a_plugin_the_user_asked_for_runs_out_of_process ... ok");
 }
@@ -234,7 +297,7 @@ fn a_plugin_that_cannot_be_destroyed_is_sandboxed_automatically() {
 
     let uri = "http://padthv1.sourceforge.net/lv2";
     assert_eq!(
-        choz_engine::quarantine::check(PluginFormat::Lv2, bundle, uri),
+        choz_engine::quarantine::check(PluginFormat::Lv2, bundle, uri).verdict,
         choz_engine::quarantine::Verdict::CrashesOnTeardown,
         "the probe should have caught it"
     );

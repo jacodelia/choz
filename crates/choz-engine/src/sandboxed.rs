@@ -169,12 +169,15 @@ impl SandboxedPlugin {
         self.status.clone()
     }
 
-    /// A `GUI` button for a plugin that lives in another process.
-    ///
-    /// Always offered: whether the plugin has a window is the child's business,
-    /// and it answers with no size when it has none. Asking is one round trip
-    /// through the region, not a load.
-    pub fn editor_handle(&self) -> choz_ports::EditorHandle {
+    /// A `GUI` button for a plugin that lives in another process — only when
+    /// the child reported that its plugin actually has a window. It answers
+    /// that before serving its first block, so by the time `build` returns the
+    /// answer is in.
+    pub fn editor_handle(&self) -> Option<choz_ports::EditorHandle> {
+        self.bridge.has_editor().unwrap_or(false).then(|| self.raw_editor_handle())
+    }
+
+    fn raw_editor_handle(&self) -> choz_ports::EditorHandle {
         // SAFETY: the link holds a clone of the mapping, so the region outlives
         // it however the instance ends.
         let link = unsafe { self.bridge.editor_link() };
@@ -365,7 +368,7 @@ impl AudioSource for SandboxedPlugin {
     }
 
     fn editor(&self) -> Option<choz_ports::EditorHandle> {
-        Some(self.editor_handle())
+        self.editor_handle()
     }
 }
 
@@ -429,7 +432,7 @@ impl crate::fx::FxProcessor for SandboxedEffect {
     }
 
     fn editor(&self) -> Option<choz_ports::EditorHandle> {
-        Some(self.inner.editor_handle())
+        self.inner.editor_handle()
     }
 }
 
@@ -487,6 +490,12 @@ fn serve_plugin(
     shm_name: &str,
     frames: u32,
 ) -> Result<()> {
+    // In here, a UI that segfaults costs a child process the supervisor will
+    // replace — which is exactly what the deny-list exists to avoid in choz's
+    // own process. So the plugins whose editors are refused there get theirs
+    // back here.
+    choz_plugin_lv2::allow_denied_uis(true);
+
     let shm = Shm::attach(shm_name, region_bytes(frames, CHANNELS))
         .context("cannot attach the shared audio region")?;
     // SAFETY: same size and layout the host created.
@@ -522,6 +531,9 @@ fn serve_plugin(
         .as_ref()
         .and_then(|s| s.editor())
         .or_else(|| effect.as_ref().and_then(|f| f.editor()));
+    // Say so before the first block: the host captures the editor handle as
+    // soon as `build` returns, and it has no other way to know.
+    sandbox.set_editor_present(editor.is_some());
     let mut window: Option<EditorThread> = None;
     let (size_tx, size_rx) = std::sync::mpsc::channel::<(u32, Option<(u16, u16)>)>();
 

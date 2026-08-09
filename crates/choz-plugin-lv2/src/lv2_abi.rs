@@ -307,3 +307,33 @@ pub struct LV2_State_Interface {
     >,
 }
 
+/// `state:mapPath`: turns a file path the plugin holds into one the host is
+/// willing to write down, and back. A plugin that keeps file paths — a sampler,
+/// a convolver — cannot save its state without it.
+pub const LV2_STATE_MAP_PATH_URI: &str = "http://lv2plug.in/ns/ext/state#mapPath";
+
+/// `state:freePath`: how to give back the strings the two functions above
+/// returned. Optional — a plugin that doesn't ask for it calls `free()`, which
+/// is why those strings must come from `malloc` and not from Rust's allocator.
+pub const LV2_STATE_FREE_PATH_URI: &str = "http://lv2plug.in/ns/ext/state#freePath";
+
+/// The `state:mapPath` feature data (`LV2_State_Map_Path`). **Both functions
+/// return a string the caller owns.**
+#[repr(C)]
+pub struct LV2_State_Map_Path {
+    pub handle: *mut c_void,
+    /// Absolute path → what the host stores.
+    pub abstract_path:
+        Option<unsafe extern "C" fn(handle: *mut c_void, absolute_path: *const c_char) -> *mut c_char>,
+    /// What the host stored → a path the plugin can open.
+    pub absolute_path:
+        Option<unsafe extern "C" fn(handle: *mut c_void, abstract_path: *const c_char) -> *mut c_char>,
+}
+
+/// The `state:freePath` feature data (`LV2_State_Free_Path`).
+#[repr(C)]
+pub struct LV2_State_Free_Path {
+    pub handle: *mut c_void,
+    pub free_path: Option<unsafe extern "C" fn(handle: *mut c_void, path: *mut c_char)>,
+}
+

@@ -1,0 +1,22 @@
+# Cross-compiling choz for the Raspberry Pi.
+#
+# `cross`'s images do not carry the target's ALSA and JACK headers, and choz
+# links both: without this the build dies in `alsa-sys`/`jack-sys` before it
+# compiles a line of choz. `$CROSS_DEB_ARCH` is the container's name for the
+# target architecture (arm64, armhf), which is what makes the `:arch` packages
+# resolve.
+#
+# Nothing else is needed: the plugin windows go through `x11rb`, which speaks
+# the X11 protocol itself and links no C library.
+
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update && apt-get install --assume-yes libasound2-dev:$CROSS_DEB_ARCH libjack-jackd2-dev:$CROSS_DEB_ARCH",
+]
+
+[target.armv7-unknown-linux-gnueabihf]
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update && apt-get install --assume-yes libasound2-dev:$CROSS_DEB_ARCH libjack-jackd2-dev:$CROSS_DEB_ARCH",
+]

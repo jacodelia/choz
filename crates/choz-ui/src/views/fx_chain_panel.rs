@@ -11,7 +11,7 @@ use ratatui::{
 };
 
 use crate::i18n::t;
-use crate::source::{AudioFxEntry, MAX_FX};
+use crate::source::{AudioFxEntry, MAX_FX, ParamShape};
 use crate::views::theme::{border as ui_border, text as ui_text};
 
 const HEADER: Color = Color::Rgb(240, 136, 62);
@@ -19,6 +19,10 @@ const LABEL: Color = Color::Rgb(120, 132, 155);
 const RULE: Color = Color::Rgb(38, 44, 54);
 const KNOB: Color = Color::Rgb(100, 160, 220);
 const SEL: Color = Color::Yellow;
+/// A switch reads as on or off at a glance, which is the whole reason it is not
+/// drawn as an arc.
+const ON_COLOUR: Color = Color::Rgb(86, 200, 120);
+const OFF_COLOUR: Color = Color::Rgb(96, 104, 118);
 
 pub const FX_CELL_W: u16 = 13;
 
@@ -119,9 +123,94 @@ pub fn knob_indicator(val: f32) -> char {
     }
 }
 
+/// The knob's arc, at eight positions per cell instead of one.
+///
+/// A terminal cell is the coarsest unit there is, so an eight-cell bar could
+/// only ever show eight positions — a filter cutoff moved by a hair looked
+/// exactly the same. The eighth-block glyphs (`▏▎▍▌▋▊▉█`) split each cell into
+/// eight, which is 64 positions in the same width and the closest a terminal
+/// gets to the angular resolution of a real knob.
 pub fn knob_arc(val: f32, width: usize) -> String {
-    let filled = (val.clamp(0.0, 1.0) * width as f32).round() as usize;
-    format!("{}{}", "\u{2593}".repeat(filled), "\u{2591}".repeat(width.saturating_sub(filled)))
+    const EIGHTHS: [char; 8] = ['\u{258F}', '\u{258E}', '\u{258D}', '\u{258C}', '\u{258B}', '\u{258A}', '\u{2589}', '\u{2588}'];
+    let eighths = (val.clamp(0.0, 1.0) * (width * 8) as f32).round() as usize;
+    let full = eighths / 8;
+    let rest = eighths % 8;
+    let mut out = String::with_capacity(width * 3);
+    for _ in 0..full.min(width) {
+        out.push('\u{2588}');
+    }
+    if full < width && rest > 0 {
+        out.push(EIGHTHS[rest - 1]);
+    }
+    let drawn = full.min(width) + usize::from(full < width && rest > 0);
+    for _ in drawn..width {
+        out.push('\u{2591}');
+    }
+    out
+}
+
+/// The cells of a **group**: three or more faders in a row sharing one unit.
+///
+/// That is an ADSR (four times), an EQ's band gains, a set of send levels — the
+/// case where seeing the *profile* beats reading four numbers. The grouping
+/// comes from the plugin too: the unit says these are the same kind of thing,
+/// and the order is the plugin's own. No name is read, so a plugin that calls
+/// its envelope A/D/S/R and one that calls it Attack/Decay/… group the same.
+///
+/// Returns one flag per parameter: draw it as a vertical bar, or as itself.
+pub fn fader_groups(shapes: &[ParamShape]) -> Vec<bool> {
+    const MIN_GROUP: usize = 3;
+    let mut grouped = vec![false; shapes.len()];
+    let mut i = 0;
+    while i < shapes.len() {
+        let ParamShape::Fader(unit) = &shapes[i] else {
+            i += 1;
+            continue;
+        };
+        let mut j = i + 1;
+        while j < shapes.len() && matches!(&shapes[j], ParamShape::Fader(u) if u == unit) {
+            j += 1;
+        }
+        if j - i >= MIN_GROUP {
+            grouped[i..j].fill(true);
+        }
+        i = j;
+    }
+    grouped
+}
+
+/// One column of a vertical fader bank, two rows tall: `(top, bottom)`.
+///
+/// Two cells of eighth-blocks are sixteen levels, and the point is not the
+/// number — it is that the bars next to each other draw the shape of the
+/// envelope (or the curve of the EQ) in one look.
+pub fn vertical_bar(val: f32, width: usize) -> (String, String) {
+    const EIGHTHS: [char; 8] = ['\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+    let eighths = (val.clamp(0.0, 1.0) * 16.0).round() as usize;
+    let cell = |e: usize| -> char {
+        match e {
+            0 => ' ',
+            n if n >= 8 => '\u{2588}',
+            n => EIGHTHS[n - 1],
+        }
+    };
+    // The bar grows upward: the bottom cell fills first.
+    let bottom = cell(eighths.min(8));
+    let top = cell(eighths.saturating_sub(8));
+    (top.to_string().repeat(width), bottom.to_string().repeat(width))
+}
+
+/// A horizontal fader: the whole travel, with the handle where the value is.
+///
+/// The difference from the arc is what it says about the parameter — a mix or a
+/// delay time is a distance covered, not a setting dialled in — so the track is
+/// drawn end to end and only the handle moves.
+pub fn fader_track(val: f32, width: usize) -> String {
+    let width = width.max(2);
+    let pos = (val.clamp(0.0, 1.0) * (width - 1) as f32).round() as usize;
+    (0..width)
+        .map(|i| if i == pos { '\u{25AE}' } else { '\u{2500}' })
+        .collect()
 }
 
 /// Active slot's mixer strip: gain (linear), pan (-1..1), mute, solo.
@@ -197,6 +286,9 @@ fn draw_knob_box(
     title: &str,
     values: &[f32],
     names: &[String],
+    // One shape per value, or empty for "all knobs" — which is what every
+    // built-in FX is, and what a plugin that reports nothing gets.
+    shapes: &[ParamShape],
     cursor: usize,
     focused: bool,
     max_rows: usize,
@@ -230,6 +322,9 @@ fn draw_knob_box(
         .style(bg);
     let param_inner = block.inner(box_rect);
     f.render_widget(block, box_rect);
+    // Runs of same-unit faders read as one instrument (an ADSR, a set of band
+    // gains), so they are drawn as a bank of vertical bars side by side.
+    let grouped = fader_groups(shapes);
 
     for row in 0..rows_shown {
         let ry = param_inner.y + (row * 3) as u16;
@@ -245,12 +340,48 @@ fn draw_knob_box(
             let val = values[pi];
             let is_p = pi == cursor && focused;
             rects.push((pi, Rect::new(param_inner.x + (col as u16) * FX_CELL_W, ry, FX_CELL_W, 3)));
+            let shape = shapes.get(pi).unwrap_or(&ParamShape::Continuous);
+            let cell = FX_CELL_W as usize;
+            // The control follows what the parameter is: a switch reads as on
+            // or off, a named step reads as its name, and everything else is
+            // the arc choz always drew.
+            let (top, bottom, top_colour) = match (shape, shape.step_at(val)) {
+                (ParamShape::Toggle, Some((k, _))) => {
+                    let on = k == 1;
+                    (
+                        format!("[  {}  ]", if on { " ON" } else { "OFF" }),
+                        String::new(),
+                        if on { ON_COLOUR } else { OFF_COLOUR },
+                    )
+                }
+                (ParamShape::Named(_), Some((k, n))) => (
+                    format!("\u{25C0}{}\u{25B6}", truncate(shape.label(k).unwrap_or("?"), cell - 3)),
+                    format!(" {}/{n}", k + 1),
+                    KNOB,
+                ),
+                // In a group the bar is vertical, and the two rows above the
+                // name are its height — the profile is what the eye reads.
+                (ParamShape::Fader(_), _) if grouped.get(pi).copied().unwrap_or(false) => {
+                    let (top, bottom) = vertical_bar(val, 5);
+                    (format!(" {top}"), format!(" {bottom} {val:4.2}"), KNOB)
+                }
+                (ParamShape::Fader(_), _) => (
+                    fader_track(val, 10),
+                    format!(" {val:4.2}"),
+                    KNOB,
+                ),
+                _ => (
+                    format!("[{}]", knob_arc(val, 8)),
+                    format!(" {}{val:4.2}", knob_indicator(val)),
+                    KNOB,
+                ),
+            };
             knob_spans.push(Span::styled(
-                format!("{:<width$}", format!("[{}]", knob_arc(val, 8)), width = FX_CELL_W as usize),
-                Style::default().fg(if is_p { SEL } else { KNOB }),
+                format!("{top:<cell$}"),
+                Style::default().fg(if is_p { SEL } else { top_colour }),
             ));
             val_spans.push(Span::styled(
-                format!("{:<width$}", format!(" {}{val:4.2}", knob_indicator(val)), width = FX_CELL_W as usize),
+                format!("{bottom:<cell$}"),
                 Style::default()
                     .fg(if is_p { SEL } else { ui_text() })
                     .add_modifier(if is_p { Modifier::BOLD } else { Modifier::empty() }),
@@ -299,7 +430,7 @@ pub fn draw_fx_chain_panel(
     // The instrument's own parameters: name and 0..1 position, in plugin order.
     // Carla's "generic UI": every plugin gets knobs whether or not it has a
     // window, so a CC can be learned without opening one.
-    instr_params: &[(String, f32)],
+    instr_params: &[(String, f32, ParamShape)],
     instr_cursor: usize,
     // Which of the two knob boxes the arrows and the highlight belong to.
     instr_focused: bool,
@@ -492,8 +623,9 @@ pub fn draw_fx_chain_panel(
 
     // ── Instrument parameters ──────────────────────────────────────────────
     if !instr_params.is_empty() {
-        let values: Vec<f32> = instr_params.iter().map(|(_, v)| *v).collect();
-        let names: Vec<String> = instr_params.iter().map(|(n, _)| n.clone()).collect();
+        let values: Vec<f32> = instr_params.iter().map(|(_, v, _)| *v).collect();
+        let names: Vec<String> = instr_params.iter().map(|(n, _, _)| n.clone()).collect();
+        let shapes: Vec<ParamShape> = instr_params.iter().map(|(_, _, s)| s.clone()).collect();
         let (rects, next) = draw_knob_box(
             f,
             inner,
@@ -508,6 +640,7 @@ pub fn draw_fx_chain_panel(
             ),
             &values,
             &names,
+            &shapes,
             instr_cursor,
             focused && instr_focused,
             INSTR_KNOB_ROWS,
@@ -586,6 +719,7 @@ pub fn draw_fx_chain_panel(
     // ── Selected FX: the same knob box, from the same helper ──────────────
     let descs = entry.param_descs();
     let names: Vec<String> = descs.iter().map(|d| d.name.to_string()).collect();
+    let shapes: Vec<ParamShape> = descs.iter().map(|d| d.shape.clone()).collect();
     let (rects, next) = draw_knob_box(
         f,
         inner,
@@ -593,6 +727,7 @@ pub fn draw_fx_chain_panel(
         &format!("{}:{}", fx_slot + 1, entry.label()),
         &entry.params,
         &names,
+        &shapes,
         fx_param,
         focused && !instr_focused,
         usize::MAX,

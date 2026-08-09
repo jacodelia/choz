@@ -341,6 +341,10 @@ impl AudioEngine {
     /// 3. If none work, return installation hints.
     pub fn start(&mut self) -> Result<()> {
         let sound_server = detect_sound_server();
+        // A position in frames means nothing once the frames change length, so
+        // opening a stream is also where the host clock is told its rate (and
+        // rewound).
+        choz_ports::transport().set_sample_rate(self.sample_rate);
 
         // The native JACK client comes first: it is the only backend that can
         // address every channel of the interface, which is what per-slot output
@@ -1208,6 +1212,11 @@ impl RtState {
             ch[..n].fill(0.0);
         }
         let playing = playing.load(Ordering::Relaxed);
+        // The host clock every plugin that syncs anything reads: it has to move
+        // with the audio, so it is advanced here and nowhere else.
+        let transport = choz_ports::transport();
+        transport.set_playing(playing);
+        transport.advance(frames);
         let n = (frames * 2).min(scratch.len());
         let sr = *sample_rate;
 
@@ -1479,7 +1488,7 @@ fn refuse_if_quarantined(
     path: &std::path::Path,
     id: &str,
 ) -> Result<()> {
-    let verdict = crate::quarantine::check(format, path, id);
+    let verdict = crate::quarantine::check(format, path, id).verdict;
     // It plays, it just can't be destroyed: tell the host crate to leak it
     // rather than take the app down when the tab is removed.
     if verdict == crate::quarantine::Verdict::CrashesOnTeardown

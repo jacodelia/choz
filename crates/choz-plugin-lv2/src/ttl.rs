@@ -42,6 +42,20 @@ pub const UI_BINARY: &str = "http://lv2plug.in/ns/extensions/ui#binary";
 pub const UI_UI: &str = "http://lv2plug.in/ns/extensions/ui#ui";
 pub const LV2_APPLIES_TO: &str = "http://lv2plug.in/ns/lv2core#appliesTo";
 
+// What kind of control a port is, which is what decides whether the UI draws a
+// knob, a switch or a named list.
+pub const LV2_PORT_PROPERTY: &str = "http://lv2plug.in/ns/lv2core#portProperty";
+pub const LV2_TOGGLED: &str = "http://lv2plug.in/ns/lv2core#toggled";
+pub const LV2_INTEGER: &str = "http://lv2plug.in/ns/lv2core#integer";
+pub const LV2_ENUMERATION: &str = "http://lv2plug.in/ns/lv2core#enumeration";
+/// `lv2:scalePoint [ rdfs:label "Sine" ; rdf:value 0 ]` — the names of the steps.
+pub const LV2_SCALE_POINT: &str = "http://lv2plug.in/ns/lv2core#scalePoint";
+pub const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
+pub const RDF_VALUE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#value";
+/// `units:unit`, and the symbol on the unit itself when the bundle inlines one.
+pub const UNITS_UNIT: &str = "http://lv2plug.in/ns/extensions/units#unit";
+pub const UNITS_SYMBOL: &str = "http://lv2plug.in/ns/extensions/units#symbol";
+
 /// Monotonic salt source for namespacing blank-node labels across parsed files.
 static NEXT_BLANK_SALT: AtomicU64 = AtomicU64::new(0);
 

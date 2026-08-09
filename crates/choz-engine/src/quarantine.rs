@@ -22,9 +22,10 @@ use serde::{Deserialize, Serialize};
 use crate::paths::PluginFormat;
 
 /// How a plugin behaved when it was tried on its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Verdict {
     /// Instantiated, processed and tore down cleanly.
+    #[default]
     Ok,
     /// Died before it ever produced audio. choz refuses to load these.
     CrashesOnLoad,
@@ -79,6 +80,25 @@ const STAGE_STARTED: &str = "started";
 const STAGE_LOADED: &str = "loaded";
 const STAGE_DONE: &str = "done";
 
+/// Appended to a stage once the child knows the plugin has a window. The probe
+/// only *asks* for the handle — opening the thing is what is dangerous, and the
+/// whole point of the answer is that choz never has to do it in its own process.
+const GUI_MARK: &str = " gui";
+
+/// What one probe found out about a plugin: how it behaved, and whether it has
+/// a window at all.
+///
+/// The verdict alone stopped being enough once the editor mattered: a plugin
+/// whose GUI segfaults processes audio perfectly, so the probe calls it `Ok` and
+/// nothing isolates it — until the user presses `GUI` and takes choz with it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Report {
+    pub verdict: Verdict,
+    /// The plugin offers its own window.
+    #[serde(default)]
+    pub editor: bool,
+}
+
 fn cache_path() -> PathBuf {
     crate::cache::state_dir().join("plugin-verdicts.json")
 }
@@ -88,14 +108,17 @@ fn key(format: PluginFormat, path: &Path, id: &str) -> String {
     format!("{}|{}|{id}", format.label(), path.display())
 }
 
-fn load_cache() -> HashMap<String, Verdict> {
+/// A file written before [`Report`] existed holds bare verdicts and no longer
+/// parses; it is dropped whole and every plugin is probed once more, which is
+/// what has to happen anyway to learn about its window.
+fn load_cache() -> HashMap<String, Report> {
     std::fs::read(cache_path())
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
 }
 
-fn save_cache(cache: &HashMap<String, Verdict>) {
+fn save_cache(cache: &HashMap<String, Report>) {
     let path = cache_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -109,37 +132,41 @@ fn save_cache(cache: &HashMap<String, Verdict>) {
 ///
 /// Never fails: if a child can't be spawned the answer is [`Verdict::Ok`], which
 /// is exactly the behaviour choz had before any of this existed.
-pub fn check(format: PluginFormat, path: &Path, id: &str) -> Verdict {
+pub fn check(format: PluginFormat, path: &Path, id: &str) -> Report {
     let k = key(format, path, id);
     let mut cache = load_cache();
-    if let Some(v) = cache.get(&k) {
-        return *v;
+    if let Some(r) = cache.get(&k) {
+        return *r;
     }
     // Worst of N: the crashes worth catching are races, and a single sample
     // that comes back clean is what silently un-sandboxes a plugin that kills
     // the app two out of three times.
-    let mut verdict = Verdict::Ok;
+    let mut report = Report::default();
     for _ in 0..probe_runs() {
-        let v = probe(format, path, id);
-        if v.severity() > verdict.severity() {
-            verdict = v;
+        let r = probe(format, path, id);
+        if r.verdict.severity() > report.verdict.severity() {
+            report.verdict = r.verdict;
         }
+        // A run that died before loading saw no window; one that got there did.
+        report.editor |= r.editor;
         // Nothing worse to find, and the answer is already the strictest one.
-        if verdict == Verdict::CrashesOnLoad || NOT_A_WORKER.load(std::sync::atomic::Ordering::Relaxed)
+        if report.verdict == Verdict::CrashesOnLoad
+            || NOT_A_WORKER.load(std::sync::atomic::Ordering::Relaxed)
         {
             break;
         }
     }
-    if verdict != Verdict::Ok {
+    if report.verdict != Verdict::Ok {
         eprintln!(
-            "choz: {} {} is quarantined: {verdict:?}",
+            "choz: {} {} is quarantined: {:?}",
             format.label(),
-            path.display()
+            path.display(),
+            report.verdict
         );
     }
-    cache.insert(k, verdict);
+    cache.insert(k, report);
     save_cache(&cache);
-    verdict
+    report
 }
 
 /// Forget every verdict, so the next load probes again. For the user who has
@@ -194,9 +221,26 @@ pub fn set_forced(format: PluginFormat, path: &Path, id: &str, on: bool) {
 }
 
 /// Whether this plugin should be hosted out of process: because the user said
-/// so, or because the probe saw it die on the way out.
+/// so, because the probe saw it die on the way out, or because it has a window.
+///
+/// A window is a reason on its own. Plugin GUIs are the least trustworthy code
+/// choz runs — guitarix's 31 X11 UIs segfault whatever loads them, and the
+/// deny-list that hides them only exists because there was nowhere safe to open
+/// them. There is now: the plugin that owns the window also owns the process
+/// that dies with it, and the supervisor puts a new one back.
+///
+/// `CHOZ_SANDBOX_GUI=0` turns this half off for whoever would rather pay the
+/// crash than the extra process.
 pub fn wants_sandbox(format: PluginFormat, path: &Path, id: &str) -> bool {
-    forced(format, path, id) || check(format, path, id) == Verdict::CrashesOnTeardown
+    if forced(format, path, id) {
+        return true;
+    }
+    let report = check(format, path, id);
+    report.verdict == Verdict::CrashesOnTeardown || (report.editor && sandbox_guis())
+}
+
+fn sandbox_guis() -> bool {
+    std::env::var("CHOZ_SANDBOX_GUI").map(|v| v != "0").unwrap_or(true)
 }
 
 /// Set once a spawned child turns out not to understand the probe flag, so a
@@ -204,13 +248,23 @@ pub fn wants_sandbox(format: PluginFormat, path: &Path, id: &str) -> bool {
 /// spawn instead of one per plugin.
 static NOT_A_WORKER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn probe(format: PluginFormat, path: &Path, id: &str) -> Verdict {
+/// Split what the child left behind into the stage it reached and whether it
+/// had found a window by then. A crash before loading leaves no mark and the
+/// answer is "no window seen", which is the truth.
+fn read_stage(written: &str) -> (&str, bool) {
+    match written.strip_suffix(GUI_MARK) {
+        Some(stage) => (stage, true),
+        None => (written, false),
+    }
+}
+
+fn probe(format: PluginFormat, path: &Path, id: &str) -> Report {
     // A worker never probes: it *is* the probe, or the sandbox that already
     // knows what it is loading.
     if crate::is_worker() || NOT_A_WORKER.load(std::sync::atomic::Ordering::Relaxed) {
-        return Verdict::Ok;
+        return Report::default();
     }
-    let Ok(exe) = std::env::current_exe() else { return Verdict::Ok };
+    let Ok(exe) = std::env::current_exe() else { return Report::default() };
     // The child writes its progress here, so the directory has to exist before
     // it starts: a failed write looks exactly like "this binary is not a probe
     // worker", and every plugin would come back Ok.
@@ -228,9 +282,10 @@ fn probe(format: PluginFormat, path: &Path, id: &str) -> Verdict {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit())
         .status();
-    let stage = std::fs::read_to_string(&out).unwrap_or_default();
+    let written = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
-    match spawned {
+    let (stage, editor) = read_stage(&written);
+    let verdict = match spawned {
         // The child never wrote anything: it isn't a probe worker at all (a
         // test binary, say), so assume the plugin is fine and stop asking.
         Ok(_) if stage.is_empty() => {
@@ -241,7 +296,8 @@ fn probe(format: PluginFormat, path: &Path, id: &str) -> Verdict {
         Ok(_) if stage == STAGE_LOADED => Verdict::CrashesOnTeardown,
         Ok(_) => Verdict::CrashesOnLoad,
         Err(_) => Verdict::Ok,
-    }
+    };
+    Report { verdict, editor }
 }
 
 /// The child side: load the named plugin, run it, drop it, recording how far it
@@ -256,8 +312,14 @@ pub fn probe_worker_main() -> bool {
     }
     let Some(format) = PluginFormat::from_label(&args[2]) else { return true };
     let (path, id, out) = (Path::new(&args[3]), args[4].as_str(), &args[5]);
+    // Asking whether a UI exists is not loading it, and the answer is what puts
+    // the dangerous ones behind a process boundary. Hiding them here would keep
+    // the very plugins the deny-list is about out of the sandbox.
+    choz_plugin_lv2::allow_denied_uis(true);
+    let gui = std::cell::Cell::new(false);
     let mark = |stage: &str| {
-        let _ = std::fs::write(out, stage);
+        let text = if gui.get() { format!("{stage}{GUI_MARK}") } else { stage.to_string() };
+        let _ = std::fs::write(out, text);
     };
 
     mark(STAGE_STARTED);
@@ -279,6 +341,7 @@ pub fn probe_worker_main() -> bool {
             block,
         );
         if let Some(fx) = fx.as_mut() {
+            gui.set(fx.editor().is_some());
             mark(STAGE_LOADED);
             for _ in 0..2 {
                 fx.process_block(&mut buf, sr);
@@ -288,6 +351,7 @@ pub fn probe_worker_main() -> bool {
         mark(STAGE_DONE);
         return true;
     }
+    gui.set(source.as_ref().is_some_and(|s| s.editor().is_some()));
     mark(STAGE_LOADED);
     if let Some(src) = source.as_mut() {
         src.note_on(60, 100);
@@ -331,6 +395,29 @@ mod tests {
             worst(&[Verdict::CrashesOnTeardown, Verdict::CrashesOnLoad]),
             Verdict::CrashesOnLoad,
         );
+    }
+
+    /// The child says two things in one file, and a crash truncates it after
+    /// whichever mark it had reached.
+    #[test]
+    fn the_stage_file_carries_the_window_answer_with_the_stage() {
+        assert_eq!(read_stage("done"), ("done", false));
+        assert_eq!(read_stage("done gui"), ("done", true));
+        assert_eq!(read_stage("loaded gui"), ("loaded", true), "died on teardown, has a UI");
+        assert_eq!(read_stage("started"), ("started", false), "never got far enough to know");
+        assert_eq!(read_stage(""), ("", false), "not a probe worker at all");
+    }
+
+    /// The verdict is not the only reason to isolate a plugin: a window is one
+    /// on its own, and the cache has to remember it for the next load.
+    #[test]
+    fn a_report_survives_the_cache_with_its_window_flag() {
+        let r = Report { verdict: Verdict::Ok, editor: true };
+        let json = serde_json::to_vec(&r).unwrap();
+        assert_eq!(serde_json::from_slice::<Report>(&json).unwrap(), r);
+        // Written before the flag existed: no field, and nothing is claimed.
+        let old: Report = serde_json::from_str(r#"{"verdict":"Ok"}"#).unwrap();
+        assert!(!old.editor);
     }
 
     #[test]

@@ -47,6 +47,17 @@ pub struct Port {
     pub default: f32,
     pub min: f32,
     pub max: f32,
+    /// `lv2:portProperty lv2:toggled` — an on/off switch, not a knob at 0.00.
+    pub toggled: bool,
+    /// `lv2:portProperty lv2:enumeration` — only the [`Port::points`] values
+    /// are meaningful; everything between them is not a position at all.
+    pub enumeration: bool,
+    /// `lv2:portProperty lv2:integer` — whole numbers only.
+    pub integer: bool,
+    /// `lv2:scalePoint`s, sorted by value: the names of the steps.
+    pub points: Vec<(f32, String)>,
+    /// `units:unit`, as a symbol to show next to the value.
+    pub unit: Option<String>,
 }
 
 /// An X11 editor shipped in the same bundle as the plugin.
@@ -93,8 +104,30 @@ pub const SUPPORTED_UI_FEATURES: &[&str] = &[
 /// ponytail: a name list is the same blunt instrument the Carla deny-list is,
 /// and for the same reason — the crash happens *inside* the plugin, so there is
 /// nothing to check for beforehand. The real fix is running editors in the
-/// sandbox that already exists for DSP; see "Pendiente" in docs/roadmap.md.
+/// sandbox that already exists for DSP — which is what happens now: the load
+/// probe sees the window, `quarantine::wants_sandbox` isolates the plugin for
+/// that reason alone, and the child lifts this list. What is left here is the
+/// last line of defence for whoever turns that policy off.
 const UI_DENY_PREFIXES: &[&str] = &["http://guitarix.sourceforge.net/plugins/"];
+
+/// Set by a process that can afford the crash — the plugin sandbox, where a
+/// dying UI costs a child the supervisor replaces. Process-wide because
+/// discovery runs deep inside the load path and the whole process is either
+/// choz or a sandbox child, never both.
+static ALLOW_DENIED_UIS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Offer editors that [`UI_DENY_PREFIXES`] would otherwise hide. Only sound in
+/// a process whose death is survivable.
+pub fn allow_denied_uis(yes: bool) {
+    ALLOW_DENIED_UIS.store(yes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `plugin_uri`'s editor is refused in this process.
+fn ui_denied(plugin_uri: &str) -> bool {
+    !ALLOW_DENIED_UIS.load(std::sync::atomic::Ordering::Relaxed)
+        && UI_DENY_PREFIXES.iter().any(|p| plugin_uri.starts_with(p))
+}
 
 /// A discovered LV2 plugin: identity, binary, classification, and ports.
 #[derive(Debug, Clone)]
@@ -213,7 +246,7 @@ fn parse_plugin(graph: &Graph, uri: &str, bundle_dir: &Path, binary_path: PathBu
 /// fallback is what covers DPF bundles (Zam, Dragonfly), where the UI is named
 /// `<plugin>#DPF_UI` and nothing states the relation at all.
 fn find_x11_ui(graph: &ttl::Graph, plugin_uri: &str) -> Option<Lv2UiInfo> {
-    if UI_DENY_PREFIXES.iter().any(|p| plugin_uri.starts_with(p)) {
+    if ui_denied(plugin_uri) {
         return None;
     }
     let x11: Vec<String> = graph.subjects_of_type(ttl::UI_X11UI);
@@ -328,6 +361,34 @@ fn parse_port(graph: &Graph, pid: &str) -> Port {
         .and_then(|n| n.as_str().parse::<f32>().ok())
         .unwrap_or(1.0);
 
+    // What sort of control this is. Taken from the plugin and nowhere else: a
+    // name that reads like a switch is a guess, `lv2:toggled` is a statement.
+    let props: Vec<&str> =
+        graph.objects(pid, ttl::LV2_PORT_PROPERTY).iter().map(|n| n.as_str()).collect();
+    let has = |p: &str| props.contains(&p);
+
+    let mut points: Vec<(f32, String)> = graph
+        .objects(pid, ttl::LV2_SCALE_POINT)
+        .iter()
+        .filter_map(|n| {
+            let sp = n.as_str();
+            let value = graph.object(sp, ttl::RDF_VALUE)?.as_str().parse::<f32>().ok()?;
+            let label = graph.object(sp, ttl::RDFS_LABEL)?.as_str().to_string();
+            (!label.is_empty()).then_some((value, label))
+        })
+        .collect();
+    points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // The unit is usually a shared IRI (`units:hz`) whose symbol lives in the
+    // units bundle, which is not parsed here — so the fragment is the fallback.
+    let unit = graph.object(pid, ttl::UNITS_UNIT).and_then(|n| {
+        let node = n.as_str();
+        graph
+            .object(node, ttl::UNITS_SYMBOL)
+            .map(|s| s.as_str().to_string())
+            .or_else(|| node.rsplit('#').next().filter(|f| !f.is_empty()).map(str::to_string))
+    });
+
     Port {
         index,
         symbol,
@@ -337,6 +398,11 @@ fn parse_port(graph: &Graph, pid: &str) -> Port {
         default,
         min,
         max,
+        toggled: has(ttl::LV2_TOGGLED),
+        enumeration: has(ttl::LV2_ENUMERATION),
+        integer: has(ttl::LV2_INTEGER),
+        points,
+        unit,
     }
 }
 
@@ -346,5 +412,25 @@ fn node_to_path(node: &Node) -> Option<PathBuf> {
     match node {
         Node::Iri(iri) => ttl::file_uri_to_path(iri),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The UI deny-list is a property of the *process*, not of the plugin: in
+    /// choz it hides the editors that segfault, and inside a sandbox child —
+    /// which the supervisor replaces when it dies — it must not.
+    #[test]
+    fn the_ui_deny_list_lifts_inside_a_sandbox() {
+        let guitarix = "http://guitarix.sourceforge.net/plugins/gx_amp#GUITARIX";
+        assert!(ui_denied(guitarix), "denied in choz's own process");
+        assert!(!ui_denied("urn:zam:ZamComp"), "everything else is offered");
+
+        allow_denied_uis(true);
+        assert!(!ui_denied(guitarix), "offered where the crash is survivable");
+        allow_denied_uis(false);
+        assert!(ui_denied(guitarix));
     }
 }

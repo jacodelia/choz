@@ -31,6 +31,11 @@ fn main() {
         .and_then(|n| n.parse().ok())
         .unwrap_or(0);
     let mapped = args.iter().any(|a| a == "--mapped");
+    // This process exists to be killed by a plugin, so it is the one place the
+    // UI deny-list has nothing to protect: hiding guitarix's editors here would
+    // only hide what the sweep is for. (choz's own process keeps them hidden;
+    // the sandbox child is the other process allowed to look.)
+    choz_plugin_lv2::allow_denied_uis(true);
     // `--limit N` stops after N UIs, so a sweep can be run in slices of fresh
     // processes instead of one that loads hundreds of libraries without ever
     // unloading them. (Measured: slicing changed none of the numbers here, so
@@ -99,16 +104,29 @@ fn main() {
                 continue;
             };
             ed.open(win as u64);
-            ed.idle();
             use x11rb::connection::Connection as _;
             use x11rb::protocol::xproto::ConnectionExt as _;
-            conn.flush().unwrap();
-            let kids = conn
-                .query_tree(win)
-                .unwrap()
-                .reply()
-                .map(|r| r.children.len())
-                .unwrap_or(0);
+            // A UI does not always have its window by the time `open` returns:
+            // several toolkits create it on the first turn of their own loop.
+            // Asking once made the answer a coin toss — the same plugin came
+            // back `ok` and `SINVENTANA` in consecutive runs — so the probe
+            // pumps `idle` and waits for the child, up to a deadline.
+            let mut kids = 0;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            while std::time::Instant::now() < deadline {
+                ed.idle();
+                conn.flush().unwrap();
+                kids = conn
+                    .query_tree(win)
+                    .unwrap()
+                    .reply()
+                    .map(|r| r.children.len())
+                    .unwrap_or(0);
+                if kids > 0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
             ed.close();
             if kids > 0 {
                 opened += 1;

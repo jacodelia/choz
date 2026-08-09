@@ -72,11 +72,22 @@ pub struct Header {
     /// Size the plugin asked for, packed `width << 16 | height`. Zero when it
     /// did not report one (or has no editor at all).
     pub editor_size: AtomicU32,
+    /// What the child found once the plugin was loaded: [`EDITOR_UNKNOWN`],
+    /// [`EDITOR_NONE`] or [`EDITOR_PRESENT`]. Without it the host would offer a
+    /// `GUI` button for every sandboxed plugin and open an empty frame for the
+    /// ones that have no window — the host cannot see the plugin itself, and at
+    /// the moment it captures the handle the child is still loading.
+    pub editor_present: AtomicU32,
 }
 
 /// `editor_cmd` values.
 pub const EDITOR_CLOSE: u32 = 0;
 pub const EDITOR_OPEN: u32 = 1;
+
+/// `editor_present` values.
+pub const EDITOR_UNKNOWN: u32 = 0;
+pub const EDITOR_NONE: u32 = 1;
+pub const EDITOR_PRESENT: u32 = 2;
 
 /// MIDI messages that fit in one block. Beyond this the newest are dropped —
 /// the host side is realtime and must not grow anything.
@@ -257,6 +268,16 @@ impl Host {
         self.missed
     }
 
+    /// Whether the loaded plugin has a window, as reported by the child.
+    /// `None` until it has answered its first block — after that it is settled.
+    pub fn has_editor(&self) -> Option<bool> {
+        match self.region.header().editor_present.load(Ordering::Acquire) {
+            EDITOR_PRESENT => Some(true),
+            EDITOR_NONE => Some(false),
+            _ => None,
+        }
+    }
+
     /// Ask the child to exit at its next wake-up.
     pub fn stop(&self) {
         let h = self.region.header();
@@ -318,6 +339,16 @@ impl Sandbox {
         let parent = h.editor_parent.load(Ordering::Relaxed);
         let open = h.editor_cmd.load(Ordering::Relaxed) == EDITOR_OPEN;
         Some((seq, (open && parent != 0).then_some(parent)))
+    }
+
+    /// Tell the host whether the plugin it asked for has a window. Called once,
+    /// right after loading and before the first block is served, so the host
+    /// knows by the time `build` returns.
+    pub fn set_editor_present(&self, present: bool) {
+        self.region
+            .header()
+            .editor_present
+            .store(if present { EDITOR_PRESENT } else { EDITOR_NONE }, Ordering::Release);
     }
 
     /// Answer the request `seq`, with the size the plugin asked for.
@@ -475,6 +506,22 @@ mod tests {
         assert_eq!(parent, None, "a close carries no window");
         child.editor_done(seq, None);
         assert_eq!(closed.join().unwrap(), None);
+    }
+
+    /// A sandboxed plugin without a window must not get a `GUI` button, and the
+    /// host has no way to look — only the child's answer.
+    #[test]
+    fn the_child_says_whether_its_plugin_has_a_window() {
+        let (frames, channels) = (8u32, 2u32);
+        let mut buf = vec![0u8; region_bytes(frames, channels)];
+        let host = unsafe { Host::create(buf.as_mut_ptr(), frames, channels, 48_000) };
+        let child = unsafe { Sandbox::attach(buf.as_mut_ptr(), frames, channels) };
+
+        assert_eq!(host.has_editor(), None, "not loaded yet");
+        child.set_editor_present(false);
+        assert_eq!(host.has_editor(), Some(false));
+        child.set_editor_present(true);
+        assert_eq!(host.has_editor(), Some(true));
     }
 
     /// Both ends in one process, on a plain buffer: the algorithm doesn't care

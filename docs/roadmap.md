@@ -3,144 +3,63 @@
 Qué falta. Lo hecho está en [CHANGELOG.md](../CHANGELOG.md), día por día; cómo
 encajan las piezas, en [architecture.md](architecture.md).
 
-Última actualización: 2026-08-08.
+Última actualización: 2026-08-09.
 
 ## Estado en una línea
 
 Los seis formatos de plugin (CLAP, LV2, LADSPA, DSSI, VST2, VST3) se escanean,
 se hostean y abren su ventana nativa; el rack es multi-slot con mixer, FX,
-ruteo de entradas/salidas y proyectos en YAML; y hay tres capas contra el código
-ajeno que revienta — escaneo fuera de proceso, cuarentena y sandbox. **236
-tests**, `clippy --workspace --all-targets -D warnings` limpio.
+ruteo de entradas/salidas y proyectos en YAML; hay tres capas contra el código
+ajeno que revienta — escaneo fuera de proceso, cuarentena y sandbox, y tener
+ventana basta para irse a un proceso aparte —; los parámetros se dibujan según
+lo que el plugin dice que son (interruptor, enumerado, fader, banco vertical,
+knob); hay transporte propio que leen VST2, VST3 y
+CLAP; y choz se instala con `.deb`, `.rpm` o `install.sh` y sale en el menú del
+escritorio. **257 tests**, `clippy --workspace --all-targets -D warnings`
+limpio.
 
-## Pendiente (en orden de ROI)
+## Pendiente
 
-1. **Política del editor sandboxeado.** El mecanismo está hecho: un plugin que
-   corre en su propio proceso abre ahí su ventana, empotrada en una ventana X11
-   de choz. Falta usarlo:
-   - **(a)** volver a ofrecer los editores de la deny-list — las 31 UIs de
-     guitarix segfaultean — **cuando el plugin va sandboxeado**, que es
-     exactamente lo que el aislamiento hace seguro;
-   - **(b)** un plugin sandboxeado sin ventana abre un marco vacío: el hijo
-     tendría que publicar "tengo editor" al arrancar y el host esperarlo (al
-     capturar el mango, el hijo todavía está cargando).
+1. **Publicar una release de verdad.** El empaquetado está hecho y probado
+   (`packaging/`, `.deb`, `.rpm`, `Cross.toml`, workflow de release); falta
+   correrlo end to end, mirar con ojos lo que sólo se ve instalado — el
+   `.desktop` en el menú, el icono, el lanzador abriendo kitty al tamaño
+   correcto, un `*.choz.yml` con doble clic, y un plugin sincronizado siguiendo
+   la fila `Tempo` — y dos cosas que sólo se ven en hardware:
+   - **armv7 sin verificar**: aquí `cross` no pudo bajarse el toolchain (red del
+     contenedor cortada). aarch64 sí compila.
+   - **En una Pi hay que medir dos cosas que en ARM no son gratis**: que
+     ALSA/JACK abren con buffers pequeños sin xruns, y que el escaneo encuentra
+     algo — **los plugins son binarios nativos**, así que una Pi sólo carga
+     plugins compilados para ARM, no los `.so` de x86.
+   - **ESP32-S3 con pantalla táctil: hecho, como superficie de control**
+     (`examples/esp32s3-touch/`). **No existen versiones del S3 con Linux** — es
+     un Xtensa LX7 sin MMU, con cientos de kilobytes de RAM y sin `dlopen`, y
+     las placas con pantalla (S3-BOX-3, T-Display-S3 Touch, Waveshare
+     S3-Touch-LCD) corren ESP-IDF/FreeRTOS con LVGL. Hostear plugins *es* cargar
+     código nativo en tiempo de ejecución, así que la placa manda y choz hostea.
+     Falta lo que no se puede hacer sin la placa delante: flashearla, mirar el
+     panel y comprobar el retardo de un toque a la nota.
 
-2. **La cuarentena y el sandbox no cubren la GUI en proceso.** Un editor que
-   revienta sólo es inofensivo si ese plugin ya iba sandboxeado. Lo natural es
-   que abrir una ventana sea, por sí solo, motivo para aislar el plugin.
-
-3. **`state:mapPath` para LV2.** Un plugin que guarda rutas de archivos (un
-   sampler) no puede guardar su estado: falta el par de funciones de mapeo de
-   rutas, que además devuelven cadenas que el plugin libera con `free`.
-
-4. **Mirar con audio y ojos reales**, que es lo único que los tests no dan:
-   - el modal INSTRUMENT y la caja de knobs con Surge XT (CLAP), Yoshimi (LV2),
-     WhySynth/hexter (DSSI) y los VST2 de u-he;
-   - el fondo por protocolo gráfico en una kitty de verdad (la secuencia está
-     verificada byte a byte, la imagen no la ha visto nadie);
-   - el modo MULTI con Reaper mandando varios canales a la vez.
-
-5. **Terminar el barrido de editores LV2 con `--mapped`.** El barrido limpio
-   (254 de 259 UIs con ventana real, 0 crashes) se hizo con la ventana padre
-   **sin mapear**, que es más suave que lo que hace choz de verdad.
-
-6. **Rediseño visual de los parámetros del instrumento** (prompt para la
-   próxima sesión, con lo que ya se sabe):
-
-   > La caja `INSTRUMENT` del RACK dibuja hoy **todos** los parámetros igual: un
-   > arco `[▁▂▃▄▅▆▇]`, el valor y el nombre, tres filas por knob. Un plugin no
-   > tiene sólo knobs. Hay que **elegir el control según lo que el parámetro
-   > es**, y dibujarlo con la densidad que el terminal permite:
-   >
-   > - **Botón / interruptor** para lo binario (bypass, sync, retrigger): se ve
-   >   encendido o apagado, no un arco a 0.00 o 1.00.
-   > - **Checkbox** para lo binario dentro de una lista larga, donde un botón
-   >   ocuparía demasiado.
-   > - **Fader horizontal** para lo que se lee mejor como recorrido (mezcla,
-   >   paneo, tiempos): ancho de sobra en una fila, y el valor a la derecha.
-   > - **Fader vertical** para grupos que se comparan entre sí — un ADSR, un
-   >   ecualizador por bandas — donde ver el perfil de un vistazo vale más que
-   >   leer cuatro números.
-   > - **Knob rotativo** para lo que ya funciona bien así (corte, resonancia,
-   >   ganancia), pero con más resolución angular que el arco actual: media
-   >   celda con `▘▝▖▗` o un dial de 12 posiciones se lee mucho mejor.
-   > - **Enumerado** (`◀ NOMBRE ▶`) cuando el parámetro tiene pasos con nombre:
-   >   forma de onda, tipo de filtro, modo. El plugin los da (`getParamStringByValue`
-   >   en VST3, `points`/`scalePoints` en LV2, la lista de CLAP).
-   >
-   > **Lo que hay que resolver, no sólo dibujar:**
-   > - **De dónde sale el tipo.** `choz_ports::PluginParam` sólo tiene
-   >   `id/name/min/max/default`. Hace falta una pista: `steps` (0 = continuo, 2 =
-   >   interruptor, n = enumerado), y `unit`. Cada host la puede llenar — VST3
-   >   `ParameterInfo.stepCount` y `units`, LV2 `lv2:portProperty` (`toggled`,
-   >   `enumeration`, `integer`) más `units:unit`, CLAP los flags de
-   >   `clap_param_info`, VST2 no da nada y se queda en continuo.
-   > - **Adivinar por el nombre es tentador y suele fallar** (la lección del
-   >   `FxCategory::guess` de ADD FX): usar la pista del plugin cuando la haya y
-   >   caer en knob continuo cuando no.
-   > - **La distribución deja de ser una rejilla uniforme.** `param_grid` reparte
-   >   celdas iguales; un fader vertical ocupa varias filas y un enumerado una
-   >   fila ancha. Hace falta un layout que agrupe por tipo y siga cabiendo con
-   >   scroll, sin romper `RackLayout.instr_knobs` (cada control sigue necesitando
-   >   su rect para el ratón y para MIDI learn).
-   > - **Todo lo nuevo tiene que seguir siendo MIDI-learnable y clicable**, y
-   >   respetar el lavado del tema (`theme::wash`, nada de `bg` propio salvo un
-   >   resaltado deliberado).
-   > - Aplicarlo también a la caja de FX: las dos salen de `draw_knob_box`, así
-   >   que el trabajo se hereda.
-   >
-   > Referencia visual: Carla dibuja exactamente esto en su panel genérico.
-
-7. **Empaquetado e instalación** (pedido 2026-08-08). Hoy sólo hay
-   `cargo build --release`; falta todo lo que convierte eso en algo instalable:
-
-   - **Un instalador que detecte la versión anterior, la desinstale y ponga la
-     nueva.** Concreto: `.deb` y `.rpm` (con `cargo-deb` / `cargo-generate-rpm`,
-     que ya hacen el reemplazo por versión con las dependencias declaradas) más
-     un `install.sh` para quien no use paquetes. El script tiene que mirar
-     `~/.local/bin/choz` y `/usr/local/bin/choz`, comparar `choz --version`
-     (**que aún no existe: hace falta la bandera**) y quitar la instalación
-     vieja antes de copiar. **Lo que nunca se toca al desinstalar**:
-     `~/.local/state/choz/` — los proyectos, las rutas de plugins y los ajustes
-     del usuario no son parte del paquete.
-   - **Artefactos por arquitectura en cada release**: `x86_64`, y **Raspberry
-     Pi** en `aarch64` (Pi 3/4/5, 64-bit) y `armv7` (Pi 2 y Zero 2 W en sistemas
-     de 32 bits). Se cruza con `cross`, y hay que comprobar dos cosas que en ARM
-     no son gratis: que ALSA/JACK abren con buffers pequeños sin xruns, y que el
-     escaneo de plugins encuentra algo — **los plugins son binarios nativos**, así
-     que una Pi sólo carga plugins compilados para ARM, no los `.so` de x86.
-   - **ESP32: no puede ejecutar choz, y conviene decirlo antes de intentarlo.**
-     Es un microcontrolador sin sistema operativo, con cientos de kilobytes de
-     RAM y sin `dlopen`; choz necesita las tres cosas (hostear plugins *es*
-     cargar código nativo en tiempo de ejecución). Lo que sí encaja, y sería
-     útil de verdad, es un ESP32 **como controlador de choz**: MIDI por USB, o
-     mandando OSC por WiFi al puerto que choz ya escucha (`/note`, `/mix/…`,
-     `/fx/…`). Eso funcionaría hoy sin tocar el código de choz — lo que falta es
-     el firmware de ejemplo y documentarlo. Decidir cuál de las dos cosas se
-     quiere antes de empezar.
-
-8. **choz como aplicación de escritorio** (pedido 2026-08-08): que salga en el
-   menú del sistema y se abra con un clic.
-
-   - Un `choz.desktop` (`Categories=AudioVideo;Audio;`) instalado en
-     `/usr/share/applications` o `~/.local/share/applications`, más un icono en
-     `hicolor`. choz es una TUI, así que hay dos caminos y hay que elegir:
-     `Terminal=true` (el escritorio abre su terminal por defecto, que puede no
-     ser la que el usuario quiere) o un lanzador propio que arranque una terminal
-     buena — **kitty primero**, porque es donde el fondo se ve a resolución real,
-     con `ghostty`/`wezterm`/`alacritty`/`xterm` como alternativas.
-   - El lanzador tiene que fijar un tamaño mínimo de ventana: por debajo de unas
-     100×30 celdas el RACK no cabe y la TUI se ve rota.
-   - Y asociar los proyectos: `application/x-choz-project` para `*.choz.yml`, de
-     modo que abrir un proyecto desde el gestor de archivos lance choz con él —
-     el binario ya acepta la ruta como argumento.
-
-9. Nice-to-have: ruteo por canal MIDI *dentro* de un puerto en modo LIVE;
-   automatización; transporte propio (hoy el host VST2 responde 120 BPM fijos a
-   `audioMasterGetTime`, marcado `ponytail:`).
+2. Nice-to-have: ruteo por canal MIDI *dentro* de un puerto en modo LIVE;
+   automatización; y lo que le falta al transporte, que ya lo leen VST2, VST3 y
+   CLAP: **compás distinto de 4/4** (nada en choz lo elige, así que hoy se
+   manda 4/4 y se marca válido), play/stop desde la interfaz y LV2
+   (`time:Position` por el puerto de atoms, que es bastante más trabajo que los
+   otros tres).
 
 ## Notas / gotchas para el que retome
 
+- **Tener ventana manda el plugin al sandbox, aunque el probe lo vea sano.** `quarantine::check` devuelve `Report{verdict, editor}` y `wants_sandbox` mira las dos cosas, así que en esta máquina casi todo lo que tiene GUI (Zam, guitarix, u-he) pasa a correr fuera de proceso. Si algo suena distinto o el rendimiento cambia, ésa es la razón: `CHOZ_SANDBOX_GUI=0` la apaga. El probe **pregunta** por el editor (`editor()`, sólo construye el mango) y nunca lo abre — abrir ventanas en el probe es lo que cuelga los barridos.
+- **El transporte es global al proceso** (`choz_ports::transport()`), y lo avanza el callback de audio en `render()`. Si algún día hay dos motores en un proceso, ese es el sitio que hay que cambiar; hoy hay uno, y `audioMasterGetTime` de VST2 no tiene por dónde recibir contexto.
+- **Un barrido de UIs bajo Xvfb no prueba nada sobre memoria compartida.** LSP Room Builder (Mono y Stereo) mata al probe con `BadMatch` en `MIT-SHM X_ShmPutImage` ahí, y abre sin problema en el X real. Antes de apuntar un plugin como roto, repetirlo en `:0` — un plugin, una ventana.
+- **Preguntar por la ventana de una UI justo después de `open()` da una moneda al aire.** Varios toolkits la crean en la primera vuelta de su bucle; `ui_probe` bombea `idle` hasta 500 ms esperándola. Las "UIs sin ventana" de barridos viejos eran eso.
+- **El directorio de estado de los tests de UI es por proceso, no por test** (`XDG_STATE_HOME` es una variable de entorno, global). Un test que guarde `ui.json` se lo pasa al siguiente por `App::new()`; `sandbox_state_dir()` lo borra al empezar. Si aparece un test de UI que falla una vez de cada cinco, mirar ahí antes que al render.
+- **Knob, fader o banco lo decide la unidad del plugin, no el nombre del parámetro** (`source::FADER_UNITS`, `fx_chain_panel::fader_groups`: tres o más faders seguidos con la misma unidad son un banco vertical). LV2 llama `pc` al porcentaje; `ms` y `pc` son las dos unidades más comunes de las 21 291 que declaran los puertos instalados aquí. Un plugin sin unidad se queda en knob a propósito.
+- **Los temas de Gogh son datos, no código**: `crates/choz-ui/src/gogh_themes.txt` (`nombre|texto|escritorio`) entra por `include_str!` y se parsea en `settings::gogh_themes()`. Para actualizarlos: bajar `data/themes.json` de Gogh-Co/Gogh y regenerar el fichero (el marco se deriva, no viene en el JSON). La lista de la pestaña THEME va ordenada y los controles de escritorio van **arriba** — con 372 filas, lo que quede debajo de la lista no se alcanza.
+- **Las UIs de guitarix matan el proceso, medido con el barrido entero** (nueve rebanadas, nueve `gx_*`, SIGSEGV). El probe levanta la deny-list a propósito; choz no, y el sandbox se las queda porque tienen ventana.
+- **La deny-list de UIs es propiedad del proceso, no del plugin.** `choz-plugin-lv2::allow_denied_uis(true)` la levanta, y el único sitio que lo hace es el hijo del sandbox: ahí una UI que segfaultea cuesta un proceso que el supervisor repone. Llamarlo en el proceso de choz devuelve el crash que la lista evita.
+- **El host no puede ver si un plugin sandboxeado tiene ventana**: cuando captura el mango, el hijo todavía está cargando. Por eso el hijo publica `editor_present` en la cabecera **antes de servir su primer bloque**, y `SandboxedPlugin::editor()` sólo ofrece botón `GUI` si dice que sí. Cualquier cosa que el host necesite saber del plugin sigue ese mismo camino.
 - **Los probes de editores abren ventanas de verdad.** `examples/ui_probe` (LV2) y `examples/gui_probe` (CLAP) instancian plugins y abren su GUI: usar `Xvfb` (o la ventana padre sin mapear, que es lo que hacen ahora) y **matarlos al terminar**. `sweep.sh` reanuda tras cada segfault por diseño, así que colgado sigue insistiendo indefinidamente. Ningún test abre ventanas, y así debe seguir — `vst2_runtime.rs` lo dice explícitamente donde toca un editor.
 - **En VST3, la GUI no habla con el procesador.** El edit controller reporta al host (`IComponentHandler::performEdit`) y es el host quien lleva el valor al procesador por `inputParameterChanges`. Un host que no lo hace tiene knobs que se mueven sin sonar. Lo mismo con los ids: `getParameterInfo` toma un **índice** y devuelve un **id arbitrario**; confundirlos mueve otro parámetro.
 - **Un valor que no se guarda tampoco se puede editar.** El cap de 7 parámetros truncaba la lista *al construirla*, no sólo al dibujarla: lo que no está en el `Vec` no viaja al proyecto.

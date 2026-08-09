@@ -33,7 +33,7 @@ use parking_lot::Mutex;
 
 use choz_ports::{AudioSource, FxProcessor, PluginParam};
 
-pub use discovery::Lv2PluginInfo;
+pub use discovery::{Lv2PluginInfo, allow_denied_uis};
 use discovery::{Port, PortKind};
 use lv2_abi::*;
 
@@ -339,8 +339,13 @@ impl Features {
     /// `boundedBlockLength` holds because every block is chunked to the size
     /// reported in the options above.
     fn supported(uri: &str) -> bool {
+        // The two path features are not passed here — they belong to `save` and
+        // `restore`, which do provide them — but a plugin that *requires* them
+        // is asking whether this host can store its file paths at all, and it
+        // can.
         matches!(uri, LV2_URID_MAP_URI | LV2_URID_UNMAP_URI | LV2_OPTIONS_URI
-            | LV2_BUF_SIZE_BOUNDED_URI | LV2_WORKER_SCHEDULE_URI)
+            | LV2_BUF_SIZE_BOUNDED_URI | LV2_WORKER_SCHEDULE_URI
+            | LV2_STATE_MAP_PATH_URI | LV2_STATE_FREE_PATH_URI)
     }
 }
 
@@ -878,6 +883,20 @@ fn params_of(info: &Lv2PluginInfo) -> Vec<PluginParam> {
             min: p.min as f64,
             max: p.max as f64,
             default: p.default as f64,
+            // `toggled` says two positions outright; an enumeration has as many
+            // as it named; an integer port has one per whole number in range,
+            // and only if that is few enough to step through.
+            steps: if p.toggled {
+                2
+            } else if p.enumeration && !p.points.is_empty() {
+                p.points.len() as u32
+            } else if p.integer {
+                ((p.max - p.min).round() as i64 + 1).clamp(0, u32::MAX as i64) as u32
+            } else {
+                0
+            },
+            unit: p.unit.clone(),
+            points: p.points.iter().map(|(v, l)| (*v as f64, l.clone())).collect(),
         })
         .collect()
 }

@@ -186,6 +186,67 @@ mod tests {
         assert_eq!(parse(&msg("/nope", vec![OscType::Float(1.0)])), None);
     }
 
+    /// The bytes the ESP32-S3 control surface puts on the wire
+    /// (`examples/esp32s3-touch/choz_touch.ino`), hand-encoded here exactly as
+    /// that firmware builds them: address, type tag and big-endian arguments,
+    /// each chunk zero-padded to four bytes.
+    ///
+    /// The firmware carries no OSC library — thirty lines of encoder instead of
+    /// a dependency pinned per board — so this is the check that those thirty
+    /// lines produce something choz actually understands.
+    #[test]
+    fn the_bytes_an_esp32_control_surface_sends_are_understood() {
+        /// Same rule as `OscMsg::str` in the sketch: NUL-terminate, then pad.
+        fn osc_str(out: &mut Vec<u8>, s: &str) {
+            out.extend_from_slice(s.as_bytes());
+            out.push(0);
+            while !out.len().is_multiple_of(4) {
+                out.push(0);
+            }
+        }
+
+        let decode = |bytes: &[u8]| {
+            let (_, packet) = rosc::decoder::decode_udp(bytes).expect("well-formed OSC");
+            match packet {
+                rosc::OscPacket::Message(m) => parse(&m),
+                _ => None,
+            }
+        };
+
+        // A fader: /mix/2/gain ,f 0.5
+        let mut msg = Vec::new();
+        osc_str(&mut msg, "/mix/2/gain");
+        osc_str(&mut msg, ",f");
+        msg.extend_from_slice(&0.5f32.to_be_bytes());
+        assert!(msg.len().is_multiple_of(4), "every OSC chunk is four-byte aligned");
+        assert_eq!(
+            decode(&msg),
+            Some(InputEvent::Control(ControlMsg::Gain { tab: 2, value: 0.5 })),
+        );
+
+        // A mute: /mix/3/mute ,i 1
+        let mut msg = Vec::new();
+        osc_str(&mut msg, "/mix/3/mute");
+        osc_str(&mut msg, ",i");
+        msg.extend_from_slice(&1i32.to_be_bytes());
+        assert_eq!(
+            decode(&msg),
+            Some(InputEvent::Control(ControlMsg::Mute { tab: 3, on: true })),
+        );
+
+        // A key, and the same key released — velocity 0, as the sketch sends.
+        let note = |vel: i32| {
+            let mut msg = Vec::new();
+            osc_str(&mut msg, "/note");
+            osc_str(&mut msg, ",ii");
+            msg.extend_from_slice(&60i32.to_be_bytes());
+            msg.extend_from_slice(&vel.to_be_bytes());
+            msg
+        };
+        assert_eq!(decode(&note(100)), Some(osc_note(true, 60, 100)));
+        assert_eq!(decode(&note(0)), Some(osc_note(false, 60, 0)));
+    }
+
     #[test]
     fn flattens_bundles() {
         let bundle = rosc::OscPacket::Bundle(rosc::OscBundle {

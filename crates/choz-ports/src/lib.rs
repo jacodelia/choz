@@ -252,7 +252,7 @@ pub type StateHandle = std::sync::Arc<dyn PluginState>;
 /// One automatable parameter of a hosted plugin (CLAP param, LV2 control port,
 /// LADSPA control port…). Names are dynamic, so this is the descriptor the UI
 /// shows instead of [`FxParam`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PluginParam {
     /// Format-specific identifier: CLAP param id, LV2/LADSPA port index.
     pub id: u32,
@@ -260,6 +260,45 @@ pub struct PluginParam {
     pub min: f64,
     pub max: f64,
     pub default: f64,
+    /// How many distinct positions the parameter has: `0` continuous, `2` an
+    /// on/off switch, `n` an enumeration of n steps.
+    ///
+    /// **Only ever what the plugin said.** Guessing a switch from a name that
+    /// happens to read like one is how a filter cutoff ends up as a checkbox;
+    /// a host that does not report this leaves it 0 and gets a knob.
+    pub steps: u32,
+    /// Unit for display (`"Hz"`, `"dB"`, `"%"`), when the plugin gives one.
+    pub unit: Option<String>,
+    /// Named positions — `(value, label)` — for a parameter whose steps have
+    /// names: waveform, filter type, mode. Empty when there are none.
+    pub points: Vec<(f64, String)>,
+}
+
+impl PluginParam {
+    /// A parameter with nothing but the numbers, which is all most hosts give.
+    pub fn plain_range(id: u32, name: String, min: f64, max: f64, default: f64) -> Self {
+        Self { id, name, min, max, default, ..Self::default() }
+    }
+
+    /// `true` when the parameter is an on/off switch.
+    pub fn is_toggle(&self) -> bool {
+        self.steps == 2
+    }
+
+    /// The label for `plain`, when the parameter has named steps: the nearest
+    /// point at or below the value, so a slider between two names reads as the
+    /// one it has reached.
+    pub fn label_for(&self, plain: f64) -> Option<&str> {
+        if self.points.is_empty() {
+            return None;
+        }
+        self.points
+            .iter()
+            .min_by(|a, b| {
+                (a.0 - plain).abs().partial_cmp(&(b.0 - plain).abs()).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(_, label)| label.as_str())
+    }
 }
 
 impl PluginParam {
@@ -274,5 +313,101 @@ impl PluginParam {
             return 0.0;
         }
         ((plain - self.min) / (self.max - self.min)).clamp(0.0, 1.0)
+    }
+}
+
+// ─── Transport ──────────────────────────────────────────────────────────────
+
+/// The host's clock: where in the song choz is, and how fast.
+///
+/// A plugin that syncs anything — a tempo delay, an LFO, an arpeggiator — asks
+/// the host for this on **every block**, from the audio thread, and several
+/// dereference the answer without checking it (u-he's VST2s segfault on a null
+/// one). So it is a handful of atomics: readable from the callback, writable
+/// from the UI, and never a lock.
+///
+/// It is a **process-global** ([`transport`]) on purpose. There is one clock, and
+/// the place that needs it most is a C callback — VST2's `audioMasterGetTime` —
+/// which is handed a plugin pointer and no host context at all. Threading a
+/// per-host instance down to there would mean a registry keyed by plugin
+/// pointer, to answer the same question with the same number.
+#[derive(Debug)]
+pub struct Transport {
+    /// Frames played since the stream started.
+    samples: std::sync::atomic::AtomicU64,
+    /// Beats per minute, as `f32` bits.
+    bpm: std::sync::atomic::AtomicU32,
+    sample_rate: std::sync::atomic::AtomicU32,
+    playing: std::sync::atomic::AtomicBool,
+}
+
+/// The one clock. See [`Transport`] for why it is global.
+pub fn transport() -> &'static Transport {
+    static TRANSPORT: Transport = Transport::new();
+    &TRANSPORT
+}
+
+impl Transport {
+    pub const DEFAULT_BPM: f32 = 120.0;
+    /// The range the UI offers, and what any setter clamps to.
+    pub const MIN_BPM: f32 = 20.0;
+    pub const MAX_BPM: f32 = 300.0;
+
+    const fn new() -> Self {
+        Self {
+            samples: std::sync::atomic::AtomicU64::new(0),
+            bpm: std::sync::atomic::AtomicU32::new(Self::DEFAULT_BPM.to_bits()),
+            sample_rate: std::sync::atomic::AtomicU32::new(48_000),
+            playing: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Move the clock on by one block. Called from the audio callback, so:
+    /// relaxed, and nothing else.
+    pub fn advance(&self, frames: usize) {
+        self.samples.fetch_add(frames as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Back to the top. A new stream starts at zero, or the user rewinds.
+    pub fn rewind(&self) {
+        self.samples.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn samples(&self) -> u64 {
+        self.samples.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn bpm(&self) -> f32 {
+        f32::from_bits(self.bpm.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn set_bpm(&self, bpm: f32) {
+        let bpm = bpm.clamp(Self::MIN_BPM, Self::MAX_BPM);
+        self.bpm.store(bpm.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate.load(std::sync::atomic::Ordering::Relaxed).max(1)
+    }
+
+    /// Told by the engine when the stream opens. Rewinds: a position in frames
+    /// means nothing once the frames are a different length.
+    pub fn set_sample_rate(&self, sr: u32) {
+        self.sample_rate.store(sr.max(1), std::sync::atomic::Ordering::Relaxed);
+        self.rewind();
+    }
+
+    pub fn playing(&self) -> bool {
+        self.playing.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_playing(&self, playing: bool) {
+        self.playing.store(playing, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Position in quarter notes, which is what every plugin format asks for
+    /// (VST2 `ppqPos`, VST3 `projectTimeMusic`, CLAP's beat position).
+    pub fn ppq(&self) -> f64 {
+        self.samples() as f64 / self.sample_rate() as f64 * (self.bpm() as f64 / 60.0)
     }
 }

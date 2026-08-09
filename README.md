@@ -115,6 +115,37 @@ cargo build --release
 
 Every plugin host is compiled in — there are no feature flags to remember.
 
+### Install
+
+```bash
+./packaging/install.sh                    # build, then install into ~/.local
+./packaging/install.sh --prefix /usr/local
+./packaging/install.sh --uninstall
+```
+
+The script replaces an older copy before putting the new one down — it looks in
+`~/.local/bin`, `/usr/local/bin` and `/usr/bin`, and asks each one its
+`choz --version`. It also installs the desktop entry, the icon and the
+`*.choz.yml` file association, so choz shows up in the menu and a project opens
+with a double click.
+
+**What no uninstall ever removes: `~/.local/state/choz`.** The projects, the
+plugin paths and the settings are yours, not the package's.
+
+For distributions, `.deb` and `.rpm` are built from the same assets and replace
+the previous version by package name:
+
+```bash
+cargo build --release --bin choz          # both read target/release/choz
+cargo deb -p choz-ui --no-build           # → target/debian/choz_*.deb
+cargo generate-rpm -p crates/choz-ui      # → target/generate-rpm/choz-*.rpm
+```
+
+Because choz is a TUI, the desktop entry runs `choz-launcher`, which opens the
+first terminal it finds — **kitty first**, since that is where the wallpaper is
+drawn at real pixel resolution — at 120×40 cells. Below about 100×30 the RACK
+does not fit.
+
 ---
 
 ## Run

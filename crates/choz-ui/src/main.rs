@@ -246,7 +246,11 @@ const BANK_SELECT_CCS: [u8; 2] = [0, 32];
 const MIDI_LOG_MAX: usize = 64;
 
 /// Editable rows of the Engine section, in display order.
-const ENGINE_ROWS: &[&str] = &["Backend", "Device", "Sample rate", "Buffer size", "SF2 engine"];
+const ENGINE_ROWS: &[&str] =
+    &["Backend", "Device", "Sample rate", "Buffer size", "Tempo", "SF2 engine"];
+
+/// How much one arrow press moves the tempo.
+const BPM_STEP: f32 = 1.0;
 /// Editable rows of the OSC section.
 const OSC_ROWS: &[&str] = &["Enable OSC", "Port mode", "UDP port", "TCP port"];
 
@@ -1239,13 +1243,29 @@ impl App {
     /// This is the panel Carla shows for every plugin — the point being that a
     /// CC can be learned on any parameter without opening the plugin's own
     /// window, which for many plugins is the slow part.
-    fn instr_knobs(&self) -> Vec<(String, f32)> {
+    fn instr_knobs(&self) -> Vec<(String, f32, source::ParamShape)> {
         let Some(slot) = self.slots.get(self.active_slot) else { return Vec::new() };
         slot.instr_params
             .iter()
             .enumerate()
-            .map(|(i, p)| (p.name.clone(), slot.instr_values.get(i).copied().unwrap_or(0.0)))
+            .map(|(i, p)| {
+                (
+                    p.name.clone(),
+                    slot.instr_values.get(i).copied().unwrap_or(0.0),
+                    source::ParamShape::of(p),
+                )
+            })
             .collect()
+    }
+
+    /// What control the instrument's parameter `i` is, so the arrows step it
+    /// the way it is drawn.
+    fn instr_param_shape(&self, i: usize) -> source::ParamShape {
+        self.slots
+            .get(self.active_slot)
+            .and_then(|s| s.instr_params.get(i))
+            .map(source::ParamShape::of)
+            .unwrap_or_default()
     }
 
     /// How many knobs that box has, for cursor movement.
@@ -1429,26 +1449,27 @@ impl App {
     ///
     /// The two halves are separated by a header row, the same trick the plugin
     /// paths list uses: headers are labels, not options.
-    fn theme_rows(&self) -> Vec<String> {
-        let mut rows: Vec<String> = Vec::with_capacity(settings::THEMES.len() + 5);
-        rows.push("COLOUR SCHEME".to_string());
-        for t in settings::THEMES {
-            let active = t.text == self.ui.text_color
-                && Some(t.border) == self.ui.border_color;
-            let mark = if active { "\u{25CF}" } else { "\u{25CB}" };
-            let swatch = "\u{2588}\u{2588}";
-            rows.push(format!("  {mark} {:<18} {swatch} text  {swatch} frame  {}",
-                t.name,
-                match t.desktop {
-                    Some(_) => format!("{swatch} desktop"),
-                    None => "   (terminal)".to_string(),
-                }));
-        }
-
-        rows.push("DESKTOP".to_string());
-        rows.push(format!("  {:<18} {}", "Background", self.ui.background.label()));
+    /// The rows and what each one does, built together.
+    ///
+    /// One list rather than two functions doing the same arithmetic from
+    /// opposite ends: with the schemes now numbering in the hundreds, an index
+    /// map maintained by hand is a bug waiting for the next row to be inserted.
+    ///
+    /// The desktop controls come **first**. They used to sit under the scheme
+    /// list, which was fine with eleven schemes and unreachable with 372.
+    fn theme_layout(&self) -> Vec<(String, Option<ThemeRow>)> {
+        let mut rows: Vec<(String, Option<ThemeRow>)> =
+            Vec::with_capacity(settings::THEMES.len() + 8);
+        rows.push(("DESKTOP".to_string(), None));
+        rows.push((
+            format!("  {:<18} {}", "Background", self.ui.background.label()),
+            Some(ThemeRow::Background),
+        ));
         if let settings::Background::Image { fit, .. } = &self.ui.background {
-            rows.push(format!("  {:<18} {}   (Enter cycles)", "Fit", fit.label()));
+            rows.push((
+                format!("  {:<18} {}   (Enter cycles)", "Fit", fit.label()),
+                Some(ThemeRow::Fit),
+            ));
             // A slider, because the useful value is "as much as it takes to read
             // the knobs" and that is judged by eye, not typed.
             let pct = self.ui.background_tint.min(100);
@@ -1456,40 +1477,51 @@ impl App {
             let bar: String = std::iter::repeat_n('\u{2588}', filled)
                 .chain(std::iter::repeat_n('\u{2591}', TINT_BAR_WIDTH - filled))
                 .collect();
-            rows.push(format!("  {:<18} {bar} {pct:>3}%   (\u{2190}\u{2192})", "Panel opacity"));
+            rows.push((
+                format!("  {:<18} {bar} {pct:>3}%   (\u{2190}\u{2192})", "Panel opacity"),
+                Some(ThemeRow::Tint),
+            ));
         }
-        rows.push(format!("  {:<18} {}", "Pick an image...", "Enter opens the browser"));
-        rows.push(format!("  {:<18} {}", "Clear background", "back to the terminal's own"));
-        rows.push(format!("  {:<18} {}", "Apply and close", "keeps theme and background"));
+        rows.push((
+            format!("  {:<18} {}", "Pick an image...", "Enter opens the browser"),
+            Some(ThemeRow::PickImage),
+        ));
+        rows.push((
+            format!("  {:<18} {}", "Clear background", "back to the terminal's own"),
+            Some(ThemeRow::Clear),
+        ));
+        rows.push((
+            format!("  {:<18} {}", "Apply and close", "keeps theme and background"),
+            Some(ThemeRow::Done),
+        ));
+
+        rows.push(("COLOUR SCHEME".to_string(), None));
+        for (k, t) in settings::THEMES.iter().enumerate() {
+            let active = t.text == self.ui.text_color && Some(t.border) == self.ui.border_color;
+            let mark = if active { "\u{25CF}" } else { "\u{25CB}" };
+            let swatch = "\u{2588}\u{2588}";
+            rows.push((
+                format!(
+                    "  {mark} {:<24} {swatch} text  {swatch} frame  {}",
+                    t.name,
+                    match t.desktop {
+                        Some(_) => format!("{swatch} desktop"),
+                        None => "   (terminal)".to_string(),
+                    }
+                ),
+                Some(ThemeRow::Scheme(k)),
+            ));
+        }
         rows
+    }
+
+    fn theme_rows(&self) -> Vec<String> {
+        self.theme_layout().into_iter().map(|(label, _)| label).collect()
     }
 
     /// Row index → what it means on the THEME tab. `None` for the headers.
     fn theme_row(&self, i: usize) -> Option<ThemeRow> {
-        let n = settings::THEMES.len();
-        if i == 0 {
-            return None; // COLOUR SCHEME header
-        }
-        if i <= n {
-            return Some(ThemeRow::Scheme(i - 1));
-        }
-        if i == n + 1 {
-            return None; // DESKTOP header
-        }
-        // With an image set, two extra rows sit between Background and the
-        // rest: the fit and the tint slider.
-        let extra = usize::from(matches!(self.ui.background, settings::Background::Image { .. })) * 2;
-        match i - (n + 2) {
-            0 => Some(ThemeRow::Background),
-            1 if extra > 0 => Some(ThemeRow::Fit),
-            2 if extra > 0 => Some(ThemeRow::Tint),
-            k => match k - extra {
-                1 => Some(ThemeRow::PickImage),
-                2 => Some(ThemeRow::Clear),
-                3 => Some(ThemeRow::Done),
-                _ => None,
-            },
-        }
+        self.theme_layout().get(i).and_then(|(_, row)| *row)
     }
 
     /// Enter on a THEME row. Returns whether the modal should close.
@@ -1616,6 +1648,9 @@ impl App {
             format!("  {:>14}  {}", "Device", device),
             format!("  {:>14}  {} Hz", "Sample rate", pending(a.sample_rate, running.map(|r| r.0))),
             format!("  {:>14}  {} samples", "Buffer size", pending(a.buffer_size, running.map(|r| r.1))),
+            // The host clock every tempo-synced plugin reads. Shown from the
+            // transport itself, which is the thing plugins actually see.
+            format!("  {:>14}  {:.1} BPM", "Tempo", choz_ports::transport().bpm()),
             // choz only builds oxisynth; the row exists so the setting matches
             // seqterm's file, not to pretend there is a choice.
             format!("  {:>14}  {} (only engine built in)", "SF2 engine", a.sf2_engine),
@@ -1797,6 +1832,14 @@ impl App {
             (SEC_ENGINE, 3) if step != 0 => {
                 self.ui.audio.buffer_size =
                     cycle_num(settings::BUFFER_SIZES, self.ui.audio.buffer_size, step);
+            }
+            // The tempo applies at once: it is a number a plugin reads on the
+            // next block, not something the stream has to be rebuilt for.
+            (SEC_ENGINE, 4) if step != 0 => {
+                let t = choz_ports::transport();
+                t.set_bpm(t.bpm() + step as f32 * BPM_STEP);
+                self.ui.audio.bpm = t.bpm();
+                self.ui.save();
             }
             // SF2 engine and the read-only rows below it take no input.
             (SEC_ENGINE, _) => return true,
@@ -2103,13 +2146,7 @@ impl App {
                         .iter()
                         .enumerate()
                         .map(|(i, p)| {
-                            let v = s.instr_values.get(i).copied().unwrap_or(0.0);
-                            format!(
-                                "{:<22} [{}] {:>10.3}",
-                                views::fx_chain_panel::truncate(&p.name, 22),
-                                views::fx_chain_panel::knob_arc(v, 8),
-                                p.plain(v as f64)
-                            )
+                            instr_param_row(p, s.instr_values.get(i).copied().unwrap_or(0.0))
                         })
                         .collect()
                 })
@@ -4060,8 +4097,37 @@ struct Cli {
     project: Option<std::path::PathBuf>,
 }
 
+/// What `--version` prints, and what an installer compares to decide whether the
+/// copy already on disk is older than the one it is about to put there.
+pub fn version_line() -> String {
+    format!("choz {}", env!("CARGO_PKG_VERSION"))
+}
+
+const USAGE: &str = "\
+choz — a terminal audio plugin host
+
+USAGE:
+    choz [OPTIONS] [FILE]
+
+ARGS:
+    FILE            a .wav or .sf2 to load as the first instrument, or a
+                    .yml/.yaml choz project to open
+
+OPTIONS:
+    --osc-port N    listen for OSC on port N (overrides the saved setting)
+    -V, --version   print the version and exit
+    -h, --help      print this help and exit
+";
+
 impl Cli {
     fn from_args() -> Self {
+        Cli::parse(std::env::args().skip(1)).0
+    }
+
+    /// Parse arguments. The second half is what to print before exiting —
+    /// `--version` and `--help` answer and stop, which is what a package's
+    /// post-install check and an installer both rely on.
+    fn parse(args: impl Iterator<Item = String>) -> (Self, Option<String>) {
         let mut cli =
             Cli {
                 osc_port: choz_engine::osc::DEFAULT_PORT,
@@ -4069,9 +4135,11 @@ impl Cli {
                 file: None,
                 project: None,
             };
-        let mut args = std::env::args().skip(1);
+        let mut args = args;
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "-V" | "--version" => return (cli, Some(version_line())),
+                "-h" | "--help" => return (cli, Some(USAGE.to_string())),
                 "--osc-port" => match args.next().and_then(|v| v.parse().ok()) {
                     Some(port) => {
                         cli.osc_port = port;
@@ -4095,7 +4163,7 @@ impl Cli {
                 }
             }
         }
-        cli
+        (cli, None)
     }
 }
 
@@ -4105,6 +4173,14 @@ fn main() -> Result<()> {
     // anything touches the terminal, the log or the audio device — its stdout
     // is the result.
     if choz_engine::worker_main() {
+        return Ok(());
+    }
+
+    // `--version` and `--help` answer on stdout and stop — before the log
+    // redirect below takes fd 1 away, which is where the answer would have
+    // silently ended up.
+    if let (_, Some(text)) = Cli::parse(std::env::args().skip(1)) {
+        println!("{text}");
         return Ok(());
     }
 
@@ -4430,7 +4506,8 @@ fn handle_modal_key(app: &mut App, key: KeyCode) {
                     .and_then(|s| s.instr_values.get(cursor))
                     .copied()
                     .unwrap_or(0.0);
-                app.set_instr_param(cursor, v + delta as f32 * INSTR_STEP);
+                let shape = app.instr_param_shape(cursor);
+                app.set_instr_param(cursor, shape.nudge(v, delta as f32 * INSTR_STEP));
             } else if let Some(m) = app.modal.as_mut() {
                 m.list.cycle_filter(delta);
             }
@@ -4794,13 +4871,17 @@ fn adjust_fx_param(app: &mut App, delta: f32) {
             .and_then(|s| s.instr_values.get(param))
             .copied()
             .unwrap_or(0.0);
-        app.set_instr_param(param, v + delta);
+        let shape = app.instr_param_shape(param);
+        app.set_instr_param(param, shape.nudge(v, delta));
         return;
     }
     let (fx_idx, param) = (app.fx_slot, app.fx_param);
     let Some(entry) = app.fx_chain.get_mut(fx_idx) else { return };
+    // A switch or a named step moves one position per press; a knob moves by
+    // `delta`.
+    let shape = entry.param_descs().get(param).map(|d| d.shape.clone()).unwrap_or_default();
     let Some(v) = entry.params.get_mut(param) else { return };
-    *v = (*v + delta).clamp(0.0, 1.0);
+    *v = shape.nudge(*v, delta);
     let value = *v;
     let (is_plugin, is_mix) = (entry.plugin.is_some(), entry.is_mix_param(param));
     if is_mix {
@@ -5164,7 +5245,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                 .and_then(|s| s.instr_values.get(pi))
                 .copied()
                 .unwrap_or(0.0);
-            app.set_instr_param(pi, v + delta);
+            // The wheel steps a switch or a named position exactly like the
+            // arrows do — 0.03 of a range that only has two places in it lands
+            // between them.
+            let shape = app.instr_param_shape(pi);
+            app.set_instr_param(pi, shape.nudge(v, delta));
         }
         MouseAction::FxParamAdjust(pi, delta) => {
             let old_slot = app.fx_slot;
@@ -5360,6 +5445,48 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
 
 /// Knob step of the instrument-parameter editor (left/right arrows).
 const INSTR_STEP: f32 = 0.05;
+
+/// One row of the INSTRUMENT parameter list: name, control, value.
+///
+/// The list is the long form of the same three controls the RACK's knob box
+/// draws — which is where a **checkbox** belongs rather than a button: a switch
+/// among forty rows should cost one column, not a box. The value carries the
+/// plugin's unit when it gave one, because "0.42" and "0.42 Hz" are different
+/// amounts of information.
+fn instr_param_row(p: &choz_engine::PluginParam, v: f32) -> String {
+    use source::ParamShape;
+    let name = views::fx_chain_panel::truncate(&p.name, 22);
+    let shape = ParamShape::of(p);
+    match (&shape, shape.step_at(v)) {
+        (ParamShape::Toggle, Some((k, _))) => {
+            let on = k == 1;
+            format!("{name:<22} [{}] {}", if on { "x" } else { " " }, if on { "ON" } else { "OFF" })
+        }
+        (ParamShape::Named(_), Some((k, n))) => format!(
+            "{name:<22} \u{25C0} {:<16} \u{25B6}  {}/{n}",
+            views::fx_chain_panel::truncate(shape.label(k).unwrap_or("?"), 16),
+            k + 1,
+        ),
+        (ParamShape::Fader(_), _) => format!(
+            "{name:<22} {} {:>10.3}{}",
+            views::fx_chain_panel::fader_track(v, 10),
+            p.plain(v as f64),
+            match &p.unit {
+                Some(u) => format!(" {u}"),
+                None => String::new(),
+            }
+        ),
+        _ => format!(
+            "{name:<22} [{}] {:>10.3}{}",
+            views::fx_chain_panel::knob_arc(v, 8),
+            p.plain(v as f64),
+            match &p.unit {
+                Some(u) => format!(" {u}"),
+                None => String::new(),
+            }
+        ),
+    }
+}
 
 /// Which of the RACK's two knob boxes the arrows and the highlight belong to.
 ///
@@ -6024,6 +6151,13 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("choz_ui_state_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         unsafe { std::env::set_var("XDG_STATE_HOME", &tmp) };
+        // …and start from defaults. The directory is per process, not per test,
+        // and `App::new()` reads `ui.json` from it: one test that sets a desktop
+        // image and saves leaves the next one starting with that image, which
+        // is a failure that only shows up in some orders. The env var is
+        // process-global, so a directory per test would not help either — the
+        // fix is that a sandbox means "nothing carried over".
+        let _ = std::fs::remove_file(tmp.join("ui.json"));
     }
 
     /// A rack tab holding a plugin instrument with two parameters.
@@ -6037,9 +6171,11 @@ mod tests {
         app.slots[0].instr_params = vec![
             choz_engine::PluginParam {
                 id: 0, name: "Cutoff".into(), min: 20.0, max: 20_000.0, default: 20.0,
+                ..Default::default()
             },
             choz_engine::PluginParam {
                 id: 1, name: "Resonance".into(), min: 0.0, max: 1.0, default: 0.0,
+                ..Default::default()
             },
         ];
         app.slots[0].instr_values = vec![0.0, 0.0];
@@ -6217,8 +6353,8 @@ mod tests {
         let mut app = App::new();
         app.slots.push(RackSlot::new(AudioSource::Midi));
         app.slots[0].instr_params = vec![
-            choz_engine::PluginParam { id: 0, name: "Cutoff".into(), min: 0.0, max: 1.0, default: 0.0 },
-            choz_engine::PluginParam { id: 1, name: "Reso".into(), min: 0.0, max: 1.0, default: 0.0 },
+            choz_engine::PluginParam { id: 0, name: "Cutoff".into(), min: 0.0, max: 1.0, default: 0.0, ..Default::default() },
+            choz_engine::PluginParam { id: 1, name: "Reso".into(), min: 0.0, max: 1.0, default: 0.0, ..Default::default() },
         ];
         app.slots[0].instr_values = vec![0.0, 0.0];
 
@@ -6405,6 +6541,214 @@ mod tests {
         layout.fx_chain_area = ratatui::layout::Rect::new(0, 0, w, h);
         drop(layout);
         (screen, rack)
+    }
+
+    /// Three or more faders in a row sharing a unit are one thing — an ADSR,
+    /// a bank of band gains — and get drawn as a bank of vertical bars, so the
+    /// shape is read in one look instead of four numbers.
+    #[test]
+    fn a_run_of_faders_with_one_unit_is_drawn_as_a_bank() {
+        use source::ParamShape;
+        use views::fx_chain_panel::{fader_groups, vertical_bar};
+
+        let ms = || ParamShape::Fader("ms".into());
+        let adsr = vec![ms(), ms(), ms(), ms()];
+        assert_eq!(fader_groups(&adsr), vec![true; 4]);
+
+        // Two is not a bank, and a different unit ends the run.
+        assert_eq!(fader_groups(&[ms(), ms()]), vec![false, false]);
+        assert_eq!(
+            fader_groups(&[ms(), ms(), ParamShape::Fader("%".into()), ms()]),
+            vec![false, false, false, false],
+        );
+        // A knob in the middle splits it, whatever the units say.
+        assert_eq!(
+            fader_groups(&[ms(), ms(), ParamShape::Continuous, ms(), ms(), ms()]),
+            vec![false, false, false, true, true, true],
+        );
+
+        // The bar grows upward and fills the bottom cell first, so a row of
+        // them draws a profile.
+        let (top, bottom) = vertical_bar(0.0, 3);
+        assert_eq!((top.as_str(), bottom.as_str()), ("   ", "   "));
+        let (top, bottom) = vertical_bar(0.25, 3);
+        assert_eq!(top, "   ", "a quarter is all in the bottom cell");
+        assert_ne!(bottom, "   ");
+        let (top, bottom) = vertical_bar(1.0, 3);
+        assert_eq!((top.as_str(), bottom.as_str()), ("\u{2588}\u{2588}\u{2588}", "\u{2588}\u{2588}\u{2588}"));
+        assert_eq!(vertical_bar(0.5, 3).1, "\u{2588}\u{2588}\u{2588}", "half fills the bottom cell");
+    }
+
+    /// The arc has to resolve finer than a cell, or a knob nudged by a hair
+    /// looks identical — which is what an eight-cell bar with one position per
+    /// cell did.
+    #[test]
+    fn the_knob_arc_resolves_finer_than_a_whole_cell() {
+        use views::fx_chain_panel::{fader_track, knob_arc};
+        let arc = |v: f32| knob_arc(v, 8);
+        assert_eq!(arc(0.0).chars().count(), 8, "always the same width");
+        assert_eq!(arc(1.0), "\u{2588}".repeat(8), "full is full");
+        // Eight cells at eight positions each: 65 distinct pictures instead of
+        // the 9 a whole-cell bar could draw.
+        let distinct: std::collections::HashSet<String> =
+            (0..=64).map(|i| arc(i as f32 / 64.0)).collect();
+        assert_eq!(distinct.len(), 65, "one picture per eighth of a cell");
+        assert_ne!(arc(0.50), arc(0.52), "a nudge inside one cell still moves it");
+
+        // The fader is a travel: the track never changes, only the handle.
+        assert_eq!(fader_track(0.0, 10).chars().next(), Some('\u{25AE}'));
+        assert_eq!(fader_track(1.0, 10).chars().last(), Some('\u{25AE}'));
+        assert_eq!(fader_track(0.5, 10).chars().filter(|c| *c == '\u{25AE}').count(), 1);
+        assert_eq!(fader_track(0.5, 10).chars().count(), 10);
+    }
+
+    /// The long form of the same three controls: a checkbox where the RACK
+    /// draws a button (one column instead of a box, which is what a list of
+    /// forty rows can afford), the step's name where it draws arrows, and the
+    /// plugin's own unit next to a continuous value.
+    #[test]
+    fn the_instrument_list_draws_a_checkbox_a_name_and_a_unit() {
+        use source::ParamShape;
+        let toggle = choz_engine::PluginParam {
+            id: 0, name: "Sync".into(), min: 0.0, max: 1.0, default: 0.0,
+            steps: 2, ..Default::default()
+        };
+        assert!(instr_param_row(&toggle, 0.0).contains("[ ] OFF"));
+        assert!(instr_param_row(&toggle, 1.0).contains("[x] ON"));
+
+        let wave = choz_engine::PluginParam {
+            id: 1, name: "Wave".into(), min: 0.0, max: 2.0, default: 0.0,
+            steps: 3,
+            points: vec![(0.0, "Sine".into()), (1.0, "Saw".into()), (2.0, "Square".into())],
+            ..Default::default()
+        };
+        let row = instr_param_row(&wave, 1.0);
+        assert!(row.contains("Square"), "the last step at the top of the range: {row}");
+        assert!(row.contains("3/3"), "and which one it is: {row}");
+
+        // A time is a distance covered, so it gets a fader — and that comes
+        // from the plugin's unit, not from its name.
+        let time = choz_engine::PluginParam {
+            id: 3, name: "Delay".into(), min: 0.0, max: 2.0, default: 0.0,
+            unit: Some("s".into()), ..Default::default()
+        };
+        assert_eq!(ParamShape::of(&time), ParamShape::Fader("s".into()));
+        let row = instr_param_row(&time, 0.5);
+        assert!(row.contains('\u{25AE}'), "the handle sits on the track: {row}");
+        assert!(row.contains("1.000 s"));
+
+        // A continuous parameter keeps the arc, and says what the number means.
+        let cutoff = choz_engine::PluginParam {
+            id: 2, name: "Cutoff".into(), min: 20.0, max: 20_000.0, default: 20.0,
+            unit: Some("Hz".into()), ..Default::default()
+        };
+        let row = instr_param_row(&cutoff, 0.0);
+        assert!(row.contains("20.000 Hz"), "value in the plugin's own units: {row}");
+        assert!(!instr_param_row(&toggle, 0.0).contains("Hz"), "no unit, nothing invented");
+    }
+
+    /// The bank on screen: four times in a row draw as vertical bars, and every
+    /// one of them keeps its own click rect — the mouse and MIDI learn work off
+    /// those, so a new control that forgets them is a control nobody can bind.
+    #[test]
+    fn an_envelope_draws_as_a_bank_and_stays_clickable() {
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        let time = |id: u32, name: &str| choz_engine::PluginParam {
+            id, name: name.into(), min: 0.0, max: 1000.0, default: 0.0,
+            unit: Some("ms".into()), ..Default::default()
+        };
+        app.slots[0].instr_params =
+            vec![time(0, "Attack"), time(1, "Decay"), time(2, "Sustain"), time(3, "Release")];
+        app.slots[0].instr_values = vec![0.1, 0.4, 0.9, 0.6];
+        app.rack_focus = RackFocus::Instrument;
+
+        let (screen, layout) = render_rack(&mut app, 120, 30);
+        assert!(screen.contains('\u{2588}'), "a full bar for the loud one: {screen}");
+        assert!(screen.contains("Attack") && screen.contains("Release"), "names stay");
+        assert_eq!(layout.instr_knobs.len(), 4, "one rect per parameter, bank or not");
+
+        // Clicking the third bar selects the third parameter.
+        let rect = layout.instr_knobs.iter().find(|(i, _)| *i == 2).map(|(_, r)| *r).unwrap();
+        let layout = app.layout.borrow().clone();
+        let action = mouse_action(
+            rect.x + 1,
+            rect.y + 1,
+            &layout,
+            MouseEventKind::Down(MouseButton::Left),
+        );
+        assert!(
+            matches!(action, MouseAction::InstrParamSel(2)),
+            "clicking the third bar has to select the third parameter"
+        );
+    }
+
+    /// A parameter is drawn as what it *is*: a switch reads on or off, a
+    /// parameter with named steps reads its name, and anything the plugin says
+    /// nothing about stays the arc it always was.
+    #[test]
+    fn a_switch_and_a_named_step_are_not_drawn_as_knobs() {
+        use source::ParamShape;
+
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.slots[0].instr_params = vec![
+            choz_engine::PluginParam {
+                id: 0, name: "Sync".into(), min: 0.0, max: 1.0, default: 0.0,
+                steps: 2, ..Default::default()
+            },
+            choz_engine::PluginParam {
+                id: 1, name: "Wave".into(), min: 0.0, max: 2.0, default: 0.0,
+                steps: 3,
+                points: vec![
+                    (0.0, "Sine".into()), (1.0, "Saw".into()), (2.0, "Square".into()),
+                ],
+                ..Default::default()
+            },
+            choz_engine::PluginParam {
+                id: 2, name: "Cutoff".into(), min: 0.0, max: 1.0, default: 0.0,
+                ..Default::default()
+            },
+        ];
+        app.slots[0].instr_values = vec![0.0, 0.0, 0.5];
+        app.rack_focus = RackFocus::Instrument;
+
+        let (screen, _) = render_rack(&mut app, 120, 30);
+        assert!(screen.contains("OFF"), "a switch at 0 says so: {screen}");
+        assert!(screen.contains("\u{25C0}Sine\u{25B6}"), "the step's own name, with arrows");
+        assert!(screen.contains("1/3"), "and which of them it is");
+        assert!(screen.contains("\u{2591}"), "the knob keeps its arc");
+
+        // The arrows move a stepped parameter one position, not one twentieth
+        // of its range.
+        adjust_fx_param(&mut app, 0.05);
+        assert_eq!(app.slots[0].instr_values[0], 1.0, "one press flips the switch");
+        adjust_fx_param(&mut app, 0.05);
+        assert_eq!(app.slots[0].instr_values[0], 1.0, "and it stops there");
+        let (screen, _) = render_rack(&mut app, 120, 30);
+        assert!(screen.contains(" ON"), "which the panel shows");
+
+        app.instr_param = 1;
+        adjust_fx_param(&mut app, 0.05);
+        assert_eq!(app.slots[0].instr_values[1], 0.5, "the middle of three steps");
+        let (screen, _) = render_rack(&mut app, 120, 30);
+        assert!(screen.contains("\u{25C0}Saw\u{25B6}"), "the second name");
+
+        // A continuous parameter is nudged, not stepped.
+        app.instr_param = 2;
+        adjust_fx_param(&mut app, 0.05);
+        assert!((app.slots[0].instr_values[2] - 0.55).abs() < 1e-6);
+
+        // And what the shape says about a plugin's parameter is only ever what
+        // the plugin reported.
+        assert_eq!(ParamShape::of(&app.slots[0].instr_params[0]), ParamShape::Toggle);
+        assert_eq!(
+            ParamShape::of(&app.slots[0].instr_params[1]),
+            ParamShape::Named(vec![
+                (0.0, "Sine".into()), (0.5, "Saw".into()), (1.0, "Square".into()),
+            ]),
+        );
+        assert_eq!(ParamShape::of(&app.slots[0].instr_params[2]), ParamShape::Continuous);
     }
 
     /// An FX with more knobs than fit across the panel wraps onto further rows,
@@ -6684,17 +7028,30 @@ mod tests {
         let tabs = app.modal.as_ref().unwrap().list.filters.clone();
         assert_eq!(tabs, vec!["AUDIO", "THEME", "LANGUAGE"]);
 
-        // Theme tab: a scheme list under a header, then the desktop rows.
+        // The starting background is stated rather than assumed: the settings
+        // file is per process, not per test, so an image left behind by another
+        // one both survives `apply_theme` (deliberately) and adds two rows to
+        // the DESKTOP block, which moves every scheme row below it. It has to be
+        // set *before* the rows are read, or the indices are off by two.
+        app.ui.background = settings::Background::Terminal;
+
+        // Theme tab: the desktop controls first, then the scheme list — which
+        // runs to hundreds of rows, so anything below it is unreachable.
         app.modal.as_mut().unwrap().list.filter = TAB_THEME;
         app.refresh_modal();
         let items = app.modal.as_ref().unwrap().list.items.clone();
-        assert_eq!(items[0], "COLOUR SCHEME", "headers label the two halves");
-        assert!(items[1].contains("choz (default)"));
-        assert!(items.iter().any(|i| i == "DESKTOP"));
+        assert_eq!(items[0], "DESKTOP", "headers label the two halves");
+        let schemes = items.iter().position(|i| i == "COLOUR SCHEME").expect("second header");
+        assert!(items[schemes + 1].contains("choz (default)"), "choz's own themes lead");
+        assert!(
+            items.iter().any(|i| i.contains("Gruvbox Dark")),
+            "and Gogh's follow: {} rows in all",
+            items.len()
+        );
 
-        // Row 2 is the second scheme (row 0 is the header).
+        // The row right after the first scheme is the second one.
         let theme = &settings::THEMES[1];
-        app.modal.as_mut().unwrap().list.cursor = 2;
+        app.modal.as_mut().unwrap().list.cursor = schemes + 2;
         assert!(!app.modal_select(), "the modal stays open so several can be tried");
         assert_eq!(app.ui.text_color, theme.text);
         assert_eq!(app.ui.border_color, Some(theme.border));
@@ -6703,10 +7060,11 @@ mod tests {
         // A scheme with a desktop colour sets the background too.
         assert_eq!(app.ui.background, settings::Background::Color(theme.desktop.unwrap()));
         // The marker moves to the chosen row.
-        assert!(app.modal.as_ref().unwrap().list.items[2].contains('\u{25CF}'));
+        app.refresh_modal();
+        assert!(app.modal.as_ref().unwrap().list.items[schemes + 2].contains('\u{25CF}'));
 
         // Back to a scheme without a desktop: the background goes with it.
-        app.modal.as_mut().unwrap().list.cursor = 1;
+        app.modal.as_mut().unwrap().list.cursor = schemes + 1;
         app.modal_select();
         assert_eq!(app.ui.background, settings::Background::Terminal);
 
@@ -6991,7 +7349,9 @@ mod tests {
 
         // Engine rows: the same ones seqterm shows.
         let rows = app.modal.as_ref().unwrap().list.items.join("\n");
-        for label in ["Backend", "Device", "Sample rate", "Buffer size", "SF2 engine", "Latency"] {
+        for label in
+            ["Backend", "Device", "Sample rate", "Buffer size", "Tempo", "SF2 engine", "Latency"]
+        {
             assert!(rows.contains(label), "{label} missing:\n{rows}");
         }
         assert!(rows.contains("5.3 ms"), "latency is computed: {rows}");
@@ -7007,6 +7367,22 @@ mod tests {
         app.modal.as_mut().unwrap().list.cursor = 3;
         app.audio_settings_key(KeyCode::Left);
         assert_eq!(app.ui.audio.buffer_size, 128);
+
+        // The tempo is the one engine row that applies at once — a plugin reads
+        // it on the next block, nothing has to be rebuilt.
+        let transport = choz_ports::transport();
+        transport.set_bpm(choz_ports::Transport::DEFAULT_BPM);
+        app.modal.as_mut().unwrap().list.cursor = 4;
+        app.audio_settings_key(KeyCode::Right);
+        assert_eq!(transport.bpm(), 121.0);
+        assert_eq!(app.ui.audio.bpm, 121.0, "and it is remembered");
+        app.refresh_modal();
+        assert!(
+            app.modal.as_ref().unwrap().list.items[4].contains("121.0 BPM"),
+            "the row shows the clock plugins actually see"
+        );
+        transport.set_bpm(choz_ports::Transport::DEFAULT_BPM);
+
         // Those need a restart, and the rows say so.
         app.audio_engine = None;
         app.refresh_modal();
@@ -7040,6 +7416,7 @@ mod tests {
         let saved = settings::UiSettings::load();
         assert_eq!(saved.audio.backend, "JACK");
         assert_eq!(saved.osc.tcp_port, 9100);
+        assert_eq!(saved.audio.bpm, 121.0);
     }
 
     /// Clicking a category in the ADD FX sidebar shows that category — through
@@ -7375,8 +7752,8 @@ mod tests {
             name: "Tyrell".into(),
         }));
         app.slots[0].instr_params = vec![
-            choz_engine::PluginParam { id: 9, name: "Cutoff".into(), min: 0.0, max: 1.0, default: 0.0 },
-            choz_engine::PluginParam { id: 4, name: "Volume".into(), min: 0.0, max: 1.0, default: 0.5 },
+            choz_engine::PluginParam { id: 9, name: "Cutoff".into(), min: 0.0, max: 1.0, default: 0.0, ..Default::default() },
+            choz_engine::PluginParam { id: 4, name: "Volume".into(), min: 0.0, max: 1.0, default: 0.5, ..Default::default() },
         ];
         app.slots[0].instr_values = vec![0.2, 0.6];
         app.source = app.slots[0].source.clone();
@@ -7438,8 +7815,8 @@ mod tests {
         // VST3 ParamID are all arbitrary, and the UI must work off the index the
         // host translated to.
         app.slots[0].instr_params = vec![
-            choz_engine::PluginParam { id: 4100, name: "Cutoff".into(), min: 0.0, max: 1.0, default: 0.0 },
-            choz_engine::PluginParam { id: 77, name: "Volume".into(), min: 0.0, max: 1.0, default: 0.5 },
+            choz_engine::PluginParam { id: 4100, name: "Cutoff".into(), min: 0.0, max: 1.0, default: 0.0, ..Default::default() },
+            choz_engine::PluginParam { id: 77, name: "Volume".into(), min: 0.0, max: 1.0, default: 0.5, ..Default::default() },
         ];
         app.slots[0].instr_values = vec![0.0, 0.5];
 

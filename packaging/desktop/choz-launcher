@@ -1,0 +1,36 @@
+#!/bin/sh
+# Open choz in a terminal good enough to draw it.
+#
+# choz is a TUI, so the desktop entry cannot just exec the binary. The two ways
+# out are `Terminal=true` — which hands the job to whatever terminal the desktop
+# happens to default to — or this: pick one we know works, and size it.
+#
+# kitty comes first because that is where the wallpaper is drawn by the graphics
+# protocol, at real pixel resolution instead of half-blocks. The rest are
+# fallbacks in descending order of how well they handle a full-screen TUI.
+#
+# Below roughly 100x30 cells the RACK does not fit and the interface looks
+# broken, so every terminal here is asked for at least that.
+set -eu
+
+COLS=120
+ROWS=40
+
+command -v choz >/dev/null 2>&1 || {
+    echo "choz-launcher: choz is not on PATH" >&2
+    exit 127
+}
+
+for term in kitty ghostty wezterm alacritty xterm; do
+    command -v "$term" >/dev/null 2>&1 || continue
+    case "$term" in
+        kitty)     exec kitty -o initial_window_width=${COLS}c -o initial_window_height=${ROWS}c choz "$@" ;;
+        ghostty)   exec ghostty --window-width=$COLS --window-height=$ROWS -e choz "$@" ;;
+        wezterm)   exec wezterm start --cwd . -- choz "$@" ;;
+        alacritty) exec alacritty -o "window.dimensions.columns=$COLS" -o "window.dimensions.lines=$ROWS" -e choz "$@" ;;
+        xterm)     exec xterm -geometry "${COLS}x${ROWS}" -e choz "$@" ;;
+    esac
+done
+
+echo "choz-launcher: no supported terminal found (kitty, ghostty, wezterm, alacritty, xterm)" >&2
+exit 127

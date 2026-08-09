@@ -95,7 +95,27 @@ unsafe extern "C" fn host_callback(
         host_opcode::WANT_MIDI => 1,
         // Plugins ask for this every block and many (u-he's, for one) read the
         // answer without a null check — returning 0 here is a segfault.
-        host_opcode::GET_TIME => TIME_INFO.with(|t| t.get() as isize),
+        host_opcode::GET_TIME => TIME_INFO.with(|t| {
+            // Refreshed from choz's clock on every ask — a plugin calls this
+            // once per block, from the audio thread, and reads the struct
+            // straight after. The pointer stays the thread's own; only the
+            // numbers in it move.
+            let transport = choz_ports::transport();
+            // SAFETY: the cell belongs to this thread and nothing else holds a
+            // reference across this write; the plugin reads it after we return.
+            unsafe {
+                let info = &mut *t.get();
+                info.sample_rate = transport.sample_rate() as f64;
+                info.sample_pos = transport.samples() as f64;
+                info.ppq_pos = transport.ppq();
+                info.tempo = transport.bpm() as f64;
+                info.flags = time_flags::PPQ_POS_VALID
+                    | time_flags::TEMPO_VALID
+                    | time_flags::TIME_SIG_VALID
+                    | if transport.playing() { time_flags::TRANSPORT_PLAYING } else { 0 };
+            }
+            t.get() as isize
+        }),
         // kVstProcessLevelRealtime: this callback only ever runs from `run`.
         host_opcode::PROCESS_LEVEL => 2,
         _ => 0,
@@ -106,9 +126,12 @@ thread_local! {
     /// The transport handed back on `audioMasterGetTime`, one per calling
     /// thread so the pointer stays valid without sharing it across threads.
     ///
-    /// ponytail: a fixed 120 BPM at bar one, because choz has no transport of
-    /// its own. Fill it from the real clock when choz grows one — tempo-synced
-    /// delays and arpeggiators will follow it then.
+    /// The contents are refreshed from [`choz_ports::transport`] on every
+    /// `audioMasterGetTime`; what is per-thread is the storage, so the pointer
+    /// handed to the plugin stays valid without being shared.
+    ///
+    /// ponytail: 4/4 is still fixed — nothing in choz sets a time signature, and
+    /// a plugin that syncs cares about the tempo and the position.
     static TIME_INFO: std::cell::UnsafeCell<VstTimeInfo> =
         std::cell::UnsafeCell::new(VstTimeInfo {
             sample_rate: 48_000.0,
@@ -465,10 +488,12 @@ impl Instance {
                     let n = self.get_string(opcode::GET_PARAM_NAME, i as i32);
                     if n.is_empty() { format!("P{i}") } else { n }
                 },
-                // VST2 parameters are normalised by definition.
+                // VST2 parameters are normalised by definition, and the ABI
+                // says nothing about steps or units: everything is a knob.
                 min: 0.0,
                 max: 1.0,
                 default: self.get_param(i) as f64,
+                ..PluginParam::default()
             })
             .collect()
     }
@@ -801,6 +826,40 @@ mod tests {
         assert!(info.sample_rate > 0.0);
         assert!(info.tempo > 0.0);
         assert_eq!(info.flags & time_flags::TEMPO_VALID, time_flags::TEMPO_VALID);
+    }
+
+    /// And the answer has to be choz's actual clock, not a constant: a plugin
+    /// syncing a delay to 90 BPM at bar three needs the position to have moved.
+    #[test]
+    fn get_time_follows_the_host_clock() {
+        let t = choz_ports::transport();
+        t.set_sample_rate(48_000);
+        t.set_bpm(90.0);
+        t.set_playing(true);
+        t.rewind();
+        t.advance(48_000); // one second
+
+        let read = || unsafe {
+            let ptr = host_callback(
+                std::ptr::null_mut(), host_opcode::GET_TIME, 0, 0, std::ptr::null_mut(), 0.0,
+            );
+            *(ptr as *const VstTimeInfo)
+        };
+        let info = read();
+        assert_eq!(info.tempo, 90.0);
+        assert_eq!(info.sample_pos, 48_000.0);
+        // One second at 90 BPM is one and a half quarter notes.
+        assert!((info.ppq_pos - 1.5).abs() < 1e-9, "ppq {}", info.ppq_pos);
+        assert_eq!(info.flags & time_flags::TRANSPORT_PLAYING, time_flags::TRANSPORT_PLAYING);
+
+        t.set_playing(false);
+        assert_eq!(read().flags & time_flags::TRANSPORT_PLAYING, 0, "stopped means stopped");
+
+        // Out-of-range tempos are clamped rather than handed to a plugin.
+        t.set_bpm(1_000.0);
+        assert_eq!(read().tempo, choz_ports::Transport::MAX_BPM as f64);
+        t.set_bpm(choz_ports::Transport::DEFAULT_BPM);
+        t.rewind();
     }
 }
 

@@ -306,7 +306,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "choz-engine"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "choz-plugin-clap",
@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "choz-plugin-clap"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "choz-ports",
@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "choz-plugin-ladspa"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "choz-ports",
@@ -356,10 +356,11 @@ dependencies = [
 
 [[package]]
 name = "choz-plugin-lv2"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "choz-ports",
+ "libc",
  "libloading 0.8.9",
  "oxiri",
  "parking_lot",
@@ -370,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "choz-plugin-sandbox"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -378,7 +379,7 @@ dependencies = [
 
 [[package]]
 name = "choz-plugin-vst2"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "choz-ports",
@@ -387,7 +388,7 @@ dependencies = [
 
 [[package]]
 name = "choz-plugin-vst3"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "choz-ports",
@@ -398,11 +399,11 @@ dependencies = [
 
 [[package]]
 name = "choz-ports"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "choz-ui"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64-simd",

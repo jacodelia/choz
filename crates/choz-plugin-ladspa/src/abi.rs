@@ -330,9 +330,33 @@ pub fn bounds(hint: &LADSPA_PortRangeHint, sample_rate: u32) -> (f32, f32) {
     if upper > lower { (lower, upper) } else { (lower, lower + 1.0) }
 }
 
+/// How many positions a control port has, for the UI to pick a control:
+/// `2` for a switch, one per whole number for an integer port, `0` (continuous)
+/// for everything else. LADSPA says this in the hint and nowhere else.
+pub fn steps_of(hint: &LADSPA_PortRangeHint, min: f32, max: f32) -> u32 {
+    if hint.hint_descriptor & HINT_TOGGLED != 0 {
+        return 2;
+    }
+    if hint.hint_descriptor & HINT_INTEGER != 0 {
+        return ((max - min).round() as i64 + 1).clamp(0, u32::MAX as i64) as u32;
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A port the plugin called a switch must not come back as a knob, and an
+    /// unhinted one must not come back as anything but continuous.
+    #[test]
+    fn a_hint_is_the_only_thing_that_makes_a_port_stepped() {
+        let hint = |d: c_int| LADSPA_PortRangeHint { hint_descriptor: d, lower_bound: 0.0, upper_bound: 1.0 };
+        assert_eq!(steps_of(&hint(HINT_TOGGLED), 0.0, 1.0), 2);
+        assert_eq!(steps_of(&hint(HINT_INTEGER), 0.0, 3.0), 4, "0,1,2,3");
+        assert_eq!(steps_of(&hint(0), 0.0, 1.0), 0, "no hint, no steps");
+        assert_eq!(steps_of(&hint(HINT_LOGARITHMIC), 20.0, 20_000.0), 0);
+    }
 
     /// The struct the plugin reads must be exactly ALSA's 28-byte event.
     #[test]

@@ -210,6 +210,10 @@ unsafe fn port_table(d: *const LADSPA_Descriptor) -> PortTable {
                     min: min as f64,
                     max: max as f64,
                     default: default_for(&hint, NOMINAL_SR) as f64,
+                    steps: steps_of(&hint, min, max),
+                    // LADSPA has no units and no step names; a hint is all it
+                    // says about a port beyond the numbers.
+                    ..PluginParam::default()
                 });
             }
             _ => t.other.push(i),
@@ -292,6 +296,7 @@ fn build(path: &Path, label: &str, sample_rate: u32, block: u32, want_synth: boo
                 min: min as f64,
                 max: max as f64,
                 default: default_for(&hint, sample_rate) as f64,
+                steps: steps_of(&hint, min, max),
                 ..p.clone()
             }
         })

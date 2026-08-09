@@ -285,3 +285,96 @@ fn plugins_with_a_state_interface_round_trip_their_patch() {
     }
     eprintln!("{tried} LV2 plugin(s) round-tripped their state");
 }
+
+/// The hints that decide which control the UI draws, read off real bundles.
+///
+/// Ardour's `a-delay` is the useful case: its divisor port is an enumeration of
+/// ten note values over a range of 1..48, so the named steps are **not** evenly
+/// spaced. A host that assumed a uniform grid would name them wrong.
+#[test]
+fn control_ports_report_what_kind_of_control_they_are() {
+    let _guard = plugin_lock();
+    let bundle = std::path::Path::new("/usr/lib/lv2/a-delay.lv2");
+    if !bundle.exists() {
+        eprintln!("a-delay not installed; skipping");
+        return;
+    }
+    let found = choz_plugin_lv2::discovery::discover_bundle(bundle);
+    let info = found.first().expect("a-delay is in its bundle");
+
+    let divisor = info
+        .ports
+        .iter()
+        .find(|p| p.enumeration)
+        .expect("a-delay declares an enumeration port");
+    assert!(divisor.integer, "and an integer one");
+    assert_eq!(divisor.points.len(), 10, "ten note divisions");
+    assert_eq!(divisor.points[0].0, 1.0, "sorted by value: whole note first");
+    assert_eq!(divisor.points.last().unwrap().0, 48.0);
+    assert!(divisor.points.iter().any(|(_, l)| l.contains("Whole note")));
+
+    let params = choz_plugin_lv2::read_params(&info.bundle_dir, &info.uri);
+    let param = params
+        .iter()
+        .find(|p| p.id == divisor.index)
+        .expect("the port is an automatable parameter");
+    assert_eq!(param.steps, 10, "one step per named point, not one per integer");
+    assert_eq!(param.points.len(), 10);
+    // The positions are what the plugin said, spread over min..max — the point
+    // of carrying them instead of a count.
+    assert!((param.normalised(param.points[1].0) - (2.0 - 1.0) / 47.0).abs() < 1e-9);
+
+    // A switch says so outright, wherever one is installed.
+    if let Some(toggle) = info.ports.iter().find(|p| p.toggled) {
+        let p = params.iter().find(|p| p.id == toggle.index).expect("also a parameter");
+        assert_eq!(p.steps, 2, "{} is a switch", toggle.name);
+    }
+}
+
+/// Units come off the port and reach the parameter, which is what decides
+/// whether the interface draws a knob or a fader. `units:ms` and `units:pc` are
+/// the two commonest on this machine after the inline definitions.
+#[test]
+fn control_ports_carry_their_unit() {
+    let _guard = plugin_lock();
+    let mut with_unit = 0;
+    let mut sample: Option<(String, String)> = None;
+
+    for dir in std::fs::read_dir("/usr/lib/lv2").into_iter().flatten().flatten() {
+        let bundle = dir.path();
+        if bundle.extension().is_none_or(|e| e != "lv2") {
+            continue;
+        }
+        for info in choz_plugin_lv2::discovery::discover_bundle(&bundle) {
+            for port in info.ports.iter().filter(|p| p.unit.is_some()) {
+                with_unit += 1;
+                if sample.is_none() {
+                    sample = Some((info.uri.clone(), port.unit.clone().unwrap()));
+                }
+            }
+        }
+    }
+
+    let Some((uri, unit)) = sample else {
+        eprintln!("no LV2 plugin here declares a unit; skipping");
+        return;
+    };
+    eprintln!("{with_unit} control port(s) with a unit; e.g. {uri} → {unit}");
+    assert!(!unit.trim().is_empty(), "a unit that parsed to nothing is worse than none");
+    // And it survives the trip to the parameter list the UI reads.
+    let bundle = std::path::Path::new("/usr/lib/lv2");
+    let found = std::fs::read_dir(bundle)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "lv2"))
+        .flat_map(|p| choz_plugin_lv2::discovery::discover_bundle(&p))
+        .find(|i| i.uri == uri)
+        .expect("the plugin it came from");
+    let params = choz_plugin_lv2::read_params(&found.bundle_dir, &found.uri);
+    assert!(
+        params.iter().any(|p| p.unit.is_some()),
+        "{uri} has a port with a unit but no parameter carries it"
+    );
+}

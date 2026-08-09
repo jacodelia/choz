@@ -2,10 +2,55 @@
 name = "choz-ui"
 version.workspace = true
 edition.workspace = true
+description.workspace = true
+license = "MIT"
 
 [[bin]]
 name = "choz"
 path = "src/main.rs"
+
+# ─── Packaging ──────────────────────────────────────────────────────────────
+#
+# `cargo deb -p choz-ui` and `cargo generate-rpm -p crates/choz-ui` (after a
+# release build). Both replace an older version of the same package by name, so
+# the "detect and uninstall the previous one" half of installing is the package
+# manager's job — `packaging/install.sh` is for people not using either.
+#
+# Nothing here owns ~/.local/state/choz: the projects, plugin paths and settings
+# are the user's and survive every uninstall.
+
+[package.metadata.deb]
+name = "choz"
+maintainer = "Jorge Codelia <jorgecodelia@gmail.com>"
+section = "sound"
+priority = "optional"
+# Only what choz links: ALSA and JACK for audio, X11 for plugin windows. The
+# plugin formats themselves are dlopened, so no plugin is a dependency.
+depends = "$auto"
+extended-description = """\
+choz hosts CLAP, LV2, LADSPA, DSSI, VST2 and VST3 plugins from a terminal: a \
+multi-slot rack with a mixer, insert FX, MIDI/OSC routing and YAML projects. \
+Plugins that misbehave are scanned, probed and hosted out of process."""
+assets = [
+    ["../../target/release/choz", "usr/bin/", "755"],
+    ["../../packaging/desktop/choz-launcher", "usr/bin/", "755"],
+    ["../../packaging/desktop/choz.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/desktop/choz.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["../../packaging/desktop/choz-project.xml", "usr/share/mime/packages/", "644"],
+    ["../../README.md", "usr/share/doc/choz/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "choz"
+summary = "A terminal audio plugin host"
+assets = [
+    { source = "../../target/release/choz", dest = "/usr/bin/choz", mode = "755" },
+    { source = "../../packaging/desktop/choz-launcher", dest = "/usr/bin/choz-launcher", mode = "755" },
+    { source = "../../packaging/desktop/choz.desktop", dest = "/usr/share/applications/choz.desktop", mode = "644" },
+    { source = "../../packaging/desktop/choz.svg", dest = "/usr/share/icons/hicolor/scalable/apps/choz.svg", mode = "644" },
+    { source = "../../packaging/desktop/choz-project.xml", dest = "/usr/share/mime/packages/choz-project.xml", mode = "644" },
+    { source = "../../README.md", dest = "/usr/share/doc/choz/README.md", mode = "644", doc = true },
+]
 
 [dependencies]
 choz-engine.workspace = true

@@ -27,12 +27,58 @@ pub struct Theme {
     pub desktop: Option<(u8, u8, u8)>,
 }
 
-/// The themes offered in Settings → THEME.
+/// Every theme Settings → THEME offers: choz's own, then Gogh's.
+pub static THEMES: std::sync::LazyLock<Vec<Theme>> =
+    std::sync::LazyLock::new(|| BUILTIN.iter().copied().chain(gogh_themes()).collect());
+
+/// Gogh's terminal colour schemes, trimmed to the three fields a theme here
+/// needs. One line per scheme: `name|text RRGGBB|desktop RRGGBB`.
 ///
-/// The first one keeps choz's original look and paints no background. The rest
-/// are the classic editor schemes, with the desktop colour taken from the
-/// scheme's own editor background.
-pub const THEMES: &[Theme] = &[
+/// ponytail: a text table parsed once beats 361 `Theme` literals — same result,
+/// 10 KB of data instead of 2000 lines of source, and re-generating it from
+/// upstream is a `curl` and a script rather than a diff nobody can read.
+const GOGH_DATA: &str = include_str!("gogh_themes.txt");
+
+/// Gogh gives a terminal palette; choz needs a frame colour, which no terminal
+/// scheme has. It is the midpoint between the text and the desktop: dimmer than
+/// the text so frames don't shout, brighter than the background so they are
+/// there at all. Works the same way for a light scheme, where "brighter" means
+/// darker.
+fn frame_between(text: (u8, u8, u8), desktop: (u8, u8, u8)) -> (u8, u8, u8) {
+    let mix = |a: u8, b: u8| ((a as u16 + b as u16) / 2) as u8;
+    (mix(text.0, desktop.0), mix(text.1, desktop.1), mix(text.2, desktop.2))
+}
+
+fn hex(s: &str) -> Option<(u8, u8, u8)> {
+    let s = s.trim();
+    if s.len() != 6 {
+        return None;
+    }
+    let v = u32::from_str_radix(s, 16).ok()?;
+    Some(((v >> 16) as u8, (v >> 8) as u8, v as u8))
+}
+
+/// Parse [`GOGH_DATA`]. A line that doesn't parse is skipped rather than fatal:
+/// the table is data, and one bad row must not cost the user every theme.
+fn gogh_themes() -> impl Iterator<Item = Theme> {
+    GOGH_DATA.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()).filter_map(|line| {
+        let mut parts = line.split('|');
+        let name = parts.next()?.trim();
+        let text = hex(parts.next()?)?;
+        let desktop = hex(parts.next()?)?;
+        (!name.is_empty()).then_some(Theme {
+            name,
+            text,
+            border: frame_between(text, desktop),
+            desktop: Some(desktop),
+        })
+    })
+}
+
+/// choz's own themes, shown first: the default look plus the classic editor
+/// schemes, with the desktop colour taken from the scheme's own editor
+/// background.
+const BUILTIN: &[Theme] = &[
     Theme {
         name: "choz (default)",
         text: (220, 226, 240),
@@ -116,7 +162,7 @@ pub const PALETTE: &[(&str, (u8, u8, u8))] = &[
 
 /// Audio-engine settings. `backend` and `sample_rate`/`buffer_size` only take
 /// effect on the next start — the stream is built from them at launch.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AudioSettings {
     /// `AUTO`, `JACK`, `PIPEWIRE` or `ALSA`.
     pub backend: String,
@@ -138,6 +184,14 @@ pub struct AudioSettings {
     pub alsa_hw_device: String,
     /// JACK server name, empty = default.
     pub jack_server_name: String,
+    /// Tempo of choz's own transport, in BPM — what a tempo-synced plugin reads
+    /// on every block. Added later, hence the default.
+    #[serde(default = "default_bpm")]
+    pub bpm: f32,
+}
+
+fn default_bpm() -> f32 {
+    choz_ports::Transport::DEFAULT_BPM
 }
 
 impl Default for AudioSettings {
@@ -152,6 +206,7 @@ impl Default for AudioSettings {
             pipewire_quantum: 0,
             alsa_hw_device: String::new(),
             jack_server_name: String::new(),
+            bpm: default_bpm(),
         }
     }
 }
@@ -303,7 +358,9 @@ impl Background {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+// No `Eq`: the tempo is an `f32`. Nothing compares settings for exact equality
+// beyond the round-trip tests, which `PartialEq` covers.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UiSettings {
     /// Text colour, as RGB.
     pub text_color: (u8, u8, u8),
@@ -449,6 +506,7 @@ impl UiSettings {
 
     /// Push the settings into the places the drawing code reads them from.
     pub fn apply(&self) {
+        choz_ports::transport().set_bpm(self.audio.bpm);
         crate::i18n::set_language(self.language);
         crate::views::theme::set_text_color(self.color());
         crate::views::theme::set_border_color(self.border());
@@ -482,6 +540,33 @@ mod tests {
         assert_eq!(osc.bind_port(), choz_engine::osc::DEFAULT_PORT);
         osc.port_mode = OscPortMode::Random;
         assert_eq!(osc.bind_port(), 0, "random = let the OS pick");
+    }
+
+    /// The Gogh table is data shipped inside the binary: a line that stopped
+    /// parsing would silently cost the user a theme, and a colour read out of
+    /// order would cost them a readable interface.
+    #[test]
+    fn the_gogh_table_parses_into_usable_themes() {
+        let gogh: Vec<Theme> = gogh_themes().collect();
+        assert!(gogh.len() > 300, "the upstream table has hundreds; got {}", gogh.len());
+        assert_eq!(THEMES.len(), BUILTIN.len() + gogh.len(), "choz's own come first");
+        assert_eq!(THEMES[0].name, BUILTIN[0].name);
+
+        // A known scheme, byte for byte from `data/themes.json`.
+        let gruvbox = gogh.iter().find(|t| t.name == "Gruvbox Dark").expect("a famous one");
+        assert_eq!(gruvbox.text, (0xEB, 0xDB, 0xB2));
+        assert_eq!(gruvbox.desktop, Some((0x28, 0x28, 0x28)));
+        // The frame sits between the two, so it reads against both.
+        assert_eq!(gruvbox.border, (0x89, 0x81, 0x6D));
+
+        // Nothing empty, nothing duplicated: the picker shows names, and two
+        // rows with the same one cannot be told apart.
+        let mut names: Vec<&str> = THEMES.iter().map(|t| t.name).collect();
+        assert!(names.iter().all(|n| !n.trim().is_empty()));
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(names.len(), before, "duplicate theme names");
     }
 
     #[test]

@@ -84,13 +84,20 @@ pub fn describe(path: &Path) -> Vst3PluginInfo {
 pub fn read_params(path: &Path, _id: &str) -> Vec<PluginParam> {
     let Ok(inst) = Vst3RealInstance::load(path, 48_000, 64) else { return Vec::new() };
     (0..inst.param_count())
-        .map(|id| PluginParam {
-            id,
-            name: inst.param_name(id),
-            // VST3 parameters are normalised by definition.
-            min: 0.0,
-            max: 1.0,
-            default: inst.get_param(id) as f64,
+        .map(|id| {
+            let (steps, points) = inst.param_steps(id);
+            let unit = inst.param_label(id);
+            PluginParam {
+                id,
+                name: inst.param_name(id),
+                // VST3 parameters are normalised by definition.
+                min: 0.0,
+                max: 1.0,
+                default: inst.get_param(id) as f64,
+                steps,
+                unit: (!unit.is_empty()).then_some(unit),
+                points,
+            }
         })
         .collect()
 }

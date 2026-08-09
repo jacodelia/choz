@@ -3,13 +3,214 @@
 Todos los cambios notables de choz. Formato basado en
 [Keep a Changelog](https://keepachangelog.com/es/1.1.0/).
 
-El proyecto todavía no publica versiones: hay un solo tramo `Unreleased` desde
-el commit inicial, agrupado por día de trabajo. **Éste es el historial**: los
+El historial va agrupado por día de trabajo. **Éste es el historial**: los
 diagnósticos, las medidas y los callejones sin salida se cuentan aquí.
 [docs/roadmap.md](docs/roadmap.md) sólo lleva lo que falta, y
 [docs/architecture.md](docs/architecture.md) cómo encajan las piezas.
 
-## [Unreleased]
+## [1.0.0] — 2026-08-09
+
+Primera versión publicada. Todo lo de abajo — desde el commit inicial hasta hoy — es
+lo que lleva: los seis formatos de plugin hosteados con ventana nativa, el rack
+multi-slot con mixer y FX, ruteo de entradas/salidas, proyectos en YAML, tres capas
+contra el código ajeno que revienta (escaneo fuera de proceso, cuarentena y sandbox
+por proceso), parámetros dibujados según lo que el plugin dice que son, transporte
+propio, 372 temas, y empaquetado `.deb`/`.rpm`/`install.sh` con entrada de escritorio.
+
+
+### 2026-08-09 (sexies) — superficie de control en un ESP32-S3 con pantalla táctil
+
+#### Añadido
+- **`examples/esp32s3-touch/`**: cuatro faders de canal con mute y un teclado de una octava, mandando OSC por WiFi al puerto que choz ya escucha. **No hace falta tocar nada de choz**: el servidor OSC es el de 2026-07-29 y el firmware sólo le habla.
+- **El firmware no lleva librería de OSC**: un mensaje es dirección, tag de tipos y argumentos big-endian, todo alineado a cuatro bytes — treinta líneas de codificador frente a una dependencia que habría que fijar por cada variante de placa.
+
+#### Corregido (premisa del requisito)
+- **No existen versiones de ESP32-S3 con Linux.** El S3 es un Xtensa LX7 sin MMU, con cientos de kilobytes de RAM y sin `dlopen`; las placas S3 con pantalla táctil (ESP32-S3-BOX-3, LilyGO T-Display-S3 Touch, Waveshare ESP32-S3-Touch-LCD) corren ESP-IDF/FreeRTOS con LVGL. Hostear plugins *es* cargar código nativo en tiempo de ejecución, así que el ejemplo apunta a esas placas haciendo lo que sí pueden: ser la superficie mientras choz corre en la máquina que tiene la interfaz de audio.
+
+#### Verificado
+- `the_bytes_an_esp32_control_surface_sends_are_understood`: los bytes exactos que arma el sketch — `/mix/2/gain ,f`, `/mix/3/mute ,i`, `/note ,ii` con velocidad 0 como note-off — decodificados y parseados por el propio choz. **Sin comprobar en la placa**: flashear, mirar el panel y medir el retardo del toque necesita el hardware delante. **257 tests**, clippy `--all-targets -D warnings` limpio.
+
+### 2026-08-09 (quinquies) — el banco de faders verticales (cierra el rediseño de parámetros)
+
+#### Añadido
+- **Tres o más faders seguidos con la misma unidad se dibujan como un banco de barras verticales**: un ADSR (cuatro tiempos), las ganancias de un EQ por bandas, un juego de envíos. Es el caso que el roadmap describía — ver el perfil de un vistazo vale más que leer cuatro números — y ahora el perfil se lee de corrido.
+  - **La agrupación también sale del plugin, no de los nombres**: la unidad dice que son la misma clase de cosa y el orden es el suyo. Un plugin que llama a su envolvente `A/D/S/R` y otro que la llama `Attack/Decay/…` se agrupan igual, y un knob en medio parte el grupo.
+  - Dos barras no son un banco (el mínimo es tres) y una unidad distinta corta la racha.
+  - Medido: **58 de los 647 plugins LV2 instalados** dibujarían un banco — MVerb, ZaMultiCompX2, los Dragonfly, LSP Beat Breather…
+- Cada barra **conserva su rect**, así que el ratón y el MIDI learn siguen funcionando sobre ella: hay un test que hace clic en la tercera barra y comprueba que selecciona el tercer parámetro.
+
+#### Verificado
+- El agrupador entero sobre casos sintéticos (racha corta, unidad distinta, knob en medio), la barra creciendo hacia arriba y llenando primero la celda de abajo, y el render real del RACK con una envolvente de cuatro tiempos. **256 tests**, clippy `--all-targets -D warnings` limpio.
+
+### 2026-08-09 (quater) — el fader y el knob fino; el punto 1 dado por cerrado
+
+El usuario dio por buena la pasada de mirar y oír: **el fondo se ve bien, el modo MULTI le
+sirve como está, y los plugins responden al MIDI con latencia correcta.** Eso desbloquea la
+mitad visual de los parámetros, que estaba detrás de ella a propósito.
+
+#### Añadido
+- **Fader horizontal para lo que se lee como recorrido** — mezcla, tiempos, porcentajes: la
+  pista entera dibujada y sólo el mango moviéndose (`─────▮────`), en la caja del RACK y en
+  la lista larga. **Qué es un recorrido lo dice el plugin, no su nombre**: la unidad
+  (`units:unit` en LV2, `units` en VST3). `s`, `ms`, `%`/`pc` y los centésimos son faderes;
+  un hercio o un decibelio siguen siendo knob. Un plugin que no declara unidad no cambia.
+  - Medido aquí: **21 291 puertos de control con unidad** entre los 261 bundles instalados
+    (`units:pc` y `units:ms` son las dos más comunes) — p. ej. Dragonfly Plate, cuyo dry/wet
+    pasa a fader.
+- **El arco del knob resuelve ocho veces más fino.** Una celda de terminal es la unidad más
+  gruesa que hay, así que ocho celdas sólo podían mostrar ocho posiciones y un corte movido
+  por poco se veía idéntico. Con los bloques de octavo (`▏▎▍▌▋▊▉█`) son **65 imágenes
+  distintas en el mismo ancho** — lo más cerca de la resolución angular de un knob real que
+  da un terminal.
+
+#### Verificado
+- El arco dibuja 65 imágenes distintas donde antes dibujaba 9, el mango del fader recorre la pista de punta a punta, y ambos salen igual en la caja del RACK y en la lista larga. **254 tests**, clippy `--all-targets -D warnings` limpio.
+
+#### Cerrado sin código
+- **"Mirar con audio y ojos reales"**, que era el punto 1 del Pendiente y lo único que los
+  tests no dan. Confirmado por el usuario: fondo correcto, MULTI suficiente por ahora,
+  plugins sonando por MIDI con latencia razonable. Lo que no se llegó a mirar —
+  el escritorio recién empaquetado y un plugin siguiendo la fila `Tempo` — queda
+  anotado con la release, que es cuando se instala de verdad.
+
+#### Pendiente del mismo punto
+- El fader **vertical** para grupos que se comparan entre sí (un ADSR, un EQ por bandas) y
+  el layout no uniforme que hace falta para él: `param_grid` sigue repartiendo celdas
+  iguales y `RackLayout.instr_knobs` necesita un rect por control para el ratón y el MIDI
+  learn.
+
+### 2026-08-09 (ter) — el reloj también para VST3 y CLAP
+
+El transporte lo leía sólo VST2, que es donde el problema apareció. Ahora los tres
+formatos que preguntan la hora reciben la misma respuesta.
+
+#### Añadido
+- **VST3: `processContext` deja de ser `NULL`.** Un puntero nulo ahí significa "el host no sabe qué hora es", y un delay sincronizado se inventa el tempo. Se rellena por bloque desde `choz_ports::transport`: `sampleRate`, `projectTimeSamples`, `projectTimeMusic` (en negras), `tempo`, 4/4 y el flag de reproducción.
+- **CLAP: el bloque lleva su `clap_event_transport`** (era `None` = "libre"), con la posición en beats y en segundos, el tempo y el estado.
+- **Sólo se marca válido lo que choz sabe de verdad.** Nada de compás distinto de 4/4, ni posición de compás, ni ciclo, ni SMPTE: un plugin lee un campo cuando su flag dice que está, e inventar un número de compás es peor que no ofrecerlo.
+
+#### Verificado
+- Los tres hosts, con el mismo reloj y la misma comprobación: 90 BPM y un segundo de audio dan 1.5 negras (`ppqPos` en VST2, `projectTimeMusic` en VST3, `song_pos_beats` en CLAP), y parado se cae el flag de reproducción. Los tests de runtime con plugins reales siguen en verde con el contexto ya adjunto. **252 tests**, clippy `--all-targets -D warnings` limpio.
+
+### 2026-08-09 (bis) — la lista larga de parámetros, y un transporte de verdad
+
+#### Añadido
+- **La lista del modal INSTRUMENT dibuja lo que cada parámetro es**, igual que la caja del RACK: **checkbox** `[x] ON` / `[ ] OFF` para lo binario (una columna, no un botón — es donde el roadmap lo pedía: en una lista de cuarenta filas), `◀ Nombre ▶ 3/8` para los pasos con nombre, y el arco de siempre para lo continuo — **con la unidad del plugin al lado del valor** (`20.000 Hz`), que era el hueco que quedaba abierto.
+- **La rueda del ratón sobre un interruptor lo cambia de posición**, no de 0.03: pasaba por un delta crudo mientras las flechas ya iban por `ParamShape::nudge`.
+- **choz tiene transporte propio** (`choz_ports::Transport`, punto de "nice-to-have"): posición en frames, BPM, sample rate y play/stop en atómicas, avanzado por el callback de audio y por nadie más. Es global al proceso a propósito: hay un solo reloj, y el sitio que más lo necesita — `audioMasterGetTime` de VST2 — es un callback en C al que le pasan un puntero al plugin y ningún contexto del host.
+  - **El host VST2 ya no responde 120 BPM fijos** (se va el `ponytail:` que lo marcaba): rellena `VstTimeInfo` con el reloj real en cada llamada — tempo, `samplePos`, `ppqPos` y el flag de reproducción. Un delay o un arpegiador sincronizado sigue ahora a choz. Sigue fijo el compás: 4/4, porque nada en choz lo elige todavía.
+  - **Settings → AUDIO → Engine gana una fila `Tempo`**, con ←/→ (20–300 BPM, clamped), aplicada al instante — no hay stream que reconstruir — y guardada en `ui.json`.
+
+#### Verificado
+- `get_time_follows_the_host_clock`: a 90 BPM y un segundo de audio, el plugin lee `ppqPos = 1.5` y `samplePos = 48000`; parado, el flag de reproducción se cae; un tempo fuera de rango se recorta antes de llegarle. Más el checkbox/nombre/unidad de la lista y la fila de Settings de punta a punta (se mueve, se ve, se guarda). **250 tests**, clippy `--all-targets -D warnings` limpio.
+
+#### Pendiente del mismo punto
+- Faders (horizontal y vertical), checkbox agrupado, más resolución angular en el knob y el layout no uniforme que hace falta para ellos. **Va detrás del punto 1**: son decisiones que se juzgan mirando, y la mitad del modelo — de dónde sale el tipo — ya está hecha, así que probarlas es barato cuando haya ojos delante.
+
+### 2026-08-09 — instalable y en el menú del escritorio (puntos 3 y 4 de Pendiente)
+
+#### Añadido
+- **`choz --version` y `choz --help`** — la bandera que faltaba para que un instalador pueda preguntarle a la copia que ya está en disco qué versión es. Responden **antes** del redirect del log, porque si no la respuesta se va al fichero: fd 1 deja de ser la terminal en cuanto choz arranca de verdad.
+- **`packaging/install.sh`**: construye (o toma un `--binary`), **busca la instalación vieja en `~/.local/bin`, `/usr/local/bin` y `/usr/bin`, le pregunta `--version` y la quita antes de copiar la nueva**, e instala también el lanzador, el `.desktop`, el icono y el tipo MIME. `--prefix`, `--uninstall` y `CHOZ_SEARCH_BINS` (lo único que sale del prefijo es esa búsqueda, así que el que llama puede apagarla — la suite de tests la apaga).
+  - **Lo que ningún desinstalado toca: `~/.local/state/choz`.** Proyectos, rutas de plugins y ajustes son del usuario, no del paquete. Hay un test que lo comprueba con un proyecto escrito a mano.
+- **`.deb` y `.rpm`** desde el mismo material (`cargo deb -p choz-ui --no-build`, `cargo generate-rpm -p crates/choz-ui`). Los dos reemplazan la versión anterior por nombre de paquete, que es la mitad del "detecta y desinstala" hecha por el gestor. El `.deb` sale con `Depends: libasound2t64, libc6` resueltos solos — ningún formato de plugin es dependencia, todos se cargan con `dlopen`.
+- **choz en el menú del sistema** (punto 4): `choz.desktop` (`Categories=AudioVideo;Audio;`), icono SVG en `hicolor`, tipo MIME `application/x-choz-project` para `*.choz.yml` — el binario ya aceptaba la ruta como argumento, así que abrir un proyecto desde el gestor de archivos lo lanza con él.
+  - **La decisión que el roadmap dejaba abierta**: no `Terminal=true`, sino un lanzador propio. `choz-launcher` prueba **kitty primero** (es donde el fondo se dibuja por protocolo gráfico, a resolución de píxel real) y luego ghostty, wezterm, alacritty y xterm, pidiendo 120×40 celdas — por debajo de ~100×30 el RACK no cabe.
+- **`.github/workflows/release.yml`**: binario por arquitectura (x86_64, aarch64, armv7) más `.deb` y `.rpm`, en tag o a mano.
+- **`Cross.toml`**: las imágenes de `cross` no traen ALSA ni JACK del target y el build moría en `alsa-sys`/`jack-sys` antes de compilar una línea de choz. Con el `pre-build` que los instala, **aarch64 compila y da un ELF ARM de verdad** (verificado aquí). armv7 no se pudo verificar en esta máquina: `cross` intenta bajarse el toolchain y la red del contenedor está cortada.
+
+#### Arreglado
+- **Un test que fallaba una vez de cada cinco**, y no por lo que decía: el directorio de estado de prueba es **por proceso, no por test**, así que el que deja un fondo de imagen guardado en `ui.json` se lo pasa al siguiente por `App::new()`. `sandbox_state_dir()` borra ahora ese `ui.json` (un sandbox que arrastra estado no es un sandbox) y el test afectado fija su fondo de partida en vez de suponerlo. **248 tests**, clippy `--all-targets -D warnings` limpio, y 12 corridas seguidas limpias del binario de UI (falla ~1 de cada 4 sin el arreglo).
+
+### 2026-08-08 (duodecies) — el barrido de editores LV2, con Xvfb y con la ventana mapeada
+
+Cierra el punto 2 de Pendiente. El usuario instaló Xvfb, que era lo que faltaba para
+correrlo sin llenar el escritorio de ventanas.
+
+#### Arreglado
+- **El probe preguntaba demasiado pronto si la UI había creado su ventana.** `query_tree` justo después de `open()` es una moneda al aire: varios toolkits crean la ventana en la primera vuelta de su propio bucle. El mismo plugin daba `ok` y `SINVENTANA` en corridas consecutivas — medido, cinco veces cada uno. Ahora el probe bombea `idle` y espera al hijo hasta 500 ms. **Las cinco "UIs sin ventana" del barrido anterior eran esto**, no plugins.
+- **El probe levanta la deny-list de UIs** (`allow_denied_uis(true)`): es un proceso que existe para que lo mate un plugin, así que esconderle justo los editores peligrosos es esconder lo que el barrido busca.
+
+#### Medido (259 UIs X11 instaladas, Xvfb `:99`, `--mapped`)
+- **252 abren una ventana hija de verdad. 0 sin ventana. 0 crashes achacables a choz.**
+- **5 no cargan** y es correcto: QMidiArp (Arp/Seq/LFO), MIDI Step Sequencer8x8 y B.SEQuencer no tienen salida de audio, así que no se instancian como efecto ni como instrumento.
+- **Mapear la ventana padre no cambia nada**: las listas de resultados con y sin `--mapped` salen **idénticas**, línea por línea. Era la duda que dejaba abierta el barrido anterior.
+- **Primer barrido de los editores de guitarix**, que hasta ahora la deny-list escondía también del probe: **nueve rebanadas murieron con SIGSEGV, las nueve en un `gx_*`** (MultiBandCompressor, Studio Preamp Stereo, digital_delay, Alembic, BigMuffPi, Chorus-Stereo, duck_delay_st, w20…). La lista no era una sospecha: es lo que hacen. Y es exactamente lo que la política nueva resuelve — esos plugines tienen ventana, así que van a su propio proceso y el crash cuesta un hijo.
+- **2 falsos positivos de Xvfb**: LSP Room Builder Mono y Stereo mueren con `BadMatch` en `MIT-SHM X_ShmPutImage` bajo Xvfb, mapeada o no. En el servidor X real abren perfectamente en los dos modos — se comprobó con esos dos plugines, un plugin, una ventana. **Un barrido bajo Xvfb no es prueba de nada sobre memoria compartida**: el que la usa para pintar necesita el servidor de verdad.
+
+### 2026-08-08 (undecies) — el control que el parámetro pide (primera mitad del punto 3)
+
+Un plugin no tiene sólo knobs. La caja `INSTRUMENT` y la de FX dibujaban **todos** los
+parámetros igual — arco, valor, nombre — así que un `bypass` era un arco a 0.00 y un
+selector de forma de onda un número sin sentido.
+
+#### Añadido
+- **`choz_ports::PluginParam` lleva ahora la pista del plugin**: `steps` (0 continuo, 2 interruptor, n enumerado), `unit` y `points` — los pasos con nombre. **Nunca se adivina por el nombre**: un host que no dice nada deja `steps: 0` y sigue saliendo un knob (la lección de `FxCategory::guess`, donde equivocarse sólo descoloca una fila de una lista).
+  - **LV2**: `lv2:portProperty` (`toggled`/`enumeration`/`integer`), `lv2:scalePoint` (valor + `rdfs:label`, ordenados) y `units:unit`. De 261 bundles instalados, **78 declaran `toggled` y 49 `enumeration`**.
+  - **LADSPA/DSSI**: `HINT_TOGGLED` y `HINT_INTEGER`, lo único que el ABI dice de un puerto.
+  - **CLAP**: el flag `IS_STEPPED`, más `value_to_text` para nombrar los pasos cuando son pocos (≤32).
+  - **VST3**: `ParameterInfo.stepCount` — que cuenta *intervalos*, así que `1` es un interruptor de dos posiciones — más `units` y `getParamStringByValue` para los nombres.
+  - **VST2** no da nada y se queda en continuo, como decía el plan.
+- **La caja de knobs dibuja tres controles según lo que el parámetro es**: interruptor (`[  ON  ]` verde / `[ OFF ]` apagado), enumerado (`◀ Sine ▶` con `1/3` debajo) y el arco de siempre. Las dos cajas salen de `draw_knob_box`, así que el FX lo hereda.
+- **Las flechas mueven una posición, no 0.05**: un interruptor necesitaba veinte pulsaciones para cambiar y se quedaba en sitios que no existen.
+- **Las posiciones con nombre viajan con su sitio en el rango, no con un índice.** El caso que lo obliga es real: el divisor de `a-delay` (Ardour) nombra diez figuras — 1, 2, 4, 6, 8, 12, 16, 24, 32, 48 — sobre un rango 1..48. Suponer una rejilla uniforme ahí muestra el nombre equivocado y salta a valores que el plugin no ofrece.
+
+#### Pendiente del mismo punto
+- Faders horizontales y verticales, más resolución angular en el knob, y el layout no uniforme que hace falta para ellos (`param_grid` sigue repartiendo celdas iguales). Los tres controles nuevos caben en la rejilla actual a propósito: es lo que se podía hacer sin tocar `RackLayout.instr_knobs`, del que dependen el ratón y el MIDI learn.
+
+#### Verificado
+- Con `a-delay` de verdad: puerto `enumeration` + `integer`, diez puntos ordenados, y el parámetro sale con `steps: 10` y las posiciones normalizadas donde el plugin las puso. Más el render de las tres formas sobre un `TestBackend` y el paso de flechas. **246 tests**, clippy `--all-targets -D warnings` limpio.
+
+### 2026-08-08 (decies) — los 361 esquemas de Gogh (pedido)
+
+#### Añadido
+- **Settings → THEME pasa de 11 esquemas a 372**: los 11 propios más los 361 de [Gogh](https://github.com/Gogh-Co/Gogh) (`data/themes.json`), en orden alfabético y sin repetir los que choz ya traía.
+- **La tabla viaja como texto, no como código**: `crates/choz-ui/src/gogh_themes.txt` (10 KB, `nombre|texto RRGGBB|escritorio RRGGBB`) va por `include_str!` y se parsea una vez en un `LazyLock<Vec<Theme>>`. 361 literales `Theme` habrían sido 2000 líneas de fuente que nadie revisa; regenerarlo desde upstream es un `curl` y un script.
+- **El color de marco lo pone choz**: un esquema de terminal no tiene uno. Es el punto medio entre el texto y el escritorio — más apagado que el texto, visible sobre el fondo — y la misma fórmula funciona para los esquemas claros. Una línea que no parsea se salta en vez de tirar la lista entera.
+
+#### Cambiado
+- **La pestaña THEME pone primero los controles de escritorio y la lista de esquemas al final.** Con 11 esquemas daba igual; con 372, todo lo que estuviera debajo de la lista era inalcanzable.
+- `theme_rows`/`theme_row` salen ahora de una sola tabla (`theme_layout`), etiqueta y significado juntos. La aritmética de índices duplicada en dos funciones ya era un bug esperando la siguiente fila.
+
+#### Verificado
+- La tabla parsea a temas usables (Gruvbox Dark byte a byte, marco derivado, sin nombres vacíos ni repetidos) y la pestaña THEME sigue aplicando esquema, marco y escritorio a la vez. **243 tests**, clippy `--all-targets -D warnings` limpio.
+
+### 2026-08-08 (nonies) — `state:mapPath` para LV2
+
+#### Añadido
+- **Las rutas de archivo que un plugin guarda ya no se pierden.** Un sampler o un convolutor tiene que pasar sus rutas por `abstract_path` antes de almacenarlas, y muchos no guardan **nada** si el host no ofrece la feature. `save`/`restore` pasan ahora `state:mapPath` y `state:freePath` (antes iba una lista de features vacía), y `Features::supported` los declara para el plugin que los exija al instanciar.
+- **Las cadenas salen de `malloc`, no del asignador de Rust**: el plugin las libera con `free()` salvo que use `state:freePath`, así que se ofrecen las dos vías. Nueva dep `libc` en `choz-plugin-lv2` (ya estaba en el workspace).
+- El mapeo es **la identidad**: se guarda la ruta absoluta. Un host de verdad copia el archivo dentro del directorio del proyecto para que sea autocontenido; el proyecto de choz es un solo YAML sin sitio donde meter una librería de samples, y una ruta que funciona en esta máquina vale más que un estado que el plugin se negó a guardar. Marcado `ponytail:` en el único sitio que habría que cambiar.
+
+#### Verificado
+- Round-trip de las dos funciones (copia propia, `free` por las dos vías, null→null) y la lista de features terminada en NULL. Con plugins reales, `plugins_with_a_state_interface_round_trip_their_patch` sigue en verde con las features nuevas. **No medido**: cuántos de los 611 LV2 instalados guardan ahora una propiedad `atom:Path` — el barrido tarda más de lo que aguanta una corrida en primer plano.
+
+### 2026-08-08 (octies) — tener ventana es motivo suficiente para aislar el plugin
+
+Cierra el punto 1 de Pendiente: la cuarentena medía si el plugin *sonaba* bien, y la GUI —
+el código ajeno menos fiable que choz ejecuta — se quedaba fuera de la política.
+
+#### Añadido
+- **Un plugin con ventana se hostea en su propio proceso, aunque el probe lo haya visto sanísimo.** Procesar audio dos bloques no dice nada de la GUI: guitarix toca perfecto y su editor segfaultea. Ahora el veredicto de la cuarentena viaja con un segundo dato — *tiene ventana* — y `wants_sandbox` lo trata como razón por sí sola. `CHOZ_SANDBOX_GUI=0` apaga esa mitad para quien prefiera pagar el crash antes que el proceso extra.
+- **El probe pregunta por la ventana, no la abre.** Tras instanciar (instrumento o efecto) llama a `editor()`, que sólo construye el mango, y lo anota en el fichero de etapa: `done gui` / `loaded gui`. Un plugin que muere antes de cargar no deja marca, que es la verdad — nadie llegó a mirar.
+- **El probe mira por encima de la deny-list de UIs** (`allow_denied_uis(true)`): esconderlas ahí dejaría fuera del sandbox justo a los plugins por los que la lista existe.
+
+#### Cambiado
+- `quarantine::check` devuelve un `Report { verdict, editor }` en vez de un `Verdict` suelto. Un `plugin-verdicts.json` viejo (veredictos pelados) ya no parsea, se descarta entero y se vuelve a probar cada plugin — que es lo que hacía falta de todos modos para averiguar lo de la ventana.
+
+#### Verificado
+- Con plugins reales: `gxts9` (guitarix, UI en la deny-list) pasa a `wants_sandbox` por la ventana, y `ZamComp` (VST2 con GUI de DPF) también — el test de "sandbox a petición del usuario" sólo ve la mitad manual con `CHOZ_SANDBOX_GUI=0`. **240 tests**, clippy limpio.
+
+### 2026-08-08 (septies) — la política de la ventana sandboxeada
+
+Cierra el punto 1 de Pendiente: el mecanismo estaba hecho la sesión anterior, faltaba usarlo.
+
+#### Añadido
+- **Los editores de la deny-list vuelven a ofrecerse cuando el plugin va sandboxeado.** Las UIs de guitarix segfaultean lo que las cargue, así que `choz-plugin-lv2` las esconde — pero esconderlas es lo correcto sólo en el proceso de choz. `allow_denied_uis(true)` levanta la lista y **el único que lo llama es el hijo del sandbox**, donde el crash cuesta un proceso que el supervisor repone. La lista pasa a ser propiedad del proceso, no del plugin.
+- **El hijo publica si su plugin tiene ventana** (`editor_present` en la cabecera compartida: desconocido / no / sí), **antes de servir su primer bloque** — que es antes de que `SandboxedPlugin::build` devuelva, y por tanto antes de que el host capture el mango. `editor()` sólo ofrece botón `GUI` cuando la respuesta es sí; antes lo ofrecía siempre y un plugin sin GUI abría un marco vacío. El host no tiene otra forma de saberlo: cuando pregunta, el hijo todavía está cargando.
+
+#### Verificado
+- Con plugins reales, en `tests/sandboxed_plugin.rs`: `gxts9` (guitarix) **no** tiene editor visible desde el proceso de choz y **sí** desde su sandbox; `a-delay` (Ardour, sin UI X11) no ofrece botón ni sandboxeado. Más el cruce del flag sobre un `Vec<u8>`, sin mapear ni forkear.
 
 ### 2026-08-08 (sexies) — la ventana del plugin, dentro del sandbox
 

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-choz-project">
+    <comment>choz project</comment>
+    <comment xml:lang="es">Proyecto de choz</comment>
+    <!-- The binary already takes the path as an argument, so opening one from
+         the file manager is enough to launch it with the project loaded. -->
+    <glob pattern="*.choz.yml"/>
+    <glob pattern="*.choz.yaml"/>
+    <icon name="choz"/>
+  </mime-type>
+</mime-info>
