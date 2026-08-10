@@ -34,10 +34,33 @@ priority = "optional"
 # user can decline.
 depends = "$auto"
 recommends = "libjack-jackd2-0 | libjack0"
+# Refresh the menu, MIME and icon caches. Debian ships triggers that usually do
+# this; "usually" is how an application installs and never appears in the menu.
+maintainer-scripts = "../../packaging/debian"
 extended-description = """\
 choz hosts CLAP, LV2, LADSPA, DSSI, VST2 and VST3 plugins from a terminal: a \
 multi-slot rack with a mixer, insert FX, MIDI/OSC routing and YAML projects. \
 Plugins that misbehave are scanned, probed and hosted out of process."""
+
+# `target/release/choz`, not `../../target/release/choz`: the first form is the
+# only one cargo-deb recognises as the Cargo target directory, and recognising it
+# is what makes it rewrite the path under `--target`. With the `../..` form it
+# packaged the **host** binary into an arm64 package. Everything else is relative
+# to this manifest, as cargo-deb expects; only the binary is special.
+#
+# These belong here and **not** in the `arm` variant below, where they spent a
+# release: a variant inherits from this table, not the other way round, so the
+# ordinary x86_64 package carried the binary and nothing else — no desktop entry,
+# no icon, no launcher, which is exactly why choz never appeared in the menu.
+# Nothing warns about it. `dpkg-deb -c` is the only way to see what is in there.
+assets = [
+    ["target/release/choz", "usr/bin/", "755"],
+    ["../../packaging/desktop/choz-launcher", "usr/bin/", "755"],
+    ["../../packaging/desktop/choz.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/desktop/choz.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["../../packaging/desktop/choz-project.xml", "usr/share/mime/packages/", "644"],
+    ["../../README.md", "usr/share/doc/choz/README.md", "644"],
+]
 
 # Cross-compiled packages, where `$auto` cannot help: reading an ARM binary's
 # needed libraries means asking the *host* dpkg about them, and it has none.
@@ -48,22 +71,22 @@ Plugins that misbehave are scanned, probed and hosted out of process."""
 #   cargo deb -p choz-ui --variant arm --target aarch64-unknown-linux-gnu
 [package.metadata.deb.variants.arm]
 depends = "libasound2t64 | libasound2, libc6"
-# `target/release/choz`, not `../../target/release/choz`: cargo-deb only
-# recognises the first form as the Cargo target directory, and only then does it
-# rewrite the path for `--target`. With the `../..` form it packaged the **host**
-# binary into an arm64 package — which installs on a Pi and refuses to run.
-assets = [
-    ["target/release/choz", "usr/bin/", "755"],
-    ["../../packaging/desktop/choz-launcher", "usr/bin/", "755"],
-    ["../../packaging/desktop/choz.desktop", "usr/share/applications/", "644"],
-    ["../../packaging/desktop/choz.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
-    ["../../packaging/desktop/choz-project.xml", "usr/share/mime/packages/", "644"],
-    ["../../README.md", "usr/share/doc/choz/README.md", "644"],
-]
 
 [package.metadata.generate-rpm]
 name = "choz"
 summary = "A terminal audio plugin host"
+# Same reason as the .deb's maintainer scripts: without this the desktop entry
+# is installed and never indexed.
+post_install_script = """
+update-desktop-database -q /usr/share/applications 2>/dev/null || true
+update-mime-database /usr/share/mime 2>/dev/null || true
+gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor 2>/dev/null || true
+"""
+post_uninstall_script = """
+update-desktop-database -q /usr/share/applications 2>/dev/null || true
+update-mime-database /usr/share/mime 2>/dev/null || true
+gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor 2>/dev/null || true
+"""
 # rpm reads the ELF itself: the built package requires `libasound.so.2()(64bit)`
 # (down to its ALSA_0.9 symbol versions), libc, libm, libgcc_s and the loader, so
 # `dnf`/`rpm -i` fails with "Failed dependencies" on a box without ALSA.

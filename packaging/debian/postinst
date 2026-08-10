@@ -1,0 +1,23 @@
+#!/bin/sh
+# Register what was just installed.
+#
+# Debian and Ubuntu ship dpkg triggers for these directories, so on a full
+# desktop this usually happens by itself — "usually" being the problem. On a
+# minimal install, or under a desktop whose packages are not there, the entry
+# lands in /usr/share/applications and nothing ever reads it: choz installs and
+# never appears in the menu. Doing it here costs three commands and removes the
+# "usually".
+set -e
+
+if [ "$1" = "configure" ]; then
+    command -v update-desktop-database >/dev/null 2>&1 &&
+        update-desktop-database -q /usr/share/applications || true
+    command -v update-mime-database >/dev/null 2>&1 &&
+        update-mime-database /usr/share/mime || true
+    # The icon cache is only consulted when it exists; refreshing a directory
+    # that has none is not an error worth failing an install over.
+    command -v gtk-update-icon-cache >/dev/null 2>&1 &&
+        gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor || true
+fi
+
+exit 0

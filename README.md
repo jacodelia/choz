@@ -324,8 +324,8 @@ when you are staging an install for a machine that is not this one.
 The script replaces an older copy before putting the new one down — it looks in
 `~/.local/bin`, `/usr/local/bin` and `/usr/bin`, and asks each one its
 `choz --version`. It also installs the desktop entry, the icon and the
-`*.choz.yml` file association, so choz shows up in the menu and a project opens
-with a double click.
+`*.choz.yml` file association, so choz shows up in the menu — under multimedia,
+beside the other audio applications — and a project opens with a double click.
 
 **What no uninstall ever removes: `~/.local/state/choz`.** The projects, the
 plugin paths and the settings are yours, not the package's.

@@ -58,7 +58,10 @@ pub type Handle = AsyncClient<(), JackRt>;
 /// `None` when the graph can't be reached; `(0, 0)` when the name is unknown.
 pub fn device_channels(sink: &str) -> Option<(usize, usize)> {
     let (client, _) = Client::new("choz-probe", ClientOptions::NO_START_SERVER).ok()?;
-    Some((sink_ports(&client, sink).len(), source_ports(&client, sink).len()))
+    Some((
+        sink_ports(&client, sink).len(),
+        source_ports(&client, sink).len(),
+    ))
 }
 
 /// **Every** capture port in the graph, ours excluded — an interface's eight
@@ -74,13 +77,19 @@ pub fn all_capture_ports() -> Vec<String> {
         return Vec::new();
     };
     let mut owners: Vec<String> = Vec::new();
-    for port in client.ports(None, Some(super::engine::JACK_AUDIO), jack::PortFlags::IS_OUTPUT) {
+    for port in client.ports(
+        None,
+        Some(super::engine::JACK_AUDIO),
+        jack::PortFlags::IS_OUTPUT,
+    ) {
         // `monitor_*` carries back what we just played, and our own ports would
         // feed the rack into itself.
         if port.contains(":monitor") {
             continue;
         }
-        let Some((owner, _)) = port.rsplit_once(':') else { continue };
+        let Some((owner, _)) = port.rsplit_once(':') else {
+            continue;
+        };
         if owner == CLIENT_NAME || owner == super::engine::CPAL_JACK_CLIENT {
             continue;
         }
@@ -88,7 +97,11 @@ pub fn all_capture_ports() -> Vec<String> {
             owners.push(owner.to_string());
         }
     }
-    owners.iter().flat_map(|owner| source_ports(&client, owner)).take(MAX_PORTS).collect()
+    owners
+        .iter()
+        .flat_map(|owner| source_ports(&client, owner))
+        .take(MAX_PORTS)
+        .collect()
 }
 
 /// The device's playback ports — where our audio goes — in channel order.
@@ -96,7 +109,11 @@ pub(crate) fn sink_ports(client: &Client, sink: &str) -> Vec<String> {
     let prefix = format!("{sink}:");
     in_order(
         client
-            .ports(None, Some(super::engine::JACK_AUDIO), jack::PortFlags::IS_INPUT)
+            .ports(
+                None,
+                Some(super::engine::JACK_AUDIO),
+                jack::PortFlags::IS_INPUT,
+            )
             .into_iter()
             .filter(|p| p.starts_with(&prefix))
             .collect(),
@@ -110,7 +127,11 @@ fn source_ports(client: &Client, sink: &str) -> Vec<String> {
     let prefix = format!("{sink}:");
     in_order(
         client
-            .ports(None, Some(super::engine::JACK_AUDIO), jack::PortFlags::IS_OUTPUT)
+            .ports(
+                None,
+                Some(super::engine::JACK_AUDIO),
+                jack::PortFlags::IS_OUTPUT,
+            )
             .into_iter()
             .filter(|p| p.starts_with(&prefix) && !p.contains(":monitor"))
             .collect(),
@@ -122,7 +143,12 @@ fn source_ports(client: &Client, sink: &str) -> Vec<String> {
 pub(crate) fn in_order(mut ports: Vec<String>) -> Vec<String> {
     ports.sort_by_key(|p| {
         let digits: String = p.chars().rev().take_while(|c| c.is_ascii_digit()).collect();
-        digits.chars().rev().collect::<String>().parse::<u32>().unwrap_or(u32::MAX)
+        digits
+            .chars()
+            .rev()
+            .collect::<String>()
+            .parse::<u32>()
+            .unwrap_or(u32::MAX)
     });
     ports
 }
@@ -198,4 +224,3 @@ fn connect(client: &Client, our_outs: &[String], sink: &str) -> Result<()> {
 
     Ok(())
 }
-

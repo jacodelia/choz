@@ -2,8 +2,8 @@
 //! Every test skips when `/usr/lib/lv2` holds nothing usable, so CI without
 //! plugins stays green.
 
-use choz_ports::{AudioSource, FxProcessor};
 use choz_plugin_lv2::{Lv2Effect, Lv2Instrument, Lv2PluginInfo, scan_directory};
+use choz_ports::{AudioSource, FxProcessor};
 
 const SR: u32 = 48_000;
 const BLOCK: u32 = 256;
@@ -45,10 +45,17 @@ fn scan_finds_bundles_with_uris_and_ports() {
         return;
     }
     for p in &found {
-        assert!(p.uri.starts_with("http") || p.uri.contains(':'), "odd URI {}", p.uri);
+        assert!(
+            p.uri.starts_with("http") || p.uri.contains(':'),
+            "odd URI {}",
+            p.uri
+        );
         assert!(p.binary_path.exists(), "{} has no binary", p.uri);
     }
-    assert!(found.iter().any(|p| p.is_effect), "expected at least one effect");
+    assert!(
+        found.iter().any(|p| p.is_effect),
+        "expected at least one effect"
+    );
 }
 
 /// Every installed effect must load, process a block, and stay finite. This is
@@ -116,7 +123,11 @@ fn effects_requiring_the_worker_feature_are_hosted() {
         for _ in 0..4 {
             fx.process_block(&mut buf, SR);
         }
-        assert!(buf.iter().all(|s| s.is_finite()), "{} produced non-finite", info.uri);
+        assert!(
+            buf.iter().all(|s| s.is_finite()),
+            "{} produced non-finite",
+            info.uri
+        );
     }
     assert!(hosted > 0, "all {} worker plugins were refused", want.len());
 }
@@ -138,7 +149,11 @@ fn a_few_effects_host_and_stay_finite() {
         };
         let mut buf = sine_block(BLOCK as usize);
         fx.process_block(&mut buf, SR);
-        assert!(buf.iter().all(|s| s.is_finite()), "{} produced non-finite", info.uri);
+        assert!(
+            buf.iter().all(|s| s.is_finite()),
+            "{} produced non-finite",
+            info.uri
+        );
         hosted += 1;
         if hosted == 5 {
             break;
@@ -212,7 +227,11 @@ fn x11_editors_are_discovered_and_the_crashing_families_are_not_offered() {
 
     for p in &all {
         if let Some(ui) = &p.x11_ui {
-            assert!(ui.binary_path.exists(), "{} points at a missing UI binary", p.name);
+            assert!(
+                ui.binary_path.exists(),
+                "{} points at a missing UI binary",
+                p.name
+            );
             assert_ne!(
                 ui.binary_path, p.binary_path,
                 "{}: the UI is a separate binary from the DSP one",
@@ -224,25 +243,32 @@ fn x11_editors_are_discovered_and_the_crashing_families_are_not_offered() {
     // Every guitarix UI crashed the probe; none may reach a slot.
     let guitarix_with_ui = all
         .iter()
-        .filter(|p| p.uri.starts_with("http://guitarix.sourceforge.net/plugins/"))
+        .filter(|p| {
+            p.uri
+                .starts_with("http://guitarix.sourceforge.net/plugins/")
+        })
         .filter(|p| p.x11_ui.is_some())
         .count();
     assert_eq!(guitarix_with_ui, 0, "guitarix UIs segfault on instantiate");
 
     // And the discovery is not vacuously passing: this machine has plenty.
     let with_ui = all.iter().filter(|p| p.x11_ui.is_some()).count();
-    eprintln!("{with_ui} of {} installed LV2 plugins ship an X11 UI", all.len());
+    eprintln!(
+        "{with_ui} of {} installed LV2 plugins ship an X11 UI",
+        all.len()
+    );
 
     // A bundle that ships ONE UI binary for hundreds of plugins is where an
     // index cap bites: the editor lookup walks `lv2ui_descriptor(0..)`, and a
     // plugin sitting past the cap silently got no editor at all. LSP has ~390
     // of them, so the last one is the regression test. No window is opened —
     // that needs a DISPLAY, which CI has not got — only the handle is asked for.
-    if let Some(last_lsp) = all.iter().rfind(|p| {
-        p.uri.starts_with("http://lsp-plug.in/plugins/lv2/") && p.x11_ui.is_some()
-    })
+    if let Some(last_lsp) = all
+        .iter()
+        .rfind(|p| p.uri.starts_with("http://lsp-plug.in/plugins/lv2/") && p.x11_ui.is_some())
     {
-        let fx = choz_plugin_lv2::Lv2Effect::build(&last_lsp.bundle_dir, &last_lsp.uri, 48_000, 256);
+        let fx =
+            choz_plugin_lv2::Lv2Effect::build(&last_lsp.bundle_dir, &last_lsp.uri, 48_000, 256);
         let editor = fx.as_ref().and_then(|f| f.editor());
         assert!(
             editor.is_some(),
@@ -267,17 +293,25 @@ fn plugins_with_a_state_interface_round_trip_their_patch() {
 
     let mut tried = 0;
     for p in all.iter().filter(|p| p.is_effect) {
-        let Some(fx) = Lv2Effect::build(&p.bundle_dir, &p.uri, 48_000, 256) else { continue };
+        let Some(fx) = Lv2Effect::build(&p.bundle_dir, &p.uri, 48_000, 256) else {
+            continue;
+        };
         let Some(state) = fx.state() else { continue };
         let Some(blob) = state.save() else { continue }; // no state:interface
         assert!(!blob.is_empty());
         drop(fx);
 
-        let Some(fresh) = Lv2Effect::build(&p.bundle_dir, &p.uri, 48_000, 256) else { continue };
+        let Some(fresh) = Lv2Effect::build(&p.bundle_dir, &p.uri, 48_000, 256) else {
+            continue;
+        };
         let restored = fresh.state().expect("same plugin, same capability");
         restored.restore(&blob);
         let again = restored.save().expect("state readable after restoring it");
-        assert_eq!(again, blob, "{}: the patch did not survive the round trip", p.name);
+        assert_eq!(
+            again, blob,
+            "{}: the patch did not survive the round trip",
+            p.name
+        );
         tried += 1;
         if tried == 3 {
             break;
@@ -309,7 +343,10 @@ fn control_ports_report_what_kind_of_control_they_are() {
         .expect("a-delay declares an enumeration port");
     assert!(divisor.integer, "and an integer one");
     assert_eq!(divisor.points.len(), 10, "ten note divisions");
-    assert_eq!(divisor.points[0].0, 1.0, "sorted by value: whole note first");
+    assert_eq!(
+        divisor.points[0].0, 1.0,
+        "sorted by value: whole note first"
+    );
     assert_eq!(divisor.points.last().unwrap().0, 48.0);
     assert!(divisor.points.iter().any(|(_, l)| l.contains("Whole note")));
 
@@ -318,7 +355,10 @@ fn control_ports_report_what_kind_of_control_they_are() {
         .iter()
         .find(|p| p.id == divisor.index)
         .expect("the port is an automatable parameter");
-    assert_eq!(param.steps, 10, "one step per named point, not one per integer");
+    assert_eq!(
+        param.steps, 10,
+        "one step per named point, not one per integer"
+    );
     assert_eq!(param.points.len(), 10);
     // The positions are what the plugin said, spread over min..max — the point
     // of carrying them instead of a count.
@@ -326,7 +366,10 @@ fn control_ports_report_what_kind_of_control_they_are() {
 
     // A switch says so outright, wherever one is installed.
     if let Some(toggle) = info.ports.iter().find(|p| p.toggled) {
-        let p = params.iter().find(|p| p.id == toggle.index).expect("also a parameter");
+        let p = params
+            .iter()
+            .find(|p| p.id == toggle.index)
+            .expect("also a parameter");
         assert_eq!(p.steps, 2, "{} is a switch", toggle.name);
     }
 }
@@ -340,7 +383,11 @@ fn control_ports_carry_their_unit() {
     let mut with_unit = 0;
     let mut sample: Option<(String, String)> = None;
 
-    for dir in std::fs::read_dir("/usr/lib/lv2").into_iter().flatten().flatten() {
+    for dir in std::fs::read_dir("/usr/lib/lv2")
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
         let bundle = dir.path();
         if bundle.extension().is_none_or(|e| e != "lv2") {
             continue;
@@ -360,7 +407,10 @@ fn control_ports_carry_their_unit() {
         return;
     };
     eprintln!("{with_unit} control port(s) with a unit; e.g. {uri} → {unit}");
-    assert!(!unit.trim().is_empty(), "a unit that parsed to nothing is worse than none");
+    assert!(
+        !unit.trim().is_empty(),
+        "a unit that parsed to nothing is worse than none"
+    );
     // And it survives the trip to the parameter list the UI reads.
     let bundle = std::path::Path::new("/usr/lib/lv2");
     let found = std::fs::read_dir(bundle)

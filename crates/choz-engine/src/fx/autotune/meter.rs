@@ -47,10 +47,14 @@ pub fn meter() -> &'static SharedMeter {
 impl SharedMeter {
     /// Called from the audio callback: six relaxed stores, no more.
     pub fn publish(&self, m: AutoTuneMeter) {
-        self.detected.store(m.detected_frequency.to_bits(), Ordering::Relaxed);
-        self.target.store(m.target_frequency.to_bits(), Ordering::Relaxed);
-        self.cents.store(m.pitch_error_cents.to_bits(), Ordering::Relaxed);
-        self.confidence.store(m.confidence.to_bits(), Ordering::Relaxed);
+        self.detected
+            .store(m.detected_frequency.to_bits(), Ordering::Relaxed);
+        self.target
+            .store(m.target_frequency.to_bits(), Ordering::Relaxed);
+        self.cents
+            .store(m.pitch_error_cents.to_bits(), Ordering::Relaxed);
+        self.confidence
+            .store(m.confidence.to_bits(), Ordering::Relaxed);
         self.level.store(m.level.to_bits(), Ordering::Relaxed);
         self.voiced.store(m.voiced as u32, Ordering::Relaxed);
     }

@@ -55,8 +55,9 @@ pub struct LADSPA_Descriptor {
     pub port_names: *const *const c_char,
     pub port_range_hints: *const LADSPA_PortRangeHint,
     pub implementation_data: *mut c_void,
-    pub instantiate:
-        Option<unsafe extern "C" fn(d: *const LADSPA_Descriptor, sample_rate: c_ulong) -> LADSPA_Handle>,
+    pub instantiate: Option<
+        unsafe extern "C" fn(d: *const LADSPA_Descriptor, sample_rate: c_ulong) -> LADSPA_Handle,
+    >,
     pub connect_port:
         Option<unsafe extern "C" fn(h: LADSPA_Handle, port: c_ulong, data: *mut LADSPA_Data)>,
     pub activate: Option<unsafe extern "C" fn(h: LADSPA_Handle)>,
@@ -88,11 +89,17 @@ pub struct DSSI_Descriptor {
     pub api_version: c_int,
     pub ladspa: *const LADSPA_Descriptor,
     pub configure: Option<
-        unsafe extern "C" fn(h: LADSPA_Handle, key: *const c_char, value: *const c_char) -> *mut c_char,
+        unsafe extern "C" fn(
+            h: LADSPA_Handle,
+            key: *const c_char,
+            value: *const c_char,
+        ) -> *mut c_char,
     >,
-    pub get_program:
-        Option<unsafe extern "C" fn(h: LADSPA_Handle, index: c_ulong) -> *const DSSI_Program_Descriptor>,
-    pub select_program: Option<unsafe extern "C" fn(h: LADSPA_Handle, bank: c_ulong, program: c_ulong)>,
+    pub get_program: Option<
+        unsafe extern "C" fn(h: LADSPA_Handle, index: c_ulong) -> *const DSSI_Program_Descriptor,
+    >,
+    pub select_program:
+        Option<unsafe extern "C" fn(h: LADSPA_Handle, bank: c_ulong, program: c_ulong)>,
     pub get_midi_controller_for_port:
         Option<unsafe extern "C" fn(h: LADSPA_Handle, port: c_ulong) -> c_int>,
     pub run_synth: Option<
@@ -201,9 +208,15 @@ pub struct snd_seq_event_t {
 
 impl snd_seq_event_t {
     fn with_data<T: Copy>(type_: u8, frame: u32, body: T) -> Self {
-        let mut ev = snd_seq_event_t { type_, ..Default::default() };
+        let mut ev = snd_seq_event_t {
+            type_,
+            ..Default::default()
+        };
         ev.time.tick_or_sec = frame;
-        assert!(std::mem::size_of::<T>() <= 12, "event body must fit the union");
+        assert!(
+            std::mem::size_of::<T>() <= 12,
+            "event body must fit the union"
+        );
         // SAFETY: `body` is a plain-old-data ALSA event struct that fits the
         // 12-byte union, copied byte for byte.
         unsafe {
@@ -224,7 +237,12 @@ impl snd_seq_event_t {
             Some(Self::with_data(
                 type_,
                 frame,
-                snd_seq_ev_note_t { channel, note: data[1] & 0x7F, velocity, ..Default::default() },
+                snd_seq_ev_note_t {
+                    channel,
+                    note: data[1] & 0x7F,
+                    velocity,
+                    ..Default::default()
+                },
             ))
         };
         match data[0] & 0xF0 {
@@ -270,7 +288,11 @@ impl snd_seq_event_t {
 /// The default value a control port should start at, from its range hints.
 /// `sample_rate` matters for ports whose bounds are relative to it.
 pub fn default_for(hint: &LADSPA_PortRangeHint, sample_rate: u32) -> f32 {
-    let scale = if hint.hint_descriptor & HINT_SAMPLE_RATE != 0 { sample_rate as f32 } else { 1.0 };
+    let scale = if hint.hint_descriptor & HINT_SAMPLE_RATE != 0 {
+        sample_rate as f32
+    } else {
+        1.0
+    };
     let lower = hint.lower_bound * scale;
     let upper = hint.upper_bound * scale;
     let log = hint.hint_descriptor & HINT_LOGARITHMIC != 0;
@@ -316,7 +338,11 @@ pub fn default_for(hint: &LADSPA_PortRangeHint, sample_rate: u32) -> f32 {
 
 /// Sane display bounds for a control port, used for the UI's 0..1 knob.
 pub fn bounds(hint: &LADSPA_PortRangeHint, sample_rate: u32) -> (f32, f32) {
-    let scale = if hint.hint_descriptor & HINT_SAMPLE_RATE != 0 { sample_rate as f32 } else { 1.0 };
+    let scale = if hint.hint_descriptor & HINT_SAMPLE_RATE != 0 {
+        sample_rate as f32
+    } else {
+        1.0
+    };
     let lower = if hint.hint_descriptor & HINT_BOUNDED_BELOW != 0 {
         hint.lower_bound * scale
     } else {
@@ -327,7 +353,11 @@ pub fn bounds(hint: &LADSPA_PortRangeHint, sample_rate: u32) -> (f32, f32) {
     } else {
         (lower + 1.0).max(1.0)
     };
-    if upper > lower { (lower, upper) } else { (lower, lower + 1.0) }
+    if upper > lower {
+        (lower, upper)
+    } else {
+        (lower, lower + 1.0)
+    }
 }
 
 /// How many positions a control port has, for the UI to pick a control:
@@ -351,7 +381,11 @@ mod tests {
     /// unhinted one must not come back as anything but continuous.
     #[test]
     fn a_hint_is_the_only_thing_that_makes_a_port_stepped() {
-        let hint = |d: c_int| LADSPA_PortRangeHint { hint_descriptor: d, lower_bound: 0.0, upper_bound: 1.0 };
+        let hint = |d: c_int| LADSPA_PortRangeHint {
+            hint_descriptor: d,
+            lower_bound: 0.0,
+            upper_bound: 1.0,
+        };
         assert_eq!(steps_of(&hint(HINT_TOGGLED), 0.0, 1.0), 2);
         assert_eq!(steps_of(&hint(HINT_INTEGER), 0.0, 3.0), 4, "0,1,2,3");
         assert_eq!(steps_of(&hint(0), 0.0, 1.0), 0, "no hint, no steps");
@@ -375,7 +409,10 @@ mod tests {
         // Note-on at velocity 0 is a note-off.
         let off = snd_seq_event_t::from_midi([0x90, 60, 0], 0).unwrap();
         assert_eq!(off.type_, SND_SEQ_EVENT_NOTEOFF);
-        assert_eq!(snd_seq_event_t::from_midi([0x80, 60, 0], 0).unwrap().type_, SND_SEQ_EVENT_NOTEOFF);
+        assert_eq!(
+            snd_seq_event_t::from_midi([0x80, 60, 0], 0).unwrap().type_,
+            SND_SEQ_EVENT_NOTEOFF
+        );
         assert_eq!(
             snd_seq_event_t::from_midi([0xB0, 7, 64], 0).unwrap().type_,
             SND_SEQ_EVENT_CONTROLLER
@@ -390,12 +427,21 @@ mod tests {
             lower_bound: lo,
             upper_bound: hi,
         };
-        assert_eq!(default_for(&h(HINT_DEFAULT_MINIMUM | HINT_BOUNDED_BELOW, -6.0, 6.0), 48_000), -6.0);
+        assert_eq!(
+            default_for(
+                &h(HINT_DEFAULT_MINIMUM | HINT_BOUNDED_BELOW, -6.0, 6.0),
+                48_000
+            ),
+            -6.0
+        );
         assert_eq!(default_for(&h(HINT_DEFAULT_MIDDLE, 0.0, 10.0), 48_000), 5.0);
         assert_eq!(default_for(&h(HINT_DEFAULT_1, 0.0, 10.0), 48_000), 1.0);
         // Sample-rate-relative bounds scale with the rate.
         assert_eq!(
-            default_for(&h(HINT_DEFAULT_MAXIMUM | HINT_SAMPLE_RATE, 0.0, 0.5), 48_000),
+            default_for(
+                &h(HINT_DEFAULT_MAXIMUM | HINT_SAMPLE_RATE, 0.0, 0.5),
+                48_000
+            ),
             24_000.0
         );
         // No default hint and no lower bound: silence, not a NaN.

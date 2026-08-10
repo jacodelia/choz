@@ -32,6 +32,18 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   BIN: choz
+  # Keep the machine that built the binary out of the binary. A release build
+  # embeds a source path in every panic message, and those paths come from the
+  # builder's home — 415 of them on a plain build, naming a directory layout
+  # that is nobody's business. `strip` does not touch them; these do, and take
+  # the count to zero.
+  #
+  # `trim-paths` would do it from Cargo.toml, and is still unstable.
+  RUSTFLAGS: >-
+    --remap-path-prefix=/home/runner/.cargo/registry=/cargo/registry
+    --remap-path-prefix=/home/runner/.cargo/git=/cargo/git
+    --remap-path-prefix=/home/runner/.rustup/toolchains/stable-x86_64-unknown-linux-gnu=/rust
+    --remap-path-prefix=/home/runner/work/choz/choz=/build
 
 jobs:
   # ── Linux x86_64: tarball + .deb + .rpm ────────────────────────────────────

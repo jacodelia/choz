@@ -71,7 +71,12 @@ impl Default for Automation {
     /// user having to find a switch. `#[serde(default)]` is not enough — it only
     /// speaks for a field a file leaves out.
     fn default() -> Self {
-        Self { lanes: Vec::new(), loop_beats: 0.0, recording: false, enabled: true }
+        Self {
+            lanes: Vec::new(),
+            loop_beats: 0.0,
+            recording: false,
+            enabled: true,
+        }
     }
 }
 
@@ -81,7 +86,11 @@ impl Automation {
     pub const DEFAULT_BEATS: f32 = 16.0;
 
     pub fn loop_beats(&self) -> f32 {
-        if self.loop_beats > 0.0 { self.loop_beats } else { Self::DEFAULT_BEATS }
+        if self.loop_beats > 0.0 {
+            self.loop_beats
+        } else {
+            Self::DEFAULT_BEATS
+        }
     }
 
     /// Where in the loop the transport's beat position falls.
@@ -104,7 +113,10 @@ impl Automation {
         let lane = match self.lanes.iter_mut().position(|l| l.target == target) {
             Some(i) => &mut self.lanes[i],
             None => {
-                self.lanes.push(Lane { target, points: Vec::new() });
+                self.lanes.push(Lane {
+                    target,
+                    points: Vec::new(),
+                });
                 self.lanes.last_mut().expect("just pushed")
             }
         };
@@ -151,7 +163,10 @@ mod tests {
 
     #[test]
     fn a_lane_holds_its_value_until_the_next_point() {
-        let lane = Lane { target: gain(0), points: vec![(0.0, 0.2), (2.0, 0.8)] };
+        let lane = Lane {
+            target: gain(0),
+            points: vec![(0.0, 0.2), (2.0, 0.8)],
+        };
         assert_eq!(lane.value_at(0.0), Some(0.2));
         assert_eq!(lane.value_at(1.9), Some(0.2), "held, not ramped");
         assert_eq!(lane.value_at(2.0), Some(0.8));
@@ -159,10 +174,20 @@ mod tests {
 
         // Before the first point the loop wraps to the last: the lane is a
         // circle, so the top of the bar continues where the pass ended.
-        let late = Lane { target: gain(0), points: vec![(4.0, 0.5)] };
+        let late = Lane {
+            target: gain(0),
+            points: vec![(4.0, 0.5)],
+        };
         assert_eq!(late.value_at(0.0), Some(0.5));
 
-        assert_eq!(Lane { target: gain(0), points: vec![] }.value_at(0.0), None);
+        assert_eq!(
+            Lane {
+                target: gain(0),
+                points: vec![]
+            }
+            .value_at(0.0),
+            None
+        );
     }
 
     #[test]
@@ -171,7 +196,11 @@ mod tests {
         a.record(gain(0), 0.0, 0.5);
         a.record(gain(0), 0.5, 0.5);
         a.record(gain(0), 1.0, 0.5);
-        assert_eq!(a.lanes[0].points.len(), 1, "a knob nobody touched writes one point");
+        assert_eq!(
+            a.lanes[0].points.len(),
+            1,
+            "a knob nobody touched writes one point"
+        );
 
         a.record(gain(0), 2.0, 0.9);
         assert_eq!(a.lanes[0].points.len(), 2);
@@ -187,21 +216,33 @@ mod tests {
 
     #[test]
     fn the_loop_wraps_and_playback_stops_while_recording() {
-        let mut a = Automation { loop_beats: 4.0, ..Automation::default() };
+        let mut a = Automation {
+            loop_beats: 4.0,
+            ..Automation::default()
+        };
         assert_eq!(a.position(0.0), 0.0);
         assert_eq!(a.position(4.0), 0.0, "one loop on");
         assert_eq!(a.position(5.5), 1.5);
         // A default-length loop is four bars of four.
-        assert_eq!(Automation::default().loop_beats(), Automation::DEFAULT_BEATS);
+        assert_eq!(
+            Automation::default().loop_beats(),
+            Automation::DEFAULT_BEATS
+        );
 
         a.record(gain(0), 0.0, 0.25);
         assert_eq!(a.values_at(1.0), vec![(gain(0), 0.25)]);
 
         a.recording = true;
-        assert!(a.values_at(1.0).is_empty(), "the user's hand wins while recording");
+        assert!(
+            a.values_at(1.0).is_empty(),
+            "the user's hand wins while recording"
+        );
         a.recording = false;
         a.enabled = false;
-        assert!(a.values_at(1.0).is_empty(), "and nothing plays when it is off");
+        assert!(
+            a.values_at(1.0).is_empty(),
+            "and nothing plays when it is off"
+        );
 
         a.enabled = true;
         a.clear(Some(&gain(0)));

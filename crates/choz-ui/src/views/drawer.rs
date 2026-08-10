@@ -37,7 +37,9 @@ pub fn drawer_width(open: bool, total: u16, pct: u16, min: u16) -> u16 {
 
 fn border_style(focused: bool) -> Style {
     if focused {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(ui_border())
     }
@@ -84,7 +86,10 @@ pub fn draw_handle(f: &mut Frame, area: Rect, label: &str, focused: bool) {
             ))
         })
         .collect();
-    f.render_widget(Paragraph::new(lines).style(super::theme::panel_style()), inner);
+    f.render_widget(
+        Paragraph::new(lines).style(super::theme::panel_style()),
+        inner,
+    );
 }
 
 /// One row of the OUT drawer. The panel only draws them; what a row *means*
@@ -101,16 +106,14 @@ pub struct OutRow {
 
 /// The open OUT drawer: the output devices, then the device's channel pairs so
 /// a rack tab can be sent to any jack of the interface.
-pub fn draw_output_panel(
-    f: &mut Frame,
-    area: Rect,
-    focused: bool,
-    rows: &[OutRow],
-    cursor: usize,
-) {
+pub fn draw_output_panel(f: &mut Frame, area: Rect, focused: bool, rows: &[OutRow], cursor: usize) {
     let title = format!(
         " {} ",
-        if focused { format!("{} [ACTIVE]", t("OUT")) } else { t("OUT").to_string() }
+        if focused {
+            format!("{} [ACTIVE]", t("OUT"))
+        } else {
+            t("OUT").to_string()
+        }
     );
     let block = Block::default()
         .title(title)
@@ -145,16 +148,25 @@ pub fn draw_output_panel(
         }
         let live = row.mark == '\u{2713}';
         let style = if focused && i == cursor {
-            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else if live {
             Style::default().fg(ui_text())
         } else {
             Style::default().fg(Color::Rgb(110, 115, 125))
         };
-        lines.push(Line::from(Span::styled(format!(" {} {}", row.mark, row.label), style)));
+        lines.push(Line::from(Span::styled(
+            format!(" {} {}", row.mark, row.label),
+            style,
+        )));
     }
 
-    f.render_widget(Paragraph::new(lines).style(super::theme::panel_style()), inner);
+    f.render_widget(
+        Paragraph::new(lines).style(super::theme::panel_style()),
+        inner,
+    );
 }
 
 #[cfg(test)]

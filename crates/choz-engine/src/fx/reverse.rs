@@ -40,7 +40,12 @@ pub struct ReverseDelay {
 impl ReverseDelay {
     /// `time`/`feedback` normalised 0..1. `time`→50..2000 ms segment length.
     pub fn new(sr: u32, time: f32, feedback: f32) -> Self {
-        const DEAD: Head = Head { anchor: 0, ph: 0, life: 1, active: false };
+        const DEAD: Head = Head {
+            anchor: 0,
+            ph: 0,
+            life: 1,
+            active: false,
+        };
         Self {
             sample_rate: sr.max(8000),
             seg_ms: 50.0 + time.clamp(0.0, 1.0) * 1950.0,
@@ -60,7 +65,12 @@ impl ReverseDelay {
 
     fn spawn(&mut self, life: u32) {
         if let Some(slot) = self.heads.iter().position(|h| !h.active) {
-            self.heads[slot] = Head { anchor: self.write, ph: 0, life, active: true };
+            self.heads[slot] = Head {
+                anchor: self.write,
+                ph: 0,
+                life,
+                active: true,
+            };
         }
     }
 }
@@ -90,14 +100,20 @@ impl FxProcessor for ReverseDelay {
             let mut wl = 0.0f32;
             let mut wr = 0.0f32;
             for h in self.heads.iter_mut() {
-                if !h.active { continue; }
+                if !h.active {
+                    continue;
+                }
                 // Reverse read: back from the anchor by `ph` samples.
                 let idx = (h.anchor + len - (h.ph as usize % len)) % len;
-                let env = (std::f32::consts::PI * h.ph as f32 / h.life as f32).sin().powi(2);
+                let env = (std::f32::consts::PI * h.ph as f32 / h.life as f32)
+                    .sin()
+                    .powi(2);
                 wl += self.buf_l[idx] * env;
                 wr += self.buf_r[idx] * env;
                 h.ph += 1;
-                if h.ph >= h.life { h.active = false; }
+                if h.ph >= h.life {
+                    h.active = false;
+                }
             }
 
             // Record input + feedback of the reversed output.
@@ -105,7 +121,7 @@ impl FxProcessor for ReverseDelay {
             self.buf_r[self.write] = dry_r + wr * self.feedback;
             self.write = (self.write + 1) % len;
 
-            buf[i * 2]     = dry_l + self.wet * (wl - dry_l);
+            buf[i * 2] = dry_l + self.wet * (wl - dry_l);
             buf[i * 2 + 1] = dry_r + self.wet * (wr - dry_r);
         }
     }
@@ -118,13 +134,23 @@ impl FxProcessor for ReverseDelay {
         self.spawn_timer = 0.0;
     }
 
-    fn set_mix(&mut self, wet: f32) { self.wet = wet.clamp(0.0, 1.0); }
-    fn name(&self) -> &str { "Reverse Delay" }
+    fn set_mix(&mut self, wet: f32) {
+        self.wet = wet.clamp(0.0, 1.0);
+    }
+    fn name(&self) -> &str {
+        "Reverse Delay"
+    }
 
     fn params(&self) -> Vec<super::FxParam> {
         use super::FxParam as P;
         vec![
-            P::new("Time", ((self.seg_ms - 50.0) / 1950.0).clamp(0.0, 1.0), 0.0, 1.0, ""),
+            P::new(
+                "Time",
+                ((self.seg_ms - 50.0) / 1950.0).clamp(0.0, 1.0),
+                0.0,
+                1.0,
+                "",
+            ),
             P::new("Feedback", self.feedback / 0.95, 0.0, 1.0, ""),
             P::new("Wet", self.wet, 0.0, 1.0, ""),
         ]
@@ -152,7 +178,12 @@ mod tests {
         // ramp played back (reversed), i.e. non-trivial energy with mix=1.
         let mut fx = ReverseDelay::new(48000, 0.1, 0.0);
         fx.set_mix(1.0);
-        let mut ramp: Vec<f32> = (0..8192).flat_map(|i| { let s = (i % 256) as f32 / 256.0; [s, s] }).collect();
+        let mut ramp: Vec<f32> = (0..8192)
+            .flat_map(|i| {
+                let s = (i % 256) as f32 / 256.0;
+                [s, s]
+            })
+            .collect();
         fx.process_block(&mut ramp, 48000);
         let mut silence = vec![0.0f32; 8192];
         fx.process_block(&mut silence, 48000);

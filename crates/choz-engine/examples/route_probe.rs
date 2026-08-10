@@ -23,11 +23,18 @@ fn main() -> anyhow::Result<()> {
     let sf2 = std::path::Path::new("/usr/share/sounds/sf2/FluidR3_GM.sf2");
     // One slot per output pair, each on its own note, so the routing is audible.
     for pair in 0..(engine.output_channels() / 2) {
-        let Some(slot) = engine.add_silent() else { break };
+        let Some(slot) = engine.add_silent() else {
+            break;
+        };
         engine.load_sf2(slot, sf2, 0, 0)?;
         engine.set_slot_out(slot, pair * 2, pair * 2 + 1);
         engine.note_on(slot, 48 + (pair as u8) * 4, 100);
-        println!("slot {slot}: note {} -> out {}/{}", 48 + pair * 4, pair * 2 + 1, pair * 2 + 2);
+        println!(
+            "slot {slot}: note {} -> out {}/{}",
+            48 + pair * 4,
+            pair * 2 + 1,
+            pair * 2 + 2
+        );
     }
     engine.set_playing(true);
     std::thread::sleep(std::time::Duration::from_secs(secs));

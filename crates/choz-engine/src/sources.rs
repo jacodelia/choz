@@ -5,8 +5,8 @@
 //! lock-free. Concrete sources (built here, off the RT thread) are handed to
 //! the engine over a ring and swapped in by the callback.
 
-use std::path::Path;
 use anyhow::{Context, Result};
+use std::path::Path;
 
 // The AudioSource trait lives in `choz-ports`; re-exported so `crate::sources::
 // AudioSource` (used by engine.rs and the impls below) keeps resolving.
@@ -21,7 +21,11 @@ pub struct TestTone {
 
 impl TestTone {
     pub fn new() -> Self {
-        Self { phase: 0.0, freq: 440.0, amp: 0.3 }
+        Self {
+            phase: 0.0,
+            freq: 440.0,
+            amp: 0.3,
+        }
     }
 }
 
@@ -86,10 +90,9 @@ impl WavPlayer {
 
         // Read every sample as f32, normalizing integer formats to -1.0..1.0.
         let mono_or_multi: Vec<f32> = match spec.sample_format {
-            hound::SampleFormat::Float => reader
-                .samples::<f32>()
-                .map(|s| s.unwrap_or(0.0))
-                .collect(),
+            hound::SampleFormat::Float => {
+                reader.samples::<f32>().map(|s| s.unwrap_or(0.0)).collect()
+            }
             hound::SampleFormat::Int => {
                 let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
                 reader
@@ -105,7 +108,11 @@ impl WavPlayer {
         for f in 0..frames {
             let base = f * channels;
             let l = mono_or_multi[base];
-            let r = if channels >= 2 { mono_or_multi[base + 1] } else { l };
+            let r = if channels >= 2 {
+                mono_or_multi[base + 1]
+            } else {
+                l
+            };
             samples.push(l);
             samples.push(r);
         }
@@ -192,21 +199,28 @@ impl Sf2Synth {
             gain: 1.0,
             ..Default::default()
         };
-        let mut synth = Synth::new(desc)
-            .map_err(|e| anyhow::anyhow!("oxisynth init failed: {e:?}"))?;
+        let mut synth =
+            Synth::new(desc).map_err(|e| anyhow::anyhow!("oxisynth init failed: {e:?}"))?;
 
-        let data = std::fs::read(path)
-            .with_context(|| format!("cannot read SF2: {}", path.display()))?;
+        let data =
+            std::fs::read(path).with_context(|| format!("cannot read SF2: {}", path.display()))?;
         let sf = SoundFont::load(&mut std::io::Cursor::new(data))
             .map_err(|e| anyhow::anyhow!("SF2 parse error: {e:?}"))?;
         let font_id = synth.add_font(sf, true);
 
         // Fall back to bank 0 / preset 0 if the requested program is missing.
-        if synth.select_program(0, font_id, bank as u32, preset).is_err() {
+        if synth
+            .select_program(0, font_id, bank as u32, preset)
+            .is_err()
+        {
             let _ = synth.select_program(0, font_id, 0, 0);
         }
         // GM channel volume so notes are audible.
-        let _ = synth.send_event(MidiEvent::ControlChange { channel: 0, ctrl: 7, value: 100 });
+        let _ = synth.send_event(MidiEvent::ControlChange {
+            channel: 0,
+            ctrl: 7,
+            value: 100,
+        });
 
         Ok(Self {
             synth,
@@ -272,13 +286,16 @@ impl AudioSource for Sf2Synth {
 
     fn note_on(&mut self, note: u8, velocity: u8) {
         let _ = self.synth.send_event(oxisynth::MidiEvent::NoteOn {
-            channel: 0, key: note, vel: velocity,
+            channel: 0,
+            key: note,
+            vel: velocity,
         });
     }
 
     fn note_off(&mut self, note: u8) {
         let _ = self.synth.send_event(oxisynth::MidiEvent::NoteOff {
-            channel: 0, key: note,
+            channel: 0,
+            key: note,
         });
     }
 
@@ -287,26 +304,33 @@ impl AudioSource for Sf2Synth {
     /// button that leaves a reverb tail ringing has not really panicked.
     fn all_notes_off(&mut self) {
         for channel in 0..16 {
-            let _ = self.synth.send_event(oxisynth::MidiEvent::AllSoundOff { channel });
+            let _ = self
+                .synth
+                .send_event(oxisynth::MidiEvent::AllSoundOff { channel });
         }
     }
 
     fn control_change(&mut self, cc: u8, value: u8) {
         let _ = self.synth.send_event(oxisynth::MidiEvent::ControlChange {
-            channel: 0, ctrl: cc, value,
+            channel: 0,
+            ctrl: cc,
+            value,
         });
     }
 
     fn pitch_bend(&mut self, value: u16) {
         let _ = self.synth.send_event(oxisynth::MidiEvent::PitchBend {
-            channel: 0, value: value.min(16383),
+            channel: 0,
+            value: value.min(16383),
         });
     }
 
     fn program_change(&mut self, bank: u8, preset: u8) {
         // RT-safe: this only looks the preset up in the already-loaded font and
         // Arc-clones it into the channel.
-        let _ = self.synth.select_program(0, self.font_id, bank as u32, preset);
+        let _ = self
+            .synth
+            .select_program(0, self.font_id, bank as u32, preset);
     }
 
     fn plays_on_transport_stop(&self) -> bool {
@@ -354,7 +378,10 @@ mod tests {
         for _ in 0..12 {
             held = peak(&mut synth, 4096);
         }
-        assert!(held > dry * 10.0, "sustain must hold the note: held {held} vs dry {dry}");
+        assert!(
+            held > dry * 10.0,
+            "sustain must hold the note: held {held} vs dry {dry}"
+        );
 
         // Lifting the pedal releases it.
         synth.control_change(64, 0);
@@ -362,7 +389,10 @@ mod tests {
         for _ in 0..12 {
             after = peak(&mut synth, 4096);
         }
-        assert!(after < held * 0.5, "lifting the pedal releases: {after} vs {held}");
+        assert!(
+            after < held * 0.5,
+            "lifting the pedal releases: {after} vs {held}"
+        );
     }
 
     #[test]
@@ -379,8 +409,12 @@ mod tests {
             let mut buf = vec![0.0f32; 8192];
             s.render(&mut buf, 48_000); // discard the attack
             s.render(&mut buf, 48_000);
-            buf.chunks(2).map(|f| f[0]).collect::<Vec<_>>()
-                .windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count()
+            buf.chunks(2)
+                .map(|f| f[0])
+                .collect::<Vec<_>>()
+                .windows(2)
+                .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+                .count()
         };
 
         synth.pitch_bend(8192); // centre
@@ -393,7 +427,10 @@ mod tests {
         let bent = crossings(&mut synth);
 
         assert!(centred > 0, "note must sound to be measurable");
-        assert!(bent > centred, "bending up must raise the pitch: {bent} vs {centred}");
+        assert!(
+            bent > centred,
+            "bending up must raise the pitch: {bent} vs {centred}"
+        );
     }
 
     #[test]

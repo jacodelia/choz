@@ -20,24 +20,30 @@ use libloading::Library;
 use vst3::{Class, ComPtr, ComWrapper, Interface};
 
 use crate::editor::{SharedView, Vst3Editor};
-use vst3::Steinberg::*;
-use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::Vst::IAttributeList_::AttrID;
-
+use vst3::Steinberg::Vst::*;
+use vst3::Steinberg::*;
 
 type GetFactoryProc = unsafe extern "system" fn() -> *mut IPluginFactory;
 
 /// Resolve the loadable `.so` inside a Linux `.vst3` bundle, or the file itself.
 fn bundle_binary(path: &Path) -> std::path::PathBuf {
     // Linux bundle layout: <name>.vst3/Contents/x86_64-linux/<name>.so
-    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let arch_dir = path.join("Contents").join("x86_64-linux");
     let so = arch_dir.join(format!("{stem}.so"));
-    if so.exists() { return so; }
+    if so.exists() {
+        return so;
+    }
     // Some bundles use the plain name; fall back to any .so in the arch dir.
     if let Ok(rd) = std::fs::read_dir(&arch_dir) {
         for e in rd.flatten() {
-            if e.path().extension().map(|x| x == "so").unwrap_or(false) { return e.path(); }
+            if e.path().extension().map(|x| x == "so").unwrap_or(false) {
+                return e.path();
+            }
         }
     }
     path.to_path_buf()
@@ -58,7 +64,13 @@ impl IHostApplicationTrait for HostContext {
             let dst = &mut *name;
             let src = "choz";
             let mut i = 0;
-            for u in src.encode_utf16() { if i + 1 >= dst.len() { break; } dst[i] = u as TChar; i += 1; }
+            for u in src.encode_utf16() {
+                if i + 1 >= dst.len() {
+                    break;
+                }
+                dst[i] = u as TChar;
+                i += 1;
+            }
             dst[i] = 0;
         }
         kResultOk
@@ -68,7 +80,12 @@ impl IHostApplicationTrait for HostContext {
     /// talk to each other. Returning `kNotImplemented` is what made DPF's UI
     /// assert `message != nullptr` the moment its editor opened, so a knob in
     /// the plugin's own window never reached the DSP.
-    unsafe fn createInstance(&self, _cid: *mut TUID, iid: *mut TUID, obj: *mut *mut c_void) -> tresult {
+    unsafe fn createInstance(
+        &self,
+        _cid: *mut TUID,
+        iid: *mut TUID,
+        obj: *mut *mut c_void,
+    ) -> tresult {
         if obj.is_null() || iid.is_null() {
             return kInvalidArgument;
         }
@@ -78,7 +95,9 @@ impl IHostApplicationTrait for HostContext {
             return kNotImplemented;
         }
         let msg = ComWrapper::new(HostMessage::new());
-        let Some(ptr) = msg.to_com_ptr::<IMessage>() else { return kInternalError };
+        let Some(ptr) = msg.to_com_ptr::<IMessage>() else {
+            return kInternalError;
+        };
         // The caller owns the reference `to_com_ptr` just took.
         unsafe { *obj = ptr.into_raw() as *mut c_void };
         kResultOk
@@ -154,8 +173,13 @@ impl HostAttributeList {
     }
 
     fn set(&self, id: AttrID, value: AttrValue) -> tresult {
-        let Some(key) = Self::key(id) else { return kInvalidArgument };
-        self.values.lock().unwrap_or_else(|e| e.into_inner()).insert(key, value);
+        let Some(key) = Self::key(id) else {
+            return kInvalidArgument;
+        };
+        self.values
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, value);
         kResultOk
     }
 }
@@ -170,7 +194,9 @@ impl IAttributeListTrait for HostAttributeList {
     }
 
     unsafe fn getInt(&self, id: AttrID, value: *mut int64) -> tresult {
-        let Some(key) = Self::key(id) else { return kInvalidArgument };
+        let Some(key) = Self::key(id) else {
+            return kInvalidArgument;
+        };
         let g = self.values.lock().unwrap_or_else(|e| e.into_inner());
         match g.get(&key) {
             Some(AttrValue::Int(v)) if !value.is_null() => {
@@ -186,7 +212,9 @@ impl IAttributeListTrait for HostAttributeList {
     }
 
     unsafe fn getFloat(&self, id: AttrID, value: *mut f64) -> tresult {
-        let Some(key) = Self::key(id) else { return kInvalidArgument };
+        let Some(key) = Self::key(id) else {
+            return kInvalidArgument;
+        };
         let g = self.values.lock().unwrap_or_else(|e| e.into_inner());
         match g.get(&key) {
             Some(AttrValue::Float(v)) if !value.is_null() => {
@@ -215,9 +243,13 @@ impl IAttributeListTrait for HostAttributeList {
     }
 
     unsafe fn getString(&self, id: AttrID, string: *mut TChar, size_in_bytes: uint32) -> tresult {
-        let Some(key) = Self::key(id) else { return kInvalidArgument };
+        let Some(key) = Self::key(id) else {
+            return kInvalidArgument;
+        };
         let g = self.values.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(AttrValue::Text(v)) = g.get(&key) else { return kResultFalse };
+        let Some(AttrValue::Text(v)) = g.get(&key) else {
+            return kResultFalse;
+        };
         if string.is_null() {
             return kInvalidArgument;
         }
@@ -253,9 +285,13 @@ impl IAttributeListTrait for HostAttributeList {
         data: *mut *const c_void,
         size_in_bytes: *mut uint32,
     ) -> tresult {
-        let Some(key) = Self::key(id) else { return kInvalidArgument };
+        let Some(key) = Self::key(id) else {
+            return kInvalidArgument;
+        };
         let g = self.values.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(AttrValue::Binary(v)) = g.get(&key) else { return kResultFalse };
+        let Some(AttrValue::Binary(v)) = g.get(&key) else {
+            return kResultFalse;
+        };
         if data.is_null() || size_in_bytes.is_null() {
             return kInvalidArgument;
         }
@@ -285,11 +321,16 @@ impl IEventListTrait for HostEventList {
     }
     unsafe fn getEvent(&self, index: int32, e: *mut Event) -> tresult {
         match self.events.get(index as usize) {
-            Some(ev) => { *e = *ev; kResultOk }
+            Some(ev) => {
+                *e = *ev;
+                kResultOk
+            }
             None => kInvalidArgument,
         }
     }
-    unsafe fn addEvent(&self, _e: *mut Event) -> tresult { kNotImplemented }
+    unsafe fn addEvent(&self, _e: *mut Event) -> tresult {
+        kNotImplemented
+    }
 }
 
 /// One parameter change for one block: the id and the value, as a single point
@@ -328,7 +369,9 @@ impl IParamValueQueueTrait for HostParamValueQueue {
     unsafe fn getParameterId(&self) -> ParamID {
         self.id.load(std::sync::atomic::Ordering::Relaxed)
     }
-    unsafe fn getPointCount(&self) -> int32 { 1 }
+    unsafe fn getPointCount(&self) -> int32 {
+        1
+    }
     unsafe fn getPoint(&self, index: int32, off: *mut int32, value: *mut ParamValue) -> tresult {
         if index != 0 {
             return kResultFalse;
@@ -347,7 +390,9 @@ impl IParamValueQueueTrait for HostParamValueQueue {
     /// same edits through `IComponentHandler`, which is where a GUI reports
     /// them.
     unsafe fn addPoint(&self, _off: int32, _value: ParamValue, index: *mut int32) -> tresult {
-        if !index.is_null() { unsafe { *index = 0 }; }
+        if !index.is_null() {
+            unsafe { *index = 0 };
+        }
         kResultOk
     }
 }
@@ -380,7 +425,8 @@ impl HostParamChanges {
         for (q, (id, v)) in queues.iter().zip(changes) {
             q.set(*id, *v);
         }
-        self.active.store(changes.len(), std::sync::atomic::Ordering::Relaxed);
+        self.active
+            .store(changes.len(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -406,8 +452,14 @@ impl IParameterChangesTrait for HostParamChanges {
     /// The plugin asking for somewhere to write *output* automation. It gets a
     /// real queue (some DPF plugins insist on a non-null one) whose points are
     /// discarded.
-    unsafe fn addParameterData(&self, _id: *const ParamID, index: *mut int32) -> *mut IParamValueQueue {
-        if !index.is_null() { unsafe { *index = 0 }; }
+    unsafe fn addParameterData(
+        &self,
+        _id: *const ParamID,
+        index: *mut int32,
+    ) -> *mut IParamValueQueue {
+        if !index.is_null() {
+            unsafe { *index = 0 };
+        }
         let mut queues = self.queues.lock().unwrap_or_else(|e| e.into_inner());
         if queues.is_empty() {
             queues.push(ComWrapper::new(HostParamValueQueue::new()));
@@ -446,7 +498,9 @@ impl choz_ports::PluginState for Vst3State {
         let guard = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         let cell = guard.as_ref()?;
         let shared = Arc::new(std::sync::Mutex::new((Vec::new(), 0usize)));
-        let stream = ComWrapper::new(MemStream { inner: shared.clone() });
+        let stream = ComWrapper::new(MemStream {
+            inner: shared.clone(),
+        });
         let ptr = stream.to_com_ptr::<IBStream>()?;
         // SAFETY: live component under the mutex; the stream is ours.
         if unsafe { cell.component.getState(ptr.as_ptr()) } != kResultOk {
@@ -562,18 +616,24 @@ impl Class for HostComponentHandler {
 impl IComponentHandlerTrait for HostComponentHandler {
     /// Start of a gesture (mouse down on a knob). Nothing to do: choz has no
     /// automation to arm, and the value arrives in `performEdit`.
-    unsafe fn beginEdit(&self, _id: ParamID) -> tresult { kResultOk }
+    unsafe fn beginEdit(&self, _id: ParamID) -> tresult {
+        kResultOk
+    }
 
     unsafe fn performEdit(&self, id: ParamID, value_normalized: ParamValue) -> tresult {
         self.feed.push(id, value_normalized);
         kResultOk
     }
 
-    unsafe fn endEdit(&self, _id: ParamID) -> tresult { kResultOk }
+    unsafe fn endEdit(&self, _id: ParamID) -> tresult {
+        kResultOk
+    }
 
     /// The plugin wants the host to re-read something (parameter list, latency,
     /// …). choz reads parameters on demand, so acknowledging is enough.
-    unsafe fn restartComponent(&self, _flags: int32) -> tresult { kResultOk }
+    unsafe fn restartComponent(&self, _flags: int32) -> tresult {
+        kResultOk
+    }
 }
 
 /// A memory-backed `IBStream` for component state get/set. The plugin reads from
@@ -597,18 +657,29 @@ impl IBStreamTrait for MemStream {
             std::ptr::copy_nonoverlapping(data[*pos..].as_ptr(), buffer as *mut u8, n);
             *pos += n;
         }
-        if !num_read.is_null() { *num_read = n as int32; }
+        if !num_read.is_null() {
+            *num_read = n as int32;
+        }
         kResultOk
     }
-    unsafe fn write(&self, buffer: *mut c_void, num_bytes: int32, num_written: *mut int32) -> tresult {
+    unsafe fn write(
+        &self,
+        buffer: *mut c_void,
+        num_bytes: int32,
+        num_written: *mut int32,
+    ) -> tresult {
         let mut g = self.inner.lock().unwrap();
         let (data, pos) = &mut *g;
         let n = num_bytes.max(0) as usize;
         let src = std::slice::from_raw_parts(buffer as *const u8, n);
-        if *pos + n > data.len() { data.resize(*pos + n, 0); }
+        if *pos + n > data.len() {
+            data.resize(*pos + n, 0);
+        }
         data[*pos..*pos + n].copy_from_slice(src);
         *pos += n;
-        if !num_written.is_null() { *num_written = n as int32; }
+        if !num_written.is_null() {
+            *num_written = n as int32;
+        }
         kResultOk
     }
     unsafe fn seek(&self, pos: int64, mode: int32, result: *mut int64) -> tresult {
@@ -622,11 +693,15 @@ impl IBStreamTrait for MemStream {
         };
         let np = (base + pos).max(0) as usize;
         *cur = np;
-        if !result.is_null() { *result = np as int64; }
+        if !result.is_null() {
+            *result = np as int64;
+        }
         kResultOk
     }
     unsafe fn tell(&self, pos: *mut int64) -> tresult {
-        if !pos.is_null() { *pos = self.inner.lock().unwrap().1 as int64; }
+        if !pos.is_null() {
+            *pos = self.inner.lock().unwrap().1 as int64;
+        }
         kResultOk
     }
 }
@@ -689,7 +764,11 @@ fn host_process_context() -> ProcessContext {
         | ProcessContext_::StatesAndFlags_::kTempoValid
         | ProcessContext_::StatesAndFlags_::kTimeSigValid
         | ProcessContext_::StatesAndFlags_::kContTimeValid
-        | if t.playing() { ProcessContext_::StatesAndFlags_::kPlaying } else { 0 };
+        | if t.playing() {
+            ProcessContext_::StatesAndFlags_::kPlaying
+        } else {
+            0
+        };
     ctx
 }
 
@@ -773,7 +852,8 @@ impl Vst3RealInstance {
             }
         }
         let get_factory: libloading::Symbol<GetFactoryProc> = unsafe {
-            lib.get(b"GetPluginFactory\0").context("no GetPluginFactory export")?
+            lib.get(b"GetPluginFactory\0")
+                .context("no GetPluginFactory export")?
         };
         let factory = unsafe { ComPtr::<IPluginFactory>::from_raw(get_factory()) }
             .context("GetPluginFactory returned null")?;
@@ -783,9 +863,13 @@ impl Vst3RealInstance {
         let mut component: Option<ComPtr<IComponent>> = None;
         for i in 0..count {
             let mut info: PClassInfo = unsafe { std::mem::zeroed() };
-            if unsafe { factory.getClassInfo(i, &mut info) } != kResultOk { continue; }
+            if unsafe { factory.getClassInfo(i, &mut info) } != kResultOk {
+                continue;
+            }
             let category = c_arr_to_string(&info.category);
-            if category != "Audio Module Class" { continue; }
+            if category != "Audio Module Class" {
+                continue;
+            }
             let mut obj: *mut c_void = std::ptr::null_mut();
             let r = unsafe {
                 factory.createInstance(
@@ -804,7 +888,8 @@ impl Vst3RealInstance {
         // IPluginBase::initialize with a real host context (null segfaults many
         // plugins that call back during init).
         let ctx = ComWrapper::new(HostContext);
-        let ctx_unknown = ctx.to_com_ptr::<FUnknown>()
+        let ctx_unknown = ctx
+            .to_com_ptr::<FUnknown>()
             .context("host context FUnknown")?;
         unsafe {
             if component.initialize(ctx_unknown.as_ptr()) != kResultOk {
@@ -835,16 +920,21 @@ impl Vst3RealInstance {
                         if let Some(c) = &ctrl {
                             c.initialize(ctx_unknown.as_ptr());
                             // Connect component ↔ controller so edits sync to audio.
-                            if let (Some(cp_comp), Some(cp_ctrl)) =
-                                (component.cast::<IConnectionPoint>(), c.cast::<IConnectionPoint>())
-                            {
+                            if let (Some(cp_comp), Some(cp_ctrl)) = (
+                                component.cast::<IConnectionPoint>(),
+                                c.cast::<IConnectionPoint>(),
+                            ) {
                                 cp_comp.connect(cp_ctrl.as_ptr());
                                 cp_ctrl.connect(cp_comp.as_ptr());
                             }
                         }
                         ctrl
-                    } else { None }
-                } else { None }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             },
         };
 
@@ -857,7 +947,8 @@ impl Vst3RealInstance {
                     .filter_map(|i| {
                         let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
                         // SAFETY: live controller, index in range.
-                        (unsafe { c.getParameterInfo(i, &mut info) } == kResultOk).then_some(info.id)
+                        (unsafe { c.getParameterInfo(i, &mut info) } == kResultOk)
+                            .then_some(info.id)
                     })
                     .collect()
             })
@@ -867,7 +958,9 @@ impl Vst3RealInstance {
         // whose window is open moves its own knobs and the processor never
         // hears about it.
         let edits = EditFeed::default();
-        let handler = ComWrapper::new(HostComponentHandler { feed: edits.clone() });
+        let handler = ComWrapper::new(HostComponentHandler {
+            feed: edits.clone(),
+        });
         if let (Some(c), Some(h)) = (&controller, handler.to_com_ptr::<IComponentHandler>()) {
             // SAFETY: live controller, and the handler outlives it (both are
             // owned by this instance, dropped after `terminate`).
@@ -881,32 +974,65 @@ impl Vst3RealInstance {
             maxSamplesPerBlock: block as int32,
             sampleRate: sample_rate as f64,
         };
-        unsafe { processor.setupProcessing(&mut setup); }
+        unsafe {
+            processor.setupProcessing(&mut setup);
+        }
 
         // Query the real output-bus channel count (mono plugins have 1 — hardcoding
         // 2 makes them index out of bounds and assert/crash).
         let out_channels = unsafe {
             let mut bi: BusInfo = std::mem::zeroed();
-            if component.getBusInfo(MediaTypes_::kAudio as int32, BusDirections_::kOutput as int32, 0, &mut bi) == kResultOk {
+            if component.getBusInfo(
+                MediaTypes_::kAudio as int32,
+                BusDirections_::kOutput as int32,
+                0,
+                &mut bi,
+            ) == kResultOk
+            {
                 (bi.channelCount.max(1)) as usize
-            } else { 2 }
+            } else {
+                2
+            }
         };
 
         // Query the input-audio bus channel count (effects have one; instruments 0).
         let in_channels = unsafe {
             let mut bi: BusInfo = std::mem::zeroed();
-            if component.getBusInfo(MediaTypes_::kAudio as int32, BusDirections_::kInput as int32, 0, &mut bi) == kResultOk {
+            if component.getBusInfo(
+                MediaTypes_::kAudio as int32,
+                BusDirections_::kInput as int32,
+                0,
+                &mut bi,
+            ) == kResultOk
+            {
                 bi.channelCount.max(0) as usize
-            } else { 0 }
+            } else {
+                0
+            }
         };
 
         // Activate the main audio-out bus, the event-in bus (notes), and — for
         // effects — the audio-in bus.
         unsafe {
-            component.activateBus(MediaTypes_::kAudio as int32, BusDirections_::kOutput as int32, 0, 1);
-            component.activateBus(MediaTypes_::kEvent as int32, BusDirections_::kInput as int32, 0, 1);
+            component.activateBus(
+                MediaTypes_::kAudio as int32,
+                BusDirections_::kOutput as int32,
+                0,
+                1,
+            );
+            component.activateBus(
+                MediaTypes_::kEvent as int32,
+                BusDirections_::kInput as int32,
+                0,
+                1,
+            );
             if in_channels > 0 {
-                component.activateBus(MediaTypes_::kAudio as int32, BusDirections_::kInput as int32, 0, 1);
+                component.activateBus(
+                    MediaTypes_::kAudio as int32,
+                    BusDirections_::kInput as int32,
+                    0,
+                    1,
+                );
             }
             component.setActive(1);
             processor.setProcessing(1);
@@ -957,17 +1083,27 @@ impl Vst3RealInstance {
 
     /// The plugin's own state blob: its patch, not just its parameter values.
     pub fn state(&self) -> Option<choz_ports::StateHandle> {
-        Some(Arc::new(Vst3State { shared: Arc::clone(&self.shared_state) }) as choz_ports::StateHandle)
+        Some(Arc::new(Vst3State {
+            shared: Arc::clone(&self.shared_state),
+        }) as choz_ports::StateHandle)
     }
 
     /// Handle to the plugin's own window, or `None` if it has no X11 editor.
     pub fn editor(&self) -> Option<EditorHandle> {
-        let has_view = self.shared_view.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        let has_view = self
+            .shared_view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
         has_view.then(|| Vst3Editor::new(Arc::clone(&self.shared_view)) as EditorHandle)
     }
 
-    pub fn note_on(&mut self, ch: u8, note: u8, vel: u8) { self.pending.push(note_on_event(ch, note, vel)); }
-    pub fn note_off(&mut self, ch: u8, note: u8) { self.pending.push(note_off_event(ch, note)); }
+    pub fn note_on(&mut self, ch: u8, note: u8, vel: u8) {
+        self.pending.push(note_on_event(ch, note, vel));
+    }
+    pub fn note_off(&mut self, ch: u8, note: u8) {
+        self.pending.push(note_off_event(ch, note));
+    }
 
     /// Render one interleaved-stereo block as an instrument (no audio input).
     pub fn render(&mut self, output: &mut [f32]) -> usize {
@@ -978,14 +1114,22 @@ impl Vst3RealInstance {
     /// input bus — the effect path. `input` empty ⇒ silent input.
     pub fn render_with_input(&mut self, input: &[f32], output: &mut [f32]) -> usize {
         let frames = (output.len() / 2).min(self.block);
-        for b in &mut self.out_bufs { for s in b.iter_mut() { *s = 0.0; } }
+        for b in &mut self.out_bufs {
+            for s in b.iter_mut() {
+                *s = 0.0;
+            }
+        }
 
         self.out_ptrs.clear();
-        for b in &mut self.out_bufs { self.out_ptrs.push(b.as_mut_ptr()); }
+        for b in &mut self.out_bufs {
+            self.out_ptrs.push(b.as_mut_ptr());
+        }
         let mut out_bus = AudioBusBuffers {
             numChannels: self.out_channels as int32,
             silenceFlags: 0,
-            __field0: AudioBusBuffers__type0 { channelBuffers32: self.out_ptrs.as_mut_ptr() },
+            __field0: AudioBusBuffers__type0 {
+                channelBuffers32: self.out_ptrs.as_mut_ptr(),
+            },
         };
 
         // Fill input channels (deinterleave) when this plugin has an audio-in bus.
@@ -994,15 +1138,23 @@ impl Vst3RealInstance {
         let (num_inputs, in_ptr) = if self.in_channels > 0 {
             for (ch_idx, b) in self.in_bufs.iter_mut().enumerate() {
                 for (f, v) in b[..frames].iter_mut().enumerate() {
-                    *v = if f < in_frames { input[f * 2 + ch_idx.min(1)] } else { 0.0 };
+                    *v = if f < in_frames {
+                        input[f * 2 + ch_idx.min(1)]
+                    } else {
+                        0.0
+                    };
                 }
             }
             self.in_ptrs.clear();
-            for b in &mut self.in_bufs { self.in_ptrs.push(b.as_mut_ptr()); }
+            for b in &mut self.in_bufs {
+                self.in_ptrs.push(b.as_mut_ptr());
+            }
             in_bus = AudioBusBuffers {
                 numChannels: self.in_channels as int32,
                 silenceFlags: 0,
-                __field0: AudioBusBuffers__type0 { channelBuffers32: self.in_ptrs.as_mut_ptr() },
+                __field0: AudioBusBuffers__type0 {
+                    channelBuffers32: self.in_ptrs.as_mut_ptr(),
+                },
             };
             (1, &mut in_bus as *mut AudioBusBuffers)
         } else {
@@ -1010,15 +1162,23 @@ impl Vst3RealInstance {
         };
 
         // Host event list for this block (moves the queued notes in).
-        let evlist = ComWrapper::new(HostEventList { events: std::mem::take(&mut self.pending) });
-        let ev_ptr = evlist.to_com_ptr::<IEventList>().map(|p| p.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let evlist = ComWrapper::new(HostEventList {
+            events: std::mem::take(&mut self.pending),
+        });
+        let ev_ptr = evlist
+            .to_com_ptr::<IEventList>()
+            .map(|p| p.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         // Everything the GUI (or a choz knob) changed since the last block, as
         // real input automation. This is what makes a plugin's own window
         // actually change the sound.
         self.edits.drain(&mut self.edit_scratch);
         self.param_changes.load(&self.edit_scratch);
-        let pc_ptr = self.param_changes.to_com_ptr::<IParameterChanges>()
-            .map(|p| p.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let pc_ptr = self
+            .param_changes
+            .to_com_ptr::<IParameterChanges>()
+            .map(|p| p.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
 
         // choz's clock. VST3 takes it by pointer per block, and a plugin that
         // syncs anything reads it there; a null one (which is what this was)
@@ -1038,13 +1198,15 @@ impl Vst3RealInstance {
             outputEvents: std::ptr::null_mut(),
             processContext: &mut context,
         };
-        unsafe { self.processor.process(&mut data); }
+        unsafe {
+            self.processor.process(&mut data);
+        }
 
         // Interleave to stereo: duplicate a mono bus to both sides; otherwise take
         // the first two channels.
         let right = if self.out_channels > 1 { 1 } else { 0 };
         for f in 0..frames {
-            output[f * 2]     = self.out_bufs[0][f];
+            output[f * 2] = self.out_bufs[0][f];
             output[f * 2 + 1] = self.out_bufs[right][f];
         }
         frames
@@ -1063,7 +1225,10 @@ impl Vst3RealInstance {
     /// Index of a parameter the plugin named by id — the direction a GUI edit
     /// arrives in.
     pub fn param_index(&self, id: u32) -> Option<u32> {
-        self.param_ids.iter().position(|&p| p == id).map(|i| i as u32)
+        self.param_ids
+            .iter()
+            .position(|&p| p == id)
+            .map(|i| i as u32)
     }
 
     pub fn get_param(&self, index: u32) -> f32 {
@@ -1079,9 +1244,15 @@ impl Vst3RealInstance {
     /// the new position, and the processor so the sound follows. The second one
     /// only happens through the block's input parameter changes.
     pub fn set_param(&self, index: u32, value: f32) {
-        let Some(id) = self.param_id(index) else { return };
+        let Some(id) = self.param_id(index) else {
+            return;
+        };
         let v = value.clamp(0.0, 1.0) as f64;
-        if let Some(c) = &self.controller { unsafe { c.setParamNormalized(id, v); } }
+        if let Some(c) = &self.controller {
+            unsafe {
+                c.setParamNormalized(id, v);
+            }
+        }
         self.edits.push(id, v);
     }
 
@@ -1090,10 +1261,15 @@ impl Vst3RealInstance {
     /// the user just grabbed in the plugin's GUI, and so choz's own copy of the
     /// values follows what happens in there.
     pub fn edit_feed(&self) -> TouchByIndex {
-        TouchByIndex { feed: self.edits.clone(), ids: self.param_ids.clone() }
+        TouchByIndex {
+            feed: self.edits.clone(),
+            ids: self.param_ids.clone(),
+        }
     }
     pub fn param_name(&self, index: u32) -> String {
-        let Some(c) = &self.controller else { return format!("P{index}") };
+        let Some(c) = &self.controller else {
+            return format!("P{index}");
+        };
         let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
         if unsafe { c.getParameterInfo(index as int32, &mut info) } == kResultOk {
             w_arr_to_string(&info.title)
@@ -1110,7 +1286,9 @@ impl Vst3RealInstance {
     /// filter-type parameter is called "Bandpass" — the value itself is a
     /// normalised float like everything else.
     pub fn param_steps(&self, index: u32) -> (u32, Vec<(f64, String)>) {
-        let Some(c) = &self.controller else { return (0, Vec::new()) };
+        let Some(c) = &self.controller else {
+            return (0, Vec::new());
+        };
         let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
         if unsafe { c.getParameterInfo(index as int32, &mut info) } != kResultOk {
             return (0, Vec::new());
@@ -1140,7 +1318,9 @@ impl Vst3RealInstance {
 
     /// Unit label (e.g. "dB", "Hz") from the parameter's `units`.
     pub fn param_label(&self, index: u32) -> String {
-        let Some(c) = &self.controller else { return String::new() };
+        let Some(c) = &self.controller else {
+            return String::new();
+        };
         let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
         if unsafe { c.getParameterInfo(index as int32, &mut info) } == kResultOk {
             w_arr_to_string(&info.units)
@@ -1165,10 +1345,16 @@ impl Vst3RealInstance {
     /// Serialize the component's state into an opaque blob (empty on failure).
     pub fn get_state(&self) -> Vec<u8> {
         let shared = Arc::new(std::sync::Mutex::new((Vec::new(), 0usize)));
-        let stream = ComWrapper::new(MemStream { inner: shared.clone() });
-        let Some(ptr) = stream.to_com_ptr::<IBStream>() else { return Vec::new() };
+        let stream = ComWrapper::new(MemStream {
+            inner: shared.clone(),
+        });
+        let Some(ptr) = stream.to_com_ptr::<IBStream>() else {
+            return Vec::new();
+        };
         let ok = unsafe { self.component.getState(ptr.as_ptr()) } == kResultOk;
-        if !ok { return Vec::new(); }
+        if !ok {
+            return Vec::new();
+        }
         let data = shared.lock().unwrap().0.clone();
         data
     }
@@ -1176,18 +1362,28 @@ impl Vst3RealInstance {
     /// Restore component state from a blob produced by [`Self::get_state`]. Also
     /// pushes it to the edit controller so its parameter view syncs.
     pub fn set_state(&self, data: &[u8]) {
-        if data.is_empty() { return; }
+        if data.is_empty() {
+            return;
+        }
         // Component state.
         let shared = Arc::new(std::sync::Mutex::new((data.to_vec(), 0usize)));
-        let stream = ComWrapper::new(MemStream { inner: shared.clone() });
+        let stream = ComWrapper::new(MemStream {
+            inner: shared.clone(),
+        });
         if let Some(ptr) = stream.to_com_ptr::<IBStream>() {
-            unsafe { self.component.setState(ptr.as_ptr()); }
+            unsafe {
+                self.component.setState(ptr.as_ptr());
+            }
         }
         // Mirror into the controller (rewind a fresh stream first).
         if let Some(c) = &self.controller {
-            let s2 = ComWrapper::new(MemStream { inner: Arc::new(std::sync::Mutex::new((data.to_vec(), 0usize))) });
+            let s2 = ComWrapper::new(MemStream {
+                inner: Arc::new(std::sync::Mutex::new((data.to_vec(), 0usize))),
+            });
             if let Some(ptr) = s2.to_com_ptr::<IBStream>() {
-                unsafe { c.setComponentState(ptr.as_ptr()); }
+                unsafe {
+                    c.setComponentState(ptr.as_ptr());
+                }
             }
         }
     }
@@ -1200,12 +1396,24 @@ impl Drop for Vst3RealInstance {
         // Detaching is NOT done here: `removed()` on a view that was never
         // attached trips a hard assert in DPF plugins, and the editor thread
         // already calls `close()` on its way out. Releasing the view is enough.
-        drop(self.shared_view.lock().unwrap_or_else(|e| e.into_inner()).take());
-        drop(self.shared_state.lock().unwrap_or_else(|e| e.into_inner()).take());
+        drop(
+            self.shared_view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+        );
+        drop(
+            self.shared_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+        );
         unsafe {
             self.processor.setProcessing(0);
             self.component.setActive(0);
-            if let Some(c) = &self.controller { c.terminate(); }
+            if let Some(c) = &self.controller {
+                c.terminate();
+            }
             self.component.terminate();
         }
     }
@@ -1213,7 +1421,11 @@ impl Drop for Vst3RealInstance {
 
 /// Convert a fixed `char8` C array to a Rust String (NUL-terminated).
 fn c_arr_to_string(buf: &[char8]) -> String {
-    let bytes: Vec<u8> = buf.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+    let bytes: Vec<u8> = buf
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
     String::from_utf8_lossy(&bytes).trim().to_string()
 }
 
@@ -1222,7 +1434,6 @@ fn w_arr_to_string(buf: &[TChar]) -> String {
     let units: Vec<u16> = buf.iter().copied().take_while(|&c| c != 0).collect();
     String::from_utf16_lossy(&units).trim().to_string()
 }
-
 
 // ─── Factory metadata (scan-time, no instantiation) ─────────────────────────
 
@@ -1284,7 +1495,11 @@ pub fn factory_info(path: &Path) -> Option<FactoryInfo> {
             }
         }
     }
-    Some(FactoryInfo { name, vendor, is_instrument })
+    Some(FactoryInfo {
+        name,
+        vendor,
+        is_instrument,
+    })
 }
 
 #[cfg(test)]
@@ -1359,7 +1574,11 @@ mod transport_tests {
         assert_eq!(ctx.sampleRate, 48_000.0);
         assert_eq!(ctx.projectTimeSamples, 48_000);
         // One second at 90 BPM is a beat and a half.
-        assert!((ctx.projectTimeMusic - 1.5).abs() < 1e-9, "{}", ctx.projectTimeMusic);
+        assert!(
+            (ctx.projectTimeMusic - 1.5).abs() < 1e-9,
+            "{}",
+            ctx.projectTimeMusic
+        );
         assert_eq!(ctx.tempo, 90.0);
         let flags = ProcessContext_::StatesAndFlags_::kTempoValid
             | ProcessContext_::StatesAndFlags_::kProjectTimeMusicValid
@@ -1374,7 +1593,11 @@ mod transport_tests {
             ProcessContext_::StatesAndFlags_::kBarPositionValid,
             "the bar position is offered, not withheld"
         );
-        assert!((ctx.barPositionMusic - 0.0).abs() < 1e-9, "{}", ctx.barPositionMusic);
+        assert!(
+            (ctx.barPositionMusic - 0.0).abs() < 1e-9,
+            "{}",
+            ctx.barPositionMusic
+        );
 
         t.set_time_signature(6, 8);
         let ctx = host_process_context();

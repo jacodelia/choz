@@ -43,12 +43,21 @@ fn hosted_clap_plugins_offer_the_window_feed() {
         let path = &info.path;
         let params = choz_plugin_clap::host::read_params(path, &info.id);
         if info.is_instrument {
-            let Some(inst) = choz_plugin_clap::host::ClapInstrument::build(path, &info.id, 48_000, 256)
-            else { continue };
-            assert!(inst.param_touch().is_some(), "{}: no window feed", info.name);
+            let Some(inst) =
+                choz_plugin_clap::host::ClapInstrument::build(path, &info.id, 48_000, 256)
+            else {
+                continue;
+            };
+            assert!(
+                inst.param_touch().is_some(),
+                "{}: no window feed",
+                info.name
+            );
         } else {
             let Some(fx) = choz_plugin_clap::host::ClapEffect::build(path, &info.id, 48_000, 256)
-            else { continue };
+            else {
+                continue;
+            };
             assert!(fx.param_touch().is_some(), "{}: no window feed", info.name);
         }
         // Nothing has been touched, so the feed is empty rather than wrong.
@@ -103,7 +112,10 @@ fn plugin_parameters_are_readable_and_settable() {
     for p in &params {
         assert!(!p.name.is_empty(), "{} has an unnamed parameter", info.name);
         assert!(p.max > p.min, "{}:{} has an empty range", info.name, p.name);
-        assert!((0.0..=1.0).contains(&p.normalised(p.default)), "default outside its own range");
+        assert!(
+            (0.0..=1.0).contains(&p.normalised(p.default)),
+            "default outside its own range"
+        );
         assert_eq!(p.plain(0.0), p.min);
         assert_eq!(p.plain(1.0), p.max);
     }

@@ -1,24 +1,24 @@
 //! choz audio engine: RT audio thread, sources, FX chain, MIDI input, and the
 //! plugin registry. Built on the RT-safe traits in `choz-ports`.
 
-pub mod fx;
-pub mod meter;
-pub mod pitch;
-pub mod fx_chain;
+pub mod cache;
 pub mod engine;
-mod jack_backend;
-pub mod sources;
-pub mod sfz;
-pub mod quarantine;
-pub mod sandboxed;
+pub mod fx;
+pub mod fx_chain;
 pub mod input;
+mod jack_backend;
+pub mod meter;
 pub mod midi;
 pub mod osc;
-pub mod cache;
 pub mod paths;
-pub mod registry;
-pub mod scanner;
+pub mod pitch;
 pub mod plugin_types;
+pub mod quarantine;
+pub mod registry;
+pub mod sandboxed;
+pub mod scanner;
+pub mod sfz;
+pub mod sources;
 
 pub use engine::AudioEngine;
 
@@ -26,9 +26,9 @@ pub use engine::AudioEngine;
 /// [`AudioEngine::set_fx_param`], rather than one of the processor's params.
 pub const FX_MIX_PARAM: usize = usize::MAX;
 pub use fx_chain::FxSpec;
-pub use registry::PluginRegistry;
-pub use plugin_types::{PluginDescriptor, PluginKind};
 pub use paths::{FoundPlugin, PluginFormat, PluginPaths, SearchDir};
+pub use plugin_types::{PluginDescriptor, PluginKind};
+pub use registry::PluginRegistry;
 
 /// Scan every enabled directory of every format in `paths`.
 ///
@@ -86,7 +86,10 @@ pub fn worker_main() -> bool {
 /// and the parent resuming after it — do that when an unknown plugin actually
 /// starts costing someone a directory. There is no timeout either: a plugin
 /// that *hangs* still hangs the scan, which has not happened yet.
-fn scan_dir_out_of_process(format: PluginFormat, dir: &std::path::Path) -> Option<Vec<FoundPlugin>> {
+fn scan_dir_out_of_process(
+    format: PluginFormat,
+    dir: &std::path::Path,
+) -> Option<Vec<FoundPlugin>> {
     if !worker_available() {
         return None;
     }
@@ -115,7 +118,10 @@ fn scan_dir_out_of_process(format: PluginFormat, dir: &std::path::Path) -> Optio
         );
         return Some(scan_dir_entrywise(format, dir));
     }
-    match found.as_deref().map(serde_json::from_slice::<Vec<FoundPlugin>>) {
+    match found
+        .as_deref()
+        .map(serde_json::from_slice::<Vec<FoundPlugin>>)
+    {
         Some(Ok(found)) => Some(found),
         Some(Err(e)) => {
             eprintln!("choz: scan worker for {} returned junk: {e}", dir.display());
@@ -141,7 +147,9 @@ fn worker_available() -> bool {
         if is_worker() {
             return false;
         }
-        let Ok(exe) = std::env::current_exe() else { return false };
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
         let probe = cache::state_dir().join(format!("scan-probe-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&probe);
         let ran = std::process::Command::new(exe)
@@ -168,7 +176,9 @@ fn worker_available() -> bool {
 /// over whole — a bundle *is* a directory, and a plain subdirectory that
 /// crashes just recurses into this same split.
 fn scan_dir_entrywise(format: PluginFormat, dir: &std::path::Path) -> Vec<FoundPlugin> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -280,7 +290,10 @@ pub fn scan_one(format: PluginFormat, dir: &std::path::Path) -> Vec<FoundPlugin>
 
 /// A directory that is itself one plugin, not a place to look inside.
 fn is_bundle(path: &std::path::Path) -> bool {
-    matches!(path.extension().and_then(|e| e.to_str()), Some("lv2") | Some("vst3"))
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("lv2") | Some("vst3")
+    )
 }
 
 /// Scan exactly one plugin file or bundle. Used by the per-entry retry, where

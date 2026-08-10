@@ -139,7 +139,8 @@ pub fn pitch_meter() -> &'static PitchMeter {
 impl PitchMeter {
     /// Called from the audio callback: three relaxed stores and nothing else.
     pub fn publish(&self, note: Option<u8>, cents: i32, level: f32) {
-        self.note.store(note.map_or(0, |n| n as u32 + 1), Ordering::Relaxed);
+        self.note
+            .store(note.map_or(0, |n| n as u32 + 1), Ordering::Relaxed);
         self.cents.store(cents, Ordering::Relaxed);
         self.level.store(level.to_bits(), Ordering::Relaxed);
     }
@@ -188,8 +189,14 @@ mod tests {
 
         let wave = m.wave();
         assert_eq!(wave.len(), WAVE_POINTS);
-        assert!(wave.iter().any(|s| s.abs() > 0.1), "the shape is not all zeros");
-        assert!(wave.iter().all(|s| s.abs() <= 0.51), "and none of it is out of range");
+        assert!(
+            wave.iter().any(|s| s.abs() > 0.1),
+            "the shape is not all zeros"
+        );
+        assert!(
+            wave.iter().all(|s| s.abs() <= 0.51),
+            "and none of it is out of range"
+        );
 
         // Silence after a signal reads as silence, not as the last thing heard.
         m.publish(&vec![0.0; 1024]);

@@ -19,9 +19,9 @@ use std::sync::{Arc, Mutex};
 
 use choz_ports::PluginEditor;
 use clap_sys::ext::gui::{
-    CLAP_EXT_GUI, CLAP_WINDOW_API_X11, clap_plugin_gui, clap_window, clap_window_handle,
+    clap_plugin_gui, clap_window, clap_window_handle, CLAP_EXT_GUI, CLAP_WINDOW_API_X11,
 };
-use clap_sys::ext::timer_support::{CLAP_EXT_TIMER_SUPPORT, clap_plugin_timer_support};
+use clap_sys::ext::timer_support::{clap_plugin_timer_support, CLAP_EXT_TIMER_SUPPORT};
 use clap_sys::plugin::clap_plugin;
 
 use crate::host::SharedGuiState;
@@ -74,15 +74,19 @@ impl ClapEditor {
             let cell = guard.as_ref()?;
             // SAFETY: the cell is `Some` only while the instance is alive.
             let supported = unsafe {
-                (*cell.gui).is_api_supported.is_some_and(|f| {
-                    f(cell.plugin, CLAP_WINDOW_API_X11.as_ptr(), false)
-                })
+                (*cell.gui)
+                    .is_api_supported
+                    .is_some_and(|f| f(cell.plugin, CLAP_WINDOW_API_X11.as_ptr(), false))
             };
             if !supported {
                 return None;
             }
         }
-        Some(Arc::new(Self { shared, state, created: Mutex::new(false) }))
+        Some(Arc::new(Self {
+            shared,
+            state,
+            created: Mutex::new(false),
+        }))
     }
 
     /// Look up `clap.gui` on a freshly built instance. Called while the instance
@@ -102,8 +106,8 @@ impl ClapEditor {
     /// `plugin` must be a live `clap_plugin` whose `get_extension` is callable.
     pub unsafe fn timer_of(plugin: *const clap_plugin) -> Option<*const clap_plugin_timer_support> {
         let get = unsafe { (*plugin).get_extension }?;
-        let ext =
-            unsafe { get(plugin, CLAP_EXT_TIMER_SUPPORT.as_ptr()) } as *const clap_plugin_timer_support;
+        let ext = unsafe { get(plugin, CLAP_EXT_TIMER_SUPPORT.as_ptr()) }
+            as *const clap_plugin_timer_support;
         (!ext.is_null()).then_some(ext)
     }
 }
@@ -122,7 +126,10 @@ impl PluginEditor for ClapEditor {
         // SAFETY: `cell` is `Some` only while the instance lives, and every call
         // below is on this one thread under the two locks held here.
         unsafe {
-            if !(*gui).create.is_some_and(|f| f(plugin, CLAP_WINDOW_API_X11.as_ptr(), false)) {
+            if !(*gui)
+                .create
+                .is_some_and(|f| f(plugin, CLAP_WINDOW_API_X11.as_ptr(), false))
+            {
                 eprintln!("choz: CLAP gui create(x11) refused");
                 return None;
             }
@@ -139,7 +146,9 @@ impl PluginEditor for ClapEditor {
 
             let window = clap_window {
                 api: CLAP_WINDOW_API_X11.as_ptr(),
-                specific: clap_window_handle { x11: parent as std::os::raw::c_ulong },
+                specific: clap_window_handle {
+                    x11: parent as std::os::raw::c_ulong,
+                },
             };
             if !(*gui).set_parent.is_some_and(|f| f(plugin, &window)) {
                 eprintln!("choz: CLAP gui set_parent refused");
@@ -206,7 +215,9 @@ impl PluginEditor for ClapEditor {
 
 /// Set a window title on the plugin's GUI, if it takes one.
 pub fn suggest_title(shared: &SharedGui, title: &str) {
-    let Ok(title) = CString::new(title) else { return };
+    let Ok(title) = CString::new(title) else {
+        return;
+    };
     let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
     let Some(cell) = guard.as_ref() else { return };
     // SAFETY: live instance under the mutex.

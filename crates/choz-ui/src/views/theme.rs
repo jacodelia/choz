@@ -73,8 +73,7 @@ pub fn panel_style() -> Style {
 /// The colour panels paint when there is no picture behind them, already
 /// blended. `u32::MAX` means "unset" — a real colour never is, because the top
 /// byte is always zero.
-static PANEL_FILL: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(u32::MAX);
+static PANEL_FILL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Publish the blended panel colour, or `None` to go back to the flat one.
 pub fn set_panel_fill(rgb: Option<(u8, u8, u8)>) {
@@ -107,7 +106,11 @@ pub fn rgb_of(c: Color) -> (u8, u8, u8) {
 pub fn blend(base: (u8, u8, u8), tint: (u8, u8, u8), alpha: f32) -> (u8, u8, u8) {
     let a = alpha.clamp(0.0, 1.0);
     let mix = |b: u8, t: u8| (b as f32 * (1.0 - a) + t as f32 * a).round() as u8;
-    (mix(base.0, tint.0), mix(base.1, tint.1), mix(base.2, tint.2))
+    (
+        mix(base.0, tint.0),
+        mix(base.1, tint.1),
+        mix(base.2, tint.2),
+    )
 }
 
 /// Same, for the app-level fill behind the body.
@@ -150,7 +153,9 @@ impl Backdrop {
         if x >= self.cols || y >= self.rows {
             return None;
         }
-        self.cells.get(y as usize * self.cols as usize + x as usize).copied()
+        self.cells
+            .get(y as usize * self.cols as usize + x as usize)
+            .copied()
     }
 }
 
@@ -188,8 +193,12 @@ fn wash_with(buf: &mut ratatui::buffer::Buffer, area: ratatui::layout::Rect, str
     };
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
-            let Some((br, bg_, bb)) = bd.at(x, y) else { continue };
-            let Some(cell) = buf.cell_mut((x, y)) else { continue };
+            let Some((br, bg_, bb)) = bd.at(x, y) else {
+                continue;
+            };
+            let Some(cell) = buf.cell_mut((x, y)) else {
+                continue;
+            };
             // Halfblocks put the top pixel in `fg` behind a `▀` and the bottom
             // one in `bg`. Washing only the background would throw away half of
             // the image's vertical resolution before anything was even drawn on
@@ -228,27 +237,27 @@ pub fn border() -> Color {
 
 // ─── Core palette ──────────────────────────────────────────────────────────
 
-pub const APP_BG:    Color = Color::Rgb(13, 17, 23);
-pub const PANEL_BG:  Color = Color::Rgb(22, 27, 34);
-pub const BACKDROP:  Color = Color::Rgb(8, 10, 14);
-pub const BORDER:    Color = Color::Rgb(48, 54, 61);
+pub const APP_BG: Color = Color::Rgb(13, 17, 23);
+pub const PANEL_BG: Color = Color::Rgb(22, 27, 34);
+pub const BACKDROP: Color = Color::Rgb(8, 10, 14);
+pub const BORDER: Color = Color::Rgb(48, 54, 61);
 pub const BORDER_LT: Color = Color::Rgb(58, 64, 72);
-pub const SHADOW:    Color = Color::Rgb(10, 12, 16);
-pub const HEADER:    Color = Color::Rgb(240, 136, 62);
-pub const ACCENT:    Color = Color::Rgb(31, 111, 235);
+pub const SHADOW: Color = Color::Rgb(10, 12, 16);
+pub const HEADER: Color = Color::Rgb(240, 136, 62);
+pub const ACCENT: Color = Color::Rgb(31, 111, 235);
 
-pub const OK:        Color = Color::Rgb(56, 200, 100);
-pub const ERR:       Color = Color::Rgb(220, 80, 80);
-pub const WARN:      Color = Color::Yellow;
-pub const DIM:       Color = Color::Rgb(80, 90, 110);
-pub const HINT:      Color = Color::Rgb(120, 130, 150);
+pub const OK: Color = Color::Rgb(56, 200, 100);
+pub const ERR: Color = Color::Rgb(220, 80, 80);
+pub const WARN: Color = Color::Yellow;
+pub const DIM: Color = Color::Rgb(80, 90, 110);
+pub const HINT: Color = Color::Rgb(120, 130, 150);
 
 pub const STATUS_BG: Color = Color::Rgb(18, 22, 28);
 pub const STATUS_FG: Color = Color::Rgb(180, 190, 210);
 
-pub const FX_ON:     Color = Color::Rgb(56, 200, 100);
-pub const FX_OFF:    Color = Color::Rgb(90, 95, 105);
-pub const FX_KNOB:   Color = Color::Rgb(100, 160, 220);
+pub const FX_ON: Color = Color::Rgb(56, 200, 100);
+pub const FX_OFF: Color = Color::Rgb(90, 95, 105);
+pub const FX_KNOB: Color = Color::Rgb(100, 160, 220);
 
 // Splash logo gradient (gold/silver metallic)
 pub const SPLASH_GRADIENT: [Color; 12] = [
@@ -294,11 +303,17 @@ thread_local! {
 pub fn ui_guard() -> UiGuard {
     static UI_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if UI_HELD.with(|h| h.get()) {
-        return UiGuard { _inner: None, outermost: false };
+        return UiGuard {
+            _inner: None,
+            outermost: false,
+        };
     }
     let guard = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     UI_HELD.with(|h| h.set(true));
-    UiGuard { _inner: Some(guard), outermost: true }
+    UiGuard {
+        _inner: Some(guard),
+        outermost: true,
+    }
 }
 
 /// What [`ui_guard`] hands back. Holds the real guard only for the outermost

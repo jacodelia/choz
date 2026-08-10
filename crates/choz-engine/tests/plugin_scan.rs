@@ -9,7 +9,7 @@
 //! parallelises by function, so one function is what serialises it. It also
 //! halves the runtime: `scan_all` costs ~6 s and now runs once.
 
-use choz_engine::{FoundPlugin, PluginFormat, PluginPaths, scan_all};
+use choz_engine::{scan_all, FoundPlugin, PluginFormat, PluginPaths};
 
 #[test]
 fn the_scan_reports_real_metadata_for_every_installed_format() {
@@ -19,7 +19,10 @@ fn the_scan_reports_real_metadata_for_every_installed_format() {
 }
 
 fn real_lv2_metadata(found: &[FoundPlugin]) {
-    let lv2: Vec<_> = found.iter().filter(|p| p.format == PluginFormat::Lv2).collect();
+    let lv2: Vec<_> = found
+        .iter()
+        .filter(|p| p.format == PluginFormat::Lv2)
+        .collect();
     if lv2.is_empty() {
         eprintln!("no LV2 plugins installed; skipping");
         return;
@@ -46,7 +49,10 @@ fn real_lv2_metadata(found: &[FoundPlugin]) {
 /// of that format are installed — this is the check that would have caught
 /// "I don't see my LV2/VST/DSSI plugins".
 fn hosted_formats_report_what_is_installed(found: &[FoundPlugin]) {
-    for &fmt in PluginFormat::ALL.iter().filter(|f| f.is_hosted() && f.is_plugin()) {
+    for &fmt in PluginFormat::ALL
+        .iter()
+        .filter(|f| f.is_hosted() && f.is_plugin())
+    {
         let of_format: Vec<_> = found.iter().filter(|p| p.format == fmt).collect();
         if of_format.is_empty() {
             eprintln!("no {} plugins installed; skipping", fmt.label());

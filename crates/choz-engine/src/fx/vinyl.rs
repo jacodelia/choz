@@ -13,10 +13,10 @@ pub struct VinylSim {
     wet: f32,
 
     // Internal state
-    wow_phase:     f32,
+    wow_phase: f32,
     flutter_phase: f32,
     // Simple interpolating delay line for pitch modulation
-    delay_buf:   Vec<f32>,
+    delay_buf: Vec<f32>,
     delay_write: usize,
     // LCG random state for crackle
     rng_state: u32,
@@ -25,33 +25,42 @@ pub struct VinylSim {
 impl VinylSim {
     pub fn new() -> Self {
         Self {
-            wow_depth:     0.003,
+            wow_depth: 0.003,
             flutter_depth: 0.001,
-            crackle:       0.05,
-            wet:           1.0,
-            wow_phase:     0.0,
+            crackle: 0.05,
+            wet: 1.0,
+            wow_phase: 0.0,
             flutter_phase: 0.0,
-            delay_buf:     vec![0.0f32; 4096],
-            delay_write:   0,
-            rng_state:     0xDEAD_BEEF,
+            delay_buf: vec![0.0f32; 4096],
+            delay_write: 0,
+            rng_state: 0xDEAD_BEEF,
         }
     }
 
-    pub fn set_wow(&mut self, depth: f32)     { self.wow_depth     = depth.clamp(0.0, 0.1); }
-    pub fn set_flutter(&mut self, depth: f32) { self.flutter_depth = depth.clamp(0.0, 0.05); }
-    pub fn set_crackle(&mut self, amount: f32) { self.crackle = amount.clamp(0.0, 1.0); }
+    pub fn set_wow(&mut self, depth: f32) {
+        self.wow_depth = depth.clamp(0.0, 0.1);
+    }
+    pub fn set_flutter(&mut self, depth: f32) {
+        self.flutter_depth = depth.clamp(0.0, 0.05);
+    }
+    pub fn set_crackle(&mut self, amount: f32) {
+        self.crackle = amount.clamp(0.0, 1.0);
+    }
 
     fn lcg_next(&mut self) -> f32 {
-        self.rng_state = self.rng_state.wrapping_mul(1664525).wrapping_add(1013904223);
+        self.rng_state = self
+            .rng_state
+            .wrapping_mul(1664525)
+            .wrapping_add(1013904223);
         // Map to [-1, 1]
         (self.rng_state as i32 as f32) / i32::MAX as f32
     }
 
     fn read_interp(&self, frac_offset: f32) -> f32 {
-        let cap   = self.delay_buf.len();
+        let cap = self.delay_buf.len();
         let total = frac_offset.max(0.0);
-        let i0    = total as usize;
-        let frac  = total - i0 as f32;
+        let i0 = total as usize;
+        let frac = total - i0 as f32;
         let idx0 = if self.delay_write > i0 {
             self.delay_write - i0 - 1
         } else {
@@ -63,7 +72,9 @@ impl VinylSim {
 }
 
 impl Default for VinylSim {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FxProcessor for VinylSim {
@@ -79,10 +90,10 @@ impl FxProcessor for VinylSim {
 
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
         let sr = sample_rate as f32;
-        let wow_rate     = 0.5_f32;   // Hz — slow wow
-        let flutter_rate = 8.0_f32;   // Hz — flutter
+        let wow_rate = 0.5_f32; // Hz — slow wow
+        let flutter_rate = 8.0_f32; // Hz — flutter
 
-        let wow_inc     = wow_rate / sr;
+        let wow_inc = wow_rate / sr;
         let flutter_inc = flutter_rate / sr;
 
         let max_delay = 512.0_f32; // frames — max modulation delay
@@ -98,7 +109,7 @@ impl FxProcessor for VinylSim {
             self.delay_write = (self.delay_write + 1) % self.delay_buf.len();
 
             // Modulated read offset (wow + flutter)
-            let wow_lfo     = self.wow_phase.sin();
+            let wow_lfo = self.wow_phase.sin();
             let flutter_lfo = self.flutter_phase.sin();
             let offset = max_delay * 0.5
                 + max_delay * 0.5 * (self.wow_depth * wow_lfo + self.flutter_depth * flutter_lfo);
@@ -119,11 +130,13 @@ impl FxProcessor for VinylSim {
 
             let wet_l = modulated + crack;
             let wet_r = modulated + crack;
-            buf[i * 2]     = dry_l + self.wet * (wet_l - dry_l);
+            buf[i * 2] = dry_l + self.wet * (wet_l - dry_l);
             buf[i * 2 + 1] = dry_r + self.wet * (wet_r - dry_r);
 
-            self.wow_phase     = (self.wow_phase     + wow_inc * std::f32::consts::TAU).rem_euclid(std::f32::consts::TAU);
-            self.flutter_phase = (self.flutter_phase + flutter_inc * std::f32::consts::TAU).rem_euclid(std::f32::consts::TAU);
+            self.wow_phase = (self.wow_phase + wow_inc * std::f32::consts::TAU)
+                .rem_euclid(std::f32::consts::TAU);
+            self.flutter_phase = (self.flutter_phase + flutter_inc * std::f32::consts::TAU)
+                .rem_euclid(std::f32::consts::TAU);
         }
     }
 

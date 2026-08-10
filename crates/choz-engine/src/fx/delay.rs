@@ -94,7 +94,9 @@ impl DelayLine {
         self.buf_l[self.write] = l;
         self.buf_r[self.write] = r;
         self.write += 1;
-        if self.write >= self.buf_l.len() { self.write = 0; }
+        if self.write >= self.buf_l.len() {
+            self.write = 0;
+        }
     }
 }
 
@@ -119,7 +121,10 @@ impl FxProcessor for DelayLine {
             // image keeps spreading on each repeat.
             let (echo_l, echo_r) = if self.cross > 0.0 {
                 let c = self.cross;
-                (read_l * (1.0 - c) + read_r * c, read_r * (1.0 - c) + read_l * c)
+                (
+                    read_l * (1.0 - c) + read_r * c,
+                    read_r * (1.0 - c) + read_l * c,
+                )
             } else {
                 (read_l, read_r)
             };
@@ -134,12 +139,9 @@ impl FxProcessor for DelayLine {
                 (self.damp_state_l, self.damp_state_r)
             };
 
-            self.write_sample(
-                dry_l + fb_l * self.feedback,
-                dry_r + fb_r * self.feedback,
-            );
+            self.write_sample(dry_l + fb_l * self.feedback, dry_r + fb_r * self.feedback);
 
-            buf[i * 2]     = dry_l + self.wet * echo_l;
+            buf[i * 2] = dry_l + self.wet * echo_l;
             buf[i * 2 + 1] = dry_r + self.wet * echo_r;
         }
     }
@@ -152,30 +154,49 @@ impl FxProcessor for DelayLine {
         self.damp_state_r = 0.0;
     }
 
-    fn set_mix(&mut self, wet: f32) { self.wet = wet.clamp(0.0, 1.0); }
-    fn name(&self) -> &str { "Delay" }
+    fn set_mix(&mut self, wet: f32) {
+        self.wet = wet.clamp(0.0, 1.0);
+    }
+    fn name(&self) -> &str {
+        "Delay"
+    }
 
     fn params(&self) -> Vec<crate::fx::FxParam> {
         use crate::fx::FxParam;
         vec![
-            FxParam::new("Time",      (self.delay_ms / 2000.0).clamp(0.0, 1.0), 0.0, 2000.0, "ms"),
-            FxParam::new("Feedback",  self.feedback / 0.95, 0.0, 0.95, ""),
-            FxParam::new("Damping",   self.damp, 0.0, 1.0, ""),
-            FxParam::new("PingPong",  if self.ping_pong { 1.0 } else { 0.0 }, 0.0, 1.0, ""),
-            FxParam::new("Wet",       self.wet, 0.0, 1.0, ""),
-            FxParam::new("Cross",     self.cross, 0.0, 1.0, ""),
+            FxParam::new(
+                "Time",
+                (self.delay_ms / 2000.0).clamp(0.0, 1.0),
+                0.0,
+                2000.0,
+                "ms",
+            ),
+            FxParam::new("Feedback", self.feedback / 0.95, 0.0, 0.95, ""),
+            FxParam::new("Damping", self.damp, 0.0, 1.0, ""),
+            FxParam::new(
+                "PingPong",
+                if self.ping_pong { 1.0 } else { 0.0 },
+                0.0,
+                1.0,
+                "",
+            ),
+            FxParam::new("Wet", self.wet, 0.0, 1.0, ""),
+            FxParam::new("Cross", self.cross, 0.0, 1.0, ""),
         ]
     }
 
     fn set_param(&mut self, index: usize, value: f32) {
         let v = value.clamp(0.0, 1.0);
         match index {
-            0 => { self.delay_ms = 10.0 + v * 990.0; self.delay_frames = (self.delay_ms / 1000.0 * self.sample_rate as f32) as usize; }
-            1 => self.feedback  = v,
-            2 => self.damp      = v,
+            0 => {
+                self.delay_ms = 10.0 + v * 990.0;
+                self.delay_frames = (self.delay_ms / 1000.0 * self.sample_rate as f32) as usize;
+            }
+            1 => self.feedback = v,
+            2 => self.damp = v,
             3 => self.ping_pong = v >= 0.5,
-            4 => self.wet       = v,
-            5 => self.cross     = v,
+            4 => self.wet = v,
+            5 => self.cross = v,
             _ => {}
         }
     }
@@ -196,7 +217,11 @@ mod tests {
         buf[1] = 0.0;
         dl.process_block(&mut buf, sr);
         // Echo should appear at frame 100 (index 200)
-        assert!(buf[200] > 0.5, "echo at frame 100 expected, got {}", buf[200]);
+        assert!(
+            buf[200] > 0.5,
+            "echo at frame 100 expected, got {}",
+            buf[200]
+        );
     }
 
     #[test]
@@ -209,8 +234,16 @@ mod tests {
         buf[0] = 1.0;
         dl.process_block(&mut buf, sr);
         // With full crossfeed, an L-only impulse echoes on the R channel.
-        assert!(buf[201] > 0.5, "R echo expected at frame 100, got {}", buf[201]);
-        assert!(buf[200].abs() < 0.01, "L echo should be silent, got {}", buf[200]);
+        assert!(
+            buf[201] > 0.5,
+            "R echo expected at frame 100, got {}",
+            buf[201]
+        );
+        assert!(
+            buf[200].abs() < 0.01,
+            "L echo should be silent, got {}",
+            buf[200]
+        );
     }
 
     #[test]

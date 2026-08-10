@@ -16,9 +16,9 @@ pub enum SvfMode {
 
 /// Stereo State Variable Filter.
 pub struct Svf {
-    mode:  SvfMode,
+    mode: SvfMode,
     cutoff_hz: f32,
-    resonance: f32,   // 0.0 (max resonance) – 1.0 (no resonance, butterworth)
+    resonance: f32, // 0.0 (max resonance) – 1.0 (no resonance, butterworth)
     wet: f32,
     // Per-channel state (L, R)
     ic1eq: [f32; 2],
@@ -43,7 +43,11 @@ impl Svf {
             wet: 1.0,
             ic1eq: [0.0; 2],
             ic2eq: [0.0; 2],
-            g: 0.0, k: 0.0, a1: 0.0, a2: 0.0, a3: 0.0,
+            g: 0.0,
+            k: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+            a3: 0.0,
             sample_rate: 48000,
         };
         s.update_coeffs();
@@ -66,11 +70,11 @@ impl Svf {
 
     fn update_coeffs(&mut self) {
         let sr = self.sample_rate as f32;
-        self.g  = (PI * self.cutoff_hz / sr).tan();
+        self.g = (PI * self.cutoff_hz / sr).tan();
         // k = 2*(1 - resonance): at resonance=0 → k=2 (max damp), at resonance=1 → k=0 (self-osc)
-        self.k  = 2.0 - 2.0 * self.resonance;
-        let g   = self.g;
-        let k   = self.k;
+        self.k = 2.0 - 2.0 * self.resonance;
+        let g = self.g;
+        let k = self.k;
         self.a1 = 1.0 / (1.0 + g * (g + k));
         self.a2 = g * self.a1;
         self.a3 = g * self.a2;
@@ -84,10 +88,10 @@ impl Svf {
         self.ic1eq[ch] = 2.0 * v1 - self.ic1eq[ch];
         self.ic2eq[ch] = 2.0 * v2 - self.ic2eq[ch];
         match self.mode {
-            SvfMode::Lowpass  => v2,
+            SvfMode::Lowpass => v2,
             SvfMode::Highpass => x - self.k * v1 - v2,
             SvfMode::Bandpass => v1,
-            SvfMode::Notch    => x - self.k * v1,
+            SvfMode::Notch => x - self.k * v1,
         }
     }
 }
@@ -115,7 +119,7 @@ impl FxProcessor for Svf {
             let dry_r = buf[i * 2 + 1];
             let wet_l = self.process_sample(0, dry_l);
             let wet_r = self.process_sample(1, dry_r);
-            buf[i * 2]     = dry_l + self.wet * (wet_l - dry_l);
+            buf[i * 2] = dry_l + self.wet * (wet_l - dry_l);
             buf[i * 2 + 1] = dry_r + self.wet * (wet_r - dry_r);
         }
     }

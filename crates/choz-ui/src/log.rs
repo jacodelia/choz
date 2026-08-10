@@ -24,7 +24,11 @@ pub fn redirect_stderr() -> Option<PathBuf> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let file = OpenOptions::new().create(true).append(true).open(&path).ok()?;
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()?;
 
     // SAFETY: dup2 duplicates the file descriptor onto STDERR_FILENO; both are
     // valid open fds. We leak `file` so its fd stays open for the process life.
@@ -52,7 +56,11 @@ pub fn take_terminal() -> std::io::Result<File> {
     }
     let terminal = unsafe { File::from_raw_fd(dup) };
 
-    if let Ok(file) = OpenOptions::new().create(true).append(true).open(log_path()) {
+    if let Ok(file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path())
+    {
         // SAFETY: both are valid open fds; the log file is leaked so its fd
         // stays alive for the life of the process.
         if unsafe { libc::dup2(file.as_raw_fd(), libc::STDOUT_FILENO) } >= 0 {

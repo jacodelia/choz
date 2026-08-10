@@ -38,7 +38,9 @@ impl Tone {
             .flat_map(|_| {
                 let p = self.phase;
                 let s = amp
-                    * (0.5 * p.sin() + 1.0 * (2.0 * p).sin() + 0.6 * (3.0 * p).sin()
+                    * (0.5 * p.sin()
+                        + 1.0 * (2.0 * p).sin()
+                        + 0.6 * (3.0 * p).sin()
                         + 0.25 * (4.0 * p).sin());
                 self.phase = (self.phase + step) % std::f32::consts::TAU;
                 [s, s]
@@ -55,9 +57,15 @@ fn detect(hz: f32, sr: f32, harmonics: bool) -> PitchEstimate {
     let mut t = Tone::new();
     let mut last = PitchEstimate::SILENT;
     for _ in 0..120 {
-        let stereo =
-            if harmonics { t.voice(hz, sr, 256, 0.2) } else { t.block(hz, sr, 256, 0.5) };
-        let mono: Vec<f32> = stereo.chunks_exact(2).map(|f| (f[0] + f[1]) * 0.5).collect();
+        let stereo = if harmonics {
+            t.voice(hz, sr, 256, 0.2)
+        } else {
+            t.block(hz, sr, 256, 0.5)
+        };
+        let mono: Vec<f32> = stereo
+            .chunks_exact(2)
+            .map(|f| (f[0] + f[1]) * 0.5)
+            .collect();
         last = d.process(&mono);
     }
     last
@@ -70,7 +78,10 @@ fn the_detector_finds_the_fundamental_of_a_steady_tone() {
             let e = detect(hz, sr, false);
             assert!(e.voiced, "{hz} Hz at {sr} should be voiced");
             let cents = 1200.0 * (e.frequency_hz / hz).log2();
-            assert!(cents.abs() < 20.0, "{hz} Hz at {sr}: off by {cents:.1} cents");
+            assert!(
+                cents.abs() < 20.0,
+                "{hz} Hz at {sr}: off by {cents:.1} cents"
+            );
         }
     }
 }
@@ -81,7 +92,10 @@ fn a_fundamental_quieter_than_its_harmonics_is_still_the_fundamental() {
         let e = detect(hz, 48_000.0, true);
         assert!(e.voiced, "{hz} Hz with harmonics should be voiced");
         let cents = 1200.0 * (e.frequency_hz / hz).log2();
-        assert!(cents.abs() < 30.0, "{hz} Hz: off by {cents:.1} cents — an octave error is 1200");
+        assert!(
+            cents.abs() < 30.0,
+            "{hz} Hz: off by {cents:.1} cents — an octave error is 1200"
+        );
     }
 }
 
@@ -114,7 +128,15 @@ fn silence_and_noise_are_unvoiced() {
 #[test]
 fn rubbish_in_does_not_crash_the_detector() {
     let mut d = PitchDetector::new(48_000.0);
-    let bad = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -0.0, 1e30, -1e30];
+    let bad = [
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        0.0,
+        -0.0,
+        1e30,
+        -1e30,
+    ];
     for _ in 0..200 {
         d.process(&bad);
     }
@@ -142,8 +164,14 @@ fn frequency_and_midi_note_convert_both_ways() {
 
 #[test]
 fn the_reference_pitch_moves_every_note_with_it() {
-    let mut q = NoteQuantizer { reference_hz: 432.0, ..Default::default() };
-    assert!((q.hz_to_note(432.0) - 69.0).abs() < 1e-4, "A4 is wherever it is put");
+    let mut q = NoteQuantizer {
+        reference_hz: 432.0,
+        ..Default::default()
+    };
+    assert!(
+        (q.hz_to_note(432.0) - 69.0).abs() < 1e-4,
+        "A4 is wherever it is put"
+    );
     assert!((q.note_to_hz(69.0) - 432.0).abs() < 1e-3);
     q.reference_hz = 442.0;
     assert!((q.note_to_hz(69.0) - 442.0).abs() < 1e-3);
@@ -153,7 +181,14 @@ fn the_reference_pitch_moves_every_note_with_it() {
 fn a_scale_holds_the_notes_it_should_and_no_others() {
     // C major: the white keys.
     let c_major = Scale::new(0, ScaleType::Major);
-    for (note, want) in [(60, true), (61, false), (62, true), (63, false), (64, true), (65, true)] {
+    for (note, want) in [
+        (60, true),
+        (61, false),
+        (62, true),
+        (63, false),
+        (64, true),
+        (65, true),
+    ] {
         assert_eq!(c_major.contains(note), want, "note {note} in C major");
     }
     // A minor is the same pitch classes, a different root.
@@ -189,7 +224,11 @@ fn the_nearest_note_is_the_nearest_one_in_the_scale() {
     // 40 cents sharp of F is still nearer F than G.
     assert_eq!(c_major.nearest(65.4), 65);
     // A note that is not in the scale goes to the closer neighbour, not up.
-    assert_eq!(c_major.nearest(66.0), 65, "F# is as near F as G; the lower wins");
+    assert_eq!(
+        c_major.nearest(66.0),
+        65,
+        "F# is as near F as G; the lower wins"
+    );
     assert_eq!(c_major.nearest(66.4), 67, "past halfway it is G");
     // C# is exactly a semitone from both C and D; the documented tie-break is
     // the lower note, the same choice `round` makes.
@@ -198,7 +237,11 @@ fn the_nearest_note_is_the_nearest_one_in_the_scale() {
     // Across an octave boundary the answer is still the nearest note.
     assert_eq!(c_major.nearest(71.6), 72);
     let c_pent = Scale::new(0, ScaleType::PentatonicMinor);
-    assert_eq!(c_pent.nearest(64.0), 63, "E in C minor pentatonic goes down to Eb");
+    assert_eq!(
+        c_pent.nearest(64.0),
+        63,
+        "E in C minor pentatonic goes down to Eb"
+    );
 }
 
 #[test]
@@ -220,7 +263,10 @@ fn the_target_frequency_is_the_note_the_singer_meant() {
 
     // A fixed MIDI target ignores the scale entirely, which is the hook the
     // MIDI routing will use.
-    let q = NoteQuantizer { target: PitchTarget::MidiNote(60), ..q };
+    let q = NoteQuantizer {
+        target: PitchTarget::MidiNote(60),
+        ..q
+    };
     assert!((q.target_hz(445.0).unwrap() - 261.626).abs() < 0.01);
 }
 
@@ -235,7 +281,10 @@ fn a_retune_time_is_a_glide_and_not_a_jump() {
 
     // One semitone of error, asked for in 64-sample blocks.
     let first = c.advance(1.0, 64);
-    assert!(first > 1.0 && first < 1.002, "one block is a nudge, not the answer: {first}");
+    assert!(
+        first > 1.0 && first < 1.002,
+        "one block is a nudge, not the answer: {first}"
+    );
     let mut ratio = first;
     // Ten time constants: a one-pole is asymptotic, so "arrived" needs saying.
     for _ in 0..1000 {
@@ -264,7 +313,10 @@ fn correction_decides_how_much_of_the_error_is_taken() {
     };
     assert!((settle(0.0) - 1.0).abs() < 1e-4, "nothing at all at 0 %");
     let half = settle(0.5);
-    assert!((half - 1.0293).abs() < 0.002, "half a semitone at 50 %: {half}");
+    assert!(
+        (half - 1.0293).abs() < 0.002,
+        "half a semitone at 50 %: {half}"
+    );
     assert!((settle(1.0) - 1.0595).abs() < 0.002);
 }
 
@@ -285,7 +337,10 @@ fn hard_tune_arrives_far_sooner_than_natural() {
     };
     let hard = blocks_to_arrive(AutoTuneMode::HardTune, 500.0);
     let natural = blocks_to_arrive(AutoTuneMode::Natural, 500.0);
-    assert!(hard < natural / 10, "hard {hard} blocks vs natural {natural}");
+    assert!(
+        hard < natural / 10,
+        "hard {hard} blocks vs natural {natural}"
+    );
     assert!(hard < 10, "and it is immediate by ear: {hard} blocks");
 }
 
@@ -324,7 +379,10 @@ fn an_unbelievable_error_is_ignored_rather_than_obeyed() {
     for _ in 0..400 {
         r = c.advance(7.0, 64); // a fifth: the detector is wrong, not the singer
     }
-    assert!((r - 1.0).abs() < 1e-3, "left alone, not dragged a fifth: {r}");
+    assert!(
+        (r - 1.0).abs() < 1e-3,
+        "left alone, not dragged a fifth: {r}"
+    );
 
     // A believable one is still corrected.
     let mut c = PitchCorrector::new(48_000.0);
@@ -426,7 +484,11 @@ fn the_shifter_moves_the_pitch_and_leaves_the_length_alone() {
         // harmoniser, and this is not one.
         let at_target = goertzel(&tail, hz * ratio, sr);
         let at_input = goertzel(&tail, hz, sr);
-        assert!(at_target > 0.05, "ratio {ratio}: nothing at {:.1} Hz ({at_target:.4})", hz * ratio);
+        assert!(
+            at_target > 0.05,
+            "ratio {ratio}: nothing at {:.1} Hz ({at_target:.4})",
+            hz * ratio
+        );
         if (ratio - 1.0).abs() > 0.01 {
             assert!(
                 at_target > at_input * 4.0,
@@ -441,7 +503,9 @@ fn the_shifter_moves_the_pitch_and_leaves_the_length_alone() {
 fn an_unvoiced_block_passes_through_the_shifter() {
     let mut s = RetuneShifter::new(48_000.0);
     let frames = 2048;
-    let input: Vec<f32> = (0..frames).map(|i| ((i % 97) as f32 / 97.0) - 0.5).collect();
+    let input: Vec<f32> = (0..frames)
+        .map(|i| ((i % 97) as f32 / 97.0) - 0.5)
+        .collect();
     let mut out = vec![0.0; frames];
     // Long enough for the latency to clear.
     for _ in 0..4 {
@@ -451,7 +515,10 @@ fn an_unvoiced_block_passes_through_the_shifter() {
     // comes back — delayed, but itself.
     let energy: f32 = out.iter().map(|x| x * x).sum();
     let want: f32 = input.iter().map(|x| x * x).sum();
-    assert!(energy > want * 0.5, "unvoiced audio must not be swallowed: {energy} vs {want}");
+    assert!(
+        energy > want * 0.5,
+        "unvoiced audio must not be swallowed: {energy} vs {want}"
+    );
     assert!(out.iter().all(|x| x.is_finite()));
 }
 
@@ -461,7 +528,10 @@ fn the_shifter_never_emits_a_nan() {
     let mut out = vec![0.0; 512];
     let nasty = vec![f32::NAN; 512];
     s.process(&nasty, &mut out, f32::NAN, f32::NAN);
-    assert!(out.iter().all(|x| x.is_finite()), "NaN in must not be NaN out");
+    assert!(
+        out.iter().all(|x| x.is_finite()),
+        "NaN in must not be NaN out"
+    );
     let big = vec![1e30f32; 512];
     s.process(&big, &mut out, 1e30, 1e30);
     assert!(out.iter().all(|x| x.is_finite()));
@@ -512,8 +582,16 @@ fn a_sharp_note_is_pulled_to_the_note_it_should_be() {
     let mono = run_sine(&mut at, 445.0, sr, 60);
     let m = at.reading();
     assert!(m.voiced, "a sung A is voiced");
-    assert!((m.target_frequency - 440.0).abs() < 0.5, "target {m}", m = m.target_frequency);
-    assert!(m.pitch_error_cents > 5.0, "it knows it is sharp: {} cents", m.pitch_error_cents);
+    assert!(
+        (m.target_frequency - 440.0).abs() < 0.5,
+        "target {m}",
+        m = m.target_frequency
+    );
+    assert!(
+        m.pitch_error_cents > 5.0,
+        "it knows it is sharp: {} cents",
+        m.pitch_error_cents
+    );
 
     let got = zero_crossing_hz(&mono, sr);
     // In tune is 440; uncorrected is 445. It has to land nearer the first.
@@ -543,13 +621,19 @@ fn a_corrected_note_is_clean_and_no_louder_than_it_arrived() {
         .iter()
         .map(|f| goertzel(&mono, *f, sr))
         .fold(0.0, f32::max);
-    assert!(target > junk * 6.0, "target {target:.4} vs the loudest junk {junk:.4}");
+    assert!(
+        target > junk * 6.0,
+        "target {target:.4} vs the loudest junk {junk:.4}"
+    );
 
     // And it did not get louder on the way. A Hann of 2P overlapped at P/ratio
     // sums to `ratio`, so without normalising, correcting *up* turns the effect
     // up — which is heard as clipping.
     let peak = mono.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-    assert!(peak < 0.75, "input peaked at 0.5; output peaks at {peak:.3}");
+    assert!(
+        peak < 0.75,
+        "input peaked at 0.5; output peaks at {peak:.3}"
+    );
     assert!(peak > 0.25, "and it is not swallowed either: {peak:.3}");
 }
 
@@ -618,7 +702,10 @@ fn mix_at_zero_is_the_input_back() {
         .zip(expect)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-    assert!(err < 1e-3, "dry at 0 % mix must be the input, delayed: max error {err}");
+    assert!(
+        err < 1e-3,
+        "dry at 0 % mix must be the input, delayed: max error {err}"
+    );
 }
 
 #[test]
@@ -640,7 +727,10 @@ fn nothing_that_leaves_this_effect_is_a_nan() {
     for pattern in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1e30, -1e30, 0.0] {
         let mut buf = vec![pattern; 1024];
         at.process_block(&mut buf, sr as u32);
-        assert!(buf.iter().all(|x| x.is_finite()), "{pattern} produced a non-finite output");
+        assert!(
+            buf.iter().all(|x| x.is_finite()),
+            "{pattern} produced a non-finite output"
+        );
     }
 }
 
@@ -712,7 +802,10 @@ fn changing_the_note_does_not_click() {
 fn every_parameter_is_reachable_and_survives_the_round_trip() {
     let mut at = AutoTune::new(48_000.0);
     let names: Vec<String> = at.params().iter().map(|p| p.name.to_string()).collect();
-    assert_eq!(names[0], "Preset", "the order is frozen: a CC learned here stays here");
+    assert_eq!(
+        names[0], "Preset",
+        "the order is frozen: a CC learned here stays here"
+    );
     assert_eq!(names[1], "Retune");
     assert_eq!(names[2], "Correct");
 
@@ -729,7 +822,10 @@ fn every_parameter_is_reachable_and_survives_the_round_trip() {
     at.set_param(7, 0.0);
     assert!((at.params.reference_hz - 430.0).abs() < 0.01);
     at.set_param(10, 0.0);
-    assert!((at.params.input_gain_db + 24.0).abs() < 0.01, "InGain is param 10 now");
+    assert!(
+        (at.params.input_gain_db + 24.0).abs() < 0.01,
+        "InGain is param 10 now"
+    );
     // An index nobody has is not a panic.
     at.set_param(99, 0.5);
 }
@@ -745,7 +841,11 @@ fn the_presets_are_five_different_sounds() {
     assert_eq!(at.params.mode, AutoTuneMode::Natural);
     assert!(at.params.correction < 1.0 && at.params.retune_speed_ms > 100.0);
     at.set_preset(4); // Robot Voice
-    assert_eq!(at.params.mode, AutoTuneMode::HardTune, "the snap is the point of this one");
+    assert_eq!(
+        at.params.mode,
+        AutoTuneMode::HardTune,
+        "the snap is the point of this one"
+    );
     // Out of range changes nothing.
     let before = at.params.retune_speed_ms;
     at.set_preset(99);
@@ -753,7 +853,10 @@ fn the_presets_are_five_different_sounds() {
 
     // And the preset knob reaches them.
     at.set_param(0, 0.0);
-    assert!((at.params.retune_speed_ms - 120.0).abs() < 1.0, "the first is Natural Vocal");
+    assert!(
+        (at.params.retune_speed_ms - 120.0).abs() < 1.0,
+        "the first is Natural Vocal"
+    );
 }
 
 /// **The output can never be louder than the input.** Two readers crossfaded is
@@ -789,7 +892,10 @@ fn the_shifter_cannot_make_the_signal_louder() {
                 );
             }
         }
-        assert!(peak > 0.2, "ratio {ratio}: and it is not swallowed either ({peak:.3})");
+        assert!(
+            peak > 0.2,
+            "ratio {ratio}: and it is not swallowed either ({peak:.3})"
+        );
     }
 }
 
@@ -814,8 +920,15 @@ fn latency_is_reported_and_constant() {
     assert!(l > 0, "PSOLA cannot be free");
     // Two periods of 60 Hz **at this rate** — 33 ms, not the 67 ms that sizing
     // it for 96 kHz would have cost.
-    assert_eq!(l, 2 * (48_000.0f32 / detector::MIN_SUPPORTED_HZ).ceil() as usize);
-    assert!((l as f32 / 48.0) < 40.0, "{:.1} ms is the budget", l as f32 / 48.0);
+    assert_eq!(
+        l,
+        2 * (48_000.0f32 / detector::MIN_SUPPORTED_HZ).ceil() as usize
+    );
+    assert!(
+        (l as f32 / 48.0) < 40.0,
+        "{:.1} ms is the budget",
+        l as f32 / 48.0
+    );
     // It does not move with the note being sung, which is what stops a change
     // of note from being a jump in time.
     let mut at = AutoTune::new(48_000.0);

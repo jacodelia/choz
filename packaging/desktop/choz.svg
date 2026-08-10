@@ -1,26 +1,33 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- choz: a terminal window with a rack of knobs in it. Flat colours only, so
-     it stays legible at 16px in a menu. -->
+<!-- choz: a synth — a waveform over a keyboard.
+
+     Drawn here rather than taken from an icon set, so there is no licence to
+     track: it is MIT with the rest of the project.
+
+     Everything is flat and nothing is thinner than 2px at 64, because the size
+     that matters is 16: at that scale a gradient is mud and a hairline is gone.
+     What has to survive is the silhouette — keys along the bottom, a wave
+     across the top — which reads as "sound" before anything is legible. -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
-  <rect x="2" y="6" width="60" height="52" rx="6" fill="#161b22"/>
-  <rect x="2" y="6" width="60" height="10" rx="6" fill="#0d1117"/>
-  <rect x="2" y="12" width="60" height="4" fill="#0d1117"/>
-  <circle cx="9" cy="11" r="2" fill="#f0883e"/>
-  <circle cx="16" cy="11" r="2" fill="#3a4048"/>
-  <circle cx="23" cy="11" r="2" fill="#3a4048"/>
+  <!-- Body -->
+  <rect x="3" y="8" width="58" height="48" rx="7" fill="#161b22"/>
+  <rect x="3" y="8" width="58" height="48" rx="7" fill="none" stroke="#30363d" stroke-width="2"/>
 
-  <!-- three knobs, the arc choz draws for a continuous parameter -->
-  <g fill="none" stroke-width="3" stroke-linecap="round">
-    <path d="M11 40 A8 8 0 1 1 25 40" stroke="#30363d"/>
-    <path d="M11 40 A8 8 0 0 1 14 30" stroke="#1f6feb"/>
-    <path d="M25 40 A8 8 0 1 1 39 40" stroke="#30363d"/>
-    <path d="M25 40 A8 8 0 0 1 32 26" stroke="#1f6feb"/>
-    <path d="M39 40 A8 8 0 1 1 53 40" stroke="#30363d"/>
-    <path d="M39 40 A8 8 0 0 1 52 36" stroke="#f0883e"/>
+  <!-- The wave. One stroke, wide enough to hold together when the whole icon
+       is 16px across. -->
+  <path d="M9 27 L15 27 L18 18 L23 36 L27 22 L31 31 L35 27 L55 27"
+        fill="none" stroke="#f0883e" stroke-width="3.4"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Keyboard. A real octave is seven whites and five blacks; at 16px those
+       twelve keys are 1px apart and turn into grey mush — rendered and looked
+       at, not assumed. So: no white-key dividers (the blacks imply them) and
+       three fat blacks instead of five. Wrong as a piano, right as a 16px
+       silhouette, and 16px is where this icon lives. -->
+  <rect x="9" y="40" width="46" height="13" rx="2" fill="#e6edf3"/>
+  <g fill="#0d1117">
+    <rect x="16" y="40" width="6" height="8" rx="1"/>
+    <rect x="29" y="40" width="6" height="8" rx="1"/>
+    <rect x="42" y="40" width="6" height="8" rx="1"/>
   </g>
-
-  <!-- the FX chain row -->
-  <rect x="10" y="47" width="12" height="5" rx="1.5" fill="#1f6feb"/>
-  <rect x="26" y="47" width="12" height="5" rx="1.5" fill="#2d333b"/>
-  <rect x="42" y="47" width="12" height="5" rx="1.5" fill="#2d333b"/>
 </svg>

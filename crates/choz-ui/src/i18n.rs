@@ -178,9 +178,17 @@ mod tests {
     #[test]
     fn the_table_is_complete() {
         for (key, row) in TABLE {
-            assert_eq!(row.len(), Lang::ALL.len() - 1, "{key} has the wrong column count");
+            assert_eq!(
+                row.len(),
+                Lang::ALL.len() - 1,
+                "{key} has the wrong column count"
+            );
             for (i, cell) in row.iter().enumerate() {
-                assert!(!cell.is_empty(), "{key} is missing {}", Lang::ALL[i + 1].code());
+                assert!(
+                    !cell.is_empty(),
+                    "{key} is missing {}",
+                    Lang::ALL[i + 1].code()
+                );
             }
         }
     }
@@ -191,8 +199,16 @@ mod tests {
     fn lookup_translates_and_falls_back() {
         assert_eq!(lookup(Lang::Es, "SETTINGS"), "AJUSTES");
         assert_eq!(lookup(Lang::Ja, "LANGUAGE"), "\u{8a00}\u{8a9e}");
-        assert_eq!(lookup(Lang::Es, "Not in the table"), "Not in the table", "unknown keys stay as-is");
-        assert_eq!(lookup(Lang::En, "SETTINGS"), "SETTINGS", "English is the key itself");
+        assert_eq!(
+            lookup(Lang::Es, "Not in the table"),
+            "Not in the table",
+            "unknown keys stay as-is"
+        );
+        assert_eq!(
+            lookup(Lang::En, "SETTINGS"),
+            "SETTINGS",
+            "English is the key itself"
+        );
     }
 
     #[test]
@@ -200,7 +216,11 @@ mod tests {
         for &l in Lang::ALL {
             assert_eq!(Lang::from_code(l.code()), Some(l));
         }
-        assert_eq!(Lang::from_code("es_AR.UTF-8"), Some(Lang::Es), "locale strings work");
+        assert_eq!(
+            Lang::from_code("es_AR.UTF-8"),
+            Some(Lang::Es),
+            "locale strings work"
+        );
         assert_eq!(Lang::from_code("xx"), None);
     }
 }

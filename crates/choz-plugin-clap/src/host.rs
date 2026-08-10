@@ -3,13 +3,12 @@
 //! Trimmed from seqterm's host: choz drives a single MIDI channel with no MPE,
 //! per-note expression, or state persistence.
 
-
 use std::ffi::CString;
 use std::path::Path;
 
-use clack_host::utils::Cookie;
 use clack_host::events::event_types::{MidiEvent, NoteOffEvent, NoteOnEvent, ParamValueEvent};
 use clack_host::prelude::*;
+use clack_host::utils::Cookie;
 
 use choz_ports::{AudioSource, FxProcessor};
 
@@ -117,8 +116,13 @@ impl clack_extensions::timer::HostTimerImpl for ChozMainThread<'_> {
         Ok(clack_extensions::timer::TimerId(id))
     }
 
-    fn unregister_timer(&mut self, timer_id: clack_extensions::timer::TimerId) -> Result<(), HostError> {
-        lock(&self.shared.gui).timers.retain(|(id, _, _)| *id != timer_id.0);
+    fn unregister_timer(
+        &mut self,
+        timer_id: clack_extensions::timer::TimerId,
+    ) -> Result<(), HostError> {
+        lock(&self.shared.gui)
+            .timers
+            .retain(|(id, _, _)| *id != timer_id.0);
         Ok(())
     }
 }
@@ -157,17 +161,24 @@ pub fn read_descriptors(path: &Path) -> Vec<ClapPluginInfo> {
 
     let mut out = Vec::new();
     for desc in factory.plugin_descriptors() {
-        let id = desc.id().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let id = desc
+            .id()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
         if id.is_empty() {
             continue;
         }
-        let is_instrument = desc
-            .features()
-            .any(|f| f.to_string_lossy() == "instrument");
+        let is_instrument = desc.features().any(|f| f.to_string_lossy() == "instrument");
         out.push(ClapPluginInfo {
             path: path.to_path_buf(),
-            name: desc.name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
-            vendor: desc.vendor().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+            name: desc
+                .name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            vendor: desc
+                .vendor()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             id,
             is_instrument,
         });
@@ -202,7 +213,10 @@ fn host_transport() -> clack_host::events::event_types::TransportEvent {
         flags |= TransportFlags::IS_PLAYING;
     }
     TransportEvent {
-        header: clack_host::events::EventHeader::new_core(0, clack_host::events::EventFlags::empty()),
+        header: clack_host::events::EventHeader::new_core(
+            0,
+            clack_host::events::EventFlags::empty(),
+        ),
         flags,
         song_pos_beats: BeatTime::from_float(beats),
         song_pos_seconds: SecondsTime::from_float(seconds),
@@ -254,20 +268,35 @@ fn port_layout(instance: &mut PluginInstance<ChozHost>) -> (Vec<usize>, Vec<usiz
 
 /// Planar buffers for one direction: `[port][channel][frame]`.
 fn alloc_ports(layout: &[usize], frames: usize) -> Vec<Vec<Vec<f32>>> {
-    layout.iter().map(|ch| vec![vec![0.0; frames]; *ch]).collect()
+    layout
+        .iter()
+        .map(|ch| vec![vec![0.0; frames]; *ch])
+        .collect()
 }
 
 /// An event queued from the audio thread, flushed into the plugin's input event
 /// list on the next `process` call.
 enum QueuedEvent {
-    NoteOn { key: i16, note_id: i32, velocity: f64 },
-    NoteOff { key: i16, note_id: i32 },
-    Param { id: u32, value: f64 },
+    NoteOn {
+        key: i16,
+        note_id: i32,
+        velocity: f64,
+    },
+    NoteOff {
+        key: i16,
+        note_id: i32,
+    },
+    Param {
+        id: u32,
+        value: f64,
+    },
     /// A raw MIDI 1.0 message (CC, pitch bend) passed straight through. CLAP has
     /// no native event for pedals or the modulation wheel, so this is the only
     /// way to reach a plugin's own handling of them. Verified against Surge XT;
     /// a plugin that declares no MIDI-dialect note port simply ignores these.
-    Midi { data: [u8; 3] },
+    Midi {
+        data: [u8; 3],
+    },
 }
 
 /// Tracks sounding voices so each note-off targets the right CLAP `note_id`.
@@ -303,29 +332,36 @@ pub fn read_params(path: &Path, plugin_id: &str) -> Vec<crate::PluginParam> {
     /// is a range to slide through, not a list of choices to pick from.
     const MAX_NAMED_STEPS: u32 = 32;
 
-
     // SAFETY: external library load; clack handles the ABI.
-    let Ok(entry) = (unsafe { PluginEntry::load(path) }) else { return Vec::new() };
-    let Ok(id) = CString::new(plugin_id) else { return Vec::new() };
-    let Ok(mut instance) =
-        PluginInstance::<ChozHost>::new(
-            |_| ChozShared { gui: Default::default() },
-            |shared| ChozMainThread { shared },
-            &entry,
-            id.as_c_str(),
-            &host_info(),
-        )
-    else {
+    let Ok(entry) = (unsafe { PluginEntry::load(path) }) else {
+        return Vec::new();
+    };
+    let Ok(id) = CString::new(plugin_id) else {
+        return Vec::new();
+    };
+    let Ok(mut instance) = PluginInstance::<ChozHost>::new(
+        |_| ChozShared {
+            gui: Default::default(),
+        },
+        |shared| ChozMainThread { shared },
+        &entry,
+        id.as_c_str(),
+        &host_info(),
+    ) else {
         return Vec::new();
     };
 
     let mut handle = instance.plugin_handle();
-    let Some(params) = handle.get_extension::<PluginParams>() else { return Vec::new() };
+    let Some(params) = handle.get_extension::<PluginParams>() else {
+        return Vec::new();
+    };
     let count = params.count(&mut handle);
     let mut buf = ParamInfoBuffer::new();
     let mut out = Vec::new();
     for i in 0..count {
-        let Some(info) = params.get_info(&mut handle, i, &mut buf) else { continue };
+        let Some(info) = params.get_info(&mut handle, i, &mut buf) else {
+            continue;
+        };
         // A parameter with min == max can't be moved; skip it.
         if info.max_value <= info.min_value {
             continue;
@@ -346,11 +382,15 @@ pub fn read_params(path: &Path, plugin_id: &str) -> Vec<crate::PluginParam> {
             let mut text = [0u8; 128];
             for k in 0..steps {
                 let value = info.min_value + k as f64;
-                let Ok(written) = params.value_to_text(&mut handle, info.id, value, &mut text) else {
+                let Ok(written) = params.value_to_text(&mut handle, info.id, value, &mut text)
+                else {
                     points.clear();
                     break;
                 };
-                let label = String::from_utf8_lossy(written).trim_end_matches('\0').trim().to_string();
+                let label = String::from_utf8_lossy(written)
+                    .trim_end_matches('\0')
+                    .trim()
+                    .to_string();
                 if label.is_empty() {
                     points.clear();
                     break;
@@ -360,7 +400,9 @@ pub fn read_params(path: &Path, plugin_id: &str) -> Vec<crate::PluginParam> {
         }
         out.push(crate::PluginParam {
             id: info.id.into(),
-            name: String::from_utf8_lossy(info.name).trim_end_matches('\0').to_string(),
+            name: String::from_utf8_lossy(info.name)
+                .trim_end_matches('\0')
+                .to_string(),
             min: info.min_value,
             max: info.max_value,
             default: info.default_value,
@@ -482,12 +524,13 @@ impl ClapProc {
         // reachable — after this it belongs to the audio thread.
         let gui = {
             let raw = instance.raw_instance() as *const _;
-            let cell = unsafe { crate::editor::ClapEditor::extension_of(raw) }
-                .map(|gui| crate::editor::GuiCell {
+            let cell = unsafe { crate::editor::ClapEditor::extension_of(raw) }.map(|gui| {
+                crate::editor::GuiCell {
                     plugin: raw,
                     gui,
                     timer: unsafe { crate::editor::ClapEditor::timer_of(raw) },
-                });
+                }
+            });
             std::sync::Arc::new(std::sync::Mutex::new(cell))
         };
 
@@ -523,12 +566,25 @@ impl ClapProc {
     /// Run one block. `in_buf` must already hold the input audio; results land
     /// in `out_buf`. Does nothing if the processor failed to start.
     fn process_block(&mut self, frames: usize, queue: &[QueuedEvent]) {
-        let Self { processor, in_ports, out_ports, in_buf, out_buf, steady, touch, .. } = self;
-        let Some(proc) = processor.as_mut() else { return };
+        let Self {
+            processor,
+            in_ports,
+            out_ports,
+            in_buf,
+            out_buf,
+            steady,
+            touch,
+            ..
+        } = self;
+        let Some(proc) = processor.as_mut() else {
+            return;
+        };
 
         for port in out_buf.iter_mut() {
             for ch in port.iter_mut() {
-                for v in ch[..frames].iter_mut() { *v = 0.0; }
+                for v in ch[..frames].iter_mut() {
+                    *v = 0.0;
+                }
             }
         }
 
@@ -536,7 +592,11 @@ impl ClapProc {
         let mut in_ev = EventBuffer::new();
         for q in queue.iter() {
             match q {
-                QueuedEvent::NoteOn { key, note_id, velocity } => {
+                QueuedEvent::NoteOn {
+                    key,
+                    note_id,
+                    velocity,
+                } => {
                     let pckn = Pckn::from_raw(0, 0, *key, *note_id);
                     in_ev.push(&NoteOnEvent::new(0, pckn, *velocity));
                 }
@@ -547,7 +607,11 @@ impl ClapProc {
                 QueuedEvent::Param { id, value } => {
                     if let Some(param_id) = ClapId::from_raw(*id) {
                         in_ev.push(&ParamValueEvent::new(
-                            0, param_id, Pckn::match_all(), *value, Cookie::empty(),
+                            0,
+                            param_id,
+                            Pckn::match_all(),
+                            *value,
+                            Cookie::empty(),
                         ));
                     }
                 }
@@ -561,14 +625,20 @@ impl ClapProc {
         let mut output_events = OutputEvents::from(&mut out_ev);
 
         // One buffer per declared port, in the plugin's own order.
-        let input_audio = in_ports.with_input_buffers(in_buf.iter_mut().map(|port| AudioPortBuffer {
-            latency: 0,
-            channels: AudioPortBufferType::f32_input_only(port.iter_mut().map(InputChannel::variable)),
-        }));
-        let mut output_audio = out_ports.with_output_buffers(out_buf.iter_mut().map(|port| AudioPortBuffer {
-            latency: 0,
-            channels: AudioPortBufferType::f32_output_only(port.iter_mut().map(|b| b.as_mut_slice())),
-        }));
+        let input_audio =
+            in_ports.with_input_buffers(in_buf.iter_mut().map(|port| AudioPortBuffer {
+                latency: 0,
+                channels: AudioPortBufferType::f32_input_only(
+                    port.iter_mut().map(InputChannel::variable),
+                ),
+            }));
+        let mut output_audio =
+            out_ports.with_output_buffers(out_buf.iter_mut().map(|port| AudioPortBuffer {
+                latency: 0,
+                channels: AudioPortBufferType::f32_output_only(
+                    port.iter_mut().map(|b| b.as_mut_slice()),
+                ),
+            }));
 
         // choz's clock, so a tempo-synced plugin follows the host instead of
         // guessing. Built per block from atomics: no allocation, no lock.
@@ -588,7 +658,10 @@ impl ClapProc {
         // it.
         for event in out_ev.iter() {
             if let Some(param) = event.as_event::<ParamValueEvent>() {
-                touch.record(param.param_id().map(|i| i.into()).unwrap_or(0), param.value());
+                touch.record(
+                    param.param_id().map(|i| i.into()).unwrap_or(0),
+                    param.value(),
+                );
             }
         }
     }
@@ -610,7 +683,10 @@ impl Drop for ClapProc {
         // instance survives but this struct's pointers do not outlive the slot.
         *self.gui.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let strict = std::env::var_os("CHOZ_CLAP_STRICT_TEARDOWN").is_some();
-        let stopped = self.processor.take().map(|started| started.stop_processing());
+        let stopped = self
+            .processor
+            .take()
+            .map(|started| started.stop_processing());
 
         if strict {
             if let (Some(stopped), Some(instance)) = (stopped, self.instance.as_mut()) {
@@ -652,17 +728,30 @@ impl ClapInstrument {
 
 /// Queue a normalised parameter change for the next block. RT-safe: nothing is
 /// allocated, and a full queue drops the change instead of growing.
-fn queue_param(queue: &mut Vec<QueuedEvent>, params: &[crate::PluginParam], index: usize, value: f32) {
-    let Some(info) = params.get(index) else { return };
+fn queue_param(
+    queue: &mut Vec<QueuedEvent>,
+    params: &[crate::PluginParam],
+    index: usize,
+    value: f32,
+) {
+    let Some(info) = params.get(index) else {
+        return;
+    };
     if queue.len() == queue.capacity() {
         return;
     }
-    queue.push(QueuedEvent::Param { id: info.id, value: info.plain(value as f64) });
+    queue.push(QueuedEvent::Param {
+        id: info.id,
+        value: info.plain(value as f64),
+    });
 }
 
 impl AudioSource for ClapInstrument {
     fn editor(&self) -> Option<choz_ports::EditorHandle> {
-        self.proc.editor.clone().map(|e| e as choz_ports::EditorHandle)
+        self.proc
+            .editor
+            .clone()
+            .map(|e| e as choz_ports::EditorHandle)
     }
 
     fn param_touch(&self) -> Option<choz_ports::TouchHandle> {
@@ -673,8 +762,10 @@ impl AudioSource for ClapInstrument {
     }
 
     fn state(&self) -> Option<choz_ports::StateHandle> {
-        Some(std::sync::Arc::new(crate::state::ClapState::new(self.proc.gui.clone()))
-            as choz_ports::StateHandle)
+        Some(
+            std::sync::Arc::new(crate::state::ClapState::new(self.proc.gui.clone()))
+                as choz_ports::StateHandle,
+        )
     }
 
     fn render(&mut self, output: &mut [f32], _sample_rate: u32) -> usize {
@@ -689,7 +780,9 @@ impl AudioSource for ClapInstrument {
         // An instrument takes no audio input; feed every port silence.
         for port in self.proc.in_buf.iter_mut() {
             for ch in port.iter_mut() {
-                for v in ch[..frames].iter_mut() { *v = 0.0; }
+                for v in ch[..frames].iter_mut() {
+                    *v = 0.0;
+                }
             }
         }
         self.proc.process_block(frames, &self.queue);
@@ -718,7 +811,10 @@ impl AudioSource for ClapInstrument {
 
     fn note_off(&mut self, note: u8) {
         let note_id = self.notes.take(note).map(|id| id as i32).unwrap_or(-1);
-        self.queue.push(QueuedEvent::NoteOff { key: note as i16, note_id });
+        self.queue.push(QueuedEvent::NoteOff {
+            key: note as i16,
+            note_id,
+        });
     }
 
     fn control_change(&mut self, cc: u8, value: u8) {
@@ -777,7 +873,10 @@ impl ClapEffect {
 
 impl FxProcessor for ClapEffect {
     fn editor(&self) -> Option<choz_ports::EditorHandle> {
-        self.proc.editor.clone().map(|e| e as choz_ports::EditorHandle)
+        self.proc
+            .editor
+            .clone()
+            .map(|e| e as choz_ports::EditorHandle)
     }
 
     fn param_touch(&self) -> Option<choz_ports::TouchHandle> {
@@ -788,8 +887,10 @@ impl FxProcessor for ClapEffect {
     }
 
     fn state(&self) -> Option<choz_ports::StateHandle> {
-        Some(std::sync::Arc::new(crate::state::ClapState::new(self.proc.gui.clone()))
-            as choz_ports::StateHandle)
+        Some(
+            std::sync::Arc::new(crate::state::ClapState::new(self.proc.gui.clone()))
+                as choz_ports::StateHandle,
+        )
     }
 
     fn process_block(&mut self, buf: &mut [f32], _sample_rate: u32) {
@@ -826,7 +927,11 @@ impl FxProcessor for ClapEffect {
             // contribution is dropped rather than mixed in.
             for i in 0..frames {
                 let (wl, wr) = (out[l][i], out[r][i]);
-                let (wl, wr) = if wl.is_finite() && wr.is_finite() { (wl, wr) } else { (0.0, 0.0) };
+                let (wl, wr) = if wl.is_finite() && wr.is_finite() {
+                    (wl, wr)
+                } else {
+                    (0.0, 0.0)
+                };
                 block[i * 2] = block[i * 2] * dry + wl * self.wet;
                 block[i * 2 + 1] = block[i * 2 + 1] * dry + wr * self.wet;
             }
@@ -911,8 +1016,15 @@ mod tests {
         // well — but a bar that started at 3.
         t.set_time_signature(6, 8);
         let ev = host_transport();
-        assert_eq!((ev.time_signature_numerator, ev.time_signature_denominator), (6, 8));
-        assert!((ev.bar_start.to_float() - 3.0).abs() < 1e-6, "{}", ev.bar_start.to_float());
+        assert_eq!(
+            (ev.time_signature_numerator, ev.time_signature_denominator),
+            (6, 8)
+        );
+        assert!(
+            (ev.bar_start.to_float() - 3.0).abs() < 1e-6,
+            "{}",
+            ev.bar_start.to_float()
+        );
         t.set_time_signature(4, 4);
 
         t.set_playing(false);

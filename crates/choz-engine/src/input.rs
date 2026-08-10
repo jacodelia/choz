@@ -62,10 +62,24 @@ pub struct ProgramMsg {
 /// change in the UI. `tab` and `fx` are 1-based, as they read on screen.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ControlMsg {
-    Gain { tab: usize, value: f32 },
-    Pan { tab: usize, value: f32 },
-    Mute { tab: usize, on: bool },
-    FxParam { tab: usize, fx: usize, param: usize, value: f32 },
+    Gain {
+        tab: usize,
+        value: f32,
+    },
+    Pan {
+        tab: usize,
+        value: f32,
+    },
+    Mute {
+        tab: usize,
+        on: bool,
+    },
+    FxParam {
+        tab: usize,
+        fx: usize,
+        param: usize,
+        value: f32,
+    },
 }
 
 /// Anything an input thread can hand the UI loop.

@@ -15,11 +15,17 @@ enum ScanRule {
 
 const fn dynlib_ext() -> &'static [&'static str] {
     #[cfg(target_os = "windows")]
-    { &["dll"] }
+    {
+        &["dll"]
+    }
     #[cfg(target_os = "macos")]
-    { &["dylib", "so"] }
+    {
+        &["dylib", "so"]
+    }
     #[cfg(all(unix, not(target_os = "macos")))]
-    { &["so"] }
+    {
+        &["so"]
+    }
 }
 
 fn rule_for(kind: &PluginKind) -> ScanRule {
@@ -44,9 +50,16 @@ const MAX_SCAN_DEPTH: usize = 6;
 fn is_pruned_dir(name: &str) -> bool {
     matches!(
         name,
-        ".git" | ".svn" | ".hg"
-            | "target" | "build" | "node_modules"
-            | ".cargo" | ".rustup" | ".cache" | "__pycache__"
+        ".git"
+            | ".svn"
+            | ".hg"
+            | "target"
+            | "build"
+            | "node_modules"
+            | ".cargo"
+            | ".rustup"
+            | ".cache"
+            | "__pycache__"
     )
 }
 
@@ -57,8 +70,13 @@ fn scan_directory(dir: &Path, rule: &ScanRule) -> Vec<PathBuf> {
 }
 
 fn scan_recursive(dir: &Path, rule: &ScanRule, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth > MAX_SCAN_DEPTH { return; }
-    let rd = match std::fs::read_dir(dir) { Ok(r) => r, Err(_) => return };
+    if depth > MAX_SCAN_DEPTH {
+        return;
+    }
+    let rd = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
     for entry in rd.flatten() {
         let path = entry.path();
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
@@ -72,13 +90,18 @@ fn scan_recursive(dir: &Path, rule: &ScanRule, depth: usize, out: &mut Vec<PathB
         match rule {
             ScanRule::BundleDir(ext) => {
                 if is_dir {
-                    if ext_matches(&path, &[ext]) { out.push(path); }
-                    else { recurse_into(&path, out); }
+                    if ext_matches(&path, &[ext]) {
+                        out.push(path);
+                    } else {
+                        recurse_into(&path, out);
+                    }
                 }
             }
             ScanRule::Files(exts) => {
                 if is_file {
-                    if ext_matches(&path, exts) { out.push(path); }
+                    if ext_matches(&path, exts) {
+                        out.push(path);
+                    }
                 } else if is_dir {
                     recurse_into(&path, out);
                 }
@@ -92,7 +115,9 @@ pub fn default_search_paths(kind: &PluginKind) -> Vec<PathBuf> {
     let mut p = Vec::new();
     macro_rules! home_join {
         ($sub:expr) => {
-            if let Some(h) = &home { p.push(h.join($sub)); }
+            if let Some(h) = &home {
+                p.push(h.join($sub));
+            }
         };
     }
 
@@ -152,7 +177,12 @@ pub struct FileScanHost {
 #[allow(dead_code)]
 impl FileScanHost {
     pub fn new(kind: PluginKind) -> Self {
-        Self { kind, plugins: Vec::new(), instances: HashMap::new(), next_id: 0 }
+        Self {
+            kind,
+            plugins: Vec::new(),
+            instances: HashMap::new(),
+            next_id: 0,
+        }
     }
 
     #[allow(dead_code)]
@@ -168,7 +198,8 @@ impl FileScanHost {
 
     fn descriptor(&self, path: &Path) -> PluginDescriptor {
         let name = path
-            .file_stem().map(|s| s.to_string_lossy().into_owned())
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Unknown".into());
         let (is_effect, is_instrument) = match self.kind {
             PluginKind::Ladspa => (true, false),
@@ -193,7 +224,9 @@ impl PluginHostPort for FileScanHost {
     fn scan(&mut self, dir: &Path) -> anyhow::Result<Vec<PluginDescriptor>> {
         let rule = rule_for(&self.kind);
         let found: Vec<PluginDescriptor> = scan_directory(dir, &rule)
-            .iter().map(|p| self.descriptor(p)).collect();
+            .iter()
+            .map(|p| self.descriptor(p))
+            .collect();
         for d in &found {
             if !self.plugins.iter().any(|p| p.id == d.id) {
                 self.plugins.push(d.clone());
@@ -202,7 +235,9 @@ impl PluginHostPort for FileScanHost {
         Ok(found)
     }
 
-    fn list_plugins(&self) -> &[PluginDescriptor] { &self.plugins }
+    fn list_plugins(&self) -> &[PluginDescriptor] {
+        &self.plugins
+    }
 
     fn instantiate(&mut self, plugin_id: &str, _sr: u32, _block: u32) -> anyhow::Result<u64> {
         if !self.plugins.iter().any(|p| p.id == plugin_id) {
@@ -214,9 +249,16 @@ impl PluginHostPort for FileScanHost {
         Ok(id)
     }
 
-    fn destroy(&mut self, instance_id: u64) { self.instances.remove(&instance_id); }
+    fn destroy(&mut self, instance_id: u64) {
+        self.instances.remove(&instance_id);
+    }
 
-    fn process(&mut self, _instance_id: u64, _input: &[f32], output: &mut [f32]) -> anyhow::Result<()> {
+    fn process(
+        &mut self,
+        _instance_id: u64,
+        _input: &[f32],
+        output: &mut [f32],
+    ) -> anyhow::Result<()> {
         output.fill(0.0);
         Ok(())
     }

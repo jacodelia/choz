@@ -4,8 +4,8 @@
 //! probe re-runs *this* executable, so it has to answer `probe_worker_main`
 //! before anything else.
 
+use choz_engine::quarantine::{check, Verdict};
 use choz_engine::PluginFormat;
-use choz_engine::quarantine::{Verdict, check};
 
 fn main() {
     // Any of the three worker roles: the engine re-runs this binary for all
@@ -22,7 +22,11 @@ fn main() {
     let good = std::path::Path::new("/usr/lib/lv2/amp.lv2");
     if good.exists() {
         let v = check(PluginFormat::Lv2, good, "urn:ardour:a-amplifier").verdict;
-        assert_ne!(v, Verdict::CrashesOnLoad, "a working plugin must stay loadable");
+        assert_ne!(
+            v,
+            Verdict::CrashesOnLoad,
+            "a working plugin must stay loadable"
+        );
     }
 
     // padthv1 plays fine and then segfaults in its own Qt thread while being
@@ -39,11 +43,28 @@ fn main() {
     // can still take the app down.
     let padthv1 = std::path::Path::new("/usr/lib/lv2/padthv1.lv2");
     if padthv1.exists() {
-        let v = check(PluginFormat::Lv2, padthv1, "http://padthv1.sourceforge.net/lv2").verdict;
-        assert_ne!(v, Verdict::CrashesOnLoad, "padthv1 dies on the way out, not in");
+        let v = check(
+            PluginFormat::Lv2,
+            padthv1,
+            "http://padthv1.sourceforge.net/lv2",
+        )
+        .verdict;
+        assert_ne!(
+            v,
+            Verdict::CrashesOnLoad,
+            "padthv1 dies on the way out, not in"
+        );
         assert!(v.loadable(), "it still plays, so it is allowed");
         // Second call comes from the cache: no second child, same answer.
-        assert_eq!(check(PluginFormat::Lv2, padthv1, "http://padthv1.sourceforge.net/lv2").verdict, v);
+        assert_eq!(
+            check(
+                PluginFormat::Lv2,
+                padthv1,
+                "http://padthv1.sourceforge.net/lv2"
+            )
+            .verdict,
+            v
+        );
     } else {
         eprintln!("padthv1 not installed; skipping the teardown-crash check");
     }

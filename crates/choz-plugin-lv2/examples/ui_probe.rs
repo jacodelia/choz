@@ -138,7 +138,10 @@ fn main() {
         }
     }
 
-    println!("\nabiertas: {opened}   sin UI: {no_ui}   fallidas: {}", failed.len());
+    println!(
+        "\nabiertas: {opened}   sin UI: {no_ui}   fallidas: {}",
+        failed.len()
+    );
     for f in failed.iter().take(20) {
         println!("  {f}");
     }

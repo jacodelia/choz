@@ -17,8 +17,20 @@ pub struct FxParam {
 }
 
 impl FxParam {
-    pub const fn new(name: &'static str, value: f32, min: f32, max: f32, unit: &'static str) -> Self {
-        Self { name, value, min, max, unit }
+    pub const fn new(
+        name: &'static str,
+        value: f32,
+        min: f32,
+        max: f32,
+        unit: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            value,
+            min,
+            max,
+            unit,
+        }
     }
 
     pub fn native(&self) -> f32 {
@@ -38,10 +50,14 @@ pub trait FxProcessor: Send {
     fn set_mix(&mut self, wet: f32);
 
     /// Human-readable name.
-    fn name(&self) -> &str { "FX" }
+    fn name(&self) -> &str {
+        "FX"
+    }
 
     /// Return automatable parameter list.
-    fn params(&self) -> Vec<FxParam> { Vec::new() }
+    fn params(&self) -> Vec<FxParam> {
+        Vec::new()
+    }
 
     /// Set a parameter by index to a normalised 0.0–1.0 value.
     fn set_param(&mut self, _index: usize, _value: f32) {}
@@ -277,7 +293,14 @@ pub struct PluginParam {
 impl PluginParam {
     /// A parameter with nothing but the numbers, which is all most hosts give.
     pub fn plain_range(id: u32, name: String, min: f64, max: f64, default: f64) -> Self {
-        Self { id, name, min, max, default, ..Self::default() }
+        Self {
+            id,
+            name,
+            min,
+            max,
+            default,
+            ..Self::default()
+        }
     }
 
     /// `true` when the parameter is an on/off switch.
@@ -295,7 +318,10 @@ impl PluginParam {
         self.points
             .iter()
             .min_by(|a, b| {
-                (a.0 - plain).abs().partial_cmp(&(b.0 - plain).abs()).unwrap_or(std::cmp::Ordering::Equal)
+                (a.0 - plain)
+                    .abs()
+                    .partial_cmp(&(b.0 - plain).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(_, label)| label.as_str())
     }
@@ -371,7 +397,8 @@ impl Transport {
     /// Move the clock on by one block. Called from the audio callback, so:
     /// relaxed, and nothing else.
     pub fn advance(&self, frames: usize) {
-        self.samples.fetch_add(frames as u64, std::sync::atomic::Ordering::Relaxed);
+        self.samples
+            .fetch_add(frames as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Back to the top. A new stream starts at zero, or the user rewinds.
@@ -389,17 +416,21 @@ impl Transport {
 
     pub fn set_bpm(&self, bpm: f32) {
         let bpm = bpm.clamp(Self::MIN_BPM, Self::MAX_BPM);
-        self.bpm.store(bpm.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        self.bpm
+            .store(bpm.to_bits(), std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn sample_rate(&self) -> u32 {
-        self.sample_rate.load(std::sync::atomic::Ordering::Relaxed).max(1)
+        self.sample_rate
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(1)
     }
 
     /// Told by the engine when the stream opens. Rewinds: a position in frames
     /// means nothing once the frames are a different length.
     pub fn set_sample_rate(&self, sr: u32) {
-        self.sample_rate.store(sr.max(1), std::sync::atomic::Ordering::Relaxed);
+        self.sample_rate
+            .store(sr.max(1), std::sync::atomic::Ordering::Relaxed);
         self.rewind();
     }
 
@@ -408,7 +439,8 @@ impl Transport {
     }
 
     pub fn set_playing(&self, playing: bool) {
-        self.playing.store(playing, std::sync::atomic::Ordering::Relaxed);
+        self.playing
+            .store(playing, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Beats per bar and the note value that gets the beat: `(4, 4)`, `(6, 8)`.

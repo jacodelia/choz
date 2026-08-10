@@ -11,7 +11,7 @@
 
 use std::ffi::c_void;
 
-use clap_sys::ext::state::{CLAP_EXT_STATE, clap_plugin_state};
+use clap_sys::ext::state::{clap_plugin_state, CLAP_EXT_STATE};
 use clap_sys::plugin::clap_plugin;
 use clap_sys::stream::{clap_istream, clap_ostream};
 
@@ -28,7 +28,11 @@ struct InBuf<'a> {
     pos: usize,
 }
 
-unsafe extern "C" fn write_cb(stream: *const clap_ostream, buffer: *const c_void, size: u64) -> i64 {
+unsafe extern "C" fn write_cb(
+    stream: *const clap_ostream,
+    buffer: *const c_void,
+    size: u64,
+) -> i64 {
     if stream.is_null() || buffer.is_null() {
         return -1;
     }
@@ -101,12 +105,18 @@ impl choz_ports::PluginState for ClapState {
         let guard = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         let Some(cell) = guard.as_ref() else { return };
         // SAFETY: as above.
-        let Some(ext) = (unsafe { Self::extension(cell.plugin) }) else { return };
-        let Some(load) = (unsafe { (*ext).load }) else { return };
+        let Some(ext) = (unsafe { Self::extension(cell.plugin) }) else {
+            return;
+        };
+        let Some(load) = (unsafe { (*ext).load }) else {
+            return;
+        };
 
         let mut inp = InBuf { data, pos: 0 };
-        let stream =
-            clap_istream { ctx: &mut inp as *mut InBuf as *mut c_void, read: Some(read_cb) };
+        let stream = clap_istream {
+            ctx: &mut inp as *mut InBuf as *mut c_void,
+            read: Some(read_cb),
+        };
         unsafe { load(cell.plugin, &stream) };
     }
 }
@@ -120,17 +130,30 @@ mod tests {
     #[test]
     fn the_streams_carry_the_bytes_both_ways() {
         let mut out = OutBuf { data: Vec::new() };
-        let ostream =
-            clap_ostream { ctx: &mut out as *mut OutBuf as *mut c_void, write: Some(write_cb) };
+        let ostream = clap_ostream {
+            ctx: &mut out as *mut OutBuf as *mut c_void,
+            write: Some(write_cb),
+        };
         let payload = b"patch-bytes";
         // SAFETY: the stream points at a live `OutBuf`.
-        let n = unsafe { write_cb(&ostream, payload.as_ptr() as *const c_void, payload.len() as u64) };
+        let n = unsafe {
+            write_cb(
+                &ostream,
+                payload.as_ptr() as *const c_void,
+                payload.len() as u64,
+            )
+        };
         assert_eq!(n, payload.len() as i64);
         assert_eq!(out.data, payload);
 
-        let mut inp = InBuf { data: &out.data, pos: 0 };
-        let istream =
-            clap_istream { ctx: &mut inp as *mut InBuf as *mut c_void, read: Some(read_cb) };
+        let mut inp = InBuf {
+            data: &out.data,
+            pos: 0,
+        };
+        let istream = clap_istream {
+            ctx: &mut inp as *mut InBuf as *mut c_void,
+            read: Some(read_cb),
+        };
         let mut buf = [0u8; 5];
         // A short read is normal: the plugin asks again until it gets 0.
         let n = unsafe { read_cb(&istream, buf.as_mut_ptr() as *mut c_void, 5) };
@@ -140,6 +163,9 @@ mod tests {
         assert_eq!(n, 6);
         assert_eq!(&rest[..6], b"-bytes");
         // And it stops at the end instead of running past it.
-        assert_eq!(unsafe { read_cb(&istream, rest.as_mut_ptr() as *mut c_void, 64) }, 0);
+        assert_eq!(
+            unsafe { read_cb(&istream, rest.as_mut_ptr() as *mut c_void, 64) },
+            0
+        );
     }
 }

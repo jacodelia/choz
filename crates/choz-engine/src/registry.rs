@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 
 use crate::plugin_types::{PluginDescriptor, PluginHostPort, PluginKind};
 use crate::scanner::FileScanHost;
@@ -34,7 +34,11 @@ pub struct PluginRegistry {
 #[allow(dead_code)]
 impl PluginRegistry {
     pub fn new() -> Self {
-        Self { adapters: Vec::new(), instances: Vec::new(), next_id: 1 }
+        Self {
+            adapters: Vec::new(),
+            instances: Vec::new(),
+            next_id: 1,
+        }
     }
 
     pub fn register_adapter(&mut self, adapter: Box<dyn PluginHostPort>) {
@@ -44,7 +48,9 @@ impl PluginRegistry {
     pub fn with_default_adapters() -> Self {
         let mut reg = Self::new();
         for kind in [
-            PluginKind::Ladspa, PluginKind::Dssi, PluginKind::Sfz,
+            PluginKind::Ladspa,
+            PluginKind::Dssi,
+            PluginKind::Sfz,
             PluginKind::Sf2,
         ] {
             reg.register_adapter(Box::new(FileScanHost::new(kind)));
@@ -55,7 +61,9 @@ impl PluginRegistry {
     pub fn scan_default_locations(&mut self, extra_dirs: &[std::path::PathBuf]) -> usize {
         let mut total = 0;
         for kind in [
-            PluginKind::Ladspa, PluginKind::Dssi, PluginKind::Sfz,
+            PluginKind::Ladspa,
+            PluginKind::Dssi,
+            PluginKind::Sfz,
             PluginKind::Sf2,
         ] {
             for dir in crate::scanner::default_search_paths(&kind) {
@@ -79,20 +87,37 @@ impl PluginRegistry {
     }
 
     pub fn list_plugins(&self) -> Vec<&PluginDescriptor> {
-        self.adapters.iter().flat_map(|a| a.list_plugins()).collect()
+        self.adapters
+            .iter()
+            .flat_map(|a| a.list_plugins())
+            .collect()
     }
 
     pub fn find_plugin(&self, plugin_id: &str) -> Option<&PluginDescriptor> {
-        self.adapters.iter().flat_map(|a| a.list_plugins()).find(|d| d.id == plugin_id)
+        self.adapters
+            .iter()
+            .flat_map(|a| a.list_plugins())
+            .find(|d| d.id == plugin_id)
     }
 
-    pub fn instantiate(&mut self, plugin_id: &str, sample_rate: u32, block_size: u32) -> Result<u64> {
-        let adapter_idx = self.adapters.iter()
+    pub fn instantiate(
+        &mut self,
+        plugin_id: &str,
+        sample_rate: u32,
+        block_size: u32,
+    ) -> Result<u64> {
+        let adapter_idx = self
+            .adapters
+            .iter()
             .position(|a| a.list_plugins().iter().any(|p| p.id == plugin_id))
             .ok_or_else(|| anyhow::anyhow!("No adapter knows plugin: {plugin_id}"))?;
 
         let descriptor = self.adapters[adapter_idx]
-            .list_plugins().iter().find(|p| p.id == plugin_id).cloned().unwrap();
+            .list_plugins()
+            .iter()
+            .find(|p| p.id == plugin_id)
+            .cloned()
+            .unwrap();
 
         let host_id = self.adapters[adapter_idx].instantiate(plugin_id, sample_rate, block_size)?;
 
@@ -100,7 +125,10 @@ impl PluginRegistry {
         self.next_id += 1;
 
         self.instances.push(PluginInstance {
-            registry_id, host_id, adapter_idx, descriptor,
+            registry_id,
+            host_id,
+            adapter_idx,
+            descriptor,
             state: InstanceState::Active,
         });
 
@@ -108,7 +136,9 @@ impl PluginRegistry {
     }
 
     pub fn process(&mut self, registry_id: u64, input: &[f32], output: &mut [f32]) -> Result<()> {
-        let inst = self.instances.iter()
+        let inst = self
+            .instances
+            .iter()
             .find(|i| i.registry_id == registry_id)
             .ok_or_else(|| anyhow::anyhow!("Instance {registry_id} not found"))?;
 
@@ -121,7 +151,11 @@ impl PluginRegistry {
     }
 
     pub fn destroy(&mut self, registry_id: u64) {
-        if let Some(idx) = self.instances.iter().position(|i| i.registry_id == registry_id) {
+        if let Some(idx) = self
+            .instances
+            .iter()
+            .position(|i| i.registry_id == registry_id)
+        {
             let inst = &mut self.instances[idx];
             if inst.state != InstanceState::Destroyed {
                 self.adapters[inst.adapter_idx].destroy(inst.host_id);
@@ -161,11 +195,15 @@ impl PluginRegistry {
 
     pub fn shutdown(&mut self) {
         let ids: Vec<u64> = self.instances.iter().map(|i| i.registry_id).collect();
-        for id in ids { self.destroy(id); }
+        for id in ids {
+            self.destroy(id);
+        }
         self.adapters.clear();
     }
 }
 
 impl Default for PluginRegistry {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

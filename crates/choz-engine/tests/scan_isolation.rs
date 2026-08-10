@@ -5,7 +5,7 @@
 //! binary has to answer [`choz_engine::scan_worker_main`] before doing anything
 //! else — exactly like the real `choz` binary does.
 
-use choz_engine::{PluginFormat, PluginPaths, SearchDir, scan_all};
+use choz_engine::{scan_all, PluginFormat, PluginPaths, SearchDir};
 
 fn main() {
     // Any of the three worker roles: the engine re-runs this binary for all
@@ -43,10 +43,13 @@ fn main() {
     }
     std::fs::copy(good, dir.join("good.so")).unwrap();
 
-    let mut paths = PluginPaths { entries: Vec::new() };
-    paths
-        .dirs_mut(PluginFormat::Vst2)
-        .push(SearchDir { path: dir.clone(), enabled: true });
+    let mut paths = PluginPaths {
+        entries: Vec::new(),
+    };
+    paths.dirs_mut(PluginFormat::Vst2).push(SearchDir {
+        path: dir.clone(),
+        enabled: true,
+    });
     let found = scan_all(&paths);
     let _ = std::fs::remove_dir_all(&dir);
 

@@ -19,9 +19,29 @@ use choz_ports::{AudioSource, FxProcessor};
 use x11rb::connection::Connection as _;
 use x11rb::protocol::xproto::ConnectionExt as _;
 
-/// Where VST3 bundles live on this system, plus whatever is passed as extra
-/// arguments.
-const DIRS: [&str; 3] = ["/usr/lib/vst3", "/usr/local/lib/vst3", "/home/jorge/repo"];
+/// Where VST3 bundles live, plus `$HOME/.vst3` — the per-user directory the
+/// format specifies. A developer's own scratch directory goes in `VST3_PATH`,
+/// not in here: a path with somebody's name in it is a path that is wrong on
+/// every machine but one.
+fn dirs() -> Vec<String> {
+    let mut out = vec![
+        "/usr/lib/vst3".to_string(),
+        "/usr/local/lib/vst3".to_string(),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        out.push(format!("{}/.vst3", home.to_string_lossy()));
+    }
+    // The same variable the host itself honours.
+    if let Ok(extra) = std::env::var("VST3_PATH") {
+        out.extend(
+            extra
+                .split(':')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        );
+    }
+    out
+}
 
 fn say(line: &str) {
     println!("{line}");
@@ -35,9 +55,12 @@ fn main() {
 
     let (mut opened, mut no_window, mut no_editor) = (0, 0, 0);
 
-    for dir in DIRS {
-        for info in choz_plugin_vst3::scan_directory(std::path::Path::new(dir)) {
-            if only.as_ref().is_some_and(|f| !info.name.contains(f.as_str())) {
+    for dir in dirs() {
+        for info in choz_plugin_vst3::scan_directory(std::path::Path::new(&dir)) {
+            if only
+                .as_ref()
+                .is_some_and(|f| !info.name.contains(f.as_str()))
+            {
                 continue;
             }
             say(&format!("try {} [{}]", info.name, info.path.display()));

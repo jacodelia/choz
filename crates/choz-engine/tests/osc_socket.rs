@@ -35,7 +35,9 @@ fn udp_packets_become_input_events() {
     }
     assert_eq!(got.len(), 2, "both packets arrive, got {got:?}");
     assert!(matches!(got[0], InputEvent::Note(n) if n.note == 60 && n.source == InputSource::Osc));
-    assert!(matches!(got[1], InputEvent::Control(ControlMsg::Gain { tab: 1, value }) if value == 0.25));
+    assert!(
+        matches!(got[1], InputEvent::Control(ControlMsg::Gain { tab: 1, value }) if value == 0.25)
+    );
 
     // Stopping frees the port, so the same one can be bound again right away.
     _osc.stop();

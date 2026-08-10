@@ -25,19 +25,26 @@ pub enum LooperState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Cmd { Record, StopRecord, Play, Stop, Overdub, Clear }
+enum Cmd {
+    Record,
+    StopRecord,
+    Play,
+    Stop,
+    Overdub,
+    Clear,
+}
 
 /// Looper / stutter effect.
 pub struct Looper {
-    buf: Vec<f32>,        // interleaved stereo, pre-allocated for MAX_LOOP_SECS @ 48 kHz
-    cap_frames: usize,    // max frames in buf
-    loop_frames: usize,   // frozen loop length (0 = not yet set)
+    buf: Vec<f32>,      // interleaved stereo, pre-allocated for MAX_LOOP_SECS @ 48 kHz
+    cap_frames: usize,  // max frames in buf
+    loop_frames: usize, // frozen loop length (0 = not yet set)
     write_pos: usize,
     read_pos: usize,
     state: LooperState,
     pending_cmd: Option<Cmd>,
     wet: f32,
-    overdub_mix: f32,     // 0.0–1.0: how much old loop survives on overdub (default 0.85)
+    overdub_mix: f32, // 0.0–1.0: how much old loop survives on overdub (default 0.85)
 }
 
 impl Looper {
@@ -56,13 +63,19 @@ impl Looper {
         }
     }
 
-    pub fn state(&self) -> LooperState { self.state }
+    pub fn state(&self) -> LooperState {
+        self.state
+    }
 
     /// Start recording (overwrites existing loop).
-    pub fn record(&mut self) { self.pending_cmd = Some(Cmd::Record); }
+    pub fn record(&mut self) {
+        self.pending_cmd = Some(Cmd::Record);
+    }
 
     /// Stop recording and lock the loop length; begin playback.
-    pub fn stop_record(&mut self) { self.pending_cmd = Some(Cmd::StopRecord); }
+    pub fn stop_record(&mut self) {
+        self.pending_cmd = Some(Cmd::StopRecord);
+    }
 
     /// Toggle record/stop_record in one call.
     pub fn toggle_record(&mut self) {
@@ -73,10 +86,14 @@ impl Looper {
     }
 
     /// Restart playback.
-    pub fn play(&mut self) { self.pending_cmd = Some(Cmd::Play); }
+    pub fn play(&mut self) {
+        self.pending_cmd = Some(Cmd::Play);
+    }
 
     /// Stop playback.
-    pub fn stop(&mut self) { self.pending_cmd = Some(Cmd::Stop); }
+    pub fn stop(&mut self) {
+        self.pending_cmd = Some(Cmd::Stop);
+    }
 
     /// Toggle play/stop.
     pub fn toggle_play(&mut self) {
@@ -87,12 +104,18 @@ impl Looper {
     }
 
     /// Enable overdub (play + add new input).
-    pub fn overdub(&mut self) { self.pending_cmd = Some(Cmd::Overdub); }
+    pub fn overdub(&mut self) {
+        self.pending_cmd = Some(Cmd::Overdub);
+    }
 
     /// Clear the loop buffer and return to Idle.
-    pub fn clear(&mut self) { self.pending_cmd = Some(Cmd::Clear); }
+    pub fn clear(&mut self) {
+        self.pending_cmd = Some(Cmd::Clear);
+    }
 
-    pub fn set_overdub_mix(&mut self, v: f32) { self.overdub_mix = v.clamp(0.0, 1.0); }
+    pub fn set_overdub_mix(&mut self, v: f32) {
+        self.overdub_mix = v.clamp(0.0, 1.0);
+    }
 }
 
 impl FxProcessor for Looper {
@@ -148,42 +171,46 @@ impl FxProcessor for Looper {
             LooperState::Recording => {
                 for i in 0..frames {
                     if self.write_pos < self.cap_frames {
-                        self.buf[self.write_pos * 2]     = buf[i * 2];
+                        self.buf[self.write_pos * 2] = buf[i * 2];
                         self.buf[self.write_pos * 2 + 1] = buf[i * 2 + 1];
                         self.write_pos += 1;
                     } else {
                         // Buffer full — auto-stop and play
                         self.loop_frames = self.cap_frames;
-                        self.read_pos    = 0;
-                        self.state       = LooperState::Playing;
+                        self.read_pos = 0;
+                        self.state = LooperState::Playing;
                         break;
                     }
                 }
             }
 
             LooperState::Playing => {
-                if self.loop_frames == 0 { return; }
+                if self.loop_frames == 0 {
+                    return;
+                }
                 for i in 0..frames {
                     let loop_l = self.buf[self.read_pos * 2];
                     let loop_r = self.buf[self.read_pos * 2 + 1];
-                    buf[i * 2]     = buf[i * 2]     + self.wet * (loop_l - buf[i * 2]);
+                    buf[i * 2] = buf[i * 2] + self.wet * (loop_l - buf[i * 2]);
                     buf[i * 2 + 1] = buf[i * 2 + 1] + self.wet * (loop_r - buf[i * 2 + 1]);
                     self.read_pos = (self.read_pos + 1) % self.loop_frames;
                 }
             }
 
             LooperState::Overdub => {
-                if self.loop_frames == 0 { return; }
+                if self.loop_frames == 0 {
+                    return;
+                }
                 for i in 0..frames {
                     // Mix input onto existing loop
-                    self.buf[self.read_pos * 2]     =
-                        self.buf[self.read_pos * 2]     * self.overdub_mix + buf[i * 2];
+                    self.buf[self.read_pos * 2] =
+                        self.buf[self.read_pos * 2] * self.overdub_mix + buf[i * 2];
                     self.buf[self.read_pos * 2 + 1] =
                         self.buf[self.read_pos * 2 + 1] * self.overdub_mix + buf[i * 2 + 1];
                     // Output the loop
                     let loop_l = self.buf[self.read_pos * 2];
                     let loop_r = self.buf[self.read_pos * 2 + 1];
-                    buf[i * 2]     = buf[i * 2]     + self.wet * (loop_l - buf[i * 2]);
+                    buf[i * 2] = buf[i * 2] + self.wet * (loop_l - buf[i * 2]);
                     buf[i * 2 + 1] = buf[i * 2 + 1] + self.wet * (loop_r - buf[i * 2 + 1]);
                     self.read_pos = (self.read_pos + 1) % self.loop_frames;
                 }
@@ -194,13 +221,15 @@ impl FxProcessor for Looper {
     fn reset(&mut self) {
         self.buf.fill(0.0);
         self.loop_frames = 0;
-        self.write_pos   = 0;
-        self.read_pos    = 0;
-        self.state       = LooperState::Idle;
+        self.write_pos = 0;
+        self.read_pos = 0;
+        self.state = LooperState::Idle;
         self.pending_cmd = None;
     }
 
-    fn set_mix(&mut self, wet: f32) { self.wet = wet.clamp(0.0, 1.0); }
+    fn set_mix(&mut self, wet: f32) {
+        self.wet = wet.clamp(0.0, 1.0);
+    }
 }
 
 #[cfg(test)]

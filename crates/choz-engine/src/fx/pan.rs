@@ -15,7 +15,11 @@ pub struct Pan {
 
 impl Pan {
     pub fn new() -> Self {
-        Self { pan: 0.0, constant_power: true, mix: 1.0 }
+        Self {
+            pan: 0.0,
+            constant_power: true,
+            mix: 1.0,
+        }
     }
 
     fn gains(&self) -> (f32, f32) {
@@ -32,7 +36,9 @@ impl Pan {
 }
 
 impl Default for Pan {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl super::FxProcessor for Pan {
@@ -46,10 +52,14 @@ impl super::FxProcessor for Pan {
     }
 
     fn process_block(&mut self, buf: &mut [f32], _sample_rate: u32) {
-        if self.pan == 0.0 { return; }
+        if self.pan == 0.0 {
+            return;
+        }
         let (gl, gr) = self.gains();
         for chunk in buf.chunks_mut(2) {
-            if chunk.len() < 2 { break; }
+            if chunk.len() < 2 {
+                break;
+            }
             let dry_l = chunk[0];
             let dry_r = chunk[1];
             chunk[0] = dry_l * gl * self.mix + dry_l * (1.0 - self.mix);
@@ -59,7 +69,9 @@ impl super::FxProcessor for Pan {
 
     fn reset(&mut self) {}
 
-    fn set_mix(&mut self, wet: f32) { self.mix = wet.clamp(0.0, 1.0); }
+    fn set_mix(&mut self, wet: f32) {
+        self.mix = wet.clamp(0.0, 1.0);
+    }
 }
 
 #[cfg(test)]
@@ -87,7 +99,11 @@ mod tests {
         let mut buf = vec![1.0f32, 1.0, 1.0, 1.0];
         p.process_block(&mut buf, 48000);
         // Right channel should be near zero
-        assert!(buf[1].abs() < 0.01, "full-left pan should silence R, got {}", buf[1]);
+        assert!(
+            buf[1].abs() < 0.01,
+            "full-left pan should silence R, got {}",
+            buf[1]
+        );
         // Left channel should be non-zero
         assert!(buf[0] > 0.5, "full-left pan should preserve L");
     }
@@ -99,7 +115,11 @@ mod tests {
         p.constant_power = false;
         let mut buf = vec![1.0f32, 1.0, 1.0, 1.0];
         p.process_block(&mut buf, 48000);
-        assert!(buf[0].abs() < 0.01, "full-right pan should silence L, got {}", buf[0]);
+        assert!(
+            buf[0].abs() < 0.01,
+            "full-right pan should silence L, got {}",
+            buf[0]
+        );
         assert!(buf[1] > 0.5, "full-right pan should preserve R");
     }
 }

@@ -42,7 +42,9 @@ fn scan_recursive(dir: &Path, depth: usize, out: &mut Vec<Vst3PluginInfo>) {
     if depth > 4 {
         return;
     }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         let path = entry.path();
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -66,7 +68,11 @@ pub fn describe(path: &Path) -> Vst3PluginInfo {
     match host::factory_info(path) {
         Some(info) => Vst3PluginInfo {
             path: path.to_path_buf(),
-            name: if info.name.is_empty() { name } else { info.name },
+            name: if info.name.is_empty() {
+                name
+            } else {
+                info.name
+            },
             vendor: info.vendor,
             is_instrument: info.is_instrument,
         },
@@ -82,7 +88,9 @@ pub fn describe(path: &Path) -> Vst3PluginInfo {
 /// Parameters exposed by the plugin's edit controller. Non-RT: this loads the
 /// plugin, so it runs once when an effect or instrument is added.
 pub fn read_params(path: &Path, _id: &str) -> Vec<PluginParam> {
-    let Ok(inst) = Vst3RealInstance::load(path, 48_000, 64) else { return Vec::new() };
+    let Ok(inst) = Vst3RealInstance::load(path, 48_000, 64) else {
+        return Vec::new();
+    };
     (0..inst.param_count())
         .map(|id| {
             let (steps, points) = inst.param_steps(id);

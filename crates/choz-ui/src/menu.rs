@@ -51,10 +51,20 @@ pub struct MenuItem {
 
 impl MenuItem {
     const fn item(label: &'static str, shortcut: &'static str, action: MenuAction) -> Self {
-        Self { label, shortcut, action, separator: false }
+        Self {
+            label,
+            shortcut,
+            action,
+            separator: false,
+        }
     }
     const fn sep() -> Self {
-        Self { label: "", shortcut: "", action: MenuAction::None, separator: true }
+        Self {
+            label: "",
+            shortcut: "",
+            action: MenuAction::None,
+            separator: true,
+        }
     }
 }
 
@@ -86,9 +96,7 @@ static EDIT_MENU: &[MenuItem] = &[
     MenuItem::item("Rescan plugin paths", "", MenuAction::RescanPlugins),
 ];
 
-static HELP_MENU: &[MenuItem] = &[
-    MenuItem::item("About choz", "", MenuAction::About),
-];
+static HELP_MENU: &[MenuItem] = &[MenuItem::item("About choz", "", MenuAction::About)];
 
 /// Open-menu state: which menu and the highlighted item (real item index,
 /// separators skipped during navigation).
@@ -106,7 +114,11 @@ impl MenuState {
     }
 
     fn first_selectable(&self) -> usize {
-        self.kind.items().iter().position(|i| !i.separator).unwrap_or(0)
+        self.kind
+            .items()
+            .iter()
+            .position(|i| !i.separator)
+            .unwrap_or(0)
     }
 
     pub fn move_down(&mut self) {
@@ -139,11 +151,19 @@ impl MenuState {
         let all = MenuKind::ALL;
         let idx = all.iter().position(|k| *k == self.kind).unwrap_or(0);
         let n = all.len();
-        let next = if forward { (idx + 1) % n } else { (idx + n - 1) % n };
+        let next = if forward {
+            (idx + 1) % n
+        } else {
+            (idx + n - 1) % n
+        };
         *self = MenuState::open(all[next]);
     }
 
     pub fn current_action(&self) -> MenuAction {
-        self.kind.items().get(self.cursor).map(|i| i.action).unwrap_or(MenuAction::None)
+        self.kind
+            .items()
+            .get(self.cursor)
+            .map(|i| i.action)
+            .unwrap_or(MenuAction::None)
     }
 }

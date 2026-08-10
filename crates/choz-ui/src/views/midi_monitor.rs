@@ -5,18 +5,20 @@
 //! input traffic (MIDI ports, OSC) passes through — the QWERTY piano drives the
 //! engine directly and is deliberately not logged as MIDI.
 
-use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::Frame;
 
 use choz_engine::input::{InputEvent, InputSource};
 
 use super::theme::{self, ACCENT, DIM, HEADER, OK, WARN};
 
 /// Note names, sharps only — flats would need a key signature to choose.
-const NOTE_NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+const NOTE_NAMES: [&str; 12] = [
+    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+];
 
 /// Scientific pitch: MIDI 60 is C4, so octave = note/12 - 1.
 pub fn note_name(note: u8) -> String {
@@ -63,7 +65,9 @@ fn line(event: &InputEvent, ports: &[String]) -> Line<'static> {
         InputEvent::Note(m) => (m.source, "NOTE OFF".to_string(), note_name(m.note), DIM),
         InputEvent::Cc(m) => (
             m.source,
-            cc_name(m.cc).map(str::to_string).unwrap_or_else(|| format!("CC {}", m.cc)),
+            cc_name(m.cc)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("CC {}", m.cc)),
             m.value.to_string(),
             ACCENT,
         ),
@@ -90,8 +94,14 @@ fn line(event: &InputEvent, ports: &[String]) -> Line<'static> {
     };
 
     Line::from(vec![
-        Span::styled(format!("{:<15}", source_label(source, ports)), Style::default().fg(DIM)),
-        Span::styled(format!("{what:<11}"), Style::default().fg(colour).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{:<15}", source_label(source, ports)),
+            Style::default().fg(DIM),
+        ),
+        Span::styled(
+            format!("{what:<11}"),
+            Style::default().fg(colour).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(detail, Style::default().fg(theme::text())),
     ])
 }
@@ -159,7 +169,10 @@ pub fn draw_midi_monitor(
         let w = text.chars().count() as u16;
         rects.push((t, Rect::new(x, inner.y, w, 1)));
         let style = if t == tab {
-            Style::default().fg(ratatui::style::Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(ratatui::style::Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(HEADER)
         };
@@ -171,7 +184,12 @@ pub fn draw_midi_monitor(
         Paragraph::new(Line::from(spans)).style(super::theme::panel_style()),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
-    let inner = Rect::new(inner.x, inner.y + 1, inner.width, inner.height.saturating_sub(1));
+    let inner = Rect::new(
+        inner.x,
+        inner.y + 1,
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
     if inner.height == 0 {
         return rects;
     }
@@ -201,7 +219,10 @@ pub fn draw_midi_monitor(
             .collect()
     };
 
-    f.render_widget(Paragraph::new(lines).style(super::theme::panel_style()), inner);
+    f.render_widget(
+        Paragraph::new(lines).style(super::theme::panel_style()),
+        inner,
+    );
     rects
 }
 
@@ -245,7 +266,10 @@ fn draw_wave(f: &mut Frame, area: Rect) {
             .collect();
         lines.push(Line::from(spans));
     }
-    f.render_widget(Paragraph::new(lines).style(super::theme::panel_style()), area);
+    f.render_widget(
+        Paragraph::new(lines).style(super::theme::panel_style()),
+        area,
+    );
 }
 
 /// How loud it is: peak and RMS as two bars, with the numbers in dB.
@@ -259,12 +283,20 @@ fn draw_activity(f: &mut Frame, area: Rect) {
         // dBFS over 60 dB, because a linear meter is all top and no bottom.
         let db = if v > 1e-6 { 20.0 * v.log10() } else { -60.0 };
         let filled = (((db + 60.0) / 60.0).clamp(0.0, 1.0) * width as f32).round() as usize;
-        format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(width.saturating_sub(filled)))
+        format!(
+            "{}{}",
+            "\u{2588}".repeat(filled),
+            "\u{2591}".repeat(width.saturating_sub(filled))
+        )
     };
     let db_text = |v: f32| -> String {
         // Always in dB, silence included: "-inf dB" is a reading, "-inf" alone
         // looks like a missing unit.
-        if v > 1e-6 { format!("{:>6.1} dB", 20.0 * v.log10()) } else { "  -inf dB".to_string() }
+        if v > 1e-6 {
+            format!("{:>6.1} dB", 20.0 * v.log10())
+        } else {
+            "  -inf dB".to_string()
+        }
     };
     let colour = |v: f32| {
         if v >= 0.99 {
@@ -292,7 +324,10 @@ fn draw_activity(f: &mut Frame, area: Rect) {
             Style::default().fg(WARN).add_modifier(Modifier::BOLD),
         )),
     ];
-    f.render_widget(Paragraph::new(lines).style(super::theme::panel_style()), area);
+    f.render_widget(
+        Paragraph::new(lines).style(super::theme::panel_style()),
+        area,
+    );
 }
 
 #[cfg(test)]
@@ -315,24 +350,56 @@ mod tests {
         let ports = vec!["Keystation Pro 88".to_string()];
         let src = InputSource::Midi(0);
         let text = |e: InputEvent| {
-            line(&e, &ports).spans.iter().map(|s| s.content.to_string()).collect::<String>()
+            line(&e, &ports)
+                .spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
         };
 
-        let sustain = text(InputEvent::Cc(CcMsg { source: src, channel: 0, cc: 64, value: 127 }));
+        let sustain = text(InputEvent::Cc(CcMsg {
+            source: src,
+            channel: 0,
+            cc: 64,
+            value: 127,
+        }));
         assert!(sustain.contains("SUSTAIN"), "got {sustain:?}");
         assert!(sustain.contains("Keystation"), "port is named: {sustain:?}");
 
-        let unknown = text(InputEvent::Cc(CcMsg { source: src, channel: 0, cc: 23, value: 5 }));
-        assert!(unknown.contains("CC 23"), "unnamed controllers fall back to a number");
+        let unknown = text(InputEvent::Cc(CcMsg {
+            source: src,
+            channel: 0,
+            cc: 23,
+            value: 5,
+        }));
+        assert!(
+            unknown.contains("CC 23"),
+            "unnamed controllers fall back to a number"
+        );
 
         // A wheel at rest reads 0, not 8192.
-        let centre = text(InputEvent::Bend(BendMsg { source: src, value: 8192 }));
+        let centre = text(InputEvent::Bend(BendMsg {
+            source: src,
+            value: 8192,
+        }));
         assert!(centre.contains("+0"), "got {centre:?}");
-        let down = text(InputEvent::Bend(BendMsg { source: src, value: 0 }));
+        let down = text(InputEvent::Bend(BendMsg {
+            source: src,
+            value: 0,
+        }));
         assert!(down.contains("-8192"), "got {down:?}");
 
-        let note = text(InputEvent::Note(NoteMsg { source: src, channel: 0, on: true, note: 60, vel: 100 }));
-        assert!(note.contains("C4") && note.contains("vel 100"), "got {note:?}");
+        let note = text(InputEvent::Note(NoteMsg {
+            source: src,
+            channel: 0,
+            on: true,
+            note: 60,
+            vel: 100,
+        }));
+        assert!(
+            note.contains("C4") && note.contains("vel 100"),
+            "got {note:?}"
+        );
     }
 
     /// An unknown port index must not panic the draw path.
@@ -373,13 +440,27 @@ mod tests {
         let src = InputSource::Midi(0);
         // More messages than the 6 inner rows of an 8-row panel.
         let events: Vec<InputEvent> = (0..20)
-            .map(|i| InputEvent::Note(NoteMsg { source: src, channel: 0, on: true, note: 40 + i, vel: 100 }))
+            .map(|i| {
+                InputEvent::Note(NoteMsg {
+                    source: src,
+                    channel: 0,
+                    on: true,
+                    note: 40 + i,
+                    vel: 100,
+                })
+            })
             .collect();
 
         let screen = render(&events, &ports, 50, 8);
         assert!(screen.contains("MIDI IN"), "panel is titled:\n{screen}");
-        assert!(screen.contains(&note_name(59)), "newest message is shown:\n{screen}");
-        assert!(!screen.contains(&note_name(40)), "oldest scrolled off:\n{screen}");
+        assert!(
+            screen.contains(&note_name(59)),
+            "newest message is shown:\n{screen}"
+        );
+        assert!(
+            !screen.contains(&note_name(40)),
+            "oldest scrolled off:\n{screen}"
+        );
     }
 
     #[test]
@@ -392,7 +473,13 @@ mod tests {
     #[test]
     fn survives_being_squeezed_to_nothing() {
         let src = InputSource::Midi(0);
-        let e = [InputEvent::Note(NoteMsg { source: src, channel: 0, on: true, note: 60, vel: 100 })];
+        let e = [InputEvent::Note(NoteMsg {
+            source: src,
+            channel: 0,
+            on: true,
+            note: 60,
+            vel: 100,
+        })];
         for h in 0..4 {
             render(&e, &[], 30, h);
         }
@@ -406,11 +493,20 @@ mod tests {
         choz_engine::meter::meter().clear();
         let midi = render_tab(&[], &[], 60, 10, MonitorTab::Midi);
         assert!(midi.contains("MIDI") && midi.contains("WAVE") && midi.contains("ACTIVITY"));
-        assert!(midi.contains("waiting for MIDI"), "the MIDI tab is the messages");
+        assert!(
+            midi.contains("waiting for MIDI"),
+            "the MIDI tab is the messages"
+        );
 
         let wave = render_tab(&[], &[], 60, 10, MonitorTab::Wave);
-        assert!(!wave.contains("waiting for MIDI"), "a different tab, different content");
-        assert!(wave.contains('\u{2500}'), "silence still draws its centre line");
+        assert!(
+            !wave.contains("waiting for MIDI"),
+            "a different tab, different content"
+        );
+        assert!(
+            wave.contains('\u{2500}'),
+            "silence still draws its centre line"
+        );
 
         // A block through the meter and the wave has something in it.
         let buf: Vec<f32> = (0..512)
@@ -422,13 +518,20 @@ mod tests {
         choz_engine::meter::meter().publish(&buf);
         let wave = render_tab(&[], &[], 60, 10, MonitorTab::Wave);
         assert!(
-            wave.chars().any(|c| c == '\u{2588}' || c == '\u{2580}' || c == '\u{2584}'),
+            wave.chars()
+                .any(|c| c == '\u{2588}' || c == '\u{2580}' || c == '\u{2584}'),
             "the shape of the sound: {wave}"
         );
 
         let activity = render_tab(&[], &[], 60, 10, MonitorTab::Activity);
-        assert!(activity.contains("PEAK") && activity.contains("RMS"), "{activity}");
-        assert!(activity.contains("dB"), "levels in dB, not in fractions: {activity}");
+        assert!(
+            activity.contains("PEAK") && activity.contains("RMS"),
+            "{activity}"
+        );
+        assert!(
+            activity.contains("dB"),
+            "levels in dB, not in fractions: {activity}"
+        );
         choz_engine::meter::meter().clear();
     }
 

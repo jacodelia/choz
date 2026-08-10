@@ -6,8 +6,8 @@
 //! every editor call — happens on the one thread this module spawns, which is
 //! what the plugin APIs require; the audio thread keeps rendering meanwhile.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use choz_ports::EditorHandle;
 
@@ -24,14 +24,14 @@ pub struct EditorWindow {
 impl EditorWindow {
     /// Open `handle`'s editor in a new window. `None` if no window system is
     /// available (no `DISPLAY`, or a build without X11).
-    pub fn open(
-        key: (usize, Option<usize>),
-        handle: EditorHandle,
-        title: String,
-    ) -> Option<Self> {
+    pub fn open(key: (usize, Option<usize>), handle: EditorHandle, title: String) -> Option<Self> {
         let close = Arc::new(AtomicBool::new(false));
         let thread = spawn(handle, Arc::clone(&close), title)?;
-        Some(Self { close, thread: Some(thread), key })
+        Some(Self {
+            close,
+            thread: Some(thread),
+            key,
+        })
     }
 
     /// False once the user closed the window from the window manager.
@@ -89,11 +89,11 @@ mod x11 {
     use std::time::Duration;
 
     use x11rb::connection::Connection;
-    use x11rb::protocol::Event;
     use x11rb::protocol::xproto::{
         AtomEnum, ConfigureWindowAux, ConnectionExt, CreateWindowAux, EventMask, PropMode,
         WindowClass,
     };
+    use x11rb::protocol::Event;
     use x11rb::wrapper::ConnectionExt as _;
 
     /// Default size until the plugin reports the one it wants.
@@ -122,7 +122,13 @@ mod x11 {
         // killing the connection under the plugin.
         let wm_protocols = conn.intern_atom(false, b"WM_PROTOCOLS")?.reply()?.atom;
         let wm_delete = conn.intern_atom(false, b"WM_DELETE_WINDOW")?.reply()?.atom;
-        conn.change_property32(PropMode::REPLACE, win, wm_protocols, AtomEnum::ATOM, &[wm_delete])?;
+        conn.change_property32(
+            PropMode::REPLACE,
+            win,
+            wm_protocols,
+            AtomEnum::ATOM,
+            &[wm_delete],
+        )?;
         conn.change_property8(
             PropMode::REPLACE,
             win,

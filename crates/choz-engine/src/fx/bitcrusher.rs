@@ -43,13 +43,15 @@ impl Bitcrusher {
     fn crush(&self, s: f32) -> f32 {
         // Quantise to 2^bits steps in [-1, 1].
         let levels = (1u32 << self.bits) as f32;
-        let half   = levels * 0.5;
+        let half = levels * 0.5;
         ((s * half).round() / half).clamp(-1.0, 1.0)
     }
 }
 
 impl Default for Bitcrusher {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FxProcessor for Bitcrusher {
@@ -71,7 +73,7 @@ impl FxProcessor for Bitcrusher {
             }
             let dry_l = buf[i * 2];
             let dry_r = buf[i * 2 + 1];
-            buf[i * 2]     = dry_l + self.wet * (self.held_l - dry_l);
+            buf[i * 2] = dry_l + self.wet * (self.held_l - dry_l);
             buf[i * 2 + 1] = dry_r + self.wet * (self.held_r - dry_r);
             self.hold_counter += 1;
             if self.hold_counter >= self.hold {

@@ -135,13 +135,23 @@ fn load(
     // One copy covers the whole screen when stretching; a third of the width
     // when tiling, keeping the source's aspect ratio.
     let tile = match fit {
-        ImageFit::Stretch => Rect { x: 0, y: 0, width: area.width, height: area.height },
+        ImageFit::Stretch => Rect {
+            x: 0,
+            y: 0,
+            width: area.width,
+            height: area.height,
+        },
         ImageFit::Tile => {
             let w = (area.width / 3).max(8);
             let px_w = w as u32 * FONT_SIZE.0 as u32;
             let px_h = px_w * img.height().max(1) / img.width().max(1);
             let h = ((px_h / FONT_SIZE.1 as u32).max(4) as u16).min(area.height.max(1));
-            Rect { x: 0, y: 0, width: w, height: h }
+            Rect {
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+            }
         }
     };
 
@@ -157,7 +167,11 @@ fn load(
         tile.width as u32 * FONT_SIZE.0 as u32,
         tile.height as u32 * FONT_SIZE.1 as u32,
     );
-    let img = img.resize_exact(px.0.max(1), px.1.max(1), image::imageops::FilterType::Lanczos3);
+    let img = img.resize_exact(
+        px.0.max(1),
+        px.1.max(1),
+        image::imageops::FilterType::Lanczos3,
+    );
     let cells = cell_colors(&img.to_rgba8(), tile.width, tile.height);
 
     let mut picker = Picker::from_fontsize(FONT_SIZE);
@@ -167,7 +181,12 @@ fn load(
     // The image already matches the area exactly, so this is a no-op resize.
     let protocol = picker.new_protocol(img, tile, Resize::Fit(None)).ok()?;
 
-    *cache = Some(Wallpaper { key, protocol, tile, cells });
+    *cache = Some(Wallpaper {
+        key,
+        protocol,
+        tile,
+        cells,
+    });
     Some(())
 }
 
@@ -223,7 +242,12 @@ mod tests {
     use super::*;
 
     fn area(w: u16, h: u16) -> Rect {
-        Rect { x: 0, y: 0, width: w, height: h }
+        Rect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        }
     }
 
     fn sample() -> Option<&'static std::path::Path> {
@@ -268,10 +292,16 @@ mod tests {
         render(
             &mut buf,
             a,
-            &Background::Image { path: "/nope/missing.png".into(), fit: ImageFit::Stretch },
+            &Background::Image {
+                path: "/nope/missing.png".into(),
+                fit: ImageFit::Stretch,
+            },
             &mut cache,
         );
-        assert!(cache.is_none(), "nothing cached for a file that cannot be read");
+        assert!(
+            cache.is_none(),
+            "nothing cached for a file that cannot be read"
+        );
         assert_eq!(buf[(0, 0)].bg, Color::Reset, "and the buffer is left alone");
     }
 
@@ -284,10 +314,22 @@ mod tests {
         let a = area(20, 10);
         let mut buf = ratatui::buffer::Buffer::empty(a);
         let mut cache = None;
-        render(&mut buf, a, &Background::Image { path: path.into(), fit: ImageFit::Stretch }, &mut cache);
+        render(
+            &mut buf,
+            a,
+            &Background::Image {
+                path: path.into(),
+                fit: ImageFit::Stretch,
+            },
+            &mut cache,
+        );
 
         let w = cache.as_ref().expect("decoded");
-        assert_eq!((w.tile.width, w.tile.height), (20, 10), "stretch covers the area");
+        assert_eq!(
+            (w.tile.width, w.tile.height),
+            (20, 10),
+            "stretch covers the area"
+        );
 
         let painted = (0..10)
             .flat_map(|y| (0..20).map(move |x| (x, y)))
@@ -305,7 +347,10 @@ mod tests {
                 c.symbol() == "\u{2580}" && c.fg != c.bg
             })
             .count();
-        assert!(two_tone > 0, "no cell carries two colours; resolution was lost");
+        assert!(
+            two_tone > 0,
+            "no cell carries two colours; resolution was lost"
+        );
     }
 
     #[test]
@@ -314,7 +359,10 @@ mod tests {
         let a = area(20, 10);
         let mut buf = ratatui::buffer::Buffer::empty(a);
         let mut cache = None;
-        let bg = Background::Image { path: path.into(), fit: ImageFit::Stretch };
+        let bg = Background::Image {
+            path: path.into(),
+            fit: ImageFit::Stretch,
+        };
 
         render(&mut buf, a, &bg, &mut cache);
         let key = cache.as_ref().unwrap().key.clone();
@@ -334,10 +382,22 @@ mod tests {
         let a = area(60, 20);
         let mut buf = ratatui::buffer::Buffer::empty(a);
         let mut cache = None;
-        render(&mut buf, a, &Background::Image { path: path.into(), fit: ImageFit::Tile }, &mut cache);
+        render(
+            &mut buf,
+            a,
+            &Background::Image {
+                path: path.into(),
+                fit: ImageFit::Tile,
+            },
+            &mut cache,
+        );
 
         let w = cache.as_ref().expect("decoded");
-        assert!(w.tile.width < a.width, "a tile is smaller than the screen: {}", w.tile.width);
+        assert!(
+            w.tile.width < a.width,
+            "a tile is smaller than the screen: {}",
+            w.tile.width
+        );
         assert!(w.tile.height > 0);
         // The far side of the screen is painted too, which only happens if the
         // tile was repeated rather than drawn once.
@@ -360,7 +420,15 @@ mod tests {
             let a = area(150, 40);
             let mut buf = ratatui::buffer::Buffer::empty(a);
             let mut cache = None;
-            render(&mut buf, a, &Background::Image { path, fit: ImageFit::Stretch }, &mut cache);
+            render(
+                &mut buf,
+                a,
+                &Background::Image {
+                    path,
+                    fit: ImageFit::Stretch,
+                },
+                &mut cache,
+            );
             let mut colours = std::collections::HashSet::new();
             let (mut painted, mut two_tone) = (0, 0);
             for y in 0..a.height {
@@ -421,7 +489,11 @@ mod tests {
             Color::Rgb(90, 40, 120),
             "the panel body still shows the desktop"
         );
-        assert_eq!(buf[(0, 0)].bg, Color::Rgb(90, 40, 120), "and so does the border cell");
+        assert_eq!(
+            buf[(0, 0)].bg,
+            Color::Rgb(90, 40, 120),
+            "and so does the border cell"
+        );
 
         // With a wash configured the panel is that colour blended over the
         // desktop — translucent, because a cell background cannot be.
@@ -433,8 +505,16 @@ mod tests {
             .borders(Borders::ALL)
             .style(crate::views::theme::panel_style())
             .render(a, &mut buf);
-        assert_eq!(buf[(5, 2)].bg, Color::Rgb(45, 20, 60), "half way to the tint");
-        assert_eq!(buf[(9, 3)].bg, Color::Rgb(45, 20, 60), "the whole panel, corners too");
+        assert_eq!(
+            buf[(5, 2)].bg,
+            Color::Rgb(45, 20, 60),
+            "half way to the tint"
+        );
+        assert_eq!(
+            buf[(9, 3)].bg,
+            Color::Rgb(45, 20, 60),
+            "the whole panel, corners too"
+        );
         // Outside the panel the desktop is untouched, which is what makes it a
         // panel and not a filter.
         crate::views::theme::set_panel_fill(None);
@@ -446,6 +526,10 @@ mod tests {
             .borders(Borders::ALL)
             .style(crate::views::theme::panel_style())
             .render(a, &mut buf);
-        assert_eq!(buf[(5, 2)].bg, crate::views::theme::PANEL_BG, "solid when there is no desktop");
+        assert_eq!(
+            buf[(5, 2)].bg,
+            crate::views::theme::PANEL_BG,
+            "solid when there is no desktop"
+        );
     }
 }

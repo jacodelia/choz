@@ -52,7 +52,10 @@ fn voice(phase: &mut f32, hz: f32, sr: f32, frames: usize) -> Vec<f32> {
         .flat_map(|_| {
             let p = *phase;
             let s = 0.2
-                * (0.5 * p.sin() + (2.0 * p).sin() + 0.6 * (3.0 * p).sin() + 0.25 * (4.0 * p).sin());
+                * (0.5 * p.sin()
+                    + (2.0 * p).sin()
+                    + 0.6 * (3.0 * p).sin()
+                    + 0.25 * (4.0 * p).sin());
             *phase = (*phase + step) % std::f32::consts::TAU;
             [s, s]
         })

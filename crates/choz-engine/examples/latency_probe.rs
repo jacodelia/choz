@@ -17,7 +17,9 @@ fn main() -> anyhow::Result<()> {
 
     let sf2 = std::path::Path::new("/usr/share/sounds/sf2/FluidR3_GM.sf2");
     for i in 0..slots {
-        let Some(slot) = engine.add_silent() else { break };
+        let Some(slot) = engine.add_silent() else {
+            break;
+        };
         engine.load_sf2(slot, sf2, 0, (i * 8) as u8)?;
     }
     engine.set_playing(true);
@@ -28,7 +30,10 @@ fn main() -> anyhow::Result<()> {
             engine.note_on(i, n, 100);
         }
     }
-    println!("buffer={buffer} slots={slots} out={:?}", engine.output_device());
+    println!(
+        "buffer={buffer} slots={slots} out={:?}",
+        engine.output_device()
+    );
 
     // Starting up (and re-negotiating the quantum) always costs a few xruns;
     // only what happens after the graph settles says anything about latency.

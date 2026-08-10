@@ -10,7 +10,7 @@
 use std::ffi::CString;
 use std::os::raw::c_void;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
 /// A mapped shared-memory region.
 pub struct Shm {
@@ -42,7 +42,11 @@ impl Shm {
 
     fn open_inner(name: &str, len: usize, create: bool) -> Result<Self> {
         let cname = CString::new(name).context("shm name has an interior NUL")?;
-        let flags = if create { libc::O_CREAT | libc::O_EXCL | libc::O_RDWR } else { libc::O_RDWR };
+        let flags = if create {
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR
+        } else {
+            libc::O_RDWR
+        };
         // 0o600: both processes run as the same user, nobody else needs it.
         let fd = unsafe { libc::shm_open(cname.as_ptr(), flags, 0o600) };
         if fd < 0 {
@@ -75,7 +79,12 @@ impl Shm {
             }
             bail!("mmap({name}, {len}): {e}");
         }
-        Ok(Self { name: cname, ptr: ptr as *mut c_void, len, owner: create })
+        Ok(Self {
+            name: cname,
+            ptr: ptr as *mut c_void,
+            len,
+            owner: create,
+        })
     }
 
     /// Base of the mapping. Valid for `len` bytes while this handle lives.

@@ -241,12 +241,18 @@ impl PitchTracker {
         }
         self.quiet = 0;
 
-        let Some((freq, clarity)) = self.detect() else { return (NONE, 0) };
+        let Some((freq, clarity)) = self.detect() else {
+            return (NONE, 0);
+        };
         // While the window still holds the previous note, the dip is shallow —
         // that mixture is what produced a spurious semitone on the way from one
         // note to the next. Changing note asks for a cleaner reading than
         // starting one from silence does.
-        let needed = if self.sounding.is_some() { CHANGE_CLARITY } else { ONSET_CLARITY };
+        let needed = if self.sounding.is_some() {
+            CHANGE_CLARITY
+        } else {
+            ONSET_CLARITY
+        };
         if clarity < needed {
             return (NONE, 0);
         }
@@ -289,7 +295,10 @@ impl PitchTracker {
         self.cents = ((exact - note as f32) * 100.0).round() as i32;
         // The off goes first: the other order lets the old note's release cut
         // the new one short.
-        let off = self.sounding.replace(note).map(|old| PitchEvent::Off { note: old });
+        let off = self
+            .sounding
+            .replace(note)
+            .map(|old| PitchEvent::Off { note: old });
         let on = Some(PitchEvent::On { note, velocity });
         match off {
             Some(_) => ([off, on], 2),
@@ -309,8 +318,14 @@ impl PitchTracker {
         let half = WINDOW / 2;
         let min_lag = (self.work_rate / note_to_freq(MAX_NOTE)) as usize;
         let max_lag = (self.work_rate / note_to_freq(MIN_NOTE)) as usize;
-        let (period, clarity) =
-            yin(&self.window, self.write, half, min_lag, max_lag, &mut self.diff)?;
+        let (period, clarity) = yin(
+            &self.window,
+            self.write,
+            half,
+            min_lag,
+            max_lag,
+            &mut self.diff,
+        )?;
         Some((self.work_rate / period, clarity))
     }
 }
@@ -341,7 +356,9 @@ pub fn yin(
     diff: &mut [f32],
 ) -> Option<(f32, f32)> {
     let n = window.len();
-    let max_lag = max_lag.min(half.saturating_sub(1)).min(diff.len().saturating_sub(1));
+    let max_lag = max_lag
+        .min(half.saturating_sub(1))
+        .min(diff.len().saturating_sub(1));
     let min_lag = min_lag.max(1);
     if n == 0 || half == 0 || min_lag + 2 >= max_lag {
         return None;
@@ -358,7 +375,11 @@ pub fn yin(
             sum += d * d;
         }
         running += sum;
-        *slot = if running > 0.0 { (sum * lag as f64 / running) as f32 } else { 1.0 };
+        *slot = if running > 0.0 {
+            (sum * lag as f64 / running) as f32
+        } else {
+            1.0
+        };
     }
 
     // The first dip under the threshold, not the deepest: the deepest is
@@ -381,7 +402,10 @@ pub fn yin(
         // Nothing convincing: the clearest dip, and only if it is a dip.
         let (i, v) = (min_lag..max_lag)
             .map(|l| (l, diff[l]))
-            .fold((0usize, f32::MAX), |acc, x| if x.1 < acc.1 { x } else { acc });
+            .fold(
+                (0usize, f32::MAX),
+                |acc, x| if x.1 < acc.1 { x } else { acc },
+            );
         (v < 0.4).then_some(i)
     })?;
     if lag == 0 || lag + 1 >= max_lag {
@@ -393,7 +417,11 @@ pub fn yin(
     // on the wrong one.
     let (y0, y1, y2) = (diff[lag - 1], diff[lag], diff[lag + 1]);
     let denom = 2.0 * (2.0 * y1 - y0 - y2);
-    let shift = if denom.abs() > 1e-9 { (y2 - y0) / denom } else { 0.0 };
+    let shift = if denom.abs() > 1e-9 {
+        (y2 - y0) / denom
+    } else {
+        0.0
+    };
     let period = lag as f32 + shift.clamp(-1.0, 1.0);
     // How convincing the dip is: 1 is a perfectly periodic window.
     let clarity = (1.0 - diff[lag]).clamp(0.0, 1.0);
@@ -465,8 +493,11 @@ mod tests {
             let step = 2.0 * std::f32::consts::PI * hz / sr as f32;
             (0..frames)
                 .flat_map(|_| {
-                    let s: f32 =
-                        parts.iter().map(|(m, a)| a * (self.phase * m).sin()).sum::<f32>() * amp;
+                    let s: f32 = parts
+                        .iter()
+                        .map(|(m, a)| a * (self.phase * m).sin())
+                        .sum::<f32>()
+                        * amp;
                     self.phase = (self.phase + step) % (2.0 * std::f32::consts::PI);
                     [s, s]
                 })
@@ -475,9 +506,14 @@ mod tests {
     }
 
     /// Collect every event a run of blocks produces.
-    fn drain(t: &mut PitchTracker, tone: &mut Tone, hz: f32, sr: u32, blocks: usize, amp: f32)
-        -> Vec<PitchEvent>
-    {
+    fn drain(
+        t: &mut PitchTracker,
+        tone: &mut Tone,
+        hz: f32,
+        sr: u32,
+        blocks: usize,
+        amp: f32,
+    ) -> Vec<PitchEvent> {
         let mut out = Vec::new();
         for _ in 0..blocks {
             let (ev, n) = t.process(&tone.block(hz, sr, 256, amp), sr);
@@ -491,14 +527,28 @@ mod tests {
     /// is always the rounded one — one jack in, one note out.
     #[test]
     fn ftom_is_the_conversion_csound_documents() {
-        assert!((freq_to_note_exact(440.0) - 69.0).abs() < 1e-4, "A4 = 440 Hz = note 69");
-        assert!((freq_to_note_exact(880.0) - 81.0).abs() < 1e-4, "an octave is twelve");
+        assert!(
+            (freq_to_note_exact(440.0) - 69.0).abs() < 1e-4,
+            "A4 = 440 Hz = note 69"
+        );
+        assert!(
+            (freq_to_note_exact(880.0) - 81.0).abs() < 1e-4,
+            "an octave is twelve"
+        );
         // A quarter tone up is half a semitone: `irnd = 0` says so, and
         // `irnd = 1` rounds it to a real note.
         let quarter_up = 440.0 * 2f32.powf(0.5 / 12.0);
         assert!((freq_to_note_exact(quarter_up) - 69.5).abs() < 1e-3);
-        assert_eq!(freq_to_note(quarter_up), 70, "rounded to the nearest integer");
-        assert_eq!(freq_to_note(440.0 * 2f32.powf(0.49 / 12.0)), 69, "and down when nearer");
+        assert_eq!(
+            freq_to_note(quarter_up),
+            70,
+            "rounded to the nearest integer"
+        );
+        assert_eq!(
+            freq_to_note(440.0 * 2f32.powf(0.49 / 12.0)),
+            69,
+            "and down when nearer"
+        );
         assert_eq!(freq_to_note_exact(0.0), 0.0, "silence is not a note");
     }
 
@@ -523,12 +573,18 @@ mod tests {
         assert!(events.is_empty(), "one note held, not {events:?}");
         assert_eq!(t.sounding(), Some(55));
         // The display still follows the pitch, even though the synth does not.
-        assert!(t.cents().abs() < 20, "the reading tracks it: {} cents", t.cents());
+        assert!(
+            t.cents().abs() < 20,
+            "the reading tracks it: {} cents",
+            t.cents()
+        );
 
         // A real semitone up **is** a new note.
         let events = drain(&mut t, &mut tone, 207.65, sr, 60, 0.5);
         assert!(
-            events.iter().any(|e| matches!(e, PitchEvent::On { note: 56, .. })),
+            events
+                .iter()
+                .any(|e| matches!(e, PitchEvent::On { note: 56, .. })),
             "a semitone up is a new note: {events:?}"
         );
         assert_eq!(t.sounding(), Some(56));
@@ -550,8 +606,10 @@ mod tests {
                 .flat_map(|_| {
                     let a = 0.5 * l.sin();
                     let b = -0.5 * r.sin();
-                    l = (l + 2.0 * std::f32::consts::PI * 196.0 / sr as f32) % std::f32::consts::TAU;
-                    r = (r + 2.0 * std::f32::consts::PI * 294.0 / sr as f32) % std::f32::consts::TAU;
+                    l = (l + 2.0 * std::f32::consts::PI * 196.0 / sr as f32)
+                        % std::f32::consts::TAU;
+                    r = (r + 2.0 * std::f32::consts::PI * 294.0 / sr as f32)
+                        % std::f32::consts::TAU;
                     [a, b]
                 })
                 .collect();
@@ -580,9 +638,14 @@ mod tests {
         let sr = 48_000;
         // Low E of a guitar, A of a bass, open G, concert A, high E, and two
         // octaves above that — the range this is for.
-        for (hz, want) in
-            [(82.41, 40u8), (110.0, 45), (196.0, 55), (440.0, 69), (659.26, 76), (1318.5, 88)]
-        {
+        for (hz, want) in [
+            (82.41, 40u8),
+            (110.0, 45),
+            (196.0, 55),
+            (440.0, 69),
+            (659.26, 76),
+            (1318.5, 88),
+        ] {
             let mut t = PitchTracker::new(sr);
             let mut tone = Tone::new();
             let mut got = None;
@@ -619,7 +682,11 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(got, Some(want), "{hz} Hz with harmonics should still be note {want}");
+            assert_eq!(
+                got,
+                Some(want),
+                "{hz} Hz with harmonics should still be note {want}"
+            );
         }
     }
 
@@ -684,7 +751,11 @@ mod tests {
             "then the new one: {seen:?}"
         );
         // And **only** those two: the slide between them is not a run of notes.
-        assert_eq!(seen.len(), 2, "one note change, not a semitone chain: {seen:?}");
+        assert_eq!(
+            seen.len(),
+            2,
+            "one note change, not a semitone chain: {seen:?}"
+        );
     }
 
     /// Under the gate there is no note at all, however clean the signal is —
@@ -723,10 +794,16 @@ mod tests {
         // A 256-frame block is 85 decimated samples, so an analysis lands
         // roughly every other block rather than on every one.
         let blocks_per_analysis = HOP as f32 / (256.0 / t.decim as f32);
-        assert!(blocks_per_analysis > 1.0, "{blocks_per_analysis} blocks between analyses");
+        assert!(
+            blocks_per_analysis > 1.0,
+            "{blocks_per_analysis} blocks between analyses"
+        );
 
         // And the correlation itself is bounded by the window, not the device.
         let max_lag = (t.work_rate / note_to_freq(MIN_NOTE)) as usize;
-        assert!(max_lag * (WINDOW / 2) < 200_000, "{max_lag} lags is the whole budget");
+        assert!(
+            max_lag * (WINDOW / 2) < 200_000,
+            "{max_lag} lags is the whole budget"
+        );
     }
 }

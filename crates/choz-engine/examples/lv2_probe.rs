@@ -9,14 +9,19 @@ fn main() -> anyhow::Result<()> {
     let secs: u64 = args.next().unwrap_or_else(|| "10".into()).parse()?;
 
     let found = choz_plugin_lv2::scan_directory(std::path::Path::new("/usr/lib/lv2"));
-    let Some(info) = found.iter().find(|p| p.is_instrument && p.uri.contains(&frag)) else {
+    let Some(info) = found
+        .iter()
+        .find(|p| p.is_instrument && p.uri.contains(&frag))
+    else {
         println!("no LV2 instrument matching {frag}");
         return Ok(());
     };
 
     let mut engine = choz_engine::AudioEngine::new(48_000, buffer);
     engine.start()?;
-    let Some(slot) = engine.add_silent() else { return Ok(()) };
+    let Some(slot) = engine.add_silent() else {
+        return Ok(());
+    };
     engine.load_plugin(
         slot,
         choz_engine::PluginFormat::Lv2,
@@ -27,7 +32,11 @@ fn main() -> anyhow::Result<()> {
     for n in [48, 55, 60, 64, 67, 72] {
         engine.note_on(slot, n, 100);
     }
-    println!("{} buffer={buffer} out={:?}", info.uri, engine.output_device());
+    println!(
+        "{} buffer={buffer} out={:?}",
+        info.uri,
+        engine.output_device()
+    );
     std::thread::sleep(std::time::Duration::from_secs(secs));
     Ok(())
 }

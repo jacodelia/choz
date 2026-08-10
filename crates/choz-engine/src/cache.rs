@@ -35,7 +35,9 @@ fn modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
 /// tree — installing a plugin touches its parent dir, which is the case that
 /// matters. Nested edits need an explicit rescan.
 fn cache_is_fresh(dirs: &[PathBuf]) -> bool {
-    let Some(cached_at) = modified(&cache_path()) else { return false };
+    let Some(cached_at) = modified(&cache_path()) else {
+        return false;
+    };
     dirs.iter()
         .filter_map(|d| modified(d))
         .all(|dir_at| dir_at <= cached_at)
@@ -58,7 +60,9 @@ fn write_cache(plugins: &[FoundPlugin]) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let file = CacheFile { plugins: plugins.to_vec() };
+    let file = CacheFile {
+        plugins: plugins.to_vec(),
+    };
     match serde_json::to_string_pretty(&file) {
         Ok(json) => {
             if let Err(e) = std::fs::write(&path, json) {
@@ -72,7 +76,10 @@ fn write_cache(plugins: &[FoundPlugin]) {
 /// Plugins from the cache when it's fresh, otherwise a full scan (which is then
 /// cached). `scan` is the real scanner, injected so this module stays testable
 /// and doesn't care where the plugins come from.
-pub fn cached_or_scan(dirs: &[PathBuf], scan: impl FnOnce() -> Vec<FoundPlugin>) -> Vec<FoundPlugin> {
+pub fn cached_or_scan(
+    dirs: &[PathBuf],
+    scan: impl FnOnce() -> Vec<FoundPlugin>,
+) -> Vec<FoundPlugin> {
     if cache_is_fresh(dirs) {
         // An unreadable or older-format cache reads as `None` and falls through
         // to a real scan.
@@ -131,7 +138,10 @@ mod tests {
         // First call scans and writes the cache...
         let mut scans = 0;
         let dirs: Vec<PathBuf> = Vec::new();
-        let got = cached_or_scan(&dirs, || { scans += 1; sample() });
+        let got = cached_or_scan(&dirs, || {
+            scans += 1;
+            sample()
+        });
         assert_eq!((got.len(), scans), (1, 1));
         assert!(cache_is_fresh(&dirs), "cache file exists now");
 
@@ -140,14 +150,20 @@ mod tests {
         assert_eq!(got[0].id, "com.acme.thing");
 
         // An explicit rescan always runs and rewrites.
-        let got = rescan(|| { scans += 1; sample() });
+        let got = rescan(|| {
+            scans += 1;
+            sample()
+        });
         assert_eq!((got.len(), scans), (1, 2));
 
         // A cache in an older/foreign format is ignored and rescanned. Same
         // test to keep the XDG_STATE_HOME override in one place.
         std::fs::write(cache_path(), b"{\"hosted\":true}").unwrap();
         assert!(read_cache().is_none(), "unreadable cache ignored");
-        cached_or_scan(&dirs, || { scans += 1; sample() });
+        cached_or_scan(&dirs, || {
+            scans += 1;
+            sample()
+        });
         assert_eq!(scans, 3, "a rejected cache forces a rescan");
         assert!(read_cache().is_some(), "and the rescan rewrites it");
 

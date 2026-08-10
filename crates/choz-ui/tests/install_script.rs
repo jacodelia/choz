@@ -72,7 +72,10 @@ fn the_installer_upgrades_in_place_and_never_touches_the_user_state() {
     ];
 
     let out = run(&prefix, &home, &["--binary", binary]);
-    assert!(out.contains("installed choz "), "it reports the version it put there: {out}");
+    assert!(
+        out.contains("installed choz "),
+        "it reports the version it put there: {out}"
+    );
     for f in files {
         assert!(prefix.join(f).exists(), "{f} was not installed");
     }
@@ -90,8 +93,14 @@ fn the_installer_upgrades_in_place_and_never_touches_the_user_state() {
     for f in files {
         assert!(!prefix.join(f).exists(), "{f} survived the uninstall");
     }
-    assert!(out.contains("left alone"), "and it says what it did not remove");
-    assert!(project.exists(), "the user's projects are not part of the package");
+    assert!(
+        out.contains("left alone"),
+        "and it says what it did not remove"
+    );
+    assert!(
+        project.exists(),
+        "the user's projects are not part of the package"
+    );
     assert_eq!(std::fs::read(&project).unwrap(), b"slots: []\n");
 
     let _ = std::fs::remove_dir_all(&tmp);
@@ -101,13 +110,25 @@ fn the_installer_upgrades_in_place_and_never_touches_the_user_state() {
 /// binary has to answer `--version` without starting a terminal.
 #[test]
 fn the_binary_answers_version_and_help_on_stdout() {
-    let out = Command::new(env!("CARGO_BIN_EXE_choz")).arg("--version").output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_choz"))
+        .arg("--version")
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.starts_with("choz "), "got {text:?}");
-    assert!(text.trim().split(' ').nth(1).is_some_and(|v| v.contains('.')), "a version number");
+    assert!(
+        text.trim()
+            .split(' ')
+            .nth(1)
+            .is_some_and(|v| v.contains('.')),
+        "a version number"
+    );
 
-    let out = Command::new(env!("CARGO_BIN_EXE_choz")).arg("-h").output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_choz"))
+        .arg("-h")
+        .output()
+        .unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("--osc-port"));
 }
 
@@ -142,9 +163,15 @@ fn the_installer_refuses_when_a_critical_library_is_missing() {
         Some(&fake_bin),
     );
     assert!(!ok, "a missing ALSA has to fail, not warn: {out}");
-    assert!(out.contains("libasound.so.2 (ALSA) is missing"), "and say which one: {out}");
+    assert!(
+        out.contains("libasound.so.2 (ALSA) is missing"),
+        "and say which one: {out}"
+    );
     assert!(out.contains("apt install"), "and how to fix it: {out}");
-    assert!(!prefix.join("bin/choz").exists(), "nothing is installed when it refuses");
+    assert!(
+        !prefix.join("bin/choz").exists(),
+        "nothing is installed when it refuses"
+    );
 
     // The escape hatch installs, and says it skipped the check rather than
     // pretending it passed.
@@ -154,7 +181,10 @@ fn the_installer_refuses_when_a_critical_library_is_missing() {
         &["--binary", env!("CARGO_BIN_EXE_choz"), "--skip-deps-check"],
         Some(&fake_bin),
     );
-    assert!(out.contains("skipping the runtime dependency check"), "{out}");
+    assert!(
+        out.contains("skipping the runtime dependency check"),
+        "{out}"
+    );
     assert!(prefix.join("bin/choz").exists(), "and it installs");
 
     let _ = std::fs::remove_dir_all(&tmp);
@@ -172,8 +202,11 @@ fn a_missing_jack_is_a_note_not_a_refusal() {
 
     // An `ldconfig` that reports ALSA and nothing else.
     let ldconfig = fake_bin.join("ldconfig");
-    std::fs::write(&ldconfig, "#!/bin/sh\necho '\tlibasound.so.2 (libc6,x86-64) => /usr/lib/libasound.so.2'\n")
-        .unwrap();
+    std::fs::write(
+        &ldconfig,
+        "#!/bin/sh\necho '\tlibasound.so.2 (libc6,x86-64) => /usr/lib/libasound.so.2'\n",
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -186,9 +219,18 @@ fn a_missing_jack_is_a_note_not_a_refusal() {
         &["--binary", env!("CARGO_BIN_EXE_choz")],
         Some(&fake_bin),
     );
-    assert!(out.contains("libjack is not installed"), "no JACK note: {out}");
-    assert!(out.contains("will use ALSA"), "and it says what happens instead: {out}");
-    assert!(prefix.join("bin/choz").exists(), "JACK is optional, so this installs");
+    assert!(
+        out.contains("libjack is not installed"),
+        "no JACK note: {out}"
+    );
+    assert!(
+        out.contains("will use ALSA"),
+        "and it says what happens instead: {out}"
+    );
+    assert!(
+        prefix.join("bin/choz").exists(),
+        "JACK is optional, so this installs"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

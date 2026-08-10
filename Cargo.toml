@@ -33,3 +33,17 @@ choz-plugin-ladspa = { path = "crates/choz-plugin-ladspa" }
 choz-plugin-vst2 = { path = "crates/choz-plugin-vst2" }
 choz-plugin-vst3 = { path = "crates/choz-plugin-vst3" }
 choz-plugin-sandbox = { path = "crates/choz-plugin-sandbox" }
+
+# ─── Release profile ──────────────────────────────────────────────────────────
+#
+# A release build embeds a source path in every panic message, and those paths
+# come from the *builder's* home: `strings target/release/choz | grep /home/`
+# found 415 of them, mostly `~/.cargo/registry/…`. Whoever builds it should not
+# be shipping their directory layout to everyone who installs it.
+#
+# `strip` drops symbols and debug info — most of that, and a smaller download.
+# The panic-location strings survive it, so the release workflow also passes
+# `--remap-path-prefix`; `trim-paths`, which would do both from here, is still
+# unstable on the toolchain this is built with.
+[profile.release]
+strip = true

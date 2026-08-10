@@ -4,8 +4,8 @@
 const MAX_DELAY_SAMPLES: usize = 4096;
 
 pub struct Chorus {
-    pub rate:     f32, // LFO Hz (0.1–5.0)
-    pub depth:    f32, // modulation depth in ms (0.5–10.0)
+    pub rate: f32,     // LFO Hz (0.1–5.0)
+    pub depth: f32,    // modulation depth in ms (0.5–10.0)
     pub delay_ms: f32, // base delay (5.0–30.0 ms)
     pub feedback: f32, // feedback level (-0.9..0.9)
     mix: f32,
@@ -19,8 +19,8 @@ pub struct Chorus {
 impl Chorus {
     pub fn new() -> Self {
         Self {
-            rate:     0.5,
-            depth:    3.0,
+            rate: 0.5,
+            depth: 3.0,
             delay_ms: 15.0,
             feedback: 0.1,
             mix: 0.5,
@@ -41,15 +41,22 @@ impl Chorus {
     }
 }
 
-impl Default for Chorus { fn default() -> Self { Self::new() } }
+impl Default for Chorus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl super::FxProcessor for Chorus {
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
-        if buf.len() < 2 { return; }
+        if buf.len() < 2 {
+            return;
+        }
         let sr = sample_rate as f32;
-        let lfo_inc   = self.rate / sr;
-        let depth_s   = (self.depth    * sr / 1000.0).clamp(1.0, MAX_DELAY_SAMPLES as f32 / 2.0);
-        let base_s    = (self.delay_ms * sr / 1000.0).clamp(1.0, MAX_DELAY_SAMPLES as f32 - depth_s - 2.0);
+        let lfo_inc = self.rate / sr;
+        let depth_s = (self.depth * sr / 1000.0).clamp(1.0, MAX_DELAY_SAMPLES as f32 / 2.0);
+        let base_s =
+            (self.delay_ms * sr / 1000.0).clamp(1.0, MAX_DELAY_SAMPLES as f32 - depth_s - 2.0);
 
         let frames = buf.len() / 2;
         use std::f32::consts::TAU;
@@ -72,7 +79,7 @@ impl super::FxProcessor for Chorus {
             self.buf_r[self.write_pos] = in_r + self.feedback * wet_r;
             self.write_pos = (self.write_pos + 1) % MAX_DELAY_SAMPLES;
 
-            buf[i * 2]     = in_l + self.mix * (wet_l - in_l);
+            buf[i * 2] = in_l + self.mix * (wet_l - in_l);
             buf[i * 2 + 1] = in_r + self.mix * (wet_r - in_r);
         }
     }
@@ -84,28 +91,44 @@ impl super::FxProcessor for Chorus {
         self.lfo_phase = 0.0;
     }
 
-    fn set_mix(&mut self, wet: f32) { self.mix = wet.clamp(0.0, 1.0); }
-    fn name(&self) -> &str { "Chorus" }
+    fn set_mix(&mut self, wet: f32) {
+        self.mix = wet.clamp(0.0, 1.0);
+    }
+    fn name(&self) -> &str {
+        "Chorus"
+    }
 
     fn params(&self) -> Vec<crate::fx::FxParam> {
         use crate::fx::FxParam;
         vec![
-            FxParam::new("Rate",     (self.rate / 5.0).clamp(0.0, 1.0), 0.0, 5.0, "Hz"),
-            FxParam::new("Depth",    (self.depth / 10.0).clamp(0.0, 1.0), 0.0, 10.0, "ms"),
-            FxParam::new("Delay",    ((self.delay_ms - 5.0) / 25.0).clamp(0.0, 1.0), 5.0, 30.0, "ms"),
+            FxParam::new("Rate", (self.rate / 5.0).clamp(0.0, 1.0), 0.0, 5.0, "Hz"),
+            FxParam::new(
+                "Depth",
+                (self.depth / 10.0).clamp(0.0, 1.0),
+                0.0,
+                10.0,
+                "ms",
+            ),
+            FxParam::new(
+                "Delay",
+                ((self.delay_ms - 5.0) / 25.0).clamp(0.0, 1.0),
+                5.0,
+                30.0,
+                "ms",
+            ),
             FxParam::new("Feedback", (self.feedback + 0.9) / 1.8, -0.9, 0.9, ""),
-            FxParam::new("Wet",      self.mix, 0.0, 1.0, ""),
+            FxParam::new("Wet", self.mix, 0.0, 1.0, ""),
         ]
     }
 
     fn set_param(&mut self, index: usize, value: f32) {
         let v = value.clamp(0.0, 1.0);
         match index {
-            0 => self.rate     = 0.05 + v * 4.95,
-            1 => self.depth    = 0.5  + v * 9.5,
+            0 => self.rate = 0.05 + v * 4.95,
+            1 => self.depth = 0.5 + v * 9.5,
             2 => self.delay_ms = 5.0 + v * 25.0,
             3 => self.feedback = -0.9 + v * 1.8,
-            4 => self.mix      = v,
+            4 => self.mix = v,
             _ => {}
         }
     }
@@ -124,8 +147,16 @@ mod tests {
         let mut buf = dry.clone();
         ch.process_block(&mut buf, 48000);
         // After processing, at least some samples should differ from dry (modulated delay).
-        let max_diff = dry.iter().zip(buf.iter()).map(|(d, w)| (d - w).abs()).fold(0.0f32, f32::max);
-        assert!(max_diff > 0.001, "chorus output should differ from dry input, max_diff={}", max_diff);
+        let max_diff = dry
+            .iter()
+            .zip(buf.iter())
+            .map(|(d, w)| (d - w).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 0.001,
+            "chorus output should differ from dry input, max_diff={}",
+            max_diff
+        );
     }
 
     #[test]

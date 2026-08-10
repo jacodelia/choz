@@ -10,13 +10,13 @@
 //! or an audio device.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use choz_plugin_sandbox::shm::Shm;
-use choz_plugin_sandbox::{Host, Sandbox, region_bytes};
+use choz_plugin_sandbox::{region_bytes, Host, Sandbox};
 
 use crate::paths::PluginFormat;
 use crate::sources::AudioSource;
@@ -143,7 +143,10 @@ impl SandboxedPlugin {
         // only after the first answer is the deadline realtime-sized.
         let mut first = vec![0.0f32; block];
         let silence = vec![0.0f32; block];
-        if !me.bridge.exchange(&silence, &mut first, Duration::from_secs(10)) {
+        if !me
+            .bridge
+            .exchange(&silence, &mut first, Duration::from_secs(10))
+        {
             if let Ok(mut c) = child.lock() {
                 let _ = c.kill();
             }
@@ -174,21 +177,28 @@ impl SandboxedPlugin {
     /// that before serving its first block, so by the time `build` returns the
     /// answer is in.
     pub fn editor_handle(&self) -> Option<choz_ports::EditorHandle> {
-        self.bridge.has_editor().unwrap_or(false).then(|| self.raw_editor_handle())
+        self.bridge
+            .has_editor()
+            .unwrap_or(false)
+            .then(|| self.raw_editor_handle())
     }
 
     fn raw_editor_handle(&self) -> choz_ports::EditorHandle {
         // SAFETY: the link holds a clone of the mapping, so the region outlives
         // it however the instance ends.
         let link = unsafe { self.bridge.editor_link() };
-        std::sync::Arc::new(SandboxEditor { link, _shm: Arc::clone(&self.shm) })
-            as choz_ports::EditorHandle
+        std::sync::Arc::new(SandboxEditor {
+            link,
+            _shm: Arc::clone(&self.shm),
+        }) as choz_ports::EditorHandle
     }
 
     /// Republish the bridge's missed count. Called at the end of every block:
     /// a relaxed store is fine on the audio thread.
     fn publish(&self) {
-        self.status.missed.store(self.bridge.missed(), Ordering::Relaxed);
+        self.status
+            .missed
+            .store(self.bridge.missed(), Ordering::Relaxed);
     }
 
     /// The pid of the process currently hosting the plugin.
@@ -262,7 +272,8 @@ impl SandboxedPlugin {
             // sides of the region must not alias.
             self.tail[..take].copy_from_slice(&buf[done..done + take]);
             self.tail[take..].fill(0.0);
-            self.bridge.exchange(&self.tail, &mut self.answer, self.deadline);
+            self.bridge
+                .exchange(&self.tail, &mut self.answer, self.deadline);
             buf[done..done + take].copy_from_slice(&self.answer[..take]);
             done += take;
         }
@@ -313,15 +324,13 @@ impl AudioSource for SandboxedPlugin {
         while done < out.len() {
             let take = (out.len() - done).min(block);
             if take == block {
-                self.bridge.exchange(
-                    &self.silence,
-                    &mut out[done..done + block],
-                    self.deadline,
-                );
+                self.bridge
+                    .exchange(&self.silence, &mut out[done..done + block], self.deadline);
             } else {
                 // A partial tail: the child only ever processes whole blocks,
                 // so it answers into `answer` and we keep what fits.
-                self.bridge.exchange(&self.silence, &mut self.answer, self.deadline);
+                self.bridge
+                    .exchange(&self.silence, &mut self.answer, self.deadline);
                 out[done..done + take].copy_from_slice(&self.answer[..take]);
             }
             done += take;
@@ -352,7 +361,8 @@ impl AudioSource for SandboxedPlugin {
 
     fn pitch_bend(&mut self, value: u16) {
         let v = value.min(16383);
-        self.bridge.push_midi([0xE0, (v & 0x7F) as u8, (v >> 7) as u8]);
+        self.bridge
+            .push_midi([0xE0, (v & 0x7F) as u8, (v >> 7) as u8]);
     }
 
     fn set_param(&mut self, index: usize, value: f32) {
@@ -393,7 +403,11 @@ impl SandboxedEffect {
         frames: u32,
     ) -> Result<Self> {
         let inner = SandboxedPlugin::build(format, path, id, sample_rate, frames)?;
-        Ok(Self { inner, wet: 1.0, dry: vec![0.0; frames as usize * CHANNELS as usize] })
+        Ok(Self {
+            inner,
+            wet: 1.0,
+            dry: vec![0.0; frames as usize * CHANNELS as usize],
+        })
     }
 }
 
@@ -473,7 +487,9 @@ pub fn sandbox_worker_main() -> bool {
     if args.len() < 7 || args[1] != SANDBOX_WORKER_FLAG {
         return false;
     }
-    let Some(format) = PluginFormat::from_label(&args[2]) else { return true };
+    let Some(format) = PluginFormat::from_label(&args[2]) else {
+        return true;
+    };
     let (path, id, name) = (Path::new(&args[3]), args[4].as_str(), args[5].as_str());
     let frames: u32 = args[6].parse().unwrap_or(256);
 
@@ -539,29 +555,32 @@ fn serve_plugin(
 
     // The host waits with a deadline, so a slow block costs it silence, not a
     // stall. Ours is generous: it only bounds "the host went away".
-    while sandbox.serve(Duration::from_secs(5), &mut |input, output, midi, params| {
-        if let Some(src) = source.as_mut() {
-            for (index, value) in params {
-                src.set_param(*index, *value);
-            }
-            for m in midi {
-                match m[0] & 0xF0 {
-                    0x90 if m[2] > 0 => src.note_on(m[1], m[2]),
-                    0x90 | 0x80 => src.note_off(m[1]),
-                    0xB0 => src.control_change(m[1], m[2]),
-                    0xE0 => src.pitch_bend(u16::from(m[1]) | u16::from(m[2]) << 7),
-                    _ => {}
+    while sandbox.serve(
+        Duration::from_secs(5),
+        &mut |input, output, midi, params| {
+            if let Some(src) = source.as_mut() {
+                for (index, value) in params {
+                    src.set_param(*index, *value);
                 }
+                for m in midi {
+                    match m[0] & 0xF0 {
+                        0x90 if m[2] > 0 => src.note_on(m[1], m[2]),
+                        0x90 | 0x80 => src.note_off(m[1]),
+                        0xB0 => src.control_change(m[1], m[2]),
+                        0xE0 => src.pitch_bend(u16::from(m[1]) | u16::from(m[2]) << 7),
+                        _ => {}
+                    }
+                }
+                src.render(output, sample_rate);
+            } else if let Some(fx) = effect.as_mut() {
+                for (index, value) in params {
+                    fx.set_param(*index, *value);
+                }
+                output.copy_from_slice(input);
+                fx.process_block(output, sample_rate);
             }
-            src.render(output, sample_rate);
-        } else if let Some(fx) = effect.as_mut() {
-            for (index, value) in params {
-                fx.set_param(*index, *value);
-            }
-            output.copy_from_slice(input);
-            fx.process_block(output, sample_rate);
-        }
-    }) {
+        },
+    ) {
         // Between blocks: the window requests. Opening one can take hundreds of
         // milliseconds, so it happens on its own thread and the answer comes
         // back through the channel — the audio rendezvous never waits for a

@@ -18,8 +18,8 @@
 //! ```
 
 use std::net::UdpSocket;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
@@ -69,8 +69,12 @@ pub fn listen(port: u16, tx: flume::Sender<InputEvent>) -> Result<OscHandle> {
         // rosc's max packet size; anything larger is a malformed bundle anyway.
         let mut buf = [0u8; rosc::decoder::MTU];
         while !thread_stop.load(Ordering::Relaxed) {
-            let Ok((n, _from)) = socket.recv_from(&mut buf) else { continue };
-            let Ok((_rest, packet)) = rosc::decoder::decode_udp(&buf[..n]) else { continue };
+            let Ok((n, _from)) = socket.recv_from(&mut buf) else {
+                continue;
+            };
+            let Ok((_rest, packet)) = rosc::decoder::decode_udp(&buf[..n]) else {
+                continue;
+            };
             for msg in flatten(packet) {
                 let _ = tx.send(msg);
             }
@@ -101,7 +105,13 @@ fn parse(msg: &rosc::OscMessage) -> Option<InputEvent> {
     };
     let key = |i: usize| num(i).map(|v| v.clamp(0.0, 127.0) as u8);
     let note = |on: bool, note: u8, vel: u8| {
-        InputEvent::Note(NoteMsg { source: InputSource::Osc, channel: 0, on, note, vel })
+        InputEvent::Note(NoteMsg {
+            source: InputSource::Osc,
+            channel: 0,
+            on,
+            note,
+            vel,
+        })
     };
 
     let addr = msg.addr.trim_end_matches('/');
@@ -124,9 +134,18 @@ fn parse(msg: &rosc::OscMessage) -> Option<InputEvent> {
         ["mix", tab, what] => {
             let tab = idx(tab)?;
             Some(InputEvent::Control(match *what {
-                "gain" => ControlMsg::Gain { tab, value: value.clamp(0.0, 2.0) },
-                "pan" => ControlMsg::Pan { tab, value: value.clamp(-1.0, 1.0) },
-                "mute" => ControlMsg::Mute { tab, on: value >= 0.5 },
+                "gain" => ControlMsg::Gain {
+                    tab,
+                    value: value.clamp(0.0, 2.0),
+                },
+                "pan" => ControlMsg::Pan {
+                    tab,
+                    value: value.clamp(-1.0, 1.0),
+                },
+                "mute" => ControlMsg::Mute {
+                    tab,
+                    on: value >= 0.5,
+                },
                 _ => return None,
             }))
         }
@@ -146,23 +165,47 @@ mod tests {
     use rosc::{OscMessage, OscType};
 
     fn osc_note(on: bool, note: u8, vel: u8) -> InputEvent {
-        InputEvent::Note(NoteMsg { source: InputSource::Osc, channel: 0, on, note, vel })
+        InputEvent::Note(NoteMsg {
+            source: InputSource::Osc,
+            channel: 0,
+            on,
+            note,
+            vel,
+        })
     }
 
     fn msg(addr: &str, args: Vec<OscType>) -> OscMessage {
-        OscMessage { addr: addr.to_string(), args }
+        OscMessage {
+            addr: addr.to_string(),
+            args,
+        }
     }
 
     #[test]
     fn parses_note_messages() {
-        assert_eq!(parse(&msg("/note", vec![OscType::Int(60), OscType::Int(90)])), Some(osc_note(true, 60, 90)));
-        assert_eq!(parse(&msg("/note", vec![OscType::Int(60), OscType::Int(0)])), Some(osc_note(false, 60, 0)),
-            "velocity 0 is a note-off");
-        assert_eq!(parse(&msg("/note/on", vec![OscType::Float(60.0)])), Some(osc_note(true, 60, 100)),
-            "velocity defaults to 100");
-        assert_eq!(parse(&msg("/note/off", vec![OscType::Int(60)])), Some(osc_note(false, 60, 0)));
-        assert_eq!(parse(&msg("/note", vec![OscType::Int(200)])), Some(osc_note(true, 127, 100)),
-            "out-of-range note clamped");
+        assert_eq!(
+            parse(&msg("/note", vec![OscType::Int(60), OscType::Int(90)])),
+            Some(osc_note(true, 60, 90))
+        );
+        assert_eq!(
+            parse(&msg("/note", vec![OscType::Int(60), OscType::Int(0)])),
+            Some(osc_note(false, 60, 0)),
+            "velocity 0 is a note-off"
+        );
+        assert_eq!(
+            parse(&msg("/note/on", vec![OscType::Float(60.0)])),
+            Some(osc_note(true, 60, 100)),
+            "velocity defaults to 100"
+        );
+        assert_eq!(
+            parse(&msg("/note/off", vec![OscType::Int(60)])),
+            Some(osc_note(false, 60, 0))
+        );
+        assert_eq!(
+            parse(&msg("/note", vec![OscType::Int(200)])),
+            Some(osc_note(true, 127, 100)),
+            "out-of-range note clamped"
+        );
         assert_eq!(parse(&msg("/note", vec![])), None, "no note argument");
     }
 
@@ -170,18 +213,48 @@ mod tests {
     fn parses_control_messages() {
         use ControlMsg::*;
         let c = |m| Some(InputEvent::Control(m));
-        assert_eq!(parse(&msg("/mix/2/gain", vec![OscType::Float(0.5)])), c(Gain { tab: 2, value: 0.5 }));
-        assert_eq!(parse(&msg("/mix/1/gain", vec![OscType::Float(9.0)])), c(Gain { tab: 1, value: 2.0 }),
-            "gain clamped to the UI's own maximum");
-        assert_eq!(parse(&msg("/mix/1/pan", vec![OscType::Float(-2.0)])), c(Pan { tab: 1, value: -1.0 }));
-        assert_eq!(parse(&msg("/mix/3/mute", vec![OscType::Int(1)])), c(Mute { tab: 3, on: true }));
-        assert_eq!(parse(&msg("/mix/3/mute", vec![OscType::Bool(false)])), c(Mute { tab: 3, on: false }));
+        assert_eq!(
+            parse(&msg("/mix/2/gain", vec![OscType::Float(0.5)])),
+            c(Gain { tab: 2, value: 0.5 })
+        );
+        assert_eq!(
+            parse(&msg("/mix/1/gain", vec![OscType::Float(9.0)])),
+            c(Gain { tab: 1, value: 2.0 }),
+            "gain clamped to the UI's own maximum"
+        );
+        assert_eq!(
+            parse(&msg("/mix/1/pan", vec![OscType::Float(-2.0)])),
+            c(Pan {
+                tab: 1,
+                value: -1.0
+            })
+        );
+        assert_eq!(
+            parse(&msg("/mix/3/mute", vec![OscType::Int(1)])),
+            c(Mute { tab: 3, on: true })
+        );
+        assert_eq!(
+            parse(&msg("/mix/3/mute", vec![OscType::Bool(false)])),
+            c(Mute { tab: 3, on: false })
+        );
         assert_eq!(
             parse(&msg("/fx/1/2/3", vec![OscType::Float(0.25)])),
-            c(FxParam { tab: 1, fx: 2, param: 3, value: 0.25 }),
+            c(FxParam {
+                tab: 1,
+                fx: 2,
+                param: 3,
+                value: 0.25
+            }),
         );
-        assert_eq!(parse(&msg("/mix/0/gain", vec![OscType::Float(0.5)])), None, "indices are 1-based");
-        assert_eq!(parse(&msg("/mix/2/wobble", vec![OscType::Float(0.5)])), None);
+        assert_eq!(
+            parse(&msg("/mix/0/gain", vec![OscType::Float(0.5)])),
+            None,
+            "indices are 1-based"
+        );
+        assert_eq!(
+            parse(&msg("/mix/2/wobble", vec![OscType::Float(0.5)])),
+            None
+        );
         assert_eq!(parse(&msg("/fx/1/2/3", vec![])), None, "no value");
         assert_eq!(parse(&msg("/nope", vec![OscType::Float(1.0)])), None);
     }
@@ -218,7 +291,10 @@ mod tests {
         osc_str(&mut msg, "/mix/2/gain");
         osc_str(&mut msg, ",f");
         msg.extend_from_slice(&0.5f32.to_be_bytes());
-        assert!(msg.len().is_multiple_of(4), "every OSC chunk is four-byte aligned");
+        assert!(
+            msg.len().is_multiple_of(4),
+            "every OSC chunk is four-byte aligned"
+        );
         assert_eq!(
             decode(&msg),
             Some(InputEvent::Control(ControlMsg::Gain { tab: 2, value: 0.5 })),
@@ -250,12 +326,18 @@ mod tests {
     #[test]
     fn flattens_bundles() {
         let bundle = rosc::OscPacket::Bundle(rosc::OscBundle {
-            timetag: rosc::OscTime { seconds: 0, fractional: 0 },
+            timetag: rosc::OscTime {
+                seconds: 0,
+                fractional: 0,
+            },
             content: vec![
                 rosc::OscPacket::Message(msg("/note", vec![OscType::Int(60), OscType::Int(90)])),
                 rosc::OscPacket::Message(msg("/note/off", vec![OscType::Int(62)])),
             ],
         });
-        assert_eq!(flatten(bundle), vec![osc_note(true, 60, 90), osc_note(false, 62, 0)]);
+        assert_eq!(
+            flatten(bundle),
+            vec![osc_note(true, 60, 90), osc_note(false, 62, 0)]
+        );
     }
 }

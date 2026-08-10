@@ -19,4 +19,4 @@ pub mod bridge;
 #[cfg(unix)]
 pub mod shm;
 
-pub use bridge::{Host, Sandbox, region_bytes};
+pub use bridge::{region_bytes, Host, Sandbox};

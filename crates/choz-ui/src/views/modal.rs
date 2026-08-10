@@ -43,7 +43,11 @@ pub struct ListModal {
 
 impl ListModal {
     pub fn new(title: impl Into<String>, items: Vec<String>) -> Self {
-        Self { title: title.into(), items, ..Default::default() }
+        Self {
+            title: title.into(),
+            items,
+            ..Default::default()
+        }
     }
 
     pub fn with_filters(mut self, filters: &[&str]) -> Self {
@@ -59,7 +63,8 @@ impl ListModal {
     /// Move the sidebar cursor, wrapping at neither end.
     pub fn move_section(&mut self, delta: isize) {
         let last = self.sidebar.len().saturating_sub(1);
-        self.sidebar_cursor = (self.sidebar_cursor as isize + delta).clamp(0, last as isize) as usize;
+        self.sidebar_cursor =
+            (self.sidebar_cursor as isize + delta).clamp(0, last as isize) as usize;
     }
 
     pub fn cycle_filter(&mut self, delta: isize) {
@@ -93,7 +98,11 @@ pub struct ModalRects {
 
 /// Truncate to `max` chars.
 fn trunc(s: &str, max: usize) -> String {
-    if s.chars().count() <= max { s.to_string() } else { s.chars().take(max).collect() }
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max).collect()
+    }
 }
 
 fn centered(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
@@ -109,7 +118,12 @@ fn centered(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
 
 /// Draw `m` centred over `area`. Returns the rects to hit-test, and writes the
 /// scroll position back into `m` so the keyboard and the mouse agree on it.
-pub fn draw_list_modal(f: &mut Frame, m: &mut ListModal, area: Rect, pct: (u16, u16)) -> ModalRects {
+pub fn draw_list_modal(
+    f: &mut Frame,
+    m: &mut ListModal,
+    area: Rect,
+    pct: (u16, u16),
+) -> ModalRects {
     f.render_widget(Clear, area);
     f.render_widget(Block::default().style(Style::default().bg(BACKDROP)), area);
 
@@ -124,8 +138,14 @@ pub fn draw_list_modal(f: &mut Frame, m: &mut ListModal, area: Rect, pct: (u16, 
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    let mut rects = ModalRects { area: Some(popup), ..Default::default() };
-    let content = inner.inner(Margin { vertical: 0, horizontal: 1 });
+    let mut rects = ModalRects {
+        area: Some(popup),
+        ..Default::default()
+    };
+    let content = inner.inner(Margin {
+        vertical: 0,
+        horizontal: 1,
+    });
     if content.height == 0 || content.width == 0 {
         return rects;
     }
@@ -144,7 +164,10 @@ pub fn draw_list_modal(f: &mut Frame, m: &mut ListModal, area: Rect, pct: (u16, 
             let rect = Rect::new(x, y, w, 1);
             rects.filters.push((i, rect));
             let st = if i == m.filter {
-                Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(HINT).bg(PANEL_BG)
             };
@@ -157,7 +180,11 @@ pub fn draw_list_modal(f: &mut Frame, m: &mut ListModal, area: Rect, pct: (u16, 
     // Buttons always sit on the last row, the note (if any) just above it.
     let btn_y = bottom.saturating_sub(1);
     let note_y = btn_y.saturating_sub(1);
-    let list_bottom = if m.note.is_empty() { note_y } else { note_y.saturating_sub(1) };
+    let list_bottom = if m.note.is_empty() {
+        note_y
+    } else {
+        note_y.saturating_sub(1)
+    };
     let rows = list_bottom.saturating_sub(y) as usize;
 
     // Keep the cursor visible.
@@ -184,13 +211,19 @@ pub fn draw_list_modal(f: &mut Frame, m: &mut ListModal, area: Rect, pct: (u16, 
                 (true, false) => (Color::Rgb(30, 38, 50), WARN),
                 _ => (PANEL_BG, HINT),
             };
-            let text = format!(" {:<w$}{count:>3} ", trunc(label, sw as usize - 5), w = sw as usize - 5);
+            let text = format!(
+                " {:<w$}{count:>3} ",
+                trunc(label, sw as usize - 5),
+                w = sw as usize - 5
+            );
             f.render_widget(
                 Paragraph::new(Span::styled(
                     text,
-                    Style::default()
-                        .fg(fg)
-                        .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() }),
+                    Style::default().fg(fg).add_modifier(if sel {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
                 ))
                 .style(Style::default().bg(bg)),
                 rect,
@@ -229,7 +262,11 @@ pub fn draw_list_modal(f: &mut Frame, m: &mut ListModal, area: Rect, pct: (u16, 
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 text,
-                Style::default().fg(fg).add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() }),
+                Style::default().fg(fg).add_modifier(if sel {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
             )))
             .style(Style::default().bg(bg)),
             rect,
@@ -267,14 +304,20 @@ pub fn draw_list_modal(f: &mut Frame, m: &mut ListModal, area: Rect, pct: (u16, 
     f.render_widget(
         Paragraph::new(Span::styled(
             format!("  {}  ", t("SELECT")),
-            Style::default().fg(Color::Black).bg(OK).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Black)
+                .bg(OK)
+                .add_modifier(Modifier::BOLD),
         )),
         select,
     );
     f.render_widget(
         Paragraph::new(Span::styled(
             format!("  {}  ", t("CANCEL")),
-            Style::default().fg(Color::White).bg(ERR).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .bg(ERR)
+                .add_modifier(Modifier::BOLD),
         )),
         cancel,
     );
@@ -291,14 +334,21 @@ pub fn draw_list_modal(f: &mut Frame, m: &mut ListModal, area: Rect, pct: (u16, 
         f.render_widget(
             Paragraph::new(Span::styled(
                 text,
-                Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
             )),
             rect,
         );
         bx += w + 1;
     }
 
-    let hint_x = if rects.actions.is_empty() { cancel.x + cancel.width + 2 } else { bx + 1 };
+    let hint_x = if rects.actions.is_empty() {
+        cancel.x + cancel.width + 2
+    } else {
+        bx + 1
+    };
     if hint_x < content.x + content.width {
         f.render_widget(
             Paragraph::new(Span::styled(
@@ -322,9 +372,15 @@ mod tests {
     fn render(m: &mut ListModal, w: u16, h: u16) -> (String, ModalRects) {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         let mut rects = ModalRects::default();
-        term.draw(|f| rects = draw_list_modal(f, m, f.area(), (90, 90))).unwrap();
-        let screen: String =
-            term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        term.draw(|f| rects = draw_list_modal(f, m, f.area(), (90, 90)))
+            .unwrap();
+        let screen: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
         (screen, rects)
     }
 
@@ -336,10 +392,22 @@ mod tests {
         let (screen, rects) = render(&mut m, 60, 14);
 
         assert!(m.scroll > 0, "cursor at the end must scroll the window");
-        assert!(screen.contains("item49"), "selected row must be visible:\n{screen}");
-        assert!(!screen.contains("item0 "), "the top of the list scrolled away");
-        assert!(screen.contains('\u{2588}'), "scrollbar thumb missing:\n{screen}");
-        assert!(screen.contains("SELECT") && screen.contains("CANCEL"), "buttons missing");
+        assert!(
+            screen.contains("item49"),
+            "selected row must be visible:\n{screen}"
+        );
+        assert!(
+            !screen.contains("item0 "),
+            "the top of the list scrolled away"
+        );
+        assert!(
+            screen.contains('\u{2588}'),
+            "scrollbar thumb missing:\n{screen}"
+        );
+        assert!(
+            screen.contains("SELECT") && screen.contains("CANCEL"),
+            "buttons missing"
+        );
         assert!(rects.select.is_some() && rects.cancel.is_some());
         // Every drawn row is hit-testable and maps back to its item index.
         assert_eq!(rects.rows.last().map(|(i, _)| *i), Some(49));
@@ -361,7 +429,10 @@ mod tests {
         assert_eq!(rects.sidebar.len(), 2);
         let list = rects.list.expect("list area");
         let side = rects.sidebar[0].1;
-        assert!(list.x > side.x + side.width - 1, "the list sits right of the sidebar");
+        assert!(
+            list.x > side.x + side.width - 1,
+            "the list sits right of the sidebar"
+        );
         assert!(rects.rows.iter().all(|(_, r)| r.x == list.x));
     }
 
@@ -374,6 +445,9 @@ mod tests {
 
         m.cursor = 0;
         m.cycle_filter(-1);
-        assert_eq!(m.filter, 2, "cycling back from the first filter wraps to the last");
+        assert_eq!(
+            m.filter, 2,
+            "cycling back from the first filter wraps to the last"
+        );
     }
 }

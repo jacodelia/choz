@@ -233,7 +233,10 @@ impl AutoTune {
         // ── Detect, quantise, decide the ratio ──────────────────────────────
         let est = self.detector.process(&self.mono[..frames]);
         self.detected_hz = if est.voiced { est.frequency_hz } else { 0.0 };
-        let target = est.voiced.then(|| self.quantizer.target_hz(est.frequency_hz)).flatten();
+        let target = est
+            .voiced
+            .then(|| self.quantizer.target_hz(est.frequency_hz))
+            .flatten();
         self.target_hz = target.unwrap_or(0.0);
 
         // Unvoiced, or a reading choz does not believe: aim at no correction at
@@ -254,7 +257,10 @@ impl AutoTune {
         };
 
         for ch in 0..2 {
-            let (input, output) = (&self.chan_in[ch][..frames], &mut self.chan_out[ch][..frames]);
+            let (input, output) = (
+                &self.chan_in[ch][..frames],
+                &mut self.chan_out[ch][..frames],
+            );
             self.shifters[ch].process(input, output, ratio, period);
         }
 
@@ -274,7 +280,10 @@ impl AutoTune {
         }
         self.dry_write = (self.dry_write + frames) % dry_len;
 
-        meter::meter().publish(AutoTuneMeter { level, ..self.reading() });
+        meter::meter().publish(AutoTuneMeter {
+            level,
+            ..self.reading()
+        });
     }
 }
 
@@ -324,17 +333,53 @@ impl FxProcessor for AutoTune {
         let p = &self.params;
         vec![
             FxParam::new("Preset", 0.0, 0.0, (PRESETS.len() - 1) as f32, ""),
-            FxParam::new("Retune", norm(p.retune_speed_ms, 0.0, 1000.0), 0.0, 1000.0, "ms"),
+            FxParam::new(
+                "Retune",
+                norm(p.retune_speed_ms, 0.0, 1000.0),
+                0.0,
+                1000.0,
+                "ms",
+            ),
             FxParam::new("Correct", p.correction, 0.0, 100.0, "%"),
             FxParam::new("Key", p.key as f32 / 11.0, 0.0, 11.0, ""),
             FxParam::new("Scale", scale_norm(p.scale), 0.0, 5.0, ""),
-            FxParam::new("Mode", (p.mode == AutoTuneMode::HardTune) as u8 as f32, 0.0, 1.0, ""),
+            FxParam::new(
+                "Mode",
+                (p.mode == AutoTuneMode::HardTune) as u8 as f32,
+                0.0,
+                1.0,
+                "",
+            ),
             FxParam::new("Human", p.humanize, 0.0, 100.0, "%"),
             FxParam::new("A4", norm(p.reference_hz, 430.0, 450.0), 430.0, 450.0, "Hz"),
-            FxParam::new("MinHz", norm(p.min_frequency, 60.0, 400.0), 60.0, 400.0, "Hz"),
-            FxParam::new("MaxHz", norm(p.max_frequency, 400.0, 1200.0), 400.0, 1200.0, "Hz"),
-            FxParam::new("InGain", norm(p.input_gain_db, -24.0, 24.0), -24.0, 24.0, "dB"),
-            FxParam::new("OutGain", norm(p.output_gain_db, -24.0, 24.0), -24.0, 24.0, "dB"),
+            FxParam::new(
+                "MinHz",
+                norm(p.min_frequency, 60.0, 400.0),
+                60.0,
+                400.0,
+                "Hz",
+            ),
+            FxParam::new(
+                "MaxHz",
+                norm(p.max_frequency, 400.0, 1200.0),
+                400.0,
+                1200.0,
+                "Hz",
+            ),
+            FxParam::new(
+                "InGain",
+                norm(p.input_gain_db, -24.0, 24.0),
+                -24.0,
+                24.0,
+                "dB",
+            ),
+            FxParam::new(
+                "OutGain",
+                norm(p.output_gain_db, -24.0, 24.0),
+                -24.0,
+                24.0,
+                "dB",
+            ),
         ]
     }
 
@@ -356,8 +401,11 @@ impl FxProcessor for AutoTune {
                 self.params.scale = ScaleType::ALL[i.min(ScaleType::ALL.len() - 1)];
             }
             5 => {
-                self.params.mode =
-                    if v >= 0.5 { AutoTuneMode::HardTune } else { AutoTuneMode::Natural }
+                self.params.mode = if v >= 0.5 {
+                    AutoTuneMode::HardTune
+                } else {
+                    AutoTuneMode::Natural
+                }
             }
             6 => self.params.humanize = v,
             7 => self.params.reference_hz = denorm(v, 430.0, 450.0),
@@ -385,12 +433,20 @@ fn scale_norm(s: ScaleType) -> f32 {
 }
 
 fn db_to_lin(db: f32) -> f32 {
-    if db.is_finite() { 10f32.powf(db / 20.0) } else { 1.0 }
+    if db.is_finite() {
+        10f32.powf(db / 20.0)
+    } else {
+        1.0
+    }
 }
 
 /// Nothing leaves this effect that is not a number. A NaN in an audio buffer
 /// spreads: it poisons the next FX, the mix bus and the device.
 #[inline]
 fn sanitise(x: f32) -> f32 {
-    if x.is_finite() { x.clamp(-8.0, 8.0) } else { 0.0 }
+    if x.is_finite() {
+        x.clamp(-8.0, 8.0)
+    } else {
+        0.0
+    }
 }

@@ -21,27 +21,29 @@ un VST con la guitarra — `ftom` de Csound redondeado, una nota exacta por jack
 mono, con trim, sensibilidad y lectura de lo que oye; el monitor tiene pestañas
 MIDI / WAVE / ACTIVITY;
 hay **AutoTune**, corrección de altura en tiempo real como efecto propio (YIN
-decimado + PSOLA, sin allocations en el callback); todas las secciones comparten
+decimado + el lector de delay de zita-at1, sin allocations en el callback);
+todas las secciones comparten
 un fondo traslúcido de color y opacidad configurables; y choz se instala con `.deb`, `.rpm` o `install.sh` y sale en el
-menú del escritorio. **335 tests**, `clippy --workspace --all-targets -D warnings`
+menú del escritorio bajo multimedia. **339 tests**, `clippy --workspace --all-targets -D warnings`
 limpio.
 
 ## Pendiente
 
-1. **Terminar de publicar la 1.0.0.** La versión está subida a `1.0.0`, el
-   CHANGELOG cerrado con esa etiqueta y los artefactos de x86_64 construidos
-   (`target/release/choz`, `target/debian/choz_1.0.0-1_amd64.deb`,
-   `target/generate-rpm/choz-1.0.0-1.x86_64.rpm`). Lo que falta:
-   - **Commit, tag `v1.0.0` y push** — el árbol sigue sin commitear a propósito;
-     el push del tag es lo que dispara `.github/workflows/release.yml`.
-   - **El binario aarch64**: `cross build --release --bin choz --target
-     aarch64-unknown-linux-gnu` (compila aquí en ~1 min; no se llegó a correr en
-     esta tanda).
-   - **Mirar con ojos lo que sólo se ve instalado**: el `.desktop` en el menú, el
-     icono, el lanzador abriendo kitty al tamaño correcto, un `*.choz.yml` con
-     doble clic, y un plugin sincronizado siguiendo la fila `Tempo`.
+1. **Re-etiquetar la 1.0.0.** El tag está pusheado y el release publicado con
+   sus artefactos (x86_64 + aarch64 + armhf, `.tar.gz`/`.deb`/`.rpm` y
+   `SHA256SUMS.txt`), pero **esos paquetes son anteriores a los arreglos de
+   empaquetado de hoy**: el `.deb` que hay colgado lleva el binario y nada más
+   —sin `.desktop`, sin icono, sin lanzador— y lleva 415 rutas `/home/jorge`
+   dentro. Falta:
+   - **Mover el tag y volver a pushear** para que el workflow reconstruya todo.
+     El release actual sirve para probar que choz corre; no para probar que
+     aparece en el menú.
    - **armv7 sin verificar**: aquí `cross` no pudo bajarse el toolchain (red del
-     contenedor cortada). aarch64 sí compila.
+     contenedor cortada). aarch64 sí compila, y el CI construye ambos.
+   - **Mirar con ojos lo que sólo se ve instalado**: el `.desktop` bajo
+     multimedia, el icono, el lanzador abriendo kitty al tamaño correcto, un
+     `*.choz.yml` con doble clic, y un plugin sincronizado siguiendo la fila
+     `Tempo`.
 
    **Éste es el único punto que queda por decisión**: lo demás de esta lista ya
    no es código, es hardware que hay que tener delante.

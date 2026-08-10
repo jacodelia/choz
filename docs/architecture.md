@@ -802,6 +802,27 @@ entry, the `hicolor` icon and the `application/x-choz-project` MIME type for
 `*.choz.yml`. `.deb` and `.rpm` metadata live in `crates/choz-ui/Cargo.toml` and
 install the same files; both replace the previous version by package name.
 
+Two things about that metadata are easy to get wrong and impossible to see:
+
+- **The `assets` list belongs in `[package.metadata.deb]`, never in a variant.**
+  A variant inherits from the base table, not the other way round. With the list
+  inside `variants.arm` the ordinary x86_64 package built cleanly, installed
+  cleanly, and contained the binary and the copyright — no desktop entry, no
+  icon, no launcher, and therefore no menu entry. Nothing warns. `dpkg-deb -c`
+  on the built package is the only way to see it, so
+  `crates/choz-ui/tests/packaging_assets.rs` reads the manifest instead and
+  fails if a destination or a source goes missing.
+- **The binary's source path is `target/release/choz`, not `../../target/…`.**
+  Only the first spelling is recognised as the Cargo target directory, and only
+  a recognised one is rewritten under `--target` — with the other form an arm64
+  package was built around the *host* binary. Every other asset is relative to
+  the manifest, as cargo-deb expects.
+
+After unpacking, `postinst` refreshes the desktop, MIME and icon caches (and
+`postrm` again on removal), which `install.sh` does too. Debian ships triggers
+that usually handle this; "usually" is how an application installs and never
+appears in the menu.
+
 **Nothing an uninstall touches lives in `~/.local/state/choz`** — the projects,
 the plugin paths and the settings are the user's, not the package's, and there is
 a test that proves it.

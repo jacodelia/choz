@@ -13,8 +13,9 @@ use choz_ports::{FxParam, FxProcessor};
 pub const EQ_BANDS: usize = 10;
 
 /// Winamp classic centre frequencies (Hz).
-pub const EQ_FREQS: [f32; EQ_BANDS] =
-    [70.0, 180.0, 320.0, 600.0, 1000.0, 3000.0, 6000.0, 12000.0, 14000.0, 16000.0];
+pub const EQ_FREQS: [f32; EQ_BANDS] = [
+    70.0, 180.0, 320.0, 600.0, 1000.0, 3000.0, 6000.0, 12000.0, 14000.0, 16000.0,
+];
 
 /// Gain range of each band, in dB.
 pub const EQ_MAX_DB: f32 = 12.0;
@@ -25,23 +26,96 @@ pub const EQ_MAX_DB: f32 = 12.0;
 /// `(value - 33) * 12/32`.
 pub const PRESETS: &[(&str, [f32; EQ_BANDS])] = &[
     ("Flat", [0.0; EQ_BANDS]),
-    ("Classical", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -4.875, -4.875, -4.875, -6.375]),
-    ("Club", [0.0, 0.0, 1.875, 3.375, 3.375, 3.375, 1.875, 0.0, 0.0, 0.0]),
-    ("Dance", [5.625, 4.125, 1.125, -0.375, -0.375, -4.125, -4.875, -4.875, -0.375, -0.375]),
-    ("Full Bass", [5.625, 5.625, 5.625, 3.375, 0.75, -3.0, -5.625, -6.75, -7.125, -7.125]),
-    ("Full Bass & Treble", [4.125, 3.375, 0.0, -4.875, -3.375, 0.75, 4.875, 6.375, 7.125, 7.125]),
-    ("Full Treble", [-6.375, -6.375, -6.375, -3.0, 1.5, 6.375, 9.375, 9.375, 9.375, 10.125]),
-    ("Laptop/Headphones", [2.625, 6.375, 3.0, -2.625, -1.875, 0.75, 2.625, 5.625, 7.5, 8.625]),
-    ("Large Hall", [6.0, 6.0, 3.375, 3.375, 0.0, -3.375, -3.375, -3.375, 0.0, 0.0]),
-    ("Live", [-3.375, 0.0, 2.25, 3.0, 3.375, 3.375, 2.25, 1.5, 1.5, 1.125]),
-    ("Party", [4.125, 4.125, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.125, 4.125]),
-    ("Pop", [-1.5, 2.625, 4.125, 4.5, 3.0, -1.125, -1.875, -1.875, -1.5, -1.5]),
-    ("Reggae", [0.0, 0.0, -0.75, -4.125, 0.0, 3.75, 3.75, 0.0, 0.0, 0.0]),
-    ("Rock", [4.5, 2.625, -3.75, -5.25, -2.625, 2.25, 5.25, 6.375, 6.375, 6.375]),
-    ("Ska", [-1.875, -3.375, -3.0, -0.75, 2.25, 3.375, 5.25, 5.625, 6.375, 5.625]),
-    ("Soft", [2.625, 0.75, -1.125, -1.875, -1.125, 2.25, 4.875, 5.625, 6.375, 7.125]),
-    ("Soft Rock", [2.25, 2.25, 1.125, -0.75, -3.0, -3.75, -2.625, -0.75, 1.5, 5.25]),
-    ("Techno", [4.5, 3.375, 0.0, -3.75, -3.375, 0.0, 4.5, 5.625, 5.625, 5.25]),
+    (
+        "Classical",
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -4.875, -4.875, -4.875, -6.375],
+    ),
+    (
+        "Club",
+        [0.0, 0.0, 1.875, 3.375, 3.375, 3.375, 1.875, 0.0, 0.0, 0.0],
+    ),
+    (
+        "Dance",
+        [
+            5.625, 4.125, 1.125, -0.375, -0.375, -4.125, -4.875, -4.875, -0.375, -0.375,
+        ],
+    ),
+    (
+        "Full Bass",
+        [
+            5.625, 5.625, 5.625, 3.375, 0.75, -3.0, -5.625, -6.75, -7.125, -7.125,
+        ],
+    ),
+    (
+        "Full Bass & Treble",
+        [
+            4.125, 3.375, 0.0, -4.875, -3.375, 0.75, 4.875, 6.375, 7.125, 7.125,
+        ],
+    ),
+    (
+        "Full Treble",
+        [
+            -6.375, -6.375, -6.375, -3.0, 1.5, 6.375, 9.375, 9.375, 9.375, 10.125,
+        ],
+    ),
+    (
+        "Laptop/Headphones",
+        [
+            2.625, 6.375, 3.0, -2.625, -1.875, 0.75, 2.625, 5.625, 7.5, 8.625,
+        ],
+    ),
+    (
+        "Large Hall",
+        [
+            6.0, 6.0, 3.375, 3.375, 0.0, -3.375, -3.375, -3.375, 0.0, 0.0,
+        ],
+    ),
+    (
+        "Live",
+        [-3.375, 0.0, 2.25, 3.0, 3.375, 3.375, 2.25, 1.5, 1.5, 1.125],
+    ),
+    (
+        "Party",
+        [4.125, 4.125, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.125, 4.125],
+    ),
+    (
+        "Pop",
+        [
+            -1.5, 2.625, 4.125, 4.5, 3.0, -1.125, -1.875, -1.875, -1.5, -1.5,
+        ],
+    ),
+    (
+        "Reggae",
+        [0.0, 0.0, -0.75, -4.125, 0.0, 3.75, 3.75, 0.0, 0.0, 0.0],
+    ),
+    (
+        "Rock",
+        [
+            4.5, 2.625, -3.75, -5.25, -2.625, 2.25, 5.25, 6.375, 6.375, 6.375,
+        ],
+    ),
+    (
+        "Ska",
+        [
+            -1.875, -3.375, -3.0, -0.75, 2.25, 3.375, 5.25, 5.625, 6.375, 5.625,
+        ],
+    ),
+    (
+        "Soft",
+        [
+            2.625, 0.75, -1.125, -1.875, -1.125, 2.25, 4.875, 5.625, 6.375, 7.125,
+        ],
+    ),
+    (
+        "Soft Rock",
+        [
+            2.25, 2.25, 1.125, -0.75, -3.0, -3.75, -2.625, -0.75, 1.5, 5.25,
+        ],
+    ),
+    (
+        "Techno",
+        [4.5, 3.375, 0.0, -3.75, -3.375, 0.0, 4.5, 5.625, 5.625, 5.25],
+    ),
 ];
 
 /// Which preset a knob position (0..1) picks. 0 is "Flat", which is also what a
@@ -74,7 +148,15 @@ struct Biquad {
 
 impl Biquad {
     const fn identity() -> Self {
-        Self { b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0, z1: 0.0, z2: 0.0 }
+        Self {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+            z1: 0.0,
+            z2: 0.0,
+        }
     }
 
     /// Peaking EQ coefficients (RBJ cookbook). The filter's state is left alone:
@@ -208,10 +290,22 @@ impl FxProcessor for GraphicEq {
             .iter()
             .enumerate()
             .map(|(i, _)| {
-                FxParam::new(BAND_NAMES[i], db_to_norm(self.gains_db[i]), -EQ_MAX_DB, EQ_MAX_DB, "dB")
+                FxParam::new(
+                    BAND_NAMES[i],
+                    db_to_norm(self.gains_db[i]),
+                    -EQ_MAX_DB,
+                    EQ_MAX_DB,
+                    "dB",
+                )
             })
             .collect();
-        out.push(FxParam::new("Preamp", db_to_norm(self.preamp_db), -EQ_MAX_DB, EQ_MAX_DB, "dB"));
+        out.push(FxParam::new(
+            "Preamp",
+            db_to_norm(self.preamp_db),
+            -EQ_MAX_DB,
+            EQ_MAX_DB,
+            "dB",
+        ));
         out
     }
 
@@ -231,8 +325,9 @@ impl FxProcessor for GraphicEq {
 }
 
 /// Band labels, short enough for a 13-column knob cell.
-pub const BAND_NAMES: [&str; EQ_BANDS] =
-    ["70", "180", "320", "600", "1k", "3k", "6k", "12k", "14k", "16k"];
+pub const BAND_NAMES: [&str; EQ_BANDS] = [
+    "70", "180", "320", "600", "1k", "3k", "6k", "12k", "14k", "16k",
+];
 
 #[cfg(test)]
 mod tests {
@@ -265,7 +360,10 @@ mod tests {
         boosted.set_band_db(4, 12.0); // the 1 kHz band
         let loud_1k = tone(1000.0, &mut boosted);
         let far = tone(70.0, &mut boosted);
-        assert!(loud_1k > flat_1k * 2.0, "1 kHz should be lifted: {loud_1k} vs {flat_1k}");
+        assert!(
+            loud_1k > flat_1k * 2.0,
+            "1 kHz should be lifted: {loud_1k} vs {flat_1k}"
+        );
         assert!(far < flat_1k * 1.3, "70 Hz is a different band: {far}");
     }
 
@@ -276,17 +374,26 @@ mod tests {
         assert_eq!(PRESETS.len(), 18, "Winamp's set, as tanu carries it");
         assert_eq!(PRESETS[0].0, "Flat");
         assert_eq!(PRESETS[0].1, [0.0; EQ_BANDS]);
-        let rock = PRESETS.iter().find(|(n, _)| *n == "Rock").expect("Rock is one of them");
+        let rock = PRESETS
+            .iter()
+            .find(|(n, _)| *n == "Rock")
+            .expect("Rock is one of them");
         assert_eq!(rock.1[0], 4.5, "bass up");
         assert!(rock.1[3] < 0.0, "mids scooped");
-        assert!(PRESETS.iter().all(|(_, g)| g.iter().all(|db| db.abs() <= EQ_MAX_DB)));
+        assert!(PRESETS
+            .iter()
+            .all(|(_, g)| g.iter().all(|db| db.abs() <= EQ_MAX_DB)));
 
         let mut eq = GraphicEq::new();
         let i = PRESETS.iter().position(|(n, _)| *n == "Rock").unwrap();
         eq.set_preset(i);
         assert_eq!(eq.gains_db(), rock.1);
         eq.set_preset(999);
-        assert_eq!(eq.gains_db(), rock.1, "an index out of range changes nothing");
+        assert_eq!(
+            eq.gains_db(),
+            rock.1,
+            "an index out of range changes nothing"
+        );
     }
 
     /// Every band is a parameter, so every band can be learned and automated —

@@ -106,7 +106,10 @@ impl PitchCorrector {
             // Hard Tune that can be set to 400 ms is just Natural with a
             // confusing name.
             AutoTuneMode::HardTune => (MIN_RETUNE_MS, 1.0),
-            AutoTuneMode::Natural => (self.retune_ms.clamp(0.0, 1000.0), self.correction.clamp(0.0, 1.0)),
+            AutoTuneMode::Natural => (
+                self.retune_ms.clamp(0.0, 1000.0),
+                self.correction.clamp(0.0, 1.0),
+            ),
         };
         let wanted = target * correction;
 
@@ -125,12 +128,20 @@ impl PitchCorrector {
         // many samples. `retune_ms` is the time constant, so ~63 % of the way
         // there in that time — which is what a retune time means everywhere.
         let tau = retune * 0.001 * self.sample_rate;
-        let a = if tau > 0.5 { (-(frames as f32) / tau).exp() } else { 0.0 };
+        let a = if tau > 0.5 {
+            (-(frames as f32) / tau).exp()
+        } else {
+            0.0
+        };
         self.current_semitones = wanted + (self.current_semitones - wanted) * a;
         if !self.current_semitones.is_finite() {
             self.current_semitones = 0.0;
         }
         let ratio = (2.0f32).powf(self.current_semitones / 12.0);
-        if ratio.is_finite() { ratio.clamp(0.25, 4.0) } else { 1.0 }
+        if ratio.is_finite() {
+            ratio.clamp(0.25, 4.0)
+        } else {
+            1.0
+        }
     }
 }

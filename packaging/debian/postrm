@@ -1,0 +1,15 @@
+#!/bin/sh
+# The same caches, after the files have gone: an entry left in the menu that
+# launches nothing is worse than no entry.
+set -e
+
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+    command -v update-desktop-database >/dev/null 2>&1 &&
+        update-desktop-database -q /usr/share/applications || true
+    command -v update-mime-database >/dev/null 2>&1 &&
+        update-mime-database /usr/share/mime || true
+    command -v gtk-update-icon-cache >/dev/null 2>&1 &&
+        gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor || true
+fi
+
+exit 0

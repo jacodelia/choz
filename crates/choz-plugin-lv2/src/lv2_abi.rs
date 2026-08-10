@@ -62,14 +62,16 @@ pub type LV2_URID_Unmap_Handle = *mut c_void;
 pub struct LV2_URID_Map {
     pub handle: LV2_URID_Map_Handle,
     /// Map a URI string to an integer URID (never 0 on success).
-    pub map: Option<unsafe extern "C" fn(handle: LV2_URID_Map_Handle, uri: *const c_char) -> LV2_URID>,
+    pub map:
+        Option<unsafe extern "C" fn(handle: LV2_URID_Map_Handle, uri: *const c_char) -> LV2_URID>,
 }
 
 #[repr(C)]
 pub struct LV2_URID_Unmap {
     pub handle: LV2_URID_Unmap_Handle,
-    pub unmap:
-        Option<unsafe extern "C" fn(handle: LV2_URID_Unmap_Handle, urid: LV2_URID) -> *const c_char>,
+    pub unmap: Option<
+        unsafe extern "C" fn(handle: LV2_URID_Unmap_Handle, urid: LV2_URID) -> *const c_char,
+    >,
 }
 
 // ─── Atom + MIDI (ext/atom, ext/midi) ───────────────────────────────────────
@@ -121,8 +123,7 @@ pub fn pad8(size: usize) -> usize {
 // ─── Options + buffer size (ext/options, ext/buf-size, ext/parameters) ──────
 
 pub const LV2_OPTIONS_URI: &str = "http://lv2plug.in/ns/ext/options#options";
-pub const LV2_BUF_SIZE_BOUNDED_URI: &str =
-    "http://lv2plug.in/ns/ext/buf-size#boundedBlockLength";
+pub const LV2_BUF_SIZE_BOUNDED_URI: &str = "http://lv2plug.in/ns/ext/buf-size#boundedBlockLength";
 pub const LV2_BUF_SIZE_MIN_BLOCK_URI: &str = "http://lv2plug.in/ns/ext/buf-size#minBlockLength";
 pub const LV2_BUF_SIZE_MAX_BLOCK_URI: &str = "http://lv2plug.in/ns/ext/buf-size#maxBlockLength";
 pub const LV2_BUF_SIZE_NOMINAL_BLOCK_URI: &str =
@@ -196,17 +197,15 @@ pub const LV2_WORKER_SUCCESS: i32 = 0;
 pub const LV2_WORKER_ERR_UNKNOWN: i32 = 1;
 
 /// Host callback the plugin's `work()` uses to send its answer back.
-pub type LV2_Worker_Respond_Function = Option<
-    unsafe extern "C" fn(handle: *mut c_void, size: u32, data: *const c_void) -> i32,
->;
+pub type LV2_Worker_Respond_Function =
+    Option<unsafe extern "C" fn(handle: *mut c_void, size: u32, data: *const c_void) -> i32>;
 
 /// The `worker#schedule` feature data (`LV2_Worker_Schedule`).
 #[repr(C)]
 pub struct LV2_Worker_Schedule {
     pub handle: *mut c_void,
-    pub schedule_work: Option<
-        unsafe extern "C" fn(handle: *mut c_void, size: u32, data: *const c_void) -> i32,
-    >,
+    pub schedule_work:
+        Option<unsafe extern "C" fn(handle: *mut c_void, size: u32, data: *const c_void) -> i32>,
 }
 
 /// What `extension_data(worker#interface)` returns (`LV2_Worker_Interface`).
@@ -358,11 +357,13 @@ pub const LV2_STATE_FREE_PATH_URI: &str = "http://lv2plug.in/ns/ext/state#freePa
 pub struct LV2_State_Map_Path {
     pub handle: *mut c_void,
     /// Absolute path → what the host stores.
-    pub abstract_path:
-        Option<unsafe extern "C" fn(handle: *mut c_void, absolute_path: *const c_char) -> *mut c_char>,
+    pub abstract_path: Option<
+        unsafe extern "C" fn(handle: *mut c_void, absolute_path: *const c_char) -> *mut c_char,
+    >,
     /// What the host stored → a path the plugin can open.
-    pub absolute_path:
-        Option<unsafe extern "C" fn(handle: *mut c_void, abstract_path: *const c_char) -> *mut c_char>,
+    pub absolute_path: Option<
+        unsafe extern "C" fn(handle: *mut c_void, abstract_path: *const c_char) -> *mut c_char,
+    >,
 }
 
 /// The `state:freePath` feature data (`LV2_State_Free_Path`).
@@ -371,4 +372,3 @@ pub struct LV2_State_Free_Path {
     pub handle: *mut c_void,
     pub free_path: Option<unsafe extern "C" fn(handle: *mut c_void, path: *mut c_char)>,
 }
-

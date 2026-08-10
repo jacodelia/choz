@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use choz_plugin_sandbox::shm::Shm;
-use choz_plugin_sandbox::{Host, Sandbox, region_bytes};
+use choz_plugin_sandbox::{region_bytes, Host, Sandbox};
 
 const FRAMES: u32 = 64;
 const CHANNELS: u32 = 2;
@@ -86,7 +86,10 @@ fn a_dying_child_costs_a_glitch() {
 
     let input = vec![0.5f32; (FRAMES * CHANNELS) as usize];
     let mut output = vec![0.0f32; (FRAMES * CHANNELS) as usize];
-    assert!(host.exchange(&input, &mut output, Duration::from_secs(5)), "first block");
+    assert!(
+        host.exchange(&input, &mut output, Duration::from_secs(5)),
+        "first block"
+    );
     shm.unlink();
 
     // The child dies on its second block. Everything after is silence, and the
@@ -95,7 +98,10 @@ fn a_dying_child_costs_a_glitch() {
     for _ in 0..5 {
         if !host.exchange(&input, &mut output, Duration::from_millis(50)) {
             silent += 1;
-            assert!(output.iter().all(|s| *s == 0.0), "a missed block must be silent");
+            assert!(
+                output.iter().all(|s| *s == 0.0),
+                "a missed block must be silent"
+            );
         }
     }
     assert!(silent > 0, "the dead child should have missed blocks");
@@ -113,11 +119,14 @@ fn child(name: &str, crash: bool) {
     assert_eq!(sandbox.sample_rate(), 48_000, "the header crossed intact");
 
     let mut served = 0;
-    while sandbox.serve(Duration::from_secs(5), &mut |input, output, _midi, _params| {
-        for (o, i) in output.iter_mut().zip(input) {
-            *o = i * 2.0;
-        }
-    }) {
+    while sandbox.serve(
+        Duration::from_secs(5),
+        &mut |input, output, _midi, _params| {
+            for (o, i) in output.iter_mut().zip(input) {
+                *o = i * 2.0;
+            }
+        },
+    ) {
         served += 1;
         if crash && served >= 1 {
             // What a broken plugin does, minus the wait for one to misbehave.

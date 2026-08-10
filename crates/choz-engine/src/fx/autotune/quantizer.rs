@@ -51,8 +51,9 @@ impl ScaleType {
 }
 
 /// Note names, sharps only — the key is a pitch class, not a spelling.
-pub const NOTE_NAMES: [&str; 12] =
-    ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+pub const NOTE_NAMES: [&str; 12] = [
+    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+];
 
 /// A key and a scale: which of the twelve pitch classes a note may land on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,13 +65,19 @@ pub struct Scale {
 
 impl Default for Scale {
     fn default() -> Self {
-        Self { root: 0, kind: ScaleType::Chromatic }
+        Self {
+            root: 0,
+            kind: ScaleType::Chromatic,
+        }
     }
 }
 
 impl Scale {
     pub fn new(root: u8, kind: ScaleType) -> Self {
-        Self { root: root % 12, kind }
+        Self {
+            root: root % 12,
+            kind,
+        }
     }
 
     /// Whether a MIDI note belongs to the scale.
@@ -130,7 +137,11 @@ pub struct NoteQuantizer {
 
 impl Default for NoteQuantizer {
     fn default() -> Self {
-        Self { scale: Scale::default(), reference_hz: 440.0, target: PitchTarget::default() }
+        Self {
+            scale: Scale::default(),
+            reference_hz: 440.0,
+            target: PitchTarget::default(),
+        }
     }
 }
 

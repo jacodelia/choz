@@ -7,33 +7,35 @@
 
 pub struct Expander {
     pub threshold_db: f32, // default -40 dB
-    pub ratio:        f32, // > 1.0 = downward, < 1.0 = upward; 1.0 = bypass
-    pub attack_ms:    f32, // default 10 ms
-    pub release_ms:   f32, // default 100 ms
-    pub range_db:     f32, // max gain change magnitude (0 = unlimited)
-    mix:              f32,
+    pub ratio: f32,        // > 1.0 = downward, < 1.0 = upward; 1.0 = bypass
+    pub attack_ms: f32,    // default 10 ms
+    pub release_ms: f32,   // default 100 ms
+    pub range_db: f32,     // max gain change magnitude (0 = unlimited)
+    mix: f32,
     // detector state
-    env:              f32,
-    gain_db:          f32,
+    env: f32,
+    gain_db: f32,
 }
 
 impl Expander {
     pub fn new() -> Self {
         Self {
             threshold_db: -40.0,
-            ratio:        2.0,
-            attack_ms:    10.0,
-            release_ms:   100.0,
-            range_db:     60.0,
-            mix:          1.0,
-            env:          0.0,
-            gain_db:      0.0,
+            ratio: 2.0,
+            attack_ms: 10.0,
+            release_ms: 100.0,
+            range_db: 60.0,
+            mix: 1.0,
+            env: 0.0,
+            gain_db: 0.0,
         }
     }
 }
 
 impl Default for Expander {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl super::FxProcessor for Expander {
@@ -52,19 +54,23 @@ impl super::FxProcessor for Expander {
     }
 
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
-        if self.ratio == 1.0 { return; }
+        if self.ratio == 1.0 {
+            return;
+        }
         let sr = sample_rate as f32;
-        let attack_coef  = (-1.0 / (self.attack_ms  * 0.001 * sr)).exp();
+        let attack_coef = (-1.0 / (self.attack_ms * 0.001 * sr)).exp();
         let release_coef = (-1.0 / (self.release_ms * 0.001 * sr)).exp();
         let thresh_lin = 10f32.powf(self.threshold_db / 20.0);
 
         for chunk in buf.chunks_mut(2) {
-            if chunk.len() < 2 { break; }
+            if chunk.len() < 2 {
+                break;
+            }
             let peak = chunk[0].abs().max(chunk[1].abs());
 
             // Envelope follower.
             if peak > self.env {
-                self.env = attack_coef  * self.env + (1.0 - attack_coef)  * peak;
+                self.env = attack_coef * self.env + (1.0 - attack_coef) * peak;
             } else {
                 self.env = release_coef * self.env + (1.0 - release_coef) * peak;
             }
@@ -72,8 +78,8 @@ impl super::FxProcessor for Expander {
             // Gain computation: below threshold, apply ratio-based expansion.
             let target_gain_db = if self.env < thresh_lin && self.env > 1e-10 {
                 let over_db = 20.0 * (self.env / thresh_lin).log10(); // negative below threshold
-                // Downward: ratio > 1 → amplify |over_db|, moving gain more negative.
-                // Upward:   ratio < 1 → compress |over_db|, moving gain closer to zero.
+                                                                      // Downward: ratio > 1 → amplify |over_db|, moving gain more negative.
+                                                                      // Upward:   ratio < 1 → compress |over_db|, moving gain closer to zero.
                 let reduced = over_db * (self.ratio - 1.0);
                 if self.range_db > 0.0 {
                     reduced.clamp(-self.range_db, self.range_db)
@@ -85,7 +91,11 @@ impl super::FxProcessor for Expander {
             };
 
             // Smooth gain changes with release coefficient.
-            let coef = if target_gain_db < self.gain_db { attack_coef } else { release_coef };
+            let coef = if target_gain_db < self.gain_db {
+                attack_coef
+            } else {
+                release_coef
+            };
             self.gain_db = coef * self.gain_db + (1.0 - coef) * target_gain_db;
 
             let gain = 10f32.powf(self.gain_db / 20.0);
@@ -96,11 +106,13 @@ impl super::FxProcessor for Expander {
     }
 
     fn reset(&mut self) {
-        self.env     = 0.0;
+        self.env = 0.0;
         self.gain_db = 0.0;
     }
 
-    fn set_mix(&mut self, wet: f32) { self.mix = wet.clamp(0.0, 1.0); }
+    fn set_mix(&mut self, wet: f32) {
+        self.mix = wet.clamp(0.0, 1.0);
+    }
 }
 
 #[cfg(test)]
@@ -121,7 +133,10 @@ mod tests {
         let before = buf[0];
         exp.process_block(&mut buf, 48000);
         let after = buf[1020].abs();
-        assert!(after < before * 0.9, "expander should attenuate below threshold, before={before}, after={after}");
+        assert!(
+            after < before * 0.9,
+            "expander should attenuate below threshold, before={before}, after={after}"
+        );
     }
 
     #[test]

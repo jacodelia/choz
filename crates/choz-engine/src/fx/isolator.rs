@@ -8,8 +8,8 @@
 //!   treble = HP @ treble_freq (cascaded 4×)
 //!   mid    = input − bass − treble  (subtraction — works well up to 4th order)
 
-use std::f32::consts::PI;
 use super::FxProcessor;
+use std::f32::consts::PI;
 
 const STAGES: usize = 4;
 
@@ -20,30 +20,36 @@ struct CascadedSvf {
     a1: f32,
     a2: f32,
     a3: f32,
-    k:  f32,
+    k: f32,
     mode: SvfPole,
 }
 
 #[derive(Clone, Copy)]
-enum SvfPole { Lp, Hp }
+enum SvfPole {
+    Lp,
+    Hp,
+}
 
 impl CascadedSvf {
     fn new(mode: SvfPole) -> Self {
         Self {
             ic1eq: [[0.0; 2]; STAGES],
             ic2eq: [[0.0; 2]; STAGES],
-            a1: 0.0, a2: 0.0, a3: 0.0, k: 1.0,
+            a1: 0.0,
+            a2: 0.0,
+            a3: 0.0,
+            k: 1.0,
             mode,
         }
     }
 
     fn set_cutoff(&mut self, hz: f32, sr: f32) {
-        let g  = (PI * hz / sr).tan();
-        let k  = std::f32::consts::SQRT_2; // k=√2 → Butterworth Q=1/√2, no resonant peak
+        let g = (PI * hz / sr).tan();
+        let k = std::f32::consts::SQRT_2; // k=√2 → Butterworth Q=1/√2, no resonant peak
         self.a1 = 1.0 / (1.0 + g * (g + k));
         self.a2 = g * self.a1;
         self.a3 = g * self.a2;
-        self.k  = k;
+        self.k = k;
     }
 
     #[inline]
@@ -73,10 +79,10 @@ impl CascadedSvf {
 /// `band_gain[0]` = bass, `band_gain[1]` = mid, `band_gain[2]` = treble.
 /// Linear gain: 0.0 = kill, 1.0 = unity.
 pub struct Isolator {
-    bass_lp:    CascadedSvf,
-    treble_hp:  CascadedSvf,
-    band_gain:  [f32; 3],
-    bass_freq:  f32,
+    bass_lp: CascadedSvf,
+    treble_hp: CascadedSvf,
+    band_gain: [f32; 3],
+    bass_freq: f32,
     treble_freq: f32,
     wet: f32,
     sample_rate: u32,
@@ -86,10 +92,10 @@ impl Isolator {
     /// Create an isolator with default crossovers (200 Hz / 3 kHz).
     pub fn new() -> Self {
         let mut iso = Self {
-            bass_lp:    CascadedSvf::new(SvfPole::Lp),
-            treble_hp:  CascadedSvf::new(SvfPole::Hp),
-            band_gain:  [1.0; 3],
-            bass_freq:  200.0,
+            bass_lp: CascadedSvf::new(SvfPole::Lp),
+            treble_hp: CascadedSvf::new(SvfPole::Hp),
+            band_gain: [1.0; 3],
+            bass_freq: 200.0,
             treble_freq: 3000.0,
             wet: 1.0,
             sample_rate: 48000,
@@ -98,9 +104,15 @@ impl Isolator {
         iso
     }
 
-    pub fn set_bass_gain(&mut self, g: f32)   { self.band_gain[0] = g.max(0.0); }
-    pub fn set_mid_gain(&mut self, g: f32)    { self.band_gain[1] = g.max(0.0); }
-    pub fn set_treble_gain(&mut self, g: f32) { self.band_gain[2] = g.max(0.0); }
+    pub fn set_bass_gain(&mut self, g: f32) {
+        self.band_gain[0] = g.max(0.0);
+    }
+    pub fn set_mid_gain(&mut self, g: f32) {
+        self.band_gain[1] = g.max(0.0);
+    }
+    pub fn set_treble_gain(&mut self, g: f32) {
+        self.band_gain[2] = g.max(0.0);
+    }
     pub fn set_gains(&mut self, bass: f32, mid: f32, treble: f32) {
         self.band_gain = [bass.max(0.0), mid.max(0.0), treble.max(0.0)];
     }
@@ -123,7 +135,9 @@ impl Isolator {
 }
 
 impl Default for Isolator {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FxProcessor for Isolator {
@@ -142,13 +156,13 @@ impl FxProcessor for Isolator {
             let bass_r = self.bass_lp.process(1, dry_r);
             let treb_l = self.treble_hp.process(0, dry_l);
             let treb_r = self.treble_hp.process(1, dry_r);
-            let mid_l  = dry_l - bass_l - treb_l;
-            let mid_r  = dry_r - bass_r - treb_r;
+            let mid_l = dry_l - bass_l - treb_l;
+            let mid_r = dry_r - bass_r - treb_r;
 
             let wet_l = bass_l * gb + mid_l * gm + treb_l * gt;
             let wet_r = bass_r * gb + mid_r * gm + treb_r * gt;
 
-            buf[i * 2]     = dry_l + self.wet * (wet_l - dry_l);
+            buf[i * 2] = dry_l + self.wet * (wet_l - dry_l);
             buf[i * 2 + 1] = dry_r + self.wet * (wet_r - dry_r);
         }
     }
@@ -193,7 +207,7 @@ mod tests {
         // Skip the first 512 frames (filter transient), compare steady-state energy.
         let skip = 1024; // 512 frames × 2 channels
         let e_unity: f32 = buf_unity[skip..].iter().map(|&s| s * s).sum();
-        let e_kill:  f32 = buf_kill[skip..].iter().map(|&s| s * s).sum();
+        let e_kill: f32 = buf_kill[skip..].iter().map(|&s| s * s).sum();
         assert!(
             e_kill < e_unity * 0.05,
             "mid kill should reduce 1kHz energy to <5%, e_kill={e_kill:.4} e_unity={e_unity:.4}"
@@ -216,7 +230,7 @@ mod tests {
         iso.process_block(&mut buf, sr);
         // Compare only the steady-state portion (skip first 256 frames of transient)
         let skip = 512;
-        let e_in:  f32 = input[skip..].iter().map(|&s| s * s).sum();
+        let e_in: f32 = input[skip..].iter().map(|&s| s * s).sum();
         let e_out: f32 = buf[skip..].iter().map(|&s| s * s).sum();
         let ratio = e_out / e_in.max(1e-9);
         assert!((0.7..=1.3).contains(&ratio), "energy ratio={ratio}");

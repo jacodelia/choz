@@ -9,18 +9,31 @@ pub struct Gain {
 }
 
 impl Gain {
-    pub fn new() -> Self { Self { gain_db: 0.0, mix: 1.0 } }
+    pub fn new() -> Self {
+        Self {
+            gain_db: 0.0,
+            mix: 1.0,
+        }
+    }
 }
 
-impl Default for Gain { fn default() -> Self { Self::new() } }
+impl Default for Gain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl super::FxProcessor for Gain {
     fn process_block(&mut self, buf: &mut [f32], _sr: u32) {
         let g = 10.0f32.powf(self.gain_db / 20.0);
-        for s in buf.iter_mut() { *s *= g; }
+        for s in buf.iter_mut() {
+            *s *= g;
+        }
     }
     fn reset(&mut self) {}
-    fn set_mix(&mut self, wet: f32) { self.mix = wet.clamp(0.0, 1.0); }
+    fn set_mix(&mut self, wet: f32) {
+        self.mix = wet.clamp(0.0, 1.0);
+    }
 }
 
 // ─── Phase Invert ─────────────────────────────────────────────────────────────
@@ -32,18 +45,36 @@ pub struct PhaseInvert {
 }
 
 impl PhaseInvert {
-    pub fn new() -> Self { Self { invert_l: true, invert_r: false } }
-    pub fn both() -> Self { Self { invert_l: true, invert_r: true } }
+    pub fn new() -> Self {
+        Self {
+            invert_l: true,
+            invert_r: false,
+        }
+    }
+    pub fn both() -> Self {
+        Self {
+            invert_l: true,
+            invert_r: true,
+        }
+    }
 }
 
-impl Default for PhaseInvert { fn default() -> Self { Self::new() } }
+impl Default for PhaseInvert {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl super::FxProcessor for PhaseInvert {
     fn process_block(&mut self, buf: &mut [f32], _sr: u32) {
         let frames = buf.len() / 2;
         for i in 0..frames {
-            if self.invert_l { buf[i * 2]     = -buf[i * 2]; }
-            if self.invert_r { buf[i * 2 + 1] = -buf[i * 2 + 1]; }
+            if self.invert_l {
+                buf[i * 2] = -buf[i * 2];
+            }
+            if self.invert_r {
+                buf[i * 2 + 1] = -buf[i * 2 + 1];
+            }
         }
     }
     fn reset(&mut self) {}
@@ -58,10 +89,16 @@ pub struct MonoMaker {
 }
 
 impl MonoMaker {
-    pub fn new() -> Self { Self { mix: 1.0 } }
+    pub fn new() -> Self {
+        Self { mix: 1.0 }
+    }
 }
 
-impl Default for MonoMaker { fn default() -> Self { Self::new() } }
+impl Default for MonoMaker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl super::FxProcessor for MonoMaker {
     fn process_block(&mut self, buf: &mut [f32], _sr: u32) {
@@ -70,12 +107,14 @@ impl super::FxProcessor for MonoMaker {
             let l = buf[i * 2];
             let r = buf[i * 2 + 1];
             let m = (l + r) * 0.5;
-            buf[i * 2]     = l + self.mix * (m - l);
+            buf[i * 2] = l + self.mix * (m - l);
             buf[i * 2 + 1] = r + self.mix * (m - r);
         }
     }
     fn reset(&mut self) {}
-    fn set_mix(&mut self, wet: f32) { self.mix = wet.clamp(0.0, 1.0); }
+    fn set_mix(&mut self, wet: f32) {
+        self.mix = wet.clamp(0.0, 1.0);
+    }
 }
 
 // ─── Soft Clipper ─────────────────────────────────────────────────────────────
@@ -83,7 +122,15 @@ impl super::FxProcessor for MonoMaker {
 /// RBJ biquad lowpass (transposed direct-form II) — the anti-alias filter for
 /// the 2× oversampled saturators below.
 #[derive(Clone, Copy)]
-pub(crate) struct Biquad { b0: f32, b1: f32, b2: f32, a1: f32, a2: f32, z1: f32, z2: f32 }
+pub(crate) struct Biquad {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    z1: f32,
+    z2: f32,
+}
 impl Biquad {
     pub(crate) fn lowpass(fc: f32, sr: f32, q: f32) -> Self {
         let w0 = 2.0 * std::f32::consts::PI * (fc / sr).clamp(1e-4, 0.49);
@@ -92,10 +139,13 @@ impl Biquad {
         let a0 = 1.0 + alpha;
         let b1 = (1.0 - cs) / a0;
         Self {
-            b0: b1 / 2.0, b1, b2: b1 / 2.0,
+            b0: b1 / 2.0,
+            b1,
+            b2: b1 / 2.0,
             a1: (-2.0 * cs) / a0,
             a2: (1.0 - alpha) / a0,
-            z1: 0.0, z2: 0.0,
+            z1: 0.0,
+            z2: 0.0,
         }
     }
     #[inline]
@@ -112,18 +162,24 @@ impl Biquad {
 /// lowpass before decimation — so the harmonics a hard waveshaper generates
 /// above Nyquist are filtered instead of folding back as aliasing.
 #[derive(Clone, Copy)]
-pub(crate) struct Oversampler2x { last: f32, lp: Biquad }
+pub(crate) struct Oversampler2x {
+    last: f32,
+    lp: Biquad,
+}
 impl Oversampler2x {
     pub(crate) fn new(base_sr: f32) -> Self {
         // Filter runs at 2× rate; cut just below the base Nyquist.
-        Self { last: 0.0, lp: Biquad::lowpass(base_sr * 0.45, base_sr * 2.0, 0.707) }
+        Self {
+            last: 0.0,
+            lp: Biquad::lowpass(base_sr * 0.45, base_sr * 2.0, 0.707),
+        }
     }
     #[inline]
     pub(crate) fn process<F: Fn(f32) -> f32>(&mut self, x: f32, f: F) -> f32 {
         let mid = 0.5 * (self.last + x); // upsampled sample between last and x
         self.last = x;
         let _ = self.lp.process(f(mid)); // first half-rate sample (discarded)
-        self.lp.process(f(x))            // second → decimated output
+        self.lp.process(f(x)) // second → decimated output
     }
 }
 
@@ -139,13 +195,21 @@ pub struct SoftClipper {
 
 impl SoftClipper {
     pub fn new() -> Self {
-        Self { drive: 2.0, mix: 1.0,
-               os_l: Oversampler2x::new(48000.0), os_r: Oversampler2x::new(48000.0),
-               sample_rate: 48000 }
+        Self {
+            drive: 2.0,
+            mix: 1.0,
+            os_l: Oversampler2x::new(48000.0),
+            os_r: Oversampler2x::new(48000.0),
+            sample_rate: 48000,
+        }
     }
 }
 
-impl Default for SoftClipper { fn default() -> Self { Self::new() } }
+impl Default for SoftClipper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl super::FxProcessor for SoftClipper {
     fn process_block(&mut self, buf: &mut [f32], sr: u32) {
@@ -163,7 +227,7 @@ impl super::FxProcessor for SoftClipper {
             let r = buf[i * 2 + 1];
             let wl = self.os_l.process(l, shape);
             let wr = self.os_r.process(r, shape);
-            buf[i * 2]     = l + self.mix * (wl - l);
+            buf[i * 2] = l + self.mix * (wl - l);
             buf[i * 2 + 1] = r + self.mix * (wr - r);
         }
     }
@@ -171,7 +235,9 @@ impl super::FxProcessor for SoftClipper {
         self.os_l = Oversampler2x::new(self.sample_rate as f32);
         self.os_r = Oversampler2x::new(self.sample_rate as f32);
     }
-    fn set_mix(&mut self, wet: f32) { self.mix = wet.clamp(0.0, 1.0); }
+    fn set_mix(&mut self, wet: f32) {
+        self.mix = wet.clamp(0.0, 1.0);
+    }
 }
 
 // ─── Tube Saturation ──────────────────────────────────────────────────────────
@@ -181,8 +247,8 @@ impl super::FxProcessor for SoftClipper {
 /// Combines soft-clip for positive half-waves with a slightly harder
 /// negative-half characteristic, reproducing the asymmetry of a triode stage.
 pub struct TubeSaturation {
-    pub drive: f32,  // 1.0..20.0
-    pub tone:  f32,  // 0.0..1.0 — amount of 1-pole HP to remove mud
+    pub drive: f32, // 1.0..20.0
+    pub tone: f32,  // 0.0..1.0 — amount of 1-pole HP to remove mud
     mix: f32,
     hp_state_l: f32,
     hp_state_r: f32,
@@ -193,10 +259,16 @@ pub struct TubeSaturation {
 
 impl TubeSaturation {
     pub fn new() -> Self {
-        Self { drive: 3.0, tone: 0.3, mix: 0.6,
-               hp_state_l: 0.0, hp_state_r: 0.0,
-               os_l: Oversampler2x::new(48000.0), os_r: Oversampler2x::new(48000.0),
-               sample_rate: 48000 }
+        Self {
+            drive: 3.0,
+            tone: 0.3,
+            mix: 0.6,
+            hp_state_l: 0.0,
+            hp_state_r: 0.0,
+            os_l: Oversampler2x::new(48000.0),
+            os_r: Oversampler2x::new(48000.0),
+            sample_rate: 48000,
+        }
     }
 
     #[inline]
@@ -213,11 +285,17 @@ impl TubeSaturation {
     }
 }
 
-impl Default for TubeSaturation { fn default() -> Self { Self::new() } }
+impl Default for TubeSaturation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl super::FxProcessor for TubeSaturation {
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
-        if buf.len() < 2 { return; }
+        if buf.len() < 2 {
+            return;
+        }
         if sample_rate != self.sample_rate {
             self.sample_rate = sample_rate;
             self.os_l = Oversampler2x::new(sample_rate as f32);
@@ -245,7 +323,7 @@ impl super::FxProcessor for TubeSaturation {
             let out_l = sat_l - self.hp_state_l;
             let out_r = sat_r - self.hp_state_r;
 
-            buf[i * 2]     = l + self.mix * (out_l - l);
+            buf[i * 2] = l + self.mix * (out_l - l);
             buf[i * 2 + 1] = r + self.mix * (out_r - r);
         }
     }
@@ -256,7 +334,9 @@ impl super::FxProcessor for TubeSaturation {
         self.os_l = Oversampler2x::new(self.sample_rate as f32);
         self.os_r = Oversampler2x::new(self.sample_rate as f32);
     }
-    fn set_mix(&mut self, wet: f32) { self.mix = wet.clamp(0.0, 1.0); }
+    fn set_mix(&mut self, wet: f32) {
+        self.mix = wet.clamp(0.0, 1.0);
+    }
 }
 
 #[cfg(test)]
@@ -270,7 +350,7 @@ mod tests {
         let mut buf = vec![0.5f32, 0.3f32, 0.5f32, 0.3f32];
         p.process_block(&mut buf, 48000);
         assert!((buf[0] - (-0.5)).abs() < 1e-6, "L should be inverted");
-        assert!((buf[1] - 0.3).abs()   < 1e-6, "R should be unchanged");
+        assert!((buf[1] - 0.3).abs() < 1e-6, "R should be unchanged");
     }
 
     #[test]
@@ -298,7 +378,10 @@ mod tests {
         // Settle the oversampler with a steady hot DC level.
         let mut buf = vec![2.0f32; 256];
         s.process_block(&mut buf, 48000);
-        assert!(buf.last().copied().unwrap() < 1.5, "soft clipper should reduce amplitude");
+        assert!(
+            buf.last().copied().unwrap() < 1.5,
+            "soft clipper should reduce amplitude"
+        );
     }
 
     #[test]
@@ -309,22 +392,26 @@ mod tests {
         let sr = 48000.0f32;
         let f0 = 9000.0f32; // harmonics 27 k/45 k fold below Nyquist if not filtered
         let n = 4096;
-        let sig: Vec<f32> = (0..n).map(|i| (2.0 * std::f32::consts::PI * f0 * i as f32 / sr).sin()).collect();
+        let sig: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * f0 * i as f32 / sr).sin())
+            .collect();
 
         let drive = 6.0f32;
         // Naive 1× reference.
         let naive: Vec<f32> = sig.iter().map(|&x| (x * drive).tanh() / drive).collect();
         // Oversampled.
         let mut os = Oversampler2x::new(sr);
-        let over: Vec<f32> = sig.iter().map(|&x| os.process(x, |v| (v * drive).tanh() / drive)).collect();
+        let over: Vec<f32> = sig
+            .iter()
+            .map(|&x| os.process(x, |v| (v * drive).tanh() / drive))
+            .collect();
 
         // Crude aliasing proxy: energy of the sample-to-sample difference that is
         // NOT explained by the fundamental tends to drop with anti-aliasing.
         let hf = |v: &[f32]| -> f32 { v.windows(2).map(|w| (w[1] - w[0]).powi(2)).sum::<f32>() };
         let alias_naive = hf(&naive);
-        let alias_over  = hf(&over);
+        let alias_over = hf(&over);
         assert!(alias_over < alias_naive,
             "oversampling should reduce HF/alias energy: over={alias_over:.3} naive={alias_naive:.3}");
     }
-
 }

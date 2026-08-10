@@ -1,7 +1,7 @@
 //! Manual check: what does one knob's worth of CC traffic cost the UI thread?
 //! `cargo run -p choz-engine --release --example cc_storm`
 
-use choz_engine::fx_chain::{FxSpec, build_chain_from_specs};
+use choz_engine::fx_chain::{build_chain_from_specs, FxSpec};
 
 fn main() {
     // A typical rack: the FX a MIDI-learned knob would be driving.
@@ -21,7 +21,9 @@ fn main() {
         }
         let each = t.elapsed() / n;
         drop(sink);
-        println!("{kind:<8} rebuild = {each:?} each  → {:.0} rebuilds/s sustainable",
-                 1.0 / each.as_secs_f64());
+        println!(
+            "{kind:<8} rebuild = {each:?} each  → {:.0} rebuilds/s sustainable",
+            1.0 / each.as_secs_f64()
+        );
     }
 }

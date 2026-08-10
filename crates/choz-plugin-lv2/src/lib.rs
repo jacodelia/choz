@@ -16,9 +16,9 @@
 //! choz builds one self-contained instance per rack slot).
 
 pub mod discovery;
-pub mod state;
 pub mod editor;
 pub mod lv2_abi;
+pub mod state;
 pub mod ttl;
 
 use std::collections::HashMap;
@@ -57,7 +57,11 @@ impl UridStore {
     }
 
     fn new() -> Self {
-        Self { map: HashMap::new(), names: Vec::new(), next: 1 }
+        Self {
+            map: HashMap::new(),
+            names: Vec::new(),
+            next: 1,
+        }
     }
     fn intern(&mut self, uri: &str) -> u32 {
         if let Some(&id) = self.map.get(uri) {
@@ -76,7 +80,9 @@ unsafe extern "C" fn urid_map_fn(handle: LV2_URID_Map_Handle, uri: *const c_char
         return 0;
     }
     let store = unsafe { &*(handle as *const Mutex<UridStore>) };
-    let s = unsafe { CStr::from_ptr(uri) }.to_string_lossy().into_owned();
+    let s = unsafe { CStr::from_ptr(uri) }
+        .to_string_lossy()
+        .into_owned();
     store.lock().intern(&s)
 }
 
@@ -206,7 +212,11 @@ impl WorkerState {
 }
 
 /// `LV2_Worker_Schedule.schedule_work`: run the job now and answer immediately.
-unsafe extern "C" fn worker_schedule_fn(handle: *mut c_void, size: u32, data: *const c_void) -> i32 {
+unsafe extern "C" fn worker_schedule_fn(
+    handle: *mut c_void,
+    size: u32,
+    data: *const c_void,
+) -> i32 {
     if handle.is_null() {
         return LV2_WORKER_ERR_UNKNOWN;
     }
@@ -253,8 +263,14 @@ impl Features {
     /// from it, so it must match what `run()` actually gets.
     fn new(store: Arc<Mutex<UridStore>>, sample_rate: u32, block_size: u32) -> Self {
         let store_ptr = Arc::as_ptr(&store) as *mut c_void;
-        let mut map = Box::new(LV2_URID_Map { handle: store_ptr, map: Some(urid_map_fn) });
-        let mut unmap = Box::new(LV2_URID_Unmap { handle: store_ptr, unmap: Some(urid_unmap_fn) });
+        let mut map = Box::new(LV2_URID_Map {
+            handle: store_ptr,
+            map: Some(urid_map_fn),
+        });
+        let mut unmap = Box::new(LV2_URID_Unmap {
+            handle: store_ptr,
+            unmap: Some(urid_unmap_fn),
+        });
         let (midi_urid, sequence_urid, int_urid, float_urid, time, opt_keys) = {
             let mut s = store.lock();
             (
@@ -317,11 +333,15 @@ impl Features {
             value: std::ptr::null(),
         });
 
-        let uris: Vec<CString> =
-            [LV2_URID_MAP_URI, LV2_URID_UNMAP_URI, LV2_OPTIONS_URI, LV2_WORKER_SCHEDULE_URI]
-                .iter()
-                .map(|u| CString::new(*u).unwrap_or_default())
-                .collect();
+        let uris: Vec<CString> = [
+            LV2_URID_MAP_URI,
+            LV2_URID_UNMAP_URI,
+            LV2_OPTIONS_URI,
+            LV2_WORKER_SCHEDULE_URI,
+        ]
+        .iter()
+        .map(|u| CString::new(*u).unwrap_or_default())
+        .collect();
         let worker = WorkerState::new();
         let mut schedule = Box::new(LV2_Worker_Schedule {
             handle: worker.as_ref() as *const WorkerState as *mut c_void,
@@ -378,9 +398,16 @@ impl Features {
         // `restore`, which do provide them — but a plugin that *requires* them
         // is asking whether this host can store its file paths at all, and it
         // can.
-        matches!(uri, LV2_URID_MAP_URI | LV2_URID_UNMAP_URI | LV2_OPTIONS_URI
-            | LV2_BUF_SIZE_BOUNDED_URI | LV2_WORKER_SCHEDULE_URI
-            | LV2_STATE_MAP_PATH_URI | LV2_STATE_FREE_PATH_URI)
+        matches!(
+            uri,
+            LV2_URID_MAP_URI
+                | LV2_URID_UNMAP_URI
+                | LV2_OPTIONS_URI
+                | LV2_BUF_SIZE_BOUNDED_URI
+                | LV2_WORKER_SCHEDULE_URI
+                | LV2_STATE_MAP_PATH_URI
+                | LV2_STATE_FREE_PATH_URI
+        )
     }
 }
 
@@ -427,7 +454,9 @@ const MAX_PENDING_MIDI: usize = 256;
 
 impl Lv2Instance {
     fn connect_all(&mut self) {
-        let Some(connect) = (unsafe { (*self.descriptor).connect_port }) else { return };
+        let Some(connect) = (unsafe { (*self.descriptor).connect_port }) else {
+            return;
+        };
         let nports = self.control_values.len();
         for i in 0..nports {
             let ptr: *mut c_void = if !self.audio_bufs[i].is_empty() {
@@ -463,12 +492,14 @@ impl Lv2Instance {
             }
             let ev = LV2_Atom_Event {
                 frames: 0,
-                body: LV2_Atom { size: 3, type_: midi_urid },
+                body: LV2_Atom {
+                    size: 3,
+                    type_: midi_urid,
+                },
             };
             // Copy event header.
-            let ev_bytes = unsafe {
-                std::slice::from_raw_parts(&ev as *const _ as *const u8, ev_hdr)
-            };
+            let ev_bytes =
+                unsafe { std::slice::from_raw_parts(&ev as *const _ as *const u8, ev_hdr) };
             buf[write..write + ev_hdr].copy_from_slice(ev_bytes);
             // Copy 3 MIDI bytes after the header.
             buf[write + ev_hdr..write + ev_hdr + 3].copy_from_slice(&msg[..3]);
@@ -476,11 +507,17 @@ impl Lv2Instance {
         }
         let body_size = (write - std::mem::size_of::<LV2_Atom>()) as u32;
         let seq = LV2_Atom_Sequence {
-            atom: LV2_Atom { size: body_size, type_: self.features.sequence_urid },
+            atom: LV2_Atom {
+                size: body_size,
+                type_: self.features.sequence_urid,
+            },
             body: LV2_Atom_Sequence_Body { unit: 0, pad: 0 },
         };
         let seq_bytes = unsafe {
-            std::slice::from_raw_parts(&seq as *const _ as *const u8, std::mem::size_of::<LV2_Atom_Sequence>())
+            std::slice::from_raw_parts(
+                &seq as *const _ as *const u8,
+                std::mem::size_of::<LV2_Atom_Sequence>(),
+            )
         };
         buf[..seq_bytes.len()].copy_from_slice(seq_bytes);
         self.pending_midi.clear();
@@ -495,9 +532,15 @@ impl Lv2Instance {
                 continue;
             }
             let cap = (buf.len() - std::mem::size_of::<LV2_Atom>()) as u32;
-            let atom = LV2_Atom { size: cap, type_: 0 };
+            let atom = LV2_Atom {
+                size: cap,
+                type_: 0,
+            };
             let bytes = unsafe {
-                std::slice::from_raw_parts(&atom as *const _ as *const u8, std::mem::size_of::<LV2_Atom>())
+                std::slice::from_raw_parts(
+                    &atom as *const _ as *const u8,
+                    std::mem::size_of::<LV2_Atom>(),
+                )
             };
             buf[..bytes.len()].copy_from_slice(bytes);
         }
@@ -523,7 +566,13 @@ impl Lv2Instance {
         };
         for body in queued {
             if let Some(respond) = unsafe { (*iface).work_response } {
-                unsafe { respond(self.handle, body.len() as u32, body.as_ptr() as *const c_void) };
+                unsafe {
+                    respond(
+                        self.handle,
+                        body.len() as u32,
+                        body.as_ptr() as *const c_void,
+                    )
+                };
             }
         }
         if let Some(end_run) = unsafe { (*iface).end_run } {
@@ -612,7 +661,10 @@ impl Drop for Lv2Instance {
         *self.controls.lock() = None;
         *self.state.lock() = None;
         if leaks_on_teardown(&self.info.uri) {
-            eprintln!("choz: leaving {} alive on purpose (it crashes in cleanup)", self.info.uri);
+            eprintln!(
+                "choz: leaving {} alive on purpose (it crashes in cleanup)",
+                self.info.uri
+            );
             return;
         }
         unsafe {
@@ -628,9 +680,7 @@ impl Drop for Lv2Instance {
 
 /// `dlopen` an LV2 binary into a reference-counted `Library`.
 fn load_library(path: &Path) -> Result<Arc<Library>> {
-    let l = unsafe {
-        Library::new(path).with_context(|| format!("dlopen {}", path.display()))?
-    };
+    let l = unsafe { Library::new(path).with_context(|| format!("dlopen {}", path.display()))? };
     let lib = Arc::new(l);
     keep_loaded(&lib);
     Ok(lib)
@@ -666,7 +716,10 @@ fn build_instance(
     // Refuse plugins needing features we don't provide.
     for feat in &info.required_features {
         if !Features::supported(feat) {
-            bail!("LV2 plugin {} requires unsupported feature: {feat}", info.uri);
+            bail!(
+                "LV2 plugin {} requires unsupported feature: {feat}",
+                info.uri
+            );
         }
     }
 
@@ -701,7 +754,12 @@ fn build_instance(
     let features = Features::new(urids, sample_rate, block_size);
 
     // Allocate per-port buffers.
-    let nports = info.ports.iter().map(|p| p.index as usize + 1).max().unwrap_or(0);
+    let nports = info
+        .ports
+        .iter()
+        .map(|p| p.index as usize + 1)
+        .max()
+        .unwrap_or(0);
     let mut control_values = vec![0.0f32; nports];
     let mut audio_bufs = vec![Vec::<f32>::new(); nports];
     let mut atom_bufs = vec![Vec::<u8>::new(); nports];
@@ -746,8 +804,8 @@ fn build_instance(
         let instantiate = (*descriptor)
             .instantiate
             .ok_or_else(|| anyhow::anyhow!("plugin has no instantiate fn"))?;
-        let bundle = CString::new(format!("{}/", info.bundle_dir.to_string_lossy()))
-            .unwrap_or_default();
+        let bundle =
+            CString::new(format!("{}/", info.bundle_dir.to_string_lossy())).unwrap_or_default();
         let h = instantiate(
             descriptor,
             sample_rate as f64,
@@ -832,10 +890,7 @@ fn scan_bundles_depth(dir: &Path, depth: usize, f: &mut impl FnMut(&Path)) {
     };
     for entry in rd.flatten() {
         // Use the entry's own (non-following) type so symlinked dirs are skipped.
-        let is_dir = entry
-            .file_type()
-            .map(|t| t.is_dir())
-            .unwrap_or(false);
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         if !is_dir {
             continue;
         }
@@ -853,9 +908,16 @@ fn scan_bundles_depth(dir: &Path, depth: usize, f: &mut impl FnMut(&Path)) {
 fn is_pruned_dir(name: &str) -> bool {
     matches!(
         name,
-        ".git" | ".svn" | ".hg"
-            | "target" | "build" | "node_modules"
-            | ".cargo" | ".rustup" | ".cache" | "__pycache__"
+        ".git"
+            | ".svn"
+            | ".hg"
+            | "target"
+            | "build"
+            | "node_modules"
+            | ".cargo"
+            | ".rustup"
+            | ".cache"
+            | "__pycache__"
     )
 }
 
@@ -882,14 +944,15 @@ pub fn default_search_paths() -> Vec<PathBuf> {
     p
 }
 
-
 // ─── choz-facing API ────────────────────────────────────────────────────────
 
 /// Every LV2 plugin under `dir` (bundles are `*.lv2` directories). Pure TTL
 /// parsing — no library is loaded, so a scan is cheap and can't crash us.
 pub fn scan_directory(dir: &Path) -> Vec<Lv2PluginInfo> {
     let mut out = Vec::new();
-    scan_bundles(dir, &mut |bundle| out.extend(discovery::discover_bundle(bundle)));
+    scan_bundles(dir, &mut |bundle| {
+        out.extend(discovery::discover_bundle(bundle))
+    });
     out
 }
 
@@ -904,7 +967,9 @@ fn info_for(bundle_dir: &Path, uri: &str) -> Result<Lv2PluginInfo> {
 /// Automatable parameters = the plugin's control input ports, in port order.
 /// Read straight from the TTL, so this never loads the binary.
 pub fn read_params(bundle_dir: &Path, uri: &str) -> Vec<PluginParam> {
-    info_for(bundle_dir, uri).map(|i| params_of(&i)).unwrap_or_default()
+    info_for(bundle_dir, uri)
+        .map(|i| params_of(&i))
+        .unwrap_or_default()
 }
 
 fn params_of(info: &Lv2PluginInfo) -> Vec<PluginParam> {
@@ -918,7 +983,11 @@ fn params_of(info: &Lv2PluginInfo) -> Vec<PluginParam> {
         .iter()
         .map(|p| PluginParam {
             id: p.index,
-            name: if p.name.is_empty() { p.symbol.clone() } else { p.name.clone() },
+            name: if p.name.is_empty() {
+                p.symbol.clone()
+            } else {
+                p.name.clone()
+            },
             min: p.min as f64,
             max: p.max as f64,
             default: p.default as f64,
@@ -935,7 +1004,11 @@ fn params_of(info: &Lv2PluginInfo) -> Vec<PluginParam> {
                 0
             },
             unit: p.unit.clone(),
-            points: p.points.iter().map(|(v, l)| (*v as f64, l.clone())).collect(),
+            points: p
+                .points
+                .iter()
+                .map(|(v, l)| (*v as f64, l.clone()))
+                .collect(),
         })
         .collect()
 }
@@ -963,8 +1036,12 @@ impl Lv2Instance {
     /// Set control input `index` (into [`params_of`]) from a 0..1 knob position.
     /// RT-safe: writes the port's own f32 cell, which the plugin reads on `run`.
     fn set_param_norm(&mut self, params: &[PluginParam], index: usize, value: f32) {
-        let Some(info) = params.get(index) else { return };
-        let Some(cell) = self.control_values.get_mut(info.id as usize) else { return };
+        let Some(info) = params.get(index) else {
+            return;
+        };
+        let Some(cell) = self.control_values.get_mut(info.id as usize) else {
+            return;
+        };
         *cell = info.plain(value.clamp(0.0, 1.0) as f64) as f32;
     }
 
@@ -1011,7 +1088,11 @@ impl Lv2Instance {
                     self.audio_bufs[self.audio_out[1]][f],
                 ),
             };
-            let (l, r) = if l.is_finite() && r.is_finite() { (l, r) } else { (0.0, 0.0) };
+            let (l, r) = if l.is_finite() && r.is_finite() {
+                (l, r)
+            } else {
+                (0.0, 0.0)
+            };
             block[f * 2] = block[f * 2] * dry + l * wet;
             block[f * 2 + 1] = block[f * 2 + 1] * dry + r * wet;
         }
@@ -1033,7 +1114,10 @@ impl choz_ports::ParamTouch for Lv2Touch {
     fn take_touched(&self) -> Option<(u32, f32)> {
         let (port, plain) = self.raw.lock().take()?;
         let index = self.params.iter().position(|p| p.id == port)?;
-        Some((index as u32, self.params[index].normalised(plain as f64) as f32))
+        Some((
+            index as u32,
+            self.params[index].normalised(plain as f64) as f32,
+        ))
     }
 }
 
@@ -1042,7 +1126,10 @@ fn touch_of(
     params: &[PluginParam],
 ) -> Option<choz_ports::TouchHandle> {
     let ed = editor.as_ref()?;
-    Some(Arc::new(Lv2Touch { raw: ed.touched(), params: params.to_vec() }) as choz_ports::TouchHandle)
+    Some(Arc::new(Lv2Touch {
+        raw: ed.touched(),
+        params: params.to_vec(),
+    }) as choz_ports::TouchHandle)
 }
 
 pub struct Lv2Instrument {
@@ -1072,7 +1159,11 @@ impl Lv2Instrument {
         let params = params_of(&inst.info);
         inst.apply_defaults(&params);
         let editor = build_editor(&inst, sample_rate);
-        Some(Self { inst, params, editor })
+        Some(Self {
+            inst,
+            params,
+            editor,
+        })
     }
 }
 
@@ -1098,8 +1189,9 @@ impl AudioSource for Lv2Instrument {
     }
 
     fn state(&self) -> Option<choz_ports::StateHandle> {
-        Some(Arc::new(state::Lv2State { shared: Arc::clone(&self.inst.state) })
-            as choz_ports::StateHandle)
+        Some(Arc::new(state::Lv2State {
+            shared: Arc::clone(&self.inst.state),
+        }) as choz_ports::StateHandle)
     }
 
     fn render(&mut self, output: &mut [f32], _sample_rate: u32) -> usize {
@@ -1129,7 +1221,8 @@ impl AudioSource for Lv2Instrument {
 
     fn pitch_bend(&mut self, value: u16) {
         let v = value.min(16383);
-        self.inst.queue_midi([0xE0, (v & 0x7F) as u8, (v >> 7) as u8]);
+        self.inst
+            .queue_midi([0xE0, (v & 0x7F) as u8, (v >> 7) as u8]);
     }
 
     fn program_change(&mut self, bank: u8, preset: u8) {
@@ -1175,7 +1268,12 @@ impl Lv2Effect {
         let params = params_of(&inst.info);
         inst.apply_defaults(&params);
         let editor = build_editor(&inst, sample_rate);
-        Some(Self { inst, params, wet: 1.0, editor })
+        Some(Self {
+            inst,
+            params,
+            wet: 1.0,
+            editor,
+        })
     }
 }
 
@@ -1189,8 +1287,9 @@ impl FxProcessor for Lv2Effect {
     }
 
     fn state(&self) -> Option<choz_ports::StateHandle> {
-        Some(Arc::new(state::Lv2State { shared: Arc::clone(&self.inst.state) })
-            as choz_ports::StateHandle)
+        Some(Arc::new(state::Lv2State {
+            shared: Arc::clone(&self.inst.state),
+        }) as choz_ports::StateHandle)
     }
 
     fn process_block(&mut self, buf: &mut [f32], _sample_rate: u32) {
@@ -1250,10 +1349,16 @@ fn write_time_position(out: &mut [u8], t: TimeUrids) -> usize {
     // 1 is rolling at normal rate.
     let props: [(u32, PropValue); 7] = [
         (t.frame, PropValue::Long(clock.samples() as i64)),
-        (t.speed, PropValue::Float(if clock.playing() { 1.0 } else { 0.0 })),
+        (
+            t.speed,
+            PropValue::Float(if clock.playing() { 1.0 } else { 0.0 }),
+        ),
         (t.bpm, PropValue::Float(clock.bpm())),
         (t.bar, PropValue::Long(bar as i64)),
-        (t.bar_beat, PropValue::Float((beats - bar * beats_per_bar) as f32)),
+        (
+            t.bar_beat,
+            PropValue::Float((beats - bar * beats_per_bar) as f32),
+        ),
         (t.beats_per_bar, PropValue::Float(beats_per_bar as f32)),
         (t.beat_unit, PropValue::Int(den as i32)),
     ];
@@ -1270,8 +1375,17 @@ fn write_time_position(out: &mut [u8], t: TimeUrids) -> usize {
 
     // The event header: an object, timestamped at the start of the block.
     let obj_size = (std::mem::size_of::<LV2_Atom_Object_Body>() + body) as u32;
-    let ev = LV2_Atom_Event { frames: 0, body: LV2_Atom { size: obj_size, type_: t.object } };
-    let obj = LV2_Atom_Object_Body { id: 0, otype: t.position };
+    let ev = LV2_Atom_Event {
+        frames: 0,
+        body: LV2_Atom {
+            size: obj_size,
+            type_: t.object,
+        },
+    };
+    let obj = LV2_Atom_Object_Body {
+        id: 0,
+        otype: t.position,
+    };
     let mut w = 0;
     w += put(out, w, &ev);
     w += put(out, w, &obj);
@@ -1280,7 +1394,10 @@ fn write_time_position(out: &mut [u8], t: TimeUrids) -> usize {
         let prop = LV2_Atom_Property_Body {
             key,
             context: 0,
-            value: LV2_Atom { size: value.len() as u32, type_: value.type_urid(t) },
+            value: LV2_Atom {
+                size: value.len() as u32,
+                type_: value.type_urid(t),
+            },
         };
         let start = w;
         w += put(out, w, &prop);
@@ -1358,9 +1475,18 @@ mod transport_tests {
     #[test]
     fn the_position_object_is_laid_out_the_way_a_plugin_reads_it() {
         let t = TimeUrids {
-            object: 1, long: 2, float: 3, int: 4, position: 5,
-            frame: 6, speed: 7, bpm: 8, bar: 9, bar_beat: 10,
-            beats_per_bar: 11, beat_unit: 12,
+            object: 1,
+            long: 2,
+            float: 3,
+            int: 4,
+            position: 5,
+            frame: 6,
+            speed: 7,
+            bpm: 8,
+            bar: 9,
+            bar_beat: 10,
+            beats_per_bar: 11,
+            beat_unit: 12,
         };
         let clock = choz_ports::transport();
         clock.set_sample_rate(48_000);
@@ -1372,19 +1498,25 @@ mod transport_tests {
 
         let mut buf = vec![0u8; 512];
         let n = write_time_position(&mut buf, t);
-        assert!(n > 0 && n.is_multiple_of(8), "atoms are eight-byte aligned; got {n}");
+        assert!(
+            n > 0 && n.is_multiple_of(8),
+            "atoms are eight-byte aligned; got {n}"
+        );
 
         // Walk it exactly as a plugin would.
         let ev: LV2_Atom_Event = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const _) };
         assert_eq!(ev.frames, 0, "the clock is for the start of the block");
         assert_eq!(ev.body.type_, t.object);
         let obj: LV2_Atom_Object_Body = unsafe {
-            std::ptr::read_unaligned(buf.as_ptr().add(std::mem::size_of::<LV2_Atom_Event>()) as *const _)
+            std::ptr::read_unaligned(
+                buf.as_ptr().add(std::mem::size_of::<LV2_Atom_Event>()) as *const _
+            )
         };
         assert_eq!(obj.otype, t.position, "it is a time:Position");
 
         let mut found = std::collections::HashMap::new();
-        let mut off = std::mem::size_of::<LV2_Atom_Event>() + std::mem::size_of::<LV2_Atom_Object_Body>();
+        let mut off =
+            std::mem::size_of::<LV2_Atom_Event>() + std::mem::size_of::<LV2_Atom_Object_Body>();
         while off + std::mem::size_of::<LV2_Atom_Property_Body>() <= n {
             let prop: LV2_Atom_Property_Body =
                 unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off) as *const _) };
@@ -1406,7 +1538,11 @@ mod transport_tests {
             off += pad8(std::mem::size_of::<LV2_Atom_Property_Body>() + prop.value.size as usize);
         }
 
-        assert_eq!(found.get(&t.frame), Some(&144_000.0), "three seconds of frames");
+        assert_eq!(
+            found.get(&t.frame),
+            Some(&144_000.0),
+            "three seconds of frames"
+        );
         assert_eq!(found.get(&t.speed), Some(&1.0), "rolling");
         assert_eq!(found.get(&t.bpm), Some(&120.0));
         assert_eq!(found.get(&t.bar), Some(&1.0), "six beats in, second bar");

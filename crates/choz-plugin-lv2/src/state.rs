@@ -76,7 +76,12 @@ unsafe extern "C" fn store_cb(
     // SAFETY: the plugin promised `size` readable bytes, and they are copied
     // before the call returns.
     let bytes = unsafe { std::slice::from_raw_parts(value as *const u8, size) }.to_vec();
-    bag.props.push(Property { key, type_uri, flags, value: bytes });
+    bag.props.push(Property {
+        key,
+        type_uri,
+        flags,
+        value: bytes,
+    });
     LV2_STATE_SUCCESS
 }
 
@@ -92,7 +97,9 @@ unsafe extern "C" fn retrieve_cb(
     }
     // SAFETY: the handle is the `Bag` this host passed to `restore`.
     let bag = unsafe { &mut *(handle as *mut Bag) };
-    let Some(key_uri) = uri_of(&bag.urids, key) else { return std::ptr::null() };
+    let Some(key_uri) = uri_of(&bag.urids, key) else {
+        return std::ptr::null();
+    };
     let Some(prop) = bag.props.iter().find(|p| p.key == key_uri) else {
         return std::ptr::null();
     };
@@ -198,10 +205,21 @@ impl PathFeatures {
             free_path: Some(free_path_cb),
         });
         let features = [
-            LV2_Feature { uri: map_uri.as_ptr(), data: &*map as *const _ as *mut c_void },
-            LV2_Feature { uri: free_uri.as_ptr(), data: &*free as *const _ as *mut c_void },
+            LV2_Feature {
+                uri: map_uri.as_ptr(),
+                data: &*map as *const _ as *mut c_void,
+            },
+            LV2_Feature {
+                uri: free_uri.as_ptr(),
+                data: &*free as *const _ as *mut c_void,
+            },
         ];
-        Some(Self { features, _map: map, _free: free, _uris: [map_uri, free_uri] })
+        Some(Self {
+            features,
+            _map: map,
+            _free: free,
+            _uris: [map_uri, free_uri],
+        })
     }
 
     /// The null-terminated list `save`/`restore` take.
@@ -233,10 +251,17 @@ impl choz_ports::PluginState for Lv2State {
         let iface = unsafe { interface(cell.descriptor) }?;
         let save = unsafe { (*iface).save }?;
 
-        let mut bag = Bag { props: Vec::new(), urids: Arc::clone(&cell.urids), lent: Vec::new() };
+        let mut bag = Bag {
+            props: Vec::new(),
+            urids: Arc::clone(&cell.urids),
+            lent: Vec::new(),
+        };
         // Without these a sampler stores nothing: the paths are half its state.
         let paths = PathFeatures::new();
-        let features = paths.as_ref().map(|p| p.list()).unwrap_or([std::ptr::null(); 3]);
+        let features = paths
+            .as_ref()
+            .map(|p| p.list())
+            .unwrap_or([std::ptr::null(); 3]);
         // SAFETY: the plugin calls `store_cb` with our bag for the duration of
         // this call and not after it.
         let status = unsafe {
@@ -262,12 +287,23 @@ impl choz_ports::PluginState for Lv2State {
         let guard = self.shared.lock();
         let Some(cell) = guard.as_ref() else { return };
         // SAFETY: live instance under the mutex.
-        let Some(iface) = (unsafe { interface(cell.descriptor) }) else { return };
-        let Some(restore) = (unsafe { (*iface).restore }) else { return };
+        let Some(iface) = (unsafe { interface(cell.descriptor) }) else {
+            return;
+        };
+        let Some(restore) = (unsafe { (*iface).restore }) else {
+            return;
+        };
 
-        let mut bag = Bag { props, urids: Arc::clone(&cell.urids), lent: Vec::new() };
+        let mut bag = Bag {
+            props,
+            urids: Arc::clone(&cell.urids),
+            lent: Vec::new(),
+        };
         let paths = PathFeatures::new();
-        let features = paths.as_ref().map(|p| p.list()).unwrap_or([std::ptr::null(); 3]);
+        let features = paths
+            .as_ref()
+            .map(|p| p.list())
+            .unwrap_or([std::ptr::null(); 3]);
         unsafe {
             restore(
                 cell.handle,
@@ -338,7 +374,12 @@ fn decode(data: &[u8]) -> Option<Vec<Property>> {
         let type_uri = String::from_utf8(r.bytes()?.to_vec()).ok()?;
         let flags = r.u32()?;
         let value = r.bytes()?.to_vec();
-        out.push(Property { key, type_uri, flags, value });
+        out.push(Property {
+            key,
+            type_uri,
+            flags,
+            value,
+        });
     }
     Some(out)
 }
@@ -354,7 +395,12 @@ mod tests {
     use super::*;
 
     fn prop(key: &str, ty: &str, value: &[u8]) -> Property {
-        Property { key: key.into(), type_uri: ty.into(), flags: 3, value: value.to_vec() }
+        Property {
+            key: key.into(),
+            type_uri: ty.into(),
+            flags: 3,
+            value: value.to_vec(),
+        }
     }
 
     /// The strings the two path functions return belong to the plugin, which
@@ -368,10 +414,18 @@ mod tests {
         let stored = unsafe { abstract_path_cb(null, src.as_ptr()) };
         assert!(!stored.is_null());
         assert_ne!(stored.cast_const(), src.as_ptr(), "the plugin must own it");
-        assert_eq!(unsafe { CStr::from_ptr(stored) }, src.as_c_str(), "stored as-is");
+        assert_eq!(
+            unsafe { CStr::from_ptr(stored) },
+            src.as_c_str(),
+            "stored as-is"
+        );
 
         let back = unsafe { absolute_path_cb(null, stored) };
-        assert_eq!(unsafe { CStr::from_ptr(back) }, src.as_c_str(), "and read back as-is");
+        assert_eq!(
+            unsafe { CStr::from_ptr(back) },
+            src.as_c_str(),
+            "and read back as-is"
+        );
 
         // Freed the way the plugin would, whichever of the two ways it uses.
         unsafe { free_path_cb(null, back) };
@@ -389,7 +443,11 @@ mod tests {
         let paths = PathFeatures::new().expect("the two URIs are literals");
         let list = paths.list();
         assert!(list[2].is_null(), "terminated");
-        let uri = |f: *const LV2_Feature| unsafe { CStr::from_ptr((*f).uri) }.to_string_lossy().into_owned();
+        let uri = |f: *const LV2_Feature| {
+            unsafe { CStr::from_ptr((*f).uri) }
+                .to_string_lossy()
+                .into_owned()
+        };
         assert_eq!(uri(list[0]), LV2_STATE_MAP_PATH_URI);
         assert_eq!(uri(list[1]), LV2_STATE_FREE_PATH_URI);
         // The data pointers survive the move out of `new`.

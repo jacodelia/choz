@@ -46,7 +46,11 @@ const GOGH_DATA: &str = include_str!("gogh_themes.txt");
 /// darker.
 fn frame_between(text: (u8, u8, u8), desktop: (u8, u8, u8)) -> (u8, u8, u8) {
     let mix = |a: u8, b: u8| ((a as u16 + b as u16) / 2) as u8;
-    (mix(text.0, desktop.0), mix(text.1, desktop.1), mix(text.2, desktop.2))
+    (
+        mix(text.0, desktop.0),
+        mix(text.1, desktop.1),
+        mix(text.2, desktop.2),
+    )
 }
 
 fn hex(s: &str) -> Option<(u8, u8, u8)> {
@@ -61,18 +65,21 @@ fn hex(s: &str) -> Option<(u8, u8, u8)> {
 /// Parse [`GOGH_DATA`]. A line that doesn't parse is skipped rather than fatal:
 /// the table is data, and one bad row must not cost the user every theme.
 fn gogh_themes() -> impl Iterator<Item = Theme> {
-    GOGH_DATA.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()).filter_map(|line| {
-        let mut parts = line.split('|');
-        let name = parts.next()?.trim();
-        let text = hex(parts.next()?)?;
-        let desktop = hex(parts.next()?)?;
-        (!name.is_empty()).then_some(Theme {
-            name,
-            text,
-            border: frame_between(text, desktop),
-            desktop: Some(desktop),
+    GOGH_DATA
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .filter_map(|line| {
+            let mut parts = line.split('|');
+            let name = parts.next()?.trim();
+            let text = hex(parts.next()?)?;
+            let desktop = hex(parts.next()?)?;
+            (!name.is_empty()).then_some(Theme {
+                name,
+                text,
+                border: frame_between(text, desktop),
+                desktop: Some(desktop),
+            })
         })
-    })
 }
 
 /// choz's own themes, shown first: the default look plus the classic editor
@@ -354,7 +361,9 @@ impl Background {
             Background::Color((r, g, b)) => format!("colour rgb({r},{g},{b})"),
             Background::Image { path, fit } => format!(
                 "{}  [{}]",
-                path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
                 fit.label()
             ),
         }
@@ -464,9 +473,11 @@ impl UiSettings {
         let len = PALETTE.len() as i32 + 1;
         let now = match self.panel_tint {
             None => 0,
-            Some(rgb) => {
-                PALETTE.iter().position(|(_, c)| *c == rgb).map(|i| i as i32 + 1).unwrap_or(0)
-            }
+            Some(rgb) => PALETTE
+                .iter()
+                .position(|(_, c)| *c == rgb)
+                .map(|i| i as i32 + 1)
+                .unwrap_or(0),
         };
         let next = (now + delta).rem_euclid(len);
         self.panel_tint = match next {
@@ -566,14 +577,21 @@ mod tests {
         let old = r#"{"text_color":[255,255,255],"language":"Es"}"#;
         let s: UiSettings = serde_json::from_str(old).unwrap();
         assert_eq!(s.language, Lang::Es);
-        assert_eq!(s.audio, AudioSettings::default(), "missing sections take defaults");
+        assert_eq!(
+            s.audio,
+            AudioSettings::default(),
+            "missing sections take defaults"
+        );
         assert_eq!(s.osc.udp_port, choz_engine::osc::DEFAULT_PORT);
     }
 
     #[test]
     fn audio_and_osc_settings_have_sane_shapes() {
         let a = AudioSettings::default();
-        assert!((a.latency_ms() - 5.333).abs() < 0.01, "256 @ 48k is ~5.3 ms");
+        assert!(
+            (a.latency_ms() - 5.333).abs() < 0.01,
+            "256 @ 48k is ~5.3 ms"
+        );
         assert!(BACKENDS.contains(&a.backend.as_str()));
         assert!(SAMPLE_RATES.contains(&a.sample_rate));
         assert!(BUFFER_SIZES.contains(&a.buffer_size));
@@ -590,12 +608,23 @@ mod tests {
     #[test]
     fn the_gogh_table_parses_into_usable_themes() {
         let gogh: Vec<Theme> = gogh_themes().collect();
-        assert!(gogh.len() > 300, "the upstream table has hundreds; got {}", gogh.len());
-        assert_eq!(THEMES.len(), BUILTIN.len() + gogh.len(), "choz's own come first");
+        assert!(
+            gogh.len() > 300,
+            "the upstream table has hundreds; got {}",
+            gogh.len()
+        );
+        assert_eq!(
+            THEMES.len(),
+            BUILTIN.len() + gogh.len(),
+            "choz's own come first"
+        );
         assert_eq!(THEMES[0].name, BUILTIN[0].name);
 
         // A known scheme, byte for byte from `data/themes.json`.
-        let gruvbox = gogh.iter().find(|t| t.name == "Gruvbox Dark").expect("a famous one");
+        let gruvbox = gogh
+            .iter()
+            .find(|t| t.name == "Gruvbox Dark")
+            .expect("a famous one");
         assert_eq!(gruvbox.text, (0xEB, 0xDB, 0xB2));
         assert_eq!(gruvbox.desktop, Some((0x28, 0x28, 0x28)));
         // The frame sits between the two, so it reads against both.

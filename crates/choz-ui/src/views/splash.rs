@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, BorderType, Clear, Gauge, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph},
     Frame,
 };
 
@@ -31,7 +31,11 @@ pub struct SplashState {
 
 impl SplashState {
     pub fn new() -> Self {
-        Self { tick: 0, ready: false, dismiss_at: None }
+        Self {
+            tick: 0,
+            ready: false,
+            dismiss_at: None,
+        }
     }
 
     pub fn dismiss(&mut self) {
@@ -52,10 +56,7 @@ pub fn is_active(state: &SplashState) -> bool {
 pub fn draw_splash(f: &mut Frame, state: &SplashState, area: Rect) {
     // Opaque backdrop
     f.render_widget(Clear, area);
-    f.render_widget(
-        Block::default().style(Style::default().bg(BACKDROP)),
-        area,
-    );
+    f.render_widget(Block::default().style(Style::default().bg(BACKDROP)), area);
 
     let modal = centered_fixed(76, 24, area);
 
@@ -83,15 +84,15 @@ pub fn draw_splash(f: &mut Frame, state: &SplashState, area: Rect) {
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(LOGO_LINES as u16), // logo
+            Constraint::Length(LOGO_LINES as u16),     // logo
             Constraint::Length(LOGO_LINES as u16 / 2), // its reflection
-            Constraint::Length(1),                 // tagline + version
-            Constraint::Length(1),                 // the formats it hosts
-            Constraint::Length(1),                 // spacer
-            Constraint::Length(1),                 // wave
-            Constraint::Length(1),                 // spinner + status
-            Constraint::Length(1),                 // progress
-            Constraint::Length(1),                 // hint
+            Constraint::Length(1),                     // tagline + version
+            Constraint::Length(1),                     // the formats it hosts
+            Constraint::Length(1),                     // spacer
+            Constraint::Length(1),                     // wave
+            Constraint::Length(1),                     // spinner + status
+            Constraint::Length(1),                     // progress
+            Constraint::Length(1),                     // hint
         ])
         .split(inner);
 
@@ -160,12 +161,18 @@ pub fn draw_splash(f: &mut Frame, state: &SplashState, area: Rect) {
 
     // ─── Tagline ────────────────────────────────────────────────────────
     let tagline = Line::from(vec![
-        Span::styled("  choz ", Style::default().fg(HEADER).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "  choz ",
+            Style::default().fg(HEADER).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             concat!("v", env!("CARGO_PKG_VERSION")),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  \u{00B7}  terminal audio plugin host", Style::default().fg(DIM)),
+        Span::styled(
+            "  \u{00B7}  terminal audio plugin host",
+            Style::default().fg(DIM),
+        ),
     ]);
     f.render_widget(
         Paragraph::new(tagline).style(Style::default().bg(PANEL_BG)),
@@ -179,7 +186,10 @@ pub fn draw_splash(f: &mut Frame, state: &SplashState, area: Rect) {
     for (i, name) in FORMATS.iter().enumerate() {
         let lit = (logo_tick as usize % (FORMATS.len() * 2)) == i;
         let style = if lit {
-            Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(HINT)
         };
@@ -209,7 +219,11 @@ pub fn draw_splash(f: &mut Frame, state: &SplashState, area: Rect) {
     };
     let spinner_color = if state.ready {
         let pulse = (state.tick % 10) < 5;
-        if pulse { Color::Rgb(70, 210, 110) } else { Color::Rgb(40, 160, 75) }
+        if pulse {
+            Color::Rgb(70, 210, 110)
+        } else {
+            Color::Rgb(40, 160, 75)
+        }
     } else {
         HEADER
     };
@@ -221,7 +235,9 @@ pub fn draw_splash(f: &mut Frame, state: &SplashState, area: Rect) {
     let status_line = Line::from(vec![
         Span::styled(
             format!("  {spinner_char}"),
-            Style::default().fg(spinner_color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(spinner_color)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(status_text, Style::default().fg(HINT)),
     ]);
@@ -231,7 +247,11 @@ pub fn draw_splash(f: &mut Frame, state: &SplashState, area: Rect) {
     );
 
     // ─── Progress bar ───────────────────────────────────────────────────
-    let progress = if state.ready { 1.0 } else { (state.tick as f64 / 60.0).min(1.0) };
+    let progress = if state.ready {
+        1.0
+    } else {
+        (state.tick as f64 / 60.0).min(1.0)
+    };
     let gauge = Gauge::default()
         .gauge_style(Style::default().fg(ACCENT).bg(PANEL_BG))
         .ratio(progress);
@@ -256,7 +276,10 @@ const FORMATS: [&str; 6] = ["CLAP", "LV2", "VST2", "VST3", "LADSPA", "DSSI"];
 /// Deterministic in `tick` and `width` so it can be tested without a terminal —
 /// an animation nobody can check is an animation that breaks quietly.
 pub fn splash_wave(tick: u64, width: usize) -> String {
-    const LEVELS: [char; 8] = ['\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+    const LEVELS: [char; 8] = [
+        '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}',
+        '\u{2588}',
+    ];
     (0..width)
         .map(|x| {
             // Two sines of different periods, so the crest travels instead of
@@ -297,7 +320,9 @@ fn draw_shadow(f: &mut Frame, modal: Rect, screen: Rect) {
 fn color_to_u8(c: Color, channel: usize) -> u8 {
     match c {
         Color::Rgb(r, g, b) => match channel {
-            0 => r, 1 => g, _ => b,
+            0 => r,
+            1 => g,
+            _ => b,
         },
         _ => 0,
     }
@@ -314,9 +339,15 @@ mod tests {
         for w in [0, 1, 40, 76] {
             assert_eq!(splash_wave(0, w).chars().count(), w);
         }
-        assert_ne!(splash_wave(0, 40), splash_wave(7, 40), "it moves with the tick");
+        assert_ne!(
+            splash_wave(0, 40),
+            splash_wave(7, 40),
+            "it moves with the tick"
+        );
         // Every glyph is one of the eighth blocks, so the row is one cell tall.
-        assert!(splash_wave(3, 40).chars().all(|c| ('\u{2581}'..='\u{2588}').contains(&c)));
+        assert!(splash_wave(3, 40)
+            .chars()
+            .all(|c| ('\u{2581}'..='\u{2588}').contains(&c)));
     }
 
     /// The box is 24 rows; the content used to be eleven of them. What fills the
@@ -325,6 +356,9 @@ mod tests {
     fn the_splash_says_what_choz_is() {
         assert_eq!(FORMATS.len(), 6, "the six formats choz hosts");
         assert!(FORMATS.contains(&"CLAP") && FORMATS.contains(&"VST3"));
-        assert!(!env!("CARGO_PKG_VERSION").is_empty(), "the version is shown on it");
+        assert!(
+            !env!("CARGO_PKG_VERSION").is_empty(),
+            "the version is shown on it"
+        );
     }
 }

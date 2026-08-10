@@ -6,12 +6,15 @@
 //! offsets used to.
 
 use ratatui::{
-    layout::Rect, style::{Color, Modifier, Style}, text::{Line, Span},
-    widgets::{Block, Borders, Paragraph}, Frame,
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph},
+    Frame,
 };
 
 use crate::i18n::t;
-use crate::source::{AudioFxEntry, MAX_FX, ParamShape};
+use crate::source::{AudioFxEntry, ParamShape, MAX_FX};
 use crate::views::theme::{border as ui_border, text as ui_text};
 
 const HEADER: Color = Color::Rgb(240, 136, 62);
@@ -110,7 +113,11 @@ pub struct SbxState {
 /// Button text for a sandbox toggle: the state, and what it has cost.
 pub fn sbx_label(s: SbxState) -> String {
     if !s.live {
-        return if s.on { " SBX \u{25CF} (reload) ".into() } else { " SBX \u{25CB} ".into() };
+        return if s.on {
+            " SBX \u{25CF} (reload) ".into()
+        } else {
+            " SBX \u{25CB} ".into()
+        };
     }
     let mut label = String::from(" SBX \u{25CF}");
     if s.missed > 0 {
@@ -125,8 +132,13 @@ pub fn sbx_label(s: SbxState) -> String {
 
 pub fn knob_indicator(val: f32) -> char {
     match (val.clamp(0.0, 1.0) * 7.99) as usize {
-        0 => '\u{2199}', 1 => '\u{2190}', 2 => '\u{2196}', 3 => '\u{2191}',
-        4 => '\u{2197}', 5 => '\u{2192}', 6 => '\u{2198}',
+        0 => '\u{2199}',
+        1 => '\u{2190}',
+        2 => '\u{2196}',
+        3 => '\u{2191}',
+        4 => '\u{2197}',
+        5 => '\u{2192}',
+        6 => '\u{2198}',
         _ => '\u{2193}',
     }
 }
@@ -139,7 +151,10 @@ pub fn knob_indicator(val: f32) -> char {
 /// eight, which is 64 positions in the same width and the closest a terminal
 /// gets to the angular resolution of a real knob.
 pub fn knob_arc(val: f32, width: usize) -> String {
-    const EIGHTHS: [char; 8] = ['\u{258F}', '\u{258E}', '\u{258D}', '\u{258C}', '\u{258B}', '\u{258A}', '\u{2589}', '\u{2588}'];
+    const EIGHTHS: [char; 8] = [
+        '\u{258F}', '\u{258E}', '\u{258D}', '\u{258C}', '\u{258B}', '\u{258A}', '\u{2589}',
+        '\u{2588}',
+    ];
     let eighths = (val.clamp(0.0, 1.0) * (width * 8) as f32).round() as usize;
     let full = eighths / 8;
     let rest = eighths % 8;
@@ -193,7 +208,10 @@ pub fn fader_groups(shapes: &[ParamShape]) -> Vec<bool> {
 /// number — it is that the bars next to each other draw the shape of the
 /// envelope (or the curve of the EQ) in one look.
 pub fn vertical_bar(val: f32, width: usize) -> (String, String) {
-    const EIGHTHS: [char; 8] = ['\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+    const EIGHTHS: [char; 8] = [
+        '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}',
+        '\u{2588}',
+    ];
     let eighths = (val.clamp(0.0, 1.0) * 16.0).round() as usize;
     let cell = |e: usize| -> char {
         match e {
@@ -205,7 +223,10 @@ pub fn vertical_bar(val: f32, width: usize) -> (String, String) {
     // The bar grows upward: the bottom cell fills first.
     let bottom = cell(eighths.min(8));
     let top = cell(eighths.saturating_sub(8));
-    (top.to_string().repeat(width), bottom.to_string().repeat(width))
+    (
+        top.to_string().repeat(width),
+        bottom.to_string().repeat(width),
+    )
 }
 
 /// A horizontal fader: the whole travel, with the handle where the value is.
@@ -237,7 +258,11 @@ pub const GATE_MIN_DB: f32 = -70.0;
 pub const GATE_MAX_DB: f32 = -20.0;
 
 pub fn gate_norm(gate: f32) -> f32 {
-    let db = if gate > 1e-6 { 20.0 * gate.log10() } else { GATE_MIN_DB };
+    let db = if gate > 1e-6 {
+        20.0 * gate.log10()
+    } else {
+        GATE_MIN_DB
+    };
     ((db - GATE_MIN_DB) / (GATE_MAX_DB - GATE_MIN_DB)).clamp(0.0, 1.0)
 }
 
@@ -247,7 +272,11 @@ pub fn gate_from_norm(norm: f32) -> f32 {
 }
 
 fn gate_db(gate: f32) -> String {
-    let db = if gate > 1e-6 { 20.0 * gate.log10() } else { GATE_MIN_DB };
+    let db = if gate > 1e-6 {
+        20.0 * gate.log10()
+    } else {
+        GATE_MIN_DB
+    };
     format!("{db:.0}")
 }
 
@@ -267,7 +296,11 @@ fn heard() -> String {
         Some(note) => format!(" {}{:+}", note_name(note), m.cents()),
         None => {
             let level = m.level();
-            let db = if level > 1e-6 { 20.0 * level.log10() } else { -99.0 };
+            let db = if level > 1e-6 {
+                20.0 * level.log10()
+            } else {
+                -99.0
+            };
             format!(" {db:.0}dB")
         }
     }
@@ -275,8 +308,9 @@ fn heard() -> String {
 
 /// `60` is `C4`, the way every tracker and DAW writes it.
 fn note_name(note: u8) -> String {
-    const NAMES: [&str; 12] =
-        ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    const NAMES: [&str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
     format!("{}{}", NAMES[note as usize % 12], note as i32 / 12 - 1)
 }
 pub const BTN_GUI: &str = " GUI ";
@@ -287,7 +321,10 @@ pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
-        s.chars().take(max.saturating_sub(1)).chain(['\u{2026}']).collect()
+        s.chars()
+            .take(max.saturating_sub(1))
+            .chain(['\u{2026}'])
+            .collect()
     }
 }
 
@@ -357,13 +394,20 @@ fn draw_knob_box(
     }
     let (cols, rows_needed) = param_grid(inner.width, n);
     // 3 rows per knob row, plus the box border.
-    let room = (inner.y + inner.height).saturating_sub(y + reserve_below).max(3) as usize;
+    let room = (inner.y + inner.height)
+        .saturating_sub(y + reserve_below)
+        .max(3) as usize;
     let rows_shown = (room / 3).clamp(1, rows_needed.max(1)).min(max_rows.max(1));
     let cursor_row = cursor / cols.max(1);
     let first_row = cursor_row.saturating_sub(rows_shown.saturating_sub(1));
 
     let box_h = (rows_shown * 3) as u16 + 2;
-    let box_rect = Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), box_h.min(inner.height));
+    let box_rect = Rect::new(
+        inner.x + 1,
+        y,
+        inner.width.saturating_sub(2),
+        box_h.min(inner.height),
+    );
     let more = if rows_needed > rows_shown {
         format!(" ({}/{} rows) ", first_row + rows_shown, rows_needed)
     } else {
@@ -394,7 +438,10 @@ fn draw_knob_box(
             }
             let val = values[pi];
             let is_p = pi == cursor && focused;
-            rects.push((pi, Rect::new(param_inner.x + (col as u16) * FX_CELL_W, ry, FX_CELL_W, 3)));
+            rects.push((
+                pi,
+                Rect::new(param_inner.x + (col as u16) * FX_CELL_W, ry, FX_CELL_W, 3),
+            ));
             let shape = shapes.get(pi).unwrap_or(&ParamShape::Continuous);
             let cell = FX_CELL_W as usize;
             // The control follows what the parameter is: a switch reads as on
@@ -410,7 +457,10 @@ fn draw_knob_box(
                     )
                 }
                 (ParamShape::Named(_), Some((k, n))) => (
-                    format!("\u{25C0}{}\u{25B6}", truncate(shape.label(k).unwrap_or("?"), cell - 3)),
+                    format!(
+                        "\u{25C0}{}\u{25B6}",
+                        truncate(shape.label(k).unwrap_or("?"), cell - 3)
+                    ),
                     format!(" {}/{n}", k + 1),
                     KNOB,
                 ),
@@ -420,11 +470,7 @@ fn draw_knob_box(
                     let (top, bottom) = vertical_bar(val, 5);
                     (format!(" {top}"), format!(" {bottom} {val:4.2}"), KNOB)
                 }
-                (ParamShape::Fader(_), _) => (
-                    fader_track(val, 10),
-                    format!(" {val:4.2}"),
-                    KNOB,
-                ),
+                (ParamShape::Fader(_), _) => (fader_track(val, 10), format!(" {val:4.2}"), KNOB),
                 _ => (
                     format!("[{}]", knob_arc(val, 8)),
                     format!(" {}{val:4.2}", knob_indicator(val)),
@@ -439,11 +485,19 @@ fn draw_knob_box(
                 format!("{bottom:<cell$}"),
                 Style::default()
                     .fg(if is_p { SEL } else { ui_text() })
-                    .add_modifier(if is_p { Modifier::BOLD } else { Modifier::empty() }),
+                    .add_modifier(if is_p {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
             ));
             let name = names.get(pi).map(|s| s.as_str()).unwrap_or("?");
             name_spans.push(Span::styled(
-                format!(" {:<width$}", truncate(name, FX_CELL_W as usize - 2), width = FX_CELL_W as usize - 1),
+                format!(
+                    " {:<width$}",
+                    truncate(name, FX_CELL_W as usize - 2),
+                    width = FX_CELL_W as usize - 1
+                ),
                 Style::default().fg(if is_p { SEL } else { LABEL }),
             ));
         }
@@ -508,7 +562,14 @@ pub fn draw_fx_chain_panel(
     };
 
     let block = Block::default()
-        .title(format!(" {} ", if focused { format!("{} [ACTIVE]", t("RACK")) } else { t("RACK").to_string() }))
+        .title(format!(
+            " {} ",
+            if focused {
+                format!("{} [ACTIVE]", t("RACK"))
+            } else {
+                t("RACK").to_string()
+            }
+        ))
         .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_style(border_style)
@@ -523,7 +584,10 @@ pub fn draw_fx_chain_panel(
     let bg = super::theme::panel_style();
     let put = |f: &mut Frame, line: Line, y: u16| {
         if y < inner.y + inner.height {
-            f.render_widget(Paragraph::new(line).style(bg), Rect::new(inner.x, y, inner.width, 1));
+            f.render_widget(
+                Paragraph::new(line).style(bg),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
         }
     };
     let rule = |f: &mut Frame, label: &str, y: u16| {
@@ -534,7 +598,10 @@ pub fn draw_fx_chain_panel(
         let pad = (inner.width as usize).saturating_sub(text.chars().count());
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(text, Style::default().fg(LABEL).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    text,
+                    Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled("\u{2500}".repeat(pad), Style::default().fg(RULE)),
             ]))
             .style(bg),
@@ -556,11 +623,18 @@ pub fn draw_fx_chain_panel(
         for (i, label) in tabs.iter().enumerate() {
             let w = label.chars().count() as u16 + 2;
             layout.tabs.push((i, Rect::new(x, y, w, 1)));
-            layout.tab_close.push((i, Rect::new(x + w - TAB_CLOSE_W, y, TAB_CLOSE_W, 1)));
+            layout
+                .tab_close
+                .push((i, Rect::new(x + w - TAB_CLOSE_W, y, TAB_CLOSE_W, 1)));
             let st = if i == active_slot {
-                Style::default().fg(Color::Black).bg(HEADER).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(HEADER)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Rgb(200, 205, 215)).bg(Color::Rgb(40, 46, 56))
+                Style::default()
+                    .fg(Color::Rgb(200, 205, 215))
+                    .bg(Color::Rgb(40, 46, 56))
             };
             tab_line.push(Span::styled(format!(" {label} "), st));
             tab_line.push(Span::raw(" "));
@@ -571,7 +645,10 @@ pub fn draw_fx_chain_panel(
             layout.tab_add = Some(Rect::new(x, y, TAB_ADD_W, 1));
             tab_line.push(Span::styled(
                 " + ",
-                Style::default().fg(Color::Black).bg(Color::Rgb(90, 170, 110)).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(90, 170, 110))
+                    .add_modifier(Modifier::BOLD),
             ));
         }
     }
@@ -586,9 +663,14 @@ pub fn draw_fx_chain_panel(
     let (gain, pan, mute, solo) = mix.unwrap_or((1.0, 0.0, false, false));
     let flag = |on: bool, on_bg: Color| {
         if on {
-            Style::default().fg(Color::Black).bg(on_bg).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Black)
+                .bg(on_bg)
+                .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Rgb(110, 115, 125)).bg(Color::Rgb(32, 38, 47))
+            Style::default()
+                .fg(Color::Rgb(110, 115, 125))
+                .bg(Color::Rgb(32, 38, 47))
         }
     };
     let label_style = Style::default().fg(LABEL).add_modifier(Modifier::BOLD);
@@ -596,12 +678,28 @@ pub fn draw_fx_chain_panel(
     // of each cell falls out of the widths instead of being re-derived.
     let cells: Vec<(String, Style, Option<usize>)> = vec![
         (format!("{} ", t("VOL")), label_style, None),
-        (format!("[{}] {gain:4.2}  ", knob_arc(gain / MAX_GAIN, 8)), Style::default().fg(KNOB), Some(0)),
+        (
+            format!("[{}] {gain:4.2}  ", knob_arc(gain / MAX_GAIN, 8)),
+            Style::default().fg(KNOB),
+            Some(0),
+        ),
         (format!("{} ", t("PAN")), label_style, None),
-        (format!("{} {:<4}  ", pan_slider(pan), pan_label(pan)), Style::default().fg(KNOB), Some(1)),
-        (format!(" {} ", t("MUTE")), flag(mute, Color::Rgb(200, 80, 80)), Some(2)),
+        (
+            format!("{} {:<4}  ", pan_slider(pan), pan_label(pan)),
+            Style::default().fg(KNOB),
+            Some(1),
+        ),
+        (
+            format!(" {} ", t("MUTE")),
+            flag(mute, Color::Rgb(200, 80, 80)),
+            Some(2),
+        ),
         (" ".to_string(), bg, None),
-        (format!(" {} ", t("SOLO")), flag(solo, Color::Rgb(220, 190, 70)), Some(3)),
+        (
+            format!(" {} ", t("SOLO")),
+            flag(solo, Color::Rgb(220, 190, 70)),
+            Some(3),
+        ),
     ];
     // A guitar is nowhere near the level of a synth, so a tab fed by audio gets
     // its own trim — and the sensitivity `A→M` listens with, which is the same
@@ -643,7 +741,10 @@ pub fn draw_fx_chain_panel(
     y += 1;
 
     // ── Instrument line ────────────────────────────────────────────────────
-    let btn_style = Style::default().fg(Color::Black).bg(KNOB).add_modifier(Modifier::BOLD);
+    let btn_style = Style::default()
+        .fg(Color::Black)
+        .bg(KNOB)
+        .add_modifier(Modifier::BOLD);
     // A plugin actually running elsewhere gets its own colour: it is the one
     // thing on this line that says the audio is crossing a process boundary.
     let sbx_style = Style::default()
@@ -651,14 +752,23 @@ pub fn draw_fx_chain_panel(
         .bg(Color::Rgb(56, 200, 100))
         .add_modifier(Modifier::BOLD);
     let mut instr_line: Vec<Span> = vec![
-        Span::styled(format!("  {} ", t("INSTR")), Style::default().fg(LABEL).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{:<18}", truncate(instrument, 18)), Style::default().fg(ui_text())),
+        Span::styled(
+            format!("  {} ", t("INSTR")),
+            Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:<18}", truncate(instrument, 18)),
+            Style::default().fg(ui_text()),
+        ),
     ];
     let mut bx = inner.x + 2 + 8 + 18;
     for (btn, text) in [
         (RackButton::Source, Some(BTN_SOURCE.to_string())),
         // Bank/preset only exists while the tab holds a SoundFont.
-        (RackButton::Preset, has_presets.then(|| BTN_PRESET.to_string())),
+        (
+            RackButton::Preset,
+            has_presets.then(|| BTN_PRESET.to_string()),
+        ),
         (RackButton::Learn, Some(BTN_LEARN.to_string())),
         // A guitar into a synth: only offered where there is audio coming in.
         (
@@ -680,12 +790,21 @@ pub fn draw_fx_chain_panel(
         // Channel 0 is "any": a tab that takes whatever its port sends.
         (
             RackButton::Channel,
-            channel.map(|c| if c == 0 { " CH ANY ".to_string() } else { format!(" CH {c:>2} ") }),
+            channel.map(|c| {
+                if c == 0 {
+                    " CH ANY ".to_string()
+                } else {
+                    format!(" CH {c:>2} ")
+                }
+            }),
         ),
         // Only plugins with a native editor get the button.
         (RackButton::Gui, has_gui.then(|| BTN_GUI.to_string())),
         // Only a hosted plugin can be moved into a process of its own.
-        (RackButton::Sandbox, sandbox.available.then(|| sbx_label(sandbox))),
+        (
+            RackButton::Sandbox,
+            sandbox.available.then(|| sbx_label(sandbox)),
+        ),
     ] {
         let Some(text) = text else { continue };
         let w = text.chars().count() as u16;
@@ -695,7 +814,10 @@ pub fn draw_fx_chain_panel(
         } else if btn == RackButton::PitchToMidi && pitch_to_midi == Some(true) {
             // On, and it changes what the tab does with its input, so it says so
             // the way the sandbox button does.
-            Style::default().fg(Color::Black).bg(ON_COLOUR).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Black)
+                .bg(ON_COLOUR)
+                .add_modifier(Modifier::BOLD)
         } else {
             btn_style
         };
@@ -709,10 +831,14 @@ pub fn draw_fx_chain_panel(
     // ── Bank / preset line (SoundFont tabs only) ───────────────────────────
     if let Some(name) = preset {
         let mut px = inner.x + 2 + 8;
-        let mut line: Vec<Span> = vec![
-            Span::styled(format!("  {}  ", t("BANK")), Style::default().fg(LABEL).add_modifier(Modifier::BOLD)),
-        ];
-        for (btn, text) in [(RackButton::PresetPrev, BTN_PREV), (RackButton::PresetNext, BTN_NEXT)] {
+        let mut line: Vec<Span> = vec![Span::styled(
+            format!("  {}  ", t("BANK")),
+            Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
+        )];
+        for (btn, text) in [
+            (RackButton::PresetPrev, BTN_PREV),
+            (RackButton::PresetNext, BTN_NEXT),
+        ] {
             let w = text.chars().count() as u16;
             layout.buttons.push((btn, Rect::new(px, y, w, 1)));
             line.push(Span::styled(text, btn_style));
@@ -748,7 +874,11 @@ pub fn draw_fx_chain_panel(
                 "{} \u{00B7} {}{}",
                 t("INSTRUMENT"),
                 truncate(instrument, 18),
-                if focused && instr_focused { "" } else { "  [k]" }
+                if focused && instr_focused {
+                    ""
+                } else {
+                    "  [k]"
+                }
             ),
             &values,
             &names,
@@ -772,7 +902,11 @@ pub fn draw_fx_chain_panel(
     let right = inner.x + inner.width;
     let mut chain_line: Vec<Span> = vec![Span::raw("  ")];
     let flush = |f: &mut Frame, line: &mut Vec<Span>, y: u16| {
-        put(f, Line::from(std::mem::replace(line, vec![Span::raw("  ")])), y);
+        put(
+            f,
+            Line::from(std::mem::replace(line, vec![Span::raw("  ")])),
+            y,
+        );
     };
     for (i, entry) in chain.iter().enumerate() {
         let text = format!(" {}:{} ", i + 1, entry.label());
@@ -783,9 +917,14 @@ pub fn draw_fx_chain_panel(
             cx = inner.x + 2;
         }
         let st = if i == fx_slot && focused {
-            Style::default().fg(Color::Black).bg(SEL).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Black)
+                .bg(SEL)
+                .add_modifier(Modifier::BOLD)
         } else if entry.enabled {
-            Style::default().fg(Color::Rgb(56, 200, 100)).bg(Color::Rgb(30, 40, 34))
+            Style::default()
+                .fg(Color::Rgb(56, 200, 100))
+                .bg(Color::Rgb(30, 40, 34))
         } else {
             Style::default()
                 .fg(Color::Rgb(90, 95, 105))
@@ -808,7 +947,9 @@ pub fn draw_fx_chain_panel(
         layout.fx_add = Some(Rect::new(cx, y, w, 1));
         chain_line.push(Span::styled(
             add,
-            Style::default().fg(Color::Black).bg(Color::Rgb(100, 160, 220)),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(100, 160, 220)),
         ));
     }
     flush(f, &mut chain_line, y);
@@ -871,7 +1012,9 @@ pub fn draw_fx_chain_panel(
                 5,
             );
             // The tail box numbers its knobs from zero; the chain does not.
-            layout.params.extend(rest.into_iter().map(|(i, r)| (i + n, r)));
+            layout
+                .params
+                .extend(rest.into_iter().map(|(i, r)| (i + n, r)));
             y = next;
             drawn = true;
         }
@@ -881,17 +1024,17 @@ pub fn draw_fx_chain_panel(
         (Vec::new(), y)
     } else {
         draw_knob_box(
-        f,
-        inner,
-        y,
-        &format!("{}:{}", fx_slot + 1, entry.label()),
-        &entry.params,
-        &names,
-        &shapes,
-        fx_param,
-        focused && !instr_focused,
-        usize::MAX,
-        5,
+            f,
+            inner,
+            y,
+            &format!("{}:{}", fx_slot + 1, entry.label()),
+            &entry.params,
+            &names,
+            &shapes,
+            fx_param,
+            focused && !instr_focused,
+            usize::MAX,
+            5,
         )
     };
     if !drawn {
@@ -924,7 +1067,10 @@ pub fn draw_fx_chain_panel(
 
         let mut cx = ctrl_inner.x + 1;
         let mut spans: Vec<Span> = vec![Span::raw(" ")];
-        let mut button = |spans: &mut Vec<Span<'static>>, text: String, style: Style, rect: &mut Option<Rect>| {
+        let mut button = |spans: &mut Vec<Span<'static>>,
+                          text: String,
+                          style: Style,
+                          rect: &mut Option<Rect>| {
             let w = text.chars().count() as u16;
             *rect = Some(Rect::new(cx, ctrl_inner.y, w, 1));
             spans.push(Span::styled(text, style));
@@ -933,41 +1079,88 @@ pub fn draw_fx_chain_panel(
             cx += w + 3;
         };
         let (on_lbl, on_style) = if entry.enabled {
-            ("  ON  ", Style::default().fg(Color::Black).bg(Color::Rgb(56, 200, 100)))
+            (
+                "  ON  ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(56, 200, 100)),
+            )
         } else {
-            (" OFF  ", Style::default().fg(Color::Rgb(180, 185, 195)).bg(Color::Rgb(40, 46, 56)))
+            (
+                " OFF  ",
+                Style::default()
+                    .fg(Color::Rgb(180, 185, 195))
+                    .bg(Color::Rgb(40, 46, 56)),
+            )
         };
-        button(&mut spans, on_lbl.into(), on_style.add_modifier(Modifier::BOLD), &mut layout.on_off);
-        let mv = Style::default().fg(Color::Black).bg(Color::Rgb(150, 195, 245));
-        let mv_off = Style::default().fg(Color::Rgb(70, 78, 92)).bg(Color::Rgb(32, 38, 47));
+        button(
+            &mut spans,
+            on_lbl.into(),
+            on_style.add_modifier(Modifier::BOLD),
+            &mut layout.on_off,
+        );
+        let mv = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(150, 195, 245));
+        let mv_off = Style::default()
+            .fg(Color::Rgb(70, 78, 92))
+            .bg(Color::Rgb(32, 38, 47));
         // Disabled ends of the chain still draw a (greyed) button, they just
         // don't get a click rect.
         let can_left = fx_slot > 0;
         let can_right = fx_slot + 1 < chain.len();
         let mut left = None;
         let mut right = None;
-        button(&mut spans, " \u{25C0} MOVE ".into(), if can_left { mv } else { mv_off }, &mut left);
-        button(&mut spans, " MOVE \u{25B6} ".into(), if can_right { mv } else { mv_off }, &mut right);
+        button(
+            &mut spans,
+            " \u{25C0} MOVE ".into(),
+            if can_left { mv } else { mv_off },
+            &mut left,
+        );
+        button(
+            &mut spans,
+            " MOVE \u{25B6} ".into(),
+            if can_right { mv } else { mv_off },
+            &mut right,
+        );
         layout.move_left = can_left.then_some(left).flatten();
         layout.move_right = can_right.then_some(right).flatten();
-        button(&mut spans, " DEL ".into(),
-               Style::default().fg(Color::White).bg(Color::Rgb(170, 50, 50)).add_modifier(Modifier::BOLD),
-               &mut layout.del);
+        button(
+            &mut spans,
+            " DEL ".into(),
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(170, 50, 50))
+                .add_modifier(Modifier::BOLD),
+            &mut layout.del,
+        );
         // Plugin FX get their own window button; built-ins have nothing to show.
         if fx_has_gui {
-            button(&mut spans, BTN_GUI.into(),
-                   Style::default().fg(Color::Black).bg(KNOB).add_modifier(Modifier::BOLD),
-                   &mut layout.fx_gui);
+            button(
+                &mut spans,
+                BTN_GUI.into(),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(KNOB)
+                    .add_modifier(Modifier::BOLD),
+                &mut layout.fx_gui,
+            );
         }
         // Same toggle as the instrument's, for a plugin effect.
         if fx_sandbox.available {
             let style = if fx_sandbox.live {
-                Style::default().fg(Color::Black).bg(Color::Rgb(56, 200, 100))
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(56, 200, 100))
             } else {
                 Style::default().fg(Color::Black).bg(KNOB)
             };
-            button(&mut spans, sbx_label(fx_sandbox), style.add_modifier(Modifier::BOLD),
-                   &mut layout.fx_sandbox);
+            button(
+                &mut spans,
+                sbx_label(fx_sandbox),
+                style.add_modifier(Modifier::BOLD),
+                &mut layout.fx_sandbox,
+            );
         }
         f.render_widget(
             Paragraph::new(Line::from(spans)).style(bg),
@@ -983,7 +1176,14 @@ pub fn draw_fx_chain_panel(
     } else {
         "  Tab=enter the rack"
     };
-    put(f, Line::from(Span::styled(truncate(hint, inner.width as usize), Style::default().fg(ui_border()))), hint_y);
+    put(
+        f,
+        Line::from(Span::styled(
+            truncate(hint, inner.width as usize),
+            Style::default().fg(ui_border()),
+        )),
+        hint_y,
+    );
 
     layout
 }
@@ -1010,14 +1210,22 @@ fn draw_autotune_readout(
     let dim = Style::default().fg(RULE);
 
     // Row 1: level, the note heard → the note aimed at, and the error.
-    let db = if m.level > 1e-6 { 20.0 * m.level.log10() } else { -99.0 };
+    let db = if m.level > 1e-6 {
+        20.0 * m.level.log10()
+    } else {
+        -99.0
+    };
     let bars = (((db + 60.0) / 60.0).clamp(0.0, 1.0) * 8.0).round() as usize;
     let meter: String = std::iter::repeat_n('\u{2588}', bars)
         .chain(std::iter::repeat_n('\u{2591}', 8 - bars))
         .collect();
     let heard = note_label(m.detected_frequency);
     let aimed = note_label(m.target_frequency);
-    let err = if m.voiced { format!("{:+.0}\u{00A2}", m.pitch_error_cents) } else { "  \u{00B7} ".into() };
+    let err = if m.voiced {
+        format!("{:+.0}\u{00A2}", m.pitch_error_cents)
+    } else {
+        "  \u{00B7} ".into()
+    };
     let err_style = if !m.voiced {
         dim
     } else if m.pitch_error_cents.abs() < 10.0 {
@@ -1077,7 +1285,9 @@ fn note_label(hz: f32) -> String {
     if !hz.is_finite() || hz <= 0.0 {
         return "\u{2014}".to_string();
     }
-    let note = (69.0 + 12.0 * (hz / 440.0).log2()).round().clamp(0.0, 127.0) as i32;
+    let note = (69.0 + 12.0 * (hz / 440.0).log2())
+        .round()
+        .clamp(0.0, 127.0) as i32;
     let name = choz_engine::fx::autotune::NOTE_NAMES[(note as usize) % 12];
     format!("{name}{} {hz:.0}", note / 12 - 1)
 }
@@ -1115,7 +1325,9 @@ pub fn draw_eq_bank(
     let block = Block::default()
         .title(Span::styled(
             format!(" {title} "),
-            Style::default().fg(if focused { SEL } else { LABEL }).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(if focused { SEL } else { LABEL })
+                .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if focused { SEL } else { RULE }))
@@ -1135,7 +1347,10 @@ pub fn draw_eq_bank(
     for b in 0..bands {
         let x0 = area.x + (b * w / bands) as u16;
         let x1 = area.x + ((b + 1) * w / bands) as u16;
-        rects.push((b, Rect::new(x0, area.y, x1.saturating_sub(x0).max(1), area.height)));
+        rects.push((
+            b,
+            Rect::new(x0, area.y, x1.saturating_sub(x0).max(1), area.height),
+        ));
     }
 
     for row in 0..track_h {
@@ -1148,7 +1363,14 @@ pub fn draw_eq_bank(
                 let (ch, colour) = if col == mid && row == kr {
                     // Above the zero line is a boost, below it is a cut, and
                     // the colour says which without reading the number.
-                    ('\u{2588}', if values[b] >= 0.5 { IN_TUNE } else { Color::Rgb(230, 120, 120) })
+                    (
+                        '\u{2588}',
+                        if values[b] >= 0.5 {
+                            IN_TUNE
+                        } else {
+                            Color::Rgb(230, 120, 120)
+                        },
+                    )
                 } else if row == centre {
                     ('\u{2500}', RULE)
                 } else if col == mid {
@@ -1203,7 +1425,11 @@ mod tests {
     /// exactly this reading.
     #[test]
     fn the_a_to_m_button_reports_what_it_heard() {
-        assert_eq!(note_name(60), "C4", "middle C is C4, the way a DAW writes it");
+        assert_eq!(
+            note_name(60),
+            "C4",
+            "middle C is C4, the way a DAW writes it"
+        );
         assert_eq!(note_name(69), "A4");
         assert_eq!(note_name(40), "E2", "a guitar's low E");
 
@@ -1228,7 +1454,11 @@ mod tests {
         // 80 columns of panel → 6 knob columns of 13.
         assert_eq!(param_grid(80, 6), (6, 1));
         assert_eq!(param_grid(80, 7), (6, 2), "a 7th knob starts a second row");
-        assert_eq!(param_grid(80, 16), (6, 3), "Z5 Texture's 16 params take 3 rows");
+        assert_eq!(
+            param_grid(80, 16),
+            (6, 3),
+            "Z5 Texture's 16 params take 3 rows"
+        );
         assert_eq!(param_grid(10, 4), (1, 4), "a narrow panel stacks them");
         assert_eq!(param_grid(80, 0), (6, 0));
     }

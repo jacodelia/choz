@@ -51,8 +51,12 @@ impl Cassette {
         c
     }
 
-    pub fn set_drive(&mut self, d: f32) { self.drive = d.clamp(0.5, 8.0); }
-    pub fn set_noise(&mut self, amp: f32) { self.noise_amp = amp.clamp(0.0, 0.1); }
+    pub fn set_drive(&mut self, d: f32) {
+        self.drive = d.clamp(0.5, 8.0);
+    }
+    pub fn set_noise(&mut self, amp: f32) {
+        self.noise_amp = amp.clamp(0.0, 0.1);
+    }
     pub fn set_emphasis_hz(&mut self, hz: f32) {
         self.emphasis_hz = hz.clamp(500.0, 15000.0);
         self.update_coeffs();
@@ -60,11 +64,11 @@ impl Cassette {
 
     fn update_coeffs(&mut self) {
         // α = e^(-2π·f/sr) — standard 1-pole LP decay coefficient.
-        let rc  = 1.0 / (2.0 * std::f32::consts::PI * self.emphasis_hz);
-        let dt  = 1.0 / self.sample_rate as f32;
+        let rc = 1.0 / (2.0 * std::f32::consts::PI * self.emphasis_hz);
+        let dt = 1.0 / self.sample_rate as f32;
         let alpha = (-dt / rc).exp();
         self.pre_alpha = alpha;
-        self.de_alpha  = alpha;
+        self.de_alpha = alpha;
     }
 
     #[inline]
@@ -77,7 +81,7 @@ impl Cassette {
     fn process_sample(&mut self, ch: usize, x: f32) -> f32 {
         // 1. Pre-emphasis: LP pole → high-shelf via HP = input - LP.
         self.pre_lp[ch] = self.pre_alpha * self.pre_lp[ch] + (1.0 - self.pre_alpha) * x;
-        let pre = x + 0.7 * (x - self.pre_lp[ch]);   // add boosted HF
+        let pre = x + 0.7 * (x - self.pre_lp[ch]); // add boosted HF
 
         // 2. Soft-clip (tanh).
         let driven = pre * self.drive;
@@ -88,14 +92,20 @@ impl Cassette {
         let de = self.de_lp[ch];
 
         // 4. Flutter noise (only on L channel to avoid phase cancellation).
-        let noise = if ch == 0 { self.rand_f32() * self.noise_amp } else { 0.0 };
+        let noise = if ch == 0 {
+            self.rand_f32() * self.noise_amp
+        } else {
+            0.0
+        };
 
         de + noise
     }
 }
 
 impl Default for Cassette {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FxProcessor for Cassette {
@@ -110,14 +120,14 @@ impl FxProcessor for Cassette {
             let dry_r = buf[i * 2 + 1];
             let wet_l = self.process_sample(0, dry_l);
             let wet_r = self.process_sample(1, dry_r);
-            buf[i * 2]     = dry_l + self.wet * (wet_l - dry_l);
+            buf[i * 2] = dry_l + self.wet * (wet_l - dry_l);
             buf[i * 2 + 1] = dry_r + self.wet * (wet_r - dry_r);
         }
     }
 
     fn reset(&mut self) {
         self.pre_lp = [0.0; 2];
-        self.de_lp  = [0.0; 2];
+        self.de_lp = [0.0; 2];
     }
 
     fn set_mix(&mut self, wet: f32) {
@@ -142,13 +152,13 @@ mod tests {
             .collect();
         let mut quiet: Vec<f32> = loud.iter().map(|&s| s * 0.1).collect();
 
-        let mut fx  = Cassette::new();
+        let mut fx = Cassette::new();
         let mut fx2 = Cassette::new();
         fx.process_block(&mut loud, sr);
         fx2.process_block(&mut quiet, sr);
 
         // Scale quiet output back up: if linear, peaks would match; saturation makes loud smaller.
-        let peak_loud:  f32 = loud.iter().copied().map(f32::abs).fold(0.0, f32::max);
+        let peak_loud: f32 = loud.iter().copied().map(f32::abs).fold(0.0, f32::max);
         let peak_quiet: f32 = quiet.iter().map(|&s| s.abs() * 10.0).fold(0.0, f32::max);
         assert!(peak_loud < peak_quiet,
             "saturation should reduce loud peak vs scaled quiet: loud={peak_loud:.4} quiet×10={peak_quiet:.4}");
@@ -161,6 +171,6 @@ mod tests {
         fx.process_block(&mut buf, 48000);
         fx.reset();
         assert_eq!(fx.pre_lp, [0.0; 2]);
-        assert_eq!(fx.de_lp,  [0.0; 2]);
+        assert_eq!(fx.de_lp, [0.0; 2]);
     }
 }

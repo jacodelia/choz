@@ -114,8 +114,7 @@ const UI_DENY_PREFIXES: &[&str] = &["http://guitarix.sourceforge.net/plugins/"];
 /// dying UI costs a child the supervisor replaces. Process-wide because
 /// discovery runs deep inside the load path and the whole process is either
 /// choz or a sandbox child, never both.
-static ALLOW_DENIED_UIS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static ALLOW_DENIED_UIS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Offer editors that [`UI_DENY_PREFIXES`] would otherwise hide. Only sound in
 /// a process whose death is survivable.
@@ -193,7 +192,12 @@ pub fn discover_bundle(bundle_dir: &Path) -> Vec<Lv2PluginInfo> {
     out
 }
 
-fn parse_plugin(graph: &Graph, uri: &str, bundle_dir: &Path, binary_path: PathBuf) -> Lv2PluginInfo {
+fn parse_plugin(
+    graph: &Graph,
+    uri: &str,
+    bundle_dir: &Path,
+    binary_path: PathBuf,
+) -> Lv2PluginInfo {
     let name = graph
         .object(uri, ttl::DOAP_NAME)
         .map(|n| n.as_str().to_string())
@@ -276,7 +280,9 @@ fn find_x11_ui(graph: &ttl::Graph, plugin_uri: &str) -> Option<Lv2UiInfo> {
     let only_one = || (x11.len() == 1).then(|| x11[0].clone());
 
     let ui_uri = declared.or_else(applies).or_else(only_one)?;
-    let binary_path = graph.object(&ui_uri, ttl::UI_BINARY).and_then(node_to_path)?;
+    let binary_path = graph
+        .object(&ui_uri, ttl::UI_BINARY)
+        .and_then(node_to_path)?;
     // A UI whose binary is missing is worse than no UI: the button would offer a
     // window that can never open.
     if !binary_path.exists() {
@@ -294,7 +300,9 @@ fn find_x11_ui(graph: &ttl::Graph, plugin_uri: &str) -> Option<Lv2UiInfo> {
         .collect();
     for see in graph.objects(&ui_uri, ttl::RDFS_SEE_ALSO) {
         let Some(p) = node_to_path(see) else { continue };
-        let Ok(g) = ttl::Graph::parse_file(&p) else { continue };
+        let Ok(g) = ttl::Graph::parse_file(&p) else {
+            continue;
+        };
         required.extend(
             g.objects(&ui_uri, ttl::LV2_REQUIRED_FEATURE)
                 .iter()
@@ -309,7 +317,10 @@ fn find_x11_ui(graph: &ttl::Graph, plugin_uri: &str) -> Option<Lv2UiInfo> {
         }
     }
 
-    Some(Lv2UiInfo { uri: ui_uri, binary_path })
+    Some(Lv2UiInfo {
+        uri: ui_uri,
+        binary_path,
+    })
 }
 
 fn parse_port(graph: &Graph, pid: &str) -> Port {
@@ -363,8 +374,11 @@ fn parse_port(graph: &Graph, pid: &str) -> Port {
 
     // What sort of control this is. Taken from the plugin and nowhere else: a
     // name that reads like a switch is a guess, `lv2:toggled` is a statement.
-    let props: Vec<&str> =
-        graph.objects(pid, ttl::LV2_PORT_PROPERTY).iter().map(|n| n.as_str()).collect();
+    let props: Vec<&str> = graph
+        .objects(pid, ttl::LV2_PORT_PROPERTY)
+        .iter()
+        .map(|n| n.as_str())
+        .collect();
     let has = |p: &str| props.contains(&p);
 
     let mut points: Vec<(f32, String)> = graph
@@ -372,7 +386,11 @@ fn parse_port(graph: &Graph, pid: &str) -> Port {
         .iter()
         .filter_map(|n| {
             let sp = n.as_str();
-            let value = graph.object(sp, ttl::RDF_VALUE)?.as_str().parse::<f32>().ok()?;
+            let value = graph
+                .object(sp, ttl::RDF_VALUE)?
+                .as_str()
+                .parse::<f32>()
+                .ok()?;
             let label = graph.object(sp, ttl::RDFS_LABEL)?.as_str().to_string();
             (!label.is_empty()).then_some((value, label))
         })
@@ -386,7 +404,12 @@ fn parse_port(graph: &Graph, pid: &str) -> Port {
         graph
             .object(node, ttl::UNITS_SYMBOL)
             .map(|s| s.as_str().to_string())
-            .or_else(|| node.rsplit('#').next().filter(|f| !f.is_empty()).map(str::to_string))
+            .or_else(|| {
+                node.rsplit('#')
+                    .next()
+                    .filter(|f| !f.is_empty())
+                    .map(str::to_string)
+            })
     });
 
     Port {
@@ -429,7 +452,10 @@ mod tests {
         assert!(!ui_denied("urn:zam:ZamComp"), "everything else is offered");
 
         allow_denied_uis(true);
-        assert!(!ui_denied(guitarix), "offered where the crash is survivable");
+        assert!(
+            !ui_denied(guitarix),
+            "offered where the crash is survivable"
+        );
         allow_denied_uis(false);
         assert!(ui_denied(guitarix));
     }

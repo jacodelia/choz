@@ -1,8 +1,8 @@
 //! Runtime checks against the VST2 plugins installed on this machine.
 //! Skips when `/usr/lib/vst` holds nothing loadable.
 
+use choz_plugin_vst2::{scan_directory, Vst2Effect, Vst2Instrument, Vst2PluginInfo};
 use choz_ports::{AudioSource, FxProcessor};
-use choz_plugin_vst2::{Vst2Effect, Vst2Instrument, Vst2PluginInfo, scan_directory};
 
 const SR: u32 = 48_000;
 const BLOCK: u32 = 256;
@@ -49,7 +49,9 @@ fn installed_vst2_plugins_scan_host_and_expose_params() {
     // MIDI-learn binding ends up calling), and it must offer the feed that
     // reports what the user moves inside its own window.
     for info in found.iter().filter(|p| p.is_instrument) {
-        let Some(mut inst) = Vst2Instrument::build(&info.path, SR, BLOCK) else { continue };
+        let Some(mut inst) = Vst2Instrument::build(&info.path, SR, BLOCK) else {
+            continue;
+        };
         let params = choz_plugin_vst2::read_params(&info.path, "");
         assert!(!params.is_empty(), "{} exposes no parameters", info.name);
         assert!(
@@ -91,7 +93,9 @@ fn installed_vst2_plugins_scan_host_and_expose_params() {
     // and a project that only saved the values would reopen on a different
     // sound. Saved from one instance, restored into a fresh one.
     for info in found.iter().filter(|p| p.is_instrument) {
-        let Some(mut inst) = Vst2Instrument::build(&info.path, SR, BLOCK) else { continue };
+        let Some(mut inst) = Vst2Instrument::build(&info.path, SR, BLOCK) else {
+            continue;
+        };
         let Some(state) = inst.state() else { continue };
         inst.set_param(0, 0.7);
         let Some(blob) = state.save() else {
@@ -100,7 +104,9 @@ fn installed_vst2_plugins_scan_host_and_expose_params() {
         };
         drop(inst);
 
-        let Some(fresh) = Vst2Instrument::build(&info.path, SR, BLOCK) else { continue };
+        let Some(fresh) = Vst2Instrument::build(&info.path, SR, BLOCK) else {
+            continue;
+        };
         let restored = fresh.state().expect("same plugin, same capability");
         restored.restore(&blob);
         assert_eq!(
@@ -115,10 +121,16 @@ fn installed_vst2_plugins_scan_host_and_expose_params() {
     // The first few installed effects load, process, and stay finite.
     let mut hosted = 0;
     for info in found.iter().filter(|p| !p.is_instrument) {
-        let Some(mut fx) = Vst2Effect::build(&info.path, SR, BLOCK) else { continue };
+        let Some(mut fx) = Vst2Effect::build(&info.path, SR, BLOCK) else {
+            continue;
+        };
         let mut buf = sine_block(BLOCK as usize);
         fx.process_block(&mut buf, SR);
-        assert!(buf.iter().all(|s| s.is_finite()), "{} produced non-finite", info.name);
+        assert!(
+            buf.iter().all(|s| s.is_finite()),
+            "{} produced non-finite",
+            info.name
+        );
         hosted += 1;
         if hosted == 3 {
             break;
@@ -127,7 +139,9 @@ fn installed_vst2_plugins_scan_host_and_expose_params() {
     assert!(hosted > 0, "no installed VST2 effect could be hosted");
 
     // Parameters come back with the plugin's own names, normalised 0..1.
-    let Some(info) = found.iter().find(|p| !p.is_instrument) else { return };
+    let Some(info) = found.iter().find(|p| !p.is_instrument) else {
+        return;
+    };
     let params = choz_plugin_vst2::read_params(&info.path, &info.id);
     if params.is_empty() {
         eprintln!("{} exposes no parameters; skipping", info.name);
@@ -136,7 +150,11 @@ fn installed_vst2_plugins_scan_host_and_expose_params() {
     for p in &params {
         assert!(!p.name.is_empty());
         assert_eq!((p.min, p.max), (0.0, 1.0));
-        assert!((0.0..=1.0).contains(&p.default), "{} default out of range", p.name);
+        assert!(
+            (0.0..=1.0).contains(&p.default),
+            "{} default out of range",
+            p.name
+        );
     }
 
     // An editor handle may outlive the plugin: the window thread can still be
@@ -144,8 +162,12 @@ fn installed_vst2_plugins_scan_host_and_expose_params() {
     // drop every call must be a no-op instead of a use-after-free. The window
     // itself is never opened here — a test must not pop up a GUI.
     for info in found.iter().filter(|p| p.is_instrument) {
-        let Some(inst) = Vst2Instrument::build(&info.path, SR, BLOCK) else { continue };
-        let Some(editor) = inst.editor() else { continue };
+        let Some(inst) = Vst2Instrument::build(&info.path, SR, BLOCK) else {
+            continue;
+        };
+        let Some(editor) = inst.editor() else {
+            continue;
+        };
         drop(inst);
         editor.idle();
         editor.close();

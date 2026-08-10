@@ -19,7 +19,7 @@ use std::os::raw::{c_char, c_float, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use libloading::Library;
 
 use choz_ports::{AudioSource, EditorHandle, FxProcessor, PluginEditor, PluginParam};
@@ -115,7 +115,11 @@ unsafe extern "C" fn host_callback(
                 info.flags = time_flags::PPQ_POS_VALID
                     | time_flags::TEMPO_VALID
                     | time_flags::TIME_SIG_VALID
-                    | if transport.playing() { time_flags::TRANSPORT_PLAYING } else { 0 };
+                    | if transport.playing() {
+                        time_flags::TRANSPORT_PLAYING
+                    } else {
+                        0
+                    };
             }
             t.get() as isize
         }),
@@ -163,7 +167,9 @@ fn scan_recursive(dir: &Path, depth: usize, out: &mut Vec<Vst2PluginInfo>) {
     if depth > 4 {
         return;
     }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         let path = entry.path();
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -201,7 +207,9 @@ pub fn describe(path: &Path) -> Option<Vst2PluginInfo> {
     Some(Vst2PluginInfo {
         path: path.to_path_buf(),
         name: if name.is_empty() {
-            path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+            path.file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
         } else {
             name
         },
@@ -387,7 +395,10 @@ const EVENT_ARRAY_OFFSET: usize = 8 + std::mem::size_of::<isize>();
 impl Instance {
     fn load(path: &Path, sample_rate: u32, block_size: u32) -> Result<Self> {
         if is_denied(path) {
-            bail!("{} is a plugin host itself; choz will not load it", path.display());
+            bail!(
+                "{} is a plugin host itself; choz will not load it",
+                path.display()
+            );
         }
         let lib = Arc::new(
             unsafe { Library::new(path) }.with_context(|| format!("dlopen {}", path.display()))?,
@@ -419,7 +430,8 @@ impl Instance {
             events: Vec::with_capacity(MAX_PENDING_MIDI),
             event_block: vec![
                 0u8;
-                EVENT_ARRAY_OFFSET + MAX_PENDING_MIDI * std::mem::size_of::<*mut VstMidiEvent>()
+                EVENT_ARRAY_OFFSET
+                    + MAX_PENDING_MIDI * std::mem::size_of::<*mut VstMidiEvent>()
             ],
             opened: false,
             shared: Arc::new(std::sync::Mutex::new(Some(EffectCell {
@@ -433,8 +445,20 @@ impl Instance {
         touch_feeds().push((effect as usize, Arc::clone(&inst.touch)));
         inst.dispatch(opcode::OPEN, 0, 0, std::ptr::null_mut(), 0.0);
         inst.opened = true;
-        inst.dispatch(opcode::SET_SAMPLE_RATE, 0, 0, std::ptr::null_mut(), sample_rate as f32);
-        inst.dispatch(opcode::SET_BLOCK_SIZE, 0, block as isize, std::ptr::null_mut(), 0.0);
+        inst.dispatch(
+            opcode::SET_SAMPLE_RATE,
+            0,
+            0,
+            std::ptr::null_mut(),
+            sample_rate as f32,
+        );
+        inst.dispatch(
+            opcode::SET_BLOCK_SIZE,
+            0,
+            block as isize,
+            std::ptr::null_mut(),
+            0.0,
+        );
         inst.dispatch(opcode::MAIN_RESUME, 0, 1, std::ptr::null_mut(), 0.0);
         Ok(inst)
     }
@@ -456,7 +480,9 @@ impl Instance {
     /// The plugin's own chunk: presets and everything else that is not a
     /// parameter value.
     fn state(&self) -> Option<choz_ports::StateHandle> {
-        Some(Arc::new(Vst2State { shared: Arc::clone(&self.shared) }) as choz_ports::StateHandle)
+        Some(Arc::new(Vst2State {
+            shared: Arc::clone(&self.shared),
+        }) as choz_ports::StateHandle)
     }
 
     /// The parameters the user moves inside the plugin's own window.
@@ -469,7 +495,9 @@ impl Instance {
         if unsafe { (*self.effect).flags & flags::HAS_EDITOR } == 0 {
             return None;
         }
-        Some(Arc::new(Vst2Editor { shared: Arc::clone(&self.shared) }))
+        Some(Arc::new(Vst2Editor {
+            shared: Arc::clone(&self.shared),
+        }))
     }
 
     fn num_params(&self) -> usize {
@@ -489,7 +517,11 @@ impl Instance {
                 id: i as u32,
                 name: {
                     let n = self.get_string(opcode::GET_PARAM_NAME, i as i32);
-                    if n.is_empty() { format!("P{i}") } else { n }
+                    if n.is_empty() {
+                        format!("P{i}")
+                    } else {
+                        n
+                    }
                 },
                 // VST2 parameters are normalised by definition, and the ABI
                 // says nothing about steps or units: everything is a knob.
@@ -600,7 +632,11 @@ impl Instance {
             1 => (self.outputs[0][f], self.outputs[0][f]),
             _ => (self.outputs[0][f], self.outputs[1][f]),
         };
-        if l.is_finite() && r.is_finite() { (l, r) } else { (0.0, 0.0) }
+        if l.is_finite() && r.is_finite() {
+            (l, r)
+        } else {
+            (0.0, 0.0)
+        }
     }
 
     /// One block of interleaved stereo through the plugin, in place.
@@ -776,11 +812,18 @@ impl AudioSource for Vst2Instrument {
 
     fn pitch_bend(&mut self, value: u16) {
         let v = value.min(16383);
-        self.inst.queue_midi([0xE0, (v & 0x7F) as u8, (v >> 7) as u8]);
+        self.inst
+            .queue_midi([0xE0, (v & 0x7F) as u8, (v >> 7) as u8]);
     }
 
     fn program_change(&mut self, _bank: u8, preset: u8) {
-        self.inst.dispatch(opcode::SET_PROGRAM, 0, preset as isize, std::ptr::null_mut(), 0.0);
+        self.inst.dispatch(
+            opcode::SET_PROGRAM,
+            0,
+            preset as isize,
+            std::ptr::null_mut(),
+            0.0,
+        );
     }
 
     fn set_param(&mut self, index: usize, value: f32) {
@@ -828,7 +871,10 @@ mod tests {
         let info = unsafe { *(ptr as *const VstTimeInfo) };
         assert!(info.sample_rate > 0.0);
         assert!(info.tempo > 0.0);
-        assert_eq!(info.flags & time_flags::TEMPO_VALID, time_flags::TEMPO_VALID);
+        assert_eq!(
+            info.flags & time_flags::TEMPO_VALID,
+            time_flags::TEMPO_VALID
+        );
     }
 
     /// And the answer has to be choz's actual clock, not a constant: a plugin
@@ -844,7 +890,12 @@ mod tests {
 
         let read = || unsafe {
             let ptr = host_callback(
-                std::ptr::null_mut(), host_opcode::GET_TIME, 0, 0, std::ptr::null_mut(), 0.0,
+                std::ptr::null_mut(),
+                host_opcode::GET_TIME,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0.0,
             );
             *(ptr as *const VstTimeInfo)
         };
@@ -853,7 +904,10 @@ mod tests {
         assert_eq!(info.sample_pos, 48_000.0);
         // One second at 90 BPM is one and a half quarter notes.
         assert!((info.ppq_pos - 1.5).abs() < 1e-9, "ppq {}", info.ppq_pos);
-        assert_eq!(info.flags & time_flags::TRANSPORT_PLAYING, time_flags::TRANSPORT_PLAYING);
+        assert_eq!(
+            info.flags & time_flags::TRANSPORT_PLAYING,
+            time_flags::TRANSPORT_PLAYING
+        );
 
         // The time signature travels with it: a plugin counting bars counts
         // the ones choz counts.
@@ -863,7 +917,11 @@ mod tests {
         t.set_time_signature(4, 4);
 
         t.set_playing(false);
-        assert_eq!(read().flags & time_flags::TRANSPORT_PLAYING, 0, "stopped means stopped");
+        assert_eq!(
+            read().flags & time_flags::TRANSPORT_PLAYING,
+            0,
+            "stopped means stopped"
+        );
 
         // Out-of-range tempos are clamped rather than handed to a plugin.
         t.set_bpm(1_000.0);
@@ -891,7 +949,14 @@ mod touch_tests {
 
         // SAFETY: the callback only uses the pointer as a key for this opcode.
         unsafe {
-            host_callback(fake as AEffectPtr, host_opcode::AUTOMATE, 3, 0, std::ptr::null_mut(), 0.75);
+            host_callback(
+                fake as AEffectPtr,
+                host_opcode::AUTOMATE,
+                3,
+                0,
+                std::ptr::null_mut(),
+                0.75,
+            );
         }
         assert_eq!(feed.take_touched(), Some((3, 0.75)));
         // Reading consumes it: an old gesture must not capture a later CC.
@@ -900,7 +965,14 @@ mod touch_tests {
         // A call from an instance that is gone must not panic or cross feeds.
         touch_feeds().retain(|(p, _)| *p != fake);
         unsafe {
-            host_callback(fake as AEffectPtr, host_opcode::AUTOMATE, 3, 0, std::ptr::null_mut(), 0.5);
+            host_callback(
+                fake as AEffectPtr,
+                host_opcode::AUTOMATE,
+                3,
+                0,
+                std::ptr::null_mut(),
+                0.5,
+            );
         }
         assert_eq!(feed.take_touched(), None);
     }

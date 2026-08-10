@@ -197,7 +197,10 @@ impl UiFeatures {
         .map(|u| CString::new(*u).expect("static URI"))
         .collect();
         // The map struct is copied so the UI's feature array owns its own.
-        let map = Box::new(LV2_URID_Map { handle: map.handle, map: map.map });
+        let map = Box::new(LV2_URID_Map {
+            handle: map.handle,
+            map: map.map,
+        });
 
         // DPF UIs (Zam, Dragonfly) list `opts:options` as required and read the
         // sample rate out of it. Interning goes through the shared UI store, so
@@ -301,7 +304,12 @@ impl PluginEditor for Lv2Editor {
             (!p.is_null()).then_some(p)
         });
 
-        *guard = Some(UiInstance { descriptor, handle, idle, _features: features });
+        *guard = Some(UiInstance {
+            descriptor,
+            handle,
+            idle,
+            _features: features,
+        });
         // An X11UI parents itself into the window we gave it and reports no size
         // of its own; the editor thread keeps its default and the plugin resizes
         // through the window manager if it wants to.

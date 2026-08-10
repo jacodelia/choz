@@ -6,11 +6,11 @@
 const MAX_STAGES: usize = 8;
 
 pub struct Phaser {
-    pub rate:     f32, // LFO Hz
-    pub depth:    f32, // frequency range (0.0..1.0)
-    pub center:   f32, // center frequency (200–2000 Hz)
+    pub rate: f32,     // LFO Hz
+    pub depth: f32,    // frequency range (0.0..1.0)
+    pub center: f32,   // center frequency (200–2000 Hz)
     pub feedback: f32, // -0.9..0.9
-    pub stages:   usize, // 2|4|6|8
+    pub stages: usize, // 2|4|6|8
     mix: f32,
     lfo_phase: f32,
     // All-pass filter states: [stage][L/R]
@@ -23,11 +23,11 @@ pub struct Phaser {
 impl Phaser {
     pub fn new() -> Self {
         Self {
-            rate:     0.4,
-            depth:    0.7,
-            center:   800.0,
+            rate: 0.4,
+            depth: 0.7,
+            center: 800.0,
             feedback: 0.5,
-            stages:   4,
+            stages: 4,
             mix: 0.7,
             lfo_phase: 0.0,
             ap_l: [0.0; MAX_STAGES],
@@ -36,20 +36,25 @@ impl Phaser {
             fb_r: 0.0,
         }
     }
-
 }
 
-impl Default for Phaser { fn default() -> Self { Self::new() } }
+impl Default for Phaser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl super::FxProcessor for Phaser {
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
-        if buf.len() < 2 { return; }
+        if buf.len() < 2 {
+            return;
+        }
         let sr = sample_rate as f32;
         let lfo_inc = self.rate / sr;
         let stages = self.stages.min(MAX_STAGES);
 
         let frames = buf.len() / 2;
-        use std::f32::consts::{TAU, PI};
+        use std::f32::consts::{PI, TAU};
 
         for i in 0..frames {
             let lfo = (self.lfo_phase * TAU).sin() * 0.5 + 0.5;
@@ -62,7 +67,7 @@ impl super::FxProcessor for Phaser {
             let t = (PI * freq_clamped / sr).tan();
             let coeff = (t - 1.0) / (t + 1.0);
 
-            let in_l = buf[i * 2]     + self.feedback * self.fb_l;
+            let in_l = buf[i * 2] + self.feedback * self.fb_l;
             let in_r = buf[i * 2 + 1] + self.feedback * self.fb_r;
 
             // Chain all-pass stages
@@ -85,7 +90,7 @@ impl super::FxProcessor for Phaser {
             let orig_l = buf[i * 2];
             let orig_r = buf[i * 2 + 1];
             // Classic phaser: sum of dry + phase-shifted (notch interference)
-            buf[i * 2]     = orig_l + self.mix * (sig_l - orig_l);
+            buf[i * 2] = orig_l + self.mix * (sig_l - orig_l);
             buf[i * 2 + 1] = orig_r + self.mix * (sig_r - orig_r);
         }
     }
@@ -98,16 +103,18 @@ impl super::FxProcessor for Phaser {
         self.lfo_phase = 0.0;
     }
 
-    fn set_mix(&mut self, wet: f32) { self.mix = wet.clamp(0.0, 1.0); }
+    fn set_mix(&mut self, wet: f32) {
+        self.mix = wet.clamp(0.0, 1.0);
+    }
 
     fn set_param(&mut self, index: usize, value: f32) {
         let v = value.clamp(0.0, 1.0);
         match index {
-            0 => self.rate     = 0.05 + v * 4.95,
-            1 => self.depth    = v,
-            2 => self.center   = 200.0 + v * 1800.0,
+            0 => self.rate = 0.05 + v * 4.95,
+            1 => self.depth = v,
+            2 => self.center = 200.0 + v * 1800.0,
             3 => self.feedback = (v - 0.5) * 1.8,
-            4 => self.mix      = v,
+            4 => self.mix = v,
             _ => {}
         }
     }

@@ -10,7 +10,8 @@ fn main() {
         return;
     };
     println!("plugin: {} ({})", id.name, id.id);
-    let Some(mut inst) = choz_plugin_clap::host::ClapInstrument::build(path, &id.id, 48_000, 512) else {
+    let Some(mut inst) = choz_plugin_clap::host::ClapInstrument::build(path, &id.id, 48_000, 512)
+    else {
         println!("build failed");
         return;
     };

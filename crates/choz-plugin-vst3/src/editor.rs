@@ -24,8 +24,8 @@ use vst3::Steinberg::Linux::{
     ITimerHandlerTrait, TimerInterval,
 };
 use vst3::Steinberg::{
-    IPlugFrame, IPlugFrameTrait, IPlugView, IPlugViewTrait, ViewRect, kPlatformTypeX11EmbedWindowID,
-    kResultOk,
+    kPlatformTypeX11EmbedWindowID, kResultOk, IPlugFrame, IPlugFrameTrait, IPlugView,
+    IPlugViewTrait, ViewRect,
 };
 use vst3::{Class, ComPtr, ComRef, ComWrapper};
 
@@ -79,7 +79,9 @@ impl Class for HostFrame {
 
 impl HostFrame {
     fn new() -> Self {
-        Self { state: Mutex::new(RunLoopState::default()) }
+        Self {
+            state: Mutex::new(RunLoopState::default()),
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RunLoopState> {
@@ -160,7 +162,11 @@ impl IRunLoopTrait for HostFrame {
         kResultOk
     }
 
-    unsafe fn registerTimer(&self, handler: *mut ITimerHandler, milliseconds: TimerInterval) -> i32 {
+    unsafe fn registerTimer(
+        &self,
+        handler: *mut ITimerHandler,
+        milliseconds: TimerInterval,
+    ) -> i32 {
         if handler.is_null() {
             return vst3::Steinberg::kInvalidArgument;
         }
@@ -197,11 +203,18 @@ impl Vst3Editor {
         if unsafe { view.isPlatformTypeSupported(kPlatformTypeX11EmbedWindowID) } != kResultOk {
             return None;
         }
-        Some(ViewCell { view, frame: ComWrapper::new(HostFrame::new()), _lib: lib })
+        Some(ViewCell {
+            view,
+            frame: ComWrapper::new(HostFrame::new()),
+            _lib: lib,
+        })
     }
 
     pub fn new(shared: SharedView) -> Arc<Self> {
-        Arc::new(Self { shared, attached: Mutex::new(false) })
+        Arc::new(Self {
+            shared,
+            attached: Mutex::new(false),
+        })
     }
 }
 
@@ -221,8 +234,10 @@ impl PluginEditor for Vst3Editor {
             // The frame goes in before attaching: it is where the plugin looks
             // for the run loop, and a JUCE editor that can't find one refuses.
             cell.view.setFrame(frame.as_ptr());
-            if cell.view.attached(parent as usize as *mut c_void, kPlatformTypeX11EmbedWindowID)
-                != kResultOk
+            if cell.view.attached(
+                parent as usize as *mut c_void,
+                kPlatformTypeX11EmbedWindowID,
+            ) != kResultOk
             {
                 eprintln!("choz: VST3 IPlugView::attached(X11) refused");
                 cell.view.setFrame(std::ptr::null_mut());
@@ -293,5 +308,4 @@ mod tests {
         frame.tick();
         assert_eq!(frame.lock().timers.len(), 1);
     }
-
 }

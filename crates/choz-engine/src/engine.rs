@@ -11,13 +11,13 @@
 //! the old chain back over a second ring so its deallocation happens on the UI
 //! thread, not in the RT context. Transport state is a plain `AtomicBool`.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use anyhow::{Result, Context};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::fx::FxProcessor;
-use crate::fx_chain::{FxSpec, build_chain_from_specs};
+use crate::fx_chain::{build_chain_from_specs, FxSpec};
 use crate::sources::{AudioSource, Sf2Synth, WavPlayer};
 
 type FxChain = Vec<Box<dyn FxProcessor>>;
@@ -89,35 +89,87 @@ impl Slot {
 pub(crate) enum EngineCommand {
     AddSlot(Source),
     RemoveSlot(usize),
-    SetSlotSource { slot: usize, source: Source },
-    SetSlotFx { slot: usize, fx: FxChain },
-    SetSlotMix { slot: usize, gain: f32, pan: f32, mute: bool },
+    SetSlotSource {
+        slot: usize,
+        source: Source,
+    },
+    SetSlotFx {
+        slot: usize,
+        fx: FxChain,
+    },
+    SetSlotMix {
+        slot: usize,
+        gain: f32,
+        pan: f32,
+        mute: bool,
+    },
     /// Which device output channels this slot lands on (0-based).
-    SetSlotOut { slot: usize, left: usize, right: usize },
+    SetSlotOut {
+        slot: usize,
+        left: usize,
+        right: usize,
+    },
     /// Which device input channels feed this slot; `None` = play its source.
-    SetSlotIn { slot: usize, pair: Option<(usize, usize)> },
+    SetSlotIn {
+        slot: usize,
+        pair: Option<(usize, usize)>,
+    },
     /// Listen to the slot's audio input and play its instrument from the pitch
     /// heard, instead of passing the audio through.
-    SetSlotPitchToMidi { slot: usize, on: bool },
+    SetSlotPitchToMidi {
+        slot: usize,
+        on: bool,
+    },
     /// Trim on the slot's audio input, and how loud that input has to be before
     /// the pitch tracker calls it a note.
-    SetSlotInTrim { slot: usize, gain: f32, gate: f32 },
-    SetSlotProgram { slot: usize, bank: u8, preset: u8 },
+    SetSlotInTrim {
+        slot: usize,
+        gain: f32,
+        gate: f32,
+    },
+    SetSlotProgram {
+        slot: usize,
+        bank: u8,
+        preset: u8,
+    },
     /// Live parameter tweak for a slot's *instrument* (hosted plugin).
-    SetSlotParam { slot: usize, index: usize, value: f32 },
+    SetSlotParam {
+        slot: usize,
+        index: usize,
+        value: f32,
+    },
     /// Live parameter tweak for one FX in a slot's chain — avoids rebuilding
     /// the chain (which, for a hosted plugin, means re-instantiating it).
-    SetFxParam { slot: usize, fx: usize, index: usize, value: f32 },
-    NoteOn { slot: usize, note: u8, vel: u8 },
-    NoteOff { slot: usize, note: u8 },
+    SetFxParam {
+        slot: usize,
+        fx: usize,
+        index: usize,
+        value: f32,
+    },
+    NoteOn {
+        slot: usize,
+        note: u8,
+        vel: u8,
+    },
+    NoteOff {
+        slot: usize,
+        note: u8,
+    },
     /// Silence every slot: the panic button. One command rather than a burst
     /// of note-offs, so the ring cannot fill up halfway through and leave a
     /// note ringing — which would be the one thing panic must never do.
     Panic,
     /// Pedals, modulation wheel — any control change, unfiltered.
-    ControlChange { slot: usize, cc: u8, value: u8 },
+    ControlChange {
+        slot: usize,
+        cc: u8,
+        value: u8,
+    },
     /// Pitch bend, raw 14-bit wire value (0..16383, centred at 8192).
-    PitchBend { slot: usize, value: u16 },
+    PitchBend {
+        slot: usize,
+        value: u16,
+    },
 }
 
 /// Items retired by the RT thread, returned to the UI thread to be dropped
@@ -270,12 +322,17 @@ fn request_pipewire_period(buffer_size: u32, sample_rate: u32) {
     unsafe { std::env::set_var("PIPEWIRE_LATENCY", &period) };
     if buffer_size >= MIN_FORCED_QUANTUM {
         unsafe { std::env::set_var("PIPEWIRE_QUANTUM", &period) };
-        eprintln!("choz: PipeWire period forced to {period} ({:.1} ms)", period_ms(buffer_size, sample_rate));
+        eprintln!(
+            "choz: PipeWire period forced to {period} ({:.1} ms)",
+            period_ms(buffer_size, sample_rate)
+        );
     } else {
         // Leave any inherited force in place rather than pushing the graph below
         // what the USB bus survives.
         unsafe { std::env::remove_var("PIPEWIRE_QUANTUM") };
-        eprintln!("choz: PipeWire period requested {period}, not forced (< {MIN_FORCED_QUANTUM} frames)");
+        eprintln!(
+            "choz: PipeWire period requested {period}, not forced (< {MIN_FORCED_QUANTUM} frames)"
+        );
     }
 }
 
@@ -291,8 +348,7 @@ fn period_ms(buffer_size: u32, sample_rate: u32) -> f32 {
 /// `/run/user/<uid>/pipewire-0`. No client connection — filesystem check only.
 fn pipewire_is_running() -> bool {
     let pipewire_socket = runtime_dir().join("pipewire-0");
-    std::env::var("PIPEWIRE_REMOTE").is_ok()
-        || pipewire_socket.exists()
+    std::env::var("PIPEWIRE_REMOTE").is_ok() || pipewire_socket.exists()
 }
 
 fn runtime_dir() -> std::path::PathBuf {
@@ -309,9 +365,7 @@ fn detect_sound_server() -> &'static str {
     if pipewire_is_running() {
         return "PipeWire";
     }
-    if std::env::var("PULSE_RUNTIME_PATH").is_ok()
-        || std::env::var("PULSE_SERVER").is_ok()
-    {
+    if std::env::var("PULSE_RUNTIME_PATH").is_ok() || std::env::var("PULSE_SERVER").is_ok() {
         return "PulseAudio";
     }
     "ALSA"
@@ -419,7 +473,9 @@ impl AudioEngine {
         };
         eprintln!(
             "choz: using {} backend via {sound_server} (sr={}, buf={}, out={})",
-            backend.label(), self.sample_rate, self.buffer_size,
+            backend.label(),
+            self.sample_rate,
+            self.buffer_size,
             self.output_device.as_deref().unwrap_or("default"),
         );
         Ok(())
@@ -452,8 +508,7 @@ impl AudioEngine {
             .context("audio engine already started")?;
         let state = self.new_rt_state(ep, outs.max(2), ins);
 
-        match crate::jack_backend::start(sink.as_deref(), &capture, outs.max(2), state)
-        {
+        match crate::jack_backend::start(sink.as_deref(), &capture, outs.max(2), state) {
             Ok((handle, channels)) => {
                 self._stream = Some(BackendHandle::Jack(Box::new(handle)));
                 self.backend = AudioBackend::Jack;
@@ -576,7 +631,8 @@ impl AudioEngine {
         // `output_device` stays empty until someone picks one. Reconnect to
         // whatever we are wired to now.
         let sink = self.output_device.clone().or_else(jack_current_sink);
-        self.restart_jack_native(sink.as_deref(), self.out_channels).map(|()| true)
+        self.restart_jack_native(sink.as_deref(), self.out_channels)
+            .map(|()| true)
     }
 
     /// Move playback to `name`. Returns `true` when the stream had to be rebuilt,
@@ -694,11 +750,13 @@ impl AudioEngine {
     /// sink, not one of cpal's devices (cpal only ever offers its own
     /// `cpal_client_out`). The stream opens on that one device and `start`
     /// patches its ports onto the wanted sink afterwards.
-    fn jack_device_config(&self, _want: Option<&str>) -> Result<(cpal::Device, cpal::StreamConfig)> {
+    fn jack_device_config(
+        &self,
+        _want: Option<&str>,
+    ) -> Result<(cpal::Device, cpal::StreamConfig)> {
         let host = cpal::host_from_id(cpal::HostId::Jack)
             .context("JACK host not available (is libjack installed?)")?;
-        let device = named_or_default(&host, None)
-            .context("no JACK output device found")?;
+        let device = named_or_default(&host, None).context("no JACK output device found")?;
         let config = pick_config(&device, self.sample_rate, self.buffer_size)?;
         Ok((device, config))
     }
@@ -883,7 +941,12 @@ impl AudioEngine {
         if slot >= self.slot_count {
             return;
         }
-        self.send(EngineCommand::SetSlotMix { slot, gain, pan, mute });
+        self.send(EngineCommand::SetSlotMix {
+            slot,
+            gain,
+            pan,
+            mute,
+        });
     }
 
     /// Change one parameter of the FX at `fx` in slot `slot`'s chain, without
@@ -892,7 +955,12 @@ impl AudioEngine {
         if slot >= self.slot_count {
             return;
         }
-        self.send(EngineCommand::SetFxParam { slot, fx, index, value });
+        self.send(EngineCommand::SetFxParam {
+            slot,
+            fx,
+            index,
+            value,
+        });
     }
 
     /// Change one parameter of slot `slot`'s instrument. `value` is a normalised
@@ -937,7 +1005,12 @@ impl AudioEngine {
     }
 
     /// Add an SF2 SoundFont instrument slot (MIDI-playable).
-    pub fn add_sf2(&mut self, path: &std::path::Path, bank: u8, preset: u8) -> Result<Option<usize>> {
+    pub fn add_sf2(
+        &mut self,
+        path: &std::path::Path,
+        bank: u8,
+        preset: u8,
+    ) -> Result<Option<usize>> {
         let synth = Sf2Synth::load(path, bank, preset, self.sample_rate)?;
         Ok(self.add_slot(Box::new(synth)))
     }
@@ -950,7 +1023,13 @@ impl AudioEngine {
     }
 
     /// Load an SF2 as slot `slot`'s source, replacing whatever was there.
-    pub fn load_sf2(&mut self, slot: usize, path: &std::path::Path, bank: u8, preset: u8) -> Result<()> {
+    pub fn load_sf2(
+        &mut self,
+        slot: usize,
+        path: &std::path::Path,
+        bank: u8,
+        preset: u8,
+    ) -> Result<()> {
         let synth = Sf2Synth::load(path, bank, preset, self.sample_rate)?;
         self.set_slot_source(slot, Box::new(synth));
         Ok(())
@@ -979,7 +1058,10 @@ impl AudioEngine {
     /// Add a CLAP instrument slot.
     fn add_clap(&mut self, path: &std::path::Path, plugin_id: &str) -> Result<Option<usize>> {
         let inst = choz_plugin_clap::host::ClapInstrument::build(
-            path, plugin_id, self.sample_rate, self.buffer_size,
+            path,
+            plugin_id,
+            self.sample_rate,
+            self.buffer_size,
         )
         .ok_or_else(|| anyhow::anyhow!("failed to instantiate CLAP plugin: {plugin_id}"))?;
         Ok(self.add_slot(Box::new(inst)))
@@ -988,7 +1070,10 @@ impl AudioEngine {
     /// Load a CLAP instrument as slot `slot`'s source.
     fn load_clap(&mut self, slot: usize, path: &std::path::Path, plugin_id: &str) -> Result<()> {
         let inst = choz_plugin_clap::host::ClapInstrument::build(
-            path, plugin_id, self.sample_rate, self.buffer_size,
+            path,
+            plugin_id,
+            self.sample_rate,
+            self.buffer_size,
         )
         .ok_or_else(|| anyhow::anyhow!("failed to instantiate CLAP plugin: {plugin_id}"))?;
         self.set_slot_source(slot, Box::new(inst));
@@ -1005,8 +1090,11 @@ impl AudioEngine {
         refuse_if_quarantined(format, path, id)?;
         match format {
             crate::PluginFormat::Clap => self.add_clap(path, id),
-            crate::PluginFormat::Lv2 | crate::PluginFormat::Dssi | crate::PluginFormat::Vst2
-            | crate::PluginFormat::Vst3 | crate::PluginFormat::Sfz => {
+            crate::PluginFormat::Lv2
+            | crate::PluginFormat::Dssi
+            | crate::PluginFormat::Vst2
+            | crate::PluginFormat::Vst3
+            | crate::PluginFormat::Sfz => {
                 Ok(self.add_slot(self.build_instrument(format, path, id)?))
             }
             _ => anyhow::bail!("{} hosting is not implemented yet", format.label()),
@@ -1024,8 +1112,11 @@ impl AudioEngine {
         refuse_if_quarantined(format, path, id)?;
         match format {
             crate::PluginFormat::Clap => self.load_clap(slot, path, id),
-            crate::PluginFormat::Lv2 | crate::PluginFormat::Dssi | crate::PluginFormat::Vst2
-            | crate::PluginFormat::Vst3 | crate::PluginFormat::Sfz => {
+            crate::PluginFormat::Lv2
+            | crate::PluginFormat::Dssi
+            | crate::PluginFormat::Vst2
+            | crate::PluginFormat::Vst3
+            | crate::PluginFormat::Sfz => {
                 let inst = self.build_instrument(format, path, id)?;
                 self.set_slot_source(slot, inst);
                 Ok(())
@@ -1100,149 +1191,160 @@ impl RtState {
     pub(crate) fn apply_commands(&mut self) {
         let state = self;
         while let Ok(cmd) = state.cmd_rx.pop() {
-        match cmd {
-            EngineCommand::AddSlot(source) => {
-                if state.slots.len() < MAX_SLOTS {
-                    state.slots.push(Slot::new(source));
-                } else {
-                    let _ = state.retired_tx.push(Retired::Slot(Slot::new(source)));
-                }
-            }
-            EngineCommand::RemoveSlot(i) => {
-                if i < state.slots.len() {
-                    let old = state.slots.remove(i);
-                    let _ = state.retired_tx.push(Retired::Slot(old));
-                }
-            }
-            EngineCommand::SetSlotSource { slot, source } => {
-                // A new instrument holds nothing, whatever the old one was
-                // playing when it was swapped out.
-                if let Some(s) = state.slots.get_mut(slot) {
-                    s.held = 0;
-                }
-                if let Some(s) = state.slots.get_mut(slot) {
-                    let old = std::mem::replace(&mut s.source, source);
-                    let _ = state.retired_tx.push(Retired::Source(old));
-                } else {
-                    let _ = state.retired_tx.push(Retired::Source(source));
-                }
-            }
-            EngineCommand::SetSlotFx { slot, fx } => {
-                if let Some(s) = state.slots.get_mut(slot) {
-                    let old = std::mem::replace(&mut s.fx, fx);
-                    let _ = state.retired_tx.push(Retired::Fx(old));
-                } else {
-                    let _ = state.retired_tx.push(Retired::Fx(fx));
-                }
-            }
-            EngineCommand::SetSlotMix { slot, gain, pan, mute } => {
-                if let Some(s) = state.slots.get_mut(slot) {
-                    s.gain = gain;
-                    s.pan = pan;
-                    s.mute = mute;
-                }
-            }
-            EngineCommand::SetSlotOut { slot, left, right } => {
-                if let Some(s) = state.slots.get_mut(slot) {
-                    s.out_pair = (left, right);
-                }
-            }
-            EngineCommand::SetSlotPitchToMidi { slot, on } => {
-                let sr = state.sample_rate;
-                if let Some(s) = state.slots.get_mut(slot) {
-                    match (on, s.pitch.take()) {
-                        (true, None) => s.pitch = Some(crate::pitch::PitchTracker::new(sr)),
-                        (true, some) => s.pitch = some,
-                        // Switching it off must not leave the note hanging.
-                        (false, Some(mut t)) => {
-                            if let Some(crate::pitch::PitchEvent::Off { note }) = t.release() {
-                                s.source.note_off(note);
-                                s.held &= !(1u128 << (note & 0x7F));
-                            }
-                        }
-                        (false, None) => {}
-                    }
-                }
-            }
-            EngineCommand::SetSlotInTrim { slot, gain, gate } => {
-                if let Some(s) = state.slots.get_mut(slot) {
-                    s.in_gain = gain.clamp(0.0, 8.0);
-                    if let Some(t) = s.pitch.as_mut() {
-                        t.gate = gate.clamp(0.0, 1.0);
-                    }
-                }
-            }
-            EngineCommand::SetSlotIn { slot, pair } => {
-                if let Some(s) = state.slots.get_mut(slot) {
-                    s.in_pair = pair;
-                }
-            }
-            EngineCommand::SetFxParam { slot, fx, index, value } => {
-                if let Some(p) = state.slots.get_mut(slot).and_then(|s| s.fx.get_mut(fx)) {
-                    if index == crate::FX_MIX_PARAM {
-                        p.set_mix(value);
+            match cmd {
+                EngineCommand::AddSlot(source) => {
+                    if state.slots.len() < MAX_SLOTS {
+                        state.slots.push(Slot::new(source));
                     } else {
-                        p.set_param(index, value);
+                        let _ = state.retired_tx.push(Retired::Slot(Slot::new(source)));
                     }
                 }
-            }
-            EngineCommand::SetSlotParam { slot, index, value } => {
-                if let Some(s) = state.slots.get_mut(slot) {
-                    s.source.set_param(index, value);
+                EngineCommand::RemoveSlot(i) => {
+                    if i < state.slots.len() {
+                        let old = state.slots.remove(i);
+                        let _ = state.retired_tx.push(Retired::Slot(old));
+                    }
                 }
-            }
-            EngineCommand::SetSlotProgram { slot, bank, preset } => {
-                if let Some(s) = state.slots.get_mut(slot) {
-                    s.source.program_change(bank, preset);
+                EngineCommand::SetSlotSource { slot, source } => {
+                    // A new instrument holds nothing, whatever the old one was
+                    // playing when it was swapped out.
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        s.held = 0;
+                    }
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        let old = std::mem::replace(&mut s.source, source);
+                        let _ = state.retired_tx.push(Retired::Source(old));
+                    } else {
+                        let _ = state.retired_tx.push(Retired::Source(source));
+                    }
                 }
-            }
-            // Notes are addressed to one slot; the UI already decided which.
-            EngineCommand::NoteOn { slot, note, vel } => {
-                if let Some(s) = state.slots.get_mut(slot) {
-                    s.held |= 1u128 << (note & 0x7F);
-                    s.source.note_on(note, vel);
+                EngineCommand::SetSlotFx { slot, fx } => {
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        let old = std::mem::replace(&mut s.fx, fx);
+                        let _ = state.retired_tx.push(Retired::Fx(old));
+                    } else {
+                        let _ = state.retired_tx.push(Retired::Fx(fx));
+                    }
                 }
-            }
-            EngineCommand::NoteOff { slot, note } => {
-                if let Some(s) = state.slots.get_mut(slot) {
-                    s.held &= !(1u128 << (note & 0x7F));
-                    s.source.note_off(note);
+                EngineCommand::SetSlotMix {
+                    slot,
+                    gain,
+                    pan,
+                    mute,
+                } => {
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        s.gain = gain;
+                        s.pan = pan;
+                        s.mute = mute;
+                    }
                 }
-            }
-            EngineCommand::Panic => {
-                for s in state.slots.iter_mut() {
-                    // The notes choz knows about get a real note-off each —
-                    // that is what a plugin cannot ignore. Then the broadcast,
-                    // for anything it started on its own (an arpeggiator, a
-                    // note that arrived before choz was listening).
-                    let mut held = s.held;
-                    while held != 0 {
-                        let note = held.trailing_zeros() as u8;
-                        held &= held - 1;
+                EngineCommand::SetSlotOut { slot, left, right } => {
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        s.out_pair = (left, right);
+                    }
+                }
+                EngineCommand::SetSlotPitchToMidi { slot, on } => {
+                    let sr = state.sample_rate;
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        match (on, s.pitch.take()) {
+                            (true, None) => s.pitch = Some(crate::pitch::PitchTracker::new(sr)),
+                            (true, some) => s.pitch = some,
+                            // Switching it off must not leave the note hanging.
+                            (false, Some(mut t)) => {
+                                if let Some(crate::pitch::PitchEvent::Off { note }) = t.release() {
+                                    s.source.note_off(note);
+                                    s.held &= !(1u128 << (note & 0x7F));
+                                }
+                            }
+                            (false, None) => {}
+                        }
+                    }
+                }
+                EngineCommand::SetSlotInTrim { slot, gain, gate } => {
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        s.in_gain = gain.clamp(0.0, 8.0);
+                        if let Some(t) = s.pitch.as_mut() {
+                            t.gate = gate.clamp(0.0, 1.0);
+                        }
+                    }
+                }
+                EngineCommand::SetSlotIn { slot, pair } => {
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        s.in_pair = pair;
+                    }
+                }
+                EngineCommand::SetFxParam {
+                    slot,
+                    fx,
+                    index,
+                    value,
+                } => {
+                    if let Some(p) = state.slots.get_mut(slot).and_then(|s| s.fx.get_mut(fx)) {
+                        if index == crate::FX_MIX_PARAM {
+                            p.set_mix(value);
+                        } else {
+                            p.set_param(index, value);
+                        }
+                    }
+                }
+                EngineCommand::SetSlotParam { slot, index, value } => {
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        s.source.set_param(index, value);
+                    }
+                }
+                EngineCommand::SetSlotProgram { slot, bank, preset } => {
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        s.source.program_change(bank, preset);
+                    }
+                }
+                // Notes are addressed to one slot; the UI already decided which.
+                EngineCommand::NoteOn { slot, note, vel } => {
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        s.held |= 1u128 << (note & 0x7F);
+                        s.source.note_on(note, vel);
+                    }
+                }
+                EngineCommand::NoteOff { slot, note } => {
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        s.held &= !(1u128 << (note & 0x7F));
                         s.source.note_off(note);
                     }
-                    s.held = 0;
-                    s.source.all_notes_off();
                 }
-            }
-            EngineCommand::ControlChange { slot, cc, value } => {
-                if let Some(s) = state.slots.get_mut(slot) {
-                    s.source.control_change(cc, value);
+                EngineCommand::Panic => {
+                    for s in state.slots.iter_mut() {
+                        // The notes choz knows about get a real note-off each —
+                        // that is what a plugin cannot ignore. Then the broadcast,
+                        // for anything it started on its own (an arpeggiator, a
+                        // note that arrived before choz was listening).
+                        let mut held = s.held;
+                        while held != 0 {
+                            let note = held.trailing_zeros() as u8;
+                            held &= held - 1;
+                            s.source.note_off(note);
+                        }
+                        s.held = 0;
+                        s.source.all_notes_off();
+                    }
                 }
-            }
-            EngineCommand::PitchBend { slot, value } => {
-                if let Some(s) = state.slots.get_mut(slot) {
-                    s.source.pitch_bend(value);
+                EngineCommand::ControlChange { slot, cc, value } => {
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        s.source.control_change(cc, value);
+                    }
+                }
+                EngineCommand::PitchBend { slot, value } => {
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        s.source.pitch_bend(value);
+                    }
                 }
             }
         }
     }
 
-    }
-
     /// Copy one capture port's block into the matching input buffer.
     pub(crate) fn write_capture(&mut self, channel: usize, src: &[f32]) {
-        let Some(dst) = self.capture.get_mut(channel) else { return };
+        let Some(dst) = self.capture.get_mut(channel) else {
+            return;
+        };
         let n = src.len().min(dst.len());
         dst[..n].copy_from_slice(&src[..n]);
     }
@@ -1253,7 +1355,15 @@ impl RtState {
     pub(crate) fn render(&mut self, frames: usize) {
         // Destructured so the capture buffers can be read while the slots are
         // borrowed mutably.
-        let Self { slots, scratch, mix, capture, playing, sample_rate, .. } = self;
+        let Self {
+            slots,
+            scratch,
+            mix,
+            capture,
+            playing,
+            sample_rate,
+            ..
+        } = self;
         let last = mix.len().saturating_sub(1);
         for ch in mix.iter_mut() {
             let n = frames.min(ch.len());
@@ -1408,7 +1518,9 @@ fn jack_sinks() -> Vec<String> {
     };
     let mut sinks: Vec<String> = Vec::new();
     for port in client.ports(None, Some(JACK_AUDIO), jack::PortFlags::IS_INPUT) {
-        let Some((owner, _)) = port.rsplit_once(':') else { continue };
+        let Some((owner, _)) = port.rsplit_once(':') else {
+            continue;
+        };
         let ours = owner == CPAL_JACK_CLIENT || owner == crate::jack_backend::CLIENT_NAME;
         if !ours && !sinks.iter().any(|s| s == owner) {
             sinks.push(owner.to_string());
@@ -1416,7 +1528,6 @@ fn jack_sinks() -> Vec<String> {
     }
     sinks
 }
-
 
 /// The sink our first playback port is wired to, if any — after start-up this
 /// is whatever PipeWire auto-connected us to.
@@ -1580,7 +1691,9 @@ fn refuse_if_quarantined(
     anyhow::bail!(
         "{} crashes when it is loaded; choz will not host it (see {})",
         path.display(),
-        crate::cache::state_dir().join("plugin-verdicts.json").display()
+        crate::cache::state_dir()
+            .join("plugin-verdicts.json")
+            .display()
     )
 }
 
@@ -1604,7 +1717,10 @@ pub fn build_hosted_instrument(
                 eprintln!("choz: hosting {} in its own process", path.display());
                 return Ok(Box::new(p));
             }
-            Err(e) => eprintln!("choz: sandbox for {} failed ({e}); hosting in-process", path.display()),
+            Err(e) => eprintln!(
+                "choz: sandbox for {} failed ({e}); hosting in-process",
+                path.display()
+            ),
         }
     }
     build_instrument(format, path, id, sr, block)
@@ -1620,31 +1736,27 @@ pub fn build_instrument(
     sr: u32,
     block: u32,
 ) -> Result<Box<dyn crate::sources::AudioSource>> {
-        let source: Option<Box<dyn crate::sources::AudioSource>> = match format {
-            crate::PluginFormat::Lv2 => choz_plugin_lv2::Lv2Instrument::build(path, id, sr, block)
-                .map(|i| Box::new(i) as Box<dyn crate::sources::AudioSource>),
-            crate::PluginFormat::Dssi => {
-                choz_plugin_ladspa::DssiInstrument::build(path, id, sr, block)
-                    .map(|i| Box::new(i) as Box<dyn crate::sources::AudioSource>)
+    let source: Option<Box<dyn crate::sources::AudioSource>> = match format {
+        crate::PluginFormat::Lv2 => choz_plugin_lv2::Lv2Instrument::build(path, id, sr, block)
+            .map(|i| Box::new(i) as Box<dyn crate::sources::AudioSource>),
+        crate::PluginFormat::Dssi => choz_plugin_ladspa::DssiInstrument::build(path, id, sr, block)
+            .map(|i| Box::new(i) as Box<dyn crate::sources::AudioSource>),
+        crate::PluginFormat::Vst2 => choz_plugin_vst2::Vst2Instrument::build(path, sr, block)
+            .map(|i| Box::new(i) as Box<dyn crate::sources::AudioSource>),
+        crate::PluginFormat::Vst3 => choz_plugin_vst3::Vst3Instrument::build(path, sr, block)
+            .map(|i| Box::new(i) as Box<dyn crate::sources::AudioSource>),
+        // Not a plugin at all: a text file pointing at samples, played by
+        // choz's own sampler.
+        crate::PluginFormat::Sfz => match crate::sfz::SfzSampler::build(path, sr) {
+            Ok(s) => Some(Box::new(s) as Box<dyn crate::sources::AudioSource>),
+            Err(e) => {
+                eprintln!("choz: SFZ {}: {e}", path.display());
+                None
             }
-            crate::PluginFormat::Vst2 => choz_plugin_vst2::Vst2Instrument::build(path, sr, block)
-                .map(|i| Box::new(i) as Box<dyn crate::sources::AudioSource>),
-            crate::PluginFormat::Vst3 => choz_plugin_vst3::Vst3Instrument::build(path, sr, block)
-                .map(|i| Box::new(i) as Box<dyn crate::sources::AudioSource>),
-            // Not a plugin at all: a text file pointing at samples, played by
-            // choz's own sampler.
-            crate::PluginFormat::Sfz => match crate::sfz::SfzSampler::build(path, sr) {
-                Ok(s) => Some(Box::new(s) as Box<dyn crate::sources::AudioSource>),
-                Err(e) => {
-                    eprintln!("choz: SFZ {}: {e}", path.display());
-                    None
-                }
-            },
-            _ => None,
-        };
-    source.ok_or_else(|| {
-        anyhow::anyhow!("failed to instantiate {} plugin: {id}", format.label())
-    })
+        },
+        _ => None,
+    };
+    source.ok_or_else(|| anyhow::anyhow!("failed to instantiate {} plugin: {id}", format.label()))
 }
 
 #[cfg(test)]
@@ -1657,14 +1769,23 @@ mod tests {
     #[test]
     fn forces_the_quantum_only_when_usb_can_take_it() {
         request_pipewire_period(256, 48000);
-        assert_eq!(std::env::var("PIPEWIRE_LATENCY").as_deref(), Ok("256/48000"));
-        assert_eq!(std::env::var("PIPEWIRE_QUANTUM").as_deref(), Ok("256/48000"));
+        assert_eq!(
+            std::env::var("PIPEWIRE_LATENCY").as_deref(),
+            Ok("256/48000")
+        );
+        assert_eq!(
+            std::env::var("PIPEWIRE_QUANTUM").as_deref(),
+            Ok("256/48000")
+        );
 
         // Below the floor choz still asks, but never forces — a 64-frame quantum
         // is what took the xHCI controller down.
         request_pipewire_period(64, 48000);
         assert_eq!(std::env::var("PIPEWIRE_LATENCY").as_deref(), Ok("64/48000"));
-        assert!(std::env::var("PIPEWIRE_QUANTUM").is_err(), "64 frames must not be forced");
+        assert!(
+            std::env::var("PIPEWIRE_QUANTUM").is_err(),
+            "64 frames must not be forced"
+        );
 
         unsafe { std::env::remove_var("PIPEWIRE_LATENCY") };
     }
@@ -1687,7 +1808,8 @@ mod tests {
                 self.offs.lock().unwrap().push(note);
             }
             fn all_notes_off(&mut self) {
-                self.broadcast.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.broadcast
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -1713,14 +1835,21 @@ mod tests {
         slot.held = 0;
         slot.source.all_notes_off();
 
-        assert_eq!(*offs.lock().unwrap(), vec![60, 67], "exactly the notes still down");
+        assert_eq!(
+            *offs.lock().unwrap(),
+            vec![60, 67],
+            "exactly the notes still down"
+        );
         assert!(broadcast.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(slot.held, 0);
     }
 
     #[test]
     fn playback_ports_pair_up_and_mono_sinks_fold() {
-        let ours = vec!["cpal_client_out:out_0".into(), "cpal_client_out:out_1".into()];
+        let ours = vec![
+            "cpal_client_out:out_0".into(),
+            "cpal_client_out:out_1".into(),
+        ];
         let stereo = vec!["Speaker:playback_FL".into(), "Speaker:playback_FR".into()];
         assert_eq!(
             pair_ports(&ours, &stereo),
@@ -1740,14 +1869,19 @@ mod tests {
             "both channels reach a mono sink instead of the right one vanishing"
         );
 
-        assert!(pair_ports(&ours, &[]).is_empty(), "a sink with no inputs wires nothing");
+        assert!(
+            pair_ports(&ours, &[]).is_empty(),
+            "a sink with no inputs wires nothing"
+        );
     }
 
     /// Adds a constant to every sample — enough to prove the chain ran.
     struct AddFx(f32);
     impl FxProcessor for AddFx {
         fn process_block(&mut self, buf: &mut [f32], _sr: u32) {
-            for s in buf.iter_mut() { *s += self.0; }
+            for s in buf.iter_mut() {
+                *s += self.0;
+            }
         }
         fn reset(&mut self) {}
         fn set_mix(&mut self, _wet: f32) {}
@@ -1760,7 +1894,9 @@ mod tests {
             out.fill(self.0);
             out.len() / 2
         }
-        fn plays_on_transport_stop(&self) -> bool { true }
+        fn plays_on_transport_stop(&self) -> bool {
+            true
+        }
     }
 
     /// Records note events it receives; proves omni routing reaches it.
@@ -1770,11 +1906,19 @@ mod tests {
             out.fill(0.0);
             out.len() / 2
         }
-        fn note_on(&mut self, note: u8, _vel: u8) { self.0.lock().push((true, note)); }
-        fn note_off(&mut self, note: u8) { self.0.lock().push((false, note)); }
+        fn note_on(&mut self, note: u8, _vel: u8) {
+            self.0.lock().push((true, note));
+        }
+        fn note_off(&mut self, note: u8) {
+            self.0.lock().push((false, note));
+        }
         /// Recorded as note 200+preset so it can't be confused with a note event.
-        fn program_change(&mut self, _bank: u8, preset: u8) { self.0.lock().push((true, 200 + preset)); }
-        fn plays_on_transport_stop(&self) -> bool { true }
+        fn program_change(&mut self, _bank: u8, preset: u8) {
+            self.0.lock().push((true, 200 + preset));
+        }
+        fn plays_on_transport_stop(&self) -> bool {
+            true
+        }
     }
 
     /// Records the pedal/wheel traffic a slot receives.
@@ -1788,11 +1932,19 @@ mod tests {
             out.fill(0.0);
             out.len() / 2
         }
-        fn control_change(&mut self, cc: u8, value: u8) { self.ccs.lock().push((cc, value)); }
-        fn pitch_bend(&mut self, value: u16) { self.bends.lock().push(value); }
+        fn control_change(&mut self, cc: u8, value: u8) {
+            self.ccs.lock().push((cc, value));
+        }
+        fn pitch_bend(&mut self, value: u16) {
+            self.bends.lock().push(value);
+        }
     }
 
-    fn mk_state() -> (rtrb::Producer<EngineCommand>, rtrb::Consumer<Retired>, RtState) {
+    fn mk_state() -> (
+        rtrb::Producer<EngineCommand>,
+        rtrb::Consumer<Retired>,
+        RtState,
+    ) {
         mk_state_ch(2, 0)
     }
 
@@ -1801,7 +1953,11 @@ mod tests {
     fn mk_state_ch(
         outs: usize,
         ins: usize,
-    ) -> (rtrb::Producer<EngineCommand>, rtrb::Consumer<Retired>, RtState) {
+    ) -> (
+        rtrb::Producer<EngineCommand>,
+        rtrb::Consumer<Retired>,
+        RtState,
+    ) {
         let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(32);
         let (retired_tx, retired_rx) = rtrb::RingBuffer::new(32);
         let state = RtState {
@@ -1823,19 +1979,38 @@ mod tests {
     #[test]
     fn slots_land_on_the_output_pair_they_are_routed_to() {
         let (mut cmd_tx, _retired, mut state) = mk_state_ch(6, 0);
-        cmd_tx.push(EngineCommand::AddSlot(Box::new(DcSource(0.25)))).unwrap();
-        cmd_tx.push(EngineCommand::AddSlot(Box::new(DcSource(0.5)))).unwrap();
-        cmd_tx.push(EngineCommand::SetSlotOut { slot: 1, left: 4, right: 5 }).unwrap();
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(DcSource(0.25))))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(DcSource(0.5))))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotOut {
+                slot: 1,
+                left: 4,
+                right: 5,
+            })
+            .unwrap();
         state.apply_commands();
         state.render(8);
 
         // Centred slots come through the constant-power pan law at -3 dB.
         let c = std::f32::consts::FRAC_1_SQRT_2;
-        assert!((state.mix[0][0] - 0.25 * c).abs() < 1e-6, "slot 0 on the default pair");
+        assert!(
+            (state.mix[0][0] - 0.25 * c).abs() < 1e-6,
+            "slot 0 on the default pair"
+        );
         assert!((state.mix[1][0] - 0.25 * c).abs() < 1e-6);
-        assert_eq!(state.mix[2][0], 0.0, "nothing bleeds onto the untouched pair");
+        assert_eq!(
+            state.mix[2][0], 0.0,
+            "nothing bleeds onto the untouched pair"
+        );
         assert_eq!(state.mix[3][0], 0.0);
-        assert!((state.mix[4][0] - 0.5 * c).abs() < 1e-6, "slot 1 plays out of 5/6");
+        assert!(
+            (state.mix[4][0] - 0.5 * c).abs() < 1e-6,
+            "slot 1 plays out of 5/6"
+        );
         assert!((state.mix[5][0] - 0.5 * c).abs() < 1e-6);
     }
 
@@ -1844,8 +2019,16 @@ mod tests {
     #[test]
     fn an_out_of_range_pair_folds_onto_the_last_channel() {
         let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 0);
-        cmd_tx.push(EngineCommand::AddSlot(Box::new(DcSource(0.5)))).unwrap();
-        cmd_tx.push(EngineCommand::SetSlotOut { slot: 0, left: 8, right: 9 }).unwrap();
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(DcSource(0.5))))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotOut {
+                slot: 0,
+                left: 8,
+                right: 9,
+            })
+            .unwrap();
         state.apply_commands();
         state.render(8);
         let c = std::f32::consts::FRAC_1_SQRT_2;
@@ -1860,11 +2043,27 @@ mod tests {
     #[test]
     fn a_slot_routed_to_an_input_pair_processes_live_audio() {
         let (mut cmd_tx, _retired, mut state) = mk_state_ch(4, 2);
-        cmd_tx.push(EngineCommand::AddSlot(Box::new(DcSource(0.9)))).unwrap();
-        cmd_tx.push(EngineCommand::SetSlotIn { slot: 0, pair: Some((0, 1)) }).unwrap();
-        cmd_tx.push(EngineCommand::SetSlotOut { slot: 0, left: 2, right: 3 }).unwrap();
         cmd_tx
-            .push(EngineCommand::SetSlotFx { slot: 0, fx: vec![Box::new(AddFx(0.1))] })
+            .push(EngineCommand::AddSlot(Box::new(DcSource(0.9))))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotIn {
+                slot: 0,
+                pair: Some((0, 1)),
+            })
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotOut {
+                slot: 0,
+                left: 2,
+                right: 3,
+            })
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotFx {
+                slot: 0,
+                fx: vec![Box::new(AddFx(0.1))],
+            })
             .unwrap();
         state.apply_commands();
         // Hardware input: what the backend copies in before rendering.
@@ -1873,7 +2072,10 @@ mod tests {
         state.render(8);
 
         let c = std::f32::consts::FRAC_1_SQRT_2;
-        assert!((state.mix[2][0] - 0.3 * c).abs() < 1e-6, "left input + FX, not the source");
+        assert!(
+            (state.mix[2][0] - 0.3 * c).abs() < 1e-6,
+            "left input + FX, not the source"
+        );
         assert!((state.mix[3][0] - 0.5 * c).abs() < 1e-6, "right input + FX");
         assert_eq!(state.mix[0][0], 0.0, "and none of it on the default pair");
     }
@@ -1882,11 +2084,18 @@ mod tests {
     fn mixes_slots_and_applies_per_slot_fx() {
         let (mut cmd_tx, _retired, mut state) = mk_state();
 
-        cmd_tx.push(EngineCommand::AddSlot(Box::new(DcSource(0.25)))).unwrap();
-        cmd_tx.push(EngineCommand::AddSlot(Box::new(DcSource(0.25)))).unwrap();
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(DcSource(0.25))))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(DcSource(0.25))))
+            .unwrap();
         // Give slot 1 a +1.0 FX.
         cmd_tx
-            .push(EngineCommand::SetSlotFx { slot: 1, fx: vec![Box::new(AddFx(1.0))] })
+            .push(EngineCommand::SetSlotFx {
+                slot: 1,
+                fx: vec![Box::new(AddFx(1.0))],
+            })
             .unwrap();
 
         let mut buf = [0.0f32; 8];
@@ -1894,24 +2103,52 @@ mod tests {
         // slot0 = 0.25, slot1 = 0.25 + 1.0 = 1.25 → sum 1.5, then the default
         // centered constant-power pan (-3 dB) scales both channels.
         let expect = 1.5 * std::f32::consts::FRAC_1_SQRT_2;
-        assert!(buf.iter().all(|&s| (s - expect).abs() < 1e-6), "got {buf:?}");
+        assert!(
+            buf.iter().all(|&s| (s - expect).abs() < 1e-6),
+            "got {buf:?}"
+        );
     }
 
     #[test]
     fn mixer_strip_applies_gain_pan_mute() {
         let (mut cmd_tx, _retired, mut state) = mk_state();
-        cmd_tx.push(EngineCommand::AddSlot(Box::new(DcSource(1.0)))).unwrap();
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(DcSource(1.0))))
+            .unwrap();
         // Half gain, hard left.
-        cmd_tx.push(EngineCommand::SetSlotMix { slot: 0, gain: 0.5, pan: -1.0, mute: false }).unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotMix {
+                slot: 0,
+                gain: 0.5,
+                pan: -1.0,
+                mute: false,
+            })
+            .unwrap();
 
         let mut buf = [0.0f32; 8];
         audio_callback(&mut buf, &mut state);
-        assert!(buf.iter().step_by(2).all(|&s| (s - 0.5).abs() < 1e-6), "left = gain, got {buf:?}");
-        assert!(buf.iter().skip(1).step_by(2).all(|&s| s.abs() < 1e-6), "right silent, got {buf:?}");
+        assert!(
+            buf.iter().step_by(2).all(|&s| (s - 0.5).abs() < 1e-6),
+            "left = gain, got {buf:?}"
+        );
+        assert!(
+            buf.iter().skip(1).step_by(2).all(|&s| s.abs() < 1e-6),
+            "right silent, got {buf:?}"
+        );
 
-        cmd_tx.push(EngineCommand::SetSlotMix { slot: 0, gain: 0.5, pan: -1.0, mute: true }).unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotMix {
+                slot: 0,
+                gain: 0.5,
+                pan: -1.0,
+                mute: true,
+            })
+            .unwrap();
         audio_callback(&mut buf, &mut state);
-        assert!(buf.iter().all(|&s| s == 0.0), "mute silences the slot, got {buf:?}");
+        assert!(
+            buf.iter().all(|&s| s == 0.0),
+            "mute silences the slot, got {buf:?}"
+        );
     }
 
     #[test]
@@ -1919,9 +2156,19 @@ mod tests {
         let (mut cmd_tx, _retired, mut state) = mk_state();
         let a = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
         let b = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-        cmd_tx.push(EngineCommand::AddSlot(Box::new(RecordingSynth(a.clone())))).unwrap();
-        cmd_tx.push(EngineCommand::AddSlot(Box::new(RecordingSynth(b.clone())))).unwrap();
-        cmd_tx.push(EngineCommand::NoteOn { slot: 1, note: 60, vel: 100 }).unwrap();
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(RecordingSynth(a.clone()))))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(RecordingSynth(b.clone()))))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::NoteOn {
+                slot: 1,
+                note: 60,
+                vel: 100,
+            })
+            .unwrap();
 
         let mut buf = [0.0f32; 8];
         audio_callback(&mut buf, &mut state);
@@ -1929,11 +2176,27 @@ mod tests {
         assert_eq!(&*b.lock(), &[(true, 60)]);
 
         // Out-of-range targets are dropped, not panics.
-        cmd_tx.push(EngineCommand::NoteOn { slot: 99, note: 62, vel: 100 }).unwrap();
-        cmd_tx.push(EngineCommand::SetSlotProgram { slot: 1, bank: 0, preset: 42 }).unwrap();
+        cmd_tx
+            .push(EngineCommand::NoteOn {
+                slot: 99,
+                note: 62,
+                vel: 100,
+            })
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotProgram {
+                slot: 1,
+                bank: 0,
+                preset: 42,
+            })
+            .unwrap();
         audio_callback(&mut buf, &mut state);
         assert!(a.lock().is_empty());
-        assert_eq!(b.lock().last(), Some(&(true, 200 + 42)), "slot 1 got the program change");
+        assert_eq!(
+            b.lock().last(),
+            Some(&(true, 200 + 42)),
+            "slot 1 got the program change"
+        );
     }
 
     #[test]
@@ -1944,47 +2207,101 @@ mod tests {
         let (q_ccs, p_ccs) = (quiet.ccs.clone(), played.ccs.clone());
         let p_bends = played.bends.clone();
 
-        cmd_tx.push(EngineCommand::AddSlot(Box::new(quiet))).unwrap();
-        cmd_tx.push(EngineCommand::AddSlot(Box::new(played))).unwrap();
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(quiet)))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(played)))
+            .unwrap();
         // Sustain down, modulation wheel up, bend fully up.
-        cmd_tx.push(EngineCommand::ControlChange { slot: 1, cc: 64, value: 127 }).unwrap();
-        cmd_tx.push(EngineCommand::ControlChange { slot: 1, cc: 1, value: 90 }).unwrap();
-        cmd_tx.push(EngineCommand::PitchBend { slot: 1, value: 16383 }).unwrap();
+        cmd_tx
+            .push(EngineCommand::ControlChange {
+                slot: 1,
+                cc: 64,
+                value: 127,
+            })
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::ControlChange {
+                slot: 1,
+                cc: 1,
+                value: 90,
+            })
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::PitchBend {
+                slot: 1,
+                value: 16383,
+            })
+            .unwrap();
         // Out-of-range targets are dropped, not panics.
-        cmd_tx.push(EngineCommand::ControlChange { slot: 99, cc: 64, value: 127 }).unwrap();
-        cmd_tx.push(EngineCommand::PitchBend { slot: 99, value: 0 }).unwrap();
+        cmd_tx
+            .push(EngineCommand::ControlChange {
+                slot: 99,
+                cc: 64,
+                value: 127,
+            })
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::PitchBend { slot: 99, value: 0 })
+            .unwrap();
 
         let mut buf = [0.0f32; 8];
         audio_callback(&mut buf, &mut state);
 
-        assert_eq!(&*p_ccs.lock(), &[(64, 127), (1, 90)], "sustain and mod wheel arrive unfiltered");
+        assert_eq!(
+            &*p_ccs.lock(),
+            &[(64, 127), (1, 90)],
+            "sustain and mod wheel arrive unfiltered"
+        );
         assert_eq!(&*p_bends.lock(), &[16383]);
-        assert!(q_ccs.lock().is_empty(), "a slot bound to another input stays untouched");
+        assert!(
+            q_ccs.lock().is_empty(),
+            "a slot bound to another input stays untouched"
+        );
     }
 
     #[test]
     fn set_slot_source_swaps_and_retires_the_old_one() {
         let (mut cmd_tx, mut retired_rx, mut state) = mk_state();
-        cmd_tx.push(EngineCommand::AddSlot(Box::new(DcSource(0.5)))).unwrap();
-        cmd_tx.push(EngineCommand::SetSlotSource { slot: 0, source: Box::new(DcSource(0.25)) }).unwrap();
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(DcSource(0.5))))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotSource {
+                slot: 0,
+                source: Box::new(DcSource(0.25)),
+            })
+            .unwrap();
 
         let mut buf = [0.0f32; 8];
         audio_callback(&mut buf, &mut state);
         let expect = 0.25 * std::f32::consts::FRAC_1_SQRT_2;
-        assert!(buf.iter().all(|&s| (s - expect).abs() < 1e-6), "new source is live, got {buf:?}");
-        assert!(matches!(retired_rx.pop(), Ok(Retired::Source(_))), "old source dropped off-RT");
+        assert!(
+            buf.iter().all(|&s| (s - expect).abs() < 1e-6),
+            "new source is live, got {buf:?}"
+        );
+        assert!(
+            matches!(retired_rx.pop(), Ok(Retired::Source(_))),
+            "old source dropped off-RT"
+        );
     }
 
     #[test]
     fn remove_slot_returns_it_off_rt() {
         let (mut cmd_tx, mut retired_rx, mut state) = mk_state();
-        cmd_tx.push(EngineCommand::AddSlot(Box::new(DcSource(0.5)))).unwrap();
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(DcSource(0.5))))
+            .unwrap();
         cmd_tx.push(EngineCommand::RemoveSlot(0)).unwrap();
 
         let mut buf = [0.0f32; 8];
         audio_callback(&mut buf, &mut state);
         assert!(state.slots.is_empty(), "slot removed");
-        assert!(matches!(retired_rx.pop(), Ok(Retired::Slot(_))), "removed slot returned for off-RT drop");
+        assert!(
+            matches!(retired_rx.pop(), Ok(Retired::Slot(_))),
+            "removed slot returned for off-RT drop"
+        );
         assert!(buf.iter().all(|&s| s == 0.0), "empty rack is silent");
     }
 }

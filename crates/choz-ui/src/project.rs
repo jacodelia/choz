@@ -147,7 +147,11 @@ impl Project {
     /// Read a project back. `path` may name the file or the directory holding
     /// the default one.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let file = if path.is_dir() { path.join(DEFAULT_NAME) } else { path.to_path_buf() };
+        let file = if path.is_dir() {
+            path.join(DEFAULT_NAME)
+        } else {
+            path.to_path_buf()
+        };
         let text = std::fs::read_to_string(&file)
             .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", file.display()))?;
         serde_yaml::from_str(&text)
@@ -157,7 +161,11 @@ impl Project {
     /// Write the project to `path`, or to `path/choz-project.yml` when `path`
     /// is a directory.
     pub fn save(&self, path: &Path) -> anyhow::Result<PathBuf> {
-        let file = if path.is_dir() { path.join(DEFAULT_NAME) } else { path.to_path_buf() };
+        let file = if path.is_dir() {
+            path.join(DEFAULT_NAME)
+        } else {
+            path.to_path_buf()
+        };
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -183,7 +191,10 @@ mod tests {
                 osc_port: Some(9000),
                 disabled_midi_inputs: vec!["Midi Through".into()],
             },
-            interface: Interface { text_color: (240, 180, 90), language: "es".into() },
+            interface: Interface {
+                text_color: (240, 180, 90),
+                language: "es".into(),
+            },
             plugin_paths: choz_engine::PluginPaths::default(),
             rack: vec![Slot {
                 input: Some("MIDI:Keystation".into()),

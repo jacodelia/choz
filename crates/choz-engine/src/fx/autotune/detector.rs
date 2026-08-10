@@ -27,8 +27,11 @@ pub struct PitchEstimate {
 }
 
 impl PitchEstimate {
-    pub const SILENT: Self =
-        PitchEstimate { frequency_hz: 0.0, confidence: 0.0, voiced: false };
+    pub const SILENT: Self = PitchEstimate {
+        frequency_hz: 0.0,
+        confidence: 0.0,
+        voiced: false,
+    };
 }
 
 /// Highest sample rate the buffers are sized for. Above this the detector still
@@ -168,9 +171,14 @@ impl PitchDetector {
         let half = WINDOW / 2;
         let min_lag = (self.work_rate / self.max_hz.max(1.0)) as usize;
         let max_lag = (self.work_rate / self.min_hz.max(1.0)) as usize;
-        let Some((period, clarity)) =
-            crate::pitch::yin(&self.window, self.write, half, min_lag, max_lag, &mut self.diff)
-        else {
+        let Some((period, clarity)) = crate::pitch::yin(
+            &self.window,
+            self.write,
+            half,
+            min_lag,
+            max_lag,
+            &mut self.diff,
+        ) else {
             self.previous = 0.0;
             return PitchEstimate::SILENT;
         };
@@ -203,7 +211,11 @@ impl PitchDetector {
         if voiced {
             self.previous = hz;
         }
-        PitchEstimate { frequency_hz: hz, confidence: clarity, voiced }
+        PitchEstimate {
+            frequency_hz: hz,
+            confidence: clarity,
+            voiced,
+        }
     }
 }
 

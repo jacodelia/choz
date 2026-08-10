@@ -240,7 +240,9 @@ pub fn wants_sandbox(format: PluginFormat, path: &Path, id: &str) -> bool {
 }
 
 fn sandbox_guis() -> bool {
-    std::env::var("CHOZ_SANDBOX_GUI").map(|v| v != "0").unwrap_or(true)
+    std::env::var("CHOZ_SANDBOX_GUI")
+        .map(|v| v != "0")
+        .unwrap_or(true)
 }
 
 /// Set once a spawned child turns out not to understand the probe flag, so a
@@ -264,7 +266,9 @@ fn probe(format: PluginFormat, path: &Path, id: &str) -> Report {
     if crate::is_worker() || NOT_A_WORKER.load(std::sync::atomic::Ordering::Relaxed) {
         return Report::default();
     }
-    let Ok(exe) = std::env::current_exe() else { return Report::default() };
+    let Ok(exe) = std::env::current_exe() else {
+        return Report::default();
+    };
     // The child writes its progress here, so the directory has to exist before
     // it starts: a failed write looks exactly like "this binary is not a probe
     // worker", and every plugin would come back Ok.
@@ -310,7 +314,9 @@ pub fn probe_worker_main() -> bool {
     if args.len() < 6 || args[1] != PROBE_WORKER_FLAG {
         return false;
     }
-    let Some(format) = PluginFormat::from_label(&args[2]) else { return true };
+    let Some(format) = PluginFormat::from_label(&args[2]) else {
+        return true;
+    };
     let (path, id, out) = (Path::new(&args[3]), args[4].as_str(), &args[5]);
     // Asking whether a UI exists is not loading it, and the answer is what puts
     // the dangerous ones behind a process boundary. Hiding them here would keep
@@ -318,7 +324,11 @@ pub fn probe_worker_main() -> bool {
     choz_plugin_lv2::allow_denied_uis(true);
     let gui = std::cell::Cell::new(false);
     let mark = |stage: &str| {
-        let text = if gui.get() { format!("{stage}{GUI_MARK}") } else { stage.to_string() };
+        let text = if gui.get() {
+            format!("{stage}{GUI_MARK}")
+        } else {
+            stage.to_string()
+        };
         let _ = std::fs::write(out, text);
     };
 
@@ -372,7 +382,10 @@ mod tests {
     #[test]
     fn a_crashing_verdict_is_not_loadable() {
         assert!(Verdict::Ok.loadable());
-        assert!(Verdict::CrashesOnTeardown.loadable(), "it plays; only the drop hurts");
+        assert!(
+            Verdict::CrashesOnTeardown.loadable(),
+            "it plays; only the drop hurts"
+        );
         assert!(!Verdict::CrashesOnLoad.loadable());
     }
 
@@ -382,7 +395,11 @@ mod tests {
     fn the_worst_of_several_probes_is_the_one_that_counts() {
         let worst = |vs: &[Verdict]| {
             vs.iter().copied().fold(Verdict::Ok, |acc, v| {
-                if v.severity() > acc.severity() { v } else { acc }
+                if v.severity() > acc.severity() {
+                    v
+                } else {
+                    acc
+                }
             })
         };
         assert_eq!(worst(&[Verdict::Ok, Verdict::Ok, Verdict::Ok]), Verdict::Ok);
@@ -403,8 +420,16 @@ mod tests {
     fn the_stage_file_carries_the_window_answer_with_the_stage() {
         assert_eq!(read_stage("done"), ("done", false));
         assert_eq!(read_stage("done gui"), ("done", true));
-        assert_eq!(read_stage("loaded gui"), ("loaded", true), "died on teardown, has a UI");
-        assert_eq!(read_stage("started"), ("started", false), "never got far enough to know");
+        assert_eq!(
+            read_stage("loaded gui"),
+            ("loaded", true),
+            "died on teardown, has a UI"
+        );
+        assert_eq!(
+            read_stage("started"),
+            ("started", false),
+            "never got far enough to know"
+        );
         assert_eq!(read_stage(""), ("", false), "not a probe worker at all");
     }
 
@@ -412,7 +437,10 @@ mod tests {
     /// on its own, and the cache has to remember it for the next load.
     #[test]
     fn a_report_survives_the_cache_with_its_window_flag() {
-        let r = Report { verdict: Verdict::Ok, editor: true };
+        let r = Report {
+            verdict: Verdict::Ok,
+            editor: true,
+        };
         let json = serde_json::to_vec(&r).unwrap();
         assert_eq!(serde_json::from_slice::<Report>(&json).unwrap(), r);
         // Written before the flag existed: no field, and nothing is claimed.

@@ -25,8 +25,8 @@ impl FilterBankFx {
     pub fn new(sample_rate: u32) -> Self {
         let mut fx = Self {
             gains_db: [0.0; BANDS],
-            state:    [[0.0; 4]; BANDS],
-            coeffs:   [[0.0; 5]; BANDS],
+            state: [[0.0; 4]; BANDS],
+            coeffs: [[0.0; 5]; BANDS],
             sample_rate,
             mix: 1.0,
         };
@@ -53,7 +53,9 @@ impl FilterBankFx {
     }
 
     /// Return center frequency for a band index.
-    pub fn band_freq(band: usize) -> f32 { center_freq(band) }
+    pub fn band_freq(band: usize) -> f32 {
+        center_freq(band)
+    }
 
     fn recompute_all(&mut self) {
         let sr = self.sample_rate;
@@ -92,9 +94,9 @@ fn peaking_coeffs(fc: f32, gain_db: f32, q: f32, sr: u32) -> [f32; 5] {
 /// Takes state by value, returns (output, new_z1, new_z2).
 #[inline]
 fn biquad(x: f32, z1: f32, z2: f32, c: &[f32; 5]) -> (f32, f32, f32) {
-    let y    = c[0] * x + z1;
-    let nz1  = c[1] * x - c[3] * y + z2;
-    let nz2  = c[2] * x - c[4] * y;
+    let y = c[0] * x + z1;
+    let nz1 = c[1] * x - c[3] * y + z2;
+    let nz2 = c[2] * x - c[4] * y;
     (y, nz1, nz2)
 }
 
@@ -122,7 +124,7 @@ impl FxProcessor for FilterBankFx {
                 r = yr;
             }
 
-            block[i * 2]     = self.mix * l + (1.0 - self.mix) * dry_l;
+            block[i * 2] = self.mix * l + (1.0 - self.mix) * dry_l;
             block[i * 2 + 1] = self.mix * r + (1.0 - self.mix) * dry_r;
         }
     }
@@ -144,17 +146,22 @@ mod tests {
     fn flat_gains_unity_output() {
         let mut fb = FilterBankFx::new(48000);
         // All gains at 0 dB — output should be close to input (small rounding errors).
-        let input: Vec<f32> = (0..64).flat_map(|i| {
-            let s = (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 48000.0).sin();
-            [s, s]
-        }).collect();
+        let input: Vec<f32> = (0..64)
+            .flat_map(|i| {
+                let s = (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 48000.0).sin();
+                [s, s]
+            })
+            .collect();
         let mut block = input.clone();
         fb.process_block(&mut block, 48000);
         // Allow up to 1% amplitude error after transient settles (skip first 16 frames).
-        let e_in:  f32 = input[32..].iter().map(|&s| s * s).sum();
+        let e_in: f32 = input[32..].iter().map(|&s| s * s).sum();
         let e_out: f32 = block[32..].iter().map(|&s| s * s).sum();
         let ratio = e_out / e_in.max(1e-9);
-        assert!(ratio > 0.9 && ratio < 1.1, "flat filter should be near-unity: ratio={ratio:.3}");
+        assert!(
+            ratio > 0.9 && ratio < 1.1,
+            "flat filter should be near-unity: ratio={ratio:.3}"
+        );
     }
 
     #[test]
@@ -162,30 +169,42 @@ mod tests {
         let mut fb = FilterBankFx::new(48000);
         // Boost all 48 bands by +12 dB; any test signal should be amplified.
         fb.set_all_gains(&[12.0f32; BANDS]);
-        let input: Vec<f32> = (0..256).flat_map(|i| {
-            let s = (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 48000.0).sin();
-            [s, s]
-        }).collect();
+        let input: Vec<f32> = (0..256)
+            .flat_map(|i| {
+                let s = (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 48000.0).sin();
+                [s, s]
+            })
+            .collect();
         let mut block = input.clone();
         fb.process_block(&mut block, 48000);
-        let e_in:  f32 = input[64..].iter().map(|&s| s * s).sum();
+        let e_in: f32 = input[64..].iter().map(|&s| s * s).sum();
         let e_out: f32 = block[64..].iter().map(|&s| s * s).sum();
-        assert!(e_out > e_in * 1.5, "+12 dB all-band boost should increase energy: ratio={:.2}", e_out / e_in.max(1e-9));
+        assert!(
+            e_out > e_in * 1.5,
+            "+12 dB all-band boost should increase energy: ratio={:.2}",
+            e_out / e_in.max(1e-9)
+        );
     }
 
     #[test]
     fn cut_all_bands_reduces_energy() {
         let mut fb = FilterBankFx::new(48000);
         fb.set_all_gains(&[-12.0f32; BANDS]);
-        let input: Vec<f32> = (0..256).flat_map(|i| {
-            let s = (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 48000.0).sin();
-            [s, s]
-        }).collect();
+        let input: Vec<f32> = (0..256)
+            .flat_map(|i| {
+                let s = (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 48000.0).sin();
+                [s, s]
+            })
+            .collect();
         let mut block = input.clone();
         fb.process_block(&mut block, 48000);
-        let e_in:  f32 = input[64..].iter().map(|&s| s * s).sum();
+        let e_in: f32 = input[64..].iter().map(|&s| s * s).sum();
         let e_out: f32 = block[64..].iter().map(|&s| s * s).sum();
-        assert!(e_out < e_in * 0.5, "-12 dB all-band cut should reduce energy: ratio={:.2}", e_out / e_in.max(1e-9));
+        assert!(
+            e_out < e_in * 0.5,
+            "-12 dB all-band cut should reduce energy: ratio={:.2}",
+            e_out / e_in.max(1e-9)
+        );
     }
 
     #[test]
@@ -202,6 +221,9 @@ mod tests {
         let f0 = FilterBankFx::band_freq(0);
         let fn_ = FilterBankFx::band_freq(BANDS - 1);
         assert!((f0 - 20.0).abs() < 0.1, "band 0 should be ~20 Hz: {f0}");
-        assert!((fn_ - 20000.0).abs() < 1.0, "band 47 should be ~20 kHz: {fn_}");
+        assert!(
+            (fn_ - 20000.0).abs() < 1.0,
+            "band 47 should be ~20 kHz: {fn_}"
+        );
     }
 }

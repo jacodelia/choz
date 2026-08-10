@@ -25,6 +25,54 @@ Todo lo de abajo — desde el commit inicial hasta hoy — es lo que lleva:
 - empaquetado `.deb`/`.rpm`/`install.sh` con entrada de escritorio, y una superficie de control de ejemplo para ESP32-S3 táctil.
 
 
+### 2026-08-10 — El `.deb` llevaba el binario y nada más
+
+Reportado: choz instalado no aparece en el menú de inicio de Linux. Y aparte:
+sacar del repo y de los binarios las rutas con el usuario de quien compila.
+
+#### Arreglado
+- **El paquete no llevaba ni entrada de escritorio, ni icono, ni lanzador.** La
+  lista `assets` había quedado dentro de `[package.metadata.deb.variants.arm]`,
+  y **una variante hereda de la tabla base, no al revés**: el paquete x86_64
+  —el que se instala en un PC— salía con `usr/bin/choz` y el `copyright`, y nada
+  más. No hay aviso de esto: cargo-deb construye contento, el paquete instala
+  limpio, y la aplicación simplemente no existe para el menú.
+  - Se ve sólo con `dpkg-deb -c` sobre el paquete construido, así que ahora hay
+    cuatro tests (`crates/choz-ui/tests/packaging_assets.rs`) que leen el
+    manifiesto y exigen que cada destino esté declarado en la tabla base y que
+    cada fuente exista, para `.deb` y para `.rpm`.
+  - Verificado sobre el paquete: los siete archivos están, en las dos variantes,
+    y la ARM sigue declarando sus dependencias a mano.
+- **Nadie refrescaba las cachés del escritorio.** `dpkg-deb -I` no mostraba
+  postinst: Debian trae triggers que suelen hacerlo, y «suelen» es como una
+  aplicación se instala y nunca aparece. Van `packaging/debian/{postinst,postrm}`
+  con `update-desktop-database`, `update-mime-database` y
+  `gtk-update-icon-cache`, los mismos que ya corría `install.sh` —al que le
+  faltaba el de iconos, que es la diferencia entre una entrada de menú y una
+  entrada de menú con un cuadrado en blanco al lado— y los mismos que ahora
+  corre el `.rpm` en sus scriptlets.
+- **415 rutas `/home/jorge` dentro del binario de release.** Un build de release
+  mete la ruta del fuente en cada mensaje de pánico, y esas rutas vienen del
+  `$HOME` de quien compila. `strip = true` no toca ninguna; cuatro
+  `--remap-path-prefix` (registro de cargo, git, sysroot y el árbol) las llevan
+  a **cero**, contadas con `strings`. Están en el workflow, apuntando a las
+  rutas del runner. `trim-paths` haría lo mismo desde `Cargo.toml` y sigue
+  siendo inestable en rustc 1.97.1.
+- **`crates/choz-plugin-vst3/examples/gui_probe.rs`** tenía `/home/jorge/repo` en
+  una constante. Ahora busca en `/usr/lib/vst3`, `/usr/local/lib/vst3`,
+  `$HOME/.vst3` y `VST3_PATH`. `git grep /home/jorge` no devuelve nada.
+
+#### Cambiado
+- **El icono es un teclado con una onda encima**, dibujado en el repo y no
+  tomado de un set —así no hay licencia que seguir, es MIT con el resto. Una
+  octava de verdad (siete blancas, cinco negras) a 16 px es papilla gris:
+  renderizado y mirado, no supuesto. Van tres negras gordas y ninguna línea
+  entre blancas. Mal como piano, bien como silueta de 16 px, que es el tamaño
+  donde este icono vive.
+- **`Categories=AudioVideo;Audio;Midi;Sequencer;Music;`** — lo que lo pone bajo
+  multimedia, que es donde se pidió. Con `Keywords` para synth, sampler, los
+  seis formatos de plugin y autotune.
+
 ### 2026-08-09 (septendecies) — AutoTune con el método de zita-at1, y los knobs dejan de cortar el sonido
 
 Reportado: el AutoTune seguía saturando la entrada; los presets del EQ no movían los sliders; y mover un parámetro de cualquier built-in cortaba el sonido.

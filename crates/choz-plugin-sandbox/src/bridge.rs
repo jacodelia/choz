@@ -237,7 +237,9 @@ impl Host {
     /// The caller must keep the shared mapping alive for as long as the link
     /// exists (`SandboxedPlugin` holds the `Shm` in an `Arc` for this).
     pub unsafe fn editor_link(&self) -> EditorLink {
-        EditorLink { header: self.region.header }
+        EditorLink {
+            header: self.region.header,
+        }
     }
 
     /// Ask the child to embed its plugin's window into `parent` (an X11 window
@@ -248,9 +250,14 @@ impl Host {
     pub fn editor(&self, parent: Option<u64>, patience: Duration) -> Option<(u16, u16)> {
         let h = self.region.header();
         h.editor_size.store(0, Ordering::Relaxed);
-        h.editor_parent.store(parent.unwrap_or(0), Ordering::Relaxed);
+        h.editor_parent
+            .store(parent.unwrap_or(0), Ordering::Relaxed);
         h.editor_cmd.store(
-            if parent.is_some() { EDITOR_OPEN } else { EDITOR_CLOSE },
+            if parent.is_some() {
+                EDITOR_OPEN
+            } else {
+                EDITOR_CLOSE
+            },
             Ordering::Relaxed,
         );
         let seq = h.editor_seq.fetch_add(1, Ordering::AcqRel) + 1;
@@ -345,10 +352,10 @@ impl Sandbox {
     /// right after loading and before the first block is served, so the host
     /// knows by the time `build` returns.
     pub fn set_editor_present(&self, present: bool) {
-        self.region
-            .header()
-            .editor_present
-            .store(if present { EDITOR_PRESENT } else { EDITOR_NONE }, Ordering::Release);
+        self.region.header().editor_present.store(
+            if present { EDITOR_PRESENT } else { EDITOR_NONE },
+            Ordering::Release,
+        );
     }
 
     /// Answer the request `seq`, with the size the plugin asked for.
@@ -359,11 +366,7 @@ impl Sandbox {
         h.editor_ack.store(seq, Ordering::Release);
     }
 
-    pub fn serve(
-        &mut self,
-        patience: Duration,
-        f: Process<'_>,
-    ) -> bool {
+    pub fn serve(&mut self, patience: Duration, f: Process<'_>) -> bool {
         let h = self.region.header();
         let want = self.served + 1;
         if !wait_until(patience, || h.request.load(Ordering::Acquire) >= want) {
@@ -442,9 +445,14 @@ impl EditorLink {
         // SAFETY: the mapping outlives the link by construction.
         let h = unsafe { &*self.header };
         h.editor_size.store(0, Ordering::Relaxed);
-        h.editor_parent.store(parent.unwrap_or(0), Ordering::Relaxed);
+        h.editor_parent
+            .store(parent.unwrap_or(0), Ordering::Relaxed);
         h.editor_cmd.store(
-            if parent.is_some() { EDITOR_OPEN } else { EDITOR_CLOSE },
+            if parent.is_some() {
+                EDITOR_OPEN
+            } else {
+                EDITOR_CLOSE
+            },
             Ordering::Relaxed,
         );
         let seq = h.editor_seq.fetch_add(1, Ordering::AcqRel) + 1;
@@ -477,8 +485,7 @@ mod tests {
         // The host asks from another thread — which is where the `GUI` button
         // is pressed — while the child side stays here.
         let link = unsafe { host.editor_link() };
-        let asked =
-            std::thread::spawn(move || link.editor(Some(0xBEEF), Duration::from_secs(2)));
+        let asked = std::thread::spawn(move || link.editor(Some(0xBEEF), Duration::from_secs(2)));
 
         // The child picks it up and answers.
         let (seq, parent) = loop {
@@ -545,13 +552,19 @@ mod tests {
         h.request.store(1, Ordering::Release);
 
         let mut seen_midi = Vec::new();
-        assert!(child.serve(Duration::from_millis(50), &mut |inp, out, midi, _params| {
-            seen_midi.extend_from_slice(midi);
-            for (o, i) in out.iter_mut().zip(inp) {
-                *o = i * 2.0;
-            }
-        }));
-        assert_eq!(seen_midi, vec![[0x90, 60, 100]], "MIDI crosses with the block");
+        assert!(
+            child.serve(Duration::from_millis(50), &mut |inp, out, midi, _params| {
+                seen_midi.extend_from_slice(midi);
+                for (o, i) in out.iter_mut().zip(inp) {
+                    *o = i * 2.0;
+                }
+            })
+        );
+        assert_eq!(
+            seen_midi,
+            vec![[0x90, 60, 100]],
+            "MIDI crosses with the block"
+        );
 
         output.copy_from_slice(host.region.output());
         assert!(output.iter().all(|s| (*s - 0.5).abs() < 1e-6), "{output:?}");

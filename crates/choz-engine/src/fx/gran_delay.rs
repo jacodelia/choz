@@ -8,61 +8,71 @@ const MAX_BUF: usize = 192_002; // ~4 s @ 48 kHz
 const MAX_GRAINS: usize = 8;
 
 struct GrainReader {
-    pos:    f64,
-    speed:  f64,
+    pos: f64,
+    speed: f64,
     active: bool,
-    age:    u32,
-    life:   u32,
+    age: u32,
+    life: u32,
 }
 
-impl GrainReader {
-}
+impl GrainReader {}
 
 /// Granular feedback delay — grain-clouds from the delay buffer fed back.
 pub struct GranularDelay {
-    buf_l:       Vec<f32>,
-    buf_r:       Vec<f32>,
-    write:       usize,
+    buf_l: Vec<f32>,
+    buf_r: Vec<f32>,
+    write: usize,
     delay_frames: usize,
-    feedback:    f32,
+    feedback: f32,
     /// Pitch scatter in semitones (0 = no scatter).
-    scatter_st:  f32,
+    scatter_st: f32,
     /// Grain density (spawns per second).
-    density:     f32,
-    wet:         f32,
-    grains:      [GrainReader; MAX_GRAINS],
-    rng:         u64,
+    density: f32,
+    wet: f32,
+    grains: [GrainReader; MAX_GRAINS],
+    rng: u64,
     spawn_timer: f64,
     sample_rate: u32,
-    delay_ms:    f32,
+    delay_ms: f32,
 }
 
 impl GranularDelay {
     pub fn new(delay_ms: f32, feedback: f32, scatter_st: f32, density: f32) -> Self {
-        const INIT: GrainReader = GrainReader { pos: 0.0, speed: 1.0, active: false, age: 0, life: 1 };
+        const INIT: GrainReader = GrainReader {
+            pos: 0.0,
+            speed: 1.0,
+            active: false,
+            age: 0,
+            life: 1,
+        };
         Self {
-            buf_l:        vec![0.0; MAX_BUF],
-            buf_r:        vec![0.0; MAX_BUF],
-            write:        0,
+            buf_l: vec![0.0; MAX_BUF],
+            buf_r: vec![0.0; MAX_BUF],
+            write: 0,
             delay_frames: ((delay_ms / 1000.0) * 48000.0) as usize,
             feedback,
             scatter_st,
             density,
-            wet:          0.7,
-            grains:       [INIT; MAX_GRAINS],
-            rng:          0xBEEF_F00D_1234_ABCD,
-            spawn_timer:  0.0,
-            sample_rate:  48000,
+            wet: 0.7,
+            grains: [INIT; MAX_GRAINS],
+            rng: 0xBEEF_F00D_1234_ABCD,
+            spawn_timer: 0.0,
+            sample_rate: 48000,
             delay_ms,
         }
     }
 
     fn rand_f32(&mut self) -> f32 {
-        self.rng = self.rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.rng = self
+            .rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (self.rng >> 33) as f32 / u32::MAX as f32
     }
 
-    fn rand_signed(&mut self) -> f32 { self.rand_f32() * 2.0 - 1.0 }
+    fn rand_signed(&mut self) -> f32 {
+        self.rand_f32() * 2.0 - 1.0
+    }
 
     fn spawn_grain(&mut self, buf_len: usize) {
         let slot = self.grains.iter().position(|g| !g.active);
@@ -74,7 +84,13 @@ impl GranularDelay {
         let speed = 2.0_f64.powf(semitones as f64 / 12.0);
         let grain_ms = 80.0 + self.rand_f32() * 120.0;
         let life = ((grain_ms / 1000.0) * self.sample_rate as f32) as u32;
-        self.grains[idx] = GrainReader { pos, speed, active: true, age: 0, life };
+        self.grains[idx] = GrainReader {
+            pos,
+            speed,
+            active: true,
+            age: 0,
+            life,
+        };
     }
 }
 
@@ -129,7 +145,9 @@ impl FxProcessor for GranularDelay {
             let mut gl = 0.0f32;
             let mut gr = 0.0f32;
             for grain in self.grains.iter_mut() {
-                if !grain.active { continue; }
+                if !grain.active {
+                    continue;
+                }
                 let p0 = grain.pos as usize % buf_len;
                 let p1 = (p0 + 1) % buf_len;
                 let frac = grain.pos.fract() as f32;
@@ -142,10 +160,12 @@ impl FxProcessor for GranularDelay {
                 gr += sr * env;
                 grain.pos = (grain.pos + grain.speed).rem_euclid(buf_len as f64);
                 grain.age += 1;
-                if grain.age >= grain.life { grain.active = false; }
+                if grain.age >= grain.life {
+                    grain.active = false;
+                }
             }
 
-            block[i * 2]     = dry_l * (1.0 - self.wet) + gl * self.wet;
+            block[i * 2] = dry_l * (1.0 - self.wet) + gl * self.wet;
             block[i * 2 + 1] = dry_r * (1.0 - self.wet) + gr * self.wet;
         }
     }
@@ -158,7 +178,9 @@ impl FxProcessor for GranularDelay {
         self.spawn_timer = 0.0;
     }
 
-    fn set_mix(&mut self, wet: f32) { self.wet = wet.clamp(0.0, 1.0); }
+    fn set_mix(&mut self, wet: f32) {
+        self.wet = wet.clamp(0.0, 1.0);
+    }
 }
 
 #[cfg(test)]

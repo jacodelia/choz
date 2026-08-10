@@ -1,8 +1,8 @@
 //! Runtime checks against the LADSPA/DSSI plugins installed on this machine.
 //! Each test skips when nothing is installed, so CI stays green without them.
 
+use choz_plugin_ladspa::{scan_directory, DssiInstrument, LadspaEffect, PluginInfo};
 use choz_ports::{AudioSource, FxProcessor};
-use choz_plugin_ladspa::{DssiInstrument, LadspaEffect, PluginInfo, scan_directory};
 
 const SR: u32 = 48_000;
 const BLOCK: u32 = 256;
@@ -35,8 +35,14 @@ fn scan_reports_labels_and_ports() {
     for p in &found {
         assert!(!p.label.is_empty(), "{} has no label", p.path.display());
     }
-    assert!(found.iter().any(|p| p.audio_outputs > 0), "no plugin has an audio output");
-    assert!(found.iter().any(|p| !p.params.is_empty()), "no plugin exposes parameters");
+    assert!(
+        found.iter().any(|p| p.audio_outputs > 0),
+        "no plugin has an audio output"
+    );
+    assert!(
+        found.iter().any(|p| !p.params.is_empty()),
+        "no plugin exposes parameters"
+    );
 }
 
 /// The first few installed effects load, process, and stay finite.
@@ -48,13 +54,20 @@ fn a_few_effects_host_and_stay_finite() {
         return;
     }
     let mut hosted = 0;
-    for info in found.iter().filter(|p| p.audio_outputs > 0 && p.audio_inputs > 0) {
+    for info in found
+        .iter()
+        .filter(|p| p.audio_outputs > 0 && p.audio_inputs > 0)
+    {
         let Some(mut fx) = LadspaEffect::build(&info.path, &info.label, SR, BLOCK) else {
             continue;
         };
         let mut buf = sine_block(BLOCK as usize);
         fx.process_block(&mut buf, SR);
-        assert!(buf.iter().all(|s| s.is_finite()), "{} produced non-finite", info.label);
+        assert!(
+            buf.iter().all(|s| s.is_finite()),
+            "{} produced non-finite",
+            info.label
+        );
         hosted += 1;
         if hosted == 5 {
             break;
@@ -74,7 +87,10 @@ fn every_installed_effect_is_safe_to_host() {
         return;
     }
     let mut hosted = 0;
-    for info in found.iter().filter(|p| p.audio_outputs > 0 && p.audio_inputs > 0) {
+    for info in found
+        .iter()
+        .filter(|p| p.audio_outputs > 0 && p.audio_inputs > 0)
+    {
         let Some(mut fx) = LadspaEffect::build(&info.path, &info.label, SR, BLOCK) else {
             continue;
         };

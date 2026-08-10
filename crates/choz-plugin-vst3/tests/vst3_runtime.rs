@@ -5,8 +5,8 @@
 //! (`ModuleEntry`), and the harness runs test functions in parallel. choz only
 //! ever loads plugins from the UI thread.
 
+use choz_plugin_vst3::{scan_directory, Vst3Effect, Vst3Instrument};
 use choz_ports::{AudioSource, FxProcessor};
-use choz_plugin_vst3::{Vst3Effect, Vst3Instrument, scan_directory};
 
 const SR: u32 = 48_000;
 const BLOCK: u32 = 256;
@@ -25,10 +25,16 @@ fn installed_vst3_plugins_scan_host_and_sound() {
     // An effect processes a block and stays finite.
     let mut hosted = 0;
     for info in found.iter().filter(|p| !p.is_instrument) {
-        let Some(mut fx) = Vst3Effect::build(&info.path, SR, BLOCK) else { continue };
+        let Some(mut fx) = Vst3Effect::build(&info.path, SR, BLOCK) else {
+            continue;
+        };
         let mut buf = vec![0.25f32; BLOCK as usize * 2];
         fx.process_block(&mut buf, SR);
-        assert!(buf.iter().all(|s| s.is_finite()), "{} produced non-finite", info.name);
+        assert!(
+            buf.iter().all(|s| s.is_finite()),
+            "{} produced non-finite",
+            info.name
+        );
         hosted += 1;
         break;
     }
@@ -41,7 +47,9 @@ fn installed_vst3_plugins_scan_host_and_sound() {
     // *which* parameter does what: it sweeps each of the first few and asks
     // that at least one of them changes the output.
     for info in found.iter().filter(|p| !p.is_instrument) {
-        let Some(mut fx) = Vst3Effect::build(&info.path, SR, BLOCK) else { continue };
+        let Some(mut fx) = Vst3Effect::build(&info.path, SR, BLOCK) else {
+            continue;
+        };
         let params = choz_plugin_vst3::read_params(&info.path, "");
         if params.is_empty() {
             continue;
@@ -81,7 +89,9 @@ fn installed_vst3_plugins_scan_host_and_sound() {
     // values alone cannot describe a patch. Saved from one instance, restored
     // into a fresh one, and the parameters have to come back with it.
     for info in found.iter() {
-        let Some(mut fx) = Vst3Effect::build(&info.path, SR, BLOCK) else { continue };
+        let Some(mut fx) = Vst3Effect::build(&info.path, SR, BLOCK) else {
+            continue;
+        };
         let Some(state) = fx.state() else { continue };
         let params = choz_plugin_vst3::read_params(&info.path, "");
         if params.is_empty() {
@@ -93,17 +103,25 @@ fn installed_vst3_plugins_scan_host_and_sound() {
         assert!(!blob.is_empty());
         drop(fx);
 
-        let Some(fresh) = Vst3Effect::build(&info.path, SR, BLOCK) else { continue };
+        let Some(fresh) = Vst3Effect::build(&info.path, SR, BLOCK) else {
+            continue;
+        };
         let restored = fresh.state().expect("the same plugin still has state");
         restored.restore(&blob);
         let after = restored.save().expect("state readable again");
-        assert_eq!(after, blob, "{}: the patch did not survive the round trip", info.name);
+        assert_eq!(
+            after, blob,
+            "{}: the patch did not survive the round trip",
+            info.name
+        );
         break;
     }
 
     // An instrument makes sound after a note-on.
     for info in found.iter().filter(|p| p.is_instrument) {
-        let Some(mut inst) = Vst3Instrument::build(&info.path, SR, BLOCK) else { continue };
+        let Some(mut inst) = Vst3Instrument::build(&info.path, SR, BLOCK) else {
+            continue;
+        };
         inst.note_on(60, 100);
         let mut peak = 0.0f32;
         for _ in 0..20 {
@@ -119,5 +137,9 @@ fn installed_vst3_plugins_scan_host_and_sound() {
         break;
     }
 
-    assert!(hosted > 0, "nothing among {} installed VST3 bundles could be hosted", found.len());
+    assert!(
+        hosted > 0,
+        "nothing among {} installed VST3 bundles could be hosted",
+        found.len()
+    );
 }

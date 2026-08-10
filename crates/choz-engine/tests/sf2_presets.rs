@@ -11,8 +11,17 @@ fn lists_general_midi_programs() {
         return;
     }
     let presets = choz_engine::sources::list_sf2_presets(path).expect("parse GM soundfont");
-    assert!(presets.len() > 100, "GM font has 128+ programs, got {}", presets.len());
-    assert!(presets.windows(2).all(|w| (w[0].bank, w[0].preset) <= (w[1].bank, w[1].preset)));
-    assert!(presets.iter().all(|p| p.name != "EOP"), "terminal record filtered");
+    assert!(
+        presets.len() > 100,
+        "GM font has 128+ programs, got {}",
+        presets.len()
+    );
+    assert!(presets
+        .windows(2)
+        .all(|w| (w[0].bank, w[0].preset) <= (w[1].bank, w[1].preset)));
+    assert!(
+        presets.iter().all(|p| p.name != "EOP"),
+        "terminal record filtered"
+    );
     assert_eq!(presets[0].label().split(' ').next(), Some("000:000"));
 }

@@ -35,7 +35,13 @@ impl FileBrowser {
     pub fn open(start: &Path, exts: &'static [&'static str]) -> Self {
         let dir = start.to_path_buf();
         let entries = scan(&dir, exts);
-        Self { dir, entries, cursor: 0, scroll: 0, exts }
+        Self {
+            dir,
+            entries,
+            cursor: 0,
+            scroll: 0,
+            exts,
+        }
     }
 
     /// Resolve the current selection. Returns `None` if the list is empty.
@@ -85,7 +91,11 @@ fn scan(dir: &Path, exts: &[&str]) -> Vec<Entry> {
     }
 
     if let Some(parent) = dir.parent() {
-        dirs.push(Entry { label: "../".to_string(), path: parent.to_path_buf(), is_dir: true });
+        dirs.push(Entry {
+            label: "../".to_string(),
+            path: parent.to_path_buf(),
+            is_dir: true,
+        });
     }
 
     if let Ok(rd) = std::fs::read_dir(dir) {
@@ -96,9 +106,17 @@ fn scan(dir: &Path, exts: &[&str]) -> Vec<Entry> {
                 continue; // skip hidden
             }
             if path.is_dir() {
-                dirs.push(Entry { label: format!("{name}/"), path, is_dir: true });
+                dirs.push(Entry {
+                    label: format!("{name}/"),
+                    path,
+                    is_dir: true,
+                });
             } else if !is_dir_pick(exts) && exts.iter().any(|e| has_ext(&path, e)) {
-                files.push(Entry { label: name, path, is_dir: false });
+                files.push(Entry {
+                    label: name,
+                    path,
+                    is_dir: false,
+                });
             }
         }
     }
@@ -113,7 +131,8 @@ fn scan(dir: &Path, exts: &[&str]) -> Vec<Entry> {
 }
 
 fn has_ext(path: &Path, ext: &str) -> bool {
-    path.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext))
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case(ext))
 }
 
 #[cfg(test)]

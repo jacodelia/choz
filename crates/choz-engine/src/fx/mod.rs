@@ -37,9 +37,9 @@ pub mod pan;
 // ── Creative time/texture ─────────────────────────────────────────────────────
 pub mod pedal;
 pub mod protocosmos;
-pub mod z5_texture;
 pub mod reverse;
 pub mod space_echo;
+pub mod z5_texture;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 pub use bitcrusher::Bitcrusher;
@@ -76,8 +76,8 @@ pub use pan::Pan;
 pub use pedal::{AmberFang, VelvetFuzz};
 pub use protocosmos::Protocosmos;
 pub use reverse::ReverseDelay;
-pub use z5_texture::{Z5Texture, Z5Meter, Z5_WAVE_BINS};
 pub use space_echo::SpaceEcho;
+pub use z5_texture::{Z5Meter, Z5Texture, Z5_WAVE_BINS};
 
 // The FX processor trait and param descriptor live in `choz-ports`; re-exported
 // here so every `super::FxProcessor` / `crate::fx::FxParam` path across the fx/

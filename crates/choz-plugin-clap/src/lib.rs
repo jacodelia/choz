@@ -44,7 +44,9 @@ pub fn scan_directory(dir: &Path) -> Vec<ClapPluginInfo> {
 }
 
 fn scan_recursive(dir: &Path, out: &mut Vec<ClapPluginInfo>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         let path = entry.path();
         if path.is_file() && path.extension().is_some_and(|e| e == "clap") {

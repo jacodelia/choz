@@ -8,7 +8,11 @@ Comment=Host CLAP, LV2, LADSPA, DSSI, VST2 and VST3 plugins from a terminal
 Exec=choz-launcher %f
 Icon=choz
 Terminal=false
-Categories=AudioVideo;Audio;
-Keywords=audio;plugin;host;synth;VST;LV2;CLAP;MIDI;
+# `AudioVideo` is what puts it in the Multimedia / Sound & Video menu; the rest
+# are registered freedesktop subcategories, and they are what a desktop uses to
+# file it *within* that menu rather than at the bottom of it. `Midi` and
+# `Sequencer` are the ones a plugin host belongs under.
+Categories=AudioVideo;Audio;Midi;Sequencer;Music;
+Keywords=audio;plugin;host;synth;synthesizer;sampler;VST;VST3;LV2;CLAP;LADSPA;DSSI;MIDI;JACK;rack;autotune;
 MimeType=application/x-choz-project;
 StartupNotify=false

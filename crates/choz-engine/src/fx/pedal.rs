@@ -10,8 +10,8 @@
 //! Both waveshape at 2× oversampling (shared with the saturators in
 //! [`super::utility`]), so hard clipping doesn't fold aliasing back down.
 
-use super::FxProcessor;
 use super::utility::{Biquad, Oversampler2x};
+use super::FxProcessor;
 
 /// One-pole state used for the simple tilt/scoop tone stacks below.
 #[derive(Clone, Copy, Default)]
@@ -90,7 +90,12 @@ impl AmberFang {
 impl FxProcessor for AmberFang {
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
         if sample_rate != self.sample_rate {
-            *self = Self { dist: self.dist, tone: self.tone, level: self.level, ..Self::new(sample_rate) };
+            *self = Self {
+                dist: self.dist,
+                tone: self.tone,
+                level: self.level,
+                ..Self::new(sample_rate)
+            };
         }
         let sr = self.sample_rate as f32;
         let hp_a = coeff(120.0, sr);
@@ -123,7 +128,12 @@ impl FxProcessor for AmberFang {
     }
 
     fn reset(&mut self) {
-        *self = Self { dist: self.dist, tone: self.tone, level: self.level, ..Self::new(self.sample_rate) };
+        *self = Self {
+            dist: self.dist,
+            tone: self.tone,
+            level: self.level,
+            ..Self::new(self.sample_rate)
+        };
     }
 
     fn set_mix(&mut self, wet: f32) {
@@ -315,8 +325,14 @@ mod tests {
     fn both_pedals_clip_and_stay_finite() {
         let sr = 48_000u32;
         for (name, mut fx) in [
-            ("AmberFang", Box::new(AmberFang::new(sr)) as Box<dyn FxProcessor>),
-            ("VelvetFuzz", Box::new(VelvetFuzz::new(sr)) as Box<dyn FxProcessor>),
+            (
+                "AmberFang",
+                Box::new(AmberFang::new(sr)) as Box<dyn FxProcessor>,
+            ),
+            (
+                "VelvetFuzz",
+                Box::new(VelvetFuzz::new(sr)) as Box<dyn FxProcessor>,
+            ),
         ] {
             fx.set_mix(1.0);
             let mut quiet = sine(2048, 220.0, sr as f32, 0.05);
@@ -330,10 +346,17 @@ mod tests {
                     buf.iter().all(|s| s.is_finite()),
                     "{name} produced non-finite output on the {label} input"
                 );
-                assert!(peak(buf) < 4.0, "{name} ran away on the {label} input: {}", peak(buf));
+                assert!(
+                    peak(buf) < 4.0,
+                    "{name} ran away on the {label} input: {}",
+                    peak(buf)
+                );
             }
             let ratio = peak(&loud) / peak(&quiet).max(1e-9);
-            assert!(ratio < 8.0, "{name} barely compressed (18:1 in, {ratio:.1}:1 out)");
+            assert!(
+                ratio < 8.0,
+                "{name} barely compressed (18:1 in, {ratio:.1}:1 out)"
+            );
             assert!(peak(&quiet) > 0.0, "{name} silenced a quiet input");
         }
     }

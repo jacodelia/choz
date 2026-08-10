@@ -3,8 +3,8 @@
 //! Custom harness (`harness = false`): the test binary is the sandbox worker
 //! too, the same trick the scan and probe tests use.
 
-use choz_engine::PluginFormat;
 use choz_engine::sandboxed::SandboxedPlugin;
+use choz_engine::PluginFormat;
 use choz_ports::AudioSource;
 
 const SR: u32 = 48_000;
@@ -52,7 +52,11 @@ fn main() {
         for _ in 0..20 {
             plug.render(&mut out, SR);
         }
-        assert_eq!(plug.missed(), before, "the window traffic did not disturb the audio");
+        assert_eq!(
+            plug.missed(),
+            before,
+            "the window traffic did not disturb the audio"
+        );
     }
 
     // A block smaller than the region still works — the callback decides the
@@ -89,8 +93,14 @@ fn only_the_sandbox_offers_an_editor_choz_itself_refuses() {
 
     // In here — choz's process — the bundle's editor is hidden.
     let found = choz_plugin_lv2::discovery::discover_bundle(bundle);
-    let info = found.iter().find(|p| p.uri == uri).expect("gxts9 is in its bundle");
-    assert!(info.x11_ui.is_none(), "choz's own process must not be offered this UI");
+    let info = found
+        .iter()
+        .find(|p| p.uri == uri)
+        .expect("gxts9 is in its bundle");
+    assert!(
+        info.x11_ui.is_none(),
+        "choz's own process must not be offered this UI"
+    );
 
     // …which is exactly why it must not be hosted here: the probe child looks
     // past the deny-list (asking is not opening), sees a window, and that alone
@@ -118,8 +128,9 @@ fn only_the_sandbox_offers_an_editor_choz_itself_refuses() {
     // a-delay ships no X11 UI.
     let plain = std::path::Path::new("/usr/lib/lv2/a-delay.lv2");
     if plain.exists() {
-        let plug = SandboxedPlugin::build(PluginFormat::Lv2, plain, "urn:ardour:a-delay", SR, FRAMES)
-            .expect("a-delay should load in its sandbox");
+        let plug =
+            SandboxedPlugin::build(PluginFormat::Lv2, plain, "urn:ardour:a-delay", SR, FRAMES)
+                .expect("a-delay should load in its sandbox");
         assert!(
             choz_ports::AudioSource::editor(&plug).is_none(),
             "no window in the child means no button in the host"
@@ -165,17 +176,32 @@ fn a_plugin_the_user_asked_for_runs_out_of_process() {
     unsafe { std::env::set_var("CHOZ_SANDBOX_GUI", "0") };
 
     // Nothing wrong with it, so nothing sandboxes it on its own.
-    assert!(!choz_engine::quarantine::wants_sandbox(PluginFormat::Vst2, path, ""));
+    assert!(!choz_engine::quarantine::wants_sandbox(
+        PluginFormat::Vst2,
+        path,
+        ""
+    ));
     let chain = build();
-    assert!(chain[0].sandbox().is_none(), "a healthy plugin stays in-process");
+    assert!(
+        chain[0].sandbox().is_none(),
+        "a healthy plugin stays in-process"
+    );
     drop(chain);
 
     choz_engine::quarantine::set_forced(PluginFormat::Vst2, path, "", true);
-    assert!(choz_engine::quarantine::wants_sandbox(PluginFormat::Vst2, path, ""));
+    assert!(choz_engine::quarantine::wants_sandbox(
+        PluginFormat::Vst2,
+        path,
+        ""
+    ));
     let mut chain = build();
-    let status = chain[0].sandbox().expect("the user asked for its own process");
+    let status = chain[0]
+        .sandbox()
+        .expect("the user asked for its own process");
 
-    let mut buf: Vec<f32> = (0..FRAMES * 2).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+    let mut buf: Vec<f32> = (0..FRAMES * 2)
+        .map(|i| (i as f32 * 0.05).sin() * 0.5)
+        .collect();
     for _ in 0..20 {
         chain[0].process_block(&mut buf, SR);
     }
@@ -186,7 +212,11 @@ fn a_plugin_the_user_asked_for_runs_out_of_process() {
     drop(chain);
 
     choz_engine::quarantine::set_forced(PluginFormat::Vst2, path, "", false);
-    assert!(!choz_engine::quarantine::forced(PluginFormat::Vst2, path, ""));
+    assert!(!choz_engine::quarantine::forced(
+        PluginFormat::Vst2,
+        path,
+        ""
+    ));
     unsafe { std::env::remove_var("CHOZ_SANDBOX_GUI") };
     let _ = std::fs::remove_dir_all(&state);
     println!("test a_plugin_the_user_asked_for_runs_out_of_process ... ok");
@@ -201,14 +231,9 @@ fn an_effect_processes_through_the_sandbox() {
     if !path.exists() {
         return;
     }
-    let mut fx = choz_engine::sandboxed::SandboxedEffect::build(
-        PluginFormat::Vst2,
-        path,
-        "",
-        SR,
-        FRAMES,
-    )
-    .expect("effect should start in its sandbox");
+    let mut fx =
+        choz_engine::sandboxed::SandboxedEffect::build(PluginFormat::Vst2, path, "", SR, FRAMES)
+            .expect("effect should start in its sandbox");
 
     // A loud sine in, something finite out — and not silence, which is what a
     // missed block would leave behind.
@@ -218,7 +243,10 @@ fn an_effect_processes_through_the_sandbox() {
     let before = buf.clone();
     fx.process_block(&mut buf, SR);
     assert!(buf.iter().all(|s| s.is_finite()));
-    assert!(buf.iter().any(|s| *s != 0.0), "the effect answered with silence");
+    assert!(
+        buf.iter().any(|s| *s != 0.0),
+        "the effect answered with silence"
+    );
 
     // Fully dry means the input comes back untouched, whatever the plugin did.
     let mut dry = before.clone();
@@ -274,7 +302,11 @@ fn a_killed_child_comes_back_by_itself() {
     for _ in 0..20 {
         plug.render(&mut out, SR);
     }
-    assert_eq!(plug.missed(), missed_before, "the new child answers every block");
+    assert_eq!(
+        plug.missed(),
+        missed_before,
+        "the new child answers every block"
+    );
     println!("test a_killed_sandbox_child_is_replaced ... ok");
 }
 
@@ -302,14 +334,9 @@ fn a_plugin_that_cannot_be_destroyed_is_sandboxed_automatically() {
         "the probe should have caught it"
     );
 
-    let mut plug = choz_engine::engine::build_hosted_instrument(
-        PluginFormat::Lv2,
-        bundle,
-        uri,
-        SR,
-        FRAMES,
-    )
-    .expect("padthv1 should load, sandboxed");
+    let mut plug =
+        choz_engine::engine::build_hosted_instrument(PluginFormat::Lv2, bundle, uri, SR, FRAMES)
+            .expect("padthv1 should load, sandboxed");
 
     let mut out = vec![0.0f32; (FRAMES * 2) as usize];
     plug.note_on(60, 100);

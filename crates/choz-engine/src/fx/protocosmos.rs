@@ -31,8 +31,8 @@ const MAX_BUF_S: f32 = 4.0;
 const MAX_GRAINS: usize = 12;
 
 struct Grain {
-    pos: f64,      // fractional read index into the buffer
-    speed: f64,    // signed playback rate (negative = reverse)
+    pos: f64,   // fractional read index into the buffer
+    speed: f64, // signed playback rate (negative = reverse)
     age: u32,
     life: u32,
     gain: f32,
@@ -40,9 +40,19 @@ struct Grain {
 }
 
 /// Schroeder allpass (diffusion).
-struct Allpass { buf: Vec<f32>, pos: usize, g: f32 }
+struct Allpass {
+    buf: Vec<f32>,
+    pos: usize,
+    g: f32,
+}
 impl Allpass {
-    fn new(len: usize, g: f32) -> Self { Self { buf: vec![0.0; len.max(1)], pos: 0, g } }
+    fn new(len: usize, g: f32) -> Self {
+        Self {
+            buf: vec![0.0; len.max(1)],
+            pos: 0,
+            g,
+        }
+    }
     #[inline]
     fn process(&mut self, x: f32) -> f32 {
         let b = self.buf[self.pos];
@@ -54,9 +64,21 @@ impl Allpass {
 }
 
 /// Damped feedback comb (reverb tail).
-struct Comb { buf: Vec<f32>, pos: usize, fb: f32, z: f32 }
+struct Comb {
+    buf: Vec<f32>,
+    pos: usize,
+    fb: f32,
+    z: f32,
+}
 impl Comb {
-    fn new(len: usize, fb: f32) -> Self { Self { buf: vec![0.0; len.max(1)], pos: 0, fb, z: 0.0 } }
+    fn new(len: usize, fb: f32) -> Self {
+        Self {
+            buf: vec![0.0; len.max(1)],
+            pos: 0,
+            fb,
+            z: 0.0,
+        }
+    }
     #[inline]
     fn process(&mut self, x: f32) -> f32 {
         let y = self.buf[self.pos];
@@ -71,13 +93,13 @@ impl Comb {
 pub struct Protocosmos {
     sample_rate: u32,
     // Normalised 0..1 controls.
-    size: f32,     // grain length
-    density: f32,  // grains/sec
-    pitch: f32,    // 0.5 = unison; ±12 st
-    spray: f32,    // position scatter
-    reverse: f32,  // probability of a reversed grain
-    freeze: f32,   // >0.5 = hold buffer
-    diffuse: f32,  // reverb/diffusion amount
+    size: f32,    // grain length
+    density: f32, // grains/sec
+    pitch: f32,   // 0.5 = unison; ±12 st
+    spray: f32,   // position scatter
+    reverse: f32, // probability of a reversed grain
+    freeze: f32,  // >0.5 = hold buffer
+    diffuse: f32, // reverb/diffusion amount
     wet: f32,
 
     buf_l: Vec<f32>,
@@ -95,33 +117,65 @@ impl Protocosmos {
     // One argument per knob: the FX chain builds these straight from the
     // parameter vector, so a struct would only add ceremony.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(sr: u32, size: f32, density: f32, pitch: f32, spray: f32, reverse: f32, freeze: f32, diffuse: f32) -> Self {
+    pub fn new(
+        sr: u32,
+        size: f32,
+        density: f32,
+        pitch: f32,
+        spray: f32,
+        reverse: f32,
+        freeze: f32,
+        diffuse: f32,
+    ) -> Self {
         let sr = sr.max(8000);
         let len = (MAX_BUF_S * sr as f32) as usize + 4;
-        const DEAD: Grain = Grain { pos: 0.0, speed: 1.0, age: 0, life: 1, gain: 0.0, active: false };
+        const DEAD: Grain = Grain {
+            pos: 0.0,
+            speed: 1.0,
+            age: 0,
+            life: 1,
+            gain: 0.0,
+            active: false,
+        };
         let s = |n: usize| ((n as f32) * sr as f32 / 44100.0) as usize;
         Self {
             sample_rate: sr,
-            size, density, pitch, spray, reverse, freeze, diffuse, wet: 0.6,
+            size,
+            density,
+            pitch,
+            spray,
+            reverse,
+            freeze,
+            diffuse,
+            wet: 0.6,
             buf_l: vec![0.0; len],
             buf_r: vec![0.0; len],
             write: 0,
             grains: [DEAD; MAX_GRAINS],
             spawn_timer: 0.0,
             rng: 0x1234_5678_9ABC_DEF0,
-            aps: vec![Allpass::new(s(441), 0.7), Allpass::new(s(341), 0.7), Allpass::new(s(225), 0.7)],
+            aps: vec![
+                Allpass::new(s(441), 0.7),
+                Allpass::new(s(341), 0.7),
+                Allpass::new(s(225), 0.7),
+            ],
             combs: vec![Comb::new(s(1617), 0.78), Comb::new(s(1277), 0.78)],
         }
     }
 
     #[inline]
     fn rand(&mut self) -> f32 {
-        self.rng = self.rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.rng = self
+            .rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (self.rng >> 40) as f32 / (1u32 << 24) as f32
     }
 
     fn spawn(&mut self) {
-        let Some(idx) = self.grains.iter().position(|g| !g.active) else { return };
+        let Some(idx) = self.grains.iter().position(|g| !g.active) else {
+            return;
+        };
         let len = self.buf_l.len();
         let sr = self.sample_rate as f32;
         // Position: scatter back from the write head by up to `spray` * 0.5 s.
@@ -131,19 +185,36 @@ impl Protocosmos {
         // Pitch: ±12 semitones; reverse with probability `reverse`.
         let st = (self.pitch - 0.5) * 24.0;
         let mut speed = 2.0_f64.powf(st as f64 / 12.0);
-        if self.rand() < self.reverse { speed = -speed; }
+        if self.rand() < self.reverse {
+            speed = -speed;
+        }
         // Grain length 20..200 ms scaled by `size`.
         let grain_ms = 20.0 + self.size * 180.0;
         let life = ((grain_ms / 1000.0) * sr).max(2.0) as u32;
-        self.grains[idx] = Grain { pos, speed, age: 0, life, gain: 0.9, active: true };
+        self.grains[idx] = Grain {
+            pos,
+            speed,
+            age: 0,
+            life,
+            gain: 0.9,
+            active: true,
+        };
     }
 }
 
 impl FxProcessor for Protocosmos {
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
         if sample_rate != self.sample_rate {
-            *self = Protocosmos::new(sample_rate, self.size, self.density, self.pitch,
-                self.spray, self.reverse, self.freeze, self.diffuse);
+            *self = Protocosmos::new(
+                sample_rate,
+                self.size,
+                self.density,
+                self.pitch,
+                self.spray,
+                self.reverse,
+                self.freeze,
+                self.diffuse,
+            );
         }
         let len = self.buf_l.len();
         let sr = self.sample_rate as f32;
@@ -168,19 +239,25 @@ impl FxProcessor for Protocosmos {
             let mut gl = 0.0f32;
             let mut gr = 0.0f32;
             for g in self.grains.iter_mut() {
-                if !g.active { continue; }
+                if !g.active {
+                    continue;
+                }
                 let p0 = g.pos as usize % len;
                 let p1 = (p0 + 1) % len;
                 let frac = g.pos.fract() as f32;
                 let sl = self.buf_l[p0] * (1.0 - frac) + self.buf_l[p1] * frac;
                 let sr_ = self.buf_r[p0] * (1.0 - frac) + self.buf_r[p1] * frac;
-                let env = (std::f32::consts::PI * g.age as f32 / g.life as f32).sin().powi(2);
+                let env = (std::f32::consts::PI * g.age as f32 / g.life as f32)
+                    .sin()
+                    .powi(2);
                 let w = env * g.gain;
                 gl += sl * w;
                 gr += sr_ * w;
                 g.pos = (g.pos + g.speed).rem_euclid(len as f64);
                 g.age += 1;
-                if g.age >= g.life { g.active = false; }
+                if g.age >= g.life {
+                    g.active = false;
+                }
             }
 
             // Write input (+ grain feedback) into the buffer, unless frozen.
@@ -192,14 +269,18 @@ impl FxProcessor for Protocosmos {
 
             // Diffusion + integrated reverb on the grain cloud.
             let mut d = (gl + gr) * 0.5;
-            for ap in self.aps.iter_mut() { d = ap.process(d); }
+            for ap in self.aps.iter_mut() {
+                d = ap.process(d);
+            }
             let mut tail = 0.0;
-            for cb in self.combs.iter_mut() { tail += cb.process(d); }
+            for cb in self.combs.iter_mut() {
+                tail += cb.process(d);
+            }
             tail *= 0.5 * self.diffuse;
 
             let wet_l = gl + tail;
             let wet_r = gr + tail;
-            buf[i * 2]     = dry_l + self.wet * (wet_l - dry_l);
+            buf[i * 2] = dry_l + self.wet * (wet_l - dry_l);
             buf[i * 2 + 1] = dry_r + self.wet * (wet_r - dry_r);
         }
     }
@@ -212,8 +293,12 @@ impl FxProcessor for Protocosmos {
         self.spawn_timer = 0.0;
     }
 
-    fn set_mix(&mut self, wet: f32) { self.wet = wet.clamp(0.0, 1.0); }
-    fn name(&self) -> &str { "Protocosmos" }
+    fn set_mix(&mut self, wet: f32) {
+        self.wet = wet.clamp(0.0, 1.0);
+    }
+    fn name(&self) -> &str {
+        "Protocosmos"
+    }
 
     fn params(&self) -> Vec<super::FxParam> {
         use super::FxParam as P;
@@ -254,9 +339,7 @@ mod tests {
     #[test]
     fn protocosmos_is_finite() {
         let mut fx = Protocosmos::new(48000, 0.5, 0.6, 0.6, 0.4, 0.3, 0.0, 0.5);
-        let mut block: Vec<f32> = (0..2048)
-            .map(|i| 0.4 * (i as f32 * 0.05).sin())
-            .collect();
+        let mut block: Vec<f32> = (0..2048).map(|i| 0.4 * (i as f32 * 0.05).sin()).collect();
         for _ in 0..20 {
             fx.process_block(&mut block, 48000);
             assert!(block.iter().all(|s| s.is_finite()));
@@ -277,6 +360,9 @@ mod tests {
         let mut silence = vec![0.0f32; 8192];
         fx.process_block(&mut silence, 48000);
         let energy: f32 = silence.iter().map(|s| s.abs()).sum();
-        assert!(energy > 0.0, "frozen buffer should still emit grains on silence");
+        assert!(
+            energy > 0.0,
+            "frozen buffer should still emit grains on silence"
+        );
     }
 }

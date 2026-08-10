@@ -144,7 +144,10 @@ impl Graph {
                 *id = format!("b{salt}:{id}");
             }
         }
-        let mut g = Graph { triples, by_subject: HashMap::new() };
+        let mut g = Graph {
+            triples,
+            by_subject: HashMap::new(),
+        };
         g.index();
         Ok(g)
     }
@@ -232,7 +235,8 @@ pub fn path_to_file_uri(path: &Path) -> String {
 /// Convert a resolved `file://` IRI (object of a relative ref) back to a path,
 /// percent-decoding it (e.g. `%20` → space) to recover the real filesystem path.
 pub fn file_uri_to_path(iri: &str) -> Option<PathBuf> {
-    iri.strip_prefix("file://").map(|s| PathBuf::from(percent_decode(s)))
+    iri.strip_prefix("file://")
+        .map(|s| PathBuf::from(percent_decode(s)))
 }
 
 /// Percent-encode a filesystem path for use in a `file://` IRI. `/` is kept as
@@ -248,8 +252,16 @@ fn percent_encode_path(s: &str) -> String {
             out.push(b as char);
         } else {
             out.push('%');
-            out.push(char::from_digit((b >> 4) as u32, 16).unwrap().to_ascii_uppercase());
-            out.push(char::from_digit((b & 0xf) as u32, 16).unwrap().to_ascii_uppercase());
+            out.push(
+                char::from_digit((b >> 4) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
+            out.push(
+                char::from_digit((b & 0xf) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
         }
     }
     out
@@ -287,7 +299,10 @@ mod tests {
         let p = Path::new("/usr/lib/lv2/Surge XT Effects.lv2/manifest.ttl");
         let uri = path_to_file_uri(p);
         assert!(uri.starts_with("file:///usr/lib/lv2/Surge%20XT%20Effects.lv2/"));
-        assert!(oxiri::Iri::parse(uri.as_str()).is_ok(), "base IRI must be valid");
+        assert!(
+            oxiri::Iri::parse(uri.as_str()).is_ok(),
+            "base IRI must be valid"
+        );
         assert_eq!(file_uri_to_path(&uri).unwrap(), p);
     }
 

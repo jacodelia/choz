@@ -18,7 +18,7 @@ use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use libloading::Library;
 
 use abi::*;
@@ -57,7 +57,9 @@ fn scan_recursive(dir: &Path, depth: usize, out: &mut Vec<PluginInfo>) {
     if depth > 4 {
         return;
     }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         let path = entry.path();
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -70,7 +72,9 @@ fn scan_recursive(dir: &Path, depth: usize, out: &mut Vec<PluginInfo>) {
 
 /// Every plugin exported by one `.so`.
 pub fn describe(path: &Path) -> Vec<PluginInfo> {
-    let Ok(lib) = (unsafe { Library::new(path) }) else { return Vec::new() };
+    let Ok(lib) = (unsafe { Library::new(path) }) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     // DSSI first: its descriptors carry a LADSPA one, and knowing a plugin is a
     // synth is what decides which side of the UI it shows up on.
@@ -139,7 +143,7 @@ unsafe fn info_from(
     index: u32,
     is_instrument: bool,
 ) -> Option<PluginInfo> {
-    let label = unsafe { cstr(( *d).label) }?;
+    let label = unsafe { cstr((*d).label) }?;
     let name = unsafe { cstr((*d).name) }.unwrap_or_else(|| label.clone());
     let ports = unsafe { port_table(d) };
     Some(PluginInfo {
@@ -275,7 +279,13 @@ impl Drop for Instance {
 
 /// Load `label` from `path` and activate it. `want_synth` picks the DSSI
 /// descriptor (and fails when the plugin has no `run_synth`).
-fn build(path: &Path, label: &str, sample_rate: u32, block: u32, want_synth: bool) -> Result<Instance> {
+fn build(
+    path: &Path,
+    label: &str,
+    sample_rate: u32,
+    block: u32,
+    want_synth: bool,
+) -> Result<Instance> {
     let lib = Arc::new(
         unsafe { Library::new(path) }.with_context(|| format!("dlopen {}", path.display()))?,
     );
@@ -386,7 +396,9 @@ unsafe fn find_descriptor(
 
 impl Instance {
     fn connect_all(&mut self) {
-        let Some(connect) = (unsafe { (*self.descriptor).connect_port }) else { return };
+        let Some(connect) = (unsafe { (*self.descriptor).connect_port }) else {
+            return;
+        };
         for i in 0..self.control_values.len() {
             let ptr: *mut f32 = if self.audio_bufs[i].is_empty() {
                 &mut self.control_values[i]
@@ -400,7 +412,9 @@ impl Instance {
     /// Set control port `index` (into `params`) from a 0..1 knob position.
     /// RT-safe: one f32 write the plugin picks up on the next `run`.
     fn set_param_norm(&mut self, index: usize, value: f32) {
-        let Some(info) = self.params.get(index) else { return };
+        let Some(info) = self.params.get(index) else {
+            return;
+        };
         let plain = info.plain(value.clamp(0.0, 1.0) as f64) as f32;
         if let Some(cell) = self.control_values.get_mut(info.id as usize) {
             *cell = plain;
@@ -497,7 +511,11 @@ impl Instance {
                 self.audio_bufs[self.audio_out[1]][f],
             ),
         };
-        if l.is_finite() && r.is_finite() { (l, r) } else { (0.0, 0.0) }
+        if l.is_finite() && r.is_finite() {
+            (l, r)
+        } else {
+            (0.0, 0.0)
+        }
     }
 }
 
@@ -604,7 +622,8 @@ impl AudioSource for DssiInstrument {
 
     fn pitch_bend(&mut self, value: u16) {
         let v = value.min(16383);
-        self.inst.queue_midi([0xE0, (v & 0x7F) as u8, (v >> 7) as u8]);
+        self.inst
+            .queue_midi([0xE0, (v & 0x7F) as u8, (v >> 7) as u8]);
     }
 
     fn program_change(&mut self, bank: u8, preset: u8) {

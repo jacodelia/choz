@@ -12,14 +12,19 @@ fn main() {
     let mut no_gui = 0;
 
     for dir in ["/usr/lib/clap", "/usr/local/lib/clap"] {
-        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
         for e in entries.flatten() {
             let path = e.path();
             if path.extension().is_none_or(|x| x != "clap") {
                 continue;
             }
             for info in choz_plugin_clap::describe(&path) {
-                if only.as_ref().is_some_and(|f| !info.name.contains(f.as_str())) {
+                if only
+                    .as_ref()
+                    .is_some_and(|f| !info.name.contains(f.as_str()))
+                {
                     continue;
                 }
                 println!("try {} [{}]", info.name, info.id);

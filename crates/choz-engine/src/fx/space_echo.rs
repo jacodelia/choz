@@ -33,28 +33,48 @@ use super::FxProcessor;
 const MAX_DELAY_S: f32 = 2.0;
 /// Fixed RE-201-style head delay ratios and their relative gains.
 const HEAD_RATIOS: [f32; 3] = [1.0, 0.68, 0.40];
-const HEAD_GAINS:  [f32; 3] = [1.0, 0.70, 0.45];
+const HEAD_GAINS: [f32; 3] = [1.0, 0.70, 0.45];
 
 /// One-pole lowpass (tape HF loss / damping).
 #[derive(Clone, Copy)]
-struct OnePole { z: f32, a: f32 }
+struct OnePole {
+    z: f32,
+    a: f32,
+}
 impl OnePole {
-    fn new() -> Self { Self { z: 0.0, a: 0.5 } }
+    fn new() -> Self {
+        Self { z: 0.0, a: 0.5 }
+    }
     /// Set corner frequency.
     fn set_hz(&mut self, hz: f32, sr: f32) {
         let x = (-2.0 * std::f32::consts::PI * hz.clamp(20.0, sr * 0.49) / sr).exp();
         self.a = x;
     }
     #[inline]
-    fn lp(&mut self, x: f32) -> f32 { self.z = self.a * self.z + (1.0 - self.a) * x; self.z }
+    fn lp(&mut self, x: f32) -> f32 {
+        self.z = self.a * self.z + (1.0 - self.a) * x;
+        self.z
+    }
     #[inline]
-    fn hp(&mut self, x: f32) -> f32 { x - self.lp(x) }
+    fn hp(&mut self, x: f32) -> f32 {
+        x - self.lp(x)
+    }
 }
 
 /// Schroeder allpass for spring dispersion.
-struct Allpass { buf: Vec<f32>, pos: usize, g: f32 }
+struct Allpass {
+    buf: Vec<f32>,
+    pos: usize,
+    g: f32,
+}
 impl Allpass {
-    fn new(len: usize, g: f32) -> Self { Self { buf: vec![0.0; len.max(1)], pos: 0, g } }
+    fn new(len: usize, g: f32) -> Self {
+        Self {
+            buf: vec![0.0; len.max(1)],
+            pos: 0,
+            g,
+        }
+    }
     #[inline]
     fn process(&mut self, x: f32) -> f32 {
         let buffered = self.buf[self.pos];
@@ -66,10 +86,20 @@ impl Allpass {
 }
 
 /// Feedback comb (metallic spring resonance).
-struct Comb { buf: Vec<f32>, pos: usize, fb: f32, damp: OnePole }
+struct Comb {
+    buf: Vec<f32>,
+    pos: usize,
+    fb: f32,
+    damp: OnePole,
+}
 impl Comb {
     fn new(len: usize, fb: f32) -> Self {
-        Self { buf: vec![0.0; len.max(1)], pos: 0, fb, damp: OnePole::new() }
+        Self {
+            buf: vec![0.0; len.max(1)],
+            pos: 0,
+            fb,
+            damp: OnePole::new(),
+        }
     }
     #[inline]
     fn process(&mut self, x: f32) -> f32 {
@@ -90,7 +120,12 @@ struct Tape {
 }
 impl Tape {
     fn new(len: usize) -> Self {
-        Self { buf: vec![0.0; len.max(2)], write: 0, hp: OnePole::new(), lp: OnePole::new() }
+        Self {
+            buf: vec![0.0; len.max(2)],
+            write: 0,
+            hp: OnePole::new(),
+            lp: OnePole::new(),
+        }
     }
     #[inline]
     fn read(&self, delay_samps: f32) -> f32 {
@@ -136,7 +171,16 @@ impl SpaceEcho {
     // One argument per knob: the FX chain builds these straight from the
     // parameter vector, so a struct would only add ceremony.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(sr: u32, time: f32, feedback: f32, wow: f32, flutter: f32, age: f32, spring: f32, tone: f32) -> Self {
+    pub fn new(
+        sr: u32,
+        time: f32,
+        feedback: f32,
+        wow: f32,
+        flutter: f32,
+        age: f32,
+        spring: f32,
+        tone: f32,
+    ) -> Self {
         let sr = sr.max(8000);
         let len = (MAX_DELAY_S * sr as f32) as usize + 4;
         // Spring: 3 allpass (prime-ish lengths) + 2 short combs, scaled to sr.
@@ -149,7 +193,14 @@ impl SpaceEcho {
         let combs = vec![Comb::new(s(1557), 0.7), Comb::new(s(1116), 0.7)];
         Self {
             sample_rate: sr,
-            time, feedback, wow, flutter, age, spring, tone, wet: 0.4,
+            time,
+            feedback,
+            wow,
+            flutter,
+            age,
+            spring,
+            tone,
+            wet: 0.4,
             tape_l: Tape::new(len),
             tape_r: Tape::new(len),
             aps,
@@ -168,8 +219,16 @@ impl SpaceEcho {
 impl FxProcessor for SpaceEcho {
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
         if sample_rate != self.sample_rate {
-            *self = SpaceEcho::new(sample_rate, self.time, self.feedback, self.wow,
-                self.flutter, self.age, self.spring, self.tone);
+            *self = SpaceEcho::new(
+                sample_rate,
+                self.time,
+                self.feedback,
+                self.wow,
+                self.flutter,
+                self.age,
+                self.spring,
+                self.tone,
+            );
         }
         let sr = self.sample_rate as f32;
         let base = self.delay_samps();
@@ -180,12 +239,14 @@ impl FxProcessor for SpaceEcho {
         self.tape_r.lp.set_hz(lp_hz, sr);
         self.tape_l.hp.set_hz(110.0, sr);
         self.tape_r.hp.set_hz(110.0, sr);
-        for c in self.combs.iter_mut() { c.damp.set_hz(2600.0, sr); }
+        for c in self.combs.iter_mut() {
+            c.damp.set_hz(2600.0, sr);
+        }
 
         let fb = self.feedback.clamp(0.0, 1.0) * 1.1;
         let sat_drive = 1.0 + self.age * 3.0;
         // Wow/flutter modulation depth, in samples.
-        let wow_d = self.wow * 0.004 * sr;      // up to ~4 ms slow
+        let wow_d = self.wow * 0.004 * sr; // up to ~4 ms slow
         let flut_d = self.flutter * 0.0009 * sr; // up to ~0.9 ms fast
         let wow_inc = 2.0 * std::f32::consts::PI * 0.6 / sr;
         let flut_inc = 2.0 * std::f32::consts::PI * 7.0 / sr;
@@ -199,7 +260,8 @@ impl FxProcessor for SpaceEcho {
             self.flutter_phase = (self.flutter_phase + flut_inc) % (2.0 * std::f32::consts::PI);
             // Right channel uses an offset wow phase → stereo drift.
             let mod_l = self.wow_phase.sin() * wow_d + self.flutter_phase.sin() * flut_d;
-            let mod_r = (self.wow_phase + 1.7).sin() * wow_d + (self.flutter_phase + 0.9).sin() * flut_d;
+            let mod_r =
+                (self.wow_phase + 1.7).sin() * wow_d + (self.flutter_phase + 0.9).sin() * flut_d;
 
             // Sum the 3 heads per channel.
             let mut echo_l = 0.0;
@@ -217,25 +279,41 @@ impl FxProcessor for SpaceEcho {
 
             // Spring reverb on the mono echo sum.
             let mut spr = (echo_l + echo_r) * 0.5;
-            for ap in self.aps.iter_mut() { spr = ap.process(spr); }
+            for ap in self.aps.iter_mut() {
+                spr = ap.process(spr);
+            }
             let mut tail = 0.0;
-            for cb in self.combs.iter_mut() { tail += cb.process(spr); }
+            for cb in self.combs.iter_mut() {
+                tail += cb.process(spr);
+            }
             tail *= 0.5;
 
             let wet_l = echo_l + tail * self.spring;
             let wet_r = echo_r + tail * self.spring;
-            buf[i * 2]     = dry_l + self.wet * (wet_l - dry_l);
+            buf[i * 2] = dry_l + self.wet * (wet_l - dry_l);
             buf[i * 2 + 1] = dry_r + self.wet * (wet_r - dry_r);
         }
     }
 
     fn reset(&mut self) {
-        *self = SpaceEcho::new(self.sample_rate, self.time, self.feedback, self.wow,
-            self.flutter, self.age, self.spring, self.tone);
+        *self = SpaceEcho::new(
+            self.sample_rate,
+            self.time,
+            self.feedback,
+            self.wow,
+            self.flutter,
+            self.age,
+            self.spring,
+            self.tone,
+        );
     }
 
-    fn set_mix(&mut self, wet: f32) { self.wet = wet.clamp(0.0, 1.0); }
-    fn name(&self) -> &str { "Space Echo" }
+    fn set_mix(&mut self, wet: f32) {
+        self.wet = wet.clamp(0.0, 1.0);
+    }
+    fn name(&self) -> &str {
+        "Space Echo"
+    }
 
     fn params(&self) -> Vec<super::FxParam> {
         use super::FxParam as P;
@@ -279,11 +357,15 @@ mod tests {
         fx.set_mix(0.6);
         // Impulse then silence — should ring out without blowing up.
         let mut block = vec![0.0f32; 4096];
-        block[0] = 1.0; block[1] = 1.0;
+        block[0] = 1.0;
+        block[1] = 1.0;
         for _ in 0..40 {
             fx.process_block(&mut block, 48000);
             assert!(block.iter().all(|s| s.is_finite()));
-            assert!(block.iter().all(|s| s.abs() < 8.0), "self-oscillation unbounded");
+            assert!(
+                block.iter().all(|s| s.abs() < 8.0),
+                "self-oscillation unbounded"
+            );
             block.iter_mut().for_each(|s| *s = 0.0);
         }
     }

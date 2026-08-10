@@ -1,8 +1,8 @@
 //! Plugin types and host port trait.
 //! Defines the interface for discovering, loading, and processing plugins.
 
-use std::path::PathBuf;
 use anyhow::Result;
+use std::path::PathBuf;
 
 /// The plugin format.
 #[allow(dead_code)]
@@ -23,15 +23,15 @@ pub enum PluginKind {
 impl PluginKind {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Vst2     => "VST2",
-            Self::Vst3     => "VST3",
-            Self::Clap     => "CLAP",
-            Self::Au       => "AU",
-            Self::Ladspa   => "LADSPA",
-            Self::Dssi     => "DSSI",
-            Self::Lv2      => "LV2",
-            Self::Sfz      => "SFZ",
-            Self::Sf2      => "SF2",
+            Self::Vst2 => "VST2",
+            Self::Vst3 => "VST3",
+            Self::Clap => "CLAP",
+            Self::Au => "AU",
+            Self::Ladspa => "LADSPA",
+            Self::Dssi => "DSSI",
+            Self::Lv2 => "LV2",
+            Self::Sfz => "SFZ",
+            Self::Sf2 => "SF2",
             Self::Internal => "FX",
         }
     }
@@ -70,14 +70,20 @@ pub trait PluginHostPort: Send + Sync {
     fn process(&mut self, instance_id: u64, input: &[f32], output: &mut [f32]) -> Result<()>;
 
     /// Return the number of automatable parameters.
-    fn param_count(&self, _instance_id: u64) -> u32 { 0 }
+    fn param_count(&self, _instance_id: u64) -> u32 {
+        0
+    }
 
     /// Get a parameter value (normalised 0.0–1.0).
-    fn get_param(&self, _instance_id: u64, _param_id: u32) -> f32 { 0.0 }
+    fn get_param(&self, _instance_id: u64, _param_id: u32) -> f32 {
+        0.0
+    }
 
     /// Set a parameter value (normalised 0.0–1.0).
     fn set_param(&mut self, _instance_id: u64, _param_id: u32, _value: f32) {}
 
     /// Human-readable parameter name.
-    fn param_name(&self, _instance_id: u64, param_id: u32) -> String { format!("P{param_id}") }
+    fn param_name(&self, _instance_id: u64, param_id: u32) -> String {
+        format!("P{param_id}")
+    }
 }

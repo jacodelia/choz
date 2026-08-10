@@ -91,7 +91,9 @@ pub fn available() -> bool {
 
 /// The terminal's window size in pixels, and the size of one cell.
 fn cell_size(area: Rect) -> (u16, u16) {
-    let Ok(ws) = crossterm::terminal::window_size() else { return FALLBACK_CELL };
+    let Ok(ws) = crossterm::terminal::window_size() else {
+        return FALLBACK_CELL;
+    };
     if ws.width == 0 || ws.height == 0 || ws.columns == 0 || ws.rows == 0 {
         return FALLBACK_CELL;
     }
@@ -150,7 +152,11 @@ pub fn sync(
 
     // The panels need to know what is behind them: under this protocol the
     // cell buffer holds nothing at all.
-    *cells = Some(super::background::cell_colors(&image, area.width, area.height));
+    *cells = Some(super::background::cell_colors(
+        &image,
+        area.width,
+        area.height,
+    ));
 
     let _ = clear(out);
     if place(out, image.as_raw(), px_w, px_h, area).is_err() {
@@ -218,7 +224,15 @@ fn place(
     px_h: u32,
     area: Rect,
 ) -> std::io::Result<()> {
-    place_image(out, IMAGE_ID, rgba, px_w, px_h, area, Z_UNDER_CELL_BACKGROUNDS)
+    place_image(
+        out,
+        IMAGE_ID,
+        rgba,
+        px_w,
+        px_h,
+        area,
+        Z_UNDER_CELL_BACKGROUNDS,
+    )
 }
 
 /// Transmit `rgba` and place it over the whole grid at `z`.
@@ -293,7 +307,10 @@ mod tests {
     #[test]
     fn the_graphics_path_is_switchable_and_the_wash_is_its_own_image() {
         unsafe { std::env::set_var("CHOZ_KITTY_BG", "0") };
-        assert!(!available(), "the escape hatch beats the terminal detection");
+        assert!(
+            !available(),
+            "the escape hatch beats the terminal detection"
+        );
         unsafe { std::env::remove_var("CHOZ_KITTY_BG") };
 
         let area = Rect::new(0, 0, 10, 4);
@@ -305,8 +322,14 @@ mod tests {
         unsafe { std::env::set_var("KITTY_WINDOW_ID", "1") };
         sync_mask(&mut out, area, (10, 20, 30), &rects, &mut state);
         let text = String::from_utf8_lossy(&out).into_owned();
-        assert!(text.contains(&format!("i={MASK_ID}")), "the mask has its own image id");
-        assert!(text.contains(&format!("z={Z_WASH}")), "over the picture, under the text");
+        assert!(
+            text.contains(&format!("i={MASK_ID}")),
+            "the mask has its own image id"
+        );
+        assert!(
+            text.contains(&format!("z={Z_WASH}")),
+            "over the picture, under the text"
+        );
         assert!(
             !text.contains(&format!("i={IMAGE_ID},")),
             "the picture itself must not be re-sent for a wash"
@@ -319,7 +342,13 @@ mod tests {
 
         // A different opacity does re-send it.
         out.clear();
-        sync_mask(&mut out, area, (10, 20, 30), &[(Rect::new(0, 0, 4, 2), 0.9)], &mut state);
+        sync_mask(
+            &mut out,
+            area,
+            (10, 20, 30),
+            &[(Rect::new(0, 0, 4, 2), 0.9)],
+            &mut state,
+        );
         assert!(!out.is_empty());
         unsafe { std::env::remove_var("KITTY_WINDOW_ID") };
     }
@@ -327,7 +356,13 @@ mod tests {
     /// A wallpaper that has been deleted must not stop choz from drawing.
     #[test]
     fn a_missing_file_is_not_fatal() {
-        assert!(render_pixels(std::path::Path::new("/nope/none.png"), ImageFit::Stretch, 8, 8).is_none());
+        assert!(render_pixels(
+            std::path::Path::new("/nope/none.png"),
+            ImageFit::Stretch,
+            8,
+            8
+        )
+        .is_none());
     }
 }
 
@@ -366,7 +401,10 @@ pub fn sync_mask(
         return;
     }
     let want = MaskState {
-        rects: rects.iter().map(|(r, a)| (*r, (a.clamp(0.0, 1.0) * 255.0) as u8)).collect(),
+        rects: rects
+            .iter()
+            .map(|(r, a)| (*r, (a.clamp(0.0, 1.0) * 255.0) as u8))
+            .collect(),
         color,
         cols: area.width,
         rows: area.height,
@@ -380,20 +418,26 @@ pub fn sync_mask(
         return;
     }
 
-    let (mw, mh) = (area.width as u32 * MASK_SCALE, area.height as u32 * MASK_SCALE);
+    let (mw, mh) = (
+        area.width as u32 * MASK_SCALE,
+        area.height as u32 * MASK_SCALE,
+    );
     let mut mask = image::RgbaImage::new(mw, mh);
     for (rect, alpha) in &want.rects {
         let px = image::Rgba([color.0, color.1, color.2, *alpha]);
-        for y in rect.top() as u32 * MASK_SCALE..(rect.bottom().min(area.height) as u32 * MASK_SCALE) {
-            for x in rect.left() as u32 * MASK_SCALE..(rect.right().min(area.width) as u32 * MASK_SCALE) {
+        for y in
+            rect.top() as u32 * MASK_SCALE..(rect.bottom().min(area.height) as u32 * MASK_SCALE)
+        {
+            for x in
+                rect.left() as u32 * MASK_SCALE..(rect.right().min(area.width) as u32 * MASK_SCALE)
+            {
                 mask.put_pixel(x, y, px);
             }
         }
     }
 
     let _ = clear_mask(out);
-    if place_image(out, MASK_ID, mask.as_raw(), mw, mh, area, Z_WASH).is_err()
-    {
+    if place_image(out, MASK_ID, mask.as_raw(), mw, mh, area, Z_WASH).is_err() {
         *state = None;
         return;
     }

@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
 use crate::sources::AudioSource;
 
@@ -65,15 +65,22 @@ struct Defaults {
 
 impl Default for Defaults {
     fn default() -> Self {
-        Self { lo_key: 0, hi_key: 127, pkc: 60, lo_vel: 0, hi_vel: 127, gain: 1.0 }
+        Self {
+            lo_key: 0,
+            hi_key: 127,
+            pkc: 60,
+            lo_vel: 0,
+            hi_vel: 127,
+            gain: 1.0,
+        }
     }
 }
 
 /// Parse an `.sfz` file. Sample paths come back absolute.
 pub fn parse_file(path: &Path) -> Result<Vec<SfzRegion>> {
     let base = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("cannot read {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
     let regions = parse_text(&text, &base);
     if regions.is_empty() {
         bail!("{} has no regions", path.display());
@@ -129,7 +136,9 @@ pub fn parse_text(text: &str, base: &Path) -> Vec<SfzRegion> {
                 // opcodes are harmless where they land.
                 t if t.starts_with('<') => {}
                 t => {
-                    let Some((key, val)) = t.split_once('=') else { continue };
+                    let Some((key, val)) = t.split_once('=') else {
+                        continue;
+                    };
                     let target = if in_region { &mut cur } else { &mut group };
                     match key.to_ascii_lowercase().as_str() {
                         "sample" => {
@@ -180,8 +189,7 @@ pub fn parse_text(text: &str, base: &Path) -> Vec<SfzRegion> {
 fn is_opcode(token: &str) -> bool {
     match token.split_once('=') {
         Some((key, _)) => {
-            !key.is_empty()
-                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         }
         None => token.starts_with('<'),
     }
@@ -250,9 +258,16 @@ fn decode(path: &Path, target_sr: u32) -> Result<Vec<f32>> {
         &MetadataOptions::default(),
     )?;
     let mut format = probed.format;
-    let track = format.default_track().context("sample has no audio track")?;
+    let track = format
+        .default_track()
+        .context("sample has no audio track")?;
     let track_id = track.id;
-    let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(1).max(1);
+    let channels = track
+        .codec_params
+        .channels
+        .map(|c| c.count())
+        .unwrap_or(1)
+        .max(1);
     let file_sr = track.codec_params.sample_rate.unwrap_or(target_sr);
     let mut decoder =
         symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
@@ -384,8 +399,8 @@ impl AudioSource for SfzSampler {
                 }
                 let t = (voice.pos - i0 as f64) as f32;
                 let l = voice.pcm[i0 * 2] + t * (voice.pcm[(i0 + 1) * 2] - voice.pcm[i0 * 2]);
-                let r =
-                    voice.pcm[i0 * 2 + 1] + t * (voice.pcm[(i0 + 1) * 2 + 1] - voice.pcm[i0 * 2 + 1]);
+                let r = voice.pcm[i0 * 2 + 1]
+                    + t * (voice.pcm[(i0 + 1) * 2 + 1] - voice.pcm[i0 * 2 + 1]);
                 out[f * 2] += l * voice.gain;
                 out[f * 2 + 1] += r * voice.gain;
                 voice.pos += voice.rate;
@@ -402,7 +417,11 @@ impl AudioSource for SfzSampler {
             self.note_off(note);
             return;
         }
-        let Some(hit) = self.regions.iter().find(|r| r.region.matches(note, velocity)) else {
+        let Some(hit) = self
+            .regions
+            .iter()
+            .find(|r| r.region.matches(note, velocity))
+        else {
             return;
         };
         if self.voices.len() == MAX_VOICES {
@@ -463,9 +482,20 @@ mod tests {
         assert_eq!((regions[0].lo_key, regions[0].hi_key), (36, 47));
         assert_eq!(regions[0].pitch_key_center, 36);
         assert_eq!(regions[0].lo_vel, 64, "group defaults reach the region");
-        assert!((regions[0].gain - 0.5011872).abs() < 1e-4, "-6 dB: {}", regions[0].gain);
+        assert!(
+            (regions[0].gain - 0.5011872).abs() < 1e-4,
+            "-6 dB: {}",
+            regions[0].gain
+        );
         // `key` sets range and root pitch at once.
-        assert_eq!((regions[1].lo_key, regions[1].hi_key, regions[1].pitch_key_center), (38, 38, 38));
+        assert_eq!(
+            (
+                regions[1].lo_key,
+                regions[1].hi_key,
+                regions[1].pitch_key_center
+            ),
+            (38, 38, 38)
+        );
     }
 
     /// Sample paths with spaces are the norm in commercial libraries, and the
@@ -475,7 +505,10 @@ mod tests {
         let sfz = "<region> sample=Saw Samples/Saw_C-3.flac lokey=36 hikey=47";
         let regions = parse_text(sfz, Path::new("/lib"));
         assert_eq!(regions.len(), 1);
-        assert_eq!(regions[0].sample, Path::new("/lib/Saw Samples/Saw_C-3.flac"));
+        assert_eq!(
+            regions[0].sample,
+            Path::new("/lib/Saw Samples/Saw_C-3.flac")
+        );
         assert_eq!((regions[0].lo_key, regions[0].hi_key), (36, 47));
     }
 

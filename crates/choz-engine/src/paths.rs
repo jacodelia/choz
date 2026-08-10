@@ -49,7 +49,10 @@ impl PluginFormat {
     }
 
     pub fn from_label(s: &str) -> Option<PluginFormat> {
-        PluginFormat::ALL.iter().copied().find(|f| f.label().eq_ignore_ascii_case(s))
+        PluginFormat::ALL
+            .iter()
+            .copied()
+            .find(|f| f.label().eq_ignore_ascii_case(s))
     }
 
     /// Environment variable that overrides this format's search path, if the
@@ -219,7 +222,10 @@ impl Default for PluginPaths {
                     let dirs = f
                         .default_dirs()
                         .into_iter()
-                        .map(|path| SearchDir { path, enabled: true })
+                        .map(|path| SearchDir {
+                            path,
+                            enabled: true,
+                        })
                         .collect();
                     (f, dirs)
                 })
@@ -348,7 +354,9 @@ fn scan_into(
     if depth > 4 {
         return;
     }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         let path = entry.path();
         let matches = path
@@ -379,11 +387,15 @@ fn stem(path: &Path) -> String {
 /// tell the user "this directory holds 73 SF2 files" when they added it under
 /// the wrong format and nothing showed up.
 pub fn formats_present(dir: &Path) -> Vec<(PluginFormat, usize)> {
-    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let mut counts: Vec<(PluginFormat, usize)> = Vec::new();
     for entry in rd.flatten() {
         let path = entry.path();
-        let Some(ext) = path.extension() else { continue };
+        let Some(ext) = path.extension() else {
+            continue;
+        };
         for &fmt in PluginFormat::ALL {
             let (exts, bundles) = fmt.matcher();
             if path.is_dir() != bundles {
@@ -427,9 +439,19 @@ mod tests {
             ["Vst2",[{"path":"/home/me/repo","enabled":true}]]
         ]}"#;
         let cfg: PluginPaths = serde_json::from_str(json).expect("unknown format must not fail");
-        assert_eq!(cfg.entries.len(), 2, "the unknown one is dropped, the rest survive");
-        assert_eq!(cfg.dirs(PluginFormat::Vst2)[0].path, PathBuf::from("/home/me/repo"));
-        assert_eq!(cfg.dirs(PluginFormat::Lv2)[0].path, PathBuf::from("/home/me/.lv2"));
+        assert_eq!(
+            cfg.entries.len(),
+            2,
+            "the unknown one is dropped, the rest survive"
+        );
+        assert_eq!(
+            cfg.dirs(PluginFormat::Vst2)[0].path,
+            PathBuf::from("/home/me/repo")
+        );
+        assert_eq!(
+            cfg.dirs(PluginFormat::Lv2)[0].path,
+            PathBuf::from("/home/me/.lv2")
+        );
     }
 
     #[test]
@@ -443,7 +465,9 @@ mod tests {
         let back: PluginPaths = serde_json::from_str(&json).unwrap();
         assert_eq!(back, cfg);
         let vst2 = back.dirs(PluginFormat::Vst2);
-        assert!(vst2.iter().any(|d| d.path == Path::new("/opt/plugins") && !d.enabled));
+        assert!(vst2
+            .iter()
+            .any(|d| d.path == Path::new("/opt/plugins") && !d.enabled));
         // A disabled dir is not offered to the scanner.
         assert!(!back.all_enabled().contains(&PathBuf::from("/opt/plugins")));
     }
@@ -460,7 +484,11 @@ mod tests {
         std::fs::write(tmp.join("readme.txt"), b"x").unwrap();
 
         let found = formats_present(&tmp);
-        assert_eq!(found[0], (PluginFormat::Sf2, 2), "case-insensitive: {found:?}");
+        assert_eq!(
+            found[0],
+            (PluginFormat::Sf2, 2),
+            "case-insensitive: {found:?}"
+        );
         assert!(found.contains(&(PluginFormat::Sfz, 1)));
         std::fs::remove_dir_all(&tmp).unwrap();
     }

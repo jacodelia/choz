@@ -7,8 +7,11 @@
 use crate::i18n::t;
 use crate::views::theme::{border as ui_border, text as ui_text};
 use ratatui::{
-    layout::Rect, style::{Color, Modifier, Style}, text::{Line, Span},
-    widgets::{Block, Borders, Paragraph}, Frame,
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph},
+    Frame,
 };
 
 const ACCENT: Color = Color::Rgb(31, 111, 235);
@@ -48,11 +51,20 @@ pub fn draw_input_panel(
     learn: Option<&str>,
 ) -> Option<Rect> {
     let border_style = if focused {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(ui_border())
     };
-    let title = format!(" {} ", if focused { format!("{} [ACTIVE]", t("INPUTS")) } else { t("INPUTS").to_string() });
+    let title = format!(
+        " {} ",
+        if focused {
+            format!("{} [ACTIVE]", t("INPUTS"))
+        } else {
+            t("INPUTS").to_string()
+        }
+    );
 
     let block = Block::default()
         .title(title)
@@ -73,16 +85,27 @@ pub fn draw_input_panel(
     // Line 0: what the active rack tab is.
     lines.push(Line::from(vec![
         Span::styled(" TAB: ", dim),
-        Span::styled(active_label.to_string(), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            active_label.to_string(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
     ]));
 
     // Line 1: rescan button — MIDI devices come and go while choz runs.
-    let scan_rect = Rect::new(inner.x + 1, inner.y + 1, scan_label().chars().count() as u16, 1);
+    let scan_rect = Rect::new(
+        inner.x + 1,
+        inner.y + 1,
+        scan_label().chars().count() as u16,
+        1,
+    );
     lines.push(Line::from(vec![
         Span::raw(" "),
         Span::styled(
             scan_label(),
-            Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
         ),
     ]));
 
@@ -104,9 +127,16 @@ pub fn draw_input_panel(
             lines.push(Line::from(Span::styled(format!(" {}", row.name), dim)));
             continue;
         }
-        let mark = if row.connected { "\u{2713}" } else { "\u{00B7}" };
+        let mark = if row.connected {
+            "\u{2713}"
+        } else {
+            "\u{00B7}"
+        };
         let style = if focused && i == input_cursor {
-            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else if row.connected {
             Style::default().fg(ui_text())
         } else {
@@ -127,10 +157,16 @@ pub fn draw_input_panel(
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             format!(" \u{25CF} MIDI LEARN \u{00B7} {target}"),
-            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )));
     }
 
-    f.render_widget(Paragraph::new(lines).style(super::theme::panel_style()), inner);
+    f.render_widget(
+        Paragraph::new(lines).style(super::theme::panel_style()),
+        inner,
+    );
     Some(scan_rect)
 }
