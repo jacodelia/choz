@@ -407,12 +407,14 @@ mod tests {
         let mut cache = None;
 
         crate::views::theme::set_has_desktop(true);
+        // A flat desktop, and no wash at all: the panel adds nothing of its own
+        // and the colour underneath comes straight through.
+        crate::views::theme::set_panel_fill(None);
         render(&mut buf, a, &Background::Color((90, 40, 120)), &mut cache);
         Block::default()
             .borders(Borders::ALL)
             .style(crate::views::theme::panel_style())
             .render(a, &mut buf);
-        crate::views::theme::set_has_desktop(false);
 
         assert_eq!(
             buf[(5, 2)].bg,
@@ -420,6 +422,23 @@ mod tests {
             "the panel body still shows the desktop"
         );
         assert_eq!(buf[(0, 0)].bg, Color::Rgb(90, 40, 120), "and so does the border cell");
+
+        // With a wash configured the panel is that colour blended over the
+        // desktop — translucent, because a cell background cannot be.
+        let washed = crate::views::theme::blend((90, 40, 120), (0, 0, 0), 0.5);
+        crate::views::theme::set_panel_fill(Some(washed));
+        let mut buf = ratatui::buffer::Buffer::empty(a);
+        render(&mut buf, a, &Background::Color((90, 40, 120)), &mut cache);
+        Block::default()
+            .borders(Borders::ALL)
+            .style(crate::views::theme::panel_style())
+            .render(a, &mut buf);
+        assert_eq!(buf[(5, 2)].bg, Color::Rgb(45, 20, 60), "half way to the tint");
+        assert_eq!(buf[(9, 3)].bg, Color::Rgb(45, 20, 60), "the whole panel, corners too");
+        // Outside the panel the desktop is untouched, which is what makes it a
+        // panel and not a filter.
+        crate::views::theme::set_panel_fill(None);
+        crate::views::theme::set_has_desktop(false);
 
         // Without a desktop the panel goes back to painting its own fill.
         let mut buf = ratatui::buffer::Buffer::empty(a);

@@ -12,22 +12,40 @@ fn script() -> PathBuf {
 }
 
 fn run(prefix: &Path, home: &Path, args: &[&str]) -> String {
-    let out = Command::new("sh")
-        .arg(script())
+    run_with_path(prefix, home, args, None)
+}
+
+fn run_with_path(prefix: &Path, home: &Path, args: &[&str], path_prefix: Option<&Path>) -> String {
+    let (out, ok) = try_run(prefix, home, args, path_prefix);
+    assert!(ok, "install.sh failed: {out}");
+    out
+}
+
+/// The output and whether it succeeded — a refusal is a result here, not a bug.
+fn try_run(
+    prefix: &Path,
+    home: &Path,
+    args: &[&str],
+    path_prefix: Option<&Path>,
+) -> (String, bool) {
+    let mut cmd = Command::new("sh");
+    cmd.arg(script())
         .arg("--prefix")
         .arg(prefix)
         .args(args)
         .env("HOME", home)
-        .env("CHOZ_SEARCH_BINS", "")
-        .output()
-        .expect("sh is installed");
-    assert!(
-        out.status.success(),
-        "install.sh failed: {}{}",
+        .env("CHOZ_SEARCH_BINS", "");
+    if let Some(dir) = path_prefix {
+        let path = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{}:{path}", dir.display()));
+    }
+    let out = cmd.output().expect("sh is installed");
+    let text = format!(
+        "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    (text, out.status.success())
 }
 
 #[test]
@@ -91,4 +109,86 @@ fn the_binary_answers_version_and_help_on_stdout() {
 
     let out = Command::new(env!("CARGO_BIN_EXE_choz")).arg("-h").output().unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("--osc-port"));
+}
+
+/// choz needs ALSA on the machine that runs it, and only *dlopens* libjack — so
+/// a missing ALSA is fatal and a missing JACK is a note.
+///
+/// Refusing matters more than warning: a choz installed without ALSA starts,
+/// opens no audio device, and looks like a bug in choz. The escape hatch exists
+/// for the one case where continuing is right — staging an install for a
+/// machine that is not this one.
+#[test]
+fn the_installer_refuses_when_a_critical_library_is_missing() {
+    let tmp = std::env::temp_dir().join(format!("choz_deps_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (prefix, home, fake_bin) = (tmp.join("prefix"), tmp.join("home"), tmp.join("bin"));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&fake_bin).unwrap();
+
+    // An `ldconfig` that reports no libraries at all: the machine has neither.
+    let ldconfig = fake_bin.join("ldconfig");
+    std::fs::write(&ldconfig, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&ldconfig, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let (out, ok) = try_run(
+        &prefix,
+        &home,
+        &["--binary", env!("CARGO_BIN_EXE_choz")],
+        Some(&fake_bin),
+    );
+    assert!(!ok, "a missing ALSA has to fail, not warn: {out}");
+    assert!(out.contains("libasound.so.2 (ALSA) is missing"), "and say which one: {out}");
+    assert!(out.contains("apt install"), "and how to fix it: {out}");
+    assert!(!prefix.join("bin/choz").exists(), "nothing is installed when it refuses");
+
+    // The escape hatch installs, and says it skipped the check rather than
+    // pretending it passed.
+    let out = run_with_path(
+        &prefix,
+        &home,
+        &["--binary", env!("CARGO_BIN_EXE_choz"), "--skip-deps-check"],
+        Some(&fake_bin),
+    );
+    assert!(out.contains("skipping the runtime dependency check"), "{out}");
+    assert!(prefix.join("bin/choz").exists(), "and it installs");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// JACK is the other half of the same check and must **not** stop anything: it
+/// is `dlopen`ed, so without it choz runs on ALSA.
+#[test]
+fn a_missing_jack_is_a_note_not_a_refusal() {
+    let tmp = std::env::temp_dir().join(format!("choz_jack_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (prefix, home, fake_bin) = (tmp.join("prefix"), tmp.join("home"), tmp.join("bin"));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&fake_bin).unwrap();
+
+    // An `ldconfig` that reports ALSA and nothing else.
+    let ldconfig = fake_bin.join("ldconfig");
+    std::fs::write(&ldconfig, "#!/bin/sh\necho '\tlibasound.so.2 (libc6,x86-64) => /usr/lib/libasound.so.2'\n")
+        .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&ldconfig, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let out = run_with_path(
+        &prefix,
+        &home,
+        &["--binary", env!("CARGO_BIN_EXE_choz")],
+        Some(&fake_bin),
+    );
+    assert!(out.contains("libjack is not installed"), "no JACK note: {out}");
+    assert!(out.contains("will use ALSA"), "and it says what happens instead: {out}");
+    assert!(prefix.join("bin/choz").exists(), "JACK is optional, so this installs");
+
+    let _ = std::fs::remove_dir_all(&tmp);
 }

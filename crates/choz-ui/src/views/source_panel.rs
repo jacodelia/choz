@@ -89,7 +89,7 @@ pub fn draw_input_panel(
     // Line 2: hint for the input list.
     lines.push(Line::from(Span::styled(
         if focused {
-            " \u{2191}\u{2193} \u{00B7} Enter=use \u{00B7} c=on/off \u{00B7} r=rescan"
+            " \u{2191}\u{2193} \u{00B7} Enter/Space=on-off \u{00B7} RMB=off \u{00B7} c=connect \u{00B7} r=rescan"
         } else {
             " INPUTS (Tab to select)"
         },

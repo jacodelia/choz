@@ -53,6 +53,15 @@ impl Default for Bitcrusher {
 }
 
 impl FxProcessor for Bitcrusher {
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match index {
+            0 => self.set_bits((1.0 + v * 15.0) as u8),
+            1 => self.set_hold((1.0 + v * 15.0) as u32),
+            _ => {}
+        }
+    }
+
     fn process_block(&mut self, buf: &mut [f32], _sample_rate: u32) {
         let frames = buf.len() / 2;
         for i in 0..frames {

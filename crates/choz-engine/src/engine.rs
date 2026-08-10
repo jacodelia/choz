@@ -41,6 +41,14 @@ pub(crate) struct Slot {
     /// `None` = the source plays (an instrument); `Some` = live audio in.
     /// Registered by the JACK backend now, exposed in the UI in stage 2.
     in_pair: Option<(usize, usize)>,
+    /// Linear gain on the audio coming in, before the FX and before the pitch
+    /// tracker hears it. A guitar is nowhere near the level of a synth, and
+    /// without this the two are stuck at whatever the interface's preamp gave.
+    in_gain: f32,
+    /// Audio in, notes out: `Some` while the tab is converting what it hears
+    /// into notes for its own instrument. The tracker lives here because it is
+    /// per slot and used only from the audio callback.
+    pitch: Option<crate::pitch::PitchTracker>,
     /// Which notes this slot has been told to play, one bit per MIDI note.
     ///
     /// Panic uses it to send the exact note-offs that are missing, which is the
@@ -59,6 +67,8 @@ impl Slot {
             mute: false,
             out_pair: (0, 1),
             in_pair: None,
+            in_gain: 1.0,
+            pitch: None,
             held: 0,
         }
     }
@@ -86,6 +96,12 @@ pub(crate) enum EngineCommand {
     SetSlotOut { slot: usize, left: usize, right: usize },
     /// Which device input channels feed this slot; `None` = play its source.
     SetSlotIn { slot: usize, pair: Option<(usize, usize)> },
+    /// Listen to the slot's audio input and play its instrument from the pitch
+    /// heard, instead of passing the audio through.
+    SetSlotPitchToMidi { slot: usize, on: bool },
+    /// Trim on the slot's audio input, and how loud that input has to be before
+    /// the pitch tracker calls it a note.
+    SetSlotInTrim { slot: usize, gain: f32, gate: f32 },
     SetSlotProgram { slot: usize, bank: u8, preset: u8 },
     /// Live parameter tweak for a slot's *instrument* (hosted plugin).
     SetSlotParam { slot: usize, index: usize, value: f32 },
@@ -108,6 +124,10 @@ pub(crate) enum EngineCommand {
 /// off the audio thread (avoids deallocation in the RT context). The payload is
 /// never read — only dropped — which is the whole point.
 #[allow(dead_code)]
+// The `Slot` variant is much the biggest, and it stays that way on purpose:
+// boxing it would move the allocation onto the audio thread, which is the one
+// thing this whole channel exists to avoid.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Retired {
     Slot(Slot),
     Fx(FxChain),
@@ -178,10 +198,6 @@ pub struct AudioEngine {
     retired_rx: rtrb::Consumer<Retired>,
     /// Name of the output device in use (set once the stream is open).
     output_device: Option<String>,
-    /// Graph node the capture ports are wired to. `None` means "the same node
-    /// as the output", which is right for a duplex interface and gives nothing
-    /// on a card whose capture is a separate node.
-    input_device: Option<String>,
     /// Backend the user asked for: `AUTO`, `JACK`, `PIPEWIRE` or `ALSA`.
     /// `AUTO` keeps the historical behaviour (JACK when PipeWire is up).
     backend_pref: String,
@@ -193,6 +209,10 @@ pub struct AudioEngine {
     out_channels: usize,
     /// Device input channels available to slots (native JACK only).
     in_channels: usize,
+    /// The graph port behind each input channel, in channel order — every
+    /// capture jack in the system, not one device's. The UI reads these for
+    /// the row labels, so what the drawer lists is what is actually wired.
+    input_ports: Vec<String>,
 }
 
 /// The live audio connection. Held only to keep it alive: dropping either
@@ -324,12 +344,12 @@ impl AudioEngine {
             cmd_tx,
             retired_rx,
             output_device: None,
-            input_device: None,
             backend_pref: "AUTO".to_string(),
             rt_endpoints: Some(RtEndpoints { cmd_rx, retired_tx }),
             _stream: None,
             out_channels: 2,
             in_channels: 0,
+            input_ports: Vec::new(),
         }
     }
 
@@ -419,11 +439,12 @@ impl AudioEngine {
             .as_deref()
             .and_then(crate::jack_backend::device_channels)
             .unwrap_or((2, 0));
-        let source = self.input_device.clone();
-        let ins = match source.as_deref() {
-            Some(name) => crate::jack_backend::capture_channels(name).unwrap_or(0),
-            None => sink_ins,
-        };
+        // Every capture jack in the graph, whatever card it belongs to: the
+        // sink's own capture ports (what this used to ask for) are none at all
+        // on PipeWire, where an interface is two nodes.
+        let _ = sink_ins;
+        let capture = crate::jack_backend::all_capture_ports();
+        let ins = capture.len();
 
         let ep = self
             .rt_endpoints
@@ -431,13 +452,14 @@ impl AudioEngine {
             .context("audio engine already started")?;
         let state = self.new_rt_state(ep, outs.max(2), ins);
 
-        match crate::jack_backend::start(sink.as_deref(), source.as_deref(), outs.max(2), ins, state)
+        match crate::jack_backend::start(sink.as_deref(), &capture, outs.max(2), state)
         {
             Ok((handle, channels)) => {
                 self._stream = Some(BackendHandle::Jack(Box::new(handle)));
                 self.backend = AudioBackend::Jack;
                 self.out_channels = channels;
                 self.in_channels = ins;
+                self.input_ports = capture;
                 self.output_device = sink.or_else(jack_current_sink);
                 Ok(())
             }
@@ -459,8 +481,11 @@ impl AudioEngine {
     /// Rebuild the native client on `sink` with `outs`/`ins` ports. Every slot
     /// is lost (they live in the old client's RT state), which is why the
     /// caller is told to reload the rack.
-    fn restart_jack_native(&mut self, sink: Option<&str>, outs: usize, ins: usize) -> Result<()> {
-        let source = self.input_device.clone();
+    fn restart_jack_native(&mut self, sink: Option<&str>, outs: usize) -> Result<()> {
+        // The graph is re-read here rather than passed in: a card that came or
+        // went since the last client is exactly what a restart is for.
+        let capture = crate::jack_backend::all_capture_ports();
+        let ins = capture.len();
         // Fresh rings: the old ones belong to the client we are about to drop.
         let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(CMD_RING);
         let (retired_tx, retired_rx) = rtrb::RingBuffer::new(CMD_RING);
@@ -470,9 +495,8 @@ impl AudioEngine {
         // the graph would rename the second one. If the new client then fails
         // to open there is no audio until the next attempt — the error says so.
         self._stream = None;
-        let (handle, channels) =
-            crate::jack_backend::start(sink, source.as_deref(), outs, ins, state)
-                .context("cannot reopen the JACK client")?;
+        let (handle, channels) = crate::jack_backend::start(sink, &capture, outs, state)
+            .context("cannot reopen the JACK client")?;
 
         self.cmd_tx = cmd_tx;
         self.retired_rx = retired_rx;
@@ -488,6 +512,7 @@ impl AudioEngine {
         self._stream = Some(BackendHandle::Jack(Box::new(handle)));
         self.out_channels = channels;
         self.in_channels = ins;
+        self.input_ports = capture;
         self.output_device = sink.map(str::to_string).or_else(jack_current_sink);
         Ok(())
     }
@@ -533,22 +558,17 @@ impl AudioEngine {
         self.output_device.as_deref()
     }
 
-    /// Graph nodes that publish capture ports, by name. Empty off JACK: cpal
-    /// gives choz no capture at all.
-    pub fn input_devices(&self) -> Vec<String> {
-        if self.backend == AudioBackend::Jack { jack_sources() } else { Vec::new() }
+    /// The graph port behind each input channel, in channel order. There is no
+    /// "input device" to choose any more: every capture jack in the system is
+    /// wired, so what the user picks is a **channel**.
+    pub fn input_ports(&self) -> &[String] {
+        &self.input_ports
     }
 
-    /// Node the capture ports are wired to, which is the output's own node
-    /// until the user picks another.
-    pub fn input_device(&self) -> Option<&str> {
-        self.input_device.as_deref().or(self.output_device.as_deref())
-    }
-
-    /// Take audio in from `name`. The client is rebuilt (a different device has
-    /// a different channel count), so **every rack slot is lost** and the caller
-    /// reloads the rack — same contract as [`Self::set_output_device`].
-    pub fn set_input_device(&mut self, name: &str) -> Result<bool> {
+    /// Re-read the graph and rebuild the client, so a card plugged in after
+    /// start-up shows up. Every slot is lost, exactly like an output change,
+    /// and the caller reloads the rack.
+    pub fn rescan_inputs(&mut self) -> Result<bool> {
         if !matches!(self._stream, Some(BackendHandle::Jack(_))) {
             anyhow::bail!("audio input needs the native JACK client");
         }
@@ -556,9 +576,7 @@ impl AudioEngine {
         // `output_device` stays empty until someone picks one. Reconnect to
         // whatever we are wired to now.
         let sink = self.output_device.clone().or_else(jack_current_sink);
-        self.input_device = Some(name.to_string());
-        let ins = crate::jack_backend::capture_channels(name).unwrap_or(0);
-        self.restart_jack_native(sink.as_deref(), self.out_channels, ins).map(|()| true)
+        self.restart_jack_native(sink.as_deref(), self.out_channels).map(|()| true)
     }
 
     /// Move playback to `name`. Returns `true` when the stream had to be rebuilt,
@@ -573,18 +591,16 @@ impl AudioEngine {
             // interface) needs a new set of ports, so the client is rebuilt and
             // the caller reloads the rack.
             Some(BackendHandle::Jack(_)) => {
-                let (outs, sink_ins) = crate::jack_backend::device_channels(name).unwrap_or((2, 0));
-                let ins = match self.input_device.as_deref() {
-                    Some(src) => crate::jack_backend::capture_channels(src).unwrap_or(0),
-                    None => sink_ins,
-                };
+                let (outs, _) = crate::jack_backend::device_channels(name).unwrap_or((2, 0));
                 let outs = outs.max(2);
-                if outs == self.out_channels && ins == self.in_channels {
+                // Inputs do not depend on the sink any more — they are the
+                // whole graph's — so only the output count can force a rebuild.
+                if outs == self.out_channels {
                     jack_route_to(name, crate::jack_backend::CLIENT_NAME)?;
                     self.output_device = Some(name.to_string());
                     return Ok(false);
                 }
-                return self.restart_jack_native(Some(name), outs, ins).map(|()| true);
+                return self.restart_jack_native(Some(name), outs).map(|()| true);
             }
             Some(BackendHandle::Cpal(_)) if self.backend == AudioBackend::Jack => {
                 jack_route_to(name, CPAL_JACK_CLIENT)?;
@@ -643,12 +659,6 @@ impl AudioEngine {
     /// Ask for a specific output device on the next [`Self::start`].
     pub fn set_output_device_preference(&mut self, name: &str) {
         self.output_device = Some(name.to_string());
-    }
-
-    /// Capture device to wire up when the client opens. Same deal: set it
-    /// before [`Self::start`].
-    pub fn set_input_device_preference(&mut self, name: &str) {
-        self.input_device = Some(name.to_string());
     }
 
     pub fn backend_preference(&self) -> &str {
@@ -852,6 +862,19 @@ impl AudioEngine {
             return;
         }
         self.send(EngineCommand::SetSlotIn { slot, pair });
+    }
+
+    /// Turn a tab's audio input into notes for its own instrument — a guitar
+    /// playing a synth. Only means anything on a tab fed by a capture pair.
+    pub fn set_slot_pitch_to_midi(&mut self, slot: usize, on: bool) {
+        self.send(EngineCommand::SetSlotPitchToMidi { slot, on });
+    }
+
+    /// Trim the slot's audio input (linear `gain`) and set how loud it must be
+    /// before `A→M` hears a note (`gate`, RMS 0..1). Only means anything on a
+    /// tab fed by a capture channel.
+    pub fn set_slot_in_trim(&mut self, slot: usize, gain: f32, gate: f32) {
+        self.send(EngineCommand::SetSlotInTrim { slot, gain, gate });
     }
 
     /// Set slot `slot`'s mixer strip: linear `gain`, `pan` (-1 left .. 1 right)
@@ -1124,6 +1147,31 @@ impl RtState {
                     s.out_pair = (left, right);
                 }
             }
+            EngineCommand::SetSlotPitchToMidi { slot, on } => {
+                let sr = state.sample_rate;
+                if let Some(s) = state.slots.get_mut(slot) {
+                    match (on, s.pitch.take()) {
+                        (true, None) => s.pitch = Some(crate::pitch::PitchTracker::new(sr)),
+                        (true, some) => s.pitch = some,
+                        // Switching it off must not leave the note hanging.
+                        (false, Some(mut t)) => {
+                            if let Some(crate::pitch::PitchEvent::Off { note }) = t.release() {
+                                s.source.note_off(note);
+                                s.held &= !(1u128 << (note & 0x7F));
+                            }
+                        }
+                        (false, None) => {}
+                    }
+                }
+            }
+            EngineCommand::SetSlotInTrim { slot, gain, gate } => {
+                if let Some(s) = state.slots.get_mut(slot) {
+                    s.in_gain = gain.clamp(0.0, 8.0);
+                    if let Some(t) = s.pitch.as_mut() {
+                        t.gate = gate.clamp(0.0, 1.0);
+                    }
+                }
+            }
             EngineCommand::SetSlotIn { slot, pair } => {
                 if let Some(s) = state.slots.get_mut(slot) {
                     s.in_pair = pair;
@@ -1216,7 +1264,12 @@ impl RtState {
         // with the audio, so it is advanced here and nowhere else.
         let transport = choz_ports::transport();
         transport.set_playing(playing);
-        transport.advance(frames);
+        // Only while rolling: a stopped transport keeps its position, it does
+        // not creep. A tempo-synced delay reading a position that moves with
+        // the stop button pressed is worse than one that reads nothing.
+        if playing {
+            transport.advance(frames);
+        }
         let n = (frames * 2).min(scratch.len());
         let sr = *sample_rate;
 
@@ -1235,9 +1288,41 @@ impl RtState {
                     let last_in = capture.len().saturating_sub(1);
                     if !capture.is_empty() {
                         let (l, r) = (l.min(last_in), r.min(last_in));
+                        let g = slot.in_gain;
                         for f in 0..(n / 2) {
-                            sc[f * 2] = capture[l][f];
-                            sc[f * 2 + 1] = capture[r][f];
+                            sc[f * 2] = capture[l][f] * g;
+                            sc[f * 2 + 1] = capture[r][f] * g;
+                        }
+                    }
+                    // With A→M on, the input is listened to rather than passed
+                    // through: what comes out of the slot is its instrument
+                    // playing the notes just heard, so a guitar drives a synth.
+                    if let Some(tracker) = slot.pitch.as_mut() {
+                        let (events, count) = tracker.process(sc, sr);
+                        for event in events.iter().take(count).flatten() {
+                            match *event {
+                                crate::pitch::PitchEvent::On { note, velocity } => {
+                                    slot.source.note_on(note, velocity);
+                                    slot.held |= 1u128 << (note & 0x7F);
+                                }
+                                crate::pitch::PitchEvent::Off { note } => {
+                                    slot.source.note_off(note);
+                                    slot.held &= !(1u128 << (note & 0x7F));
+                                }
+                            }
+                        }
+                        // What it heard, for the rack to draw: a tracker that
+                        // plays nothing and one that plays the wrong thing look
+                        // identical without this, and `SENS` has nothing to aim
+                        // at.
+                        crate::meter::pitch_meter().publish(
+                            tracker.sounding(),
+                            tracker.cents(),
+                            tracker.level(),
+                        );
+                        let written = slot.source.render(sc, sr);
+                        for s in sc[written * 2..].iter_mut() {
+                            *s = 0.0;
                         }
                     }
                 }
@@ -1260,6 +1345,19 @@ impl RtState {
                 mix[l][f] += sc[f * 2] * gl;
                 mix[r][f] += sc[f * 2 + 1] * gr;
             }
+        }
+
+        // What went out, for whoever draws it. The first pair is the one the
+        // interface calls the output; a meter of every channel would be a
+        // different panel.
+        if mix.len() >= 2 {
+            let frames = frames.min(mix[0].len()).min(mix[1].len());
+            let scratch_len = scratch.len().min(frames * 2);
+            for f in 0..scratch_len / 2 {
+                scratch[f * 2] = mix[0][f];
+                scratch[f * 2 + 1] = mix[1][f];
+            }
+            crate::meter::meter().publish(&scratch[..scratch_len]);
         }
     }
 }
@@ -1292,7 +1390,7 @@ pub(crate) const JACK_AUDIO: &str = "32 bit float mono audio";
 /// ponytail: hard-coded rather than plumbed out of cpal, which never exposes
 /// it. Only wrong if a second choz is already connected, in which case JACK
 /// renames the client and the routing below silently finds no ports.
-const CPAL_JACK_CLIENT: &str = "cpal_client_out";
+pub(crate) const CPAL_JACK_CLIENT: &str = "cpal_client_out";
 
 /// Open a short-lived JACK client just to inspect/patch the graph.
 fn jack_probe(name: &str) -> Result<jack::Client> {
@@ -1319,26 +1417,6 @@ fn jack_sinks() -> Vec<String> {
     sinks
 }
 
-/// Every graph node publishing capture ports — the input-side twin of
-/// [`jack_sinks`]. Monitor ports are excluded there, so a plain sink doesn't
-/// masquerade as a source.
-fn jack_sources() -> Vec<String> {
-    let Ok(client) = jack_probe("choz-probe") else {
-        return Vec::new();
-    };
-    let mut sources: Vec<String> = Vec::new();
-    for port in client.ports(None, Some(JACK_AUDIO), jack::PortFlags::IS_OUTPUT) {
-        if port.contains(":monitor") {
-            continue;
-        }
-        let Some((owner, _)) = port.rsplit_once(':') else { continue };
-        let ours = owner == CPAL_JACK_CLIENT || owner == crate::jack_backend::CLIENT_NAME;
-        if !ours && !sources.iter().any(|s| s == owner) {
-            sources.push(owner.to_string());
-        }
-    }
-    sources
-}
 
 /// The sink our first playback port is wired to, if any — after start-up this
 /// is whatever PipeWire auto-connected us to.

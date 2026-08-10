@@ -5,6 +5,7 @@
 //!
 //! UI styling adapted from seqterm.
 
+mod automation;
 mod editor;
 mod i18n;
 mod project;
@@ -73,9 +74,21 @@ impl InputRef {
 
 #[derive(Clone)]
 struct RackSlot {
-    /// MIDI channel this tab answers in MULTI mode, 1..16. Ignored in LIVE,
-    /// where a tab is picked by its input and by which one is active.
+    /// MIDI channel this tab answers, 1..16 — **or 0, meaning any**.
+    ///
+    /// In MULTI it is what a tab *is*, and every tab has a number. In LIVE it is
+    /// opt-in: a tab left on `ANY` behaves as it always did (the active one
+    /// plays), and giving it a number turns one port into a split — a keyboard
+    /// sending channel 3 reaches the tab that asked for 3, whether or not it is
+    /// the tab on screen.
     channel: u8,
+    /// Turn this tab's audio input into notes for its own instrument.
+    pitch_to_midi: bool,
+    /// Trim on the audio coming in, and how loud it has to be before `A→M`
+    /// hears a note. A guitar into a preamp is nowhere near a synth's level,
+    /// so without the trim the two are stuck wherever the interface left them.
+    in_gain: f32,
+    in_gate: f32,
     /// Which note input drives this tab. `None` = only the QWERTY piano (which
     /// always plays the active tab) reaches it.
     input: Option<InputRef>,
@@ -111,10 +124,13 @@ struct RackSlot {
 impl RackSlot {
     fn new(source: AudioSource) -> Self {
         RackSlot {
-            // Channel 1 until the tab is placed: `push_slot` gives each new
-            // tab the next channel, which is the layout an orchestral template
-            // expects without anyone configuring anything.
-            channel: 1,
+            // Any channel until something says otherwise: `push_slot` numbers
+            // the tabs in MULTI (an orchestral template's default layout), and
+            // in LIVE a number is opt-in — it turns one port into a split.
+            channel: ANY_CHANNEL,
+            pitch_to_midi: false,
+            in_gain: 1.0,
+            in_gate: choz_engine::pitch::DEFAULT_GATE,
             input: None, source, fx_chain: Vec::new(),
             gain: 1.0, pan: 0.0, mute: false, solo: false,
             out_pair: (0, 1), in_pair: None,
@@ -150,8 +166,62 @@ enum OutTarget {
     None,
     /// Index into `App::out_devices`.
     Device(usize),
-    /// Output pair `n`, i.e. device channels `2n` and `2n+1`.
-    Pair(usize),
+    /// One output channel of the device. A tab's two sides are picked
+    /// separately, so "left out of 3, right out of 9" is a routing like any
+    /// other — an interface's jacks are not glued together in pairs.
+    Channel(usize),
+}
+
+/// What a gesture on a channel row does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Assign {
+    /// Left click: put this channel on the tab.
+    On,
+    /// Right click: take it off.
+    Off,
+    /// Enter or Space: whichever of the two this channel is not already.
+    Toggle,
+}
+
+/// A routing is one or two jacks: `(a, a)` is one, `(a, b)` is two.
+fn channels_of(pair: (usize, usize)) -> Vec<usize> {
+    if pair.0 == pair.1 { vec![pair.0] } else { vec![pair.0, pair.1] }
+}
+
+/// `pair` with `ch` added. Two jacks is all a tab has, so this is a queue of
+/// two: the newcomer is the right side and the oldest falls off the left.
+///
+/// That is what makes the common gesture work. A new tab starts on 1 and 2, so
+/// clicking 3 and then 9 leaves it on **3 and 9** — with the left side pinned
+/// instead, clicking twice would have left channel 1 in there.
+fn assign_channel(pair: (usize, usize), ch: usize) -> (usize, usize) {
+    if channels_of(pair).contains(&ch) {
+        return pair;
+    }
+    (pair.1, ch)
+}
+
+/// `pair` with `ch` removed. `None` when that was the only jack left — for an
+/// input that means "back to the instrument", and for an output there is
+/// nothing sensible to do, so the caller keeps what it had.
+fn unassign_channel(pair: (usize, usize), ch: usize) -> Option<(usize, usize)> {
+    match (pair.0 == ch, pair.1 == ch) {
+        (true, true) => None,
+        (true, false) => Some((pair.1, pair.1)),
+        (false, true) => Some((pair.0, pair.0)),
+        (false, false) => Some(pair),
+    }
+}
+
+/// What a channel is to a routing: `"  L"`, `"  R"`, `"  L+R"` — or nothing at
+/// all when the tab does not use it.
+fn side_label(pair: Option<(usize, usize)>, ch: usize) -> &'static str {
+    match pair {
+        Some((l, r)) if l == ch && r == ch => "  L+R",
+        Some((l, _)) if l == ch => "  L",
+        Some((_, r)) if r == ch => "  R",
+        _ => "",
+    }
 }
 
 /// What Enter on an IN drawer row does.
@@ -161,10 +231,9 @@ enum InTarget {
     None,
     /// Index into `App::input_list()`: a note input (MIDI port or OSC).
     Note(usize),
-    /// Index into `App::in_devices`: where capture comes from.
-    Device(usize),
-    /// Capture pair `n` (device input channels `2n` and `2n+1`) feeds the tab.
-    Capture(usize),
+    /// One capture channel of the device feeds the tab. Picked per channel, so
+    /// a guitar on input 5 is one jack rather than half of a pair.
+    Channel(usize),
     /// Back to the tab's own instrument.
     NoCapture,
 }
@@ -195,6 +264,10 @@ enum ModalKind {
     LoadProject,
     /// Image picker for the desktop background (Settings \u{2192} THEME).
     Wallpaper,
+    /// The positions of one **named** FX parameter — a preset, a key, a scale,
+    /// a mode. Stepping through eighteen Winamp presets with an arrow key is a
+    /// list pretending to be a knob; this is the list.
+    FxChoice,
 }
 
 /// Tabs of the Settings modal, in chip order.
@@ -208,9 +281,13 @@ enum ThemeRow {
     Background,
     /// Stretch ↔ tile, only present while an image is set.
     Fit,
-    /// How strongly the theme's colour washes over the image, `←`/`→`. Only
-    /// present while an image is set: there is nothing to wash otherwise.
+    /// How strongly the panel colour washes over the desktop, `←`/`→`. Absent
+    /// on the terminal's own background: choz cannot read that colour, so
+    /// there is nothing to be translucent against.
     Tint,
+    /// Which colour that wash is. The scheme's own, or any palette entry —
+    /// `←`/`→`, because it is judged by looking at it.
+    PanelColor,
     /// Open the file browser on the project's `assets/`.
     PickImage,
     /// Back to the terminal's own background.
@@ -247,7 +324,12 @@ const MIDI_LOG_MAX: usize = 64;
 
 /// Editable rows of the Engine section, in display order.
 const ENGINE_ROWS: &[&str] =
-    &["Backend", "Device", "Sample rate", "Buffer size", "Tempo", "SF2 engine"];
+    &["Backend", "Device", "Sample rate", "Buffer size", "Tempo", "Time signature", "SF2 engine"];
+
+/// Time signatures the Engine row cycles through. Every denominator here is a
+/// note value; the plugin formats have no way to read anything else.
+const TIME_SIGS: &[(u16, u16)] =
+    &[(4, 4), (3, 4), (2, 4), (6, 8), (5, 4), (7, 8), (12, 8), (2, 2)];
 
 /// How much one arrow press moves the tempo.
 const BPM_STEP: f32 = 1.0;
@@ -308,11 +390,17 @@ const SOURCE_FORMATS: &[&str] = &[
     "ALL", "CLAP", "SF2", "WAV", "SFZ", "LV2", "VST2", "VST3", "DSSI", "LADSPA",
 ];
 
-/// A rack control a MIDI CC can drive, bound by MIDI learn.
+/// A rack control a MIDI CC can drive, bound by MIDI learn — and the address an
+/// automation lane is recorded against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-enum LearnTarget {
+pub enum LearnTarget {
     Gain(usize),
     Pan(usize),
+    /// Trim on the tab's audio input, and the level `A→M` calls a note. Both
+    /// are knobs like any other, so both are bindable and automatable — a
+    /// guitarist wants the sensitivity on a pedal, not in a menu.
+    InGain(usize),
+    InGate(usize),
     FxParam { slot: usize, fx: usize, param: usize },
     /// A parameter of the tab's own plugin instrument. Any parameter of any
     /// hosted plugin is bindable, not just the FX chain's.
@@ -334,7 +422,7 @@ fn fx_scope(t: &LearnTarget) -> Option<(usize, usize)> {
 /// Rack buttons a CC can press. `DEL` is deliberately absent — nothing should
 /// delete an FX because a fader was nudged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-enum TriggerAction {
+pub enum TriggerAction {
     PresetPrev,
     PresetNext,
     FxToggle,
@@ -437,11 +525,20 @@ struct Modal {
     sources: Vec<SourceChoice>,
     targets: Vec<LearnTarget>,
     browser: Option<file_browser::FileBrowser>,
+    /// Which FX parameter a [`ModalKind::FxChoice`] is picking a position for.
+    fx_param: usize,
 }
 
 impl Modal {
     fn new(kind: ModalKind, list: views::modal::ListModal) -> Self {
-        Self { kind, list, sources: Vec::new(), targets: Vec::new(), browser: None }
+        Self {
+            kind,
+            list,
+            sources: Vec::new(),
+            targets: Vec::new(),
+            browser: None,
+            fx_param: 0,
+        }
     }
 }
 
@@ -477,10 +574,15 @@ struct UiLayout {
     out_device_rect: Option<Rect>,
     /// The PANIC button in the TRANSPORT panel.
     panic_rect: Option<Rect>,
+    /// The automation loop's length, in bars. Clickable: the left half of the
+    /// cell shortens it, the right half lengthens it.
+    loop_rect: Option<Rect>,
     /// The LIVE/MULTI switch in the top-right corner of the menu bar.
     mode_switch_rect: Option<Rect>,
     /// About dialog close-button rect.
     about_close_rect: Option<Rect>,
+    /// The MIDI monitor's tab strip: MIDI / WAVE / ACTIVITY.
+    monitor_tabs: Vec<(views::midi_monitor::MonitorTab, Rect)>,
 }
 
 #[allow(dead_code)]
@@ -571,8 +673,14 @@ struct App {
     /// enumeration is far too slow to redo every frame.
     out_devices: Vec<String>,
     out_cursor: usize,
-    /// Capture devices the graph publishes, for the IN drawer.
-    in_devices: Vec<String>,
+    /// Recent AutoTune pitch error, in cents, oldest first. Filled from the
+    /// meter as the panel draws, so watching the pitch costs the audio thread
+    /// nothing at all.
+    autotune_trace: Vec<f32>,
+    /// The graph port behind each input channel, cached from the engine: the
+    /// IN drawer redraws every frame and this only changes when the client is
+    /// rebuilt.
+    in_ports: Vec<String>,
     /// Interface settings (text colour, language).
     ui: settings::UiSettings,
     /// Format whose directory list the AddPath browser is feeding.
@@ -620,6 +728,10 @@ struct App {
     audio_engine: Option<engine::AudioEngine>,
 
     playing: bool,
+    /// Recorded parameter moves, played back against the transport.
+    automation: automation::Automation,
+    /// Which of the monitor's tabs is showing.
+    monitor_tab: views::midi_monitor::MonitorTab,
     quit: bool,
 
     layout: RefCell<UiLayout>,
@@ -670,8 +782,9 @@ impl App {
             in_open: false,
             out_open: false,
             out_devices: Vec::new(),
+            in_ports: Vec::new(),
+            autotune_trace: vec![f32::NAN; AUTOTUNE_TRACE],
             out_cursor: 0,
-            in_devices: Vec::new(),
             // Loaded here, applied by `main` — `apply()` sets process-wide
             // state (language, text colour) that tests must not inherit.
             ui: settings::UiSettings::load(),
@@ -696,6 +809,8 @@ impl App {
             registry,
             audio_engine: None,
             playing: false,
+            automation: automation::Automation::default(),
+            monitor_tab: views::midi_monitor::MonitorTab::default(),
             quit: false,
             layout: RefCell::new(UiLayout::default()),
             splash: SplashState::new(),
@@ -867,6 +982,27 @@ impl App {
         self.refresh_modal();
     }
 
+    /// Open the picker for FX parameter `param` of the selected unit, when that
+    /// parameter is a list of names. Returns false when it is not one — the
+    /// caller then does whatever it did before.
+    fn open_fx_choice(&mut self, param: usize) -> bool {
+        let Some(entry) = self.fx_chain.get(self.fx_slot) else { return false };
+        let descs = entry.param_descs();
+        let Some(desc) = descs.get(param) else { return false };
+        let source::ParamShape::Named(points) = &desc.shape else { return false };
+        if points.len() < 2 {
+            return false;
+        }
+        let items: Vec<String> = points.iter().map(|(_, n)| n.clone()).collect();
+        let here = desc.shape.step_at(entry.params.get(param).copied().unwrap_or(0.0));
+        let title = format!("{} \u{00B7} {}", entry.label(), desc.name);
+        let mut modal = Modal::new(ModalKind::FxChoice, views::modal::ListModal::new(title, items));
+        modal.list.cursor = here.map(|(k, _)| k).unwrap_or(0);
+        modal.fx_param = param;
+        self.modal = Some(modal);
+        true
+    }
+
     /// What Enter (or a click) on an OUT drawer row does.
     fn out_targets(&self) -> Vec<(OutTarget, views::drawer::OutRow)> {
         use views::drawer::OutRow;
@@ -891,23 +1027,23 @@ impl App {
             ));
         }
 
-        // Channel pairs of the running device. Two channels is one pair, so a
-        // plain stereo card shows a single row and nothing to choose.
+        // Every output channel of the running device, one row each: the two
+        // sides of a tab are separate choices, so 3 and 9 is a routing like 1
+        // and 2 is.
         let channels = self.audio_engine.as_ref().map(|e| e.output_channels()).unwrap_or(2);
         let active = self.slots.get(self.active_slot).map(|s| s.out_pair);
         rows.push((
             OutTarget::None,
             OutRow { label: format!("CHANNELS ({channels})"), mark: ' ', header: true },
         ));
-        for pair in 0..(channels / 2) {
-            let (l, r) = (pair * 2, pair * 2 + 1);
-            // Which tabs already play out of this pair, so the routing of the
-            // whole rack is visible at a glance.
+        for ch in 0..channels {
+            // Which tabs already play out of this channel, so the routing of
+            // the whole rack is visible at a glance.
             let tabs: Vec<String> = self
                 .slots
                 .iter()
                 .enumerate()
-                .filter(|(_, s)| s.out_pair == (l, r))
+                .filter(|(_, s)| s.out_pair.0 == ch || s.out_pair.1 == ch)
                 .map(|(i, _)| format!("{}", i + 1))
                 .collect();
             let used = if tabs.is_empty() {
@@ -915,11 +1051,12 @@ impl App {
             } else {
                 format!("  \u{2190} tab {}", tabs.join(","))
             };
+            let role = side_label(active, ch);
             rows.push((
-                OutTarget::Pair(pair),
+                OutTarget::Channel(ch),
                 OutRow {
-                    label: format!("{}/{}{used}", l + 1, r + 1),
-                    mark: if active == Some((l, r)) { '\u{2713}' } else { '\u{00B7}' },
+                    label: format!("{}{role}{used}", ch + 1),
+                    mark: if role.is_empty() { '\u{00B7}' } else { '\u{2713}' },
                     header: false,
                 },
             ));
@@ -927,28 +1064,47 @@ impl App {
         rows
     }
 
-    /// Act on the OUT drawer row under the cursor.
-    fn out_select(&mut self, row: usize) {
+    /// Act on the OUT drawer row under the cursor. `how` says what a channel
+    /// row does: assign it, take it off, or toggle — which is how a tab ends up
+    /// playing out of 3 and 9, two jacks that are not a pair.
+    fn out_select_side(&mut self, row: usize, how: Assign) {
         let Some((target, _)) = self.out_targets().into_iter().nth(row) else { return };
         match target {
             OutTarget::None => {}
+            // Picking the device is not an assignment, so the right button
+            // leaves it alone.
+            OutTarget::Device(_) if how == Assign::Off => {}
             OutTarget::Device(i) => {
                 if let Some(name) = self.out_devices.get(i).cloned() {
                     self.set_output_device(&name);
                     self.refresh_out_devices();
                 }
             }
-            // Routing is per rack tab: the pair applies to the active one.
-            OutTarget::Pair(pair) => {
-                let (l, r) = (pair * 2, pair * 2 + 1);
-                let idx = self.active_slot;
-                if let Some(slot) = self.slots.get_mut(idx) {
-                    slot.out_pair = (l, r);
-                }
-                if let Some(ref mut engine) = self.audio_engine {
-                    engine.set_slot_out(idx, l, r);
-                }
-            }
+            // Routing is per rack tab: the channel applies to the active one.
+            OutTarget::Channel(ch) => self.set_active_out(ch, how),
+        }
+    }
+
+    /// Enter (or a left click) on an OUT row.
+    fn out_select(&mut self, row: usize) {
+        self.out_select_side(row, Assign::Toggle);
+    }
+
+    /// Add or remove `ch` from the active tab's output.
+    fn set_active_out(&mut self, ch: usize, how: Assign) {
+        let idx = self.active_slot;
+        let Some(slot) = self.slots.get_mut(idx) else { return };
+        let on = channels_of(slot.out_pair).contains(&ch);
+        let next = match (how, on) {
+            (Assign::On, _) | (Assign::Toggle, false) => Some(assign_channel(slot.out_pair, ch)),
+            (Assign::Off, _) | (Assign::Toggle, true) => unassign_channel(slot.out_pair, ch),
+        };
+        // A tab has to come out somewhere: taking away its last channel would
+        // leave the engine no channel to mix into, so that gesture does nothing.
+        let Some(pair) = next else { return };
+        slot.out_pair = pair;
+        if let Some(ref mut engine) = self.audio_engine {
+            engine.set_slot_out(idx, pair.0, pair.1);
         }
     }
 
@@ -957,12 +1113,24 @@ impl App {
     fn apply_routing(&mut self) {
         let outs: Vec<(usize, usize)> = self.slots.iter().map(|s| s.out_pair).collect();
         let ins: Vec<Option<(usize, usize)>> = self.slots.iter().map(|s| s.in_pair).collect();
+        // A tab that lost its audio input cannot convert a pitch it no longer
+        // hears, so the flag follows the routing.
+        let a2m: Vec<bool> = self.slots.iter().map(|s| s.in_pair.is_some() && s.pitch_to_midi).collect();
+        let trims: Vec<(f32, f32)> = self.slots.iter().map(|s| (s.in_gain, s.in_gate)).collect();
         let Some(ref mut engine) = self.audio_engine else { return };
         for (i, (l, r)) in outs.into_iter().enumerate() {
             engine.set_slot_out(i, l, r);
         }
         for (i, pair) in ins.into_iter().enumerate() {
             engine.set_slot_in(i, pair);
+        }
+        for (i, on) in a2m.into_iter().enumerate() {
+            engine.set_slot_pitch_to_midi(i, on);
+        }
+        // The trim goes last: it carries the gate, and the tracker it sets the
+        // gate on only exists once `set_slot_pitch_to_midi(true)` has run.
+        for (i, (gain, gate)) in trims.into_iter().enumerate() {
+            engine.set_slot_in_trim(i, gain, gate);
         }
     }
 
@@ -997,7 +1165,7 @@ impl App {
     fn toggle_in_drawer(&mut self) {
         self.in_open = !self.in_open;
         if self.in_open {
-            self.refresh_in_devices();
+            self.refresh_in_ports();
             self.input_cursor = self
                 .in_targets()
                 .iter()
@@ -1258,6 +1426,89 @@ impl App {
             .collect()
     }
 
+    /// Whether the active tab is fed by audio, and whether it is converting it
+    /// to notes. `None` when there is no audio coming in: the button would be a
+    /// switch for something that is not happening.
+    fn pitch_to_midi_state(&self) -> Option<bool> {
+        let slot = self.slots.get(self.active_slot)?;
+        slot.in_pair.map(|_| slot.pitch_to_midi)
+    }
+
+    /// The automation loop's length in bars of the current time signature —
+    /// what the UI shows, because "16 beats" means nothing in 6/8.
+    fn automation_loop_bars(&self) -> u32 {
+        let per_bar = choz_ports::transport().bar_quarters().max(1.0) as f32;
+        ((self.automation.loop_beats() / per_bar).round() as u32).max(1)
+    }
+
+    /// Lengthen or shorten the loop by `d` bars. A lane is a position in a
+    /// loop, so this is the one number that decides what a lane means.
+    fn nudge_automation_loop(&mut self, d: i32) {
+        let per_bar = choz_ports::transport().bar_quarters().max(1.0) as f32;
+        let bars = (self.automation_loop_bars() as i32 + d).clamp(1, 64) as f32;
+        self.automation.loop_beats = bars * per_bar;
+    }
+
+    /// The active tab's input trim and `A→M` sensitivity, or `None` when it
+    /// plays its own instrument and there is nothing coming in to trim.
+    fn in_trim_state(&self) -> Option<(f32, f32)> {
+        let slot = self.slots.get(self.active_slot)?;
+        slot.in_pair.map(|_| (slot.in_gain, slot.in_gate))
+    }
+
+    /// Move the input trim (`gain`) or the sensitivity (`gate`) of the active
+    /// tab, both as a delta on the knob's own 0..1 travel.
+    fn adjust_in_trim(&mut self, d_gain: f32, d_gate: f32) {
+        let idx = self.active_slot;
+        let Some(s) = self.slots.get_mut(idx) else { return };
+        if s.in_pair.is_none() {
+            return;
+        }
+        if d_gain != 0.0 {
+            s.in_gain = (s.in_gain + d_gain * MAX_GAIN).clamp(0.0, MAX_GAIN);
+        }
+        if d_gate != 0.0 {
+            let norm = views::fx_chain_panel::gate_norm(s.in_gate) + d_gate;
+            s.in_gate = views::fx_chain_panel::gate_from_norm(norm);
+        }
+        let (gain, gate) = (s.in_gain, s.in_gate);
+        if let Some(engine) = self.audio_engine.as_mut() {
+            engine.set_slot_in_trim(idx, gain, gate);
+        }
+    }
+
+    /// Set them outright, which is what MIDI learn and automation do: a CC is a
+    /// position on the knob, not a nudge.
+    fn set_in_trim(&mut self, gain: Option<f32>, gate_norm: Option<f32>) {
+        let idx = self.active_slot;
+        let Some(s) = self.slots.get_mut(idx) else { return };
+        if let Some(g) = gain {
+            s.in_gain = g.clamp(0.0, MAX_GAIN);
+        }
+        if let Some(n) = gate_norm {
+            s.in_gate = views::fx_chain_panel::gate_from_norm(n);
+        }
+        let (gain, gate) = (s.in_gain, s.in_gate);
+        if let Some(engine) = self.audio_engine.as_mut() {
+            engine.set_slot_in_trim(idx, gain, gate);
+        }
+    }
+
+    /// A guitar into a synth, or back to passing the audio through.
+    fn toggle_pitch_to_midi(&mut self) {
+        let slot = self.active_slot;
+        let Some(s) = self.slots.get_mut(slot) else { return };
+        if s.in_pair.is_none() {
+            return;
+        }
+        s.pitch_to_midi = !s.pitch_to_midi;
+        let on = s.pitch_to_midi;
+        if let Some(engine) = self.audio_engine.as_mut() {
+            engine.set_slot_pitch_to_midi(slot, on);
+        }
+        eprintln!("choz: tab {} audio\u{2192}MIDI {}", slot + 1, if on { "on" } else { "off" });
+    }
+
     /// What control the instrument's parameter `i` is, so the arrows step it
     /// the way it is drawn.
     fn instr_param_shape(&self, i: usize) -> source::ParamShape {
@@ -1289,11 +1540,12 @@ impl App {
             (settings::Background::Image { .. }, _, Some(c)) if self.kitty_bg.is_some() => {
                 Some(c.clone())
             }
-            // A flat colour is its own backdrop; no image, nothing to see
-            // through, so panels keep their own solid fill.
+            // A flat colour has no picture in it; the panels are tinted over
+            // it once, below, instead of cell by cell.
             _ => None,
         };
         let graphics = self.kitty_bg.is_some();
+        let has_cells = cells.is_some();
         views::theme::set_backdrop(cells.map(|cells| views::theme::Backdrop {
             cols: area.width,
             rows: area.height,
@@ -1301,6 +1553,24 @@ impl App {
             tint: self.ui.tint(),
             graphics,
         }));
+
+        // With a picture behind them the panels are washed per cell, so they
+        // paint nothing of their own. Otherwise the translucency is resolved
+        // once: the desktop's own colour with the tint mixed in.
+        let (tint, alpha) = self.ui.tint();
+        views::theme::set_panel_fill(match (&self.ui.background, has_cells) {
+            (_, true) => None,
+            (settings::Background::Color(base), _) => {
+                Some(views::theme::blend(*base, tint, alpha))
+            }
+            // The terminal's own background: choz cannot read it, so it blends
+            // against the colour it would have painted there anyway.
+            _ => Some(views::theme::blend(
+                views::theme::rgb_of(views::theme::APP_BG),
+                tint,
+                alpha,
+            )),
+        });
     }
 
     /// Follow the knobs the user moves **inside the plugin's own window**.
@@ -1470,6 +1740,12 @@ impl App {
                 format!("  {:<18} {}   (Enter cycles)", "Fit", fit.label()),
                 Some(ThemeRow::Fit),
             ));
+        }
+        // The panel wash: every section — IN/OUT, RACK, FX, TRANSPORT, the
+        // monitor — gets the same colour at the same strength, so the desktop
+        // reads through all of them equally. Absent on the terminal's own
+        // background, which choz cannot read and therefore cannot blend with.
+        if !matches!(self.ui.background, settings::Background::Terminal) {
             // A slider, because the useful value is "as much as it takes to read
             // the knobs" and that is judged by eye, not typed.
             let pct = self.ui.background_tint.min(100);
@@ -1480,6 +1756,14 @@ impl App {
             rows.push((
                 format!("  {:<18} {bar} {pct:>3}%   (\u{2190}\u{2192})", "Panel opacity"),
                 Some(ThemeRow::Tint),
+            ));
+            rows.push((
+                format!(
+                    "  {:<18} {}   (\u{2190}\u{2192})",
+                    "Panel colour",
+                    self.ui.panel_tint_label()
+                ),
+                Some(ThemeRow::PanelColor),
             ));
         }
         rows.push((
@@ -1567,6 +1851,14 @@ impl App {
                 // has not noticed the arrows.
                 self.step_tint(TINT_STEP as i16);
             }
+            ThemeRow::PanelColor => {
+                self.ui.panel_tint = {
+                    self.ui.step_panel_tint(1);
+                    self.ui.panel_tint
+                };
+                self.ui.save();
+                self.apply_ui_settings();
+            }
             ThemeRow::PickImage => {
                 self.open_wallpaper_browser();
                 return false;
@@ -1651,6 +1943,10 @@ impl App {
             // The host clock every tempo-synced plugin reads. Shown from the
             // transport itself, which is the thing plugins actually see.
             format!("  {:>14}  {:.1} BPM", "Tempo", choz_ports::transport().bpm()),
+            {
+                let (num, den) = choz_ports::transport().time_signature();
+                format!("  {:>14}  {num}/{den}", "Time signature")
+            },
             // choz only builds oxisynth; the row exists so the setting matches
             // seqterm's file, not to pretend there is a choice.
             format!("  {:>14}  {} (only engine built in)", "SF2 engine", a.sf2_engine),
@@ -1839,6 +2135,17 @@ impl App {
                 let t = choz_ports::transport();
                 t.set_bpm(t.bpm() + step as f32 * BPM_STEP);
                 self.ui.audio.bpm = t.bpm();
+                self.ui.save();
+            }
+            // Cycles through the signatures a bar can actually be written in.
+            (SEC_ENGINE, 5) if step != 0 => {
+                let t = choz_ports::transport();
+                let cur = t.time_signature();
+                let i = TIME_SIGS.iter().position(|s| *s == cur).unwrap_or(0) as isize;
+                let n = TIME_SIGS.len() as isize;
+                let (num, den) = TIME_SIGS[(((i + step) % n + n) % n) as usize];
+                t.set_time_signature(num, den);
+                self.ui.audio.time_sig = (num, den);
                 self.ui.save();
             }
             // SF2 engine and the read-only rows below it take no input.
@@ -2038,6 +2345,10 @@ impl App {
                 .get(self.active_slot)
                 .map(|s| s.presets.iter().map(|p| p.label()).collect())
                 .unwrap_or_default(),
+            // The list was built when the modal opened and the parameter has
+            // not moved since; rebuilding it here would only re-read the same
+            // names.
+            ModalKind::FxChoice => return,
             ModalKind::Learn => {
                 let targets = self.modal.as_ref().unwrap().targets.clone();
                 targets
@@ -2248,6 +2559,8 @@ impl App {
         match *t {
             LearnTarget::Gain(s) => format!("tab {} \u{00B7} VOL", s + 1),
             LearnTarget::Pan(s) => format!("tab {} \u{00B7} PAN", s + 1),
+            LearnTarget::InGain(s) => format!("tab {} \u{00B7} IN", s + 1),
+            LearnTarget::InGate(s) => format!("tab {} \u{00B7} SENS", s + 1),
             LearnTarget::Trigger(action) => action.label(),
             LearnTarget::InstrParam { slot, param } => {
                 let name = self
@@ -2327,6 +2640,24 @@ impl App {
             }
             ModalKind::Learn => {
                 self.learn = m.targets.get(i).copied();
+                true
+            }
+            ModalKind::FxChoice => {
+                let param = m.fx_param;
+                // The list is the parameter's own positions, so the value is
+                // wherever the chosen one sits — not `i / len`, which would be
+                // a uniform grid the parameter never had.
+                let value = self
+                    .fx_chain
+                    .get(self.fx_slot)
+                    .and_then(|e| e.param_descs().get(param).cloned())
+                    .and_then(|d| match d.shape {
+                        source::ParamShape::Named(points) => points.get(i).map(|(v, _)| *v),
+                        _ => None,
+                    });
+                if let Some(v) = value {
+                    self.set_fx_param(self.fx_slot, param, v);
+                }
                 true
             }
             ModalKind::Browser | ModalKind::Wallpaper => {
@@ -2638,7 +2969,10 @@ impl App {
                     .cc_bindings
                     .iter()
                     .filter(|(_, t)| match t {
-                        LearnTarget::Gain(s) | LearnTarget::Pan(s) => *s == idx,
+                        LearnTarget::Gain(s)
+                        | LearnTarget::Pan(s)
+                        | LearnTarget::InGain(s)
+                        | LearnTarget::InGate(s) => *s == idx,
                         LearnTarget::FxParam { slot, .. }
                         | LearnTarget::InstrParam { slot, .. } => *slot == idx,
                         LearnTarget::Trigger(_) => idx == self.active_slot,
@@ -2657,6 +2991,9 @@ impl App {
                     }),
                     instrument,
                     mixer: project::Mixer {
+                        pitch_to_midi: slot.pitch_to_midi,
+                        in_gain: Some(slot.in_gain),
+                        in_gate: Some(slot.in_gate),
                         gain: slot.gain,
                         pan: slot.pan,
                         mute: slot.mute,
@@ -2672,6 +3009,7 @@ impl App {
 
         project::Project {
             version: 1,
+            automation: self.automation.clone(),
             audio: project::Audio {
                 // Settings, not the live engine: sample rate, buffer and backend
                 // only take effect on the next start, so the engine still runs
@@ -2736,6 +3074,10 @@ impl App {
     /// The sound half of a project: tabs, instruments, FX, mixer, routing and
     /// MIDI-learn bindings. Nothing here touches choz's own configuration.
     fn apply_project_rack(&mut self, p: project::Project) {
+        // The lanes address slots and FX by index, so they belong to the rack
+        // half of a project and travel with it.
+        self.automation = p.automation.clone();
+        self.automation.recording = false;
         // Drop the live rack first: `rebuild_rack` appends engine slots and
         // assumes it starts from nothing.
         while !self.slots.is_empty() {
@@ -2788,6 +3130,9 @@ impl App {
             rack.solo = slot.mixer.solo;
             rack.out_pair = slot.mixer.out_pair.unwrap_or((0, 1));
             rack.in_pair = slot.mixer.in_pair;
+            rack.pitch_to_midi = slot.mixer.pitch_to_midi;
+            rack.in_gain = slot.mixer.in_gain.unwrap_or(1.0).clamp(0.0, MAX_GAIN);
+            rack.in_gate = slot.mixer.in_gate.unwrap_or(choz_engine::pitch::DEFAULT_GATE);
             rack.channel = slot.channel.clamp(1, 16);
             self.slots.push(rack);
 
@@ -2975,6 +3320,12 @@ impl App {
         if rack.pan.is_some_and(|r| r.contains(pos)) {
             return Some(LearnTarget::Pan(slot));
         }
+        if rack.in_gain.is_some_and(|r| r.contains(pos)) {
+            return Some(LearnTarget::InGain(slot));
+        }
+        if rack.in_gate.is_some_and(|r| r.contains(pos)) {
+            return Some(LearnTarget::InGate(slot));
+        }
         // Buttons: everything in SLOT except DEL, the FX CHAIN row, the mixer
         // flags and the bank arrows.
         let trigger = [
@@ -3081,7 +3432,15 @@ impl App {
         let rising = value >= 64 && self.cc_last[cc as usize] < 64;
         self.cc_last[cc as usize] = value;
         for (_, target) in self.cc_bindings.clone().iter().filter(|(c, _)| *c == cc) {
-            match *target {
+            self.apply_target(*target, v, rising);
+        }
+    }
+
+    /// Move one control, wherever the instruction came from — a CC, an
+    /// automation lane, a click. One place, so a control that can be learned can
+    /// also be automated without being wired up twice.
+    fn apply_target(&mut self, target: LearnTarget, v: f32, rising: bool) {
+        match target {
                 LearnTarget::Trigger(action) => {
                     if rising {
                         self.fire_trigger(action);
@@ -3099,40 +3458,90 @@ impl App {
                     }
                     self.push_mix();
                 }
+                LearnTarget::InGain(slot) => {
+                    if slot == self.active_slot {
+                        self.set_in_trim(Some(v * MAX_GAIN), None);
+                    }
+                }
+                LearnTarget::InGate(slot) => {
+                    if slot == self.active_slot {
+                        self.set_in_trim(None, Some(v));
+                    }
+                }
                 LearnTarget::InstrParam { slot, param } => {
                     self.set_slot_instr_param(slot, param, v);
                 }
                 LearnTarget::FxParam { slot, fx, param } => {
                     if slot != self.active_slot {
                         // Only the active tab has a live working copy of its chain.
-                        continue;
+                        return;
                     }
                     if fx != self.fx_slot {
                         // The selected FX unit owns the fader; the same CC bound
                         // to another unit stays quiet until that unit is picked.
-                        continue;
+                        return;
                     }
-                    let Some(entry) = self.fx_chain.get_mut(fx) else { continue };
-                    let Some(p) = entry.params.get_mut(param) else { continue };
-                    *p = v;
-                    let is_mix = entry.is_mix_param(param);
-                    if is_mix {
-                        entry.wet = v;
-                    }
-                    let native = entry.plugin.is_none();
-                    let idx = if is_mix { choz_engine::FX_MIX_PARAM } else { param };
-                    self.set_live_fx_param(fx, idx, v);
-                    if native {
-                        // Built-in FX that don't implement `set_param` only pick
-                        // the value up when the chain is rebuilt — but a fader
-                        // sends ~100 CCs a second, and rebuilding per message
-                        // floods the command ring (note-offs get dropped: notes
-                        // hang) and re-instantiates hosted plugins. Mark it and
-                        // rebuild once per drain instead.
-                        self.fx_dirty = true;
-                    }
+                    self.set_fx_param(fx, param, v);
                 }
+        }
+    }
+
+    /// The controls an automation lane can address on this tab, and where they
+    /// stand right now. The active tab only: a lane belongs to the rack, but the
+    /// FX chain of an inactive tab is not live to be read or moved.
+    fn automatable(&self) -> Vec<(LearnTarget, f32)> {
+        let slot = self.active_slot;
+        let mut out = Vec::new();
+        if let Some(s) = self.slots.get(slot) {
+            out.push((LearnTarget::Gain(slot), (s.gain / MAX_GAIN).clamp(0.0, 1.0)));
+            out.push((LearnTarget::Pan(slot), (s.pan + 1.0) / 2.0));
+            // Only where there is audio coming in: a lane for a control that
+            // is not on screen would play back into nothing.
+            if s.in_pair.is_some() {
+                out.push((LearnTarget::InGain(slot), (s.in_gain / MAX_GAIN).clamp(0.0, 1.0)));
+                out.push((
+                    LearnTarget::InGate(slot),
+                    views::fx_chain_panel::gate_norm(s.in_gate),
+                ));
             }
+            for (param, value) in s.instr_values.iter().enumerate() {
+                out.push((LearnTarget::InstrParam { slot, param }, *value));
+            }
+        }
+        let fx = self.fx_slot;
+        if let Some(entry) = self.fx_chain.get(fx) {
+            for (param, value) in entry.params.iter().enumerate() {
+                out.push((LearnTarget::FxParam { slot, fx, param }, *value));
+            }
+        }
+        out
+    }
+
+    /// One pass of the automation: write down what moved, or move what was
+    /// written down. Called once per UI tick, which is faster than a hand.
+    ///
+    /// Nothing happens while the transport is stopped — a lane is a position in
+    /// a loop, and with no clock running there is no position.
+    fn tick_automation(&mut self) {
+        if !self.playing {
+            return;
+        }
+        let beat = self.automation.position(choz_ports::transport().ppq());
+        if self.automation.recording {
+            for (target, value) in self.automatable() {
+                self.automation.record(target, beat, value);
+            }
+            return;
+        }
+        for (target, value) in self.automation.values_at(beat) {
+            // Only what actually differs: `apply_target` pushes to the engine,
+            // and re-sending an unchanged value every tick would flood the ring
+            // the notes travel on.
+            let current = self.automatable().into_iter().find(|(t, _)| *t == target);
+            if current.is_some_and(|(_, v)| (v - value).abs() < 1e-4) {
+                continue;
+            }
+            self.apply_target(target, value, false);
         }
     }
 
@@ -3178,72 +3587,104 @@ impl App {
 
         // Audio in only exists on the native JACK client; cpal gives none, and
         // then the section is a single "no capture" row.
-        let channels = self.audio_engine.as_ref().map(|e| e.input_channels()).unwrap_or(0);
-        rows.push((InTarget::None, header(&format!("{} ({channels})", i18n::t("AUDIO IN")))));
-        // The capture device is its own choice: on a plain sound card playback
-        // and capture are different graph nodes, so following the output would
-        // leave the rack with no inputs at all.
-        let live_in = self.audio_engine.as_ref().and_then(|e| e.input_device()).map(str::to_string);
-        for (i, name) in self.in_devices.iter().enumerate() {
-            rows.push((
-                InTarget::Device(i),
-                row("AUDIO", name.clone(), Some(name) == live_in.as_ref(), None),
-            ));
-        }
+        //
+        // **Every capture jack in the system is listed**, grouped under the card
+        // that owns it: an eight-input interface, the laptop's microphone and
+        // the second card are all here at once, because choz wires them all.
+        let ports = &self.in_ports;
+        rows.push((
+            InTarget::None,
+            header(&format!("{} ({})", i18n::t("AUDIO IN"), ports.len())),
+        ));
         let active = self.slots.get(self.active_slot).and_then(|s| s.in_pair);
         rows.push((
             InTarget::NoCapture,
             row("AUDIO", i18n::t("(instrument)").to_string(), active.is_none(), None),
         ));
-        for pair in 0..(channels / 2) {
-            let (l, r) = (pair * 2, pair * 2 + 1);
-            let tab = self.slots.iter().position(|s| s.in_pair == Some((l, r)));
+        let mut card = String::new();
+        for (ch, port) in ports.iter().enumerate() {
+            let (owner, jack) = port.rsplit_once(':').unwrap_or(("", port.as_str()));
+            if owner != card {
+                card = owner.to_string();
+                rows.push((InTarget::None, header(owner)));
+            }
+            let tab = self
+                .slots
+                .iter()
+                .position(|s| s.in_pair.is_some_and(|(l, r)| l == ch || r == ch));
+            let role = side_label(active, ch);
             rows.push((
-                InTarget::Capture(pair),
-                row("AUDIO", format!("{}/{}", l + 1, r + 1), active == Some((l, r)), tab),
+                InTarget::Channel(ch),
+                row("AUDIO", format!("{}  {jack}{role}", ch + 1), !role.is_empty(), tab),
             ));
         }
         rows
     }
 
-    /// Act on the IN drawer row under the cursor.
-    fn in_select(&mut self, row: usize) {
+    /// Act on the IN drawer row under the cursor. Channel rows work exactly
+    /// like the OUT drawer's: assign, unassign, or toggle. Taking away a tab's
+    /// last input channel puts it back on its instrument, which is the same
+    /// thing the `(instrument)` row does.
+    fn in_select_side(&mut self, row: usize, how: Assign) {
         let Some((target, _)) = self.in_targets().into_iter().nth(row) else { return };
         match target {
             InTarget::None => {}
+            // A note input is bound, not assigned to a side: the right button
+            // has nothing to take off it.
+            InTarget::Note(_) if how == Assign::Off => {}
             InTarget::Note(_) => self.bind_selected_input(),
-            InTarget::Device(i) => {
-                if let Some(name) = self.in_devices.get(i).cloned() {
-                    self.set_input_device(&name);
+            InTarget::Channel(ch) => {
+                // Assigning an audio input starts a tab if the rack is empty,
+                // the same way binding a MIDI port does. Without this a
+                // guitarist is stuck: there is no note input to bind, so the
+                // rack stays empty and the assignment lands on no slot at all.
+                if how != Assign::Off && self.ensure_slot().is_none() {
+                    return;
                 }
+                let current = self.slots.get(self.active_slot).and_then(|s| s.in_pair);
+                let on = current.is_some_and(|p| channels_of(p).contains(&ch));
+                let next = match (how, current, on) {
+                    // Nothing captured yet: the first pick is the whole input.
+                    (Assign::Off, _, _) if !on => return,
+                    (_, None, _) => Some((ch, ch)),
+                    (Assign::On, Some(p), _) | (Assign::Toggle, Some(p), false) => {
+                        Some(assign_channel(p, ch))
+                    }
+                    (Assign::Off, Some(p), _) | (Assign::Toggle, Some(p), true) => {
+                        unassign_channel(p, ch)
+                    }
+                };
+                self.set_active_capture(next);
             }
-            InTarget::Capture(pair) => self.set_active_capture(Some((pair * 2, pair * 2 + 1))),
             InTarget::NoCapture => self.set_active_capture(None),
         }
     }
 
-    /// Point choz's capture ports at another device. The JACK client is rebuilt,
-    /// so the rack has to be recreated exactly like an output change.
-    fn set_input_device(&mut self, name: &str) {
-        self.persist_active();
-        match self.audio_engine.as_mut().map(|e| e.set_input_device(name)) {
-            Some(Ok(true)) => self.rebuild_rack(),
-            Some(Ok(false)) => {}
-            Some(Err(e)) => {
-                eprintln!("choz: {e}");
-                return;
-            }
-            None => return,
-        }
-        self.ui.audio.input_device = name.to_string();
-        self.ui.save();
-        self.refresh_in_devices();
+    /// Enter (or a left click) on an IN row.
+    fn in_select(&mut self, row: usize) {
+        self.in_select_side(row, Assign::Toggle);
     }
 
-    /// Re-read the capture devices the graph publishes.
-    fn refresh_in_devices(&mut self) {
+    /// Re-read the graph's capture ports, so a card plugged in while choz runs
+    /// shows up. The JACK client is rebuilt, so the rack is recreated exactly
+    /// like an output change.
+    fn rescan_capture(&mut self) {
+        self.persist_active();
+        match self.audio_engine.as_mut().map(|e| e.rescan_inputs()) {
+            Some(Ok(true)) => self.rebuild_rack(),
+            Some(Ok(false)) => {}
+            Some(Err(e)) => eprintln!("choz: {e}"),
+            None => {}
+        }
+        self.refresh_in_ports();
+    }
+
+    /// Re-read the capture ports the engine wired up. Cheap, and only worth
+    /// doing when the client can have changed — the drawer redraws far more
+    /// often than the graph moves.
+    fn refresh_in_ports(&mut self) {
         if let Some(engine) = self.audio_engine.as_ref() {
-            self.in_devices = engine.input_devices();
+            self.in_ports = engine.input_ports().to_vec();
         }
     }
 
@@ -3395,7 +3836,8 @@ impl App {
             return multi_targets(&channels, self.active_slot, source, channel);
         }
         let bindings: Vec<Option<&InputRef>> = self.slots.iter().map(|s| s.input.as_ref()).collect();
-        note_targets(&bindings, &self.midi_connected, self.active_slot, source)
+        let channels: Vec<u8> = self.slots.iter().map(|s| s.channel).collect();
+        note_targets(&bindings, &channels, &self.midi_connected, self.active_slot, source, channel)
     }
 
     /// Where a note-on should go, remembered so its note-off can follow it.
@@ -3432,20 +3874,42 @@ impl App {
 
     /// The active tab's MIDI channel, or `None` in LIVE mode where it means
     /// nothing.
+    /// The channel button, when the channel means something.
+    ///
+    /// Always in MULTI, where a tab *is* a channel. In LIVE only when another
+    /// tab shares this one's input: that is the case where the channel picks
+    /// between them, and showing it on a lone tab would offer a setting that
+    /// changes nothing.
     fn tab_channel(&self) -> Option<u8> {
-        (self.ui.rack_mode == settings::RackMode::Multi)
-            .then(|| self.slots.get(self.active_slot).map(|s| s.channel))
-            .flatten()
+        let slot = self.slots.get(self.active_slot)?;
+        if self.ui.rack_mode == settings::RackMode::Multi {
+            return Some(slot.channel);
+        }
+        let input = slot.input.as_ref()?;
+        let shared = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| *i != self.active_slot && s.input.as_ref() == Some(input))
+            .count();
+        (shared > 0).then_some(slot.channel)
     }
 
-    /// Step the active tab's MIDI channel, wrapping 16 → 1.
+    /// Step the active tab's MIDI channel, wrapping 16 → ANY → 1.
     fn step_channel(&mut self, delta: i8) {
         // Notes already sounding were routed by the old channel; leaving them
         // would strand their note-offs.
         self.panic();
+        let live = self.ui.rack_mode == settings::RackMode::Live;
         if let Some(slot) = self.slots.get_mut(self.active_slot) {
-            let next = (slot.channel as i8 - 1 + delta).rem_euclid(16) + 1;
-            slot.channel = next as u8;
+            // MULTI has no "any": a tab there is a channel. LIVE cycles through
+            // ANY as the seventeenth position, which is how a split is turned
+            // off again.
+            slot.channel = if live {
+                (slot.channel as i8 + delta).rem_euclid(17) as u8
+            } else {
+                ((slot.channel.max(1) as i8 - 1 + delta).rem_euclid(16) + 1) as u8
+            };
         }
     }
 
@@ -3457,6 +3921,16 @@ impl App {
     fn toggle_rack_mode(&mut self) {
         self.panic();
         self.ui.rack_mode = self.ui.rack_mode.next();
+        // MULTI has no "any": a tab there *is* a channel, and one left on ANY
+        // would answer nothing at all. Tabs that came from LIVE get numbered on
+        // the way in, consecutively, which is the layout a DAW sends.
+        if self.ui.rack_mode == settings::RackMode::Multi {
+            for (i, slot) in self.slots.iter_mut().enumerate() {
+                if slot.channel == ANY_CHANNEL {
+                    slot.channel = (i % 16) as u8 + 1;
+                }
+            }
+        }
         self.ui.save();
         eprintln!("choz: rack mode {}", self.ui.rack_mode.label());
     }
@@ -3500,10 +3974,15 @@ impl App {
     fn push_slot(&mut self, source: AudioSource) {
         self.persist_active();
         let mut slot = RackSlot::new(source.clone());
-        // Tabs land on consecutive MIDI channels, which is the layout a DAW's
-        // orchestral template sends by default. Past 16 they wrap; a rack that
-        // big is sharing channels on purpose.
-        slot.channel = (self.slots.len() % 16) as u8 + 1;
+        // In MULTI a tab is a channel, and consecutive is the layout a DAW's
+        // orchestral template sends by default (past 16 they wrap; a rack that
+        // big is sharing channels on purpose). In LIVE a new tab answers **any**
+        // channel: it is another patch on the same port, not a split, and the
+        // user opts into a split by giving it a number.
+        slot.channel = match self.ui.rack_mode {
+            settings::RackMode::Multi => (self.slots.len() % 16) as u8 + 1,
+            settings::RackMode::Live => ANY_CHANNEL,
+        };
         self.slots.push(slot);
         self.active_slot = self.slots.len() - 1;
         self.source = source;
@@ -3709,6 +4188,9 @@ impl App {
         // Engine slots are new after a reload, so they start on the default
         // pair — put every tab back where the user routed it.
         self.apply_routing();
+        // A reload is the one thing that can have rebuilt the JACK client, so
+        // it is where the capture ports can have changed under us.
+        self.refresh_in_ports();
     }
 
     /// One-line summary of the active tab: position, instrument and bound input.
@@ -3758,7 +4240,20 @@ impl App {
         // A tab fed by live audio ignores its instrument, so say so instead of
         // naming a plugin that isn't being heard.
         if let Some((l, r)) = self.slots.get(self.active_slot).and_then(|s| s.in_pair) {
-            return format!("{} {}/{}", i18n::t("AUDIO IN"), l + 1, r + 1);
+            // One jack is one number: "AUDIO IN 5", not "5/5".
+            let jacks = match l == r {
+                true => format!("{} {}", i18n::t("AUDIO IN"), l + 1),
+                false => format!("{} {}/{}", i18n::t("AUDIO IN"), l + 1, r + 1),
+            };
+            // `A→M` plays the tab's **instrument**, not its FX chain. A tab with
+            // no instrument converts the pitch perfectly and then has nothing to
+            // play it on, which from the outside is indistinguishable from a
+            // tracker that does not work — so it says so.
+            let a2m = self.slots.get(self.active_slot).is_some_and(|s| s.pitch_to_midi);
+            if a2m && matches!(self.source, AudioSource::Midi) {
+                return format!("{jacks} \u{2192} A\u{2192}M needs an instrument [1]");
+            }
+            return jacks;
         }
         match &self.source {
             AudioSource::Midi => "(none)".to_string(),
@@ -3776,6 +4271,40 @@ impl App {
     /// Send one live parameter change to the FX at UI index `fx_idx` of the
     /// active slot. Disabled entries aren't in the engine's chain, so the index
     /// has to be translated.
+    /// Move FX `fx`'s parameter `param` to `value`, and everything that
+    /// follows from it: the working copy, the dry/wet, a preset's knock-on
+    /// values, the live processor, and the rebuild flag.
+    ///
+    /// One place, because there are three callers — a CC, a click, and the
+    /// picker modal — and each of them getting this subtly wrong in its own way
+    /// is how a knob ends up moving in the UI and not in the audio.
+    fn set_fx_param(&mut self, fx: usize, param: usize, value: f32) {
+        let Some(entry) = self.fx_chain.get_mut(fx) else { return };
+        let Some(p) = entry.params.get_mut(param) else { return };
+        *p = value;
+        let is_mix = entry.is_mix_param(param);
+        if is_mix {
+            entry.wet = value;
+        }
+        // A preset knob fills in the knobs below it, and those are what the
+        // rebuild and the project read.
+        let preset = entry.apply_preset(param);
+        let kind = entry.kind;
+        let native = entry.plugin.is_none();
+        let idx = if is_mix { choz_engine::FX_MIX_PARAM } else { param };
+        self.set_live_fx_param(fx, idx, value);
+        // Only rebuild when the processor cannot take the value live. A rebuild
+        // replaces **every** processor in the chain, so it throws away the
+        // reverb's tail and the delay's buffer — nudging one knob used to cut
+        // the sound of everything else in the slot. The fader also sends ~100
+        // CCs a second, and rebuilding per message floods the command ring
+        // (note-offs get dropped: notes hang), so when it is needed it is
+        // marked and done once per drain.
+        if preset || (native && !source::AudioFxEntry::takes_live_params(kind)) {
+            self.fx_dirty = true;
+        }
+    }
+
     fn set_live_fx_param(&mut self, fx_idx: usize, param: usize, value: f32) {
         let Some(engine_fx) = self.engine_fx_index(fx_idx) else { return };
         let slot = self.active_slot;
@@ -4045,10 +4574,12 @@ impl App {
                 if is_mix {
                     entry.wet = value;
                 }
+                entry.apply_preset(p_idx);
+                let kind = entry.kind;
                 let native = entry.plugin.is_none();
                 let param = if is_mix { choz_engine::FX_MIX_PARAM } else { p_idx };
                 self.set_live_fx_param(fx_idx, param, value);
-                if native {
+                if native && !source::AudioFxEntry::takes_live_params(kind) {
                     self.fx_dirty = true;
                 }
             }
@@ -4270,9 +4801,6 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Screen>>, app: &mut App) -> 
                 if !audio.device.is_empty() {
                     eng.set_output_device_preference(&audio.device);
                 }
-                if !audio.input_device.is_empty() {
-                    eng.set_input_device_preference(&audio.input_device);
-                }
                 if eng.start().is_ok() {
                     app.audio_engine = Some(eng);
                     app.connect_midi();
@@ -4285,7 +4813,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Screen>>, app: &mut App) -> 
                     }
                     app.apply_osc_settings();
                     app.discover_synths(false);
-                    app.refresh_in_devices();
+                    app.refresh_in_ports();
                     // A project rebuilds the whole rack, so it goes first and a
                     // file argument still lands on the tab that ends up active.
                     if let Some(path) = cli.project {
@@ -4307,6 +4835,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Screen>>, app: &mut App) -> 
         app.tick_notes();
         app.poll_editor();
         app.poll_plugin_touch();
+        app.tick_automation();
     }
     Ok(())
 }
@@ -4351,6 +4880,11 @@ fn handle_key(app: &mut App, key: KeyCode) {
     // with the plugin's window focused still has to be killable from the TUI.
     if key == KeyCode::Char('P') && app.modal.is_none() {
         app.panic();
+        return;
+    }
+    // The monitor's tabs, from anywhere: the panel has no focus of its own.
+    if key == KeyCode::F(5) && app.modal.is_none() {
+        app.monitor_tab = app.monitor_tab.next();
         return;
     }
     // The rack mode switch, from anywhere: it changes what every note does.
@@ -4491,10 +5025,20 @@ fn handle_modal_key(app: &mut App, key: KeyCode) {
         KeyCode::Left | KeyCode::Right
             if kind == ModalKind::PluginPaths
                 && app.modal.as_ref().is_some_and(|m| m.list.filter == TAB_THEME)
-                && app.theme_row(cursor) == Some(ThemeRow::Tint) =>
+                && matches!(
+                    app.theme_row(cursor),
+                    Some(ThemeRow::Tint) | Some(ThemeRow::PanelColor)
+                ) =>
         {
-            let delta = if key == KeyCode::Right { TINT_STEP as i16 } else { -(TINT_STEP as i16) };
-            app.step_tint(delta);
+            let up = key == KeyCode::Right;
+            if app.theme_row(cursor) == Some(ThemeRow::Tint) {
+                app.step_tint(if up { TINT_STEP as i16 } else { -(TINT_STEP as i16) });
+            } else {
+                app.ui.step_panel_tint(if up { 1 } else { -1 });
+                app.ui.save();
+                app.apply_ui_settings();
+                app.refresh_modal();
+            }
         }
         // Value arrows in the instrument editor; filter chips everywhere else.
         KeyCode::Left | KeyCode::Right => {
@@ -4579,10 +5123,17 @@ fn handle_source_keys(app: &mut App, key: KeyCode) {
     match key {
         KeyCode::Up => app.input_cursor = in_step(app, -1),
         KeyCode::Down => app.input_cursor = in_step(app, 1),
-        // Bind a note input to a rack tab, or feed the tab from a capture pair.
-        KeyCode::Enter => app.in_select(app.input_cursor),
+        // Bind a note input to a rack tab, or take a capture channel on and off
+        // the tab. Enter and Space are the same gesture, which is what makes a
+        // stereo pair out of any two jacks: press on each of them.
+        KeyCode::Enter | KeyCode::Char(' ') => app.in_select(app.input_cursor),
         KeyCode::Char('c') => app.toggle_selected_input(),
-        KeyCode::Char('r') => app.connect_midi(),
+        // Rescan: the note inputs *and* the graph's capture ports, because a
+        // card plugged in after start-up is the same kind of surprise.
+        KeyCode::Char('r') => {
+            app.connect_midi();
+            app.rescan_capture();
+        }
         KeyCode::Esc => app.toggle_in_drawer(),
         // The QWERTY piano plays the active tab from any panel.
         _ => {
@@ -4598,7 +5149,9 @@ fn handle_output_keys(app: &mut App, key: KeyCode) {
     match key {
         KeyCode::Up => app.out_cursor = out_step(app, -1),
         KeyCode::Down => app.out_cursor = out_step(app, 1),
-        KeyCode::Enter => app.out_select(app.out_cursor),
+        // One channel at a time: Enter (or Space) on 3 and again on 9 is a tab
+        // playing out of two jacks that are not a pair.
+        KeyCode::Enter | KeyCode::Char(' ') => app.out_select(app.out_cursor),
         KeyCode::Char('r') => app.refresh_out_devices(),
         KeyCode::Esc => app.toggle_out_drawer(),
         // The QWERTY piano plays the active tab from any panel.
@@ -4674,11 +5227,16 @@ fn multi_targets(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn note_targets(
     bindings: &[Option<&InputRef>],
+    // Each tab's MIDI channel, 1-based, as MULTI uses it.
+    channels: &[u8],
     midi_connected: &[String],
     active_slot: usize,
     source: choz_engine::input::InputSource,
+    // The channel the note arrived on, 0-based off the wire.
+    channel: u8,
 ) -> Vec<usize> {
     use choz_engine::input::InputSource as S;
     let input = match source {
@@ -4698,16 +5256,33 @@ fn note_targets(
         .map(|(i, _)| i)
         .collect();
     // Several tabs on one port are alternative configurations of it, not a
-    // layer: the active one plays, the others stay silent until clicked. With a
-    // single tab bound this is the same list either way.
-    // When the active tab is elsewhere, the first of the group answers, so a
-    // port is never played by two tabs at once.
+    // layer: exactly one of them answers a note.
     if bound.len() > 1 {
+        // First ask the channel. A controller with a split keyboard, or two
+        // sequencer tracks on one cable, sends different channels down the same
+        // port — and a tab that says it listens to channel 3 should get channel
+        // 3 whether or not it is the one on screen.
+        let on_channel: Vec<usize> = bound
+            .iter()
+            .copied()
+            .filter(|i| {
+                channels.get(*i).is_some_and(|c| *c != ANY_CHANNEL && *c - 1 == channel)
+            })
+            .collect();
+        if !on_channel.is_empty() {
+            return vec![if on_channel.contains(&active_slot) { active_slot } else { on_channel[0] }];
+        }
+        // Nobody claims it: the active tab answers, and if it is elsewhere the
+        // first of the group does, so a port is never played by two at once.
         return vec![if bound.contains(&active_slot) { active_slot } else { bound[0] }];
     }
     bound
 }
 
+
+/// A tab that answers every MIDI channel of its port. The default in LIVE,
+/// where a tab is a patch rather than a part.
+const ANY_CHANNEL: u8 = 0;
 
 /// Directories scanned for SoundFonts in the SOURCE picker.
 fn sf2_dirs() -> Vec<std::path::PathBuf> {
@@ -4816,6 +5391,12 @@ fn handle_fx_keys(app: &mut App, key: KeyCode) {
         }
         // Parameters of the tab's own instrument (plugin instruments only).
         KeyCode::Char('p') => app.open_instr_modal(),
+        // A named parameter — a preset, a key, a scale, a mode — is a list, so
+        // Enter opens the list. Stepping through eighteen Winamp presets with
+        // an arrow key is a knob pretending to be a menu.
+        KeyCode::Enter if app.rack_focus != RackFocus::Instrument => {
+            app.open_fx_choice(app.fx_param);
+        }
         // The plugin's own window, for plugins that have one.
         KeyCode::Char('4') | KeyCode::Char('g') => app.toggle_editor(None),
         KeyCode::Char('G') => app.toggle_editor(Some(app.fx_slot)),
@@ -4828,6 +5409,12 @@ fn handle_fx_keys(app: &mut App, key: KeyCode) {
         KeyCode::Char('+') | KeyCode::Char('=') => adjust_gain(app, 0.05),
         KeyCode::Char(',') => adjust_pan(app, -0.1),
         KeyCode::Char('.') => adjust_pan(app, 0.1),
+        // The input strip, on the keys next to the volume ones: a guitar's
+        // trim, and how hard it has to be hit before `A→M` calls it a note.
+        KeyCode::Char('<') => app.adjust_in_trim(-0.05, 0.0),
+        KeyCode::Char('>') => app.adjust_in_trim(0.05, 0.0),
+        KeyCode::Char(';') => app.adjust_in_trim(0.0, -0.05),
+        KeyCode::Char(':') => app.adjust_in_trim(0.0, 0.05),
         KeyCode::Char('m') => app.with_active_mix(|s| s.mute = !s.mute),
         KeyCode::Char('S') => app.with_active_mix(|s| s.solo = !s.solo),
         KeyCode::Char(' ') => {
@@ -4851,6 +5438,9 @@ fn handle_fx_keys(app: &mut App, key: KeyCode) {
 
 /// Max linear slot gain (+6 dB).
 const MAX_GAIN: f32 = 2.0;
+
+/// How much AutoTune history the strip under the knobs shows.
+const AUTOTUNE_TRACE: usize = 240;
 
 fn adjust_gain(app: &mut App, delta: f32) {
     app.with_active_mix(|s| s.gain = (s.gain + delta).clamp(0.0, MAX_GAIN));
@@ -4903,6 +5493,21 @@ fn handle_transport_keys(app: &mut App, key: KeyCode) {
         KeyCode::Char(' ') => toggle_play(app),
         KeyCode::Char('s') => stop_play(app),
         KeyCode::Char('p') => app.panic(),
+        // The automation loop's length, in bars.
+        KeyCode::Left => app.nudge_automation_loop(-1),
+        KeyCode::Right => app.nudge_automation_loop(1),
+        // Arming is a toggle, and it starts the transport if it is stopped:
+        // recording into a clock that is not running records one instant.
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            app.automation.recording = !app.automation.recording;
+            if app.automation.recording && !app.playing {
+                toggle_play(app);
+            }
+        }
+        KeyCode::Char('x') | KeyCode::Char('X') => {
+            app.automation.clear(None);
+            app.automation.recording = false;
+        }
         KeyCode::Char('o') => app.toggle_out_drawer(),
         _ => {}
     }
@@ -4943,10 +5548,17 @@ enum MouseAction {
     TransportStop,
     /// Kill every sounding note, everywhere.
     Panic,
+    /// Turn the active tab's audio input into notes for its instrument.
+    TogglePitchToMidi,
+    /// Show one of the monitor's tabs.
+    MonitorTab(views::midi_monitor::MonitorTab),
     ToggleInDrawer,
     ToggleOutDrawer,
     OutputDevice(usize),
     InputBind(usize),
+    /// Right click on a drawer row: take that channel off the active tab.
+    OutputUnassign(usize),
+    InputUnassign(usize),
     InputToggle(usize),
     OpenSourcePicker,
     ScanInputs,
@@ -4964,6 +5576,10 @@ enum MouseAction {
     RackTabAdd,
     MixGain(f32),
     MixPan(f32),
+    /// `(input trim, A→M sensitivity)`, each a delta on that knob's travel.
+    InTrim(f32, f32),
+    /// Lengthen or shorten the automation loop, in bars.
+    AutomationLoop(i32),
     MixMute,
     MixSolo,
 }
@@ -5009,6 +5625,12 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                 return MouseAction::FocusPanel(Focus::Source);
             }
 
+            for &(tab, rect) in layout.monitor_tabs.iter() {
+                if rect.contains(pos) {
+                    return MouseAction::MonitorTab(tab);
+                }
+            }
+
             if layout.fx_chain_area.contains(pos) {
                 let rack = &layout.rack;
                 for &(btn, rect) in rack.buttons.iter() {
@@ -5018,6 +5640,7 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                             RackButton::Source => MouseAction::OpenSourcePicker,
                             RackButton::Preset => MouseAction::OpenPresetPicker,
                             RackButton::Learn => MouseAction::OpenLearnPicker,
+                            RackButton::PitchToMidi => MouseAction::TogglePitchToMidi,
                             RackButton::Gui => MouseAction::ToggleEditor,
                             RackButton::Sandbox => MouseAction::ToggleSandbox,
                             RackButton::PresetPrev => MouseAction::PresetStep(-1),
@@ -5080,6 +5703,14 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                 if layout.panic_rect.is_some_and(|r| r.contains(pos)) {
                     return MouseAction::Panic;
                 }
+                if let Some(r) = layout.loop_rect {
+                    if r.contains(pos) {
+                        // Left half shortens, right half lengthens — the two
+                        // arrows the cell is drawn with.
+                        let d = if pos.x < r.x + r.width / 2 { -1 } else { 1 };
+                        return MouseAction::AutomationLoop(d);
+                    }
+                }
                 if layout.out_device_rect.is_some_and(|r| r.contains(pos)) {
                     return MouseAction::ToggleOutDrawer;
                 }
@@ -5100,8 +5731,33 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
 
             MouseAction::None
         }
+        // The right button only means one thing, and only over the two drawers:
+        // take this channel off the tab. Everywhere else it does nothing.
+        MouseEventKind::Down(MouseButton::Right) => {
+            if layout.source_area.contains(pos) {
+                for &(ii, rect) in layout.input_item_rects.iter() {
+                    if rect.contains(pos) {
+                        return MouseAction::InputUnassign(ii);
+                    }
+                }
+            }
+            if layout.output_area.contains(pos) {
+                for &(di, rect) in layout.output_item_rects.iter() {
+                    if rect.contains(pos) {
+                        return MouseAction::OutputUnassign(di);
+                    }
+                }
+            }
+            MouseAction::None
+        }
         MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
             let dir = if matches!(kind, MouseEventKind::ScrollUp) { 1.0 } else { -1.0 };
+            for &(tab, rect) in layout.monitor_tabs.iter() {
+                if rect.contains(pos) {
+                    return MouseAction::MonitorTab(tab);
+                }
+            }
+
             if layout.fx_chain_area.contains(pos) {
                 let rack = &layout.rack;
                 if rack.gain.is_some_and(|r| r.contains(pos)) {
@@ -5109,6 +5765,12 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                 }
                 if rack.pan.is_some_and(|r| r.contains(pos)) {
                     return MouseAction::MixPan(dir * 0.1);
+                }
+                if rack.in_gain.is_some_and(|r| r.contains(pos)) {
+                    return MouseAction::InTrim(dir * 0.05, 0.0);
+                }
+                if rack.in_gate.is_some_and(|r| r.contains(pos)) {
+                    return MouseAction::InTrim(0.0, dir * 0.05);
                 }
                 for &(pi, rect) in rack.instr_knobs.iter() {
                     if rect.contains(pos) {
@@ -5229,6 +5891,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             app.fx_param = 0;
         }
         MouseAction::FxParam(pi) => {
+            // A click on a named parameter opens its list rather than nudging
+            // it: there is nothing to nudge, only positions to choose.
+            if app.fx_param == pi && app.open_fx_choice(pi) {
+                return;
+            }
             app.focus = Focus::FxChain;
             app.rack_focus = RackFocus::Fx;
             app.fx_param = pi;
@@ -5259,6 +5926,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             app.fx_slot = old_slot;
             app.fx_param = old_param;
         }
+        MouseAction::TogglePitchToMidi => app.toggle_pitch_to_midi(),
+        MouseAction::MonitorTab(tab) => app.monitor_tab = tab,
         MouseAction::Panic => app.panic(),
         MouseAction::ChannelStep(d) => app.step_channel(d),
         MouseAction::FxAdd => app.open_add_fx_modal(),
@@ -5306,12 +5975,25 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         MouseAction::OutputDevice(i) => {
             app.focus = Focus::Output;
             app.out_cursor = i;
-            app.out_select(i);
+            // The left button assigns. It is not a toggle, so clicking a
+            // channel twice is not the same as clicking it and taking it back —
+            // that is what the right button is for.
+            app.out_select_side(i, Assign::On);
+        }
+        MouseAction::OutputUnassign(i) => {
+            app.focus = Focus::Output;
+            app.out_cursor = i;
+            app.out_select_side(i, Assign::Off);
         }
         MouseAction::InputBind(i) => {
             app.focus = Focus::Source;
             app.input_cursor = i;
-            app.in_select(i);
+            app.in_select_side(i, Assign::On);
+        }
+        MouseAction::InputUnassign(i) => {
+            app.focus = Focus::Source;
+            app.input_cursor = i;
+            app.in_select_side(i, Assign::Off);
         }
         MouseAction::InputToggle(i) => {
             app.focus = Focus::Source;
@@ -5322,6 +6004,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         MouseAction::ScanInputs => {
             app.focus = Focus::Source;
             app.connect_midi();
+            app.rescan_capture();
         }
         MouseAction::PresetStep(d) => app.step_preset(d),
         MouseAction::OpenPresetPicker => app.open_preset_modal(),
@@ -5344,6 +6027,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         }
         MouseAction::MixGain(d) => adjust_gain(app, d),
         MouseAction::MixPan(d) => adjust_pan(app, d),
+        MouseAction::InTrim(g, s) => app.adjust_in_trim(g, s),
+        MouseAction::AutomationLoop(d) => {
+            app.focus = Focus::Transport;
+            app.nudge_automation_loop(d);
+        }
         MouseAction::MixMute => app.with_active_mix(|s| s.mute = !s.mute),
         MouseAction::MixSolo => app.with_active_mix(|s| s.solo = !s.solo),
     }
@@ -5622,14 +6310,30 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     let tabs: Vec<String> = app.slots.iter().map(tab_label).collect();
     let mix = app.slots.get(app.active_slot).map(|s| (s.gain, s.pan, s.mute, s.solo));
+    // AutoTune draws a live reading under its knobs, and the reading is only
+    // meaningful for the effect the cursor is on.
+    let at_selected = app
+        .fx_chain
+        .get(app.fx_slot)
+        .is_some_and(|e| e.plugin.is_none() && e.kind == source::AudioFxKind::AutoTune);
+    let at_view = if at_selected {
+        let m = choz_engine::fx::autotune::meter::meter().read();
+        app.autotune_trace.remove(0);
+        app.autotune_trace.push(if m.voiced { m.pitch_error_cents } else { f32::NAN });
+        Some((m, app.autotune_trace.as_slice()))
+    } else {
+        None
+    };
     let rack = views::fx_chain_panel::draw_fx_chain_panel(
         f, fx_chain_area, &app.fx_chain,
         app.fx_slot, app.fx_param, app.focus == Focus::FxChain,
         &tabs, app.active_slot, mix, &app.instrument_label(),
         app.active_preset_label().as_deref(), app.has_editor(), app.has_fx_editor(),
         app.sbx_state(None), app.sbx_state(Some(app.fx_slot)),
-        app.tab_channel(), &app.instr_knobs(), app.instr_param,
+        app.tab_channel(), app.pitch_to_midi_state(), &app.instr_knobs(), app.instr_param,
         app.rack_focus == RackFocus::Instrument,
+        app.in_trim_state(),
+        at_view,
     );
     app.layout.borrow_mut().rack = rack;
 
@@ -5637,7 +6341,9 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     if monitor_area.height > 0 {
         let log: Vec<midi::InputEvent> = app.midi_log.iter().copied().collect();
-        views::midi_monitor::draw_midi_monitor(f, monitor_area, &log, &app.midi_ports);
+        let tabs =
+            views::midi_monitor::draw_midi_monitor(f, monitor_area, &log, &app.midi_ports, app.monitor_tab);
+        app.layout.borrow_mut().monitor_tabs = tabs;
     }
 
     if app.modal.is_some() {
@@ -5825,12 +6531,58 @@ fn draw_transport(f: &mut Frame, app: &App, area: Rect) {
         Rect::new(inner.x + 16, btn_row, stop_label.len() as u16, 1),
     );
 
+    // Automation: arm it here, because it only means anything while the
+    // transport rolls — which is the thing this panel is about.
+    let rec_on = app.automation.recording;
+    let rec_label = if rec_on { " [ \u{25CF} REC ]" } else { " [ \u{25CB} REC ]" };
+    let (rec_bg, rec_fg) = if rec_on {
+        (ERR, Color::Black)
+    } else if app.automation.is_empty() {
+        (Color::Rgb(40, 28, 28), DIM)
+    } else {
+        // Lanes exist and are playing back: not armed, but not idle either.
+        (Color::Rgb(60, 48, 20), Color::Rgb(230, 200, 120))
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            rec_label,
+            Style::default().fg(rec_fg).bg(rec_bg).add_modifier(Modifier::BOLD),
+        )))
+        .style(views::theme::panel_style()),
+        Rect::new(inner.x + 28, btn_row, rec_label.chars().count() as u16, 1),
+    );
+
+    // How long the automation loop is, in bars — the one number a lane is
+    // measured against, and until now a constant nobody could reach.
+    let bars = app.automation_loop_bars();
+    let loop_label = format!(" [ \u{25C0} LOOP {bars:>2} \u{25B6} ]");
+    let loop_rect =
+        Rect::new(inner.x + 40, btn_row, loop_label.chars().count() as u16, 1);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            loop_label,
+            Style::default()
+                .fg(Color::Rgb(230, 200, 120))
+                .bg(Color::Rgb(40, 40, 48))
+                .add_modifier(Modifier::BOLD),
+        )))
+        .style(views::theme::panel_style()),
+        loop_rect,
+    );
+    app.layout.borrow_mut().loop_rect = Some(loop_rect);
+
     // Row 2: status text
     let status_y = btn_row + 1;
+    let lanes = app.automation.lanes.iter().filter(|l| !l.points.is_empty()).count();
+    let auto = match (rec_on, lanes) {
+        (true, _) => "  \u{25CF} REC".to_string(),
+        (false, 0) => String::new(),
+        (false, n) => format!("  {n} lane(s) [R]=rec [X]=clear"),
+    };
     let state_text = if app.playing {
-        "  ▶ PLAYING  |  [Space]=pause  [S]=stop  [P]=panic".to_string()
+        format!("  \u{25B6} PLAYING  |  [Space]=pause  [S]=stop  [P]=panic{auto}")
     } else {
-        "  ■ STOPPED  |  [Space]=play  [S]=stop  [P]=panic".to_string()
+        format!("  \u{25A0} STOPPED  |  [Space]=play  [S]=stop  [P]=panic{auto}")
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -6095,8 +6847,10 @@ mod tests {
                 f, f.area(), &app.fx_chain, app.fx_slot, app.fx_param, true,
                 &tabs, app.active_slot, mix, &app.instrument_label(), None, false, false,
                 Default::default(), Default::default(),
-                app.tab_channel(), &app.instr_knobs(), app.instr_param,
+                app.tab_channel(), app.pitch_to_midi_state(), &app.instr_knobs(), app.instr_param,
                 app.rack_focus == RackFocus::Instrument,
+                app.in_trim_state(),
+                None,
             );
         })
         .unwrap();
@@ -6109,7 +6863,7 @@ mod tests {
     /// Language and text colour are process-wide (the draw code reads them from
     /// globals), so the test that switches them and the tests that render have
     /// to take turns.
-    fn ui_guard() -> std::sync::MutexGuard<'static, ()> {
+    fn ui_guard() -> views::theme::UiGuard {
         // The lock lives in `theme` so the panels' own tests can take it too.
         views::theme::ui_guard()
     }
@@ -6529,8 +7283,10 @@ mod tests {
                 &tabs, app.active_slot, mix, &app.instrument_label(), preset.as_deref(),
                 app.has_editor(), app.has_fx_editor(),
                 app.sbx_state(None), app.sbx_state(Some(app.fx_slot)),
-                app.tab_channel(), &app.instr_knobs(), app.instr_param,
+                app.tab_channel(), app.pitch_to_midi_state(), &app.instr_knobs(), app.instr_param,
                 app.rack_focus == RackFocus::Instrument,
+                app.in_trim_state(),
+                None,
             );
         })
         .unwrap();
@@ -7059,9 +7815,13 @@ mod tests {
         assert_eq!(views::theme::border(), app.ui.border(), "and so do the frames");
         // A scheme with a desktop colour sets the background too.
         assert_eq!(app.ui.background, settings::Background::Color(theme.desktop.unwrap()));
-        // The marker moves to the chosen row.
+        // The marker moves to the chosen row. The scheme block itself moved:
+        // picking a desktop colour added the wash rows above it, so the header
+        // has to be found again rather than remembered.
         app.refresh_modal();
-        assert!(app.modal.as_ref().unwrap().list.items[schemes + 2].contains('\u{25CF}'));
+        let items = app.modal.as_ref().unwrap().list.items.clone();
+        let schemes = items.iter().position(|i| i == "COLOUR SCHEME").expect("second header");
+        assert!(items[schemes + 2].contains('\u{25CF}'));
 
         // Back to a scheme without a desktop: the background goes with it.
         app.modal.as_mut().unwrap().list.cursor = schemes + 1;
@@ -7349,9 +8109,10 @@ mod tests {
 
         // Engine rows: the same ones seqterm shows.
         let rows = app.modal.as_ref().unwrap().list.items.join("\n");
-        for label in
-            ["Backend", "Device", "Sample rate", "Buffer size", "Tempo", "SF2 engine", "Latency"]
-        {
+        for label in [
+            "Backend", "Device", "Sample rate", "Buffer size", "Tempo", "Time signature",
+            "SF2 engine", "Latency",
+        ] {
             assert!(rows.contains(label), "{label} missing:\n{rows}");
         }
         assert!(rows.contains("5.3 ms"), "latency is computed: {rows}");
@@ -7382,6 +8143,16 @@ mod tests {
             "the row shows the clock plugins actually see"
         );
         transport.set_bpm(choz_ports::Transport::DEFAULT_BPM);
+
+        // The time signature is the row under it, and cycles.
+        transport.set_time_signature(4, 4);
+        app.modal.as_mut().unwrap().list.cursor = 5;
+        app.audio_settings_key(KeyCode::Right);
+        assert_eq!(transport.time_signature(), (3, 4));
+        app.refresh_modal();
+        assert!(app.modal.as_ref().unwrap().list.items[5].contains("3/4"), "the row follows");
+        app.audio_settings_key(KeyCode::Left);
+        assert_eq!(transport.time_signature(), (4, 4), "and it goes back");
 
         // Those need a restart, and the rows say so.
         app.audio_engine = None;
@@ -7430,11 +8201,25 @@ mod tests {
         sandbox_state_dir();
         let mut app = App::new();
 
-        // No image: no slider row at all.
+        // The terminal's own background: choz cannot read that colour, so there
+        // is nothing to be translucent against and neither row is offered.
+        app.ui.background = settings::Background::Terminal;
+        assert!(
+            (0..app.theme_rows().len()).all(|i| {
+                !matches!(app.theme_row(i), Some(ThemeRow::Tint) | Some(ThemeRow::PanelColor))
+            }),
+            "nothing to blend with on the terminal's own background"
+        );
+
+        // A flat colour is something to see through, so both rows appear.
         app.ui.background = settings::Background::Color((1, 2, 3));
         assert!(
-            (0..app.theme_rows().len()).all(|i| app.theme_row(i) != Some(ThemeRow::Tint)),
-            "nothing to see through without an image"
+            (0..app.theme_rows().len()).any(|i| app.theme_row(i) == Some(ThemeRow::Tint)),
+            "a flat desktop can be washed too"
+        );
+        assert!(
+            (0..app.theme_rows().len()).any(|i| app.theme_row(i) == Some(ThemeRow::PanelColor)),
+            "and the colour of that wash is a choice"
         );
 
         app.ui.background = settings::Background::Image {
@@ -7650,7 +8435,9 @@ mod tests {
         let _restore = UiRestore;
         sandbox_state_dir();
         let mut app = App::new();
-        // Three tabs on the same MIDI port, on channels 1, 2 and 3.
+        // Three tabs on the same MIDI port. Numbered in MULTI, where a tab *is*
+        // a channel; in LIVE they would land on ANY.
+        app.ui.rack_mode = settings::RackMode::Multi;
         for _ in 0..3 {
             app.push_slot(AudioSource::Midi);
         }
@@ -7666,11 +8453,24 @@ mod tests {
 
         let midi = choz_engine::input::InputSource::Midi(0);
 
-        // LIVE: whatever the channel, only the active tab plays.
+        // LIVE: one tab answers a note, and among tabs sharing a port the
+        // channel is what picks which — a split keyboard, or two sequencer
+        // tracks down one cable, land on different tabs.
         app.ui.rack_mode = settings::RackMode::Live;
         app.active_slot = 1;
-        assert_eq!(app.targets_for(midi, 0), vec![1]);
-        assert_eq!(app.targets_for(midi, 2), vec![1], "the channel is noise here");
+        assert_eq!(app.targets_for(midi, 0), vec![0], "channel 1 → the tab set to 1");
+        assert_eq!(app.targets_for(midi, 1), vec![1]);
+        assert_eq!(app.targets_for(midi, 2), vec![2], "even though tab 1 is the active one");
+        // A channel nobody claims falls back to the tab in front of the user.
+        assert_eq!(app.targets_for(midi, 9), vec![1], "no tab listens to channel 10");
+        // Two tabs on the same channel are still one voice in LIVE: the active
+        // one if it is among them, otherwise the first — never both.
+        app.slots[2].channel = 2;
+        assert_eq!(app.targets_for(midi, 1), vec![1]);
+        app.active_slot = 0;
+        assert_eq!(app.targets_for(midi, 1), vec![1], "the first of the two, not both");
+        app.slots[2].channel = 3;
+        app.active_slot = 1;
 
         // …and an unbound program change selects a tab, like a live rig.
         app.apply_program_button(2);
@@ -8358,12 +9158,196 @@ mod tests {
         assert!(app.fx_chain.is_empty(), "the new tab starts with its own empty chain");
         assert_eq!(app.slots[0].fx_chain.len(), 1, "the first tab kept its FX");
 
-        // One port, two configurations: only the active tab is fed.
+        // One port, two configurations: only the active tab is fed. Both land
+        // on ANY, because in LIVE a new tab is another patch and not a split.
+        assert_eq!(app.slots[1].channel, ANY_CHANNEL);
         let connected = vec!["Keystation".to_string()];
         let bindings: Vec<Option<&InputRef>> =
             app.slots.iter().map(|s| s.input.as_ref()).collect();
-        assert_eq!(note_targets(&bindings, &connected, 1, InputSource::Midi(0)), vec![1]);
-        assert_eq!(note_targets(&bindings, &connected, 0, InputSource::Midi(0)), vec![0]);
+        let channels: Vec<u8> = app.slots.iter().map(|s| s.channel).collect();
+        assert_eq!(note_targets(&bindings, &channels, &connected, 1, InputSource::Midi(0), 0), vec![1]);
+        assert_eq!(note_targets(&bindings, &channels, &connected, 0, InputSource::Midi(0), 0), vec![0]);
+    }
+
+    /// The loop's length is the one number a lane is measured against, and it
+    /// is shown in **bars** because "16 beats" means nothing in 6/8.
+    #[test]
+    fn the_automation_loop_is_as_long_as_the_user_says() {
+        let _g = ui_guard();
+        let clock = choz_ports::transport();
+        clock.set_time_signature(4, 4);
+        let mut app = App::new();
+
+        assert_eq!(app.automation_loop_bars(), 4, "four bars of four by default");
+        app.nudge_automation_loop(4);
+        assert_eq!(app.automation_loop_bars(), 8);
+        assert_eq!(app.automation.loop_beats, 32.0, "and eight bars of four is 32 beats");
+        app.nudge_automation_loop(-100);
+        assert_eq!(app.automation_loop_bars(), 1, "one bar is as short as a loop gets");
+
+        // A bar is what the time signature says it is: eight bars of 6/8 is 24
+        // quarter notes, not 32.
+        clock.set_time_signature(6, 8);
+        app.nudge_automation_loop(7);
+        assert_eq!(app.automation_loop_bars(), 8);
+        assert_eq!(app.automation.loop_beats, 24.0);
+        clock.set_time_signature(4, 4);
+    }
+
+    /// Record a fader move against the clock, then let it move on its own.
+    ///
+    /// The whole loop, through the app: arm, roll the transport, move a control,
+    /// disarm, wind the clock forward and watch the value come back.
+    #[test]
+    fn a_recorded_move_plays_itself_back_on_the_next_pass() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.push_slot(AudioSource::Midi);
+
+        let clock = choz_ports::transport();
+        clock.set_sample_rate(48_000);
+        clock.set_bpm(120.0); // one beat every half second
+        clock.set_time_signature(4, 4);
+        clock.rewind();
+        app.automation.loop_beats = 4.0;
+        app.playing = true;
+
+        // Arm and move the fader a beat in.
+        app.automation.recording = true;
+        app.tick_automation();
+        clock.advance(24_000); // half a second = one beat
+        app.slots[0].gain = 1.5;
+        app.tick_automation();
+        app.automation.recording = false;
+
+        let lane = app
+            .automation
+            .lanes
+            .iter()
+            .find(|l| l.target == LearnTarget::Gain(0))
+            .expect("the fader that moved has a lane");
+        assert_eq!(lane.points.len(), 2, "where it started and where it went");
+        assert!((lane.points[1].0 - 1.0).abs() < 0.01, "one beat in: {:?}", lane.points);
+
+        // Wind on to the same place in the next pass, with the fader put back:
+        // the lane moves it again.
+        app.slots[0].gain = 1.0;
+        clock.advance(24_000 * 6); // three more beats, then one into the next loop
+        app.tick_automation();
+        assert!(
+            (app.slots[0].gain - 1.5).abs() < 0.05,
+            "the lane replayed the move, got {}",
+            app.slots[0].gain
+        );
+
+        // Stopped, nothing moves — a lane is a position in a loop and there is
+        // no position without a clock.
+        app.playing = false;
+        app.slots[0].gain = 1.0;
+        app.tick_automation();
+        assert_eq!(app.slots[0].gain, 1.0);
+
+        // And clearing forgets it.
+        app.automation.clear(None);
+        assert!(app.automation.is_empty());
+        clock.rewind();
+        clock.set_bpm(choz_ports::Transport::DEFAULT_BPM);
+    }
+
+    /// The `A→M` button: only where there is audio coming in, and it survives a
+    /// project round trip.
+    #[test]
+    fn audio_to_midi_is_offered_only_on_a_tab_fed_by_audio() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.push_slot(AudioSource::Midi);
+
+        // No capture pair: nothing to listen to, so no button.
+        assert_eq!(app.pitch_to_midi_state(), None);
+        app.toggle_pitch_to_midi();
+        assert!(!app.slots[0].pitch_to_midi, "and toggling it does nothing");
+
+        // Fed by a capture pair: the button appears, off.
+        app.slots[0].in_pair = Some((0, 1));
+        assert_eq!(app.pitch_to_midi_state(), Some(false));
+        let (screen, rack) = render_rack(&mut app, 120, 30);
+        assert!(screen.contains('\u{2192}'), "the A→M button is drawn: {screen}");
+        let rect = rack
+            .buttons
+            .iter()
+            .find(|(b, _)| *b == views::fx_chain_panel::RackButton::PitchToMidi)
+            .map(|(_, r)| *r)
+            .expect("and it is clickable");
+
+        // Clicking turns it on.
+        handle_mouse(&mut app, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert_eq!(app.pitch_to_midi_state(), Some(true));
+
+        // It travels with the project, because it is part of how the tab sounds.
+        let saved = app.project_snapshot();
+        assert!(saved.rack[0].mixer.pitch_to_midi);
+    }
+
+    /// One port, two tabs, two channels: the split the roadmap asked for.
+    ///
+    /// It has to be opt-in, and this is why: pressing `+` gives another patch on
+    /// the same controller, and if that tab claimed a channel the controller
+    /// already sends, the patch on screen would go silent. So a tab answers
+    /// **any** channel until someone gives it a number.
+    #[test]
+    fn a_channel_splits_one_port_between_tabs_in_live() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let mut app = App::new();
+        for _ in 0..2 {
+            app.push_slot(AudioSource::Midi);
+        }
+        app.midi_connected = vec!["Keystation".into()];
+        for slot in app.slots.iter_mut() {
+            slot.input = Some(InputRef::Midi("Keystation".into()));
+        }
+        assert_eq!(app.ui.rack_mode, settings::RackMode::Live);
+        assert_eq!(
+            app.slots.iter().map(|s| s.channel).collect::<Vec<_>>(),
+            vec![ANY_CHANNEL, ANY_CHANNEL],
+            "a new tab in LIVE is another patch, not a part"
+        );
+
+        let midi = choz_engine::input::InputSource::Midi(0);
+        // With both on ANY nothing changed: the tab on screen plays.
+        app.active_slot = 1;
+        assert_eq!(app.targets_for(midi, 0), vec![1]);
+        assert_eq!(app.targets_for(midi, 5), vec![1]);
+
+        // Give the lower tab channel 3 and the port is split: channel 3 reaches
+        // it even while the other tab is the active one, and everything else
+        // still goes where it went.
+        app.slots[0].channel = 3;
+        assert_eq!(app.targets_for(midi, 2), vec![0], "channel 3 is claimed");
+        assert_eq!(app.targets_for(midi, 0), vec![1], "the rest is unchanged");
+
+        // The button says which it is, and stepping past 16 gets back to ANY.
+        app.active_slot = 0;
+        assert_eq!(app.tab_channel(), Some(3), "shown, because another tab shares the port");
+        app.slots[0].channel = 16;
+        app.step_channel(1);
+        assert_eq!(app.slots[0].channel, ANY_CHANNEL, "16 → ANY");
+        app.step_channel(1);
+        assert_eq!(app.slots[0].channel, 1, "and on to 1");
+
+        // A lone tab has nothing to split, so the button is not offered.
+        app.remove_slot(1);
+        assert_eq!(app.tab_channel(), None);
     }
 
     #[test]
@@ -8372,20 +9356,21 @@ mod tests {
         let other = InputRef::Midi("Midi Through".to_string());
         // tab 0 ← Keystation, tab 1 ← OSC, tab 2 ← Keystation, tab 3 unbound.
         let bindings = vec![Some(&keys), Some(&InputRef::Osc), Some(&keys), None];
+        let channels = vec![1u8, 1, 1, 1];
         let connected = vec!["Keystation".to_string(), "Midi Through".to_string()];
 
         // Tabs 0 and 2 are two configurations of the same port: one plays at a
         // time, the active one when it's among them, the first otherwise.
-        assert_eq!(note_targets(&bindings, &connected, 2, InputSource::Midi(0)), vec![2]);
-        assert_eq!(note_targets(&bindings, &connected, 0, InputSource::Midi(0)), vec![0]);
-        assert_eq!(note_targets(&bindings, &connected, 3, InputSource::Midi(0)), vec![0]);
-        assert_eq!(note_targets(&bindings, &connected, 3, InputSource::Osc), vec![1]);
+        assert_eq!(note_targets(&bindings, &channels, &connected, 2, InputSource::Midi(0), 0), vec![2]);
+        assert_eq!(note_targets(&bindings, &channels, &connected, 0, InputSource::Midi(0), 0), vec![0]);
+        assert_eq!(note_targets(&bindings, &channels, &connected, 3, InputSource::Midi(0), 0), vec![0]);
+        assert_eq!(note_targets(&bindings, &channels, &connected, 3, InputSource::Osc, 0), vec![1]);
         assert!(
-            note_targets(&bindings, &connected, 3, InputSource::Midi(1)).is_empty(),
+            note_targets(&bindings, &channels, &connected, 3, InputSource::Midi(1), 0).is_empty(),
             "no tab is bound to {other:?}"
         );
         assert!(
-            note_targets(&bindings, &connected, 3, InputSource::Midi(9)).is_empty(),
+            note_targets(&bindings, &channels, &connected, 3, InputSource::Midi(9), 0).is_empty(),
             "unknown port index is dropped, not panicked on"
         );
     }
@@ -8394,10 +9379,14 @@ mod tests {
     fn the_qwerty_piano_always_plays_the_active_tab() {
         let osc = InputRef::Osc;
         let bindings = vec![Some(&osc), None];
-        assert_eq!(note_targets(&bindings, &[], 1, InputSource::Keyboard), vec![1]);
-        assert_eq!(note_targets(&bindings, &[], 0, InputSource::Keyboard), vec![0],
+        let channels = vec![1u8, 1];
+        assert_eq!(note_targets(&bindings, &channels, &[], 1, InputSource::Keyboard, 0), vec![1]);
+        assert_eq!(note_targets(&bindings, &channels, &[], 0, InputSource::Keyboard, 0), vec![0],
             "even a bound tab is playable from the keyboard");
-        assert!(note_targets(&[], &[], 0, InputSource::Keyboard).is_empty(), "empty rack");
+        assert!(
+            note_targets(&[], &[], &[], 0, InputSource::Keyboard, 0).is_empty(),
+            "empty rack"
+        );
     }
 
     /// The IN drawer holds both kinds of input: note sources first, then the
@@ -8409,10 +9398,6 @@ mod tests {
         app.slots.push(RackSlot::new(AudioSource::Midi));
         app.midi_ports = vec!["Keystation".to_string()];
 
-        // Capture devices are their own rows: on a plain sound card playback and
-        // capture are different graph nodes.
-        app.in_devices = vec!["alsa_input.usb-Scarlett".to_string()];
-
         let rows = app.in_targets();
         let targets: Vec<InTarget> = rows.iter().map(|(t, _)| *t).collect();
         let names: Vec<String> = rows.iter().map(|(_, r)| r.name.clone()).collect();
@@ -8421,16 +9406,14 @@ mod tests {
         assert_eq!(names[1], "Keystation");
         // Note inputs, then the AUDIO IN title, then "play the instrument".
         let audio = targets.iter().position(|t| *t == InTarget::NoCapture).expect("no audio row");
-        let device = targets.iter().position(|t| *t == InTarget::Device(0)).expect("no device row");
-        assert!(device < audio, "the capture device is listed before the tab's own choice");
-        assert_eq!(rows[device].1.name, "alsa_input.usb-Scarlett");
         assert!(rows[audio].1.connected, "a tab with no capture is on its instrument");
 
         // Down from the last note input hops over the AUDIO IN header onto the
-        // first row under it.
+        // first row under it. No engine in a test, so that row is the
+        // "(instrument)" one — there are no capture ports to list.
         let last_note = targets.iter().rposition(|t| matches!(t, InTarget::Note(_))).unwrap();
         app.input_cursor = last_note;
-        assert_eq!(in_step(&app, 1), device, "the cursor must not park on a header");
+        assert_eq!(in_step(&app, 1), audio, "the cursor must not park on a header");
 
         // Selecting a capture pair swaps the tab onto live audio, and the RACK
         // says so instead of naming an instrument that isn't heard.
@@ -8442,50 +9425,519 @@ mod tests {
         assert_eq!(app.slots[0].in_pair, None, "back to the instrument");
     }
 
-    /// The OUT drawer's row model: devices, then the running device's channel
-    /// pairs, with the active tab's pair ticked and its neighbours labelled.
+    /// The OUT drawer's row model: devices, then **one row per channel** of the
+    /// running device, each saying what it is to the active tab.
     #[test]
-    fn out_drawer_lists_devices_then_channel_pairs() {
+    fn out_drawer_lists_devices_then_single_channels() {
         let mut app = App::new();
         app.slots.push(RackSlot::new(AudioSource::Midi));
         app.slots.push(RackSlot::new(AudioSource::Midi));
         app.out_devices = vec!["UMC1820".into(), "Headset".into()];
-        app.slots[1].out_pair = (2, 3);
+        app.slots[1].out_pair = (0, 1);
         app.active_slot = 1;
 
         let labels: Vec<String> = app.out_targets().iter().map(|(_, r)| r.label.clone()).collect();
         assert_eq!(labels[0], "DEVICE");
         assert_eq!(labels[1], "UMC1820");
         assert!(labels[3].starts_with("CHANNELS"), "channel section: {labels:?}");
-        // No engine in a test, so only the default stereo pair is offered.
-        assert!(labels[4].starts_with("1/2"), "{labels:?}");
-        assert!(labels[4].contains("tab 1"), "tab 1 is still on 1/2: {labels:?}");
+        // No engine in a test, so the device is the stereo default: two rows.
+        assert!(labels[4].starts_with("1  L"), "channel 1 is the tab's left: {labels:?}");
+        assert!(labels[5].starts_with("2  R"), "and channel 2 its right: {labels:?}");
+        assert!(labels[4].contains("tab 1"), "both tabs are on it: {labels:?}");
 
         let targets: Vec<OutTarget> = app.out_targets().iter().map(|(t, _)| *t).collect();
         assert_eq!(targets[0], OutTarget::None, "headers are not selectable");
         assert_eq!(targets[1], OutTarget::Device(0));
-        assert_eq!(targets[4], OutTarget::Pair(0));
+        assert_eq!(targets[4], OutTarget::Channel(0));
+        assert_eq!(targets[5], OutTarget::Channel(1));
     }
 
-    /// Enter on a pair row routes the *active* tab there, leaving the others
-    /// alone — that is the whole "[MIDI] → plugin → out 3/4" gesture.
+    /// Enter on a channel row routes the *active* tab there, leaving the others
+    /// alone — that is the whole "[MIDI] → plugin → out 3" gesture.
     #[test]
-    fn selecting_a_pair_routes_only_the_active_tab() {
+    fn selecting_a_channel_routes_only_the_active_tab() {
         let mut app = App::new();
         app.slots.push(RackSlot::new(AudioSource::Midi));
         app.slots.push(RackSlot::new(AudioSource::Midi));
         app.active_slot = 1;
 
-        let pair_row = app
+        let row = app
             .out_targets()
             .iter()
-            .position(|(t, _)| *t == OutTarget::Pair(0))
-            .expect("a pair row is drawn");
+            .position(|(t, _)| *t == OutTarget::Channel(0))
+            .expect("a channel row is drawn");
         app.slots[1].out_pair = (8, 9);
-        app.out_select(pair_row);
+        app.out_select(row);
 
-        assert_eq!(app.slots[1].out_pair, (0, 1), "active tab moved to pair 1");
+        assert_eq!(app.slots[1].out_pair, (9, 0), "channel 1 joined, the oldest fell off");
         assert_eq!(app.slots[0].out_pair, (0, 1), "the other tab is untouched");
+    }
+
+    /// Channels go on and off one at a time, which is the point: a tab can play
+    /// out of 3 and 9, jacks that are not a pair and never were.
+    #[test]
+    fn channels_go_on_and_off_one_at_a_time() {
+        assert_eq!(assign_channel((2, 2), 8), (2, 8), "a second jack is the right side");
+        assert_eq!(assign_channel((2, 8), 8), (2, 8), "assigning what is already on is a no-op");
+        assert_eq!(assign_channel((2, 8), 4), (8, 4), "a third pushes the oldest off");
+        assert_eq!(unassign_channel((2, 8), 2), Some((8, 8)), "what is left goes mono");
+        assert_eq!(unassign_channel((2, 8), 5), Some((2, 8)), "a channel it never had");
+        assert_eq!(unassign_channel((2, 2), 2), None, "the last one leaves nothing");
+
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        // A new tab is on 1 and 2. Click 3, click 9, and it plays out of **3
+        // and 9** — the routing the pairs could not express.
+        assert_eq!(app.slots[0].out_pair, (0, 1));
+        app.set_active_out(2, Assign::On);
+        app.set_active_out(8, Assign::On);
+        assert_eq!(app.slots[0].out_pair, (2, 8));
+
+        // The right button takes one off and the other goes mono.
+        app.set_active_out(2, Assign::Off);
+        assert_eq!(app.slots[0].out_pair, (8, 8));
+        // And a tab has to come out somewhere: the last one cannot be removed.
+        app.set_active_out(8, Assign::Off);
+        assert_eq!(app.slots[0].out_pair, (8, 8), "a tab always has an output");
+
+        // Enter is the toggle: on when off, off when on.
+        app.set_active_out(2, Assign::Toggle);
+        assert_eq!(app.slots[0].out_pair, (8, 2));
+        app.set_active_out(2, Assign::Toggle);
+        assert_eq!(app.slots[0].out_pair, (8, 8));
+
+        // And the rows say what each channel carries.
+        assert_eq!(side_label(Some((2, 8)), 2), "  L");
+        assert_eq!(side_label(Some((2, 8)), 8), "  R");
+        assert_eq!(side_label(Some((2, 8)), 5), "", "a channel it does not use");
+        assert_eq!(side_label(Some((4, 4)), 4), "  L+R");
+    }
+
+    /// `A→M` plays the tab's instrument, not its FX chain. A tab with no
+    /// instrument tracks the pitch perfectly and has nothing to play it on,
+    /// which looks exactly like a broken tracker — so the rack says which it is.
+    #[test]
+    fn audio_to_midi_says_when_there_is_no_instrument_to_play() {
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.slots[0].in_pair = Some((4, 4));
+        assert_eq!(app.instrument_label(), "AUDIO IN 5", "passing audio through is fine");
+
+        app.slots[0].pitch_to_midi = true;
+        assert!(
+            app.instrument_label().contains("needs an instrument"),
+            "{}",
+            app.instrument_label()
+        );
+
+        // With one loaded it goes back to naming the input.
+        app.source = AudioSource::Sf2 { path: "x.sf2".into(), bank: 0, preset: 0 };
+        assert_eq!(app.instrument_label(), "AUDIO IN 5");
+    }
+
+    /// The graphic EQ draws as a bank of sliders, tanu's way: a column per
+    /// band with the zero line through the middle. Ten arcs cannot be read as a
+    /// curve, and the curve is the only question anyone asks an EQ.
+    #[test]
+    fn the_graphic_eq_draws_as_a_slider_bank() {
+        // Taken here *and* inside `render_rack`; the guard is reentrant on one
+        // thread, which is what stops that from being a deadlock.
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.fx_chain.push(AudioFxEntry::new(source::AudioFxKind::GraphicEq));
+        app.fx_slot = 0;
+        // A shape only a bank can show: boost the bottom, cut the top.
+        for (i, v) in [0.9f32, 0.85, 0.7, 0.55, 0.5, 0.45, 0.3, 0.2, 0.15, 0.1].iter().enumerate() {
+            app.fx_chain[0].params[i] = *v;
+        }
+        let (screen, rack) = render_rack(&mut app, 110, 34);
+
+        // The zero line, the tracks and the knobs are all there.
+        assert!(screen.contains('\u{2588}'), "no slider knobs:\n{screen}");
+        assert!(screen.contains('\u{2502}'), "no slider tracks:\n{screen}");
+        // The band labels are the frequencies, not "p1 p2 p3".
+        for label in ["70", "180", "1k", "16k"] {
+            assert!(screen.contains(label), "band {label} unlabelled:\n{screen}");
+        }
+        // One click rect per band, plus the knobs that are not bands.
+        assert!(rack.params.len() > choz_engine::fx::EQ_BANDS, "{} rects", rack.params.len());
+        let band_rects: Vec<_> =
+            rack.params.iter().filter(|(i, _)| *i < choz_engine::fx::EQ_BANDS).collect();
+        assert_eq!(band_rects.len(), choz_engine::fx::EQ_BANDS, "a rect per band");
+        // Side by side, and each one tall enough to be a slider.
+        assert!(band_rects[1].1.x > band_rects[0].1.x, "left to right");
+        assert!(band_rects[0].1.height >= 6, "a slider, not a row");
+    }
+
+    /// A named parameter is a list, so Enter and a click open the list. Walking
+    /// eighteen Winamp presets with an arrow key is a knob pretending to be a
+    /// menu.
+    #[test]
+    fn a_named_fx_parameter_opens_a_picker() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.fx_chain.push(AudioFxEntry::new(source::AudioFxKind::GraphicEq));
+        app.fx_slot = 0;
+
+        // A band is a knob: there is nothing to list.
+        assert!(!app.open_fx_choice(0));
+        assert!(app.modal.is_none());
+
+        // The preset is a list of names, and every Winamp preset is in it.
+        let preset = app.fx_chain[0]
+            .param_descs()
+            .iter()
+            .position(|d| d.name == "Preset")
+            .expect("the EQ has a preset");
+        assert!(app.open_fx_choice(preset));
+        let m = app.modal.as_ref().expect("a modal opened");
+        assert_eq!(m.kind, ModalKind::FxChoice);
+        assert_eq!(m.list.items.len(), choz_engine::fx::EQ_PRESETS.len());
+        assert!(m.list.items.iter().any(|i| i == "Rock"));
+
+        // Choosing one moves the parameter to that position and fills the bands.
+        let rock = m.list.items.iter().position(|i| i == "Rock").unwrap();
+        app.modal.as_mut().unwrap().list.cursor = rock;
+        assert!(app.modal_select(), "picking closes it");
+        let v = app.fx_chain[0].params[preset];
+        let expect = rock as f32 / (choz_engine::fx::EQ_PRESETS.len() - 1) as f32;
+        assert!((v - expect).abs() < 1e-4, "{v} vs {expect}");
+
+        // AutoTune's scale and mode are lists too, by the same route.
+        app.fx_chain.push(AudioFxEntry::new(source::AudioFxKind::AutoTune));
+        app.fx_slot = 1;
+        for name in ["Preset", "Key", "Scale", "Mode"] {
+            let i = app.fx_chain[1].param_descs().iter().position(|d| d.name == name).unwrap();
+            assert!(app.open_fx_choice(i), "{name} should open a list");
+            app.modal = None;
+        }
+    }
+
+    /// A preset has to move the **sliders**, not just the processor. The array
+    /// is what the panel draws and what the project saves: a preset that only
+    /// reaches the DSP vanishes the next time anything is rebuilt, and until
+    /// then the sliders say something that is not true.
+    #[test]
+    fn an_eq_preset_moves_the_sliders() {
+        use choz_engine::fx::{graphic_eq, EQ_BANDS, EQ_PRESETS};
+        let mut entry = source::AudioFxEntry::new(source::AudioFxKind::GraphicEq);
+        let slot = entry.param_descs().iter().position(|d| d.name == "Preset").unwrap();
+        assert!(entry.params[..EQ_BANDS].iter().all(|v| (*v - 0.5).abs() < 1e-6), "flat to start");
+
+        let rock = EQ_PRESETS.iter().position(|(n, _)| *n == "Rock").unwrap();
+        entry.params[slot] = rock as f32 / (EQ_PRESETS.len() - 1) as f32;
+        assert!(entry.apply_preset(slot), "the preset knob changed the bands");
+
+        let gains = EQ_PRESETS[rock].1;
+        for (b, db) in gains.iter().enumerate() {
+            let want = graphic_eq::db_to_norm(*db);
+            assert!(
+                (entry.params[b] - want).abs() < 1e-4,
+                "band {b}: slider at {} but the preset says {want}",
+                entry.params[b]
+            );
+        }
+        // Rock is a smile curve, so the sliders are not all in one place.
+        assert!(entry.params[0] > 0.55 && entry.params[3] < 0.45);
+
+        // Any other knob is not the preset.
+        assert!(!entry.apply_preset(0));
+    }
+
+    /// Turning a knob must not rebuild the chain. A rebuild replaces **every**
+    /// processor in the slot, so nudging one control threw away the reverb's
+    /// tail, the delay's buffer and the looper's recording — which is heard as
+    /// the sound cutting out.
+    #[test]
+    fn moving_a_knob_does_not_rebuild_the_chain() {
+        use source::{AudioFxEntry, AudioFxKind};
+        // Everything with state takes its parameters live.
+        for kind in [
+            AudioFxKind::Reverb,
+            AudioFxKind::Delay,
+            AudioFxKind::SpaceEcho,
+            AudioFxKind::Protocosmos,
+            AudioFxKind::Z5Texture,
+            AudioFxKind::GranDelay,
+            AudioFxKind::Vinyl,
+            AudioFxKind::Filter,
+            AudioFxKind::GraphicEq,
+            AudioFxKind::AutoTune,
+        ] {
+            assert!(AudioFxEntry::takes_live_params(kind), "{kind:?} would cut the sound");
+        }
+
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.fx_chain.push(AudioFxEntry::new(AudioFxKind::SpaceEcho));
+        app.fx_dirty = false;
+        app.set_fx_param(0, 1, 0.7);
+        assert!(!app.fx_dirty, "a space echo knob rebuilt the chain");
+        assert!((app.fx_chain[0].params[1] - 0.7).abs() < 1e-6, "and the value did land");
+
+        // One that cannot take them live still asks for the rebuild, because
+        // otherwise the knob would do nothing at all.
+        app.fx_chain.push(AudioFxEntry::new(AudioFxKind::Cassette));
+        app.fx_dirty = false;
+        app.set_fx_param(1, 0, 0.3);
+        assert!(app.fx_dirty, "cassette has no live path, so it must rebuild");
+    }
+
+    /// AutoTune is a built-in like any other: it is in the ADD FX list, under a
+    /// category of its own, and it builds into a real processor.
+    #[test]
+    fn autotune_is_one_of_the_built_in_effects() {
+        use source::{AudioFxKind, FxCategory};
+        assert!(source::ALL_FX_KINDS.contains(&AudioFxKind::AutoTune));
+        assert_eq!(AudioFxKind::AutoTune.label(), "AUTO-TUNE");
+        assert_eq!(AudioFxKind::AutoTune.id(), "autotune");
+        assert_eq!(AudioFxKind::AutoTune.category(), FxCategory::Pitch);
+        assert!(FxCategory::ALL.contains(&FxCategory::Pitch), "and the section exists");
+        assert_eq!(AudioFxKind::from_id("autotune"), Some(AudioFxKind::AutoTune));
+
+        // The knobs are named, not numbered: a key is C or it is not.
+        let entry = source::AudioFxEntry::new(AudioFxKind::AutoTune);
+        let descs = entry.param_descs();
+        let named = |n: &str| {
+            descs
+                .iter()
+                .find(|d| d.name == n)
+                .map(|d| matches!(d.shape, source::ParamShape::Named(_)))
+                .unwrap_or(false)
+        };
+        assert!(named("Preset") && named("Key") && named("Scale") && named("Mode"));
+        // No formant switch: the shifter resamples, so the envelope moves with
+        // the pitch and there is nothing to switch. A control that does nothing
+        // is worse than no control.
+        assert!(!descs.iter().any(|d| d.name == "Formant"));
+
+        // And it builds, which is what the rack actually does with it.
+        let params: Vec<f32> = descs.iter().map(|d| d.default).collect();
+        assert!(choz_engine::fx_chain::build_processor("autotune", &params, 48_000).is_some());
+    }
+
+    /// Picking a preset writes the knobs it stands for. Without that the rebuild
+    /// reads the parameter array, finds the defaults, and the preset lasts until
+    /// the next knob is touched.
+    #[test]
+    fn an_autotune_preset_fills_in_the_knobs_below_it() {
+        let mut entry = source::AudioFxEntry::new(source::AudioFxKind::AutoTune);
+        let before = entry.params.clone();
+        // Preset 2 is Hard Auto-Tune: immediate retune, full correction.
+        entry.params[0] = 2.0 / (choz_engine::fx::autotune::PRESETS.len() - 1) as f32;
+        assert!(entry.apply_preset(0), "the preset knob changed something");
+        assert!(entry.params[1] < before[1] + 0.01, "retune went to the floor");
+        assert_eq!(entry.params[5], 1.0, "and the mode is Hard Tune");
+
+        // Any other knob is not a preset.
+        assert!(!entry.apply_preset(3));
+        // Neither is a preset knob on an effect that has none.
+        let mut delay = source::AudioFxEntry::new(source::AudioFxKind::Delay);
+        assert!(!delay.apply_preset(0));
+    }
+
+    /// Every section gets the same wash: one colour, one opacity, resolved to
+    /// a real colour because a terminal cell background has no alpha.
+    #[test]
+    fn one_colour_washes_every_panel_at_the_configured_opacity() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let mut app = App::new();
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+
+        // Follows the scheme by default, which is what keeps a washed UI
+        // looking like the theme instead of like a filter over it.
+        assert_eq!(app.ui.panel_tint, None);
+        assert_eq!(app.ui.panel_tint_label(), "theme's own");
+
+        // A flat desktop: the panels are that colour with the tint mixed in.
+        app.ui.background = settings::Background::Color((100, 100, 100));
+        app.ui.panel_tint = Some((0, 0, 0));
+        app.ui.background_tint = 50;
+        app.publish_backdrop(area);
+        assert_eq!(
+            views::theme::panel_fill(),
+            Some(ratatui::style::Color::Rgb(50, 50, 50)),
+            "half way to the tint"
+        );
+        // And every panel paints it — the drawers, the rack, the transport and
+        // the monitor all go through this one style.
+        assert_eq!(
+            views::theme::panel_style().bg,
+            Some(ratatui::style::Color::Rgb(50, 50, 50))
+        );
+
+        // Opacity 0 is the desktop untouched; 100 hides it entirely.
+        app.ui.background_tint = 0;
+        app.publish_backdrop(area);
+        assert_eq!(views::theme::panel_fill(), Some(ratatui::style::Color::Rgb(100, 100, 100)));
+        app.ui.background_tint = 100;
+        app.publish_backdrop(area);
+        assert_eq!(views::theme::panel_fill(), Some(ratatui::style::Color::Rgb(0, 0, 0)));
+
+        // The colour steps through the palette and wraps back to the theme's.
+        app.ui.panel_tint = None;
+        app.ui.step_panel_tint(1);
+        assert_eq!(app.ui.panel_tint, Some(settings::PALETTE[0].1));
+        app.ui.step_panel_tint(-1);
+        assert_eq!(app.ui.panel_tint, None, "and back round to the scheme's own");
+
+        views::theme::set_panel_fill(None);
+    }
+
+    /// A tab fed by audio gets a trim and a sensitivity, and neither exists on
+    /// a tab playing its own instrument — there is nothing coming in to trim.
+    #[test]
+    fn an_audio_input_brings_its_own_trim_and_sensitivity() {
+        use views::fx_chain_panel::{gate_from_norm, gate_norm};
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        assert_eq!(app.in_trim_state(), None, "no input, no trim");
+        app.adjust_in_trim(0.5, 0.5);
+        assert_eq!(app.slots[0].in_gain, 1.0, "and the knobs do nothing");
+
+        app.slots[0].in_pair = Some((4, 4));
+        assert_eq!(app.in_trim_state(), Some((1.0, choz_engine::pitch::DEFAULT_GATE)));
+
+        // A guitar is quieter than a synth, so the trim goes up and the
+        // sensitivity with it.
+        app.adjust_in_trim(0.25, 0.0);
+        assert_eq!(app.slots[0].in_gain, 1.5);
+        app.adjust_in_trim(2.0, 0.0);
+        assert_eq!(app.slots[0].in_gain, MAX_GAIN, "and it stops at the top");
+
+        // The gate is a level, so the knob is in dB and the ends are the ends.
+        let before = gate_norm(app.slots[0].in_gate);
+        app.adjust_in_trim(0.0, 0.1);
+        assert!(gate_norm(app.slots[0].in_gate) > before, "a stiffer gate");
+        app.adjust_in_trim(0.0, -5.0);
+        assert!(gate_norm(app.slots[0].in_gate) < 1e-6, "and it bottoms out");
+        assert!((gate_norm(gate_from_norm(0.42)) - 0.42).abs() < 1e-4, "the knob round-trips");
+
+        // Both are learn targets, so both are automatable and both survive a
+        // project round trip.
+        app.set_in_trim(Some(1.25), Some(0.5));
+        let auto = app.automatable();
+        assert!(auto.iter().any(|(t, _)| *t == LearnTarget::InGain(0)));
+        assert!(auto.iter().any(|(t, _)| *t == LearnTarget::InGate(0)));
+        let saved = app.project_snapshot();
+        assert_eq!(saved.rack[0].mixer.in_gain, Some(1.25));
+        assert_eq!(saved.rack[0].mixer.in_gate, Some(gate_from_norm(0.5)));
+    }
+
+    /// The whole way from a drawer row to the rack: the capture ports are
+    /// listed under the card that owns them, and picking one lands on the tab.
+    ///
+    /// This is the path that was broken — the rows were drawn and nothing
+    /// happened when they were picked, because nothing here was ever exercised
+    /// without a JACK client.
+    #[test]
+    fn picking_a_capture_row_feeds_the_active_tab() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.in_ports = vec![
+            "alsa_input.usb-UMC1820:capture_AUX0".into(),
+            "alsa_input.usb-UMC1820:capture_AUX1".into(),
+            "alsa_input.pci-HDA:capture_FL".into(),
+        ];
+
+        let rows = app.in_targets();
+        let cards: Vec<&str> = rows
+            .iter()
+            .filter(|(t, r)| *t == InTarget::None && r.header)
+            .map(|(_, r)| r.name.as_str())
+            .collect();
+        assert!(
+            cards.contains(&"alsa_input.usb-UMC1820") && cards.contains(&"alsa_input.pci-HDA"),
+            "one header per card: {cards:?}"
+        );
+        let ch2 = rows.iter().position(|(t, _)| *t == InTarget::Channel(1)).expect("channel 2");
+        assert!(rows[ch2].1.name.starts_with("2  capture_AUX1"), "{}", rows[ch2].1.name);
+
+        // Enter on it feeds the tab, and the RACK stops naming an instrument
+        // that is not being heard.
+        app.in_select(ch2);
+        assert_eq!(app.slots[0].in_pair, Some((1, 1)));
+        assert!(app.instrument_label().contains("AUDIO IN 2"), "{}", app.instrument_label());
+
+        // A second channel makes it stereo, and Enter again takes it off.
+        let ch3 = app.in_targets().iter().position(|(t, _)| *t == InTarget::Channel(2)).unwrap();
+        app.in_select(ch3);
+        assert_eq!(app.slots[0].in_pair, Some((1, 2)));
+        app.in_select(ch3);
+        assert_eq!(app.slots[0].in_pair, Some((1, 1)));
+        // And the last one puts the tab back on its instrument.
+        app.in_select_side(ch2, Assign::Off);
+        assert_eq!(app.slots[0].in_pair, None);
+    }
+
+    /// The two mouse buttons are the two halves of the gesture: left puts a
+    /// channel on the tab, right takes it off. Nowhere else does the right
+    /// button mean anything.
+    #[test]
+    fn the_right_button_takes_a_channel_off() {
+        let layout = UiLayout {
+            output_area: Rect::new(60, 0, 20, 10),
+            output_item_rects: vec![(3, Rect::new(61, 4, 18, 1))],
+            source_area: Rect::new(0, 0, 20, 10),
+            input_item_rects: vec![(2, Rect::new(1, 5, 18, 1))],
+            ..Default::default()
+        };
+
+        let down = |btn| MouseEventKind::Down(btn);
+        assert!(matches!(
+            mouse_action(62, 4, &layout, down(MouseButton::Left)),
+            MouseAction::OutputDevice(3)
+        ));
+        assert!(matches!(
+            mouse_action(62, 4, &layout, down(MouseButton::Right)),
+            MouseAction::OutputUnassign(3)
+        ));
+        assert!(matches!(
+            mouse_action(2, 5, &layout, down(MouseButton::Right)),
+            MouseAction::InputUnassign(2)
+        ));
+        // Off the rows, the right button does nothing at all.
+        assert!(matches!(
+            mouse_action(62, 9, &layout, down(MouseButton::Right)),
+            MouseAction::None
+        ));
+        assert!(matches!(
+            mouse_action(40, 4, &layout, down(MouseButton::Right)),
+            MouseAction::None
+        ));
+    }
+
+    /// One input jack is one input: a guitar in 5 feeds the tab in mono, and
+    /// taking the last one off puts the tab back on its instrument.
+    #[test]
+    fn an_input_channel_can_be_picked_on_its_own() {
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+
+        app.set_active_capture(Some((4, 4)));
+        assert_eq!(app.slots[0].in_pair, Some((4, 4)));
+        assert!(
+            app.instrument_label().contains("AUDIO IN 5"),
+            "one jack is one number: {}",
+            app.instrument_label()
+        );
+        assert!(!app.instrument_label().contains("5/5"));
+
+        // A second jack makes it a stereo capture of 5 and 7.
+        app.set_active_capture(Some(assign_channel(app.slots[0].in_pair.unwrap(), 6)));
+        assert_eq!(app.slots[0].in_pair, Some((4, 6)));
+        assert!(app.instrument_label().contains("5/7"), "{}", app.instrument_label());
+
+        // Off they come, and with the last one the tab is on its instrument.
+        app.set_active_capture(unassign_channel(app.slots[0].in_pair.unwrap(), 6));
+        assert_eq!(app.slots[0].in_pair, Some((4, 4)));
+        app.set_active_capture(unassign_channel(app.slots[0].in_pair.unwrap(), 4));
+        assert_eq!(app.slots[0].in_pair, None, "back to the instrument");
     }
 
     /// The cursor never lands on a section header.
@@ -8498,7 +9950,7 @@ mod tests {
         let next = out_step(&app, 1);
         assert_eq!(
             app.out_targets()[next].0,
-            OutTarget::Pair(0),
+            OutTarget::Channel(0),
             "stepping down skips the CHANNELS header"
         );
         assert_eq!(out_step(&app, -1), 1, "and stops at the first row going up");

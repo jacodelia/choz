@@ -24,9 +24,16 @@ name = "choz"
 maintainer = "Jorge Codelia <jorgecodelia@gmail.com>"
 section = "sound"
 priority = "optional"
-# Only what choz links: ALSA and JACK for audio, X11 for plugin windows. The
-# plugin formats themselves are dlopened, so no plugin is a dependency.
+# `$auto` reads the binary: ALSA and glibc come out of it, and **that is what
+# makes the package refuse to install without them** — apt reports the unmet
+# dependency and installs nothing (verified against a package with a dependency
+# that cannot be satisfied).
+#
+# libjack is *not* there on purpose: choz `dlopen`s it, so without it choz runs
+# on ALSA. That makes it a recommendation, which apt installs by default and the
+# user can decline.
 depends = "$auto"
+recommends = "libjack-jackd2-0 | libjack0"
 extended-description = """\
 choz hosts CLAP, LV2, LADSPA, DSSI, VST2 and VST3 plugins from a terminal: a \
 multi-slot rack with a mixer, insert FX, MIDI/OSC routing and YAML projects. \
@@ -43,6 +50,10 @@ assets = [
 [package.metadata.generate-rpm]
 name = "choz"
 summary = "A terminal audio plugin host"
+# rpm reads the ELF itself: the built package requires `libasound.so.2()(64bit)`
+# (down to its ALSA_0.9 symbol versions), libc, libm, libgcc_s and the loader, so
+# `dnf`/`rpm -i` fails with "Failed dependencies" on a box without ALSA.
+# JACK is dlopened, hence weak.
 assets = [
     { source = "../../target/release/choz", dest = "/usr/bin/choz", mode = "755" },
     { source = "../../packaging/desktop/choz-launcher", dest = "/usr/bin/choz-launcher", mode = "755" },
@@ -73,3 +84,8 @@ serde_yaml = "0.9"
 # Plugin editors are X11 child windows; only Linux builds get one.
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = "0.13"
+
+# A weak dependency, and a table because that is the shape cargo-generate-rpm
+# takes: libjack is `dlopen`ed, so choz runs without it — on ALSA.
+[package.metadata.generate-rpm.recommends]
+jack-audio-connection-kit = "*"

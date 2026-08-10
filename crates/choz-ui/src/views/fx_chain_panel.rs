@@ -18,6 +18,8 @@ const HEADER: Color = Color::Rgb(240, 136, 62);
 const LABEL: Color = Color::Rgb(120, 132, 155);
 const RULE: Color = Color::Rgb(38, 44, 54);
 const KNOB: Color = Color::Rgb(100, 160, 220);
+/// In tune. The one colour in the AutoTune strip that means "nothing to do".
+const IN_TUNE: Color = Color::Rgb(56, 200, 100);
 const SEL: Color = Color::Yellow;
 /// A switch reads as on or off at a glance, which is the whole reason it is not
 /// drawn as an arc.
@@ -44,6 +46,8 @@ pub enum RackButton {
     Preset,
     /// Arm MIDI learn.
     Learn,
+    /// Listen to the tab's audio input and play its instrument from the pitch.
+    PitchToMidi,
     /// Open (or close) the plugin's own window.
     Gui,
     /// Ask for (or stop asking for) this plugin to run in its own process.
@@ -62,6 +66,10 @@ pub struct RackLayout {
     pub tab_add: Option<Rect>,
     pub gain: Option<Rect>,
     pub pan: Option<Rect>,
+    /// Trim on the tab's audio input, and how loud that input has to be before
+    /// `A→M` calls it a note. Both only exist on a tab fed by audio.
+    pub in_gain: Option<Rect>,
+    pub in_gate: Option<Rect>,
     pub mute: Option<Rect>,
     pub solo: Option<Rect>,
     pub buttons: Vec<(RackButton, Rect)>,
@@ -220,10 +228,57 @@ pub type MixStrip = (f32, f32, bool, bool);
 /// gain bar.
 const MAX_GAIN: f32 = 2.0;
 
+/// The `A→M` gate as a knob position and as a reading.
+///
+/// A gate is a level, so it is drawn in dB like every other level: the knob
+/// spans -70 dBFS (anything plays) to -20 dBFS (only a hard note does), which
+/// is the range a pickup actually lives in.
+pub const GATE_MIN_DB: f32 = -70.0;
+pub const GATE_MAX_DB: f32 = -20.0;
+
+pub fn gate_norm(gate: f32) -> f32 {
+    let db = if gate > 1e-6 { 20.0 * gate.log10() } else { GATE_MIN_DB };
+    ((db - GATE_MIN_DB) / (GATE_MAX_DB - GATE_MIN_DB)).clamp(0.0, 1.0)
+}
+
+pub fn gate_from_norm(norm: f32) -> f32 {
+    let db = GATE_MIN_DB + norm.clamp(0.0, 1.0) * (GATE_MAX_DB - GATE_MIN_DB);
+    10f32.powf(db / 20.0)
+}
+
+fn gate_db(gate: f32) -> String {
+    let db = if gate > 1e-6 { 20.0 * gate.log10() } else { GATE_MIN_DB };
+    format!("{db:.0}")
+}
+
 /// Instrument-line button labels.
 pub const BTN_SOURCE: &str = " SOURCE ";
 pub const BTN_PRESET: &str = " BANK/PRESET ";
 pub const BTN_LEARN: &str = " MIDI LEARN ";
+/// Audio in → notes out. Only offered on a tab fed by a capture pair.
+pub const BTN_A2M: &str = " A\u{2192}M ";
+
+/// What `A→M` is hearing, short enough to sit inside its own button:
+/// ` E2+14` — the note and how many cents off it is — or the input level in dB
+/// when nothing is sounding, which is the number `SENS` is set against.
+fn heard() -> String {
+    let m = choz_engine::meter::pitch_meter();
+    match m.note() {
+        Some(note) => format!(" {}{:+}", note_name(note), m.cents()),
+        None => {
+            let level = m.level();
+            let db = if level > 1e-6 { 20.0 * level.log10() } else { -99.0 };
+            format!(" {db:.0}dB")
+        }
+    }
+}
+
+/// `60` is `C4`, the way every tracker and DAW writes it.
+fn note_name(note: u8) -> String {
+    const NAMES: [&str; 12] =
+        ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    format!("{}{}", NAMES[note as usize % 12], note as i32 / 12 - 1)
+}
 pub const BTN_GUI: &str = " GUI ";
 pub const BTN_PREV: &str = " \u{25C0} ";
 pub const BTN_NEXT: &str = " \u{25B6} ";
@@ -427,6 +482,9 @@ pub fn draw_fx_chain_panel(
     // The tab's MIDI channel (1..16), `None` in LIVE mode where it means
     // nothing: there, a tab is chosen by its input and by which one is active.
     channel: Option<u8>,
+    // Audio-in state of the tab: `Some(on)` when it is fed by a capture pair —
+    // the only case where turning its pitch into notes means anything.
+    pitch_to_midi: Option<bool>,
     // The instrument's own parameters: name and 0..1 position, in plugin order.
     // Carla's "generic UI": every plugin gets knobs whether or not it has a
     // window, so a CC can be learned without opening one.
@@ -434,6 +492,12 @@ pub fn draw_fx_chain_panel(
     instr_cursor: usize,
     // Which of the two knob boxes the arrows and the highlight belong to.
     instr_focused: bool,
+    // `(trim, gate)` of the tab's audio input, or `None` when it plays its own
+    // instrument and there is nothing coming in to trim.
+    in_trim: Option<(f32, f32)>,
+    // The AutoTune reading and its recent pitch error, when that is the FX the
+    // cursor is on. `None` for every other effect.
+    at_view: Option<(choz_engine::fx::autotune::AutoTuneMeter, &[f32])>,
 ) -> RackLayout {
     let has_presets = preset.is_some();
     let mut layout = RackLayout::default();
@@ -539,6 +603,25 @@ pub fn draw_fx_chain_panel(
         (" ".to_string(), bg, None),
         (format!(" {} ", t("SOLO")), flag(solo, Color::Rgb(220, 190, 70)), Some(3)),
     ];
+    // A guitar is nowhere near the level of a synth, so a tab fed by audio gets
+    // its own trim — and the sensitivity `A→M` listens with, which is the same
+    // knob from the player's side: how hard you have to hit it to make a note.
+    let mut cells = cells;
+    if let Some((in_gain, gate)) = in_trim {
+        cells.push(("  ".to_string(), bg, None));
+        cells.push((format!("{} ", t("IN")), label_style, None));
+        cells.push((
+            format!("[{}] {in_gain:4.2}  ", knob_arc(in_gain / MAX_GAIN, 8)),
+            Style::default().fg(KNOB),
+            Some(4),
+        ));
+        cells.push((format!("{} ", t("SENS")), label_style, None));
+        cells.push((
+            format!("[{}] {:>3}", knob_arc(gate_norm(gate), 8), gate_db(gate)),
+            Style::default().fg(KNOB),
+            Some(5),
+        ));
+    }
     let mut x = inner.x + 2;
     let mut mix_line: Vec<Span> = vec![Span::raw("  ")];
     for (text, style, target) in cells {
@@ -549,6 +632,8 @@ pub fn draw_fx_chain_panel(
             Some(1) => layout.pan = Some(rect),
             Some(2) => layout.mute = Some(rect),
             Some(3) => layout.solo = Some(rect),
+            Some(4) => layout.in_gain = Some(rect),
+            Some(5) => layout.in_gate = Some(rect),
             _ => {}
         }
         mix_line.push(Span::styled(text, style));
@@ -575,9 +660,28 @@ pub fn draw_fx_chain_panel(
         // Bank/preset only exists while the tab holds a SoundFont.
         (RackButton::Preset, has_presets.then(|| BTN_PRESET.to_string())),
         (RackButton::Learn, Some(BTN_LEARN.to_string())),
+        // A guitar into a synth: only offered where there is audio coming in.
+        (
+            RackButton::PitchToMidi,
+            pitch_to_midi.map(|on| {
+                // With it on, the button says what the tracker is hearing —
+                // the note and how far off it is. Without that, "nothing
+                // happens" and "the wrong note" look the same and `SENS` has
+                // nothing to aim at.
+                if on {
+                    format!("{}\u{25CF}{} ", BTN_A2M.trim_end(), heard())
+                } else {
+                    format!("{}\u{25CB} ", BTN_A2M.trim_end())
+                }
+            }),
+        ),
         // In MULTI the channel is what decides whether this tab sounds at all,
         // so it sits on the same line as the instrument it selects.
-        (RackButton::Channel, channel.map(|c| format!(" CH {c:>2} "))),
+        // Channel 0 is "any": a tab that takes whatever its port sends.
+        (
+            RackButton::Channel,
+            channel.map(|c| if c == 0 { " CH ANY ".to_string() } else { format!(" CH {c:>2} ") }),
+        ),
         // Only plugins with a native editor get the button.
         (RackButton::Gui, has_gui.then(|| BTN_GUI.to_string())),
         // Only a hosted plugin can be moved into a process of its own.
@@ -586,7 +690,15 @@ pub fn draw_fx_chain_panel(
         let Some(text) = text else { continue };
         let w = text.chars().count() as u16;
         layout.buttons.push((btn, Rect::new(bx, y, w, 1)));
-        let style = if btn == RackButton::Sandbox && sandbox.live { sbx_style } else { btn_style };
+        let style = if btn == RackButton::Sandbox && sandbox.live {
+            sbx_style
+        } else if btn == RackButton::PitchToMidi && pitch_to_midi == Some(true) {
+            // On, and it changes what the tab does with its input, so it says so
+            // the way the sandbox button does.
+            Style::default().fg(Color::Black).bg(ON_COLOUR).add_modifier(Modifier::BOLD)
+        } else {
+            btn_style
+        };
         instr_line.push(Span::styled(text, style));
         instr_line.push(Span::raw(" "));
         bx += w + 1;
@@ -720,7 +832,55 @@ pub fn draw_fx_chain_panel(
     let descs = entry.param_descs();
     let names: Vec<String> = descs.iter().map(|d| d.name.to_string()).collect();
     let shapes: Vec<ParamShape> = descs.iter().map(|d| d.shape.clone()).collect();
-    let (rects, next) = draw_knob_box(
+
+    // A graphic EQ is ten sliders, and ten arcs cannot be read as a curve. It
+    // gets tanu's drawing — a column per band, the zero line through the middle
+    // — and the knobs that are *not* bands (preamp, preset, wet) follow below.
+    let mut drawn = false;
+    let eq_bands = (entry.plugin.is_none() && entry.kind == crate::source::AudioFxKind::GraphicEq)
+        .then_some(choz_engine::fx::EQ_BANDS)
+        .filter(|n| entry.params.len() > *n);
+    if let Some(n) = eq_bands {
+        let labels: Vec<&str> = names[..n].iter().map(|s| s.as_str()).collect();
+        let title = format!("{}:{}", fx_slot + 1, entry.label());
+        let (band_rects, after) = draw_eq_bank(
+            f,
+            inner,
+            y,
+            &entry.params[..n],
+            &labels,
+            fx_param.min(n - 1),
+            focused && !instr_focused && fx_param < n,
+            &title,
+            bg,
+        );
+        if !band_rects.is_empty() {
+            layout.params = band_rects;
+            y = after;
+            let (rest, next) = draw_knob_box(
+                f,
+                inner,
+                y,
+                "",
+                &entry.params[n..],
+                &names[n..],
+                &shapes[n..],
+                fx_param.saturating_sub(n),
+                focused && !instr_focused && fx_param >= n,
+                usize::MAX,
+                5,
+            );
+            // The tail box numbers its knobs from zero; the chain does not.
+            layout.params.extend(rest.into_iter().map(|(i, r)| (i + n, r)));
+            y = next;
+            drawn = true;
+        }
+    }
+
+    let (rects, next) = if drawn {
+        (Vec::new(), y)
+    } else {
+        draw_knob_box(
         f,
         inner,
         y,
@@ -732,9 +892,21 @@ pub fn draw_fx_chain_panel(
         focused && !instr_focused,
         usize::MAX,
         5,
-    );
-    layout.params = rects;
+        )
+    };
+    if !drawn {
+        layout.params = rects;
+    }
     y = next;
+
+    // ── What AutoTune is hearing ──────────────────────────────────────────
+    //
+    // The knobs already show every parameter, so what is added here is the one
+    // thing they cannot: the live reading. Two rows, because a pitch corrector
+    // that cannot be seen working can only be trusted or not.
+    if let Some((m, trace)) = at_view {
+        y = draw_autotune_readout(f, inner, y, m, trace, bg);
+    }
 
     // ── Slot controls, in their own box, one blank line below the knobs ────
     if y + 2 < inner.y + inner.height {
@@ -816,8 +988,239 @@ pub fn draw_fx_chain_panel(
     layout
 }
 
+/// The AutoTune strip: level, the note heard, the note aimed at, the error, and
+/// where that error has been.
+///
+/// Everything here is read from a lock-free meter the audio thread publishes —
+/// no work crosses back the other way, which is why a graph of the pitch costs
+/// the callback nothing.
+fn draw_autotune_readout(
+    f: &mut Frame,
+    inner: Rect,
+    mut y: u16,
+    m: choz_engine::fx::autotune::AutoTuneMeter,
+    trace: &[f32],
+    bg: Style,
+) -> u16 {
+    if y + 2 >= inner.y + inner.height || inner.width < 30 {
+        return y;
+    }
+    let label = Style::default().fg(LABEL);
+    let value = Style::default().fg(KNOB);
+    let dim = Style::default().fg(RULE);
+
+    // Row 1: level, the note heard → the note aimed at, and the error.
+    let db = if m.level > 1e-6 { 20.0 * m.level.log10() } else { -99.0 };
+    let bars = (((db + 60.0) / 60.0).clamp(0.0, 1.0) * 8.0).round() as usize;
+    let meter: String = std::iter::repeat_n('\u{2588}', bars)
+        .chain(std::iter::repeat_n('\u{2591}', 8 - bars))
+        .collect();
+    let heard = note_label(m.detected_frequency);
+    let aimed = note_label(m.target_frequency);
+    let err = if m.voiced { format!("{:+.0}\u{00A2}", m.pitch_error_cents) } else { "  \u{00B7} ".into() };
+    let err_style = if !m.voiced {
+        dim
+    } else if m.pitch_error_cents.abs() < 10.0 {
+        Style::default().fg(IN_TUNE)
+    } else {
+        Style::default().fg(KNOB)
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  IN ", label),
+            Span::styled(meter, value),
+            Span::styled(format!(" {db:>5.1}dB   "), dim),
+            Span::styled(format!("{heard:>10}"), value),
+            Span::styled(" \u{2192} ", dim),
+            Span::styled(format!("{aimed:<10}"), Style::default().fg(HEADER)),
+            Span::styled(err, err_style),
+        ]))
+        .style(bg),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
+    y += 1;
+
+    // Row 2: where the error has been. The centre line is in tune; the trace is
+    // ±50 cents around it, which is the range a listener calls "out".
+    let cols = (inner.width as usize).saturating_sub(10).min(trace.len());
+    if cols > 4 {
+        let spans: Vec<Span> = trace[trace.len() - cols..]
+            .iter()
+            .map(|&c| {
+                if !c.is_finite() {
+                    return Span::styled("\u{00B7}", dim);
+                }
+                let n = (c / 50.0).clamp(-1.0, 1.0);
+                let (ch, st) = match n {
+                    n if n > 0.35 => ('\u{2594}', Style::default().fg(KNOB)),
+                    n if n > 0.08 => ('\u{2500}', Style::default().fg(KNOB)),
+                    n if n < -0.35 => ('\u{2581}', Style::default().fg(KNOB)),
+                    n if n < -0.08 => ('\u{2582}', Style::default().fg(KNOB)),
+                    _ => ('\u{2500}', Style::default().fg(IN_TUNE)),
+                };
+                Span::styled(ch.to_string(), st)
+            })
+            .collect();
+        let mut line = vec![Span::styled("  0\u{00A2} ", dim)];
+        line.extend(spans);
+        f.render_widget(
+            Paragraph::new(Line::from(line)).style(bg),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        y += 1;
+    }
+    y
+}
+
+/// `233.4 Hz` as `A#3 233`, or a dash when there is nothing to name.
+fn note_label(hz: f32) -> String {
+    if !hz.is_finite() || hz <= 0.0 {
+        return "\u{2014}".to_string();
+    }
+    let note = (69.0 + 12.0 * (hz / 440.0).log2()).round().clamp(0.0, 127.0) as i32;
+    let name = choz_engine::fx::autotune::NOTE_NAMES[(note as usize) % 12];
+    format!("{name}{} {hz:.0}", note / 12 - 1)
+}
+
+/// The graphic EQ as tanu draws it: a column per band, a knob on the track, and
+/// the zero line straight through the middle.
+///
+/// A row of arcs says what each band is set to; this says what the **curve**
+/// is, which is the only question anyone asks an EQ. Ten arcs cannot be read as
+/// a shape, and a shape is the whole reason the control is ten sliders and not
+/// one number.
+///
+/// Returns a click rect per band, so a click lands on the band under the mouse.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_eq_bank(
+    f: &mut Frame,
+    inner: Rect,
+    y: u16,
+    values: &[f32],
+    labels: &[&str],
+    cursor: usize,
+    focused: bool,
+    title: &str,
+    bg: Style,
+) -> (Vec<(usize, Rect)>, u16) {
+    let bands = values.len().min(labels.len());
+    let mut rects = Vec::new();
+    // Six rows of track plus the labels and the frame: under that there is no
+    // curve to see and the knob grid is the better drawing.
+    let height = 10u16.min(inner.height.saturating_sub(y - inner.y));
+    if bands == 0 || height < 7 || inner.width < bands as u16 * 4 {
+        return (rects, y);
+    }
+    let rect = Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), height);
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(if focused { SEL } else { LABEL }).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if focused { SEL } else { RULE }))
+        .style(bg);
+    let area = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let w = area.width as usize;
+    let track_h = (area.height - 1) as usize;
+    let centre = track_h / 2;
+    // Where the knob sits: 1.0 is the top of the track, 0.5 the zero line.
+    let knob_row = |v: f32| -> usize {
+        (((1.0 - v.clamp(0.0, 1.0)) * (track_h - 1) as f32).round() as usize).min(track_h - 1)
+    };
+    let band_mid = |b: usize| (b * w / bands + (b + 1) * w / bands) / 2;
+
+    for b in 0..bands {
+        let x0 = area.x + (b * w / bands) as u16;
+        let x1 = area.x + ((b + 1) * w / bands) as u16;
+        rects.push((b, Rect::new(x0, area.y, x1.saturating_sub(x0).max(1), area.height)));
+    }
+
+    for row in 0..track_h {
+        let spans: Vec<Span> = (0..w)
+            .map(|col| {
+                let b = (col * bands / w).min(bands - 1);
+                let mid = band_mid(b);
+                let sel = b == cursor && focused;
+                let kr = knob_row(values[b]);
+                let (ch, colour) = if col == mid && row == kr {
+                    // Above the zero line is a boost, below it is a cut, and
+                    // the colour says which without reading the number.
+                    ('\u{2588}', if values[b] >= 0.5 { IN_TUNE } else { Color::Rgb(230, 120, 120) })
+                } else if row == centre {
+                    ('\u{2500}', RULE)
+                } else if col == mid {
+                    ('\u{2502}', RULE)
+                } else {
+                    (' ', RULE)
+                };
+                let style = if sel && ch != ' ' && ch != '\u{2588}' {
+                    Style::default().fg(SEL)
+                } else {
+                    Style::default().fg(colour)
+                };
+                Span::styled(ch.to_string(), style)
+            })
+            .collect();
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(bg),
+            Rect::new(area.x, area.y + row as u16, area.width, 1),
+        );
+    }
+
+    // Band labels, centred under their own column.
+    let mut label_line = vec![Span::raw(" ".repeat(0))];
+    let mut at = 0usize;
+    for (b, label) in labels.iter().enumerate().take(bands) {
+        let mid = band_mid(b);
+        let text = truncate(label, 4);
+        let start = mid.saturating_sub(text.chars().count() / 2);
+        if start > at {
+            label_line.push(Span::raw(" ".repeat(start - at)));
+            at = start;
+        }
+        let style = if b == cursor && focused {
+            Style::default().fg(SEL).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(LABEL)
+        };
+        at += text.chars().count();
+        label_line.push(Span::styled(text.to_string(), style));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(label_line)).style(bg),
+        Rect::new(area.x, area.y + track_h as u16, area.width, 1),
+    );
+    (rects, rect.y + rect.height)
+}
+
 #[cfg(test)]
 mod tests {
+    /// The `A→M` button says what it is hearing, because "nothing happens" and
+    /// "the wrong note" look identical otherwise — and `SENS` is set against
+    /// exactly this reading.
+    #[test]
+    fn the_a_to_m_button_reports_what_it_heard() {
+        assert_eq!(note_name(60), "C4", "middle C is C4, the way a DAW writes it");
+        assert_eq!(note_name(69), "A4");
+        assert_eq!(note_name(40), "E2", "a guitar's low E");
+
+        let m = choz_engine::meter::pitch_meter();
+        // Nothing sounding: the reading is the input level, which is the number
+        // the sensitivity is set against.
+        m.publish(None, 0, 0.01);
+        assert!(heard().contains("-40dB"), "{}", heard());
+
+        // Sounding, and 40 cents flat of it.
+        m.publish(Some(40), -40, 0.2);
+        let text = heard();
+        assert!(text.contains("E2"), "{text}");
+        assert!(text.contains("-40"), "and how far off it is: {text}");
+        m.clear();
+    }
+
     use super::*;
 
     #[test]

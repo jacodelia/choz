@@ -4,6 +4,7 @@
 #   ./packaging/install.sh              build with cargo, install into ~/.local
 #   ./packaging/install.sh --prefix /usr/local
 #   ./packaging/install.sh --binary target/release/choz     skip the build
+#   ./packaging/install.sh --skip-deps-check      install without checking ALSA
 #   ./packaging/install.sh --uninstall
 #
 # What it will never touch, install or uninstall: ~/.local/state/choz. The
@@ -13,6 +14,7 @@ set -eu
 PREFIX="${PREFIX:-$HOME/.local}"
 BINARY=""
 UNINSTALL=0
+SKIP_DEPS=0
 # Where an older copy may be hiding, whatever prefix is asked for now.
 # `CHOZ_SEARCH_BINS` narrows that (the test suite sets it empty): this list is
 # the one thing here that reaches outside `--prefix`, and deleting a binary
@@ -27,6 +29,7 @@ while [ $# -gt 0 ]; do
         --prefix) PREFIX="${2:?--prefix needs a directory}"; shift 2 ;;
         --binary) BINARY="${2:?--binary needs a path}"; shift 2 ;;
         --uninstall) UNINSTALL=1; shift ;;
+        --skip-deps-check) SKIP_DEPS=1; shift ;;
         -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
@@ -73,6 +76,41 @@ if [ "$UNINSTALL" = 1 ]; then
     exit 0
 fi
 
+# What choz needs on the machine that runs it. Checked rather than assumed: the
+# binary links ALSA and glibc, and *dlopens* libjack at runtime — so JACK and
+# PipeWire are optional, and a box without them still gets audio through ALSA.
+#
+# A missing ALSA is fatal, because the result would be a choz that starts and
+# then opens no audio device — a bug report waiting to happen rather than an
+# install. `--skip-deps-check` is for the one case where continuing is right:
+# staging an install for a machine that is not this one.
+check_runtime_deps() {
+    if [ "$SKIP_DEPS" = 1 ]; then
+        say "skipping the runtime dependency check (--skip-deps-check)"
+        return 0
+    fi
+    # No ldconfig at all (a container, a musl box): say so and carry on rather
+    # than refuse over a question that could not be asked.
+    if ! command -v ldconfig >/dev/null 2>&1; then
+        say "note: no ldconfig here, so the runtime libraries were not checked"
+        return 0
+    fi
+    if ! ldconfig -p 2>/dev/null | grep -q 'libasound\.so\.2'; then
+        say "libasound.so.2 (ALSA) is missing — choz would start and open no audio device."
+        say "  Debian/Ubuntu: sudo apt install libasound2t64   (or libasound2)"
+        say "  Arch:          sudo pacman -S alsa-lib"
+        say "  Fedora:        sudo dnf install alsa-lib"
+        say "Install it and run this again, or pass --skip-deps-check to install anyway"
+        say "(right when you are staging this for another machine)."
+        exit 1
+    fi
+    if ! ldconfig -p 2>/dev/null | grep -q 'libjack\.so'; then
+        say "note: libjack is not installed — choz will use ALSA."
+        say "      For JACK/PipeWire routing: apt install libjack-jackd2-0 | pacman -S jack2 | dnf install jack-audio-connection-kit"
+    fi
+    return 0
+}
+
 if [ -z "$BINARY" ]; then
     command -v cargo >/dev/null 2>&1 || die "no cargo and no --binary; nothing to install"
     say "building (release)…"
@@ -82,6 +120,7 @@ fi
 [ -x "$BINARY" ] || die "$BINARY is not an executable"
 
 new_version=$("$BINARY" --version 2>/dev/null || echo "choz (unknown)")
+check_runtime_deps
 
 # Upgrade means replacing what is there, not installing alongside it.
 remove_installed

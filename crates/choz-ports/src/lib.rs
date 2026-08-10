@@ -339,6 +339,11 @@ pub struct Transport {
     bpm: std::sync::atomic::AtomicU32,
     sample_rate: std::sync::atomic::AtomicU32,
     playing: std::sync::atomic::AtomicBool,
+    /// Time signature, packed as `numerator << 16 | denominator`. One atomic
+    /// because the two are only ever meaningful together — a plugin reading
+    /// 3 over 4 halfway through a change to 6/8 would be reading a bar that
+    /// never existed.
+    time_sig: std::sync::atomic::AtomicU32,
 }
 
 /// The one clock. See [`Transport`] for why it is global.
@@ -359,6 +364,7 @@ impl Transport {
             bpm: std::sync::atomic::AtomicU32::new(Self::DEFAULT_BPM.to_bits()),
             sample_rate: std::sync::atomic::AtomicU32::new(48_000),
             playing: std::sync::atomic::AtomicBool::new(false),
+            time_sig: std::sync::atomic::AtomicU32::new((4 << 16) | 4),
         }
     }
 
@@ -405,9 +411,95 @@ impl Transport {
         self.playing.store(playing, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Beats per bar and the note value that gets the beat: `(4, 4)`, `(6, 8)`.
+    pub fn time_signature(&self) -> (u16, u16) {
+        let packed = self.time_sig.load(std::sync::atomic::Ordering::Relaxed);
+        ((packed >> 16) as u16, packed as u16)
+    }
+
+    /// Set the time signature. Both halves are clamped to something a bar can
+    /// be made of; a denominator that is not a power of two is not a note
+    /// value, and a plugin handed one has no way to interpret it.
+    pub fn set_time_signature(&self, numerator: u16, denominator: u16) {
+        let numerator = numerator.clamp(1, 32);
+        let denominator = match denominator {
+            1 | 2 | 4 | 8 | 16 | 32 => denominator,
+            _ => 4,
+        };
+        self.time_sig.store(
+            ((numerator as u32) << 16) | denominator as u32,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     /// Position in quarter notes, which is what every plugin format asks for
     /// (VST2 `ppqPos`, VST3 `projectTimeMusic`, CLAP's beat position).
     pub fn ppq(&self) -> f64 {
         self.samples() as f64 / self.sample_rate() as f64 * (self.bpm() as f64 / 60.0)
+    }
+
+    /// A bar's length in quarter notes. 4/4 is four, 6/8 is three, 7/8 is 3.5 —
+    /// the numerator counts notes of `1/denominator`, and a quarter is four of
+    /// the denominator's own units.
+    pub fn bar_quarters(&self) -> f64 {
+        let (num, den) = self.time_signature();
+        num as f64 * 4.0 / den.max(1) as f64
+    }
+
+    /// Where the bar containing the playhead started, in quarter notes, and
+    /// which bar that is counting from 1.
+    ///
+    /// choz has no arrangement, so "bar 1" is simply where the transport was
+    /// last reset. That is still worth publishing: a plugin that draws a bar
+    /// counter or syncs a pattern to bar starts needs the *phase*, and the phase
+    /// is real even when the number is only a count.
+    pub fn bar_position(&self) -> (i32, f64) {
+        let quarters = self.bar_quarters();
+        if quarters <= 0.0 {
+            return (1, 0.0);
+        }
+        let ppq = self.ppq();
+        let bars = (ppq / quarters).floor();
+        (bars as i32 + 1, bars * quarters)
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    /// A bar is the time signature read as quarter notes, and the playhead's
+    /// bar is where the phase is — which is the half of it a plugin can use
+    /// even though choz has no arrangement to number bars against.
+    #[test]
+    fn a_bar_is_the_time_signature_read_in_quarter_notes() {
+        let t = transport();
+        t.set_sample_rate(48_000);
+        t.set_bpm(120.0);
+        t.rewind();
+        t.set_time_signature(4, 4);
+        assert_eq!(t.bar_quarters(), 4.0);
+        assert_eq!(t.bar_position(), (1, 0.0), "the start is bar 1 at 0");
+
+        // 120 BPM: a quarter note is half a second. Five quarters in is the
+        // second bar, and it began at 4.
+        t.advance(24_000 * 5);
+        assert_eq!(t.bar_position(), (2, 4.0));
+
+        // 6/8 is six eighths, which is three quarters — so the same playhead
+        // sits in a different bar with a different start.
+        t.set_time_signature(6, 8);
+        assert_eq!(t.bar_quarters(), 3.0);
+        assert_eq!(t.bar_position(), (2, 3.0));
+
+        // 7/8 is three and a half quarters, which is not a whole number and is
+        // exactly why this is computed rather than counted in beats.
+        t.set_time_signature(7, 8);
+        assert_eq!(t.bar_quarters(), 3.5);
+        assert_eq!(t.bar_position(), (2, 3.5));
+
+        t.set_time_signature(4, 4);
+        t.set_bpm(Transport::DEFAULT_BPM);
+        t.rewind();
     }
 }

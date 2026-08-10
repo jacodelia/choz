@@ -2,6 +2,8 @@
 //! plugin registry. Built on the RT-safe traits in `choz-ports`.
 
 pub mod fx;
+pub mod meter;
+pub mod pitch;
 pub mod fx_chain;
 pub mod engine;
 mod jack_backend;

@@ -61,12 +61,34 @@ pub fn device_channels(sink: &str) -> Option<(usize, usize)> {
     Some((sink_ports(&client, sink).len(), source_ports(&client, sink).len()))
 }
 
-/// Capture ports of `source`. A separate input device is the normal case on a
-/// plain sound card, where playback (`alsa_output…`) and capture
-/// (`alsa_input…`) are two different graph nodes.
-pub fn capture_channels(source: &str) -> Option<usize> {
-    let (client, _) = Client::new("choz-probe", ClientOptions::NO_START_SERVER).ok()?;
-    Some(source_ports(&client, source).len())
+/// **Every** capture port in the graph, ours excluded — an interface's eight
+/// inputs *and* the laptop's microphone *and* the other card, grouped by the
+/// node that owns them and channel-ordered inside each group.
+///
+/// This is what the IN drawer lists. Taking the capture ports of the *sink*
+/// instead (which is what choz used to do) finds nothing at all on a PipeWire
+/// box, because playback and capture of one interface are two separate nodes:
+/// an eight-input UMC1820 showed `AUDIO IN (0)`.
+pub fn all_capture_ports() -> Vec<String> {
+    let Ok((client, _)) = Client::new("choz-probe", ClientOptions::NO_START_SERVER) else {
+        return Vec::new();
+    };
+    let mut owners: Vec<String> = Vec::new();
+    for port in client.ports(None, Some(super::engine::JACK_AUDIO), jack::PortFlags::IS_OUTPUT) {
+        // `monitor_*` carries back what we just played, and our own ports would
+        // feed the rack into itself.
+        if port.contains(":monitor") {
+            continue;
+        }
+        let Some((owner, _)) = port.rsplit_once(':') else { continue };
+        if owner == CLIENT_NAME || owner == super::engine::CPAL_JACK_CLIENT {
+            continue;
+        }
+        if !owners.iter().any(|o| o == owner) {
+            owners.push(owner.to_string());
+        }
+    }
+    owners.iter().flat_map(|owner| source_ports(&client, owner)).take(MAX_PORTS).collect()
 }
 
 /// The device's playback ports — where our audio goes — in channel order.
@@ -105,16 +127,19 @@ pub(crate) fn in_order(mut ports: Vec<String>) -> Vec<String> {
     ports
 }
 
-/// Open the client, register `outs`/`ins` ports, wire them to `sink` when one
-/// is named, and start processing. Returns the live client and the number of
-/// output ports actually registered.
+/// Open the client, register the ports, wire them to `sink` when one is named,
+/// and start processing. Returns the live client and the number of output ports
+/// actually registered.
+///
+/// `capture` is the graph ports our inputs are wired to, one for one — see
+/// [`all_capture_ports`]. Its length *is* the input channel count.
 pub fn start(
     sink: Option<&str>,
-    source: Option<&str>,
+    capture: &[String],
     outs: usize,
-    ins: usize,
     state: RtState,
 ) -> Result<(Handle, usize)> {
+    let ins = capture.len();
     let (client, _status) = Client::new(CLIENT_NAME, ClientOptions::NO_START_SERVER)
         .context("cannot reach the JACK graph (is PipeWire's JACK layer installed?)")?;
 
@@ -145,10 +170,10 @@ pub fn start(
             eprintln!("choz: {e}");
         }
     }
-    // Capture comes from wherever the user pointed it — the same node as the
-    // output on a duplex interface, a different one on a plain sound card.
-    if let Some(source) = source {
-        connect_capture(handle.as_client(), &our_ins, source);
+    // Capture: every input jack in the graph, wired one for one. A device that
+    // vanished between the scan and here just fails to connect.
+    for (from, ours) in capture.iter().zip(our_ins.iter()) {
+        let _ = handle.as_client().connect_ports_by_name(from, ours);
     }
     Ok((handle, outs))
 }
@@ -174,9 +199,3 @@ fn connect(client: &Client, our_outs: &[String], sink: &str) -> Result<()> {
     Ok(())
 }
 
-/// Wire `source`'s capture ports into our `in_*`, channel for channel.
-fn connect_capture(client: &Client, our_ins: &[String], source: &str) {
-    for (from, ours) in source_ports(client, source).iter().zip(our_ins.iter()) {
-        let _ = client.connect_ports_by_name(from, ours);
-    }
-}

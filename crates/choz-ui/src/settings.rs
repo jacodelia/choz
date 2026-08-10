@@ -168,11 +168,6 @@ pub struct AudioSettings {
     pub backend: String,
     /// Output device name, or empty for the system default.
     pub device: String,
-    /// Capture device name, empty = follow the output's own graph node (right
-    /// for a duplex interface, nothing at all on a plain sound card). Added
-    /// later, hence the default.
-    #[serde(default)]
-    pub input_device: String,
     pub sample_rate: u32,
     pub buffer_size: u32,
     /// SF2 synthesis engine. choz only builds `oxisynth`; kept so a project
@@ -188,6 +183,14 @@ pub struct AudioSettings {
     /// on every block. Added later, hence the default.
     #[serde(default = "default_bpm")]
     pub bpm: f32,
+    /// Beats per bar and the note that gets the beat. Added later, hence the
+    /// default.
+    #[serde(default = "default_time_sig")]
+    pub time_sig: (u16, u16),
+}
+
+fn default_time_sig() -> (u16, u16) {
+    (4, 4)
 }
 
 fn default_bpm() -> f32 {
@@ -199,7 +202,6 @@ impl Default for AudioSettings {
         Self {
             backend: "AUTO".into(),
             device: String::new(),
-            input_device: String::new(),
             sample_rate: 48_000,
             buffer_size: 256,
             sf2_engine: "oxisynth".into(),
@@ -207,6 +209,7 @@ impl Default for AudioSettings {
             alsa_hw_device: String::new(),
             jack_server_name: String::new(),
             bpm: default_bpm(),
+            time_sig: default_time_sig(),
         }
     }
 }
@@ -391,6 +394,11 @@ pub struct UiSettings {
     /// can exist is in the picture itself.
     #[serde(default = "default_tint")]
     pub background_tint: u8,
+    /// The colour the panels are washed with. `None` follows the active
+    /// scheme's own desktop colour, which is what keeps a tinted UI looking
+    /// like the theme rather than like a filter over it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel_tint: Option<(u8, u8, u8)>,
     /// Live rig or multi-timbral module. Saved, because it is a property of how
     /// this machine is set up, not of a single session.
     #[serde(default)]
@@ -413,6 +421,7 @@ impl Default for UiSettings {
             border_color: None,
             theme_name: THEMES[0].name.to_string(),
             background_tint: default_tint(),
+            panel_tint: None,
             rack_mode: RackMode::default(),
         }
     }
@@ -426,12 +435,44 @@ impl UiSettings {
     /// rather than as a grey filter. Falls back to a neutral dark when the
     /// scheme paints no desktop of its own.
     pub fn tint(&self) -> ((u8, u8, u8), f32) {
-        let rgb = THEMES
-            .iter()
-            .find(|t| t.name == self.theme_name)
-            .and_then(|t| t.desktop)
-            .unwrap_or((16, 18, 24));
+        let rgb = self.panel_tint.unwrap_or_else(|| {
+            THEMES
+                .iter()
+                .find(|t| t.name == self.theme_name)
+                .and_then(|t| t.desktop)
+                .unwrap_or((16, 18, 24))
+        });
         (rgb, self.background_tint.min(100) as f32 / 100.0)
+    }
+
+    /// Name of the panel colour for the settings row: the scheme's own, or the
+    /// palette entry the user picked.
+    pub fn panel_tint_label(&self) -> String {
+        match self.panel_tint {
+            None => "theme's own".to_string(),
+            Some(rgb) => PALETTE
+                .iter()
+                .find(|(_, c)| *c == rgb)
+                .map(|(n, _)| (*n).to_string())
+                .unwrap_or_else(|| format!("rgb({},{},{})", rgb.0, rgb.1, rgb.2)),
+        }
+    }
+
+    /// Step through "the theme's own" and then the palette, wrapping. One row,
+    /// one key — the colour is a taste decision made by looking at it.
+    pub fn step_panel_tint(&mut self, delta: i32) {
+        let len = PALETTE.len() as i32 + 1;
+        let now = match self.panel_tint {
+            None => 0,
+            Some(rgb) => {
+                PALETTE.iter().position(|(_, c)| *c == rgb).map(|i| i as i32 + 1).unwrap_or(0)
+            }
+        };
+        let next = (now + delta).rem_euclid(len);
+        self.panel_tint = match next {
+            0 => None,
+            i => Some(PALETTE[(i - 1) as usize].1),
+        };
     }
 
     pub fn color(&self) -> Color {
@@ -507,6 +548,7 @@ impl UiSettings {
     /// Push the settings into the places the drawing code reads them from.
     pub fn apply(&self) {
         choz_ports::transport().set_bpm(self.audio.bpm);
+        choz_ports::transport().set_time_signature(self.audio.time_sig.0, self.audio.time_sig.1);
         crate::i18n::set_language(self.language);
         crate::views::theme::set_text_color(self.color());
         crate::views::theme::set_border_color(self.border());

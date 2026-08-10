@@ -130,6 +130,41 @@ pub const LV2_BUF_SIZE_NOMINAL_BLOCK_URI: &str =
 pub const LV2_PARAM_SAMPLE_RATE_URI: &str = "http://lv2plug.in/ns/ext/parameters#sampleRate";
 pub const LV2_ATOM_INT_URI: &str = "http://lv2plug.in/ns/ext/atom#Int";
 pub const LV2_ATOM_FLOAT_URI: &str = "http://lv2plug.in/ns/ext/atom#Float";
+pub const LV2_ATOM_LONG_URI: &str = "http://lv2plug.in/ns/ext/atom#Long";
+pub const LV2_ATOM_OBJECT_URI: &str = "http://lv2plug.in/ns/ext/atom#Object";
+
+// ─── Transport (ext/time) ───────────────────────────────────────────────────
+//
+// LV2 has no host callback for the clock: the host writes a `time:Position`
+// object into the plugin's atom input, next to the MIDI. These are the keys a
+// plugin looks for inside it.
+
+pub const LV2_TIME_POSITION_URI: &str = "http://lv2plug.in/ns/ext/time#Position";
+pub const LV2_TIME_FRAME_URI: &str = "http://lv2plug.in/ns/ext/time#frame";
+pub const LV2_TIME_SPEED_URI: &str = "http://lv2plug.in/ns/ext/time#speed";
+pub const LV2_TIME_BPM_URI: &str = "http://lv2plug.in/ns/ext/time#beatsPerMinute";
+pub const LV2_TIME_BAR_URI: &str = "http://lv2plug.in/ns/ext/time#bar";
+pub const LV2_TIME_BAR_BEAT_URI: &str = "http://lv2plug.in/ns/ext/time#barBeat";
+pub const LV2_TIME_BEATS_PER_BAR_URI: &str = "http://lv2plug.in/ns/ext/time#beatsPerBar";
+pub const LV2_TIME_BEAT_UNIT_URI: &str = "http://lv2plug.in/ns/ext/time#beatUnit";
+
+/// `LV2_Atom_Object_Body` — `{ id, otype }`, followed by properties.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LV2_Atom_Object_Body {
+    pub id: u32,
+    pub otype: u32,
+}
+
+/// `LV2_Atom_Property_Body` — `{ key, context, value }`, the value's own bytes
+/// following it and the whole thing padded to eight.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LV2_Atom_Property_Body {
+    pub key: u32,
+    pub context: u32,
+    pub value: LV2_Atom,
+}
 
 /// `LV2_Options_Context::LV2_OPTIONS_INSTANCE`.
 pub const LV2_OPTIONS_INSTANCE: u32 = 0;

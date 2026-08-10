@@ -79,6 +79,24 @@ impl GranularDelay {
 }
 
 impl FxProcessor for GranularDelay {
+    /// The chain is **not** rebuilt for a knob turn — that would throw away the
+    /// delay buffer, and a delay with no buffer is silence. Same order as
+    /// `build_processor` maps them.
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match index {
+            0 => {
+                self.delay_ms = 20.0 + v * 980.0;
+                self.delay_frames =
+                    ((self.delay_ms * 0.001 * self.sample_rate as f32) as usize).min(MAX_BUF - 1);
+            }
+            1 => self.feedback = v,
+            2 => self.scatter_st = (v - 0.5) * 24.0,
+            3 => self.density = 1.0 + v * 31.0,
+            _ => {}
+        }
+    }
+
     fn process_block(&mut self, block: &mut [f32], sample_rate: u32) {
         if sample_rate != self.sample_rate {
             self.sample_rate = sample_rate;

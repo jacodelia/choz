@@ -49,7 +49,7 @@ pub enum AudioFxKind {
     #[default] Delay,
     Reverb, GranDelay,
     Compressor, Limiter, Gate, Expander,
-    ParamEq, Filter, FilterBank,
+    ParamEq, GraphicEq, Filter, FilterBank,
     Chorus, Flanger, Phaser,
     BitCrusher, Vinyl, Cassette, SoftClip, TubeSat,
     Widener, Isolator,
@@ -59,6 +59,8 @@ pub enum AudioFxKind {
     Protocosmos, SpaceEcho, ReverseDelay, Z5Texture,
     // Stompbox distortions.
     AmberFang, VelvetFuzz,
+    // Pitch.
+    AutoTune,
 }
 
 /// What an effect does, for grouping the ADD FX list.
@@ -72,6 +74,8 @@ pub enum FxCategory {
     Distortion,
     Spatial,
     Texture,
+    /// Anything that moves the pitch itself rather than the timbre around it.
+    Pitch,
     Utility,
     /// A hosted plugin whose name gives nothing away.
     Other,
@@ -88,6 +92,7 @@ impl FxCategory {
         FxCategory::Distortion,
         FxCategory::Spatial,
         FxCategory::Texture,
+        FxCategory::Pitch,
         FxCategory::Utility,
         FxCategory::Other,
     ];
@@ -102,6 +107,7 @@ impl FxCategory {
             FxCategory::Distortion => "DISTORTION",
             FxCategory::Spatial => "SPATIAL",
             FxCategory::Texture => "TEXTURE",
+            FxCategory::Pitch => "PITCH",
             FxCategory::Utility => "UTILITY",
             FxCategory::Other => "OTHER",
         }
@@ -145,25 +151,31 @@ impl AudioFxKind {
             Delay | GranDelay | ReverseDelay | SpaceEcho => FxCategory::Delay,
             Reverb => FxCategory::Reverb,
             Compressor | Limiter | Gate | Expander | SidechainDuck => FxCategory::Dynamics,
-            ParamEq | Filter | FilterBank | Isolator => FxCategory::EqFilter,
+            ParamEq | GraphicEq | Filter | FilterBank | Isolator => FxCategory::EqFilter,
             Chorus | Flanger | Phaser => FxCategory::Modulation,
             BitCrusher | Vinyl | Cassette | SoftClip | TubeSat | AmberFang | VelvetFuzz => {
                 FxCategory::Distortion
             }
             Widener | Pan => FxCategory::Spatial,
             Protocosmos | Z5Texture | Looper => FxCategory::Texture,
+            AutoTune => FxCategory::Pitch,
             Gain | PhaseInvert | MonoMaker => FxCategory::Utility,
         }
     }
 }
 
-/// Max FX per rack slot (matches seqterm's chain length).
-pub const MAX_FX: usize = 5;
+/// Max FX per rack slot.
+///
+/// Twelve, not seqterm's five: a guitar chain is a tuner, a gate, a compressor,
+/// a drive, a modulation and two delays before anyone has thought about reverb.
+/// The chain row wraps onto further lines on its own, so the only thing this
+/// number costs is the DSP the user asked for.
+pub const MAX_FX: usize = 12;
 
 pub const ALL_FX_KINDS: &[AudioFxKind] = &[
     AudioFxKind::Delay, AudioFxKind::Reverb, AudioFxKind::GranDelay,
     AudioFxKind::Compressor, AudioFxKind::Limiter, AudioFxKind::Gate, AudioFxKind::Expander,
-    AudioFxKind::ParamEq, AudioFxKind::Filter, AudioFxKind::FilterBank,
+    AudioFxKind::ParamEq, AudioFxKind::GraphicEq, AudioFxKind::Filter, AudioFxKind::FilterBank,
     AudioFxKind::Chorus, AudioFxKind::Flanger, AudioFxKind::Phaser,
     AudioFxKind::BitCrusher, AudioFxKind::Vinyl, AudioFxKind::Cassette,
     AudioFxKind::SoftClip, AudioFxKind::TubeSat,
@@ -173,6 +185,7 @@ pub const ALL_FX_KINDS: &[AudioFxKind] = &[
     AudioFxKind::Protocosmos, AudioFxKind::SpaceEcho, AudioFxKind::ReverseDelay,
     AudioFxKind::Z5Texture,
     AudioFxKind::AmberFang, AudioFxKind::VelvetFuzz,
+    AudioFxKind::AutoTune,
 ];
 
 impl AudioFxKind {
@@ -181,7 +194,8 @@ impl AudioFxKind {
             Self::Delay => "DELAY", Self::Reverb => "REVERB", Self::GranDelay => "GRANDELAY",
             Self::Compressor => "COMPRESSOR", Self::Limiter => "LIMITER", Self::Gate => "GATE",
             Self::Expander => "EXPANDER",
-            Self::ParamEq => "PARAM EQ", Self::Filter => "FILTER", Self::FilterBank => "FILTERBANK",
+            Self::ParamEq => "PARAM EQ", Self::GraphicEq => "GRAPHIC EQ",
+            Self::Filter => "FILTER", Self::FilterBank => "FILTERBANK",
             Self::Chorus => "CHORUS", Self::Flanger => "FLANGER", Self::Phaser => "PHASER",
             Self::BitCrusher => "BITCRUSH", Self::Vinyl => "VINYL", Self::Cassette => "CASSETTE",
             Self::SoftClip => "SOFTCLIP", Self::TubeSat => "TUBE SAT",
@@ -192,6 +206,7 @@ impl AudioFxKind {
             Self::Protocosmos => "PROTOCOSMOS", Self::SpaceEcho => "SPACE ECHO",
             Self::ReverseDelay => "REVERSE", Self::Z5Texture => "Z5 TEXTURE",
             Self::AmberFang => "AMBER FANG", Self::VelvetFuzz => "VELVET FUZZ",
+            Self::AutoTune => "AUTO-TUNE",
         }
     }
 
@@ -200,7 +215,8 @@ impl AudioFxKind {
             Self::Delay => "delay", Self::Reverb => "reverb", Self::GranDelay => "grandelay",
             Self::Compressor => "compressor", Self::Limiter => "limiter", Self::Gate => "gate",
             Self::Expander => "expander",
-            Self::ParamEq => "parameq", Self::Filter => "filter", Self::FilterBank => "filterbank",
+            Self::ParamEq => "parameq", Self::GraphicEq => "graphiceq",
+            Self::Filter => "filter", Self::FilterBank => "filterbank",
             Self::Chorus => "chorus", Self::Flanger => "flanger", Self::Phaser => "phaser",
             Self::BitCrusher => "bitcrusher", Self::Vinyl => "vinyl", Self::Cassette => "cassette",
             Self::SoftClip => "softclip", Self::TubeSat => "tubesat",
@@ -211,6 +227,7 @@ impl AudioFxKind {
             Self::Protocosmos => "protocosmos", Self::SpaceEcho => "spaceecho",
             Self::ReverseDelay => "reversedelay", Self::Z5Texture => "z5texture",
             Self::AmberFang => "amberfang", Self::VelvetFuzz => "velvetfuzz",
+            Self::AutoTune => "autotune",
         }
     }
 
@@ -370,6 +387,28 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
     static COMP:     &[FxParamDesc] = &[pd!("Thresh",0.70),pd!("Ratio",0.18),pd!("Attack",0.10),pd!("Release",0.15),pd!("Makeup",0.00),pd!("Knee",0.50),pd!("Wet",1.00)];
     static LIMIT:    &[FxParamDesc] = &[pd!("Thresh",0.95),pd!("Release",0.25),pd!("Wet",1.00)];
     static GATE:     &[FxParamDesc] = &[pd!("Thresh",0.50),pd!("Attack",0.02),pd!("Hold",0.10),pd!("Release",0.20),pd!("Floor",0.00),pd!("Wet",1.00)];
+    // Ten Winamp bands, a preamp and the preset list — each one a knob, so a CC
+    // can ride a single band. The preset is drawn as a named step.
+    static GRAPHICEQ: &[FxParamDesc] = &[
+        pd!("70",0.50),pd!("180",0.50),pd!("320",0.50),pd!("600",0.50),pd!("1k",0.50),
+        pd!("3k",0.50),pd!("6k",0.50),pd!("12k",0.50),pd!("14k",0.50),pd!("16k",0.50),
+        pd!("Preamp",0.50),
+        FxParamDesc { name: Cow::Borrowed("Preset"), default: 0.0, shape: ParamShape::Continuous },
+        pd!("Wet",1.00),
+    ];
+    // AUTO-TUNE. Named steps where the value is a name — a key is C or it is
+    // not, and drawing "0.36" for D would be a knob that means nothing.
+    static AUTOTUNE: &[FxParamDesc] = &[
+        FxParamDesc { name: Cow::Borrowed("Preset"), default: 0.0, shape: ParamShape::Continuous },
+        pd!("Retune",0.08), pd!("Correct",1.00),
+        FxParamDesc { name: Cow::Borrowed("Key"), default: 0.0, shape: ParamShape::Continuous },
+        FxParamDesc { name: Cow::Borrowed("Scale"), default: 0.0, shape: ParamShape::Continuous },
+        FxParamDesc { name: Cow::Borrowed("Mode"), default: 0.0, shape: ParamShape::Continuous },
+        pd!("Human",0.00),
+        pd!("A4",0.50), pd!("MinHz",0.03), pd!("MaxHz",1.00),
+        pd!("InGain",0.50), pd!("OutGain",0.50),
+        pd!("Wet",1.00),
+    ];
     static PARAMEQ:  &[FxParamDesc] = &[pd!("Low",0.50),pd!("LowMid",0.50),pd!("HiMid",0.50),pd!("High",0.50),pd!("LowFreq",0.30),pd!("HiFreq",0.70),pd!("MidQ",0.30),pd!("Wet",1.00)];
     static FILTER:   &[FxParamDesc] = &[pd!("Cutoff",0.70),pd!("Res",0.20),pd!("Wet",1.00)];
     static FILTERBNK:&[FxParamDesc] = &[pd!("Low",0.50),pd!("Mid",0.50),pd!("High",0.50),pd!("Wet",1.00)];
@@ -392,7 +431,7 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
     match kind {
         Delay => DELAY, Reverb => REVERB, GranDelay => GRNDLY,
         Compressor => COMP, Limiter => LIMIT, Gate => GATE,
-        ParamEq => PARAMEQ, Filter => FILTER, FilterBank => FILTERBNK,
+        AutoTune => AUTOTUNE, ParamEq => PARAMEQ, GraphicEq => GRAPHICEQ, Filter => FILTER, FilterBank => FILTERBNK,
         Chorus => CHORUS, Flanger => FLANGER, Phaser => PHASER,
         BitCrusher => CRUSH, Vinyl => VINYL, Cassette => CASSETTE,
         SoftClip => SOFTCLIP, TubeSat => TUBESAT,
@@ -473,6 +512,101 @@ impl AudioFxEntry {
         }
     }
 
+    /// Whether the built-in processor takes parameter changes **live**.
+    ///
+    /// This is the difference between turning a knob and losing the sound: a
+    /// built-in that does not implement `set_param` only picks a value up when
+    /// the chain is rebuilt, and a rebuild replaces **every** processor in the
+    /// chain — so nudging a Gain knob throws away the reverb's tail, the
+    /// delay's buffer and the looper's recording. Everything with state is on
+    /// this list, and the ones that are not are stateless: rebuilding them is
+    /// inaudible.
+    pub fn takes_live_params(kind: AudioFxKind) -> bool {
+        use AudioFxKind::*;
+        matches!(
+            kind,
+            Delay
+                | Reverb
+                | GranDelay
+                | Compressor
+                | Limiter
+                | Gate
+                | Expander
+                | GraphicEq
+                | Filter
+                | Chorus
+                | Flanger
+                | Phaser
+                | BitCrusher
+                | Vinyl
+                | Widener
+                | Pan
+                | Protocosmos
+                | SpaceEcho
+                | ReverseDelay
+                | Z5Texture
+                | AmberFang
+                | VelvetFuzz
+                | AutoTune
+        )
+    }
+
+    /// A preset knob that fills in the knobs below it.
+    ///
+    /// AutoTune's presets are five sets of five values, and the parameter array
+    /// here is the state everything else reads: the project saves it and the
+    /// chain is rebuilt from it. So picking a preset has to *write* those
+    /// values, not just tell the processor — otherwise the rebuild reads the
+    /// array, finds the defaults, and the preset lasts exactly until the next
+    /// knob is touched.
+    ///
+    /// Returns true when it changed something, so the caller knows to rebuild.
+    pub fn apply_preset(&mut self, index: usize) -> bool {
+        if self.plugin.is_some() {
+            return false;
+        }
+        // The graphic EQ's preset is the last-but-one knob, not the first.
+        if self.kind == AudioFxKind::GraphicEq {
+            use choz_engine::fx::{graphic_eq, EQ_BANDS, EQ_PRESETS};
+            let Some(slot) = self.param_descs().iter().position(|d| d.name == "Preset") else {
+                return false;
+            };
+            if index != slot {
+                return false;
+            }
+            let pick = graphic_eq::preset_index(self.params.get(slot).copied().unwrap_or(0.0));
+            let Some((_, gains)) = EQ_PRESETS.get(pick) else { return false };
+            // **Write the bands.** The processor was already told, but the
+            // sliders draw from this array and the project saves it — a preset
+            // the sliders do not show is a preset that vanishes the next time
+            // anything is rebuilt.
+            for (b, db) in gains.iter().enumerate().take(EQ_BANDS) {
+                if let Some(p) = self.params.get_mut(b) {
+                    *p = graphic_eq::db_to_norm(*db);
+                }
+            }
+            return true;
+        }
+        if self.kind != AudioFxKind::AutoTune || index != 0 {
+            return false;
+        }
+        use choz_engine::fx::autotune;
+        let pick = autotune::preset_index(self.params.first().copied().unwrap_or(0.0));
+        let Some(&(_, retune, correction, humanize, mode)) = autotune::PRESETS.get(pick) else {
+            return false;
+        };
+        let set = |ps: &mut Vec<f32>, i: usize, v: f32| {
+            if let Some(slot) = ps.get_mut(i) {
+                *slot = v.clamp(0.0, 1.0);
+            }
+        };
+        set(&mut self.params, 1, retune / 1000.0);
+        set(&mut self.params, 2, correction);
+        set(&mut self.params, 5, (mode == autotune::AutoTuneMode::HardTune) as u8 as f32);
+        set(&mut self.params, 6, humanize);
+        true
+    }
+
     /// True when knob `index` is choz's dry/wet rather than a plugin parameter.
     pub fn is_mix_param(&self, index: usize) -> bool {
         match &self.plugin {
@@ -503,7 +637,62 @@ impl AudioFxEntry {
                 })
                 .chain(std::iter::once(pd!("Wet", 1.00)))
                 .collect(),
-            None => fx_param_descs(self.kind).to_vec(),
+            None => {
+                let mut descs = fx_param_descs(self.kind).to_vec();
+                // The preset row is a list of names, not a number: the same
+                // control a plugin's enumerated parameter gets.
+                if self.kind == AudioFxKind::GraphicEq {
+                    let last = choz_engine::fx::EQ_PRESETS.len().saturating_sub(1).max(1) as f32;
+                    let points = choz_engine::fx::EQ_PRESETS
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (name, _))| (i as f32 / last, (*name).to_string()))
+                        .collect();
+                    if let Some(d) = descs.iter_mut().find(|d| d.name == "Preset") {
+                        d.shape = ParamShape::Named(points);
+                    }
+                }
+                // Same for AutoTune: the preset, the key, the scale and the
+                // mode are all names. A knob at 0.36 does not say "D".
+                if self.kind == AudioFxKind::AutoTune {
+                    use choz_engine::fx::autotune;
+                    let named = |d: &mut FxParamDesc, items: Vec<String>| {
+                        let last = items.len().saturating_sub(1).max(1) as f32;
+                        d.shape = ParamShape::Named(
+                            items
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, n)| (i as f32 / last, n))
+                                .collect(),
+                        );
+                    };
+                    for d in descs.iter_mut() {
+                        match d.name.as_ref() {
+                            "Preset" => named(
+                                d,
+                                autotune::PRESETS.iter().map(|p| p.0.to_string()).collect(),
+                            ),
+                            "Key" => named(
+                                d,
+                                autotune::NOTE_NAMES.iter().map(|n| (*n).to_string()).collect(),
+                            ),
+                            "Scale" => named(
+                                d,
+                                autotune::ScaleType::ALL
+                                    .iter()
+                                    .map(|s| s.label().to_string())
+                                    .collect(),
+                            ),
+                            "Mode" => named(
+                                d,
+                                vec!["Natural".to_string(), "Hard Tune".to_string()],
+                            ),
+                            _ => {}
+                        }
+                    }
+                }
+                descs
+            }
         }
     }
 

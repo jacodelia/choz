@@ -96,9 +96,47 @@ fn line(event: &InputEvent, ports: &[String]) -> Line<'static> {
     ])
 }
 
+/// What the monitor is showing: the messages, or the sound they made.
+///
+/// seqterm has these as sidebar tabs; here they share the MIDI panel, because
+/// "did the note arrive" and "did anything come out" are the same question asked
+/// twice, and answering the second one needs no MIDI at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MonitorTab {
+    #[default]
+    Midi,
+    /// The output's shape, as a travelling window.
+    Wave,
+    /// How loud it is: peak and RMS, held and decaying.
+    Activity,
+}
+
+impl MonitorTab {
+    pub const ALL: [MonitorTab; 3] = [MonitorTab::Midi, MonitorTab::Wave, MonitorTab::Activity];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MonitorTab::Midi => "MIDI",
+            MonitorTab::Wave => "WAVE",
+            MonitorTab::Activity => "ACTIVITY",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let i = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+}
+
 /// Draw the monitor. `events` is oldest-first; the newest ones are shown at the
 /// bottom, so the eye follows new arrivals downward like a terminal log.
-pub fn draw_midi_monitor(f: &mut Frame, area: Rect, events: &[InputEvent], ports: &[String]) {
+pub fn draw_midi_monitor(
+    f: &mut Frame,
+    area: Rect,
+    events: &[InputEvent],
+    ports: &[String],
+    tab: MonitorTab,
+) -> Vec<(MonitorTab, Rect)> {
     let block = Block::default()
         .title(" MIDI IN ")
         .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
@@ -109,7 +147,45 @@ pub fn draw_midi_monitor(f: &mut Frame, area: Rect, events: &[InputEvent], ports
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height == 0 {
-        return;
+        return Vec::new();
+    }
+
+    // The tab strip takes the first row; the rest is whichever tab is showing.
+    let mut rects = Vec::new();
+    let mut spans: Vec<Span> = Vec::new();
+    let mut x = inner.x;
+    for t in MonitorTab::ALL {
+        let text = format!(" {} ", t.label());
+        let w = text.chars().count() as u16;
+        rects.push((t, Rect::new(x, inner.y, w, 1)));
+        let style = if t == tab {
+            Style::default().fg(ratatui::style::Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(HEADER)
+        };
+        spans.push(Span::styled(text, style));
+        spans.push(Span::styled("\u{2502}", Style::default().fg(DIM)));
+        x += w + 1;
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(super::theme::panel_style()),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    let inner = Rect::new(inner.x, inner.y + 1, inner.width, inner.height.saturating_sub(1));
+    if inner.height == 0 {
+        return rects;
+    }
+
+    match tab {
+        MonitorTab::Wave => {
+            draw_wave(f, inner);
+            return rects;
+        }
+        MonitorTab::Activity => {
+            draw_activity(f, inner);
+            return rects;
+        }
+        MonitorTab::Midi => {}
     }
 
     let rows = inner.height as usize;
@@ -126,6 +202,97 @@ pub fn draw_midi_monitor(f: &mut Frame, area: Rect, events: &[InputEvent], ports
     };
 
     f.render_widget(Paragraph::new(lines).style(super::theme::panel_style()), inner);
+    rects
+}
+
+/// The output's shape: a window of the mixed signal, oldest on the left.
+///
+/// Half-blocks, so one row of cells carries two rows of resolution — the same
+/// trick the wallpaper uses, and the reason this reads as a wave rather than as
+/// a bar chart.
+fn draw_wave(f: &mut Frame, area: Rect) {
+    let wave = choz_engine::meter::meter().wave();
+    let rows = area.height as usize;
+    let cols = area.width as usize;
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    // Auto-gain so a quiet signal is still a picture, with a floor so silence
+    // does not become noise magnified to full scale.
+    let peak = wave.iter().fold(0.02f32, |m, s| m.max(s.abs()));
+    let mid = (rows * 2) as f32 / 2.0;
+
+    let mut lines: Vec<Line> = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let spans: Vec<Span> = (0..cols)
+            .map(|col| {
+                let s = wave[col * wave.len() / cols.max(1)] / peak;
+                let y = mid - s * (mid - 1.0);
+                // The two half-cells this character covers.
+                let (top, bottom) = ((row * 2) as f32, (row * 2 + 1) as f32);
+                let hit = |cell: f32| (y - cell).abs() < 1.0;
+                let ch = match (hit(top), hit(bottom)) {
+                    (true, true) => '\u{2588}',
+                    (true, false) => '\u{2580}',
+                    (false, true) => '\u{2584}',
+                    // The centre line, so a silent signal is still a signal.
+                    _ if (row * 2 + 1) as f32 == mid.floor() => '\u{2500}',
+                    _ => ' ',
+                };
+                let colour = if ch == '\u{2500}' { DIM } else { ACCENT };
+                Span::styled(ch.to_string(), Style::default().fg(colour))
+            })
+            .collect();
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines).style(super::theme::panel_style()), area);
+}
+
+/// How loud it is: peak and RMS as two bars, with the numbers in dB.
+fn draw_activity(f: &mut Frame, area: Rect) {
+    let m = choz_engine::meter::meter();
+    let (peak, rms) = (m.peak(), m.rms());
+    // Six columns for the label, ten for the reading, and the bar gets the rest
+    // — the first version gave the bar too much and pushed the dB off the edge.
+    let width = area.width.saturating_sub(17) as usize;
+    let bar = |v: f32| -> String {
+        // dBFS over 60 dB, because a linear meter is all top and no bottom.
+        let db = if v > 1e-6 { 20.0 * v.log10() } else { -60.0 };
+        let filled = (((db + 60.0) / 60.0).clamp(0.0, 1.0) * width as f32).round() as usize;
+        format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(width.saturating_sub(filled)))
+    };
+    let db_text = |v: f32| -> String {
+        // Always in dB, silence included: "-inf dB" is a reading, "-inf" alone
+        // looks like a missing unit.
+        if v > 1e-6 { format!("{:>6.1} dB", 20.0 * v.log10()) } else { "  -inf dB".to_string() }
+    };
+    let colour = |v: f32| {
+        if v >= 0.99 {
+            WARN
+        } else if v > 0.7 {
+            OK
+        } else {
+            ACCENT
+        }
+    };
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(" PEAK ", Style::default().fg(HEADER)),
+            Span::styled(bar(peak), Style::default().fg(colour(peak))),
+            Span::styled(db_text(peak), Style::default().fg(theme::text())),
+        ]),
+        Line::from(vec![
+            Span::styled(" RMS  ", Style::default().fg(HEADER)),
+            Span::styled(bar(rms), Style::default().fg(colour(rms))),
+            Span::styled(db_text(rms), Style::default().fg(theme::text())),
+        ]),
+        Line::from(Span::styled(
+            if peak >= 0.99 { "  CLIPPING" } else { "" },
+            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+        )),
+    ];
+    f.render_widget(Paragraph::new(lines).style(super::theme::panel_style()), area);
 }
 
 #[cfg(test)]
@@ -176,9 +343,22 @@ mod tests {
     }
 
     fn render(events: &[InputEvent], ports: &[String], w: u16, h: u16) -> String {
+        render_tab(events, ports, w, h, MonitorTab::Midi)
+    }
+
+    fn render_tab(
+        events: &[InputEvent],
+        ports: &[String],
+        w: u16,
+        h: u16,
+        tab: MonitorTab,
+    ) -> String {
         use ratatui::{backend::TestBackend, Terminal};
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| draw_midi_monitor(f, f.area(), events, ports)).unwrap();
+        term.draw(|f| {
+            draw_midi_monitor(f, f.area(), events, ports, tab);
+        })
+        .unwrap();
         // One string per row, so assertions can talk about lines.
         let buf = term.backend().buffer().clone();
         (0..h)
@@ -216,5 +396,59 @@ mod tests {
         for h in 0..4 {
             render(&e, &[], 30, h);
         }
+    }
+
+    /// Three tabs, and each one shows its own thing. WAVE and ACTIVITY read the
+    /// engine's meter, so with no audio running they draw an empty picture
+    /// rather than nothing at all — "no signal" is information.
+    #[test]
+    fn the_monitor_has_three_tabs_and_each_draws_its_own() {
+        choz_engine::meter::meter().clear();
+        let midi = render_tab(&[], &[], 60, 10, MonitorTab::Midi);
+        assert!(midi.contains("MIDI") && midi.contains("WAVE") && midi.contains("ACTIVITY"));
+        assert!(midi.contains("waiting for MIDI"), "the MIDI tab is the messages");
+
+        let wave = render_tab(&[], &[], 60, 10, MonitorTab::Wave);
+        assert!(!wave.contains("waiting for MIDI"), "a different tab, different content");
+        assert!(wave.contains('\u{2500}'), "silence still draws its centre line");
+
+        // A block through the meter and the wave has something in it.
+        let buf: Vec<f32> = (0..512)
+            .flat_map(|i| {
+                let s = 0.8 * (2.0 * std::f32::consts::PI * i as f32 / 32.0).sin();
+                [s, s]
+            })
+            .collect();
+        choz_engine::meter::meter().publish(&buf);
+        let wave = render_tab(&[], &[], 60, 10, MonitorTab::Wave);
+        assert!(
+            wave.chars().any(|c| c == '\u{2588}' || c == '\u{2580}' || c == '\u{2584}'),
+            "the shape of the sound: {wave}"
+        );
+
+        let activity = render_tab(&[], &[], 60, 10, MonitorTab::Activity);
+        assert!(activity.contains("PEAK") && activity.contains("RMS"), "{activity}");
+        assert!(activity.contains("dB"), "levels in dB, not in fractions: {activity}");
+        choz_engine::meter::meter().clear();
+    }
+
+    /// The tabs are clickable, which means they have to hand back where they
+    /// were drawn.
+    #[test]
+    fn the_tab_strip_reports_its_rects() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        let mut rects = Vec::new();
+        term.draw(|f| {
+            rects = draw_midi_monitor(f, f.area(), &[], &[], MonitorTab::Midi);
+        })
+        .unwrap();
+        assert_eq!(rects.len(), 3);
+        assert_eq!(rects[0].0, MonitorTab::Midi);
+        assert!(rects[1].1.x > rects[0].1.x, "left to right");
+        assert!(rects.iter().all(|(_, r)| r.height == 1));
+
+        assert_eq!(MonitorTab::Midi.next(), MonitorTab::Wave);
+        assert_eq!(MonitorTab::Activity.next(), MonitorTab::Midi, "it wraps");
     }
 }

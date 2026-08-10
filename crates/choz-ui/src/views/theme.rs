@@ -59,11 +59,55 @@ pub fn set_has_desktop(on: bool) {
 /// paints straight over the wallpaper. A `Style` with no `bg` leaves whatever
 /// the buffer already holds, which is where the picture is.
 pub fn panel_style() -> Style {
-    if HAS_DESKTOP.load(Ordering::Relaxed) {
-        Style::default()
-    } else {
-        Style::default().bg(PANEL_BG)
+    match panel_fill() {
+        // A desktop with no picture in it — a flat colour, or the terminal's
+        // own. There is nothing to see *through*, so the translucency is done
+        // once, here: the panel colour is the desktop's with the tint mixed in
+        // at the configured strength.
+        Some(c) => Style::default().bg(c),
+        None if HAS_DESKTOP.load(Ordering::Relaxed) => Style::default(),
+        None => Style::default().bg(PANEL_BG),
     }
+}
+
+/// The colour panels paint when there is no picture behind them, already
+/// blended. `u32::MAX` means "unset" — a real colour never is, because the top
+/// byte is always zero.
+static PANEL_FILL: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Publish the blended panel colour, or `None` to go back to the flat one.
+pub fn set_panel_fill(rgb: Option<(u8, u8, u8)>) {
+    let packed = match rgb {
+        Some((r, g, b)) => ((r as u32) << 16) | ((g as u32) << 8) | b as u32,
+        None => u32::MAX,
+    };
+    PANEL_FILL.store(packed, Ordering::Relaxed);
+}
+
+pub fn panel_fill() -> Option<Color> {
+    match PANEL_FILL.load(Ordering::Relaxed) {
+        u32::MAX => None,
+        p => Some(Color::Rgb((p >> 16) as u8, (p >> 8) as u8, p as u8)),
+    }
+}
+
+/// The channels of an RGB colour. Only `Color::Rgb` has any — the palette is
+/// all `Rgb`, and anything else has no numbers to blend.
+pub fn rgb_of(c: Color) -> (u8, u8, u8) {
+    match c {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ => (0, 0, 0),
+    }
+}
+
+/// `base` with `tint` mixed in at `alpha`. The one place a translucent colour
+/// can exist in a terminal: a cell background has no alpha, so "semi
+/// transparent" has to be resolved to a real colour before it is painted.
+pub fn blend(base: (u8, u8, u8), tint: (u8, u8, u8), alpha: f32) -> (u8, u8, u8) {
+    let a = alpha.clamp(0.0, 1.0);
+    let mix = |b: u8, t: u8| (b as f32 * (1.0 - a) + t as f32 * a).round() as u8;
+    (mix(base.0, tint.0), mix(base.1, tint.1), mix(base.2, tint.2))
 }
 
 /// Same, for the app-level fill behind the body.
@@ -226,14 +270,50 @@ pub const SPLASH_GRADIENT: [Color; 12] = [
 pub const SPINNER: [char; 8] = ['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
 pub const SPINNER_DOTS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+// Whether this thread already holds `ui_guard`'s lock.
+#[cfg(test)]
+thread_local! {
+    static UI_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The lock every test that touches the process-wide look has to hold.
 ///
 /// Language, text colour, the desktop flag and the backdrop are all globals, so
 /// two rendering tests running in parallel can undo each other's setup. It
 /// lives here rather than in the UI's test module because the panels' own tests
 /// need it too.
+///
+/// **Reentrant, deliberately.** A `std::sync::Mutex` is not, and the helpers
+/// that render a panel take this lock themselves — so a test that takes it and
+/// then renders deadlocks against itself, taking every other test waiting on
+/// the same lock down with it. It looked like a slow suite rather than a
+/// failure (every thread parked in `futex_do_wait` at 0 % CPU), and it cost two
+/// sessions to find. Twice. A thread-local "already held" flag makes taking it
+/// twice on one thread free, while two threads still take turns.
 #[cfg(test)]
-pub fn ui_guard() -> std::sync::MutexGuard<'static, ()> {
+pub fn ui_guard() -> UiGuard {
     static UI_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    UI_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    if UI_HELD.with(|h| h.get()) {
+        return UiGuard { _inner: None, outermost: false };
+    }
+    let guard = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    UI_HELD.with(|h| h.set(true));
+    UiGuard { _inner: Some(guard), outermost: true }
+}
+
+/// What [`ui_guard`] hands back. Holds the real guard only for the outermost
+/// take on this thread.
+#[cfg(test)]
+pub struct UiGuard {
+    _inner: Option<std::sync::MutexGuard<'static, ()>>,
+    outermost: bool,
+}
+
+#[cfg(test)]
+impl Drop for UiGuard {
+    fn drop(&mut self) {
+        if self.outermost {
+            UI_HELD.with(|h| h.set(false));
+        }
+    }
 }

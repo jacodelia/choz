@@ -45,8 +45,9 @@ choz is a Cargo **workspace** of nine crates (modelled on seqterm's
 `ports` / `engine` / `ui` layout, one crate per plugin format):
 
 - **`choz-ports`** — the realtime-safe port traits (`FxProcessor`, `AudioSource`),
-  plus `PluginEditor`, `PluginParam` and `SandboxStatus`. Pure trait definitions,
-  no dependencies. Every other crate builds on it.
+  plus `PluginEditor`, `PluginParam`, `SandboxStatus` and `Transport`. Pure trait
+  definitions and a handful of atomics, no dependencies. Every other crate builds
+  on it.
 - **`choz-engine`** — the RT audio thread, sources, FX DSP, MIDI/OSC input, plugin
   path config and the scan cache. Depends on `choz-ports` + cpal/oxisynth/hound/midir/rosc/rtrb.
 - **`choz-plugin-clap`** — CLAP hosting via `clack-host`.
@@ -82,6 +83,8 @@ choz/
 │   │       ├── midi.rs          # Hardware MIDI input (midir → flume), incl. CC
 │   │       ├── osc.rs           # OSC UDP listener (notes + remote control)
 │   │       ├── fx_chain.rs      # Builds FX processor chains from specs
+│   │       ├── pitch.rs         # Audio in → notes out (YIN), for the A→M button
+│   │       ├── meter.rs         # Peak/RMS + a waveform window, for the monitor
 │   │       ├── paths.rs         # PluginFormat + per-format scan dirs (Carla-style)
 │   │       ├── cache.rs         # State dir + on-disk plugin scan cache
 │   │       ├── jack_backend.rs  # Native JACK client: one port per device channel
@@ -91,7 +94,7 @@ choz/
 │   │       ├── registry.rs      # Legacy plugin registry (largely stub)
 │   │       ├── scanner.rs       # Legacy filesystem discovery (largely stub)
 │   │       ├── plugin_types.rs  # Legacy plugin format enum / host port trait
-│   │       └── fx/              # 32 DSP processors (see below)
+│   │       └── fx/              # 34 DSP processors (see below)
 │   ├── choz-plugin-clap/
 │   │   └── src/
 │   │       ├── lib.rs           # Discovery + ClapPluginInfo
@@ -126,6 +129,7 @@ choz/
 │           ├── editor.rs        # X11 window thread hosting a plugin's own GUI
 │           ├── source.rs        # Instrument model, AudioFxKind, FxCategory, param descs
 │           ├── project.rs       # choz-project.yml save model (serde_yaml)
+│           ├── automation.rs    # Lanes against the beat, addressed like MIDI learn
 │           ├── settings.rs      # ui.json: color, language, audio + OSC settings
 │           ├── file_browser.rs  # Filesystem browser (files and DIR_PICK mode)
 │           ├── i18n.rs          # 9 languages, keys are the English strings
@@ -139,14 +143,14 @@ choz/
 │               ├── source_panel.rs    # INPUTS panel (inside the IN drawer)
 │               ├── fx_chain_panel.rs  # RACK panel; returns its own RackLayout
 │               ├── splash.rs          # Startup splash
-│               ├── midi_monitor.rs    # What arrived on the note inputs
+│               ├── midi_monitor.rs    # Tabs: MIDI arrivals / WAVE / ACTIVITY
 │               ├── background.rs      # Desktop: flat colour or image, in cells
 │               ├── kitty_bg.rs        # The same image at real pixel resolution,
 │               │                      # under the cell backgrounds (kitty et al)
 │               └── theme.rs           # Colours, and the wash panels blend with
 ```
 
-FX processors under `crates/choz-engine/src/fx/` (32 built-ins, each with its own tests):
+FX processors under `crates/choz-engine/src/fx/` (34 built-ins, each with its own tests):
 
 ```
 fx/
@@ -163,6 +167,14 @@ fx/
 ├── expander.rs     # Expander
 ├── sidechain.rs    # Sidechain ducking
 ├── parametric_eq.rs# 4-band parametric EQ
+├── graphic_eq.rs   # 10-band Winamp graphic EQ + its 18 presets (from tanu)
+├── autotune/       # Real-time pitch correction — see docs/autotune.md
+│   ├── detector.rs   # YIN at 16 kHz: F0, confidence, voiced
+│   ├── quantizer.rs  # Hz → note → the note it should have been (key + scale)
+│   ├── corrector.rs  # Retune speed, correction, humanise → a pitch ratio
+│   ├── shifter.rs    # PSOLA: pitch without time, formants for free
+│   ├── formant.rs    # …and the switch that gives them up on purpose
+│   └── meter.rs      # What it heard, for the readout under the knobs
 ├── filter.rs       # State-variable filter (LP/HP/BP/Notch)
 ├── filterbank.rs   # Multi-band filter bank
 ├── isolator.rs     # 3-band isolator
@@ -338,6 +350,119 @@ was told to play and gets a real note-off for every one of them, then the
 `all_notes_off()` broadcast — the note-offs are what a VST3 plugin actually
 receives, since *all notes off* is a MIDI CC.
 
+### Routing is per channel, not per pair
+
+A tab's input and output are `(usize, usize)` — two device channels picked
+independently, not an index into a list of stereo pairs. The engine has always
+read them that way (`mix[l]`, `mix[r]`, `capture[l]`, `capture[r]`, each clamped
+to the last channel); only the drawers used to offer `2n`/`2n+1`, which is what
+made an interface look like a stack of stereo pairs it is not.
+
+Both drawers list **one row per channel**, labelled with what it is to the active
+tab (`L`, `R`, `L+R`), and channels go on and off one at a time: `Enter`/`Space`
+toggles, the left button assigns, the right button unassigns.
+
+`assign_channel` and `unassign_channel` are the whole rule, both pure functions
+with tests. Assigning is a **queue of two**: the newcomer is the right side and
+the oldest falls off the left. That is not a detail — a tab starts on 1 and 2,
+so pinning the left instead would leave channel 1 in the routing however many
+times the user clicked. As it is, clicking 3 then 9 gives exactly 3 and 9.
+
+Unassigning the last channel of an input returns `None`, which is the tab back on
+its instrument — the same state the `(instrument)` row sets. An output has no
+such state (the engine needs a channel to mix into), so that gesture does
+nothing.
+
+### Where the inputs come from
+
+`jack_backend::all_capture_ports()` returns **every** capture port in the graph,
+grouped by owning node, and the client registers one input port per entry and
+wires them one for one. There is no input-device selection any more: the user
+picks a *channel*, and `AudioEngine::input_ports()` gives the UI the port behind
+each one, which is what the drawer groups its rows by.
+
+This replaced asking the *sink* for its capture ports, which is what choz used to
+do — and on PipeWire an interface is two nodes, so an eight-input UMC1820
+reported `AUDIO IN (0)` and the rows were simply not there. Nothing about the
+engine changed: `in_pair` was always a pair of capture indices.
+
+**A rack tab has two ways to be born**, and it used to have one: binding a note
+input (`bind_selected_input`), or now assigning an audio channel — both go
+through `ensure_slot`. Only the first existed, so a guitarist with no MIDI port
+to bind had an empty rack and every assignment landed on a slot that was not
+there: the rows drew, the clicks did nothing.
+
+`ponytail:` a slot's `in_pair` indexes that flat list, so unplugging a card
+shifts what a saved project points at. Names in the project would fix it; a
+rescan is the honest workaround until someone hits it.
+
+### Audio in, notes out (`A→M`)
+
+A tab fed by a capture pair normally passes that audio through its FX. With `A→M`
+on (`RackButton::PitchToMidi`, only offered where there *is* an input) the audio
+is listened to instead: `pitch::PitchTracker` reads the block the callback
+already has and the slot's own instrument plays what it heard, so a guitar drives
+Surge XT like a keyboard would.
+
+- **Monophonic, and that is the honest limit, not a shortcut.** One period is one
+  frequency; a chord has several and picking one is a guess. Guitar synths have
+  worked this way — one string, one converter — for forty years.
+- **What it costs is the whole design.** The first version ran YIN at the
+  device's rate on every block — 872 lags over 2048 samples, 187 times a second,
+  inside the audio callback. That is ~340M operations a second for one guitar,
+  and it did not read as "late": it read as **random notes**, because the
+  callback was missing its deadline and the plugin was being starved. Decimating
+  to ~16 kHz (a box average is both the downsample and its anti-alias filter)
+  and analysing on an 8 ms hop instead of per block is ~30× less work. A note
+  cannot start twice inside a hop, so nothing is lost.
+- **YIN, not plain autocorrelation.** A squared difference alone dips at every
+  short lag on a smooth signal, and the first version duly reported a guitar's
+  low E an octave and a half up. Dividing each lag by the running mean of the
+  ones before it leaves the real period as the first dip under the threshold.
+- **A pitch has to hold before it becomes a note** (three analyses, ~24 ms):
+  while the window still holds the previous note the detector walks up a
+  semitone at a time, and without this a slide fired eight note-ons instead of
+  two. A note change also asks for a cleaner reading than a note start does.
+- **The conversion is Csound's `ftom` with `irnd` non-zero** — rounded to the
+  nearest integer. One jack in, one note out. `freq_to_note_exact` is the
+  `irnd = 0` form and exists so the *deviation* can be shown; only the rounded
+  note is ever played.
+- **Rounding alone is not enough, and this is the part to get right.** A pitch
+  resting on a semitone boundary rounds up and down as it wobbles, and each flip
+  would be a note-on. A note changes only when the new one is `HYSTERESIS`
+  (20 cents) past the halfway point *and* has held for `STEADY_ANALYSES`. A
+  singer's vibrato is one note held; a real semitone is a new note.
+- **The input is one jack.** A tab on a single channel has the same signal both
+  sides; a tab on two different channels has two different microphones, and
+  summing those is phase cancellation plus two pitches at once. The tracker
+  reads the left side — the channel assigned first.
+- **The reading is published** (`meter::pitch_meter()`), and the `A→M` button
+  draws it: the note and its cents, or the input level when nothing sounds. The
+  cents are a display only — the plugin gets the note, exactly.
+  Without it a tracker that hears nothing and one that hears the wrong thing are
+  indistinguishable from the outside, and `SENS` has nothing to aim at.
+- **`A→M` drives the tab's instrument, not its FX chain.** A tab with no
+  instrument tracks perfectly and has nothing to play, so the rack says which of
+  the two is happening.
+- The tracker lives in the `Slot`, so it is per tab and touched only from the
+  audio thread. Switching it off releases whatever was sounding — the toggle must
+  not leave a note hanging.
+- **The gate is a control, not a constant** (`SENS` on the mixer strip). A
+  single-coil through an amp has a noise floor a synthetic test tone does not,
+  and the level that means "a note" is the player's decision. It rides on the
+  same command as the input trim (`SetSlotInTrim`), because both are answers to
+  the same question: how loud is what is coming in.
+
+### What the output sounds like (`meter.rs`)
+
+The audio callback is the only place that sees the mixed signal and can neither
+allocate nor block, so it publishes a handful of atomics — peak, RMS and a
+decimated waveform ring — and the UI reads them when it redraws. Relaxed
+ordering throughout: a meter one block stale is a meter that is right. The MIDI
+monitor's **WAVE** and **ACTIVITY** tabs (`F5`, or click the strip) are just two
+drawings of that, next to the messages, because "did the note arrive" and "did
+anything come out" are the same question asked twice.
+
 ## FX Chain Processing Pipeline
 
 ```mermaid
@@ -382,14 +507,14 @@ flowchart TB
     subgraph Screen
         direction LR
         subgraph Left["IN drawer (F2) — 3 cols shut, 40% open"]
-            SP["INPUTS Panel<br/>SCAN INPUTS button<br/>MIDI ports + OSC, with tab bindings"]
+            SP["INPUTS Panel<br/>SCAN INPUTS button<br/>MIDI ports + OSC, with tab bindings<br/>every capture jack, grouped by card"]
         end
         subgraph Mid["RACK — everything the drawers leave"]
             FXP["RACK Panel<br/>tabs · mixer strip · INSTR buttons · BANK<br/>FX chain row · knob grid · SLOT buttons"]
             TR["TRANSPORT<br/>[PLAY] [STOP] · OUT device"]
         end
         subgraph Right["OUT drawer (F3) — 3 cols shut, 34% open"]
-            OP["Output devices + the device's channel pairs<br/>Enter on a device reloads the rack,<br/>Enter on a pair routes the active tab there"]
+            OP["Output devices + one row per device channel<br/>Enter on a device reloads the rack,<br/>Enter on a channel sends the active tab there,<br/>←/→ set one side only"]
         end
     end
     SB["Status Bar: version, backend, active tab, FX count, playback state"]
@@ -507,19 +632,27 @@ layers, each measured against what is installed on the dev machine:
    in a child — instantiate, two blocks, destroy — and the child records how far
    it got. `CrashesOnLoad` is refused outright; `CrashesOnTeardown` is loaded and
    then deliberately leaked, because it plays fine and only dies on the way out.
-   Verdicts are cached in `<state dir>/plugin-verdicts.json`.
+   The child also reports **whether the plugin has a window** — it asks for the
+   editor handle, it never opens one — and both halves are cached together in
+   `<state dir>/plugin-verdicts.json`.
 3. **Sandbox** (`sandboxed.rs` + `choz-plugin-sandbox`). A plugin can run in its
    own process, exchanging one block at a time over shared memory. The exchange
    has a **deadline**: if the child does not answer, the host reads silence and
    carries on, so a hung plugin costs a click rather than the stream. A supervisor
-   thread restarts a child that dies. Applied automatically to whatever the probe
-   saw die on teardown, and manually per plugin via the `SBX` button
-   (`<state dir>/plugin-sandbox.json`).
+   thread restarts a child that dies. Applied to whatever the probe saw die on
+   teardown, to anything the user pins with the `SBX` button
+   (`<state dir>/plugin-sandbox.json`), and **to every plugin that has a window**:
+   plugin GUIs are the least trustworthy code choz runs, and the sandbox is the
+   only place where one that dies costs a process instead of the app.
+   `CHOZ_SANDBOX_GUI=0` turns that last reason off.
 
 Deny-lists remain for two cases the layers above cannot cover, both by name and
 both measured: Carla's own wrappers (they corrupt the allocator rather than
-crash, so there is nothing to catch) and guitarix's X11 UIs (every one of them
-segfaults on instantiate).
+crash, so there is nothing to catch) and guitarix's X11 UIs — a sweep of every
+installed editor killed nine slices of twenty, all nine on a `gx_*`. **The UI
+deny-list belongs to the process, not to the plugin**: `allow_denied_uis(true)`
+lifts it, and the only places that call it are the sandbox child and the probe,
+both of which can afford to die.
 
 ### Native plugin windows
 
@@ -546,10 +679,58 @@ moment, for the same reason.
 
 ### Parameters, without opening a window
 
-The RACK draws the tab's instrument parameters as knobs (`draw_knob_box`, shared
-with the FX chain's). They are clickable, they are MIDI-learn targets, and the
-values are what the project saves — so a CC can be bound to any parameter of any
-plugin without waiting for its GUI to build.
+The RACK draws the tab's instrument parameters (`draw_knob_box`, shared with the
+FX chain's). They are clickable, they are MIDI-learn targets, and the values are
+what the project saves — so a CC can be bound to any parameter of any plugin
+without waiting for its GUI to build.
+
+**Which control each one gets comes from the plugin, never from its name.**
+`PluginParam` carries `steps` (0 continuous, 2 a switch, n an enumeration), `unit`
+and `points` — the named steps with the place each sits at — filled by each host
+from what its format reports: `lv2:portProperty`/`lv2:scalePoint`/`units:unit`,
+VST3's `stepCount` + `getParamStringByValue` + `units`, CLAP's `IS_STEPPED` +
+`value_to_text`, LADSPA's `TOGGLED`/`INTEGER` hints. VST2 reports none of it and
+stays continuous. `source::ParamShape` turns that into the control:
+
+| Report | Control |
+|---|---|
+| `steps == 2` | switch in the RACK, checkbox in the long list |
+| every step named | `◀ Sine ▶` with `k/n` under it |
+| unit is a time or a percentage | horizontal fader |
+| three or more of those in a row sharing a unit | a bank of vertical bars (`fader_groups`) |
+| anything else | the arc, at eight positions per cell |
+
+Two things this must keep, and there are tests for both: a stepped parameter
+moves **one position** per arrow or wheel click (`ParamShape::nudge`), and every
+control — bank bars included — keeps its own rect in `RackLayout.instr_knobs`,
+which is what the mouse and MIDI learn work off.
+
+The named positions carry the value they sit at, not an index: Ardour's `a-delay`
+names ten note divisions over a range of 1..48, so a uniform grid would show the
+wrong name and step to values the plugin never offered.
+
+### The transport
+
+`choz_ports::transport()` is one clock — position in frames, tempo, sample rate,
+play state — as atomics, advanced by the audio callback in `AudioEngine::render`
+and by nothing else. It is process-global on purpose: there is one clock, and the
+place that needs it most is VST2's `audioMasterGetTime`, a C callback handed a
+plugin pointer and no host context at all.
+
+Four formats read it, each in its own units: VST2 fills `VstTimeInfo` on every
+ask, VST3 gets a `ProcessContext` per block (it used to get `NULL`, which means
+"the host has no idea what time it is"), CLAP gets a transport event, and LV2 is
+handed a `time:Position` object written into its atom port. Only what choz knows
+is flagged valid — a plugin reads a field when its flag says it is there — so
+there is no cycle and no SMPTE. Tempo and time signature are Settings → AUDIO,
+applied live and saved in `ui.json`.
+
+**Bars are offered, and they are the phase rather than a place.** `bar_position()`
+reads the time signature in quarter notes — 4/4 is four, 6/8 is three, 7/8 is
+three and a half — and counts from the last transport reset, because choz has no
+arrangement to number bars against. A plugin syncing a pattern to bar starts
+needs the phase, and the phase is true; "bar 1 forever" was not, which is why
+this used to be withheld.
 
 When the GUI *is* open, choz follows it: `choz_ports::ParamTouch` reports the
 parameter the user just grabbed **inside the plugin's window**, translated to the
@@ -581,9 +762,21 @@ A terminal cell background is **opaque**, which decides everything here:
   keeps every pixel it had. Panels cannot wash it by painting cells — that would
   cover it — so the wash is a **second, translucent image** over the first, four
   pixels per cell and re-sent only when the layout or the opacity changes.
+- **A flat colour**: there is no picture to blend cell by cell, so the wash is
+  resolved **once per frame** into a single colour (`theme::panel_fill`) that
+  every panel paints. Without this a flat desktop left the panels painting
+  nothing at all, and a section was indistinguishable from the space around it.
 
-The opacity is one slider (Settings → THEME). Because it lives in the panels and
-not in the image, moving it costs a redraw rather than a decode and a transfer.
+`theme::blend(base, tint, alpha)` is the one place "semi transparent" exists —
+a cell background has no alpha, so it has to become a real colour before it is
+painted. Every section goes through the same two settings, so they wash
+identically: **Panel colour** (the scheme's own by default, or any palette
+entry) and **Panel opacity**. Neither is offered on the terminal's own
+background: choz cannot read that colour, and a translucency it cannot compute
+would be a setting that lies.
+
+Because the opacity lives in the panels and not in the image, moving it costs a
+redraw rather than a decode and a transfer.
 
 ## Persistence
 
@@ -599,6 +792,31 @@ not in the image, moving it costs a redraw rather than a decode and a transfer.
 
 `<state dir>` is `~/.local/state/choz` (`cache::state_dir()` is the single source
 of truth; tests redirect it with `XDG_STATE_HOME`).
+
+## Packaging and the desktop
+
+`packaging/` holds everything that turns a build into something installed:
+`install.sh` (finds an older copy in `~/.local/bin`, `/usr/local/bin` and
+`/usr/bin`, asks it `choz --version`, removes it, then installs), the `.desktop`
+entry, the `hicolor` icon and the `application/x-choz-project` MIME type for
+`*.choz.yml`. `.deb` and `.rpm` metadata live in `crates/choz-ui/Cargo.toml` and
+install the same files; both replace the previous version by package name.
+
+**Nothing an uninstall touches lives in `~/.local/state/choz`** — the projects,
+the plugin paths and the settings are the user's, not the package's, and there is
+a test that proves it.
+
+choz is a TUI, so the desktop entry runs `choz-launcher` rather than the binary:
+it opens the first terminal it finds — **kitty first**, because that is where the
+wallpaper is drawn at real pixel resolution — at 120×40 cells, below which the
+RACK does not fit. `Cross.toml` carries the ALSA/JACK headers the Raspberry Pi
+targets need; without it the cross build dies in `alsa-sys` before compiling a
+line of choz.
+
+`examples/esp32s3-touch/` is the other end of the same idea: an ESP32-S3 with a
+touchscreen cannot host plugins (no MMU, no `dlopen`, no Linux for it), but it
+makes a good surface — faders, mutes and keys over OSC to the port choz already
+listens on, with no choz-side change at all.
 
 ## Key Dependencies
 

@@ -109,6 +109,9 @@ unsafe extern "C" fn host_callback(
                 info.sample_pos = transport.samples() as f64;
                 info.ppq_pos = transport.ppq();
                 info.tempo = transport.bpm() as f64;
+                let (num, den) = transport.time_signature();
+                info.time_sig_numerator = num as i32;
+                info.time_sig_denominator = den as i32;
                 info.flags = time_flags::PPQ_POS_VALID
                     | time_flags::TEMPO_VALID
                     | time_flags::TIME_SIG_VALID
@@ -130,8 +133,8 @@ thread_local! {
     /// `audioMasterGetTime`; what is per-thread is the storage, so the pointer
     /// handed to the plugin stays valid without being shared.
     ///
-    /// ponytail: 4/4 is still fixed — nothing in choz sets a time signature, and
-    /// a plugin that syncs cares about the tempo and the position.
+    /// The time signature comes from the same clock (Settings → AUDIO), so a
+    /// plugin counting bars counts the same ones choz does.
     static TIME_INFO: std::cell::UnsafeCell<VstTimeInfo> =
         std::cell::UnsafeCell::new(VstTimeInfo {
             sample_rate: 48_000.0,
@@ -851,6 +854,13 @@ mod tests {
         // One second at 90 BPM is one and a half quarter notes.
         assert!((info.ppq_pos - 1.5).abs() < 1e-9, "ppq {}", info.ppq_pos);
         assert_eq!(info.flags & time_flags::TRANSPORT_PLAYING, time_flags::TRANSPORT_PLAYING);
+
+        // The time signature travels with it: a plugin counting bars counts
+        // the ones choz counts.
+        t.set_time_signature(6, 8);
+        let info = read();
+        assert_eq!((info.time_sig_numerator, info.time_sig_denominator), (6, 8));
+        t.set_time_signature(4, 4);
 
         t.set_playing(false);
         assert_eq!(read().flags & time_flags::TRANSPORT_PLAYING, 0, "stopped means stopped");

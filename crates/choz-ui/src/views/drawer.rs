@@ -128,7 +128,7 @@ pub fn draw_output_panel(
     let dim = Style::default().fg(Color::DarkGray);
     let mut lines: Vec<Line> = vec![Line::from(Span::styled(
         if focused {
-            " \u{2191}\u{2193} \u{00B7} Enter=use \u{00B7} r=rescan"
+            " \u{2191}\u{2193} \u{00B7} Enter/Space=on-off \u{00B7} RMB=off \u{00B7} r=rescan"
         } else {
             " OUT (Tab to select)"
         },

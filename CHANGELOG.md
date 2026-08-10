@@ -10,13 +10,221 @@ diagnósticos, las medidas y los callejones sin salida se cuentan aquí.
 
 ## [1.0.0] — 2026-08-09
 
-Primera versión publicada. Todo lo de abajo — desde el commit inicial hasta hoy — es
-lo que lleva: los seis formatos de plugin hosteados con ventana nativa, el rack
-multi-slot con mixer y FX, ruteo de entradas/salidas, proyectos en YAML, tres capas
-contra el código ajeno que revienta (escaneo fuera de proceso, cuarentena y sandbox
-por proceso), parámetros dibujados según lo que el plugin dice que son, transporte
-propio, 372 temas, y empaquetado `.deb`/`.rpm`/`install.sh` con entrada de escritorio.
+Primera versión etiquetada. Artefactos de x86_64 construidos desde este árbol
+(binario, `.deb` con las dependencias resueltas solas, `.rpm`); el aarch64 se
+cruza con `cross` y `.github/workflows/release.yml` los genera todos en un tag.
 
+Todo lo de abajo — desde el commit inicial hasta hoy — es lo que lleva:
+
+- los seis formatos de plugin hosteados, con su ventana nativa;
+- rack multi-slot con mixer, FX de inserto, ruteo de entradas/salidas y proyectos en YAML;
+- cuatro capas contra el código ajeno que revienta: escaneo fuera de proceso, cuarentena, sandbox por plugin, y tener ventana como motivo suficiente para aislarlo;
+- parámetros dibujados según lo que el plugin dice que son (interruptor, enumerado, fader, banco vertical, knob), MIDI-learnables uno por uno;
+- transporte propio que leen VST2, VST3 y CLAP;
+- 372 esquemas de color, fondo de escritorio y nueve idiomas;
+- empaquetado `.deb`/`.rpm`/`install.sh` con entrada de escritorio, y una superficie de control de ejemplo para ESP32-S3 táctil.
+
+
+### 2026-08-09 (septendecies) — AutoTune con el método de zita-at1, y los knobs dejan de cortar el sonido
+
+Reportado: el AutoTune seguía saturando la entrada; los presets del EQ no movían los sliders; y mover un parámetro de cualquier built-in cortaba el sonido.
+
+#### Cambiado
+- **El pitch shifter es ahora el de zita-at1** (Fons Adriaensen; x42 lo porta en [`fat1.lv2`](https://github.com/x42/fat1.lv2)): **un lector de delay a velocidad variable** que salta **períodos enteros** con un crossfade de coseno elevado, e interpolación cúbica. Fuera el overlap-add.
+  - **Por qué**: una suma de copias enventanadas **tiene ganancia**, y esa ganancia depende del espaciado de granos, del largo de ventana y de cuánto se alinean granos consecutivos. Con una señal cuyo período se mueve, los tres bailan, y la salida sale sucia **y más fuerte que la entrada**. Más fuerte que la entrada se oye como que el efecto satura, y ninguna corrección de ventana arregla la clase de problema.
+  - Dos lectores mezclados no pueden: la salida es una combinación convexa de dos muestras de la entrada, así que **`|out| ≤ max |in|`** para cualquier relación y cualquier altura. Es una propiedad del método, no un ajuste — y hay un test que lo comprueba a cinco relaciones distintas.
+  - **Las formantes se mueven con la altura** (es un resampler). A las relaciones en las que vive un *corrector* — un semitono es 6 % — no se oye, y es lo que hace zita-at1. **Se fue el parámetro `Formant`**: con este método no hacía nada, y un interruptor que no hace nada es peor que no tenerlo. Un camino que preserve formantes sería otra implementación de `PitchShifter`, que es para lo que está ese trait.
+
+#### Arreglado
+- **Mover un parámetro de un built-in cortaba el sonido.** La UI marcaba la cadena para reconstruir en **cada** cambio de knob de un efecto nativo, y una reconstrucción reemplaza **todos** los procesadores del slot: mover el knob de un Gain tiraba la cola de la reverb, el búfer del delay y la grabación del looper. Ahora sólo se reconstruye si el procesador **no** puede tomar el valor en vivo (`AudioFxEntry::takes_live_params`).
+  - `space_echo`, `protocosmos` y `z5_texture` — los tres que se reportaron — ya tenían `set_param`: nunca fue su culpa, era la reconstrucción.
+  - Se añadió `set_param` a los que faltaban y tienen estado: `gran_delay`, `vinyl`, `bitcrusher`, `expander`, `filter`, `widener`, `pan`.
+- **Los presets del GRAPHIC EQ no movían los sliders.** El preset llegaba al procesador pero no al array de parámetros — y ese array es lo que dibuja el panel y lo que guarda el proyecto, así que el preset se veía como si no hubiera pasado nada y desaparecía en la siguiente reconstrucción. `apply_preset` ahora escribe las diez bandas.
+
+#### Verificado
+- El shifter: la frecuencia objetivo aparece y la original desaparece; y **el pico de salida nunca supera el de entrada** con armónicos a fondo de escala, a relaciones de 0.6 a 1.5. El preset del EQ deja cada slider exactamente donde dice el preset (curva de sonrisa en "Rock"). Y que un knob de space echo **no** ensucia la bandera de reconstrucción, mientras que uno de cassette — que no tiene camino en vivo — sí. Coste sin cambios: cero allocations, ~10 % del presupuesto de búfer, 33.3 ms de latencia. **335 tests**, clippy `--all-targets -D warnings` limpio.
+
+### 2026-08-09 (sexdecies) — AutoTune limpio, el EQ como el de tanu, y doce efectos
+
+Probado con voz: sonaba sucio, con clip, y en pentatónica sólo ruido. Tres causas distintas.
+
+#### Arreglado
+- **El PSOLA reanclaba la rejilla de análisis en cada grano.** La marca de análisis se calculaba como `anal_ref + round((centro − anal_ref)/P)·P`, que es de manual para un `P` **fijo** y está mal para una voz: `P` cambia con cada análisis, así que la rejilla que define se mueve, y la fuente del grano salta hasta medio período cada vez que el cantante mueve la altura. Ese salto es una discontinuidad **dentro** de un grano, y una discontinuidad cada 8 ms es exactamente la suciedad que se oía. Ahora la marca **avanza un período** desde la anterior, y la deriva contra el reloj de salida se corrige sumando o quitando períodos enteros — que es lo que significa "duplicar o saltar una marca".
+- **El overlap-add no estaba normalizado.** Un Hann de `2P` solapado con salto `P/ratio` suma `ratio`: corregir hacia arriba **subía el volumen**, y eso se oye como que el efecto satura cuando en realidad está subido. Cada grano se escala ahora por `1/ratio`.
+- **Sonoro y sordo se conmutaban muestra a muestra**, así que cada consonante era un borde entre la señal desplazada y la seca — y con una voz real, que es medio sorda, se oía la fuente todo el rato. Ahora hay un crossfade de ~8 ms.
+- **Una corrección enorme es un error de detección, no un cantante.** Más de tres semitonos de error se **ignora** (no se recorta: recortar seguiría doblando la voz tres semitonos hacia una nota que nadie cantó). Es lo que convertía la escala pentatónica en ruido: los objetivos más lejanos pedían relaciones que el shifter no puede hacer limpias, y obedecía.
+- El período que corta los granos se sigue **suavizado**: la respuesta del detector tiembla una fracción de muestra entre análisis, y un largo de grano que tiembla es una ventana que deja de solapar a uno.
+
+#### Añadido
+- **Los parámetros con nombre se eligen en un modal** — Enter o clic sobre el knob. Vale para el `Preset` del GRAPHIC EQ (los 18 de Winamp, como en tanu), y para `Preset`, `Key`, `Scale` y `Mode` del AutoTune. Recorrer dieciocho presets con una flecha es un knob haciéndose pasar por un menú.
+  - De paso salió `App::set_fx_param`: mover un parámetro de FX tiene tres llamadores — un CC, un clic y ahora el modal — y que cada uno se equivoque a su manera es cómo un knob acaba moviéndose en la interfaz y no en el audio.
+- **El GRAPHIC EQ se dibuja como el ecualizador de tanu**: una columna por banda, el knob sobre la pista y la línea de cero recta por el medio, con las frecuencias debajo. Diez arcos no se leen como una curva, y la curva es la única pregunta que se le hace a un ecualizador. Los knobs que no son bandas (preamp, preset, wet) siguen debajo.
+- **Hasta doce efectos por cadena** en vez de cinco. Una cadena de guitarra es afinador, puerta, compresor, drive, modulación y dos delays antes de que nadie piense en la reverb. El botón `+ ADD` ya envolvía a la línea siguiente solo; lo único que faltaba era el número.
+
+#### Verificado
+- El EQ dibujado de verdad sobre un `TestBackend`: los knobs, las pistas, las etiquetas de frecuencia (`70`, `180`, `1k`, `16k`) y un rectángulo de clic por banda, lado a lado y altos como una corredera. El picker: una banda **no** abre lista (no hay nada que listar), el preset sí y trae los dieciocho de Winamp, elegir "Rock" deja el parámetro en su posición, y `Preset`/`Key`/`Scale`/`Mode` del AutoTune abren la suya. Y en el DSP: la nota corregida es **limpia** — la frecuencia objetivo domina seis a uno sobre todo lo que una rejilla saltarina pondría alrededor — y **no sube de nivel**, que era el clip. **335 tests**, clippy `--all-targets -D warnings` limpio.
+
+#### Arreglado (herramienta)
+- **`ui_guard` es reentrante.** Un `std::sync::Mutex` no lo es, y los ayudantes que dibujan un panel toman ese candado por su cuenta: un test que lo toma y luego dibuja se bloquea contra sí mismo y arrastra a todos los demás. Se ve como una suite lenta, no como un fallo — todos los hilos en `futex_do_wait` al 0 % de CPU — y me costó encontrarlo **dos veces**. Un flag por hilo hace que tomarlo dos veces salga gratis, y dos hilos siguen turnándose.
+
+### 2026-08-09 (quindecies) — AutoTune: corrección de altura en tiempo real, built-in
+
+Un efecto de pitch correction nativo, no un envoltorio de nada. Documentación entera en [docs/autotune.md](docs/autotune.md).
+
+#### Añadido
+- **`AUTO-TUNE` es un built-in más** (`a → PITCH → AUTO-TUNE`), con su propia categoría porque un corrector de altura no es una textura ni un filtro. Efecto 34 de la casa.
+- **Detección**: YIN — la misma función que usa `A→M`, extraída a `pitch::yin` y llamada dos veces en vez de escrita dos veces. Con gate por RMS, confianza, decisión de sonoro/sordo y una comprobación de octava (si la lectura está a unos cents del doble o la mitad de la anterior, gana la respuesta continua: nadie salta una octava entre dos análisis de 8 ms y cae afinado).
+  - **Decimado a 16 kHz, y no es opcional.** A 48 kHz con ventana para 60 Hz, un análisis son ~2.2 millones de operaciones y un salto de 256 muestras pide 187 por segundo: **410 millones de operaciones por segundo por una sola voz**. Eso no es "va lento", son xruns y un plugin sin CPU — exactamente como fallaba `A→M` antes de reescribirlo. Promediar `round(sr/16000)` muestras en una (el downsample *y* su filtro anti-alias) lo deja en ~117 k: **treinta veces menos**. La precisión de frecuencia sobrevive porque el valle se interpola.
+- **Nota objetivo**: `ftom`, con `A4` configurable (430–450 Hz), y seis escalas — cromática, mayor, menor, pentatónicas y blues. La nota más cercana se busca contra el número de nota **fraccionario**: alguien 40 cents por encima de F en Do mayor está más cerca de F que de G, y redondear primero tiraría justo el dato que lo dice.
+- **Corrección en el dominio logarítmico** — semitonos, no hertz. Suavizar una frecuencia linealmente pasa por las notas equivocadas de camino. `Retune` (0–1000 ms) es la constante de tiempo de un polo, nunca cero porque un escalón en la relación de altura es un clic; `Correction` cuánto del error se toma; `Humanize` **mueve el tiempo de retune, no la altura** (modular la altura sería un vibrato que nadie cantó); `Mode` es Natural o Hard Tune, y Hard ignora las dos perillas a propósito.
+- **Pitch shifting por PSOLA**, no por resampling: leer una línea de retardo más rápido sube la altura *y acorta el sonido*. PSOLA cambia sólo el espaciado de los granos, así que la salida siempre tiene tantas muestras como la entrada. Y preserva las formantes gratis — un grano son dos períodos del original sin tocar, su envolvente espectral es la del cantante. `Formant Preserve` es entonces un interruptor sobre **cómo se lee un grano**, y apagarlo da la ardilla, que es un sonido que la gente pide.
+- **Latencia: 1600 muestras, 33.3 ms a 48 kHz** — dos veces el período más largo (60 Hz) **al rate que corre**, no al máximo para el que están dimensionados los búferes; ese error costaba 67 ms a 48 kHz para nada. La señal seca se retrasa lo mismo antes de mezclarse: mezclar un seco sin retrasar con un mojado 33 ms tarde es un filtro peine, no una mezcla.
+- **Cinco presets** (Natural Vocal, Fast Vocal, Hard Auto-Tune, Subtle Correction, Robot Voice) que **escriben** sus valores en el array de parámetros del efecto, que es lo que guarda el proyecto y lo que reconstruye la cadena. Decírselo sólo al procesador haría que el preset durara hasta la próxima perilla que se tocara.
+- **Lectura bajo las perillas**: nivel, la nota que oye, la nota a la que apunta, el error en cents y una traza de por dónde ha ido ese error. Sale de un medidor sin locks que publica el callback — seis stores relajados y nada más.
+
+#### Arreglado (dentro de la propia feature, y vale la pena recordarlo)
+- **El PSOLA no desplazaba nada.** El reloj de síntesis se reancla cuando se queda atrás — así se reengancha tras un tramo sordo. La primera versión preguntaba "¿está atrasado?" a secas, y como la marca es fraccionaria cae entre dos muestras y **siempre** lo está por una fracción: la rejilla de análisis se reanclaba en cada grano, cada grano salía de su propia posición de síntesis, y la suma solapada reconstruía la entrada. Espectro puro, espaciado de granos perfecto, y cero desplazamiento — una relación de 1.5 daba 220 Hz a partir de 220 Hz. Ahora la pregunta es "¿atrasado más de un período?".
+
+#### Verificado
+- **31 tests** propios: el detector a 44.1/48/96 kHz sobre seis notas y sobre un fundamental más flojo que sus armónicos (donde un detector ingenuo canta la octava); silencio y ruido como sordos; NaN e infinitos que entran y no salen. Escalas, la nota más cercana con sus empates, el A4 configurable. El glide que no salta, `Correction` al 50 % dando medio semitono, Hard Tune llegando diez veces antes, `Humanize` cambiando la curva y **no** la nota. El shifter midiendo con un DFT de un bin — ni cruces por cero ni autocorrelación, que las dos mienten aquí — y comprobando que la frecuencia objetivo está y la original **no**. Y el efecto entero: 445 Hz que se va a 440, la escala decidiendo el destino, mezcla a 0 % devolviendo la entrada retrasada, silencio que sigue en silencio, tamaños de bloque de 37 a 1024, cambio de sample rate a mitad de camino y ningún clic al cambiar de nota.
+- **Coste medido, no prometido**: `examples/autotune_bench.rs` instala un asignador global que cuenta y toma la cuenta alrededor de `process_block` sólo. **Cero allocations** a 44.1/48/96 kHz con bloques de 64 a 512, y entre un 6 % y un 11 % del presupuesto del búfer. Alrededor de una décima de núcleo por voz.
+- **Sin probar con una voz de verdad**: todas las señales de test son sintéticas, y una señal sintética es más amable que una habitación.
+
+### 2026-08-09 (quaterdecies) — un solo color traslúcido para todas las secciones
+
+#### Añadido
+- **Todas las secciones — IN/OUT, RACK, FX, TRANSPORT y el monitor — comparten un mismo fondo de color traslúcido**, con la opacidad y el color elegidos en `Settings → THEME`. Antes el lavado existía sólo sobre una imagen de fondo; sobre un color plano los paneles no pintaban nada y no se distinguían del escritorio.
+  - **`Panel colour`**: el color del lavado. Por defecto es *"theme's own"* — el color de escritorio del esquema activo — así que una interfaz lavada sigue pareciendo el tema y no un filtro encima. `←`/`→` lo pasean por toda la paleta y vuelven al del tema.
+  - **`Panel opacity`**: 0 % deja el escritorio intacto, 100 % lo tapa. Ahora aparece con **cualquier** escritorio, no sólo con una imagen.
+  - Las dos filas desaparecen con el fondo por defecto de la terminal: choz no puede leer ese color, así que no tiene con qué mezclarse — y una traslucidez que no se puede calcular es una casilla que miente.
+- **La traslucidez se resuelve a un color de verdad**, porque el fondo de una celda de terminal no tiene alfa: `theme::blend(base, tint, alpha)` es el único sitio donde vive lo "semi transparente". Sobre una imagen el lavado sigue siendo celda a celda (cada una mezcla con lo que la foto muestra ahí); sobre un color plano se calcula una vez por cuadro (`theme::panel_fill`).
+
+#### Verificado
+- El camino entero por la app: color plano al 50 % da exactamente la mitad, 0 % deja el escritorio y 100 % lo tapa; el mismo color sale por `panel_style()`, que es por donde pasan **todos** los paneles; el selector de color recorre la paleta y vuelve al del tema; y con el fondo de la terminal no se ofrece ninguna de las dos filas. Más el render real: un panel sobre un escritorio plano pinta la mezcla, y sin lavado deja pasar el color de abajo. **335 tests**, clippy `--all-targets -D warnings` limpio.
+
+### 2026-08-09 (terdecies) — `A→M`: una nota exacta, como el `ftom` de Csound
+
+Probado con el micro de unos auriculares H340 y un LV2: no sonaba bien. La entrada es **un jack mono** y lo que tiene que salir es **una nota**, ni más ni menos.
+
+#### Cambiado
+- **La conversión es `ftom` de Csound con `irnd` distinto de cero**: *"if non-zero the result is rounded to the nearest integer"* ([docs](https://csound.com/docs/manual/ftom.html)). `freq_to_note_exact` es `ftom` con el `irnd = 0` por defecto (la nota fraccionaria) y `freq_to_note` es la redondeada, que es la que se toca. Un jack entra, una nota sale, como un teclado.
+  - **Redondear solo no alcanza, y ésta es la parte que hay que acertar**: una altura apoyada en el límite entre dos semitonos redondea arriba y abajo según tiembla, y cada salto sería un note-on. Una nota sólo cambia cuando la nueva es **claramente** la más cercana (`HYSTERESIS`, 20 cents pasado el punto medio) **y** se ha sostenido tres análisis. Un vibrato dentro del semitono es una nota sostenida, que es lo que habría mandado un teclado.
+  - Se fue el pitch bend continuo del intento anterior: la petición era una nota exacta, no una cinta de altura.
+- **La entrada es un jack, no una mezcla.** Un tab alimentado por un solo canal tiene la misma señal en los dos lados; uno alimentado por dos canales distintos tiene **dos micrófonos distintos**, y sumarlos es cancelación de fase y dos alturas a la vez, que no es ninguna nota. El detector escucha el lado izquierdo, que es el canal que el usuario asignó primero.
+- **El gate por defecto baja a -55 dBFS.** Un micro de auriculares por el previo de un portátil está mucho más flojo que una guitarra por una DI, y un gate por encima de la señal se lee como "no hace absolutamente nada", que es el peor de los dos fallos. `SENS` está en la tira del mixer justo para volver a subirlo donde una pastilla ruidosa lo necesita.
+
+#### Añadido
+- **El botón `A→M` dice lo que está oyendo**: ` A→M● E2-14` con la nota y los cents de desvío, o el nivel de entrada en dB cuando no suena nada. Sin esto, un tracker que no toca nada y uno que toca la nota equivocada se ven exactamente igual desde fuera, y `SENS` no tiene a qué apuntar. Los cents son **sólo display**: al plugin le llega la nota, exacta. Sale de un medidor sin locks que publica el callback (`meter::pitch_meter()`), igual que el de la salida.
+- **El rack avisa cuando no hay a quién tocar.** `A→M` toca el **instrumento del tab**, no su cadena de FX: un tab sin instrumento sigue la altura perfectamente y no tiene con qué sonar, que desde fuera es idéntico a un detector roto. Ahora la línea del instrumento lo dice: `AUDIO IN 5 → A→M needs an instrument [1]`.
+
+#### Verificado
+- `ftom` en sus dos formas (440 Hz son 69 exactos; un cuarto de tono es 69.5 con `irnd=0` y **70** redondeado; 0.49 semitonos redondea a 69). Un vibrato de ±35 cents que sale como **una nota sostenida y cero eventos**, y un semitono de verdad que sí es nota nueva. Y la entrada mono: con un G en el canal izquierdo y una quinta invertida en el derecho, sale el G — sumar habría dado cualquier otra cosa. **335 tests**, clippy `--all-targets -D warnings` limpio.
+- **Sigue sin probarse con el micro delante.** El modelo ya es el correcto y el gate no puede tapar una señal floja, pero cuánto hay que subir `IN` para unos H340 concretos sólo se ve mirando la lectura del botón.
+
+### 2026-08-09 (duodecies) — el A→M no llegaba a tiempo, y el resto del roadmap
+
+#### Arreglado
+- **`A→M` mandaba notas al azar, y no era el detector: era el presupuesto.** YIN es O(ventana × lags), y corría **a la frecuencia del dispositivo en cada bloque**: 872 lags sobre 2048 muestras, 187 veces por segundo, dentro del callback de audio. Son ~340 millones de operaciones por segundo por una sola guitarra. El resultado no era "va un poco tarde" — eran xruns, el plugin sin CPU, y notas que parecían aleatorias porque el callback perdía su plazo. Dos cambios, los dos son hacer menos:
+  - **Decimar a ~16 kHz.** La nota más aguda de una guitarra son 1.3 kHz; nada por encima de 8 kHz dice nada sobre su período. Promediar `D` muestras en una es a la vez el downsample y su filtro anti-alias.
+  - **Analizar por salto, no por bloque.** Una nota no puede empezar dos veces en 8 ms, así que ésa es la frecuencia con la que se mira la ventana, sea cual sea el tamaño de bloque.
+  - Juntos: ~150k operaciones cada 8 ms, unas **30 veces menos trabajo**, y el callback llega. La interpolación parabólica pasa de ser un pulido a ser obligatoria: a 16 kHz un lag entero es un *tono* en los trastes altos.
+  - Test nuevo con **armónicos más fuertes que el fundamental**, que es como oye una pastilla de puente y donde un detector ingenuo canta la octava.
+
+#### Añadido
+- **Trim de entrada y sensibilidad, por tab** (`IN` y `SENS` en la tira del mixer, sólo donde hay audio entrando). Una guitarra por un previo no está ni cerca del nivel de un sintetizador, y sin esto los dos quedaban donde los dejó la interfaz. `SENS` es el gate del `A→M` en dB (-70 a -20 dBFS), que desde el lado del que toca es la misma perilla: cuánto hay que pegarle para que suene una nota. Rueda del ratón, `<`/`>` y `;`/`:`, MIDI-learnables y automatizables como todo lo demás, y guardados en el proyecto. Cierra el punto del roadmap que decía que el gate era fijo y sin control.
+- **Posición de compás para VST3 y CLAP** — lo que le faltaba al transporte. `Transport::bar_position()` sale del compás leído en negras (4/4 son cuatro, 6/8 son tres, 7/8 son tres y media), así que VST3 declara `kBarPositionValid` con `barPositionMusic` y CLAP manda `bar_number` y `bar_start`. **Es la fase, no un sitio en una canción**: choz no tiene arreglo, cuenta compases desde el último reset del transporte. Eso es exactamente lo que necesita un plugin que sincroniza un patrón al inicio de compás, y es verdad — "compás 1 para siempre" no lo era.
+- **La longitud del bucle de automatización se ajusta desde la interfaz**: botón `◀ LOOP n ▶` en el TRANSPORT, flechas o clic (mitad izquierda acorta, derecha alarga). Se muestra **en compases**, porque "16 pulsos" no significa nada en 6/8.
+
+#### Verificado
+- El detector contra seis notas de guitarra y bajo, y contra tonos con armónicos más fuertes que el fundamental. El trim y `SENS` de punta a punta: no existen sin audio entrando, se recortan en los extremos, el gate va en dB y la perilla ida y vuelta, los dos son targets de learn y automatización, y los dos sobreviven al proyecto. El compás en negras (4/4 son cuatro, 6/8 tres, 7/8 tres y media) y la posición de compás llegando a VST3 y a CLAP. El bucle de automatización en compases del compás vigente. **290 tests**, clippy `--all-targets -D warnings` limpio.
+- **Lo que no se puede simular**: nada de esto se ha tocado con una guitarra por un amplificador. El presupuesto de CPU está calculado y acotado por un test, no medido con un `xrun` contador delante. Queda en el roadmap.
+
+### 2026-08-09 (undecies) — faltaban entradas, y el gesto de asignar
+
+#### Arreglado
+- **Con las entradas ya visibles, no se podían asignar.** Un tab del rack sólo nacía al enlazar un **puerto de notas** (`bind_selected_input` llama a `add_silent` y `push_slot`). Quien entra por una guitarra no tiene ningún puerto MIDI que enlazar, así que el rack se quedaba vacío y `set_active_capture` volvía sin hacer nada: filas dibujadas, clic sin efecto. Asignar un canal de audio ahora arranca el tab si no hay ninguno, igual que enlazar un puerto.
+- **La UMC1820 con ocho entradas mostraba `AUDIO IN (0)`.** choz pedía los puertos de captura **del sink**, y en PipeWire una interfaz son *dos* nodos: `alsa_output…` no tiene ninguno (los `monitor_*` se descartan a propósito, o el rack se realimentaría). Ahora `jack_backend::all_capture_ports()` devuelve **todos** los puertos de captura del grafo, de todas las tarjetas, y el cliente registra un puerto de entrada por cada uno y los cablea uno a uno. El cajón IN los lista agrupados por la tarjeta que los publica.
+  - **Se fue la elección de "dispositivo de entrada"**, que ya no significa nada: están todos conectados y lo que se elige es un canal. Con ella se van `set_input_device`, `input_devices`, `capture_channels` y el ajuste `input_device` de `ui.json`. `r` en el cajón IN vuelve a leer el grafo, para una tarjeta enchufada después de arrancar.
+  - Cambiar de salida ya no reconstruye el cliente por culpa de las entradas: dependen del grafo entero, no del sink.
+
+#### Cambiado
+- **Asignar y desasignar, en vez de mover lados.** Como pidió el usuario: `Enter` o `Espacio` ponen y quitan un canal del tab activo, el botón izquierdo del ratón pone y el derecho quita. Un tab tiene hasta dos canales — el primero es su izquierda, el segundo su derecha.
+  - **Asignar es una cola de dos**: el nuevo entra por la derecha y el más viejo se cae por la izquierda. No es un detalle: un tab nace en 1 y 2, así que fijar la izquierda dejaría el canal 1 dentro por más clics que se hicieran. Así, clic en 3 y clic en 9 da exactamente 3 y 9.
+  - Quitar el último canal de una **entrada** devuelve el tab a su instrumento (el mismo estado que la fila `(instrument)`); una **salida** siempre conserva uno, porque el motor necesita un canal donde mezclar.
+  - El botón derecho no significa nada fuera de las filas de canal — ni sobre un puerto MIDI ni sobre un dispositivo de salida.
+
+#### Verificado
+- `assign_channel` y `unassign_channel` como funciones puras (la cola de dos, quitar el que no está, quitar el último), el recorrido entero por la app — nace en 1 y 2, clic en 3, clic en 9, queda en 3 y 9; el derecho lo deja en mono; el último no se puede quitar de una salida — y el reparto del ratón: izquierdo asigna, derecho desasigna, y fuera de las filas de canal el derecho no hace nada. **290 tests**, clippy `--all-targets -D warnings` limpio.
+- **Sin la interfaz de audio delante no se puede comprobar lo que importa**: que las ocho entradas de la UMC1820 aparezcan de verdad y que el jack 5 sea el jack 5. Los tests corren sin cliente JACK, así que ven cero puertos de captura. Queda en el roadmap.
+
+### 2026-08-09 (decies) — el ruteo es por canal, no por pares
+
+#### Cambiado
+- **Los dos cajones listan un canal por fila, no pares.** Los jacks de una interfaz no vienen pegados de a dos, y choz dejaba elegir sólo `2n`/`2n+1`: la salida 3 con la 9 no se podía pedir aunque el motor la soportara desde siempre (`mix[l]` y `mix[r]` son índices sueltos, y ya se recortaban al último canal). Ahora:
+  - Cada fila dice qué es para el tab activo — `L`, `R`, `L+R` — así que el ruteo se lee del panel en vez de recordarse.
+  - El gesto para poner y quitar canales cambió el mismo día; está en la entrada de arriba, que es la que vale.
+- La etiqueta del RACK dice `AUDIO IN 5` cuando un tab entra por un jack, no `5/5`.
+
+#### Verificado
+- El caso entero por la app: entrada 5 en mono (la etiqueta dice `AUDIO IN 5`), salida por el 3 y el 9, y las filas del cajón etiquetadas `L`, `R`, `L+R`. Elegir un canal mueve **sólo** el tab activo.
+- **El motor no hubo que tocarlo**: `SetSlotOut { left, right }` y `SetSlotIn { pair }` ya eran canales sueltos, y sus tests (`slots_land_on_the_output_pair_they_are_routed_to`, `an_out_of_range_pair_folds_onto_the_last_channel`) ya cubrían un par arbitrario y el recorte al último canal. Lo que sobraba era la interfaz.
+
+### 2026-08-09 (nonies) — la guitarra toca el VST, el EQ de tanu, y el monitor mira el audio
+
+#### Añadido
+- **`A→M`: la entrada de audio de un tab se convierte en notas para su propio instrumento** (`choz-engine/src/pitch.rs`). Un botón en la línea del instrumento del rack, que **sólo aparece donde hay una entrada** — sin par de captura no hay nada que escuchar. Con él encendido el audio ya no pasa por los FX: se escucha, y lo que suena es el instrumento del tab tocando lo que oyó, así que una guitarra toca Surge XT.
+  - **Monofónico, y no es un atajo que arreglar luego.** Un período es una frecuencia; un acorde tiene varias y elegir una es adivinar. Los sintetizadores de guitarra funcionan así — una cuerda, un conversor — desde hace cuarenta años.
+  - **YIN, no autocorrelación pelada.** La primera versión usaba una diferencia cuadrada sola, que en una señal suave baja en *todos* los lags cortos: el mi grave de una guitarra salía una octava y media arriba. Dividir cada lag por la media acumulada de los anteriores deja el período real como el primer valle bajo el umbral.
+  - **Un tono tiene que sostenerse para ser nota** (tres análisis, ~16 ms a 256 frames). Sin eso, arrastrar un dedo hasta la nota dispara una nota-on por semitono: medido, ocho notas donde debía haber dos. Cambiar de nota exige además una lectura más limpia que empezar una (0.95 contra 0.85), porque mientras la ventana aún tiene la nota anterior la mezcla ensucia el valle.
+  - Se corre sobre el bloque que el callback ya tiene: sin latencia extra, sin reservar memoria, sin locks. Apagarlo suelta la nota que estuviera sonando.
+- **GRAPHIC EQ: el ecualizador de diez bandas de tanu, con sus 18 presets de Winamp** (`fx/graphic_eq.rs`). Las mismas frecuencias, el mismo rango de ±12 dB y los mismos presets copiados de tanu (`src/audio/eq.rs`), así que un preset significa aquí lo mismo que allí. La diferencia: cada banda es un parámetro de choz, o sea **MIDI-learnable y automatizable una por una**, y el selector de preset es un knob más.
+- **El monitor MIDI tiene pestañas: MIDI / WAVE / ACTIVITY** (`F5`, o clic en la tira). Las dos visualizaciones vienen de seqterm. Se alimentan de un medidor sin locks (`choz-engine/src/meter.rs`): el callback publica pico, RMS y una ventana de onda diezmada en atómicas relajadas, y la interfaz las lee al redibujar — un medidor un bloque atrasado es un medidor correcto.
+- **La splash screen llena su caja**: reflejo del logo, versión, los seis formatos encendiéndose por turno y una línea de onda que viaja. Antes eran 24 filas con once de contenido. La onda es determinista en `(tick, width)`, así que hay test: una animación que nadie puede comprobar es una animación que se rompe en silencio.
+
+#### Arreglado
+- **El knob de preset del GRAPHIC EQ no hacía nada en caliente.** `set_param` atendía las diez bandas y el preamp y dejaba caer el índice 11, así que elegir "Rock" sólo surtía efecto la próxima vez que se reconstruía la cadena (recargar el proyecto): un knob muerto.
+- **Y al reconstruirla, el preset anulaba las bandas.** Quien elegía un preset y luego movía una banda no movía nada. Ahora una banda en el centro se queda con lo que puso el preset y una movida gana, que es la decisión más reciente.
+- **`cargo test --workspace` se colgaba para siempre.** El test nuevo de `A→M` tomaba `ui_guard()` y llamaba a `render_rack`, que lo vuelve a tomar: un `std::sync::Mutex` no es reentrante, así que el hilo se bloqueaba contra sí mismo — y con él todos los demás tests que esperan ese mismo candado. Se veía como una suite lenta (todos los hilos en `futex_do_wait` al 0% de CPU) y no como un fallo. `render_rack` ya toma el candado; el test no debe.
+
+#### Verificado
+- Bandas y presets contra tonos: la banda de 1 kHz sube 1 kHz y deja 70 Hz en paz, y los 18 presets llegan enteros y en dB. El detector, contra seis notas de guitarra y bajo (mi grave 82 Hz hasta el mi 1318 Hz), el silencio, el gate y el cambio de nota. Las tres pestañas del monitor, incluida la de que la tira devuelve sus rectángulos para el clic. **281 tests**.
+- **Los paquetes se plantan de verdad sin ALSA, comprobado sobre los paquetes construidos y no sobre la intención**: el `.deb` sale con `Depends: libasound2t64 (>= 1.0.29), libc6 (>= 2.43)` (`dpkg-deb -f`), o sea que apt no lo instala sin ALSA; el `.rpm` pide `libasound.so.2()(64bit)` con sus versiones de símbolo (`ALSA_0.9`, `0.9.0rc4`, `0.9.0rc8`) además de `libc`, `libm`, `libgcc_s` y el cargador, así que `rpm -i` falla con "Failed dependencies". JACK es débil en los dos (`Recommends` / `recommends`), que es correcto: se abre con `dlopen`. `install.sh` sale con error 1 sin copiar nada.
+- **Lo que no se puede simular**: nada de esto se ha tocado con una guitarra de verdad por un amplificador. Queda en el roadmap.
+
+### 2026-08-09 (octies) — los nice-to-have: canal por tab, compás, LV2 y automatización
+
+Cierra el último punto de Pendiente que no dependía de hardware ni de decisiones del usuario.
+
+#### Añadido
+- **Un puerto MIDI se puede partir entre tabs por canal, en modo LIVE.** Es **opt-in**, y por una razón concreta: pulsar `+` da otro patch sobre el mismo controlador, y si ese tab reclamara un canal que el teclado ya manda, el patch que está en pantalla se quedaría mudo. Así que un tab responde a **cualquier** canal (`CH ANY`) hasta que se le da un número; entonces ese canal le llega aunque el activo sea otro. Al entrar en MULTI los tabs en ANY se numeran solos, porque allí un tab *es* un canal.
+- **Compás distinto de 4/4** en el transporte (`Settings → AUDIO → Time signature`, ocho compases usuales), y viaja a los tres formatos que ya leían el reloj: `timeSigNumerator/Denominator` en VST2 y VST3, `time_signature_*` en CLAP.
+- **LV2 recibe el transporte.** Era el que faltaba, y el más trabajoso: LV2 no tiene callback de reloj — el host **escribe un objeto `time:Position`** en el puerto de atoms del plugin, junto al MIDI. Se manda `frame`, `speed`, `beatsPerMinute`, `bar`, `barBeat`, `beatsPerBar` y `beatUnit`, en un objeto de atoms construido a mano y alineado a ocho bytes.
+- **Automatización** (`choz-ui/src/automation.rs`): se graba lo que el usuario mueve y se vuelve a mover en la pasada siguiente. `R` arma (y arranca el transporte, porque grabar contra un reloj parado graba un instante), `X` borra, y el botón `REC` del TRANSPORT dice en qué estado está.
+  - **Las direcciones son las de MIDI learn** (`LearnTarget`): un carril es "este control, a lo largo de un bucle". Nada nuevo hubo que hacer automatizable, y un carril significa lo mismo en el proyecto que un binding de CC.
+  - **Graba muestreando, no interceptando.** La alternativa era un gancho en cada setter — el mixer, los knobs del instrumento, los del FX, la ventana del plugin, el camino del CC: cinco sitios que nadie puede olvidarse. El bucle de la interfaz ya late más rápido que una mano, así que cada vuelta pregunta los valores y anota los que cambiaron.
+  - **Escalón, no rampa**: se reproduce dónde *estuvo* el control, sin inventar el movimiento entre dos muestras. Un valor repetido no escribe punto, y una segunda pasada reemplaza a la primera en vez de entrelazarse.
+  - Se guarda en el proyecto (`automation:`), y un proyecto anterior simplemente no trae carriles.
+
+#### Arreglado
+- **La posición del transporte avanzaba con el transporte parado.** Un delay sincronizado leyendo una posición que se mueve con el STOP pulsado es peor que uno que no lee nada.
+
+#### Verificado
+- El bucle entero por la app: armar, rodar, mover un fader un pulso adentro, desarmar, adelantar el reloj a la misma posición de la pasada siguiente y ver el valor volver solo. Más el objeto `time:Position` recorrido como lo recorre un plugin (evento → objeto → propiedades por URID: tres segundos a 120 BPM son el compás 1, pulso 2), el split por canal con sus tres casos, y el compás llegando a VST2, VST3 y CLAP. **265 tests**, clippy `--all-targets -D warnings` limpio.
+
+### 2026-08-09 (septies) — documentación al día, y el instalador dice qué falta
+
+#### Añadido
+- **`install.sh` comprueba las dependencias de ejecución antes de copiar nada, y con ALSA ausente se planta.** Antes no miraba: se instalaba un binario que arrancaba y no abría ningún dispositivo, que es un informe de bug esperando a pasar y no una instalación. Ahora sale con error 1, sin copiar nada, diciendo el paquete de cada familia de distro. `--skip-deps-check` instala igual, para el único caso en que seguir es lo correcto: preparar la instalación para una máquina que no es ésta.
+  - **ALSA (`libasound.so.2`) es obligatoria; JACK no.** Comprobado sobre el binario, no supuesto: `ldd` sólo lista `libasound`, `libc`, `libm` y `libgcc_s`; **`libjack.so.0` se abre con `dlopen`**, así que sin ella choz funciona por ALSA y lo único que se pierde es el ruteo JACK/PipeWire. Por eso el `.deb` declara sólo `libasound2t64` y `libc6`, que es correcto.
+  - X11 no aparece por ningún lado: las ventanas de plugin van por `x11rb`, que habla el protocolo y no enlaza ninguna librería C. La instrucción de instalar `libx11-dev` para compilar sobraba y se ha quitado.
+
+#### Documentación
+- **README**: estado en 1.0.0; qué necesita para *compilar* frente a qué necesita para *ejecutar* (tabla nueva); la política de "tener ventana basta para ir al sandbox"; la tabla de qué control dibuja cada tipo de parámetro; el transporte y la fila `Tempo`; `packaging/` y `examples/esp32s3-touch/` en el árbol; `CHOZ_SANDBOX_GUI` en las variables de entorno; y los conteos de tests por crate corregidos uno a uno.
+- **architecture.md**: secciones nuevas de transporte y de empaquetado/escritorio; la sección de parámetros reescrita con de dónde sale cada control y las dos invariantes que hay que mantener (un paso por pulsación, y un rect por control); la deny-list de UIs explicada como propiedad del proceso.
+- **roadmap.md**: el punto de la release dice ahora exactamente qué queda (commit, tag `v1.0.0`, push, binario aarch64) y qué ya está construido.
+
+#### Verificado
+- Los tres caminos, con un `ldconfig` falso: sin ALSA **falla y no instala nada**; con `--skip-deps-check` instala y dice que se saltó la comprobación; con ALSA pero sin JACK instala y deja la nota. Sin `ldconfig` en la máquina (contenedor, musl) tampoco se planta: dice que no pudo comprobarlo. **259 tests**, clippy `--all-targets -D warnings` limpio.
 
 ### 2026-08-09 (sexies) — superficie de control en un ESP32-S3 con pantalla táctil
 

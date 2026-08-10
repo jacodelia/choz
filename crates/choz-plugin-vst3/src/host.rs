@@ -662,9 +662,14 @@ fn note_off_event(ch: u8, note: u8) -> Event {
 /// choz's clock as VST3 wants it, filled from [`choz_ports::transport`].
 ///
 /// Only what choz actually knows is flagged valid: tempo, the musical position
-/// and 4/4. There is no arrangement here, so no bar position, no cycle and no
-/// SMPTE — a plugin reads a field only when its flag says it is there, and
-/// inventing a bar number is worse than not offering one.
+/// the time signature and the bar the playhead is in. There is no arrangement
+/// here, so no cycle and no SMPTE — a plugin reads a field only when its flag
+/// says it is there.
+///
+/// The bar position is the *phase*, not a place in a song: choz counts bars
+/// from wherever the transport was last reset. That is what a plugin syncing a
+/// pattern to bar starts actually needs, and it is true, which "bar 1 forever"
+/// was not.
 fn host_process_context() -> ProcessContext {
     let t = choz_ports::transport();
     // SAFETY: `ProcessContext` is a plain C struct of numbers; zero is its
@@ -675,9 +680,12 @@ fn host_process_context() -> ProcessContext {
     ctx.continousTimeSamples = t.samples() as TSamples;
     ctx.projectTimeMusic = t.ppq() as TQuarterNotes;
     ctx.tempo = t.bpm() as f64;
-    ctx.timeSigNumerator = 4;
-    ctx.timeSigDenominator = 4;
-    ctx.state = ProcessContext_::StatesAndFlags_::kProjectTimeMusicValid
+    let (num, den) = t.time_signature();
+    ctx.timeSigNumerator = num as int32;
+    ctx.timeSigDenominator = den as int32;
+    ctx.barPositionMusic = t.bar_position().1 as TQuarterNotes;
+    ctx.state = ProcessContext_::StatesAndFlags_::kBarPositionValid
+        | ProcessContext_::StatesAndFlags_::kProjectTimeMusicValid
         | ProcessContext_::StatesAndFlags_::kTempoValid
         | ProcessContext_::StatesAndFlags_::kTimeSigValid
         | ProcessContext_::StatesAndFlags_::kContTimeValid
@@ -1357,6 +1365,21 @@ mod transport_tests {
             | ProcessContext_::StatesAndFlags_::kProjectTimeMusicValid
             | ProcessContext_::StatesAndFlags_::kPlaying;
         assert_eq!(ctx.state & flags, flags);
+
+        // The bar the playhead is in, and where that bar began. At 4/4 and
+        // 1.5 quarters in, that is bar 1 starting at 0; five quarters in it is
+        // bar 2 starting at 4.
+        assert_eq!(
+            ctx.state & ProcessContext_::StatesAndFlags_::kBarPositionValid,
+            ProcessContext_::StatesAndFlags_::kBarPositionValid,
+            "the bar position is offered, not withheld"
+        );
+        assert!((ctx.barPositionMusic - 0.0).abs() < 1e-9, "{}", ctx.barPositionMusic);
+
+        t.set_time_signature(6, 8);
+        let ctx = host_process_context();
+        assert_eq!((ctx.timeSigNumerator, ctx.timeSigDenominator), (6, 8));
+        t.set_time_signature(4, 4);
 
         t.set_playing(false);
         assert_eq!(

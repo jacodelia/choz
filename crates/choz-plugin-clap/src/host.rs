@@ -187,7 +187,12 @@ fn host_transport() -> clack_host::events::event_types::TransportEvent {
     use clack_host::utils::{BeatTime, SecondsTime};
 
     let t = choz_ports::transport();
+    let (num, den) = t.time_signature();
     let beats = t.ppq();
+    // The bar the playhead is in, and where it started. choz has no
+    // arrangement, so the number counts from the last transport reset — the
+    // phase is what a plugin syncing to bar starts is actually after.
+    let (bar_number, bar_start) = t.bar_position();
     let seconds = t.samples() as f64 / t.sample_rate() as f64;
     let mut flags = TransportFlags::HAS_TEMPO
         | TransportFlags::HAS_BEATS_TIMELINE
@@ -207,10 +212,10 @@ fn host_transport() -> clack_host::events::event_types::TransportEvent {
         loop_end_beats: BeatTime::from_int(0),
         loop_start_seconds: SecondsTime::from_int(0),
         loop_end_seconds: SecondsTime::from_int(0),
-        bar_start: BeatTime::from_int(0),
-        bar_number: 0,
-        time_signature_numerator: 4,
-        time_signature_denominator: 4,
+        bar_start: BeatTime::from_float(bar_start),
+        bar_number,
+        time_signature_numerator: num,
+        time_signature_denominator: den,
     }
 }
 
@@ -891,9 +896,24 @@ mod tests {
         assert!((ev.song_pos_seconds.to_float() - 1.0).abs() < 1e-6);
         assert!(ev.flags.contains(TransportFlags::HAS_TEMPO));
         assert!(ev.flags.contains(TransportFlags::IS_PLAYING));
-        // Nothing is claimed about an arrangement choz does not have.
-        assert!(!ev.flags.contains(TransportFlags::HAS_TIME_SIGNATURE) || ev.time_signature_numerator == 4);
-        assert_eq!(ev.bar_number, 0);
+        assert_eq!(ev.time_signature_numerator, 4);
+        // A beat and a half into 4/4 is the first bar, which started at 0.
+        assert_eq!(ev.bar_number, 1);
+        assert!((ev.bar_start.to_float() - 0.0).abs() < 1e-6);
+
+        // Five quarters in, the second bar has begun and it began at 4.
+        t.advance(48_000 * 7 / 3); // to 5 quarters at 90 BPM
+        let ev = host_transport();
+        assert_eq!(ev.bar_number, 2, "{}", ev.song_pos_beats.to_float());
+        assert!((ev.bar_start.to_float() - 4.0).abs() < 1e-6);
+
+        // 6/8 is three quarters to the bar, so the same position is bar 2 as
+        // well — but a bar that started at 3.
+        t.set_time_signature(6, 8);
+        let ev = host_transport();
+        assert_eq!((ev.time_signature_numerator, ev.time_signature_denominator), (6, 8));
+        assert!((ev.bar_start.to_float() - 3.0).abs() < 1e-6, "{}", ev.bar_start.to_float());
+        t.set_time_signature(4, 4);
 
         t.set_playing(false);
         assert!(!host_transport().flags.contains(TransportFlags::IS_PLAYING));

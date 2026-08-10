@@ -21,6 +21,10 @@ pub struct Project {
     pub interface: Interface,
     pub plugin_paths: choz_engine::PluginPaths,
     pub rack: Vec<Slot>,
+    /// Recorded parameter moves. Added later, hence the default: a project
+    /// written before automation existed simply has none.
+    #[serde(default)]
+    pub automation: crate::automation::Automation,
 }
 
 /// Engine-side settings that aren't per-slot.
@@ -86,6 +90,15 @@ pub struct Mixer {
     /// instead of its instrument.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_pair: Option<(usize, usize)>,
+    /// Audio in, notes out. Added later, hence the default.
+    #[serde(default)]
+    pub pitch_to_midi: bool,
+    /// Trim on the audio input, and the level `A→M` calls a note. Both added
+    /// later; `None` means "whatever the defaults are now".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_gain: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_gate: Option<f32>,
 }
 
 /// What a tab plays. `kind` is `none` / `sf2` / `wav` / `plugin`.
@@ -160,6 +173,7 @@ mod tests {
 
     fn sample() -> Project {
         Project {
+            automation: crate::automation::Automation::default(),
             version: 1,
             audio: Audio {
                 sample_rate: 48_000,
@@ -191,6 +205,9 @@ mod tests {
                     solo: false,
                     out_pair: Some((2, 3)),
                     in_pair: None,
+                    pitch_to_midi: false,
+                    in_gain: None,
+                    in_gate: None,
                 },
                 fx: vec![Fx {
                     kind: "amberfang".into(),

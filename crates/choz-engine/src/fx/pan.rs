@@ -36,6 +36,15 @@ impl Default for Pan {
 }
 
 impl super::FxProcessor for Pan {
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match index {
+            0 => self.pan = (v - 0.5) * 2.0,
+            1 => self.constant_power = v > 0.5,
+            _ => {}
+        }
+    }
+
     fn process_block(&mut self, buf: &mut [f32], _sample_rate: u32) {
         if self.pan == 0.0 { return; }
         let (gl, gr) = self.gains();

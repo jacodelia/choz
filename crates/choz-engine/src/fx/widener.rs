@@ -17,6 +17,12 @@ impl StereoWidener {
 impl Default for StereoWidener { fn default() -> Self { Self::new() } }
 
 impl super::FxProcessor for StereoWidener {
+    fn set_param(&mut self, index: usize, value: f32) {
+        if index == 0 {
+            self.width = value.clamp(0.0, 1.0) * 2.0;
+        }
+    }
+
     fn process_block(&mut self, buf: &mut [f32], _sample_rate: u32) {
         if buf.len() < 2 { return; }
         // width = 1.0 → mid_gain = 1.0, side_gain = 1.0

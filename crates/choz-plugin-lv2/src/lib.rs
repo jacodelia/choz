@@ -129,8 +129,28 @@ struct Features {
     _schedule: Box<LV2_Worker_Schedule>,
     /// The URID assigned to `midi:MidiEvent` (for building Atom sequences).
     midi_urid: u32,
+    /// URIDs for the `time:Position` object written next to the MIDI.
+    time: TimeUrids,
     /// The URID assigned to `atom:Sequence` (the MIDI port's atom type).
     sequence_urid: u32,
+}
+
+/// The URIDs a `time:Position` object is made of. Interned once per instance:
+/// the numbers only mean anything inside the store that minted them.
+#[derive(Clone, Copy)]
+struct TimeUrids {
+    object: u32,
+    long: u32,
+    float: u32,
+    int: u32,
+    position: u32,
+    frame: u32,
+    speed: u32,
+    bpm: u32,
+    bar: u32,
+    bar_beat: u32,
+    beats_per_bar: u32,
+    beat_unit: u32,
 }
 
 /// One `opts:options` value: an `atom:Int` or an `atom:Float`.
@@ -235,13 +255,27 @@ impl Features {
         let store_ptr = Arc::as_ptr(&store) as *mut c_void;
         let mut map = Box::new(LV2_URID_Map { handle: store_ptr, map: Some(urid_map_fn) });
         let mut unmap = Box::new(LV2_URID_Unmap { handle: store_ptr, unmap: Some(urid_unmap_fn) });
-        let (midi_urid, sequence_urid, int_urid, float_urid, opt_keys) = {
+        let (midi_urid, sequence_urid, int_urid, float_urid, time, opt_keys) = {
             let mut s = store.lock();
             (
                 s.intern(LV2_MIDI_EVENT_URI),
                 s.intern(LV2_ATOM_SEQUENCE_URI),
                 s.intern(LV2_ATOM_INT_URI),
                 s.intern(LV2_ATOM_FLOAT_URI),
+                TimeUrids {
+                    object: s.intern(LV2_ATOM_OBJECT_URI),
+                    long: s.intern(LV2_ATOM_LONG_URI),
+                    float: s.intern(LV2_ATOM_FLOAT_URI),
+                    int: s.intern(LV2_ATOM_INT_URI),
+                    position: s.intern(LV2_TIME_POSITION_URI),
+                    frame: s.intern(LV2_TIME_FRAME_URI),
+                    speed: s.intern(LV2_TIME_SPEED_URI),
+                    bpm: s.intern(LV2_TIME_BPM_URI),
+                    bar: s.intern(LV2_TIME_BAR_URI),
+                    bar_beat: s.intern(LV2_TIME_BAR_BEAT_URI),
+                    beats_per_bar: s.intern(LV2_TIME_BEATS_PER_BAR_URI),
+                    beat_unit: s.intern(LV2_TIME_BEAT_UNIT_URI),
+                },
                 [
                     s.intern(LV2_BUF_SIZE_MIN_BLOCK_URI),
                     s.intern(LV2_BUF_SIZE_MAX_BLOCK_URI),
@@ -332,6 +366,7 @@ impl Features {
             _schedule: schedule,
             midi_urid,
             sequence_urid,
+            time,
         }
     }
 
@@ -410,12 +445,16 @@ impl Lv2Instance {
     fn write_midi_sequence(&mut self) {
         let Some(idx) = self.atom_in else { return };
         let midi_urid = self.features.midi_urid;
+        let time = self.features.time;
         let buf = &mut self.atom_bufs[idx];
         if buf.len() < std::mem::size_of::<LV2_Atom_Sequence>() {
             return;
         }
         // Sequence header: atom.size will be filled after writing events.
         let mut write = std::mem::size_of::<LV2_Atom_Sequence>();
+        // The clock goes first, at frame 0: LV2 has no host callback for it, so
+        // a tempo-synced plugin reads it out of this same sequence.
+        write += write_time_position(&mut buf[write..], time);
         for msg in &self.pending_midi {
             let ev_hdr = std::mem::size_of::<LV2_Atom_Event>();
             let needed = pad8(ev_hdr + 3);
@@ -1186,5 +1225,213 @@ impl FxProcessor for Lv2Effect {
         let params = std::mem::take(&mut self.params);
         self.inst.set_param_norm(&params, index, value);
         self.params = params;
+    }
+}
+
+// ─── The clock, as LV2 wants it ─────────────────────────────────────────────
+
+/// Write choz's transport into `out` as one `time:Position` object at frame 0.
+///
+/// LV2 is the odd one out: VST2 answers a callback, VST3 takes a struct and CLAP
+/// an event, but an LV2 plugin reads the clock as an **atom object in its own
+/// input port**, next to the MIDI. Everything it needs is a property inside it,
+/// keyed by URID.
+///
+/// Returns how many bytes were written — 0 if the buffer cannot hold the object,
+/// which leaves the sequence exactly as it was.
+fn write_time_position(out: &mut [u8], t: TimeUrids) -> usize {
+    let clock = choz_ports::transport();
+    let (num, den) = clock.time_signature();
+    let beats = clock.ppq();
+    let beats_per_bar = num as f64 * (4.0 / den.max(1) as f64);
+    let bar = (beats / beats_per_bar).floor();
+
+    // `speed` is the one a plugin checks before anything else: 0 is stopped,
+    // 1 is rolling at normal rate.
+    let props: [(u32, PropValue); 7] = [
+        (t.frame, PropValue::Long(clock.samples() as i64)),
+        (t.speed, PropValue::Float(if clock.playing() { 1.0 } else { 0.0 })),
+        (t.bpm, PropValue::Float(clock.bpm())),
+        (t.bar, PropValue::Long(bar as i64)),
+        (t.bar_beat, PropValue::Float((beats - bar * beats_per_bar) as f32)),
+        (t.beats_per_bar, PropValue::Float(beats_per_bar as f32)),
+        (t.beat_unit, PropValue::Int(den as i32)),
+    ];
+
+    let head = std::mem::size_of::<LV2_Atom_Event>() + std::mem::size_of::<LV2_Atom_Object_Body>();
+    let body: usize = props
+        .iter()
+        .map(|(_, v)| pad8(std::mem::size_of::<LV2_Atom_Property_Body>() + v.len()))
+        .sum();
+    let total = pad8(head + body);
+    if out.len() < total {
+        return 0;
+    }
+
+    // The event header: an object, timestamped at the start of the block.
+    let obj_size = (std::mem::size_of::<LV2_Atom_Object_Body>() + body) as u32;
+    let ev = LV2_Atom_Event { frames: 0, body: LV2_Atom { size: obj_size, type_: t.object } };
+    let obj = LV2_Atom_Object_Body { id: 0, otype: t.position };
+    let mut w = 0;
+    w += put(out, w, &ev);
+    w += put(out, w, &obj);
+
+    for (key, value) in props {
+        let prop = LV2_Atom_Property_Body {
+            key,
+            context: 0,
+            value: LV2_Atom { size: value.len() as u32, type_: value.type_urid(t) },
+        };
+        let start = w;
+        w += put(out, w, &prop);
+        w += value.write(&mut out[w..]);
+        // Every property is padded to eight, whatever its value was.
+        let padded = pad8(w - start);
+        out[w..start + padded].fill(0);
+        w = start + padded;
+    }
+    out[w..total].fill(0);
+    total
+}
+
+/// A property's value, in the three atom types a position is made of.
+enum PropValue {
+    Long(i64),
+    Float(f32),
+    Int(i32),
+}
+
+impl PropValue {
+    fn len(&self) -> usize {
+        match self {
+            PropValue::Long(_) => 8,
+            PropValue::Float(_) | PropValue::Int(_) => 4,
+        }
+    }
+
+    fn type_urid(&self, t: TimeUrids) -> u32 {
+        match self {
+            PropValue::Long(_) => t.long,
+            PropValue::Float(_) => t.float,
+            PropValue::Int(_) => t.int,
+        }
+    }
+
+    fn write(&self, out: &mut [u8]) -> usize {
+        match self {
+            PropValue::Long(v) => {
+                out[..8].copy_from_slice(&v.to_ne_bytes());
+                8
+            }
+            PropValue::Float(v) => {
+                out[..4].copy_from_slice(&v.to_ne_bytes());
+                4
+            }
+            PropValue::Int(v) => {
+                out[..4].copy_from_slice(&v.to_ne_bytes());
+                4
+            }
+        }
+    }
+}
+
+/// Copy a `#[repr(C)]` value into `out` at `at`, returning its size.
+fn put<T: Copy>(out: &mut [u8], at: usize, value: &T) -> usize {
+    let n = std::mem::size_of::<T>();
+    // SAFETY: a plain C struct of integers, copied byte for byte into a buffer
+    // the caller has already checked is big enough.
+    let bytes = unsafe { std::slice::from_raw_parts(value as *const T as *const u8, n) };
+    out[at..at + n].copy_from_slice(bytes);
+    n
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    /// The `time:Position` object choz writes into a plugin's atom port, read
+    /// back the way a plugin reads it: an event, an object header, then
+    /// properties keyed by URID.
+    ///
+    /// LV2 is the format where the host has to *build* the clock rather than
+    /// answer a call, so the layout is the thing that can be wrong.
+    #[test]
+    fn the_position_object_is_laid_out_the_way_a_plugin_reads_it() {
+        let t = TimeUrids {
+            object: 1, long: 2, float: 3, int: 4, position: 5,
+            frame: 6, speed: 7, bpm: 8, bar: 9, bar_beat: 10,
+            beats_per_bar: 11, beat_unit: 12,
+        };
+        let clock = choz_ports::transport();
+        clock.set_sample_rate(48_000);
+        clock.set_bpm(120.0);
+        clock.set_time_signature(4, 4);
+        clock.set_playing(true);
+        clock.rewind();
+        clock.advance(48_000 * 3); // three seconds = six beats at 120 = bar 1, beat 2
+
+        let mut buf = vec![0u8; 512];
+        let n = write_time_position(&mut buf, t);
+        assert!(n > 0 && n.is_multiple_of(8), "atoms are eight-byte aligned; got {n}");
+
+        // Walk it exactly as a plugin would.
+        let ev: LV2_Atom_Event = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const _) };
+        assert_eq!(ev.frames, 0, "the clock is for the start of the block");
+        assert_eq!(ev.body.type_, t.object);
+        let obj: LV2_Atom_Object_Body = unsafe {
+            std::ptr::read_unaligned(buf.as_ptr().add(std::mem::size_of::<LV2_Atom_Event>()) as *const _)
+        };
+        assert_eq!(obj.otype, t.position, "it is a time:Position");
+
+        let mut found = std::collections::HashMap::new();
+        let mut off = std::mem::size_of::<LV2_Atom_Event>() + std::mem::size_of::<LV2_Atom_Object_Body>();
+        while off + std::mem::size_of::<LV2_Atom_Property_Body>() <= n {
+            let prop: LV2_Atom_Property_Body =
+                unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off) as *const _) };
+            if prop.key == 0 {
+                break;
+            }
+            let value_at = off + std::mem::size_of::<LV2_Atom_Property_Body>();
+            let value: f64 = if prop.value.type_ == t.long {
+                let v: i64 = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(value_at).cast()) };
+                v as f64
+            } else if prop.value.type_ == t.float {
+                let v: f32 = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(value_at).cast()) };
+                v as f64
+            } else {
+                let v: i32 = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(value_at).cast()) };
+                v as f64
+            };
+            found.insert(prop.key, value);
+            off += pad8(std::mem::size_of::<LV2_Atom_Property_Body>() + prop.value.size as usize);
+        }
+
+        assert_eq!(found.get(&t.frame), Some(&144_000.0), "three seconds of frames");
+        assert_eq!(found.get(&t.speed), Some(&1.0), "rolling");
+        assert_eq!(found.get(&t.bpm), Some(&120.0));
+        assert_eq!(found.get(&t.bar), Some(&1.0), "six beats in, second bar");
+        assert_eq!(found.get(&t.bar_beat), Some(&2.0), "and its third beat");
+        assert_eq!(found.get(&t.beats_per_bar), Some(&4.0));
+        assert_eq!(found.get(&t.beat_unit), Some(&4.0));
+
+        // Stopped is what a plugin checks first, and it must say so.
+        clock.set_playing(false);
+        let mut buf2 = vec![0u8; 512];
+        write_time_position(&mut buf2, t);
+        assert_ne!(buf, buf2, "the object follows the transport");
+
+        // 6/8 changes the bar, not just the numbers reported.
+        clock.set_time_signature(6, 8);
+        let mut buf3 = vec![0u8; 512];
+        assert!(write_time_position(&mut buf3, t) > 0);
+
+        // And a buffer that cannot hold it is left alone rather than half-written.
+        let mut tiny = vec![0u8; 16];
+        assert_eq!(write_time_position(&mut tiny, t), 0);
+        assert!(tiny.iter().all(|b| *b == 0), "nothing was written");
+
+        clock.set_time_signature(4, 4);
+        clock.set_bpm(choz_ports::Transport::DEFAULT_BPM);
+        clock.rewind();
     }
 }

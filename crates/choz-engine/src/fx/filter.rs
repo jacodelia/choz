@@ -93,6 +93,17 @@ impl Svf {
 }
 
 impl FxProcessor for Svf {
+    /// Cutoff and resonance, live: rebuilding would clear the filter's state
+    /// and a state-variable filter with no state is a click.
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match index {
+            0 => self.set_cutoff(20.0 + v * 19980.0),
+            1 => self.set_resonance(v * 0.98),
+            _ => {}
+        }
+    }
+
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
         if self.sample_rate != sample_rate {
             self.sample_rate = sample_rate;

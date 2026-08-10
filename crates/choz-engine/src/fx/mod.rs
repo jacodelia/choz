@@ -18,7 +18,10 @@ pub mod vinyl;
 // ── Dynamics ─────────────────────────────────────────────────────────────────
 pub mod compressor;
 pub mod gate;
+// ── Pitch ────────────────────────────────────────────────────────────────────
+pub mod autotune;
 // ── EQ ───────────────────────────────────────────────────────────────────────
+pub mod graphic_eq;
 pub mod parametric_eq;
 // ── Modulation ───────────────────────────────────────────────────────────────
 pub mod chorus;
@@ -53,7 +56,10 @@ pub use vinyl::VinylSim;
 // Dynamics
 pub use compressor::Compressor;
 pub use gate::Gate;
+// Pitch
+pub use autotune::{AutoTune, AutoTuneMode, AutoTuneParameters, ScaleType};
 // EQ
+pub use graphic_eq::{GraphicEq, EQ_BANDS, EQ_FREQS, PRESETS as EQ_PRESETS};
 pub use parametric_eq::{EqBandKind, ParametricEq};
 // Modulation
 pub use chorus::Chorus;

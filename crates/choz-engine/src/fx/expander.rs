@@ -37,6 +37,20 @@ impl Default for Expander {
 }
 
 impl super::FxProcessor for Expander {
+    /// Live, so a knob turn does not rebuild the chain — which would reset
+    /// every other effect's tail along with this one's envelope.
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match index {
+            0 => self.threshold_db = -(1.0 - v) * 80.0,
+            1 => self.ratio = 1.0 + v * 9.0,
+            2 => self.attack_ms = 0.1 + v * 49.9,
+            3 => self.release_ms = 10.0 + v * 990.0,
+            4 => self.range_db = v * 80.0,
+            _ => {}
+        }
+    }
+
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
         if self.ratio == 1.0 { return; }
         let sr = sample_rate as f32;

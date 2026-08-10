@@ -79,11 +79,44 @@ pub fn build_processor(kind: &str, params: &[f32], sample_rate: u32) -> Option<B
             eq.bands[2].q       = 0.1 + p(6) * 9.9;
             Box::new(eq)
         }
+        // Ten bands and a preamp, all of them knobs — so a CC can ride one
+        // band. `p(11)` picks a Winamp preset, which fills the bands unless the
+        // user has moved them (a preset is a starting point, not a lock).
+        "graphiceq" => {
+            let mut eq = fx::GraphicEq::new();
+            eq.set_preset(fx::graphic_eq::preset_index(p(11)));
+            // A band left in the middle keeps whatever the preset put there; one
+            // the user has moved wins, because it is the later decision. The
+            // first version let the preset win outright, which made every band
+            // knob dead as soon as a preset was picked.
+            for band in 0..fx::EQ_BANDS {
+                if (p(band) - 0.5).abs() > 1e-4 {
+                    eq.set_band_db(band, fx::graphic_eq::norm_to_db(p(band)));
+                }
+            }
+            eq.set_preamp_db(fx::graphic_eq::norm_to_db(p(10)));
+            Box::new(eq)
+        }
         "filter" => {
             let freq = 20.0 + p(0) * 19980.0;
             // Map 0..1 into the filter's 0..~0.98 resonance range (1.0 self-oscillates).
             let res  = p(1) * 0.98;
             Box::new(fx::Svf::new(fx::SvfMode::Lowpass, freq, res))
+        }
+        // AutoTune reads its whole parameter block at once — a preset sets
+        // several of them, so applying them one by one would fight itself.
+        "autotune" => {
+            use fx::FxProcessor as _;
+            let mut at = fx::AutoTune::new(sample_rate as f32);
+            // The preset is **not** applied here. Picking one writes its values
+            // into the parameter array itself (`AudioFxEntry::apply_preset`),
+            // and that array is what the project saves and this rebuilds from —
+            // applying the preset again would fight whatever the user moved
+            // afterwards.
+            for i in 1..13 {
+                at.set_param(i, p(i));
+            }
+            Box::new(at)
         }
         "filterbank" => Box::new(fx::FilterBankFx::new(sample_rate)),
         "chorus" => {
@@ -301,7 +334,7 @@ mod tests {
     /// Every FX id the UI can build (kept in sync with `choz-ui`'s FX kinds).
     const FX_IDS: &[&str] = &[
         "delay", "reverb", "grandelay", "compressor", "limiter", "gate",
-        "expander", "parameq", "filter", "filterbank", "chorus", "flanger",
+        "expander", "parameq", "graphiceq", "filter", "filterbank", "chorus", "flanger",
         "phaser", "bitcrusher", "vinyl", "cassette", "softclip", "tubesat",
         "widener", "isolator", "gain", "phaseinvert", "monomaker", "pan",
         "looper", "sidechain", "protocosmos", "spaceecho", "reversedelay",

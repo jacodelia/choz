@@ -9,46 +9,80 @@ encajan las piezas, en [architecture.md](architecture.md).
 
 Los seis formatos de plugin (CLAP, LV2, LADSPA, DSSI, VST2, VST3) se escanean,
 se hostean y abren su ventana nativa; el rack es multi-slot con mixer, FX,
-ruteo de entradas/salidas y proyectos en YAML; hay tres capas contra el código
+ruteo de entradas/salidas **canal por canal** (cualquier jack a cualquier jack)
+y proyectos en YAML; hay tres capas contra el código
 ajeno que revienta — escaneo fuera de proceso, cuarentena y sandbox, y tener
 ventana basta para irse a un proceso aparte —; los parámetros se dibujan según
 lo que el plugin dice que son (interruptor, enumerado, fader, banco vertical,
-knob); hay transporte propio que leen VST2, VST3 y
-CLAP; y choz se instala con `.deb`, `.rpm` o `install.sh` y sale en el menú del
-escritorio. **257 tests**, `clippy --workspace --all-targets -D warnings`
+knob); hay transporte propio con compás y posición de compás, que leen VST2,
+VST3, CLAP y LV2, y automatización contra ese reloj con la longitud del bucle
+ajustable; una entrada de audio se puede convertir en notas (`A→M`) para tocar
+un VST con la guitarra — `ftom` de Csound redondeado, una nota exacta por jack
+mono, con trim, sensibilidad y lectura de lo que oye; el monitor tiene pestañas
+MIDI / WAVE / ACTIVITY;
+hay **AutoTune**, corrección de altura en tiempo real como efecto propio (YIN
+decimado + PSOLA, sin allocations en el callback); todas las secciones comparten
+un fondo traslúcido de color y opacidad configurables; y choz se instala con `.deb`, `.rpm` o `install.sh` y sale en el
+menú del escritorio. **335 tests**, `clippy --workspace --all-targets -D warnings`
 limpio.
 
 ## Pendiente
 
-1. **Publicar una release de verdad.** El empaquetado está hecho y probado
-   (`packaging/`, `.deb`, `.rpm`, `Cross.toml`, workflow de release); falta
-   correrlo end to end, mirar con ojos lo que sólo se ve instalado — el
-   `.desktop` en el menú, el icono, el lanzador abriendo kitty al tamaño
-   correcto, un `*.choz.yml` con doble clic, y un plugin sincronizado siguiendo
-   la fila `Tempo` — y dos cosas que sólo se ven en hardware:
+1. **Terminar de publicar la 1.0.0.** La versión está subida a `1.0.0`, el
+   CHANGELOG cerrado con esa etiqueta y los artefactos de x86_64 construidos
+   (`target/release/choz`, `target/debian/choz_1.0.0-1_amd64.deb`,
+   `target/generate-rpm/choz-1.0.0-1.x86_64.rpm`). Lo que falta:
+   - **Commit, tag `v1.0.0` y push** — el árbol sigue sin commitear a propósito;
+     el push del tag es lo que dispara `.github/workflows/release.yml`.
+   - **El binario aarch64**: `cross build --release --bin choz --target
+     aarch64-unknown-linux-gnu` (compila aquí en ~1 min; no se llegó a correr en
+     esta tanda).
+   - **Mirar con ojos lo que sólo se ve instalado**: el `.desktop` en el menú, el
+     icono, el lanzador abriendo kitty al tamaño correcto, un `*.choz.yml` con
+     doble clic, y un plugin sincronizado siguiendo la fila `Tempo`.
    - **armv7 sin verificar**: aquí `cross` no pudo bajarse el toolchain (red del
      contenedor cortada). aarch64 sí compila.
-   - **En una Pi hay que medir dos cosas que en ARM no son gratis**: que
-     ALSA/JACK abren con buffers pequeños sin xruns, y que el escaneo encuentra
-     algo — **los plugins son binarios nativos**, así que una Pi sólo carga
-     plugins compilados para ARM, no los `.so` de x86.
-   - **ESP32-S3 con pantalla táctil: hecho, como superficie de control**
-     (`examples/esp32s3-touch/`). **No existen versiones del S3 con Linux** — es
-     un Xtensa LX7 sin MMU, con cientos de kilobytes de RAM y sin `dlopen`, y
-     las placas con pantalla (S3-BOX-3, T-Display-S3 Touch, Waveshare
-     S3-Touch-LCD) corren ESP-IDF/FreeRTOS con LVGL. Hostear plugins *es* cargar
-     código nativo en tiempo de ejecución, así que la placa manda y choz hostea.
-     Falta lo que no se puede hacer sin la placa delante: flashearla, mirar el
-     panel y comprobar el retardo de un toque a la nota.
 
-2. Nice-to-have: ruteo por canal MIDI *dentro* de un puerto en modo LIVE;
-   automatización; y lo que le falta al transporte, que ya lo leen VST2, VST3 y
-   CLAP: **compás distinto de 4/4** (nada en choz lo elige, así que hoy se
-   manda 4/4 y se marca válido), play/stop desde la interfaz y LV2
-   (`time:Position` por el puerto de atoms, que es bastante más trabajo que los
-   otros tres).
+   **Éste es el único punto que queda por decisión**: lo demás de esta lista ya
+   no es código, es hardware que hay que tener delante.
+
+2. **Lo que sólo se comprueba con el hardware delante.** No queda código
+   pendiente aquí: queda mirar.
+   - **Las entradas**: los tests corren sin cliente JACK, así que
+     `all_capture_ports()` devuelve cero y las filas de canal no existen para
+     ellos. Falta ver que las ocho entradas de la UMC1820 salgan bajo su
+     tarjeta junto al micro del portátil y la otra placa, que el jack 5 sea el
+     jack 5 (`in_order` ordena por el número final del nombre del puerto, y no
+     todos los nombres terminan en número), y que registrar ~20 puertos de
+     captura no cueste nada en el callback.
+   - **`A→M` con un instrumento de verdad delante.** El detector está verificado
+     con tonos, con tonos armónicos (fundamental más flojo que el segundo y el
+     tercer parcial, como oye una pastilla de puente) y con un vibrato de ±35
+     cents que sale como una sola nota sostenida; entra en presupuesto (decimado
+     a 16 kHz, un análisis cada 8 ms). Lo que falta es
+     mirar la lectura del botón (` A→M● E2-14`) con la señal real puesta:
+     cuánto hay que subir `IN` para unos auriculares, dónde queda `SENS` contra
+     el ruido de una single-coil, y si 24 ms de espera (`STEADY_ANALYSES`) se
+     sienten como retardo tocando rápido.
+   - **AutoTune con una voz de verdad por un micrófono de verdad.** El DSP está
+     medido (cero allocations, ~10 % del presupuesto de búfer, 33 ms de
+     latencia) y probado contra señales sintéticas, que son más amables que una
+     habitación. Falta cantarle: si `Retune` a 120 ms se siente natural, si el
+     gate a -50 dBFS aguanta el ruido de sala, y si las formantes se sostienen
+     en una corrección de más de un tono.
+   - **La ESP32-S3 táctil** (`examples/esp32s3-touch/`, hecha como superficie de
+     control): flashearla, mirar el panel y medir el retardo de un toque a la
+     nota. **No existen versiones del S3 con Linux** — es un Xtensa LX7 sin MMU,
+     sin `dlopen`, con ESP-IDF/FreeRTOS y LVGL; hostear plugins *es* cargar
+     código nativo en tiempo de ejecución, así que la placa manda y choz hostea.
+   - **En una Pi**: que ALSA/JACK abren con buffers pequeños sin xruns, y que el
+     escaneo encuentra algo — **los plugins son binarios nativos**, así que una
+     Pi sólo carga plugins compilados para ARM, no los `.so` de x86.
 
 ## Notas / gotchas para el que retome
+
+- **Ningún cajón hace scroll**, y ahora el cajón IN lista **todos** los puertos de captura del sistema (una UMC1820 son ocho, más el micro del portátil, más la otra tarjeta), con una cabecera por tarjeta. En una terminal normal entra; en una baja las últimas filas quedan fuera y no hay forma de llegar a ellas. `draw_output_panel` y `draw_input_panel` pintan un `Paragraph` entero sin desplazamiento — y los rectángulos de clic tendrían que moverse con él, que es el trabajo de verdad. **Es lo primero que va a doler.**
+- **`in_pair` es un índice en esa lista plana de puertos.** Si se desenchufa una tarjeta, los índices se corren y un proyecto guardado apunta a otro jack. Guardar el nombre del puerto en el proyecto lo arreglaría; hoy la respuesta honesta es volver a asignar.
 
 - **Tener ventana manda el plugin al sandbox, aunque el probe lo vea sano.** `quarantine::check` devuelve `Report{verdict, editor}` y `wants_sandbox` mira las dos cosas, así que en esta máquina casi todo lo que tiene GUI (Zam, guitarix, u-he) pasa a correr fuera de proceso. Si algo suena distinto o el rendimiento cambia, ésa es la razón: `CHOZ_SANDBOX_GUI=0` la apaga. El probe **pregunta** por el editor (`editor()`, sólo construye el mango) y nunca lo abre — abrir ventanas en el probe es lo que cuelga los barridos.
 - **El transporte es global al proceso** (`choz_ports::transport()`), y lo avanza el callback de audio en `render()`. Si algún día hay dos motores en un proceso, ese es el sitio que hay que cambiar; hoy hay uno, y `audioMasterGetTime` de VST2 no tiene por dónde recibir contexto.

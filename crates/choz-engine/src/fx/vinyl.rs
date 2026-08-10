@@ -67,6 +67,16 @@ impl Default for VinylSim {
 }
 
 impl FxProcessor for VinylSim {
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match index {
+            0 => self.set_wow(v * 0.1),
+            1 => self.set_flutter(v * 0.05),
+            2 => self.set_crackle(v),
+            _ => {}
+        }
+    }
+
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
         let sr = sample_rate as f32;
         let wow_rate     = 0.5_f32;   // Hz — slow wow
