@@ -1,114 +1,190 @@
-name: Release artifacts
-
-# One binary per architecture, plus a .deb and an .rpm for x86_64. Runs on a tag
-# and on demand; `workflow_dispatch` is there so the packaging can be exercised
-# without cutting a release.
+# ─── choz Release ─────────────────────────────────────────────────────────────
 #
-# `upload-artifact` alone was not enough and it failed quietly: it puts the
-# files on the *run* page, where they expire in 90 days and where nobody
-# looking at the releases page will ever find them. The `publish` job below is
-# what actually attaches them to the tag.
+# Triggered by pushing a SemVer tag. Builds every artifact and **attaches them
+# to the GitHub Release** — modelled on seqterm's workflow, which is where this
+# project takes its patterns from.
+#
+#   git tag -a v1.0.0 -m "Release v1.0.0"
+#   git push origin v1.0.0
+#
+# Artifacts:
+#   • choz-<ver>-x86_64-unknown-linux-gnu.tar.gz  + .deb + .rpm
+#   • choz-<ver>-aarch64-unknown-linux-gnu.tar.gz + arm64 .deb   (Pi 3/4/5)
+#   • choz-<ver>-armv7-unknown-linux-gnueabihf.tar.gz + armhf .deb (Pi 2 / Zero 2 W)
+#   • SHA256SUMS.txt
+#
+# Linux only, and that is not an oversight: choz opens plugin windows through
+# the X11 protocol and its audio goes through ALSA/JACK. There is nothing to
+# build for Windows or macOS yet.
+# ──────────────────────────────────────────────────────────────────────────────
+name: Release
+
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
+  # A manual dry-run from the Actions tab. No Release is published: there is no
+  # tag to attach one to.
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  BIN: choz
 
 jobs:
-  binaries:
+  # ── Linux x86_64: tarball + .deb + .rpm ────────────────────────────────────
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libjack-jackd2-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked --bin ${{ env.BIN }}
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          NAME="${BIN}-${VER}-x86_64-unknown-linux-gnu"
+          mkdir -p "dist/${NAME}"
+          cp "target/release/${BIN}" "dist/${NAME}/"
+          strip "dist/${NAME}/${BIN}"
+          # The desktop entry, the icon, the launcher and the MIME type: without
+          # them the tarball is a binary that never appears in a menu.
+          cp README.md LICENSE "dist/${NAME}/"
+          cp packaging/install.sh "dist/${NAME}/"
+          cp -r packaging/desktop "dist/${NAME}/"
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          rm -rf "dist/${NAME}"
+
+      - name: Build .deb
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb -p choz-ui --no-build --output dist/
+
+      - name: Build .rpm
+        run: |
+          cargo install cargo-generate-rpm --locked
+          cargo generate-rpm -p crates/choz-ui --output dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/*
+
+  # ── Linux ARM (ARM64 + ARMv7 / Raspberry Pi) via cross ─────────────────────
+  linux-arm:
+    name: Linux ${{ matrix.arch }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          # The machines this is actually meant to run on: a desktop, and a
-          # Raspberry Pi (3/4/5 are aarch64; a Pi 2 or Zero 2 W on a 32-bit
-          # system is armv7).
-          - target: x86_64-unknown-linux-gnu
-            cross: false
-          - target: aarch64-unknown-linux-gnu
-            cross: true
-          - target: armv7-unknown-linux-gnueabihf
-            cross: true
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+          - arch: armhf
+            target: armv7-unknown-linux-gnueabihf
     steps:
       - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: Install audio dev libraries (native builds only)
-        if: ${{ !matrix.cross }}
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libjack-dev
+
       - name: Install cross
-        if: ${{ matrix.cross }}
         run: cargo install cross --locked
-      # `cross` builds inside a container that carries the target's own ALSA and
+
+      # `cross` builds inside a container carrying the target's own ALSA and
       # JACK headers, which is the whole reason it is used here.
-      - name: Build
-        run: |
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --bin choz --target ${{ matrix.target }}
-          else
-            cargo build --release --bin choz --target ${{ matrix.target }}
-          fi
-      - name: Package the binary
-        run: |
-          tar -czf choz-${{ matrix.target }}.tar.gz \
-            -C target/${{ matrix.target }}/release choz \
-            -C ${{ github.workspace }}/packaging/desktop choz-launcher choz.desktop choz.svg choz-project.xml
-      - uses: actions/upload-artifact@v4
-        with:
-          name: choz-${{ matrix.target }}
-          path: choz-${{ matrix.target }}.tar.gz
+      - name: Build release binary (cross)
+        run: cross build --release --locked --target ${{ matrix.target }} --bin ${{ env.BIN }}
 
-  packages:
+      - name: Package tarball
+        shell: bash
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          NAME="${BIN}-${VER}-${{ matrix.target }}"
+          mkdir -p "dist/${NAME}"
+          cp "target/${{ matrix.target }}/release/${BIN}" "dist/${NAME}/"
+          cp README.md LICENSE "dist/${NAME}/"
+          cp packaging/install.sh "dist/${NAME}/"
+          cp -r packaging/desktop "dist/${NAME}/"
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          rm -rf "dist/${NAME}"
+
+      - name: Build .deb
+        run: |
+          cargo install cargo-deb --locked
+          # `--variant arm` carries an explicit `depends`: `$auto` reads the
+          # binary's needed libraries by asking the *host* dpkg, and a host that
+          # is x86_64 knows nothing about an ARM binary — the package would
+          # declare no dependencies at all and install on a Pi with no ALSA.
+          #
+          # `--no-strip` because the host `strip` cannot process an ARM binary.
+          # The `target/release/…` asset path (not `../../target/release/…`) is
+          # what makes cargo-deb retarget it: with the other form it packaged
+          # the *host* binary into an arm64 package. Verified by unpacking one.
+          cargo deb -p choz-ui --variant arm --no-build --no-strip \
+            --target ${{ matrix.target }} --output dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+
+  # ── Publish the GitHub Release ─────────────────────────────────────────────
+  release:
+    name: Publish Release
+    needs: [linux, linux-arm]
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libjack-dev
-      - run: cargo install cargo-deb cargo-generate-rpm --locked
-      # Both read `target/release/choz`, so it has to exist first — neither of
-      # them builds the workspace's binary from a sub-crate manifest.
-      - run: cargo build --release --bin choz
-      - run: cargo deb -p choz-ui --no-build
-      - run: cargo generate-rpm -p crates/choz-ui
-      - uses: actions/upload-artifact@v4
-        with:
-          name: choz-packages
-          path: |
-            target/debian/*.deb
-            target/generate-rpm/*.rpm
-
-  # ── Attach the lot to the release ──────────────────────────────────────────
-  #
-  # Only for a real tag: `workflow_dispatch` runs on a branch, and there is no
-  # release to attach anything to. `gh` is already on the runner, so this needs
-  # no third-party action.
-  publish:
-    needs: [binaries, packages]
+    # Only on a real tag: a manual dry-run has no release to attach to.
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
-          path: dist
-      - name: Create the release if it is not there, then upload
-        env:
-          GH_TOKEN: ${{ github.token }}
+          path: artifacts
+
+      - name: Flatten + checksum
+        shell: bash
         run: |
-          set -euo pipefail
-          # The tag may already have a release (a re-run, or one made by hand),
-          # so creating it is allowed to fail; uploading is not.
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
-            gh release create "$GITHUB_REF_NAME" \
-              --title "choz $GITHUB_REF_NAME" --notes-from-tag
-          find dist -type f \( -name '*.tar.gz' -o -name '*.deb' -o -name '*.rpm' \) -print0 |
-            xargs -0 --no-run-if-empty gh release upload "$GITHUB_REF_NAME" --clobber
-          gh release view "$GITHUB_REF_NAME"
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          cd release
+          sha256sum * > SHA256SUMS.txt
+          ls -la
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: choz ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release/*

@@ -38,8 +38,22 @@ extended-description = """\
 choz hosts CLAP, LV2, LADSPA, DSSI, VST2 and VST3 plugins from a terminal: a \
 multi-slot rack with a mixer, insert FX, MIDI/OSC routing and YAML projects. \
 Plugins that misbehave are scanned, probed and hosted out of process."""
+
+# Cross-compiled packages, where `$auto` cannot help: reading an ARM binary's
+# needed libraries means asking the *host* dpkg about them, and it has none.
+# Without this the ARM package declares no dependencies at all — it installs on
+# a Pi with no ALSA and then opens no audio device, which is the exact failure
+# `$auto` protects the x86_64 package from.
+#
+#   cargo deb -p choz-ui --variant arm --target aarch64-unknown-linux-gnu
+[package.metadata.deb.variants.arm]
+depends = "libasound2t64 | libasound2, libc6"
+# `target/release/choz`, not `../../target/release/choz`: cargo-deb only
+# recognises the first form as the Cargo target directory, and only then does it
+# rewrite the path for `--target`. With the `../..` form it packaged the **host**
+# binary into an arm64 package — which installs on a Pi and refuses to run.
 assets = [
-    ["../../target/release/choz", "usr/bin/", "755"],
+    ["target/release/choz", "usr/bin/", "755"],
     ["../../packaging/desktop/choz-launcher", "usr/bin/", "755"],
     ["../../packaging/desktop/choz.desktop", "usr/share/applications/", "644"],
     ["../../packaging/desktop/choz.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
