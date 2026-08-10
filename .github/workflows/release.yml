@@ -1,0 +1,79 @@
+name: Release artifacts
+
+# One binary per architecture, plus a .deb and an .rpm for x86_64. Runs on a tag
+# and on demand; `workflow_dispatch` is there so the packaging can be exercised
+# without cutting a release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  binaries:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The machines this is actually meant to run on: a desktop, and a
+          # Raspberry Pi (3/4/5 are aarch64; a Pi 2 or Zero 2 W on a 32-bit
+          # system is armv7).
+          - target: x86_64-unknown-linux-gnu
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            cross: true
+          - target: armv7-unknown-linux-gnueabihf
+            cross: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install audio dev libraries (native builds only)
+        if: ${{ !matrix.cross }}
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libjack-dev
+      - name: Install cross
+        if: ${{ matrix.cross }}
+        run: cargo install cross --locked
+      # `cross` builds inside a container that carries the target's own ALSA and
+      # JACK headers, which is the whole reason it is used here.
+      - name: Build
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --bin choz --target ${{ matrix.target }}
+          else
+            cargo build --release --bin choz --target ${{ matrix.target }}
+          fi
+      - name: Package the binary
+        run: |
+          tar -czf choz-${{ matrix.target }}.tar.gz \
+            -C target/${{ matrix.target }}/release choz \
+            -C ${{ github.workspace }}/packaging/desktop choz-launcher choz.desktop choz.svg choz-project.xml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: choz-${{ matrix.target }}
+          path: choz-${{ matrix.target }}.tar.gz
+
+  packages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libjack-dev
+      - run: cargo install cargo-deb cargo-generate-rpm --locked
+      # Both read `target/release/choz`, so it has to exist first — neither of
+      # them builds the workspace's binary from a sub-crate manifest.
+      - run: cargo build --release --bin choz
+      - run: cargo deb -p choz-ui --no-build
+      - run: cargo generate-rpm -p crates/choz-ui
+      - uses: actions/upload-artifact@v4
+        with:
+          name: choz-packages
+          path: |
+            target/debian/*.deb
+            target/generate-rpm/*.rpm
