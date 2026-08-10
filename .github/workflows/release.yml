@@ -3,6 +3,11 @@ name: Release artifacts
 # One binary per architecture, plus a .deb and an .rpm for x86_64. Runs on a tag
 # and on demand; `workflow_dispatch` is there so the packaging can be exercised
 # without cutting a release.
+#
+# `upload-artifact` alone was not enough and it failed quietly: it puts the
+# files on the *run* page, where they expire in 90 days and where nobody
+# looking at the releases page will ever find them. The `publish` job below is
+# what actually attaches them to the tag.
 on:
   push:
     tags: ["v*"]
@@ -77,3 +82,33 @@ jobs:
           path: |
             target/debian/*.deb
             target/generate-rpm/*.rpm
+
+  # ── Attach the lot to the release ──────────────────────────────────────────
+  #
+  # Only for a real tag: `workflow_dispatch` runs on a branch, and there is no
+  # release to attach anything to. `gh` is already on the runner, so this needs
+  # no third-party action.
+  publish:
+    needs: [binaries, packages]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Create the release if it is not there, then upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The tag may already have a release (a re-run, or one made by hand),
+          # so creating it is allowed to fail; uploading is not.
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" \
+              --title "choz $GITHUB_REF_NAME" --notes-from-tag
+          find dist -type f \( -name '*.tar.gz' -o -name '*.deb' -o -name '*.rpm' \) -print0 |
+            xargs -0 --no-run-if-empty gh release upload "$GITHUB_REF_NAME" --clobber
+          gh release view "$GITHUB_REF_NAME"
