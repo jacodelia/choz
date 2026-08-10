@@ -38,6 +38,11 @@ done
 BIN_DIR="$PREFIX/bin"
 APP_DIR="$PREFIX/share/applications"
 ICON_DIR="$PREFIX/share/icons/hicolor/scalable/apps"
+# The raster sizes. **Not a nicety**: GTK 3 loads theme icons through
+# gdk-pixbuf, and librsvg 2.61 dropped the gdk-pixbuf SVG loader — so on a
+# current desktop a scalable-only icon does not render and the menu draws its
+# generic cog. The .svg stays for GTK 4 and Qt, which rasterise it themselves.
+ICON_SIZES="16x16 24x24 32x32 48x48 64x64 128x128 256x256"
 MIME_DIR="$PREFIX/share/mime/packages"
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
@@ -55,6 +60,10 @@ remove_installed() {
     done
     for f in "$BIN_DIR/choz-launcher" "$APP_DIR/choz.desktop" \
              "$ICON_DIR/choz.svg" "$MIME_DIR/choz-project.xml"; do
+        [ -e "$f" ] && rm -f "$f" && say "removed $f"
+    done
+    for size in $ICON_SIZES; do
+        f="$PREFIX/share/icons/hicolor/$size/apps/choz.png"
         [ -e "$f" ] && rm -f "$f" && say "removed $f"
     done
     return 0
@@ -133,6 +142,11 @@ install -m 755 "$BINARY" "$BIN_DIR/choz"
 install -m 755 "$HERE/desktop/choz-launcher" "$BIN_DIR/choz-launcher"
 install -m 644 "$HERE/desktop/choz.desktop" "$APP_DIR/choz.desktop"
 install -m 644 "$HERE/desktop/choz.svg" "$ICON_DIR/choz.svg"
+for size in $ICON_SIZES; do
+    install -d "$PREFIX/share/icons/hicolor/$size/apps"
+    install -m 644 "$HERE/desktop/icons/$size/choz.png" \
+        "$PREFIX/share/icons/hicolor/$size/apps/choz.png"
+done
 install -m 644 "$HERE/desktop/choz-project.xml" "$MIME_DIR/choz-project.xml"
 say "installed $new_version into $PREFIX"
 

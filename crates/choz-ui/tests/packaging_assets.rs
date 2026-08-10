@@ -46,10 +46,15 @@ fn manifest() -> String {
 
 /// The files that make choz an application rather than a binary, by their
 /// destination. A package missing any of these installs and disappears.
-const REQUIRED_DESTINATIONS: [&str; 4] = [
+/// The 48px raster is in here on purpose. GTK 3 loads theme icons through
+/// gdk-pixbuf, and librsvg 2.61 dropped the gdk-pixbuf SVG loader, so a package
+/// carrying only `scalable/` installs an icon that does not render — the menu
+/// draws its generic cog and everything looks correctly installed.
+const REQUIRED_DESTINATIONS: [&str; 5] = [
     "usr/bin/",
     "usr/share/applications/",
     "usr/share/icons/hicolor/scalable/apps/",
+    "usr/share/icons/hicolor/48x48/apps/",
     "usr/share/mime/packages/",
 ];
 

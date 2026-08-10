@@ -58,6 +58,21 @@ assets = [
     ["../../packaging/desktop/choz-launcher", "usr/bin/", "755"],
     ["../../packaging/desktop/choz.desktop", "usr/share/applications/", "644"],
     ["../../packaging/desktop/choz.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    # **The PNGs are not a nicety, they are the icon.** GTK 3 loads theme icons
+    # through gdk-pixbuf, and librsvg 2.61 dropped the gdk-pixbuf SVG loader — so
+    # on a current system a scalable-only icon does not render at all and the
+    # menu draws its generic cog instead. Seen on XFCE with the file installed,
+    # readable and correctly named; `Gtk.IconTheme` even resolved it. It was
+    # `GdkPixbuf.new_from_file_at_size` that said "couldn't recognize the image
+    # file format". The `.svg` stays for GTK 4 and Qt, which rasterise it
+    # themselves.
+    ["../../packaging/desktop/icons/16x16/choz.png", "usr/share/icons/hicolor/16x16/apps/", "644"],
+    ["../../packaging/desktop/icons/24x24/choz.png", "usr/share/icons/hicolor/24x24/apps/", "644"],
+    ["../../packaging/desktop/icons/32x32/choz.png", "usr/share/icons/hicolor/32x32/apps/", "644"],
+    ["../../packaging/desktop/icons/48x48/choz.png", "usr/share/icons/hicolor/48x48/apps/", "644"],
+    ["../../packaging/desktop/icons/64x64/choz.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["../../packaging/desktop/icons/128x128/choz.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
+    ["../../packaging/desktop/icons/256x256/choz.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
     ["../../packaging/desktop/choz-project.xml", "usr/share/mime/packages/", "644"],
     ["../../README.md", "usr/share/doc/choz/README.md", "644"],
 ]
@@ -96,6 +111,14 @@ assets = [
     { source = "../../packaging/desktop/choz-launcher", dest = "/usr/bin/choz-launcher", mode = "755" },
     { source = "../../packaging/desktop/choz.desktop", dest = "/usr/share/applications/choz.desktop", mode = "644" },
     { source = "../../packaging/desktop/choz.svg", dest = "/usr/share/icons/hicolor/scalable/apps/choz.svg", mode = "644" },
+    # See the .deb's list: without the PNGs, GTK 3 draws a generic cog.
+    { source = "../../packaging/desktop/icons/16x16/choz.png", dest = "/usr/share/icons/hicolor/16x16/apps/choz.png", mode = "644" },
+    { source = "../../packaging/desktop/icons/24x24/choz.png", dest = "/usr/share/icons/hicolor/24x24/apps/choz.png", mode = "644" },
+    { source = "../../packaging/desktop/icons/32x32/choz.png", dest = "/usr/share/icons/hicolor/32x32/apps/choz.png", mode = "644" },
+    { source = "../../packaging/desktop/icons/48x48/choz.png", dest = "/usr/share/icons/hicolor/48x48/apps/choz.png", mode = "644" },
+    { source = "../../packaging/desktop/icons/64x64/choz.png", dest = "/usr/share/icons/hicolor/64x64/apps/choz.png", mode = "644" },
+    { source = "../../packaging/desktop/icons/128x128/choz.png", dest = "/usr/share/icons/hicolor/128x128/apps/choz.png", mode = "644" },
+    { source = "../../packaging/desktop/icons/256x256/choz.png", dest = "/usr/share/icons/hicolor/256x256/apps/choz.png", mode = "644" },
     { source = "../../packaging/desktop/choz-project.xml", dest = "/usr/share/mime/packages/choz-project.xml", mode = "644" },
     { source = "../../README.md", dest = "/usr/share/doc/choz/README.md", mode = "644", doc = true },
 ]
