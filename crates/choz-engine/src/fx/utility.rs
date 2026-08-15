@@ -167,6 +167,25 @@ impl Biquad {
         }
     }
 
+    /// RBJ band-pass, constant peak gain (0 dB at the centre). The shape a
+    /// filter bank is built from: what it passes is a band, and what a band
+    /// carries is one number about the sound.
+    pub(crate) fn bandpass(fc: f32, sr: f32, q: f32) -> Self {
+        let w0 = 2.0 * std::f32::consts::PI * (fc / sr).clamp(1e-4, 0.49);
+        let (sn, cs) = w0.sin_cos();
+        let alpha = sn / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        Self {
+            b0: alpha / a0,
+            b1: 0.0,
+            b2: -alpha / a0,
+            a1: (-2.0 * cs) / a0,
+            a2: (1.0 - alpha) / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+
     #[inline]
     pub(crate) fn process(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.z1;

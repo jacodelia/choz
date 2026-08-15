@@ -25,6 +25,36 @@ Todo lo de abajo — desde el commit inicial hasta hoy — es lo que lleva:
 - empaquetado `.deb`/`.rpm`/`install.sh` con entrada de escritorio, y una superficie de control de ejemplo para ESP32-S3 táctil.
 
 
+### 2026-08-15 (sexies) — Vocoder, y el talkbox que salió del mismo código
+
+Lo que el roadmap decía que era el más barato de los cuatro que faltaban de la
+lista de voz, y el que más suena a lo pedido.
+
+#### Añadido
+- **`Vocoder`**: la voz se parte en bandas, se mide **cuánto** hay en cada una,
+  y el portador se parte en las mismas bandas y se sube o baja con esos
+  números. No pasa nada del sonido de la voz — sólo su forma — y por eso lo que
+  se oye es el portador hablando.
+  - **El portador es todo el carácter**: `SAW` y `PULSE` son la voz de
+    ordenador (`Pitch` es la nota a la que habla, y mantenerla quieta es lo que
+    la hace robot y no persona), `NOISE` es un susurro, y **`INPUT R` es un
+    talkbox** — porque un talkbox *es* un vocoder cuyo portador es un
+    instrumento de verdad. Voz por la izquierda, guitarra por la derecha, `Res`
+    arriba para la respuesta puntiaguda que tiene un tubo en la boca. **No hay
+    un segundo efecto para eso**: era el mismo código con otro portador.
+  - 8, 16 o 24 bandas (16 es donde está el trato: menos es más basto y más de
+    24 son bandas más estrechas de lo que se mueve un formante), `Res`,
+    `Speed` de las envolventes, y `Shift` — que desplaza las bandas del
+    portador contra las de la voz, o sea las mismas palabras saliendo de una
+    cabeza de otro tamaño.
+  - `Biquad::bandpass` en `fx/utility.rs`, al lado del `lowpass` y el
+    `highpass` que ya estaban.
+- 5 tests: el portador tomando la forma de la vocal (una vocal grave abre las
+  bandas graves y una aguda las agudas), **silencio dentro = silencio fuera**
+  aunque el portador siga corriendo (el fallo que todo el mundo ha oído de un
+  vocoder mal hecho), el talkbox dejando oír la guitarra y no la voz, el número
+  de bandas sin ser un knob de volumen, y los extremos.
+
 ### 2026-08-15 (quinquies) — Harmonizer, y lo que AutoTune no es
 
 #### Añadido

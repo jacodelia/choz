@@ -152,6 +152,7 @@ pub fn build_processor(
         )),
         "shimmer" => Box::new(fx::ShimmerReverb::with_params(sample_rate, params)),
         "harmonizer" => Box::new(fx::Harmonizer::with_params(sample_rate, params)),
+        "vocoder" => Box::new(fx::Vocoder::with_params(sample_rate, params)),
         "beatrepeat" => Box::new(fx::BeatRepeat::with_params(sample_rate, params)),
         "chorus" => {
             let mut c = fx::Chorus::new();

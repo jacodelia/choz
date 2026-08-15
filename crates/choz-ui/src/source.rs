@@ -70,6 +70,8 @@ pub enum AudioFxKind {
     BeatRepeat,
     /// Up to eight transposed voices, in the key.
     Harmonizer,
+    /// One sound wearing another's mouth — and a talkbox with `INPUT R`.
+    Vocoder,
     /// Every partial moved by the same number of Hz (one sideband).
     FreqShifter,
     /// The same carrier, both sidebands.
@@ -203,7 +205,7 @@ impl AudioFxKind {
             | AmberFang | VelvetFuzz => FxCategory::Distortion,
             Widener | Pan => FxCategory::Spatial,
             Protocosmos | Z5Texture | Looper | BeatRepeat => FxCategory::Texture,
-            AutoTune | Harmonizer => FxCategory::Pitch,
+            AutoTune | Harmonizer | Vocoder => FxCategory::Pitch,
             Gain | PhaseInvert | MonoMaker => FxCategory::Utility,
         }
     }
@@ -237,6 +239,7 @@ pub const ALL_FX_KINDS: &[AudioFxKind] = &[
     AudioFxKind::AutoFilter,
     AudioFxKind::BeatRepeat,
     AudioFxKind::Harmonizer,
+    AudioFxKind::Vocoder,
     AudioFxKind::FreqShifter,
     AudioFxKind::RingMod,
     AudioFxKind::Shimmer,
@@ -286,6 +289,7 @@ impl AudioFxKind {
             Self::AutoFilter => "AUTO FILTER",
             Self::BeatRepeat => "BEAT REPEAT",
             Self::Harmonizer => "HARMONIZER",
+            Self::Vocoder => "VOCODER",
             Self::FreqShifter => "FREQ SHIFT",
             Self::RingMod => "RING MOD",
             Self::Shimmer => "SHIMMER",
@@ -335,6 +339,7 @@ impl AudioFxKind {
             Self::AutoFilter => "autofilter",
             Self::BeatRepeat => "beatrepeat",
             Self::Harmonizer => "harmonizer",
+            Self::Vocoder => "vocoder",
             Self::FreqShifter => "freqshifter",
             Self::RingMod => "ringmod",
             Self::Shimmer => "shimmer",
@@ -718,6 +723,16 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         pd!("Width", 1.00),
         pd!("Wet", 0.50),
     ];
+    /// Bands and carrier are lists of names; the rest are knobs.
+    static VOCODER: &[FxParamDesc] = &[
+        pd!("Bands", 0.50),
+        pd!("Carrier", 0.00),
+        pd!("Pitch", 0.35),
+        pd!("Res", 0.36),
+        pd!("Speed", 0.20),
+        pd!("Shift", 0.50),
+        pd!("Wet", 1.00),
+    ];
     static CRUSH: &[FxParamDesc] = &[pd!("Bits", 0.70), pd!("Rate", 1.00), pd!("Wet", 1.00)];
     static VINYL: &[FxParamDesc] = &[
         pd!("Wow", 0.20),
@@ -791,6 +806,7 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         AutoFilter => AUTOFILTER,
         BeatRepeat => BEATREPEAT,
         Harmonizer => HARMONIZER,
+        Vocoder => VOCODER,
         FreqShifter | RingMod => FREQSHIFT,
         Shimmer => SHIMMER,
         BitCrusher => CRUSH,
@@ -976,6 +992,7 @@ impl AudioFxEntry {
                 | RingMod
                 | Shimmer
                 | Harmonizer
+                | Vocoder
                 | BitCrusher
                 | Vinyl
                 | Widener
@@ -1185,6 +1202,27 @@ impl AudioFxEntry {
                             ),
                             _ => {}
                         }
+                    }
+                }
+                if self.kind == AudioFxKind::Vocoder {
+                    use choz_engine::fx::vocoder::{Carrier, BAND_COUNTS};
+                    if let Some(d) = descs.iter_mut().find(|d| d.name == "Bands") {
+                        let last = (BAND_COUNTS.len() - 1) as f32;
+                        d.shape = ParamShape::Named(
+                            BAND_COUNTS
+                                .iter()
+                                .enumerate()
+                                .map(|(i, c)| (i as f32 / last, c.to_string()))
+                                .collect(),
+                        );
+                    }
+                    if let Some(d) = descs.iter_mut().find(|d| d.name == "Carrier") {
+                        d.shape = ParamShape::Named(
+                            Carrier::ALL
+                                .iter()
+                                .map(|c| (c.to_norm(), c.label().to_string()))
+                                .collect(),
+                        );
                     }
                 }
                 if self.kind == AudioFxKind::BeatRepeat {

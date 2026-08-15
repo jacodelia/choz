@@ -15,7 +15,7 @@ elegible en Settings), así que también es un multiefecto; hay tres capas contr
 que revienta —escaneo fuera de proceso, cuarentena y sandbox—; hay transporte
 propio con compás, automatización contra ese reloj, `A→M` (audio a notas),
 AutoTune, `A→M` como traductor de guitarra/micro a notas para un plugin,
-44 efectos propios (**la suite está completa**: dinámica, EQ,
+45 efectos propios (**la suite está completa**: dinámica, EQ,
 saturación, modulación, frecuencia, espacio y medida), arpegiador por tab (esclavo de un reloj MIDI
 externo, y capaz de tocar hacia fuera por un puerto MIDI) y fondo de escritorio
 configurable; la dinámica y el EQ ya son ajustables de verdad (detección
@@ -144,31 +144,29 @@ voz, una nota, en tono. Eso funciona y está medido.
 | Pedido | Estado |
 |---|---|
 | Motor sinte de 8 voces, doble motor, controlado por voz | **no existe**; es otro efecto, no un ajuste de éste |
-| Voz de ordenador (vocoder / talkbox) | **no existe** |
+| Voz de ordenador (vocoder / talkbox) | **hecho**, en el `Vocoder` nuevo |
 | Pitch shifting polifónico | **no existe** — el detector es monofónico por diseño |
 | Armonías orgánicas | **hecho**, en el `Harmonizer` nuevo (ver abajo) |
-| Tono clásico de talkbox de guitarra/voz | **no existe** |
+| Tono clásico de talkbox de guitarra/voz | **hecho**: `Vocoder` con portador `INPUT R` |
 
 - **Por qué no es un ajuste de AutoTune**: el corrector *sigue* un tono y lo
   mueve; un motor de síntesis *genera* uno y lo toca. Meterlo en el mismo efecto
   sería un efecto con dos mitades que no comparten nada salvo el nombre.
 - **Lo que haría falta, en orden de dificultad**:
-  1. **Vocoder** (voz de ordenador): banco de filtros de la voz aplicado a un
-     portador. La infraestructura está toda: `FilterBankFx`, los biquads, la
-     envolvente. Es el más barato de los cuatro y el que más suena a lo pedido.
-  2. **Talkbox**: es un vocoder con el portador a la entrada y una respuesta
-     más resonante — el mismo código con otros ajustes.
-  3. **Motor sinte controlado por voz**: `A→M`/`ftom` ya saca la nota; lo que
+  1. ~~**Vocoder**~~ y ~~**talkbox**~~: **hechos**, y en el mismo efecto — un
+     talkbox *es* un vocoder cuyo portador es un instrumento de verdad, así que
+     es el portador `INPUT R` y no un segundo efecto.
+  2. **Motor sinte controlado por voz**: `A→M`/`ftom` ya saca la nota; lo que
      falta es el sinte, y choz **hostea sintes**. La versión honesta es una tab
      con `A→M` y un plugin, que ya funciona; un sinte propio de 8 voces dentro
      de un efecto es escribir un sintetizador.
-  4. **Pitch shifting polifónico**: requiere un detector polifónico (varios
+  3. **Pitch shifting polifónico**: requiere un detector polifónico (varios
      tonos a la vez), que es un problema distinto y mucho más caro que el
      monofónico que hay. No antes de que alguien lo pida por segunda vez.
 
 ### 5. Los efectos propios como plugins CLAP
 
-Que los 44 efectos de choz se puedan usar **fuera** de choz: en Bitwig, en
+Que los 45 efectos de choz se puedan usar **fuera** de choz: en Bitwig, en
 Reaper, en Carla, en cualquier host CLAP.
 
 - **Lo que juega a favor**: `FxProcessor` ya es exactamente la forma de un

@@ -40,6 +40,7 @@ pub mod oversample;
 pub mod saturator;
 pub mod smooth;
 pub mod utility;
+pub mod vocoder;
 // ── New processors ───────────────────────────────────────────────────────────
 pub mod expander;
 pub mod pan;
@@ -87,6 +88,7 @@ pub use tremolo::{ModTarget, Tremolo};
 pub use widener::StereoWidener;
 // Utility
 pub use utility::{Gain, MonoMaker, PhaseInvert, SoftClipper, TubeSaturation};
+pub use vocoder::Vocoder;
 // New
 pub use expander::Expander;
 pub use pan::Pan;
