@@ -373,6 +373,7 @@ mod tests {
 
     #[test]
     fn a_block_becomes_a_level_and_a_shape() {
+        let _g = crate::test_locks::meter();
         let m = meter();
         m.clear();
         assert_eq!(m.peak(), 0.0);
@@ -410,6 +411,7 @@ mod tests {
     /// level. Counting it is what turns "it sounds saturated" into a reading.
     #[test]
     fn going_past_full_scale_is_counted() {
+        let _g = crate::test_locks::meter();
         let m = meter();
         m.clear();
         m.publish(&vec![0.5f32; 256]);

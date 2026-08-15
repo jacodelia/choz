@@ -56,6 +56,13 @@ pub(crate) struct Slot {
     /// doubled by a synth is the sound most people are after, and it needs the
     /// guitar still there.
     pitch_mix: f32,
+    /// Notes with a time on them, waiting for the block that contains it.
+    ///
+    /// Fixed size and never grown: this is the audio thread. A queue that
+    /// fills applies its oldest immediately rather than dropping it — a note
+    /// slightly early is a note, and a dropped note-on is silence while a
+    /// dropped note-off is a note that never stops.
+    pending: [Option<Scheduled>; MAX_SCHEDULED],
     /// Which notes this slot has been told to play, one bit per MIDI note.
     ///
     /// Panic uses it to send the exact note-offs that are missing, which is the
@@ -77,8 +84,52 @@ impl Slot {
             in_gain: 1.0,
             pitch: None,
             pitch_mix: 1.0,
+            pending: [None; MAX_SCHEDULED],
             held: 0,
         }
+    }
+
+    /// Play a note now, and remember it for `PANIC`.
+    #[inline]
+    fn play(&mut self, note: u8, vel: u8, on: bool) {
+        if on {
+            self.held |= 1u128 << (note & 0x7F);
+            self.source.note_on(note, vel);
+        } else {
+            self.held &= !(1u128 << (note & 0x7F));
+            self.source.note_off(note);
+        }
+    }
+
+    /// Take a note, now or later. `at == 0` is now.
+    fn schedule(&mut self, at: u64, note: u8, vel: u8, on: bool) {
+        if at == 0 {
+            self.play(note, vel, on);
+            return;
+        }
+        if let Some(slot) = self.pending.iter_mut().find(|p| p.is_none()) {
+            *slot = Some(Scheduled { at, note, vel, on });
+            return;
+        }
+        // Full. A note slightly early is still the note; a dropped one is
+        // silence, or worse, a note that never stops.
+        self.play(note, vel, on);
+    }
+
+    /// The earliest pending note inside `[start, end)`, taken off the queue.
+    fn due(&mut self, start: u64, end: u64) -> Option<Scheduled> {
+        let mut best: Option<(usize, u64)> = None;
+        for (i, p) in self.pending.iter().enumerate() {
+            let Some(s) = p else { continue };
+            // Anything already past is due immediately: a block was missed, and
+            // the note is late rather than cancelled.
+            let when = s.at.max(start);
+            if when < end && best.is_none_or(|(_, b)| when < b) {
+                best = Some((i, when));
+            }
+        }
+        let (i, _) = best?;
+        self.pending[i].take()
     }
 
     /// Constant-power pan law → (left, right) channel gains.
@@ -163,10 +214,17 @@ pub(crate) enum EngineCommand {
         slot: usize,
         note: u8,
         vel: u8,
+        /// Transport sample the note is **for**. `0` means "as soon as it
+        /// arrives", which is what every input that has no schedule of its own
+        /// sends: a key, a MIDI port, OSC. A generator that knows when its next
+        /// step lands sends that sample, and the callback splits its render
+        /// there rather than starting the note at the top of a block.
+        at: u64,
     },
     NoteOff {
         slot: usize,
         note: u8,
+        at: u64,
     },
     /// Silence every slot: the panic button. One command rather than a burst
     /// of note-offs, so the ring cannot fill up halfway through and leave a
@@ -346,6 +404,20 @@ pub(crate) struct RtState {
     /// threads.
     pub(crate) capture_rx: Option<rtrb::Consumer<f32>>,
     pub(crate) sample_rate: u32,
+}
+
+/// Notes a slot can have waiting for their sample. Eight is two bars of
+/// sixteenths at the fastest an arpeggiator schedules ahead, and the overflow
+/// path is "play it now", not "lose it".
+const MAX_SCHEDULED: usize = 8;
+
+/// A note and the transport sample it is for.
+#[derive(Clone, Copy)]
+struct Scheduled {
+    at: u64,
+    note: u8,
+    vel: u8,
+    on: bool,
 }
 
 /// Smallest quantum choz will force on the graph. Forcing 64 frames onto a
@@ -1420,11 +1492,37 @@ impl AudioEngine {
 
     /// Send a note-on to one slot. Input→slot routing lives in the UI.
     pub fn note_on(&mut self, slot: usize, note: u8, vel: u8) {
-        self.send(EngineCommand::NoteOn { slot, note, vel });
+        self.send(EngineCommand::NoteOn {
+            slot,
+            note,
+            vel,
+            at: 0,
+        });
     }
 
     pub fn note_off(&mut self, slot: usize, note: u8) {
-        self.send(EngineCommand::NoteOff { slot, note });
+        self.send(EngineCommand::NoteOff { slot, note, at: 0 });
+    }
+
+    /// A note the sender knows the time of: `at` is an absolute transport
+    /// sample. The callback holds it until the block that contains it and
+    /// splits that slot's render there, so the note starts on the sample it
+    /// was written for and not at the top of whichever block noticed.
+    ///
+    /// This is what a generator with its own clock uses — the arpeggiator —
+    /// and it is the only way its resolution stops being the interface's wake
+    /// interval.
+    pub fn note_on_at(&mut self, slot: usize, note: u8, vel: u8, at: u64) {
+        self.send(EngineCommand::NoteOn {
+            slot,
+            note,
+            vel,
+            at,
+        });
+    }
+
+    pub fn note_off_at(&mut self, slot: usize, note: u8, at: u64) {
+        self.send(EngineCommand::NoteOff { slot, note, at });
     }
 
     /// Stop every note in every slot.
@@ -1586,16 +1684,23 @@ impl RtState {
                     }
                 }
                 // Notes are addressed to one slot; the UI already decided which.
-                EngineCommand::NoteOn { slot, note, vel } => {
+                //
+                // `at == 0` is "now" — a key, a port, OSC, anything with no
+                // schedule of its own — and goes straight through. Anything
+                // else waits for the block that contains its sample.
+                EngineCommand::NoteOn {
+                    slot,
+                    note,
+                    vel,
+                    at,
+                } => {
                     if let Some(s) = state.slots.get_mut(slot) {
-                        s.held |= 1u128 << (note & 0x7F);
-                        s.source.note_on(note, vel);
+                        s.schedule(at, note, vel, true);
                     }
                 }
-                EngineCommand::NoteOff { slot, note } => {
+                EngineCommand::NoteOff { slot, note, at } => {
                     if let Some(s) = state.slots.get_mut(slot) {
-                        s.held &= !(1u128 << (note & 0x7F));
-                        s.source.note_off(note);
+                        s.schedule(at, note, 0, false);
                     }
                 }
                 EngineCommand::Panic => {
@@ -1714,6 +1819,10 @@ impl RtState {
             ch[..n].fill(0.0);
         }
         let playing = playing.load(Ordering::Relaxed);
+        // Where this block sits on the transport's timeline, taken **before**
+        // it is advanced: a scheduled note is a position on that line.
+        let block_start = choz_ports::transport().samples();
+        let block_end = block_start + frames as u64;
         // The host clock every plugin that syncs anything reads: it has to move
         // with the audio, so it is advanced here and nowhere else.
         let transport = choz_ports::transport();
@@ -1825,9 +1934,66 @@ impl RtState {
                     }
                 }
                 None => {
-                    let written = slot.source.render(sc, sr);
-                    for s in sc[written * 2..].iter_mut() {
-                        *s = 0.0;
+                    // **Split at the notes.** A slot with scheduled notes is
+                    // rendered in segments: apply what is due at a sample,
+                    // render up to the next one, repeat. That is what makes a
+                    // generator's timing the sample it asked for rather than
+                    // the top of whichever block noticed — the interface's
+                    // wake interval stops being the resolution.
+                    //
+                    // The cost is real and worth naming: a slot with notes in
+                    // the middle of a block calls `render` more than once, in
+                    // pieces. For choz's own sources that is nothing; for a
+                    // hosted plugin it is several small process calls instead
+                    // of one, which is legal, and which every host with
+                    // sample-accurate automation already does.
+                    let frames = n / 2;
+                    // Everything due this block, oldest first. A fixed array,
+                    // because this is the audio thread.
+                    let mut due: [Option<(usize, Scheduled)>; MAX_SCHEDULED] =
+                        [None; MAX_SCHEDULED];
+                    let mut count = 0usize;
+                    while count < MAX_SCHEDULED {
+                        let Some(ev) = slot.due(block_start, block_end) else {
+                            break;
+                        };
+                        // Anything already past lands on the first sample:
+                        // late, not lost.
+                        let offset = (ev.at.saturating_sub(block_start) as usize).min(frames);
+                        due[count] = Some((offset, ev));
+                        count += 1;
+                    }
+                    // Insertion sort over at most eight: the order they come
+                    // off the queue is not the order they are played in.
+                    for i in 1..count {
+                        let mut j = i;
+                        while j > 0 && due[j - 1].unwrap().0 > due[j].unwrap().0 {
+                            due.swap(j - 1, j);
+                            j -= 1;
+                        }
+                    }
+
+                    let mut at = 0usize;
+                    let mut next_event = 0usize;
+                    while at < frames {
+                        // Everything that lands on this sample, before the
+                        // segment that starts here is rendered.
+                        while next_event < count && due[next_event].unwrap().0 <= at {
+                            let ev = due[next_event].unwrap().1;
+                            slot.play(ev.note, ev.vel, ev.on);
+                            next_event += 1;
+                        }
+                        let end = due
+                            .get(next_event)
+                            .and_then(|d| d.map(|(o, _)| o))
+                            .unwrap_or(frames)
+                            .clamp(at + 1, frames);
+                        let seg = &mut sc[at * 2..end * 2];
+                        let written = slot.source.render(seg, sr);
+                        for s in seg[written * 2..].iter_mut() {
+                            *s = 0.0;
+                        }
+                        at = end;
                     }
                 }
             }
@@ -2505,6 +2671,8 @@ mod tests {
     /// in and put a reverb on it" case, and nothing covered it.
     #[test]
     fn an_effect_on_a_capture_fed_tab_processes_the_input() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 2);
         cmd_tx
             .push(EngineCommand::AddSlot(Box::new(crate::sources::Silence)))
@@ -2543,6 +2711,8 @@ mod tests {
     /// synth, which is the one thing this mode exists to prevent.
     #[test]
     fn audio_to_midi_does_not_leak_the_input() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         /// A source that adds to the buffer instead of filling it, which is
         /// what a plugin idling on an empty note list does.
         struct Adder;
@@ -2589,6 +2759,8 @@ mod tests {
     /// people are actually after.
     #[test]
     fn the_converter_can_bring_the_input_back_under_the_instrument() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         /// Renders a constant, so the two halves of the blend are told apart.
         struct Dc(f32);
         impl AudioSource for Dc {
@@ -2645,6 +2817,8 @@ mod tests {
     /// so the panel can say which knob to turn down.
     #[test]
     fn a_trim_past_full_scale_is_limited_and_counted() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 2);
         let health = crate::meter::capture_health();
         health.clear();
@@ -2693,10 +2867,169 @@ mod tests {
         health.clear();
     }
 
+    /// **Sample-accurate notes.** A note with a transport sample on it starts
+    /// on that sample, not at the top of whichever block noticed it — the slot
+    /// is rendered in segments and the note is applied between them. That is
+    /// the whole point: the resolution stops being how often the interface
+    /// wakes up.
+    #[test]
+    fn a_scheduled_note_starts_on_the_sample_it_was_written_for() {
+        /// Silent until told to play, then a constant. Where the constant
+        /// starts *is* the note's timing, visible in the buffer.
+        struct Switch(bool);
+        impl AudioSource for Switch {
+            fn render(&mut self, out: &mut [f32], _sr: u32) -> usize {
+                out.fill(if self.0 { 1.0 } else { 0.0 });
+                out.len() / 2
+            }
+            fn note_on(&mut self, _n: u8, _v: u8) {
+                self.0 = true;
+            }
+            fn note_off(&mut self, _n: u8) {
+                self.0 = false;
+            }
+            fn plays_on_transport_stop(&self) -> bool {
+                true
+            }
+        }
+
+        let _g = crate::test_locks::transport();
+        let _m = crate::test_locks::meter();
+        let t = choz_ports::transport();
+        let was = t.playing();
+        t.set_sample_rate(48_000);
+        t.set_playing(true);
+        t.rewind();
+
+        let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 0);
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(Switch(false))))
+            .unwrap();
+        // Nine samples into a sixteen-sample block.
+        cmd_tx
+            .push(EngineCommand::NoteOn {
+                slot: 0,
+                note: 60,
+                vel: 100,
+                at: 9,
+            })
+            .unwrap();
+        state.apply_commands();
+        state.render(16);
+
+        let c = std::f32::consts::FRAC_1_SQRT_2;
+        for f in 0..9 {
+            assert!(
+                state.mix[0][f].abs() < 1e-6,
+                "silent until sample 9, but frame {f} is {}",
+                state.mix[0][f]
+            );
+        }
+        for f in 9..16 {
+            assert!(
+                (state.mix[0][f] - c).abs() < 1e-5,
+                "sounding from sample 9, but frame {f} is {}",
+                state.mix[0][f]
+            );
+        }
+
+        t.set_playing(was);
+    }
+
+    /// Two notes in one block, and the second one stops what the first
+    /// started. Both land where they were written, which a queue that only
+    /// looked at the first event of a block would get wrong.
+    #[test]
+    fn several_scheduled_notes_in_one_block_all_land() {
+        struct Switch(bool);
+        impl AudioSource for Switch {
+            fn render(&mut self, out: &mut [f32], _sr: u32) -> usize {
+                out.fill(if self.0 { 1.0 } else { 0.0 });
+                out.len() / 2
+            }
+            fn note_on(&mut self, _n: u8, _v: u8) {
+                self.0 = true;
+            }
+            fn note_off(&mut self, _n: u8) {
+                self.0 = false;
+            }
+            fn plays_on_transport_stop(&self) -> bool {
+                true
+            }
+        }
+
+        let _g = crate::test_locks::transport();
+        let _m = crate::test_locks::meter();
+        let t = choz_ports::transport();
+        let was = t.playing();
+        t.set_sample_rate(48_000);
+        t.set_playing(true);
+        t.rewind();
+
+        let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 0);
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(Switch(false))))
+            .unwrap();
+        // Pushed out of order on purpose: the queue is not the running order.
+        cmd_tx
+            .push(EngineCommand::NoteOff {
+                slot: 0,
+                note: 60,
+                at: 12,
+            })
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::NoteOn {
+                slot: 0,
+                note: 60,
+                vel: 100,
+                at: 4,
+            })
+            .unwrap();
+        state.apply_commands();
+        state.render(16);
+
+        let c = std::f32::consts::FRAC_1_SQRT_2;
+        let sounding: Vec<bool> = (0..16).map(|f| state.mix[0][f].abs() > c * 0.5).collect();
+        let expected: Vec<bool> = (0..16).map(|f| (4..12).contains(&f)).collect();
+        assert_eq!(sounding, expected, "the note should run from 4 to 12");
+
+        t.set_playing(was);
+    }
+
+    /// A note with no time on it is still immediate — every input that has no
+    /// schedule of its own sends one, and none of them may be delayed.
+    #[test]
+    fn a_note_without_a_time_plays_at_once() {
+        let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 0);
+        let played = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(RecordingSynth(
+                played.clone(),
+            ))))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::NoteOn {
+                slot: 0,
+                note: 64,
+                vel: 100,
+                at: 0,
+            })
+            .unwrap();
+        state.apply_commands();
+        assert_eq!(
+            *played.lock(),
+            vec![(true, 64)],
+            "an untimed note is played by `apply_commands`, before any render"
+        );
+    }
+
     /// The same tab with the transport stopped. A multi-effect is not a
     /// sequencer: a microphone does not wait for the play button.
     #[test]
     fn a_capture_fed_tab_works_with_the_transport_stopped() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 2);
         state.playing.store(false, Ordering::Relaxed);
         cmd_tx
@@ -2731,6 +3064,8 @@ mod tests {
     /// "MIDI → plugin → out 5/6" rests on.
     #[test]
     fn slots_land_on_the_output_pair_they_are_routed_to() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         let (mut cmd_tx, _retired, mut state) = mk_state_ch(6, 0);
         cmd_tx
             .push(EngineCommand::AddSlot(Box::new(DcSource(0.25))))
@@ -2771,6 +3106,8 @@ mod tests {
     /// instead of panicking or going silent.
     #[test]
     fn an_out_of_range_pair_folds_onto_the_last_channel() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 0);
         cmd_tx
             .push(EngineCommand::AddSlot(Box::new(DcSource(0.5))))
@@ -2795,6 +3132,8 @@ mod tests {
     /// chain over the live audio instead — "AUDIO 1/2 → plugin → out 5/6".
     #[test]
     fn a_slot_routed_to_an_input_pair_processes_live_audio() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         let (mut cmd_tx, _retired, mut state) = mk_state_ch(4, 2);
         cmd_tx
             .push(EngineCommand::AddSlot(Box::new(DcSource(0.9))))
@@ -2835,6 +3174,8 @@ mod tests {
 
     #[test]
     fn mixes_slots_and_applies_per_slot_fx() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         let (mut cmd_tx, _retired, mut state) = mk_state();
 
         cmd_tx
@@ -2864,6 +3205,8 @@ mod tests {
 
     #[test]
     fn mixer_strip_applies_gain_pan_mute() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         let (mut cmd_tx, _retired, mut state) = mk_state();
         cmd_tx
             .push(EngineCommand::AddSlot(Box::new(DcSource(1.0))))
@@ -2906,6 +3249,8 @@ mod tests {
 
     #[test]
     fn notes_reach_only_their_target_slot() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         let (mut cmd_tx, _retired, mut state) = mk_state();
         let a = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
         let b = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -2920,6 +3265,7 @@ mod tests {
                 slot: 1,
                 note: 60,
                 vel: 100,
+                at: 0,
             })
             .unwrap();
 
@@ -2934,6 +3280,7 @@ mod tests {
                 slot: 99,
                 note: 62,
                 vel: 100,
+                at: 0,
             })
             .unwrap();
         cmd_tx
@@ -2954,6 +3301,8 @@ mod tests {
 
     #[test]
     fn pedals_and_wheels_reach_the_targeted_slot_only() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         let (mut cmd_tx, _retired, mut state) = mk_state();
         let quiet = Expressive::default();
         let played = Expressive::default();
@@ -3016,6 +3365,8 @@ mod tests {
 
     #[test]
     fn set_slot_source_swaps_and_retires_the_old_one() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         let (mut cmd_tx, mut retired_rx, mut state) = mk_state();
         cmd_tx
             .push(EngineCommand::AddSlot(Box::new(DcSource(0.5))))
@@ -3042,6 +3393,8 @@ mod tests {
 
     #[test]
     fn remove_slot_returns_it_off_rt() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         let (mut cmd_tx, mut retired_rx, mut state) = mk_state();
         cmd_tx
             .push(EngineCommand::AddSlot(Box::new(DcSource(0.5))))

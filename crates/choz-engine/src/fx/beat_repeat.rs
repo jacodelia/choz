@@ -310,13 +310,8 @@ mod tests {
     use super::*;
     use crate::fx::FxProcessor;
 
-    /// The transport is global to the **process**, and tests run in parallel:
-    /// every test in this file has to hold the same lock, including the one
-    /// that stops the clock — otherwise it stops it under the others.
-    pub(super) static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn with_transport<R>(bpm: f32, sr: u32, f: impl FnOnce() -> R) -> R {
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_locks::transport();
         let t = transport();
         let (old_bpm, old_sr, old_play) = (t.bpm(), t.sample_rate(), t.playing());
         t.set_sample_rate(sr);
@@ -343,7 +338,7 @@ mod tests {
 
     #[test]
     fn a_stopped_transport_is_a_pass_through() {
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_locks::transport();
         let t = transport();
         let was = t.playing();
         t.set_playing(false);

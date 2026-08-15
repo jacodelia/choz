@@ -25,6 +25,58 @@ Todo lo de abajo — desde el commit inicial hasta hoy — es lo que lleva:
 - empaquetado `.deb`/`.rpm`/`install.sh` con entrada de escritorio, y una superficie de control de ejemplo para ESP32-S3 táctil.
 
 
+### 2026-08-15 (septies) — El arpegiador en muestras, y el punto 1 cerrado
+
+El ítem que llevaba aplazado desde el principio, hecho como pidió el usuario:
+partiendo el render por slot.
+
+#### Añadido
+- **Notas con hora.** `EngineCommand::NoteOn/NoteOff` llevan `at`, una muestra
+  absoluta del transporte. `0` es "ahora" y es lo que manda todo lo que no
+  tiene reloj propio —una tecla, un puerto MIDI, OSC—, así que ese camino no
+  cambia en nada.
+- **El render se parte por el slot.** Un slot con notas programadas se
+  renderiza en segmentos: se aplica lo que vence en una muestra, se renderiza
+  hasta la siguiente, y así. La nota empieza en la muestra para la que se
+  escribió y no al principio del bloque que se enteró.
+  - Cola fija de 8 por slot, y **el desbordamiento toca, no descarta**: una
+    nota un poco pronto sigue siendo la nota; una perdida es silencio, o peor,
+    una nota que no para nunca.
+- **El arpegiador programa hacia delante** en lugar de reaccionar. Cuando el
+  siguiente compás entra en la ventana de anticipación (25 ms, cinco veces lo
+  que tarda el bucle en despertar), se manda ya con su muestra — swing incluido,
+  porque la muestra es la que la nota merece. El cierre de puerta también lleva
+  muestra: un ataque exacto seguido de una suelta en el siguiente tic de
+  interfaz es media mejora.
+
+#### Corregido
+- **El mismo compás se programaba una y otra vez.** Cuando el siguiente paso
+  estaba todavía lejos, el camino sincronizado caía al reloj libre, que borra
+  `grid` — y en el tic siguiente el compás volvía a parecer nuevo. "Todavía no
+  toca" no es "no hay rejilla", y ahora se decide una sola vez cuál de los dos
+  relojes manda. Lo cazó el test.
+- **`0` significaba dos cosas** en la muestra cero de un transporte rebobinado:
+  "ahora" y "el downbeat". Una muestra de diferencia (20 µs) desambigua el
+  protocolo.
+- **Dos candados distintos para el mismo transporte global** no se serializan
+  entre sí, y `render` lo avanza — así que cualquier test que renderizara movía
+  el reloj de los demás. Un candado por global, en `test_locks`, y lo cogen los
+  catorce tests que renderizan. Tres pasadas seguidas limpias.
+
+#### Notas
+- **`MIDI OUT` sigue saliendo inmediato**, y tiene que ser así: ALSA manda
+  cuando se le dice, así que una nota programada para dentro de 20 ms saldría
+  fuera antes de sonar dentro. El instrumento de la tab recibe la precisa.
+- **El reloj libre no cambió**: sin transporte no hay línea de tiempo contra la
+  que ser exacto, y sus notas siguen siendo "ahora".
+- El coste que se temía es real y acotado: un plugin hosteado recibe varias
+  llamadas pequeñas en vez de una cuando hay notas en medio del bloque. Es
+  legal, y es lo que hace cualquier host con automatización de muestra exacta.
+- 5 tests nuevos: la nota empezando en su muestra exacta, varias notas en un
+  bloque (empujadas en desorden a propósito), la nota sin hora tocando al
+  instante, el paso sincronizado programado por delante y no dos veces, y el
+  reloj libre siguiendo inmediato.
+
 ### 2026-08-15 (sexies) — Vocoder, y el talkbox que salió del mismo código
 
 Lo que el roadmap decía que era el más barato de los cuatro que faltaban de la

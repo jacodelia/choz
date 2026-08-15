@@ -369,3 +369,31 @@ pub fn read_plugin_params(
         _ => Vec::new(),
     }
 }
+
+/// Locks for the things that are global to the **process**, so tests that move
+/// them do not move them under each other.
+///
+/// The transport and the meters are singletons by design — there is one
+/// output and one clock — and `cargo test` runs a crate's tests in parallel in
+/// one process. Two tests each rewinding the transport, or one clearing the
+/// meter while another renders into it, is a failure that looks like a bug in
+/// the code under test and is not one. **One lock per global**, in one place,
+/// or they do not serialise against each other: that was the first attempt.
+#[cfg(test)]
+pub(crate) mod test_locks {
+    use std::sync::{Mutex, MutexGuard};
+
+    static TRANSPORT: Mutex<()> = Mutex::new(());
+    static METER: Mutex<()> = Mutex::new(());
+
+    /// Held while a test moves the transport (rewind, play, tempo).
+    pub(crate) fn transport() -> MutexGuard<'static, ()> {
+        TRANSPORT.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Held while a test reads or clears the output meter — which every
+    /// `render` writes to.
+    pub(crate) fn meter() -> MutexGuard<'static, ()> {
+        METER.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}

@@ -30,26 +30,31 @@ está publicada y sus paquetes verificados** (ver "Hecho" abajo). 462 tests,
 
 ## Pendiente
 
-### 1. El arpegiador
+### 1. El arpegiador — **cerrado**
 
-Completo (ocho modos, ocho divisiones, octavas, gate, swing, latch, acorde,
-`SYNC` al transporte y `TAP`) y su ruteo también: `A→M`, otra tab y MIDI OUT.
-Queda una sola cosa, **aplazada a propósito**:
+Completo: ocho modos, ocho divisiones, octavas, gate, swing, latch, acorde,
+`SYNC` al transporte, `TAP`, y su ruteo (`A→M`, otra tab, MIDI OUT).
 
-- **Timing en el engine.** Es **resolución, no deriva**: con `SYNC` el número
-  del paso viene de la posición del transporte (que avanza el callback de
-  audio), así que la rejilla no se desplaza; pero `Arp::tick` sigue en el bucle
-  de UI, que despierta cada 5 ms, y un paso puede sonar hasta 5 ms tarde.
-  - **Lo que costaría** (mirado, para no volver a mirarlo): programar las notas
-    por adelantado con sello de tiempo no basta —aplicarlas al principio del
-    bloque que las contiene deja el error en un bloque (1–3 ms) y no en cero—.
-    Para que sea exacto hay que **partir el render por slot** en los puntos
-    donde caen las notas, o sea llamar a `source.render` varias veces por bloque
-    con trozos pequeños: legal, pero es otra cosa para un plugin hosteado.
-    Además saca la generación de notas de donde vive el ruteo (la UI), y
-    `MIDI OUT` no se puede programar por adelantado (ALSA manda cuando se le
-    dice), así que una nota programada llegaría antes fuera que dentro.
-  - Decidido con el usuario: **se queda así**.
+El timing en el engine **está hecho** (2026-08-15). Con `SYNC`, un paso ya no se
+toca cuando el bucle de interfaz se entera de que el compás pasó —lo que sólo
+podía llegar tarde, hasta 5 ms— sino que se **programa por adelantado** con la
+muestra de transporte a la que pertenece, y el callback **parte el render de
+ese slot** por ahí. La resolución deja de ser cada cuánto despierta la interfaz.
+
+Lo que queda dicho, para el que lo lea después:
+
+- **El coste que se temía es real y está acotado**: un slot con notas en medio
+  de un bloque llama a `render` más de una vez, en trozos. Para las fuentes
+  propias de choz no es nada; para un plugin hosteado son varias llamadas
+  pequeñas en vez de una, que es legal y lo que hace cualquier host con
+  automatización de muestra exacta.
+- **`MIDI OUT` sigue saliendo inmediato**, y tiene que ser así: ALSA manda
+  cuando se le dice, así que una nota programada para dentro de 20 ms saldría
+  del edificio antes de sonar dentro. El instrumento de la tab recibe la
+  precisa; un sinte externo recibe lo que recibía antes.
+- **El reloj libre (`SYNC` apagado) no cambió**: sin transporte no hay línea de
+  tiempo contra la que ser exacto, así que sus notas son "ahora", exactamente
+  como siempre.
 - **Lo que no se hace**: una matriz de ruteo general. Un `Vec` de "esta fuente
   va a esta tab con este arpegiador" cubre todo lo pedido; una matriz N×M es la
   abstracción que se escribe hoy y se depura durante meses.

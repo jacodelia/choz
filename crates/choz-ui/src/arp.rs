@@ -133,9 +133,29 @@ impl TimeDiv {
 /// What the arpeggiator wants done, in the order it wants it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArpEvent {
-    On { note: u8, vel: u8 },
-    Off { note: u8 },
+    On { note: u8, vel: u8, at: u64 },
+    Off { note: u8, at: u64 },
 }
+
+impl ArpEvent {
+    /// The transport sample this event is for. `0` is "now", which is what
+    /// everything the free-running clock produces sends: with no transport
+    /// there is no timeline to be accurate against.
+    #[cfg(test)]
+    pub fn at(self) -> u64 {
+        match self {
+            ArpEvent::On { at, .. } | ArpEvent::Off { at, .. } => at,
+        }
+    }
+}
+
+/// How far ahead the synced clock schedules, in seconds.
+///
+/// It has to be longer than the interface's wake interval or the note is
+/// queued after the sample it was for, and short enough that a tempo change
+/// does not leave a stale step queued. The event loop wakes every 5 ms while a
+/// pattern runs; 25 ms is five of those.
+const LOOKAHEAD_SECS: f64 = 0.025;
 
 /// What the arpeggiator is: saved with the project, because it is part of how a
 /// tab sounds, not of a session.
@@ -202,6 +222,9 @@ pub struct Arp {
     /// and the other modes sort a copy.
     held: Vec<(u8, u8)>,
     step: usize,
+    /// The transport sample the current note's gate closes on, when it was
+    /// scheduled. `None` for the free-running clock, which has no timeline.
+    scheduled_off: Option<u64>,
     /// The note this arpeggiator started and has not stopped yet.
     sounding: Option<u8>,
     /// When the next step is due, and when the current note should be released.
@@ -246,6 +269,7 @@ impl Default for Arp {
             settings: ArpSettings::default(),
             held: Vec::new(),
             step: 0,
+            scheduled_off: None,
             sounding: None,
             next_step: None,
             off_at: None,
@@ -358,35 +382,65 @@ impl Arp {
             self.next_step = None;
             return;
         }
-        // The gate closes even if the next step is far away.
+        // The gate closes even if the next step is far away. When the note-on
+        // carried a sample, so does its off: an accurate start followed by a
+        // release on the next interface tick is half an improvement.
         if let Some(at) = self.off_at {
             if now >= at {
-                self.release(out);
+                let sample = self.scheduled_off.take().unwrap_or(0);
+                self.release_at(out, sample);
+                self.off_at = None;
             }
         }
-        // Synced: the transport says which step it is, and a step is due when
-        // that number changes. The free-running clock below is what runs when
-        // there is no transport to follow.
-        let due = match self.grid_step() {
-            Some(index) => {
-                if self.grid == Some(index) {
+        // **Scheduled, not noticed.** Reacting to a boundary that has already
+        // gone by can only ever be late by however long it took to notice —
+        // which is the interface's wake interval, 5 ms. So the synced path
+        // looks *forward*: when the next boundary falls inside the lookahead
+        // window it is sent now, carrying the transport sample it is for, and
+        // the audio callback splits its render there. The resolution stops
+        // being how often this function is called.
+        // **"Nothing due yet" is not "no grid".** Falling through to the free
+        // clock when the next boundary is merely still ahead cleared `grid`,
+        // and the boundary was then scheduled again on the next tick — the same
+        // step, over and over. Which clock is running is decided once, here.
+        if self.synced() {
+            let Some((index, at)) = self.next_grid_step() else {
+                return;
+            };
+            self.grid = Some(index);
+            {
+                let step = self.step_len();
+                let swung = self.swing_of(self.step);
+                let gate = swung.mul_f32(self.settings.gate.clamp(0.05, 1.0));
+                let sequence = self.sequence();
+                if sequence.is_empty() {
                     return;
                 }
-                self.grid = Some(index);
-                now
+                let idx = self.pick(sequence.len());
+                let (note, vel) = sequence[idx];
+                // Both ends carry a sample: a gate that closes on the next
+                // interface tick would undo the accuracy the note-on just won.
+                self.release_at(out, at);
+                out.push(ArpEvent::On { note, vel, at });
+                self.sounding = Some(note);
+                let sr = choz_ports::transport().sample_rate() as f64;
+                self.off_at = Some(now + gate);
+                self.scheduled_off = Some(at + (gate.as_secs_f64() * sr) as u64);
+                self.next_step = Some(now + step);
+                self.step = self.step.wrapping_add(1);
+                return;
             }
-            None => {
-                self.grid = None;
-                let Some(due) = self.next_step else {
-                    self.next_step = Some(now);
-                    return;
-                };
-                if now < due {
-                    return;
-                }
-                due
-            }
+        }
+        // The free-running clock: no transport to follow, so a step is due
+        // when enough time has gone by, and its notes are "now".
+        self.grid = None;
+        let Some(due) = self.next_step else {
+            self.next_step = Some(now);
+            return;
         };
+        if now < due {
+            return;
+        }
 
         let sequence = self.sequence();
         if sequence.is_empty() {
@@ -396,7 +450,9 @@ impl Arp {
         let (note, vel) = sequence[idx];
 
         self.release(out);
-        out.push(ArpEvent::On { note, vel });
+        // The free-running clock has no timeline to be accurate against, so
+        // its notes are "now" — which is what they always were.
+        out.push(ArpEvent::On { note, vel, at: 0 });
         self.sounding = Some(note);
 
         let step = self.step_len();
@@ -490,9 +546,25 @@ impl Arp {
     }
 
     fn release(&mut self, out: &mut Vec<ArpEvent>) {
+        self.release_at(out, 0);
+    }
+
+    fn release_at(&mut self, out: &mut Vec<ArpEvent>, at: u64) {
         if let Some(note) = self.sounding.take() {
-            out.push(ArpEvent::Off { note });
+            out.push(ArpEvent::Off { note, at });
         }
+    }
+
+    /// The transport sample a position in quarter notes falls on.
+    ///
+    /// Never zero: `0` is the engine's word for "now", and the downbeat of a
+    /// rewound transport really is sample zero — so the two would be the same
+    /// value meaning different things. One sample of difference is 20
+    /// microseconds and buys an unambiguous protocol.
+    fn sample_of(quarters: f64) -> u64 {
+        let t = choz_ports::transport();
+        let bpm = t.bpm().max(1.0) as f64;
+        ((quarters * 60.0 / bpm * t.sample_rate() as f64).max(0.0) as u64).max(1)
     }
 
     fn step_len(&self) -> Duration {
@@ -513,7 +585,18 @@ impl Arp {
     /// position rather than from counting durations, so nothing accumulates.
     /// A stall skips steps instead of firing a burst to catch up, which is the
     /// same rule the free-running clock follows and for the same reason.
-    fn grid_step(&self) -> Option<i64> {
+    /// Whether the transport is the clock: `SYNC` on and something rolling.
+    fn synced(&self) -> bool {
+        self.settings.sync && choz_ports::transport().playing()
+    }
+
+    /// The next step boundary, once it is close enough to send: `(index,
+    /// transport sample)`.
+    ///
+    /// `None` while there is nothing to schedule — no grid, or the boundary is
+    /// still further away than the lookahead. The index is remembered by the
+    /// caller so the same one is never sent twice.
+    fn next_grid_step(&self) -> Option<(i64, u64)> {
         if !self.settings.sync {
             return None;
         }
@@ -525,16 +608,36 @@ impl Arp {
         if step_q <= 0.0 {
             return None;
         }
-        let position = transport.ppq() / step_q;
-        let index = position.floor() as i64;
-        // Swing pushes the off-beats late, so the grid has not reached an odd
-        // step until that share of the step has gone by: until then the
-        // playhead still belongs to the one before it.
-        let into_step = position - index as f64;
-        if index % 2 == 1 && into_step < self.settings.swing as f64 {
-            return Some(index - 1);
+        let now_q = transport.ppq();
+        // The one after whatever was scheduled last; from a standing start,
+        // the next boundary the playhead has not passed.
+        let next = match self.grid {
+            Some(last) => last + 1,
+            None => (now_q / step_q).ceil() as i64,
+        };
+        // Swing pushes the odd steps late, and the schedule has to say so:
+        // this is the sample the note is *for*.
+        let mut quarters = next as f64 * step_q;
+        if next % 2 == 1 {
+            quarters += step_q * self.settings.swing as f64;
         }
-        Some(index)
+        let bpm = transport.bpm().max(1.0) as f64;
+        let ahead_q = LOOKAHEAD_SECS * bpm / 60.0;
+        if quarters > now_q + ahead_q {
+            return None;
+        }
+        Some((next, Self::sample_of(quarters)))
+    }
+
+    /// How long step `n` lasts once swing has pushed it about. Applied to
+    /// *this* step's length, so a pair still adds up to two straight ones.
+    fn swing_of(&self, n: usize) -> Duration {
+        let step = self.step_len();
+        if n % 2 == 1 {
+            step.mul_f32(1.0 + self.settings.swing)
+        } else {
+            step.mul_f32(1.0 - self.settings.swing)
+        }
     }
 
     /// The notes to walk, with the octaves stacked on top.
@@ -801,5 +904,104 @@ impl ArpSettings {
             ArpParam::Chord => self.chord = v >= 0.5,
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The point of the whole thing: a synced step is **scheduled**, not
+    /// noticed. What comes out carries the transport sample the note is for,
+    /// and that sample is in the future — because a boundary that has already
+    /// gone by can only ever be played late.
+    #[test]
+    fn a_synced_step_is_scheduled_ahead_of_the_sample_it_is_for() {
+        let t = choz_ports::transport();
+        let was = t.playing();
+        t.set_sample_rate(48_000);
+        t.set_bpm(120.0);
+        t.set_playing(true);
+        t.rewind();
+
+        let mut arp = Arp::default();
+        arp.settings.on = true;
+        arp.settings.sync = true;
+        arp.settings.swing = 0.0;
+        arp.settings.div = TimeDiv::Sixteenth;
+        arp.note_on(60, 100, Instant::now());
+
+        // From a standing start the boundary the playhead is on is the
+        // downbeat, and that one is due now.
+        let mut out = Vec::new();
+        arp.tick(Instant::now(), &mut out);
+        assert!(
+            out.iter().any(|e| matches!(e, ArpEvent::On { .. })),
+            "the downbeat plays"
+        );
+
+        // The step after it is 6000 samples away (120 bpm, a sixteenth is an
+        // eighth of a second) and is **not** scheduled until it is inside the
+        // lookahead — a note queued a beat early is a note a tempo change
+        // makes wrong.
+        out.clear();
+        arp.tick(Instant::now(), &mut out);
+        assert!(out.is_empty(), "too far away to schedule yet: {out:?}");
+
+        // Move the playhead to just under a lookahead away from it.
+        t.advance(6000 - 480);
+        out.clear();
+        arp.tick(Instant::now(), &mut out);
+        let on = out
+            .iter()
+            .find(|e| matches!(e, ArpEvent::On { .. }))
+            .copied()
+            .expect("now it is close enough to schedule");
+        let at = on.at();
+        assert!(
+            (at as i64 - 6000).abs() < 64,
+            "a sixteenth at 120 bpm lands 6000 samples in: {at}"
+        );
+        assert!(
+            at > t.samples(),
+            "and it is still ahead of the playhead: {at} vs {}",
+            t.samples()
+        );
+
+        // The same step is never scheduled twice, however often it is ticked.
+        let before = out.len();
+        for _ in 0..5 {
+            arp.tick(Instant::now(), &mut out);
+        }
+        assert_eq!(out.len(), before, "one boundary, one note");
+
+        t.set_playing(was);
+    }
+
+    /// Free-running has no transport to be accurate against, so its notes are
+    /// "now" — exactly what they were before any of this.
+    #[test]
+    fn the_free_running_clock_still_plays_immediately() {
+        let t = choz_ports::transport();
+        let was = t.playing();
+        t.set_playing(false);
+
+        let mut arp = Arp::default();
+        arp.settings.on = true;
+        arp.settings.sync = false;
+        arp.note_on(60, 100, Instant::now());
+
+        let start = Instant::now();
+        let mut out = Vec::new();
+        arp.tick(start, &mut out);
+        arp.tick(start + Duration::from_millis(600), &mut out);
+        let on = out
+            .iter()
+            .find(|e| matches!(e, ArpEvent::On { .. }))
+            .copied()
+            .expect("the free clock still runs");
+        assert_eq!(on.at(), 0, "no timeline, no timestamp");
+
+        t.set_playing(was);
     }
 }

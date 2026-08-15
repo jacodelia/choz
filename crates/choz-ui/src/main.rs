@@ -4791,11 +4791,27 @@ impl App {
     /// paths know about and others do not is a synth left droning by whichever
     /// path was forgotten.
     fn send_note(&mut self, slot: usize, on: bool, note: u8, vel: u8) {
+        self.send_note_at(slot, on, note, vel, 0);
+    }
+
+    /// The same funnel, for a sender that knows **when** the note is for.
+    ///
+    /// `at` is an absolute transport sample; `0` is "now". Only the
+    /// arpeggiator's synced clock sends anything else, because it is the only
+    /// thing here that knows where its next step lands before it gets there.
+    ///
+    /// **MIDI OUT is still sent immediately**, and it has to be: ALSA sends
+    /// when it is told, so a note scheduled for a sample in the future would
+    /// leave the building before it sounded inside. The instrument in the tab
+    /// gets the accurate one; an external synth gets it when the interface
+    /// noticed, which is what it got before any of this.
+    fn send_note_at(&mut self, slot: usize, on: bool, note: u8, vel: u8, at: u64) {
         if let Some(ref mut engine) = self.audio_engine {
-            if on {
-                engine.note_on(slot, note, vel);
-            } else {
-                engine.note_off(slot, note);
+            match (on, at) {
+                (true, 0) => engine.note_on(slot, note, vel),
+                (false, 0) => engine.note_off(slot, note),
+                (true, at) => engine.note_on_at(slot, note, vel, at),
+                (false, at) => engine.note_off_at(slot, note, at),
             }
         }
         let Some((port, channel)) = self
@@ -4943,7 +4959,7 @@ impl App {
             }
         }
         for event in stop {
-            if let arp::ArpEvent::Off { note } = event {
+            if let arp::ArpEvent::Off { note, .. } = event {
                 self.send_note(slot_index, false, note, 0);
             }
         }
@@ -4963,8 +4979,8 @@ impl App {
         }
         for (slot, event) in events {
             match event {
-                arp::ArpEvent::On { note, vel } => self.send_note(slot, true, note, vel),
-                arp::ArpEvent::Off { note } => self.send_note(slot, false, note, 0),
+                arp::ArpEvent::On { note, vel, at } => self.send_note_at(slot, true, note, vel, at),
+                arp::ArpEvent::Off { note, at } => self.send_note_at(slot, false, note, 0, at),
             }
         }
     }
