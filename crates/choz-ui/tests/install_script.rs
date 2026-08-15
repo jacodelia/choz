@@ -190,6 +190,66 @@ fn the_installer_refuses_when_a_critical_library_is_missing() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// In a release tarball the script sits next to the binary it should install.
+/// Without this, a user who downloaded a `.tar.gz` gets `cargo build` — a
+/// toolchain they have no reason to have — instead of the binary in their hand.
+#[test]
+fn the_installer_uses_the_binary_shipped_beside_it() {
+    let tmp = std::env::temp_dir().join(format!("choz_tarball_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (prefix, home, dist) = (tmp.join("prefix"), tmp.join("home"), tmp.join("dist"));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&dist).unwrap();
+
+    // The tarball layout the release workflow builds: script, binary, desktop/.
+    let packaging = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging");
+    std::fs::copy(script(), dist.join("install.sh")).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_choz"), dist.join("choz")).unwrap();
+    copy_tree(&packaging.join("desktop"), &dist.join("desktop"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dist.join("choz"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+
+    let out = Command::new("/bin/sh")
+        .arg(dist.join("install.sh"))
+        .arg("--prefix")
+        .arg(&prefix)
+        .arg("--skip-deps-check")
+        .env("HOME", &home)
+        .env("CHOZ_SEARCH_BINS", "")
+        .output()
+        .expect("sh is installed");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "install.sh failed: {text}");
+    assert!(
+        text.contains("shipped next to this script"),
+        "it says where the binary came from: {text}"
+    );
+    assert!(prefix.join("bin/choz").exists(), "and installs it: {text}");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let (src, dst) = (entry.path(), to.join(entry.file_name()));
+        if src.is_dir() {
+            copy_tree(&src, &dst);
+        } else {
+            std::fs::copy(&src, &dst).unwrap();
+        }
+    }
+}
+
 /// JACK is the other half of the same check and must **not** stop anything: it
 /// is `dlopen`ed, so without it choz runs on ALSA.
 #[test]

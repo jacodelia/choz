@@ -329,6 +329,12 @@ impl FxProcessor for AutoTune {
         "AUTO-TUNE"
     }
 
+    /// The shifter's window, which is the one place the signal is held back.
+    /// Reported so the rack can say where its 30-odd milliseconds went.
+    fn latency_samples(&self) -> u32 {
+        AutoTune::latency_samples(self) as u32
+    }
+
     fn params(&self) -> Vec<FxParam> {
         let p = &self.params;
         vec![

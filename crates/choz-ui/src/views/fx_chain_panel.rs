@@ -51,6 +51,9 @@ pub enum RackButton {
     Learn,
     /// Listen to the tab's audio input and play its instrument from the pitch.
     PitchToMidi,
+    /// How much of a converting tab's output is the instrument and how much is
+    /// the audio that drove it.
+    PitchMix,
     /// Open (or close) the plugin's own window.
     Gui,
     /// Ask for (or stop asking for) this plugin to run in its own process.
@@ -58,6 +61,23 @@ pub enum RackButton {
     /// Previous / next program of the loaded SoundFont.
     PresetPrev,
     PresetNext,
+    /// The tab's arpeggiator. `ArpOn` is the only one drawn while it is off —
+    /// a box of settings for something switched off is six rows of nothing in a
+    /// panel that is already tight.
+    ArpOn,
+    ArpMode,
+    ArpDiv,
+    ArpRateDown,
+    ArpRateUp,
+    ArpGate,
+    ArpOctaves,
+    ArpLatch,
+    ArpSwing,
+    /// Follow choz's transport instead of the arpeggiator's own tempo.
+    ArpSync,
+    /// One key plays the memorised chord.
+    ArpChord,
+    ArpTap,
 }
 
 /// Every clickable area of the panel, filled in as it draws.
@@ -93,6 +113,34 @@ pub struct RackLayout {
     pub fx_gui: Option<Rect>,
     /// The selected FX's sandbox toggle, when it's a hosted plugin.
     pub fx_sandbox: Option<Rect>,
+    /// The factory-preset picker, for a built-in that ships any.
+    pub fx_preset: Option<Rect>,
+    /// (knob index, rect) of the arpeggiator's own box, when it is drawn as
+    /// one. Empty on a screen too short for it, where the controls are buttons.
+    pub arp_knobs: Vec<(usize, Rect)>,
+}
+
+/// What the SLOT box says about the selected effect beyond its buttons: what is
+/// going through it, what it delays, and whether it has presets to offer.
+#[derive(Default, Clone, Copy)]
+pub struct FxSlotInfo {
+    /// Peak in and out of the last block, linear. `None` for a slot that is not
+    /// running — an empty chain, or a rack with no engine behind it.
+    pub peaks: Option<(f32, f32)>,
+    /// What the whole chain delays the signal by, in milliseconds. Shown on the
+    /// chain, not on the effect: it is the number the player feels.
+    pub latency_ms: f32,
+    /// This effect ships factory presets.
+    pub presets: bool,
+}
+
+/// A linear peak as the dB the meter shows. Anything under -60 is "nothing",
+/// which is shorter to read than `-inf` and means the same to a player.
+fn db_label(peak: f32) -> String {
+    if peak <= 0.001 {
+        return "  -\u{221E}".into();
+    }
+    format!("{:5.1}", 20.0 * peak.log10())
 }
 
 /// How a plugin stands with respect to running in its own process. `on` is what
@@ -245,6 +293,11 @@ pub fn fader_track(val: f32, width: usize) -> String {
 /// Active slot's mixer strip: gain (linear), pan (-1..1), mute, solo.
 pub type MixStrip = (f32, f32, bool, bool);
 
+/// Max linear **input** trim, mirrors `MAX_IN_GAIN` in main.rs. An input is
+/// coming off whatever the preamp was set to, so it gets far more range than
+/// a slot's output does.
+const MAX_IN_GAIN: f32 = 16.0;
+
 /// Max linear slot gain, mirrors `MAX_GAIN` in main.rs — only used to scale the
 /// gain bar.
 const MAX_GAIN: f32 = 2.0;
@@ -314,8 +367,81 @@ fn note_name(note: u8) -> String {
     format!("{}{}", NAMES[note as usize % 12], note as i32 / 12 - 1)
 }
 pub const BTN_GUI: &str = " GUI ";
+/// How many cells a run of spans takes on screen — the only honest way to know
+/// where the next button lands once any of the text before it is translated.
+fn line_width(spans: &[Span]) -> u16 {
+    spans.iter().map(|s| s.width() as u16).sum()
+}
+
 pub const BTN_PREV: &str = " \u{25C0} ";
 pub const BTN_NEXT: &str = " \u{25B6} ";
+
+/// A row of buttons that **wraps** onto the next line when the panel runs out
+/// of columns, handing back the rect of everything it draws.
+///
+/// The arpeggiator's row is what forced this: with the sequencer on, its
+/// switches ran past 120 columns and the last ones were simply not there — and
+/// the RACK cannot afford to answer that with another bordered box, which is
+/// the same reason the row collapses to a single switch when it is off.
+///
+/// Each button is rendered where it is measured, so a translated label moves
+/// the ones after it instead of leaving their click rects behind. That bug has
+/// been fixed twice on hand-computed offsets; this is the shape that cannot
+/// have it.
+struct ButtonRow {
+    x: u16,
+    y: u16,
+    inner: Rect,
+    bg: Style,
+    /// Columns the wrapped lines start at, so a continuation reads as one.
+    indent: u16,
+}
+
+impl ButtonRow {
+    fn new(inner: Rect, bg: Style, y: u16, indent: u16) -> Self {
+        Self {
+            x: inner.x + indent,
+            y,
+            inner,
+            bg,
+            indent,
+        }
+    }
+
+    /// Draw `text`, wrapping first if it does not fit, and leave `gap` columns
+    /// after it. Returns where it landed.
+    fn draw(&mut self, f: &mut Frame, text: String, style: Style, gap: u16) -> Rect {
+        let w = Span::raw(text.as_str()).width() as u16;
+        if self.x + w > self.inner.x + self.inner.width && self.x > self.inner.x + self.indent {
+            self.y += 1;
+            self.x = self.inner.x + self.indent;
+        }
+        let rect = Rect::new(self.x, self.y, w, 1);
+        if self.y < self.inner.y + self.inner.height {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(text, style))).style(self.bg),
+                rect,
+            );
+        }
+        self.x += w + gap;
+        rect
+    }
+
+    /// Text that takes room but answers no clicks.
+    fn label(&mut self, f: &mut Frame, text: String, style: Style) {
+        self.draw(f, text, style, 0);
+    }
+
+    /// A button, spaced from the next so they don't read as one bar.
+    fn button(&mut self, f: &mut Frame, text: String, style: Style) -> Rect {
+        self.draw(f, text, style, 1)
+    }
+
+    /// The first line below the row.
+    fn finish(self) -> u16 {
+        self.y + 1
+    }
+}
 
 pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -355,6 +481,41 @@ pub fn pan_label(pan: f32) -> String {
 /// parameters would otherwise eat the whole thing.
 const INSTR_KNOB_ROWS: usize = 2;
 
+/// Rows of arpeggiator knobs the RACK gives up: two is every control it has at
+/// any usable width, and a third would come out of the FX chain.
+const ARP_KNOB_ROWS: usize = 2;
+
+/// What one row of knobs costs: the arc, the value and the name.
+const ARP_KNOBS_ROWS: u16 = 3;
+
+/// The row the TAP button sits on. It is never a knob — tapping a tempo is a
+/// gesture, and a gesture has no position to be turned to.
+const ARP_TAP_ROW: u16 = 1;
+
+/// Which of the three shapes the arpeggiator's controls take, decided by the
+/// rows the panel has left rather than by a setting: the same controls either
+/// way, and nothing to get wrong when a window is resized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArpShape {
+    /// Not running: one switch, and the rest of the panel keeps its rows.
+    Off,
+    /// Knobs in a bordered, titled box, like the FX and the instrument get.
+    Boxed,
+    /// The same knobs with no frame — two rows cheaper, which is the difference
+    /// between having them and not on a five-inch screen.
+    Strip,
+    /// No room for knobs at all: the row of buttons, wrapping.
+    Buttons,
+}
+
+/// Rows the FX chain cannot do without: its title rule, the row of units and a
+/// knob box for the selected one. The SLOT box below them is already drawn only
+/// where it fits, so it is not counted here — this is the floor, not the wish.
+///
+/// The arpeggiator only takes a knob shape when this much is left after it,
+/// which is what keeps a five-inch screen showing an FX chain at all.
+const FX_CHAIN_ROWS: u16 = 7;
+
 pub fn param_grid(width: u16, n: usize) -> (usize, usize) {
     let cols = (width.saturating_sub(2) / FX_CELL_W).max(1) as usize;
     let rows = n.div_ceil(cols);
@@ -385,11 +546,17 @@ fn draw_knob_box(
     focused: bool,
     max_rows: usize,
     reserve_below: u16,
+    // A border costs two rows and buys a title. On a panel that has the rows it
+    // is worth it; on a five-inch screen those two rows are the difference
+    // between knobs and no knobs, so the box loses its frame instead of the
+    // user losing the controls.
+    bordered: bool,
 ) -> (Vec<(usize, Rect)>, u16) {
     let bg = super::theme::panel_style();
     let n = values.len();
     let mut rects = Vec::new();
-    if n == 0 || y + 5 > inner.y + inner.height {
+    let frame = if bordered { 2 } else { 0 };
+    if n == 0 || y + 3 + frame > inner.y + inner.height {
         return (rects, y);
     }
     let (cols, rows_needed) = param_grid(inner.width, n);
@@ -401,7 +568,7 @@ fn draw_knob_box(
     let cursor_row = cursor / cols.max(1);
     let first_row = cursor_row.saturating_sub(rows_shown.saturating_sub(1));
 
-    let box_h = (rows_shown * 3) as u16 + 2;
+    let box_h = (rows_shown * 3) as u16 + frame;
     let box_rect = Rect::new(
         inner.x + 1,
         y,
@@ -413,14 +580,19 @@ fn draw_knob_box(
     } else {
         String::new()
     };
-    let block = Block::default()
-        .title(format!(" {title}{more} "))
-        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(if focused { SEL } else { RULE }))
-        .style(bg);
-    let param_inner = block.inner(box_rect);
-    f.render_widget(block, box_rect);
+    let param_inner = if bordered {
+        let block = Block::default()
+            .title(format!(" {title}{more} "))
+            .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(if focused { SEL } else { RULE }))
+            .style(bg);
+        let param_inner = block.inner(box_rect);
+        f.render_widget(block, box_rect);
+        param_inner
+    } else {
+        box_rect
+    };
     // Runs of same-unit faders read as one instrument (an ADSR, a set of band
     // gains), so they are drawn as a bank of vertical bars side by side.
     let grouped = fader_groups(shapes);
@@ -539,6 +711,8 @@ pub fn draw_fx_chain_panel(
     // Audio-in state of the tab: `Some(on)` when it is fed by a capture pair —
     // the only case where turning its pitch into notes means anything.
     pitch_to_midi: Option<bool>,
+    // How much of a converting tab is the instrument: 1 = only the instrument.
+    pitch_mix: f32,
     // The instrument's own parameters: name and 0..1 position, in plugin order.
     // Carla's "generic UI": every plugin gets knobs whether or not it has a
     // window, so a CC can be learned without opening one.
@@ -552,6 +726,14 @@ pub fn draw_fx_chain_panel(
     // The AutoTune reading and its recent pitch error, when that is the FX the
     // cursor is on. `None` for every other effect.
     at_view: Option<(choz_engine::fx::autotune::AutoTuneMeter, &[f32])>,
+    // The tab's arpeggiator: settings plus where its sequencer is. Drawn as one
+    // line while it is off, two when it is on.
+    arp: crate::arp::ArpView<'_>,
+    // Where this tab's notes are pointed, when they are pointed anywhere, and
+    // over how much of that parameter's range.
+    // Meter, latency and presets of the selected FX — everything the SLOT box
+    // knows that is not a button.
+    fx_info: FxSlotInfo,
 ) -> RackLayout {
     let has_presets = preset.is_some();
     let mut layout = RackLayout::default();
@@ -709,8 +891,35 @@ pub fn draw_fx_chain_panel(
         cells.push(("  ".to_string(), bg, None));
         cells.push((format!("{} ", t("IN")), label_style, None));
         cells.push((
-            format!("[{}] {in_gain:4.2}  ", knob_arc(in_gain / MAX_GAIN, 8)),
-            Style::default().fg(KNOB),
+            // In dB, not as a bare multiplier: "×8.30" is not a number anyone
+            // sets a microphone by, and the useful part of a 24 dB range is
+            // all bunched up at the bottom of a linear reading.
+            //
+            // `CLIP` is the reading that matters more than the number: a trim
+            // past full scale saturates what comes out **and** hands the pitch
+            // detector a square wave, and neither of those says which knob did
+            // it. Turn it down until this goes away.
+            format!(
+                "[{}] {:>+3.0}dB{}  ",
+                knob_arc(in_gain / MAX_IN_GAIN, 8),
+                if in_gain > 1e-4 {
+                    20.0 * in_gain.log10()
+                } else {
+                    -60.0
+                },
+                if choz_engine::meter::capture_health().clipping() > 0 {
+                    " CLIP"
+                } else {
+                    ""
+                }
+            ),
+            if choz_engine::meter::capture_health().clipping() > 0 {
+                Style::default()
+                    .fg(super::theme::WARN)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(KNOB)
+            },
             Some(4),
         ));
         cells.push((format!("{} ", t("SENS")), label_style, None));
@@ -751,17 +960,20 @@ pub fn draw_fx_chain_panel(
         .fg(Color::Black)
         .bg(Color::Rgb(56, 200, 100))
         .add_modifier(Modifier::BOLD);
-    let mut instr_line: Vec<Span> = vec![
-        Span::styled(
-            format!("  {} ", t("INSTR")),
-            Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("{:<18}", truncate(instrument, 18)),
-            Style::default().fg(ui_text()),
-        ),
-    ];
-    let mut bx = inner.x + 2 + 8 + 18;
+    // The row wraps: it already carries eight buttons on a tab with audio in, a
+    // window and a sandbox, and the label of the learn one grows with the
+    // parameter it points at.
+    let mut instr_row = ButtonRow::new(inner, bg, y, 2);
+    instr_row.label(
+        f,
+        format!("{} ", t("INSTR")),
+        Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
+    );
+    instr_row.label(
+        f,
+        format!("{:<18} ", truncate(instrument, 18)),
+        Style::default().fg(ui_text()),
+    );
     for (btn, text) in [
         (RackButton::Source, Some(BTN_SOURCE.to_string())),
         // Bank/preset only exists while the tab holds a SoundFont.
@@ -783,6 +995,18 @@ pub fn draw_fx_chain_panel(
                 } else {
                     format!("{}\u{25CB} ", BTN_A2M.trim_end())
                 }
+            }),
+        ),
+        // How much of the input comes back with the instrument. Only worth a
+        // control once the converter is on — off, there is nothing to mix.
+        (
+            RackButton::PitchMix,
+            (pitch_to_midi == Some(true)).then(|| {
+                format!(
+                    " WET {}{:>3.0}% ",
+                    knob_arc(pitch_mix, 6),
+                    pitch_mix * 100.0
+                )
             }),
         ),
         // In MULTI the channel is what decides whether this tab sounds at all,
@@ -807,8 +1031,6 @@ pub fn draw_fx_chain_panel(
         ),
     ] {
         let Some(text) = text else { continue };
-        let w = text.chars().count() as u16;
-        layout.buttons.push((btn, Rect::new(bx, y, w, 1)));
         let style = if btn == RackButton::Sandbox && sandbox.live {
             sbx_style
         } else if btn == RackButton::PitchToMidi && pitch_to_midi == Some(true) {
@@ -821,25 +1043,26 @@ pub fn draw_fx_chain_panel(
         } else {
             btn_style
         };
-        instr_line.push(Span::styled(text, style));
-        instr_line.push(Span::raw(" "));
-        bx += w + 1;
+        let rect = instr_row.button(f, text, style);
+        layout.buttons.push((btn, rect));
     }
-    put(f, Line::from(instr_line), y);
-    y += 1;
+    y = instr_row.finish();
 
     // ── Bank / preset line (SoundFont tabs only) ───────────────────────────
     if let Some(name) = preset {
-        let mut px = inner.x + 2 + 8;
-        let mut line: Vec<Span> = vec![Span::styled(
+        let line_start: Vec<Span> = vec![Span::styled(
             format!("  {}  ", t("BANK")),
             Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
         )];
+        // Same rule as the instrument line: the arrows are where the label
+        // leaves them, not where an English label would leave them.
+        let mut px = inner.x + line_width(&line_start);
+        let mut line = line_start;
         for (btn, text) in [
             (RackButton::PresetPrev, BTN_PREV),
             (RackButton::PresetNext, BTN_NEXT),
         ] {
-            let w = text.chars().count() as u16;
+            let w = Span::raw(text).width() as u16;
             layout.buttons.push((btn, Rect::new(px, y, w, 1)));
             line.push(Span::styled(text, btn_style));
             line.push(Span::raw(" "));
@@ -858,6 +1081,272 @@ pub fn draw_fx_chain_panel(
         put(f, Line::from(line), y);
         y += 1;
     }
+
+    // ── Arpeggiator ────────────────────────────────────────────────────────
+    //
+    // Off, it is a single switch: a bordered box for something most tabs never
+    // turn on would cost the RACK rows it does not have. On, it is the same
+    // knob box the FX and the instrument get — BPM, GATE and SWING are values,
+    // and a value belongs on the arc this program draws every other value with.
+    //
+    // **Unless the screen is too small for it.** On a 5-inch panel the rack has
+    // a handful of rows, and five of them spent on a bordered box would leave
+    // no FX chain — so there the controls stay a row of buttons, wrapping. Same
+    // controls either way; only the shape changes.
+    let arp_boxed;
+    {
+        let s = arp.settings;
+        // Which control the arrows are on, as buttons rather than as a knob:
+        // on a panel too short for the box the row **is** the box, and a
+        // cursor nobody can see is a cursor nobody can use.
+        let knobs = arp.knobs();
+        let cursor_btns: &[RackButton] = if arp.focused && focused {
+            match knobs.get(arp.cursor).map(|(p, ..)| *p) {
+                Some(crate::arp::ArpParam::On) => &[RackButton::ArpOn],
+                Some(crate::arp::ArpParam::Sync) => &[RackButton::ArpSync],
+                Some(crate::arp::ArpParam::Mode) => &[RackButton::ArpMode],
+                Some(crate::arp::ArpParam::Div) => &[RackButton::ArpDiv],
+                // The tempo is two buttons, and both are the same control.
+                Some(crate::arp::ArpParam::Bpm) => {
+                    &[RackButton::ArpRateDown, RackButton::ArpRateUp]
+                }
+                Some(crate::arp::ArpParam::Gate) => &[RackButton::ArpGate],
+                Some(crate::arp::ArpParam::Swing) => &[RackButton::ArpSwing],
+                Some(crate::arp::ArpParam::Octaves) => &[RackButton::ArpOctaves],
+                Some(crate::arp::ArpParam::Latch) => &[RackButton::ArpLatch],
+                Some(crate::arp::ArpParam::Chord) => &[RackButton::ArpChord],
+                None => &[],
+            }
+        } else {
+            &[]
+        };
+        let button = |row: &mut ButtonRow,
+                      f: &mut Frame,
+                      layout: &mut RackLayout,
+                      btn: RackButton,
+                      text: String,
+                      on: bool| {
+            let style = if cursor_btns.contains(&btn) {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(SEL)
+                    .add_modifier(Modifier::BOLD)
+            } else if on {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(ON_COLOUR)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                btn_style
+            };
+            let rect = row.button(f, text, style);
+            layout.buttons.push((btn, rect));
+        };
+
+        // What shape the controls take is decided by the rows left, and only by
+        // them: a bordered box where the panel is tall, the same knobs without
+        // their frame where two rows matter (a five-inch screen gives the rack
+        // about eleven), and the row of buttons where even that would leave no
+        // FX chain.
+        let room = (inner.y + inner.height).saturating_sub(y);
+        let shape = if !s.on {
+            ArpShape::Off
+        } else if room >= ARP_KNOBS_ROWS + 2 + ARP_TAP_ROW + FX_CHAIN_ROWS {
+            ArpShape::Boxed
+        } else if room >= ARP_KNOBS_ROWS + ARP_TAP_ROW + FX_CHAIN_ROWS {
+            ArpShape::Strip
+        } else {
+            ArpShape::Buttons
+        };
+        let boxed = matches!(shape, ArpShape::Boxed | ArpShape::Strip);
+        arp_boxed = boxed;
+
+        // The switch is a knob inside the box when there is one — the header
+        // row it used to live on is a row, and a row is what is scarce. TAP is
+        // never a knob: tapping a tempo is a gesture, not a position.
+        let mut row = ButtonRow::new(inner, bg, y, 2);
+        if !boxed {
+            row.label(
+                f,
+                format!("{}   ", t("ARP")),
+                Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
+            );
+            button(
+                &mut row,
+                f,
+                &mut layout,
+                RackButton::ArpOn,
+                format!(
+                    " {} {} ",
+                    t("ARP"),
+                    if s.on { "\u{25CF}" } else { "\u{25CB}" }
+                ),
+                s.on,
+            );
+        }
+        // TAP only rides the button row in the shapes that *are* a button row.
+        // With a box, it goes on the box's own top edge — a gesture that
+        // belongs to the arpeggiator should not be floating above it.
+        if s.on && !boxed {
+            button(
+                &mut row,
+                f,
+                &mut layout,
+                RackButton::ArpTap,
+                format!(" TAP {:>3.0} ", s.tempo()),
+                false,
+            );
+        }
+        if matches!(shape, ArpShape::Buttons) {
+            // Every control a button, on the row that wraps: the shape for a
+            // panel with no room for knobs.
+            button(
+                &mut row,
+                f,
+                &mut layout,
+                RackButton::ArpMode,
+                format!(" {} ", s.mode.label()),
+                false,
+            );
+            button(
+                &mut row,
+                f,
+                &mut layout,
+                RackButton::ArpDiv,
+                format!(" {} ", s.div.label()),
+                false,
+            );
+            button(
+                &mut row,
+                f,
+                &mut layout,
+                RackButton::ArpRateDown,
+                BTN_PREV.into(),
+                false,
+            );
+            row.label(
+                f,
+                // The tempo it is actually counting at, which is the
+                // transport's while SYNC is on.
+                format!("{:>3.0} BPM ", s.tempo()),
+                Style::default().fg(ui_text()),
+            );
+            button(
+                &mut row,
+                f,
+                &mut layout,
+                RackButton::ArpRateUp,
+                BTN_NEXT.into(),
+                false,
+            );
+            button(
+                &mut row,
+                f,
+                &mut layout,
+                RackButton::ArpSync,
+                format!(" SYNC {} ", if s.sync { "\u{25CF}" } else { "\u{25CB}" }),
+                s.sync,
+            );
+            button(
+                &mut row,
+                f,
+                &mut layout,
+                RackButton::ArpGate,
+                format!(" GATE {:>3.0}% ", s.gate * 100.0),
+                false,
+            );
+            button(
+                &mut row,
+                f,
+                &mut layout,
+                RackButton::ArpSwing,
+                format!(" SWING {:>2.0}% ", s.swing * 100.0),
+                s.swing > 0.0,
+            );
+            button(
+                &mut row,
+                f,
+                &mut layout,
+                RackButton::ArpOctaves,
+                format!(" OCT {} ", s.octaves),
+                false,
+            );
+            button(
+                &mut row,
+                f,
+                &mut layout,
+                RackButton::ArpLatch,
+                format!(" LATCH {} ", if s.latch { "\u{25CF}" } else { "\u{25CB}" }),
+                s.latch,
+            );
+            button(
+                &mut row,
+                f,
+                &mut layout,
+                RackButton::ArpChord,
+                // On, it says how many notes one key will play: a chord mode
+                // with nothing memorised looks identical to one that works
+                // until you press a key.
+                if s.chord {
+                    format!(" CHORD \u{25CF}{} ", arp.chord.len())
+                } else {
+                    " CHORD \u{25CB} ".to_string()
+                },
+                s.chord,
+            );
+        }
+        y = row.finish();
+
+        if boxed {
+            let box_top = y;
+            let values: Vec<f32> = knobs.iter().map(|(_, _, v, _)| *v).collect();
+            let names: Vec<String> = knobs.iter().map(|(_, n, _, _)| n.to_string()).collect();
+            let shapes: Vec<ParamShape> = knobs.iter().map(|(_, _, _, s)| s.clone()).collect();
+            let (rects, next) = draw_knob_box(
+                f,
+                inner,
+                y,
+                // Same convention as the other two boxes: the title says which
+                // key hands it the arrows.
+                &format!("{} [k]", t("ARP")),
+                &values,
+                &names,
+                &shapes,
+                arp.cursor.min(values.len().saturating_sub(1)),
+                focused && arp.focused,
+                ARP_KNOB_ROWS,
+                FX_CHAIN_ROWS,
+                matches!(shape, ArpShape::Boxed),
+            );
+            layout.arp_knobs = rects;
+            // On the box's own top edge, right-aligned: the same place the
+            // SLOT box carries its meter, and the reason this is not a knob is
+            // that tapping a tempo is a gesture, not a position.
+            if matches!(shape, ArpShape::Boxed) {
+                let label = format!(" TAP {:>3.0} ", s.tempo());
+                let w = label.chars().count() as u16;
+                let right = inner.x + inner.width.saturating_sub(1);
+                if right > inner.x + w + 2 {
+                    let rect = Rect::new(right.saturating_sub(w + 1), box_top, w, 1);
+                    let style = if cursor_btns.contains(&RackButton::ArpTap) {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(SEL)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        btn_style
+                    };
+                    f.render_widget(Paragraph::new(Span::styled(label, style)), rect);
+                    layout.buttons.push((RackButton::ArpTap, rect));
+                }
+            }
+            y = next;
+        }
+    }
+
+    // Whichever box has the arrows is the one drawn live: with three boxes on
+    // the panel, "not the instrument's" stopped being the same as "the FX's".
+    let fx_focused = focused && !instr_focused && !(arp_boxed && arp.focused);
 
     // ── Instrument parameters ──────────────────────────────────────────────
     if !instr_params.is_empty() {
@@ -888,6 +1377,7 @@ pub fn draw_fx_chain_panel(
             INSTR_KNOB_ROWS,
             // Leave the FX chain its rule, its buttons and a knob row.
             9,
+            true,
         );
         layout.instr_knobs = rects;
         y = next;
@@ -897,25 +1387,10 @@ pub fn draw_fx_chain_panel(
     rule(f, t("FX CHAIN"), y);
     y += 1;
 
-    // Chain buttons wrap onto further lines instead of running off the panel.
-    let mut cx = inner.x + 2;
-    let right = inner.x + inner.width;
-    let mut chain_line: Vec<Span> = vec![Span::raw("  ")];
-    let flush = |f: &mut Frame, line: &mut Vec<Span>, y: u16| {
-        put(
-            f,
-            Line::from(std::mem::replace(line, vec![Span::raw("  ")])),
-            y,
-        );
-    };
+    // Chain buttons wrap onto further lines instead of running off the panel —
+    // the same row as the arpeggiator's, from the same helper.
+    let mut row = ButtonRow::new(inner, bg, y, 2);
     for (i, entry) in chain.iter().enumerate() {
-        let text = format!(" {}:{} ", i + 1, entry.label());
-        let w = text.chars().count() as u16;
-        if cx + w > right && cx > inner.x + 2 {
-            flush(f, &mut chain_line, y);
-            y += 1;
-            cx = inner.x + 2;
-        }
         let st = if i == fx_slot && focused {
             Style::default()
                 .fg(Color::Black)
@@ -931,29 +1406,21 @@ pub fn draw_fx_chain_panel(
                 .bg(Color::Rgb(30, 34, 40))
                 .add_modifier(Modifier::CROSSED_OUT)
         };
-        layout.fx_slots.push((i, Rect::new(cx, y, w, 1)));
-        chain_line.push(Span::styled(text, st));
-        chain_line.push(Span::raw(" "));
-        cx += w + 1;
+        let rect = row.button(f, format!(" {}:{} ", i + 1, entry.label()), st);
+        layout.fx_slots.push((i, rect));
     }
     if chain.len() < MAX_FX {
-        let add = " + ADD ";
-        let w = add.chars().count() as u16;
-        if cx + w > right && cx > inner.x + 2 {
-            flush(f, &mut chain_line, y);
-            y += 1;
-            cx = inner.x + 2;
-        }
-        layout.fx_add = Some(Rect::new(cx, y, w, 1));
-        chain_line.push(Span::styled(
-            add,
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(100, 160, 220)),
-        ));
+        layout.fx_add = Some(
+            row.button(
+                f,
+                " + ADD ".to_string(),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(100, 160, 220)),
+            ),
+        );
     }
-    flush(f, &mut chain_line, y);
-    y += 1;
+    y = row.finish();
 
     let Some(entry) = chain.get(fx_slot) else {
         if chain.is_empty() {
@@ -977,12 +1444,34 @@ pub fn draw_fx_chain_panel(
     // A graphic EQ is ten sliders, and ten arcs cannot be read as a curve. It
     // gets tanu's drawing — a column per band, the zero line through the middle
     // — and the knobs that are *not* bands (preamp, preset, wet) follow below.
+    //
+    // The waveshaper's eight points are the same drawing for the same reason:
+    // a transfer curve is a shape, and eight arcs are eight numbers. The bank
+    // already carries its own click rects and its own cursor, so drawing the
+    // curve *is* editing it — there is no editor to write.
     let mut drawn = false;
-    let eq_bands = (entry.plugin.is_none() && entry.kind == crate::source::AudioFxKind::GraphicEq)
-        .then_some(choz_engine::fx::EQ_BANDS)
-        .filter(|n| entry.params.len() > *n);
+    let bank_labels: Vec<String>;
+    let eq_bands = match entry.kind {
+        _ if entry.plugin.is_some() => None,
+        crate::source::AudioFxKind::GraphicEq => Some(choz_engine::fx::EQ_BANDS),
+        crate::source::AudioFxKind::WaveShaper => Some(choz_engine::fx::saturator::TABLE_POINTS),
+        _ => None,
+    }
+    .filter(|n| entry.params.len() > *n);
     if let Some(n) = eq_bands {
-        let labels: Vec<&str> = names[..n].iter().map(|s| s.as_str()).collect();
+        // The waveshaper's columns are input levels, not band names: "P3" says
+        // nothing, "-.43" says where on the curve the point sits.
+        let labels: Vec<&str> = if entry.kind == crate::source::AudioFxKind::WaveShaper {
+            bank_labels = (0..n)
+                .map(|i| {
+                    let x = choz_engine::fx::saturator::Table::input_at(i);
+                    format!("{x:+.1}")
+                })
+                .collect();
+            bank_labels.iter().map(|s| s.as_str()).collect()
+        } else {
+            names[..n].iter().map(|s| s.as_str()).collect()
+        };
         let title = format!("{}:{}", fx_slot + 1, entry.label());
         let (band_rects, after) = draw_eq_bank(
             f,
@@ -991,7 +1480,7 @@ pub fn draw_fx_chain_panel(
             &entry.params[..n],
             &labels,
             fx_param.min(n - 1),
-            focused && !instr_focused && fx_param < n,
+            fx_focused && fx_param < n,
             &title,
             bg,
         );
@@ -1007,9 +1496,10 @@ pub fn draw_fx_chain_panel(
                 &names[n..],
                 &shapes[n..],
                 fx_param.saturating_sub(n),
-                focused && !instr_focused && fx_param >= n,
+                fx_focused && fx_param >= n,
                 usize::MAX,
                 5,
+                true,
             );
             // The tail box numbers its knobs from zero; the chain does not.
             layout
@@ -1032,9 +1522,10 @@ pub fn draw_fx_chain_panel(
             &names,
             &shapes,
             fx_param,
-            focused && !instr_focused,
+            fx_focused,
             usize::MAX,
             5,
+            true,
         )
     };
     if !drawn {
@@ -1051,13 +1542,34 @@ pub fn draw_fx_chain_panel(
         y = draw_autotune_readout(f, inner, y, m, trace, bg);
     }
 
+    // ── What the parametric EQ is doing to the signal ─────────────────────
+    // Drawn at 48 kHz whatever the device runs at: bilinear warping only moves
+    // the curve near Nyquist, and the panel does not get a knob's worth of
+    // plumbing for a difference nobody can see at this many pixels per octave.
+    if entry.plugin.is_none() && entry.kind == crate::source::AudioFxKind::ParamEq {
+        y = draw_eq_curve(f, inner, y, &entry.params, 48_000, bg);
+    }
+
     // ── Slot controls, in their own box, one blank line below the knobs ────
     if y + 2 < inner.y + inner.height {
         y += 1;
         let ctrl_h = 3u16;
         let ctrl_rect = Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), ctrl_h);
+        // The title carries the meter: the box is one row of buttons, and a
+        // second row for two numbers would cost a line of knobs.
+        let mut title = format!(" {} ", t("SLOT"));
+        if let Some((pin, pout)) = fx_info.peaks {
+            title.push_str(&format!(
+                "\u{00B7} IN {} OUT {} dB ",
+                db_label(pin),
+                db_label(pout)
+            ));
+        }
+        if fx_info.latency_ms >= 0.05 {
+            title.push_str(&format!("\u{00B7} LAT {:.1} ms ", fx_info.latency_ms));
+        }
         let ctrl_block = Block::default()
-            .title(format!(" {} ", t("SLOT")))
+            .title(title)
             .title_style(Style::default().fg(LABEL))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(RULE))
@@ -1134,6 +1646,18 @@ pub fn draw_fx_chain_panel(
                 .add_modifier(Modifier::BOLD),
             &mut layout.del,
         );
+        // Factory presets, for the built-ins that ship them.
+        if fx_info.presets {
+            button(
+                &mut spans,
+                format!(" {} ", t("PRESET")),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(KNOB)
+                    .add_modifier(Modifier::BOLD),
+                &mut layout.fx_preset,
+            );
+        }
         // Plugin FX get their own window button; built-ins have nothing to show.
         if fx_has_gui {
             button(
@@ -1172,7 +1696,7 @@ pub fn draw_fx_chain_panel(
     // ── Hint, last line of the panel ───────────────────────────────────────
     let hint_y = (inner.y + inner.height).saturating_sub(1).max(y);
     let hint = if focused {
-        "  1=source 2=bank/preset 3=learn 4=plugin window p=instr x/X=sandbox \u{00B7} a=add d=del \u{2190}\u{2192}=FX \u{2191}\u{2193}=param wheel=value \u{00B7} -/+=vol ,/.=pan m=mute S=solo"
+        "  1=source 2=bank/preset 3=learn 4=plugin window k=box p=instr P=fx preset x/X=sandbox \u{00B7} a=add d=del \u{2190}\u{2192}=FX \u{2191}\u{2193}=param wheel=value \u{00B7} -/+=vol ,/.=pan m=mute S=solo"
     } else {
         "  Tab=enter the rack"
     };
@@ -1194,6 +1718,90 @@ pub fn draw_fx_chain_panel(
 /// Everything here is read from a lock-free meter the audio thread publishes —
 /// no work crosses back the other way, which is why a graph of the pitch costs
 /// the callback nothing.
+/// The parametric EQ's response, 20 Hz–20 kHz on a log axis, ±18 dB.
+///
+/// Four knobs and a Q do not read as a shape; the curve does. It is computed
+/// from the same coefficients the processor runs, through
+/// `ParametricEq::from_params`, so it cannot claim a curve that is not there.
+/// Drawn only when there are rows to spare — the knobs are what has to fit.
+fn draw_eq_curve(
+    f: &mut Frame,
+    inner: Rect,
+    y: u16,
+    params: &[f32],
+    sample_rate: u32,
+    bg: Style,
+) -> u16 {
+    let rows = inner.y + inner.height - y.min(inner.y + inner.height);
+    let height = 6u16;
+    if rows < height || inner.width < 24 {
+        return y;
+    }
+    let eq = choz_engine::fx::ParametricEq::from_params(params, sample_rate);
+    let area = Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), height);
+    let w = area.width as usize;
+    let track_h = (height - 1) as usize;
+    let centre = track_h / 2;
+    // ±18 dB across the box: the range the knobs can actually reach.
+    let row_of = |db: f32| -> usize {
+        let t = (1.0 - (db / 18.0).clamp(-1.0, 1.0)) * 0.5;
+        ((t * (track_h - 1) as f32).round() as usize).min(track_h - 1)
+    };
+    // Log frequency: an octave is the same distance everywhere.
+    let freq_of = |col: usize| 20.0f32 * 1000.0f32.powf(col as f32 / (w.max(2) - 1) as f32);
+
+    let curve: Vec<usize> = (0..w)
+        .map(|c| row_of(eq.response_db(freq_of(c), sample_rate)))
+        .collect();
+
+    for row in 0..track_h {
+        let spans: Vec<Span> = (0..w)
+            .map(|col| {
+                if curve[col] == row {
+                    let db = eq.response_db(freq_of(col), sample_rate);
+                    let colour = if db > 0.5 {
+                        IN_TUNE
+                    } else if db < -0.5 {
+                        Color::Rgb(230, 120, 120)
+                    } else {
+                        KNOB
+                    };
+                    Span::styled("\u{2501}".to_string(), Style::default().fg(colour))
+                } else if row == centre {
+                    Span::styled("\u{2500}".to_string(), Style::default().fg(RULE))
+                } else {
+                    Span::raw(" ")
+                }
+            })
+            .collect();
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(bg),
+            Rect::new(area.x, area.y + row as u16, area.width, 1),
+        );
+    }
+
+    // Decade marks, so the axis is readable without a legend.
+    let mut axis: Vec<Span> = Vec::new();
+    let mut at = 0usize;
+    for (hz, text) in [(100.0f32, "100"), (1000.0, "1k"), (10000.0, "10k")] {
+        let col = ((hz / 20.0).log(1000.0) * (w.max(2) - 1) as f32).round() as usize;
+        let start = col
+            .saturating_sub(text.len() / 2)
+            .min(w.saturating_sub(text.len()));
+        if start < at {
+            continue;
+        }
+        axis.push(Span::raw(" ".repeat(start - at)));
+        axis.push(Span::styled(text, Style::default().fg(LABEL)));
+        at = start + text.len();
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(axis)).style(bg),
+        Rect::new(area.x, area.y + track_h as u16, area.width, 1),
+    );
+    y + height
+}
+
 fn draw_autotune_readout(
     f: &mut Frame,
     inner: Rect,
@@ -1448,6 +2056,140 @@ mod tests {
     }
 
     use super::*;
+
+    /// The curve has to *move* with the knobs, not decorate the panel: a boost
+    /// draws above the zero line where the band is and nowhere else.
+    #[test]
+    fn the_eq_curve_follows_the_knobs() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let render = |params: &[f32]| -> Vec<String> {
+            let mut term = Terminal::new(TestBackend::new(60, 8)).unwrap();
+            term.draw(|f| {
+                draw_eq_curve(f, f.area(), 0, params, 48_000, Style::default());
+            })
+            .unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..8)
+                .map(|y| (0..60).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect()
+        };
+
+        // Everything flat: the curve sits on the zero line and nowhere else.
+        let flat = [0.5, 0.5, 0.5, 0.5, 0.3, 0.7, 0.3, 0.0, 0.0, 1.0];
+        let rows = render(&flat);
+        let above: usize = rows[..2]
+            .iter()
+            .map(|r| r.matches('\u{2501}').count())
+            .sum();
+        assert_eq!(
+            above, 0,
+            "a flat EQ has nothing to draw above the line:\n{rows:?}"
+        );
+
+        // A full low-shelf boost: the curve leaves the line on the left.
+        let mut boosted = flat;
+        boosted[0] = 1.0;
+        let rows = render(&boosted);
+        let count = |r: &String, range: std::ops::Range<usize>| {
+            r.chars()
+                .skip(range.start)
+                .take(range.end - range.start)
+                .filter(|c| *c == '\u{2501}')
+                .count()
+        };
+        let top_left: usize = rows[..2].iter().map(|r| count(r, 0..20)).sum();
+        assert!(
+            top_left > 0,
+            "a +18 dB low shelf should draw high on the left:\n{rows:?}"
+        );
+        let top_right: usize = rows[..2].iter().map(|r| count(r, 40..60)).sum();
+        assert_eq!(top_right, 0, "and not on the right:\n{rows:?}");
+
+        // The axis labels are the legend.
+        assert!(
+            rows[5].contains("1k"),
+            "the frequency axis is marked: {}",
+            rows[5]
+        );
+    }
+
+    /// The waveshaper's points are drawn as the bank, so the curve is the
+    /// editor: the identity climbs left to right, and each column is clickable.
+    #[test]
+    fn the_waveshaper_draws_its_curve_as_the_bank() {
+        use choz_engine::fx::saturator::TABLE_POINTS;
+        use ratatui::{backend::TestBackend, Terminal};
+        let entry = crate::source::AudioFxEntry::new(crate::source::AudioFxKind::WaveShaper);
+        assert_eq!(
+            entry.params.len(),
+            TABLE_POINTS + 5,
+            "eight points plus drive, tone, output, oversampling and wet"
+        );
+
+        let labels: Vec<String> = (0..TABLE_POINTS)
+            .map(|i| format!("{:+.1}", choz_engine::fx::saturator::Table::input_at(i)))
+            .collect();
+        let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let mut rects = Vec::new();
+        term.draw(|f| {
+            let (r, _) = draw_eq_bank(
+                f,
+                f.area(),
+                0,
+                &entry.params[..TABLE_POINTS],
+                &refs,
+                0,
+                true,
+                "1:WAVESHAPER",
+                Style::default(),
+            );
+            rects = r;
+        })
+        .unwrap();
+        assert_eq!(rects.len(), TABLE_POINTS, "one click rect per point");
+
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..12)
+            .map(|y| (0..60).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        // The identity curve rises: the first point is at the bottom of the
+        // track and the last at the top.
+        let row_of = |col_range: std::ops::Range<usize>| {
+            rows.iter()
+                .position(|r| {
+                    r.chars()
+                        .skip(col_range.start)
+                        .take(col_range.end - col_range.start)
+                        .any(|c| c == '\u{2588}')
+                })
+                .unwrap_or(99)
+        };
+        let first = row_of(0..7);
+        let last = row_of(50..60);
+        assert!(
+            first > last,
+            "the identity should climb left to right: {first} vs {last}\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("-1.0")),
+            "the axis is input level"
+        );
+    }
+
+    /// A panel with no rows left draws no curve, rather than over the knobs.
+    #[test]
+    fn the_eq_curve_gives_up_before_it_overflows() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut term = Terminal::new(TestBackend::new(60, 4)).unwrap();
+        let mut after = 99;
+        term.draw(|f| {
+            after = draw_eq_curve(f, f.area(), 0, &[0.5; 10], 48_000, Style::default());
+        })
+        .unwrap();
+        assert_eq!(after, 0, "no room, no drawing, and no rows consumed");
+    }
 
     #[test]
     fn params_wrap_onto_more_rows_when_they_dont_fit() {

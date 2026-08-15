@@ -1,0 +1,16 @@
+[package]
+name = "choz-plugin-pd"
+version.workspace = true
+edition.workspace = true
+description = "Pure Data patches as choz effects, one Pd per process"
+
+[features]
+# Off by default: linking libpd is a build dependency not every machine has,
+# and a host that will not build without Pure Data installed is a host nobody
+# can build. Turn it on with `--features pd`.
+default = []
+pd = []
+
+[dependencies]
+anyhow.workspace = true
+choz-ports.workspace = true

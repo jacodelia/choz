@@ -123,6 +123,13 @@ check_runtime_deps() {
     return 0
 }
 
+# In a release tarball the binary sits right next to this script; building it
+# again there needs a Rust toolchain the user has no reason to have.
+if [ -z "$BINARY" ] && [ -x "$HERE/choz" ]; then
+    BINARY="$HERE/choz"
+    say "using the binary shipped next to this script ($BINARY)"
+fi
+
 if [ -z "$BINARY" ]; then
     command -v cargo >/dev/null 2>&1 || die "no cargo and no --binary; nothing to install"
     say "building (release)…"

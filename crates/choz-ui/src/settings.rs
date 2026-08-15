@@ -175,6 +175,12 @@ pub struct AudioSettings {
     pub backend: String,
     /// Output device name, or empty for the system default.
     pub device: String,
+    /// Capture device, for choz as a multi-effect. `None` = no live input,
+    /// `Some("")` = whatever the host calls default. Added later, hence the
+    /// default: an old `ui.json` opens with the microphone off, which is the
+    /// only polite way round.
+    #[serde(default)]
+    pub input_device: Option<String>,
     pub sample_rate: u32,
     pub buffer_size: u32,
     /// SF2 synthesis engine. choz only builds `oxisynth`; kept so a project
@@ -209,6 +215,7 @@ impl Default for AudioSettings {
         Self {
             backend: "AUTO".into(),
             device: String::new(),
+            input_device: None,
             sample_rate: 48_000,
             buffer_size: 256,
             sf2_engine: "oxisynth".into(),
@@ -394,6 +401,11 @@ pub struct UiSettings {
     /// the drawing code never reads it.
     #[serde(default)]
     pub theme_name: String,
+    /// Follow an outside MIDI clock instead of choz's own transport. Off by
+    /// default: a port that sends clock all day would otherwise take the tempo
+    /// over the moment it is plugged in.
+    #[serde(default)]
+    pub midi_clock: bool,
     /// How strongly the theme's panel colour is washed over a background image,
     /// 0..100 %. A photo behind the UI is beautiful and unreadable; this is the
     /// knob that trades one for the other.
@@ -412,6 +424,11 @@ pub struct UiSettings {
     /// this machine is set up, not of a single session.
     #[serde(default)]
     pub rack_mode: RackMode,
+    /// What colours a lit key in the monitor's KEYS/ROLL tabs. A property of how
+    /// this rig is played (one channel per tab, or one keyboard split by
+    /// velocity), so it outlives the session.
+    #[serde(default)]
+    pub key_colour: crate::views::midi_monitor::KeyColor,
 }
 
 /// Enough wash to read knobs and labels over a busy photo, without hiding it.
@@ -432,6 +449,8 @@ impl Default for UiSettings {
             background_tint: default_tint(),
             panel_tint: None,
             rack_mode: RackMode::default(),
+            key_colour: crate::views::midi_monitor::KeyColor::default(),
+            midi_clock: false,
         }
     }
 }

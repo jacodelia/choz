@@ -12,23 +12,18 @@ pub mod midi;
 pub mod osc;
 pub mod paths;
 pub mod pitch;
-pub mod plugin_types;
 pub mod quarantine;
-pub mod registry;
 pub mod sandboxed;
-pub mod scanner;
 pub mod sfz;
 pub mod sources;
 
-pub use engine::AudioEngine;
+pub use engine::{AudioBackend, AudioEngine};
 
 /// Parameter index that means "choz's own dry/wet" in
 /// [`AudioEngine::set_fx_param`], rather than one of the processor's params.
 pub const FX_MIX_PARAM: usize = usize::MAX;
 pub use fx_chain::FxSpec;
 pub use paths::{FoundPlugin, PluginFormat, PluginPaths, SearchDir};
-pub use plugin_types::{PluginDescriptor, PluginKind};
-pub use registry::PluginRegistry;
 
 /// Scan every enabled directory of every format in `paths`.
 ///

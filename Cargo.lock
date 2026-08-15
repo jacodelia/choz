@@ -370,6 +370,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "choz-plugin-pd"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "choz-ports",
+]
+
+[[package]]
 name = "choz-plugin-sandbox"
 version = "1.0.0"
 dependencies = [

@@ -36,7 +36,7 @@ effects, with their own parameters and their own windows — and choz installs a
 | **SFZ**    | ✅ | ✅ | — | — |
 | **SF2**    | ✅ | ✅ (oxisynth) | — | — |
 
-Plus **34 built-in DSP effects** — including a real-time pitch corrector — and WAV playback as a rack source.
+Plus **35 built-in DSP effects** — including a real-time pitch corrector — and WAV playback as a rack source.
 
 Plugin windows embed into a real X11 window on choz's editor thread — no suil,
 no Steinberg SDK. Verified by counting the parent window's actual X11 children,
@@ -209,14 +209,71 @@ valid — no cycle, no SMPTE. The bar position is offered because it is real: ch
 has no arrangement, so bars are counted from the last transport reset, and the
 *phase* is what a plugin syncing a pattern to bar starts is actually after.
 
-### Three ways to look at one panel
+### Five ways to look at one panel
 
 The **MIDI IN** panel has tabs (`F5`, or click them). **MIDI** is the messages as
-they arrive; **WAVE** is the shape of what came out; **ACTIVITY** is peak and RMS
-in dB, with a clip warning. Both pictures come from a lock-free meter the audio
-callback publishes — "did the note arrive" and "did anything come out" are the
-same question asked twice, and the second one needs no MIDI at all. The two
-drawings are seqterm's, moved here as tabs.
+they arrive; **KEYS** is a piano keyboard lit by them; **ROLL** is the same notes
+falling towards that keyboard; **WAVE** is the shape of what came out; and
+**ACTIVITY** is peak and RMS in dB, with a clip warning. The last two come from a
+lock-free meter the audio callback publishes — "did the note arrive" and "did
+anything come out" are the same question asked twice, and the second one needs no
+MIDI at all.
+
+`C` cycles what colours a lit key: **CHANNEL** (each MIDI channel its own hue —
+in MULTI a channel is a tab), **INSTRUMENT** (the tab that is actually playing
+it, for when two ports share a channel) or **VELOCITY** (how hard it was
+played). Controllers never light a key: pitch bend, the modulation wheel and the
+last pedals seen get their own row underneath. A note-on with velocity 0 is
+treated as the release it is, and `PANIC` clears the picture along with the
+notes — the keyboard is never left insisting on a chord nothing is playing.
+
+### An arpeggiator, per tab
+
+`A` turns it on, and the `ARP` line in the RACK is one switch until it is —
+then its controls follow: pattern (**UP**, **DOWN**, **INCL**, **EXCL**,
+**RANDOM**, **ORDER**, **UP×2**, **DN×2**), division from `1/4` to `1/32T` with
+real triplets, its own tempo or the transport's (`SYNC`), `TAP`, gate, swing,
+octaves, latch and a chord mode where one key plays a memorised shape. Held keys
+go to it instead of to the instrument, and its own clock plays them.
+
+A tab can also play **out of choz**: the OUT drawer lists the MIDI ports under
+their own heading, and binding one sends everything the tab plays — keys and
+arpeggiator alike — to that port as well as to its own instrument. `PANIC`
+reaches it, note by note, because a synth on the other end of a cable is exactly
+what that button is for.
+
+That clock can be somebody else's: `SYNC` counts the steps off choz's transport
+rather than a tempo of its own, and the transport itself follows an outside MIDI
+clock when `CLK EXT` is switched on in the TRANSPORT panel — `START` from the
+top, `CONTINUE` from where it stopped, and a tempo averaged over each quarter of
+pulses in the port's own callback, where the timestamps are still honest.
+
+The controls are drawn as the knob box the FX and the instrument use, without
+its frame where the panel is short, and as a wrapping row of buttons where even
+that would leave no FX chain — the same controls in all three. Everything is
+reachable without a mouse: `k` hands it the arrows, Enter opens the list of a
+control that has names, and `w`/`s` move the ones that are numbers. On/off, tap
+and latch are MIDI-learnable, because they are what a player needs with both
+hands busy.
+
+It is not an FX and cannot be one: an FX processes interleaved audio and has
+nowhere to put a note. It lives where routing is decided, and `tick` is handed
+the current instant rather than reading a clock, so the sample-exact version
+against the transport is a change of driver, not a rewrite. Every note it starts
+it stops — `PANIC` and switching it off release what was sounding.
+
+### A note as a control (`mtof`)
+
+`M→P` on the instrument line arms the pointer; click any knob and from then on
+this tab's notes drive it — keys and the arpeggiator alike. The value goes
+through the same function a MIDI CC does.
+
+What gets written depends on what the target says it is. A plugin parameter with
+a `Hz` unit and a declared range gets the note's real frequency, placed
+**logarithmically**, so an octave is always the same distance. Anything else is
+key-tracked across the playable note range: a built-in effect's parameter
+declares neither range nor unit, so writing "440" into it would be a guess, not a
+conversion — and "the filter follows the keyboard" is what this is for anyway.
 
 ### Automation
 
@@ -314,9 +371,27 @@ when you are staging an install for a machine that is not this one.
 
 ### Install
 
+**From a release** — no toolchain needed. Every tag publishes a `.tar.gz` per
+architecture (x86-64, aarch64, armv7), a `.deb`, an `.rpm` and a `PKGBUILD` for
+Arch, plus `SHA256SUMS.txt`:
+
+```bash
+tar xzf choz-1.0.0-x86_64-unknown-linux-gnu.tar.gz
+cd choz-1.0.0-x86_64-unknown-linux-gnu
+./install.sh            # uses the binary shipped beside it — no cargo involved
+```
+
+The tarball carries the binary, the launcher, the desktop entry, every icon size
+and the MIME type, so the script installs the same set the `.deb` does. On ARM,
+remember that **plugins are native binaries**: a Raspberry Pi loads plugins built
+for ARM, not the x86 ones.
+
+**From a checkout** — the same script builds first:
+
 ```bash
 ./packaging/install.sh                    # build, then install into ~/.local
 ./packaging/install.sh --prefix /usr/local
+./packaging/install.sh --binary target/release/choz   # skip the build
 ./packaging/install.sh --skip-deps-check   # install without checking ALSA
 ./packaging/install.sh --uninstall
 ```
@@ -444,7 +519,7 @@ ring so they are freed off the RT thread.
 | choz | **1.0.0** |
 | Rust edition | 2021 (`choz-plugin-lv2` is 2024) |
 | Toolchain tested | rustc 1.97.1 |
-| Platform | Linux (x86-64). ALSA/JACK/PipeWire |
+| Platform | Linux. ALSA/JACK/PipeWire. Released for x86-64, aarch64 and armv7 |
 
 See [`CHANGELOG.md`](CHANGELOG.md) for what has landed so far.
 
@@ -453,14 +528,14 @@ See [`CHANGELOG.md`](CHANGELOG.md) for what has landed so far.
 ## Tests
 
 ```bash
-cargo test --workspace              # 335 tests
+cargo test --workspace              # 395 tests
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 | Crate | Tests | Covers |
 |---|---|---|
-| `choz-engine` | 112 | 32 FX processors, mixer, sources, SFZ parser, plugin paths, scan cache, quarantine, sandbox, OSC socket |
-| `choz-ui` | 105 | Rack layout, parameter controls, modals, mouse hit-testing, MIDI learn, note routing in both modes, project save/load, i18n, themes, background rendering, the installer script |
+| `choz-engine` | 183 | 35 FX processors, mixer, sources, SFZ parser, plugin paths, scan cache, quarantine, sandbox, OSC socket |
+| `choz-ui` | 163 | Rack layout, parameter controls, modals, mouse hit-testing, MIDI learn, note routing in both modes, project save/load, i18n, themes, background rendering, the installer script |
 | `choz-plugin-lv2` | 16 | TTL parsing, hosting installed effects, `worker#schedule`, X11 editor discovery, state round-trip |
 | `choz-plugin-clap` | 11 | Effect and instrument runtime against installed plugins, window feed |
 | `choz-plugin-ladspa` | 7 | LADSPA + DSSI descriptors and runtime |
@@ -516,7 +591,7 @@ State lives in `~/.local/state/choz/`: `choz.log`, `plugins.json` (scan cache),
 ---
 ### Layout
 
-![SeqTerm Pattern view](docs/layout.png)
+![The choz rack, inputs and monitor](docs/layout.png)
 ---
 
 ## Credits

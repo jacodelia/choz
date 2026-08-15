@@ -60,10 +60,30 @@ pub enum AudioFxKind {
     Chorus,
     Flanger,
     Phaser,
+    /// Level moved by an LFO; the same processor as [`AudioFxKind::AutoPan`].
+    Tremolo,
+    /// The balance moved by the same LFO.
+    AutoPan,
+    /// A filter with an LFO and an envelope follower on its cutoff.
+    AutoFilter,
+    /// A slice of the bar, caught and looped on choz's own transport.
+    BeatRepeat,
+    /// Up to eight transposed voices, in the key.
+    Harmonizer,
+    /// Every partial moved by the same number of Hz (one sideband).
+    FreqShifter,
+    /// The same carrier, both sidebands.
+    RingMod,
+    /// A reverb whose tail climbs, because the shifter is inside its loop.
+    Shimmer,
     BitCrusher,
     Vinyl,
     Cassette,
     SoftClip,
+    /// The general waveshaper: eight curves, bias, tone and 1x–8x oversampling.
+    Saturator,
+    /// The same processor with the curve drawn instead of computed.
+    WaveShaper,
     TubeSat,
     Widener,
     Isolator,
@@ -173,16 +193,17 @@ impl AudioFxKind {
         use AudioFxKind::*;
         match self {
             Delay | GranDelay | ReverseDelay | SpaceEcho => FxCategory::Delay,
-            Reverb => FxCategory::Reverb,
+            Reverb | Shimmer => FxCategory::Reverb,
             Compressor | Limiter | Gate | Expander | SidechainDuck => FxCategory::Dynamics,
             ParamEq | GraphicEq | Filter | FilterBank | Isolator => FxCategory::EqFilter,
-            Chorus | Flanger | Phaser => FxCategory::Modulation,
-            BitCrusher | Vinyl | Cassette | SoftClip | TubeSat | AmberFang | VelvetFuzz => {
-                FxCategory::Distortion
+            Chorus | Flanger | Phaser | Tremolo | AutoPan | AutoFilter | FreqShifter | RingMod => {
+                FxCategory::Modulation
             }
+            BitCrusher | Vinyl | Cassette | SoftClip | Saturator | WaveShaper | TubeSat
+            | AmberFang | VelvetFuzz => FxCategory::Distortion,
             Widener | Pan => FxCategory::Spatial,
-            Protocosmos | Z5Texture | Looper => FxCategory::Texture,
-            AutoTune => FxCategory::Pitch,
+            Protocosmos | Z5Texture | Looper | BeatRepeat => FxCategory::Texture,
+            AutoTune | Harmonizer => FxCategory::Pitch,
             Gain | PhaseInvert | MonoMaker => FxCategory::Utility,
         }
     }
@@ -211,10 +232,20 @@ pub const ALL_FX_KINDS: &[AudioFxKind] = &[
     AudioFxKind::Chorus,
     AudioFxKind::Flanger,
     AudioFxKind::Phaser,
+    AudioFxKind::Tremolo,
+    AudioFxKind::AutoPan,
+    AudioFxKind::AutoFilter,
+    AudioFxKind::BeatRepeat,
+    AudioFxKind::Harmonizer,
+    AudioFxKind::FreqShifter,
+    AudioFxKind::RingMod,
+    AudioFxKind::Shimmer,
     AudioFxKind::BitCrusher,
     AudioFxKind::Vinyl,
     AudioFxKind::Cassette,
     AudioFxKind::SoftClip,
+    AudioFxKind::Saturator,
+    AudioFxKind::WaveShaper,
     AudioFxKind::TubeSat,
     AudioFxKind::Widener,
     AudioFxKind::Isolator,
@@ -250,10 +281,20 @@ impl AudioFxKind {
             Self::Chorus => "CHORUS",
             Self::Flanger => "FLANGER",
             Self::Phaser => "PHASER",
+            Self::Tremolo => "TREMOLO",
+            Self::AutoPan => "AUTO PAN",
+            Self::AutoFilter => "AUTO FILTER",
+            Self::BeatRepeat => "BEAT REPEAT",
+            Self::Harmonizer => "HARMONIZER",
+            Self::FreqShifter => "FREQ SHIFT",
+            Self::RingMod => "RING MOD",
+            Self::Shimmer => "SHIMMER",
             Self::BitCrusher => "BITCRUSH",
             Self::Vinyl => "VINYL",
             Self::Cassette => "CASSETTE",
             Self::SoftClip => "SOFTCLIP",
+            Self::Saturator => "SATURATOR",
+            Self::WaveShaper => "WAVESHAPER",
             Self::TubeSat => "TUBE SAT",
             Self::Widener => "WIDENER",
             Self::Isolator => "ISOLATOR",
@@ -289,10 +330,20 @@ impl AudioFxKind {
             Self::Chorus => "chorus",
             Self::Flanger => "flanger",
             Self::Phaser => "phaser",
+            Self::Tremolo => "tremolo",
+            Self::AutoPan => "autopan",
+            Self::AutoFilter => "autofilter",
+            Self::BeatRepeat => "beatrepeat",
+            Self::Harmonizer => "harmonizer",
+            Self::FreqShifter => "freqshifter",
+            Self::RingMod => "ringmod",
+            Self::Shimmer => "shimmer",
             Self::BitCrusher => "bitcrusher",
             Self::Vinyl => "vinyl",
             Self::Cassette => "cassette",
             Self::SoftClip => "softclip",
+            Self::Saturator => "saturator",
+            Self::WaveShaper => "waveshaper",
             Self::TubeSat => "tubesat",
             Self::Widener => "widener",
             Self::Isolator => "isolator",
@@ -465,12 +516,18 @@ macro_rules! pd {
 /// Static parameter table per FX kind.
 pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
     use AudioFxKind::*;
+    /// `Wet` is not last here: from index 4 on, the knobs are the processor's
+    /// own `set_param` order, and moving them would move a saved project's
+    /// values to a different knob.
     static DELAY: &[FxParamDesc] = &[
         pd!("Time", 0.30),
         pd!("Feedback", 0.40),
         pd!("Damping", 0.30),
         pd!("PingPong", 0.00),
         pd!("Wet", 1.00),
+        pd!("Cross", 0.00),
+        pd!("ModRate", 0.03),
+        pd!("ModDepth", 0.00),
     ];
     static REVERB: &[FxParamDesc] = &[
         pd!("Room", 0.50),
@@ -485,6 +542,9 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         pd!("Feedback", 0.30),
         pd!("Wet", 0.80),
     ];
+    /// The order is the processor's own `set_param` order — the compressor
+    /// takes values live, so a knob that moves here writes there by index.
+    /// `Detect` is a list of names, filled in by `param_descs` from the DSP.
     static COMP: &[FxParamDesc] = &[
         pd!("Thresh", 0.70),
         pd!("Ratio", 0.18),
@@ -492,15 +552,25 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         pd!("Release", 0.15),
         pd!("Makeup", 0.00),
         pd!("Knee", 0.50),
+        pd!("Detect", 0.00),
+        pd!("Link", 1.00),
+        pd!("SC HPF", 0.00),
         pd!("Wet", 1.00),
     ];
-    static LIMIT: &[FxParamDesc] = &[pd!("Thresh", 0.95), pd!("Release", 0.25), pd!("Wet", 1.00)];
+    static LIMIT: &[FxParamDesc] = &[
+        pd!("Thresh", 0.95),
+        pd!("Release", 0.25),
+        pd!("Look", 0.20),
+        pd!("Link", 1.00),
+        pd!("Wet", 1.00),
+    ];
     static GATE: &[FxParamDesc] = &[
         pd!("Thresh", 0.50),
         pd!("Attack", 0.02),
         pd!("Hold", 0.10),
         pd!("Release", 0.20),
         pd!("Floor", 0.00),
+        pd!("Hyst", 0.25),
         pd!("Wet", 1.00),
     ];
     // Ten Winamp bands, a preamp and the preset list — each one a knob, so a CC
@@ -565,6 +635,8 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         pd!("LowFreq", 0.30),
         pd!("HiFreq", 0.70),
         pd!("MidQ", 0.30),
+        pd!("Mode", 0.00),
+        pd!("Solo", 0.00),
         pd!("Wet", 1.00),
     ];
     static FILTER: &[FxParamDesc] = &[pd!("Cutoff", 0.70), pd!("Res", 0.20), pd!("Wet", 1.00)];
@@ -595,6 +667,57 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         pd!("Feedback", 0.70),
         pd!("Wet", 0.70),
     ];
+    /// Tremolo and auto-pan share their knobs because they share their
+    /// processor: only what the LFO is pointed at differs.
+    static TREMOLO: &[FxParamDesc] = &[
+        pd!("Rate", 0.35),
+        pd!("Depth", 0.50),
+        pd!("Shape", 0.00),
+        pd!("Spread", 0.00),
+        pd!("Wet", 1.00),
+    ];
+    static AUTOFILTER: &[FxParamDesc] = &[
+        pd!("Freq", 0.50),
+        pd!("Res", 0.40),
+        pd!("Mode", 0.00),
+        pd!("Rate", 0.35),
+        pd!("Depth", 0.50),
+        pd!("Shape", 0.00),
+        pd!("Spread", 0.00),
+        pd!("Env", 0.50),
+        pd!("Wet", 1.00),
+    ];
+    static BEATREPEAT: &[FxParamDesc] = &[
+        pd!("Interval", 0.75),
+        pd!("Grain", 0.40),
+        pd!("Chance", 1.00),
+        pd!("Decay", 1.00),
+        pd!("Wet", 1.00),
+    ];
+    /// The shifter and the ring modulator share their knobs the way the
+    /// tremolo and the auto-pan do: one processor, one carrier, two uses.
+    static FREQSHIFT: &[FxParamDesc] = &[pd!("Freq", 0.50), pd!("Spread", 0.00), pd!("Wet", 1.00)];
+    static SHIMMER: &[FxParamDesc] = &[
+        pd!("Size", 0.85),
+        pd!("PreDelay", 0.25),
+        pd!("Shift", 1.00),
+        pd!("Feedback", 0.50),
+        pd!("Damping", 0.50),
+        pd!("Width", 0.50),
+        pd!("Wet", 0.40),
+    ];
+    /// Voices, shape, key and scale are lists of names; the rest are knobs.
+    static HARMONIZER: &[FxParamDesc] = &[
+        pd!("Voices", 0.334),
+        pd!("Shape", 0.00),
+        pd!("Key", 0.00),
+        pd!("Scale", 0.20),
+        pd!("Detune", 0.32),
+        pd!("Delay", 0.36),
+        pd!("Env", 0.50),
+        pd!("Width", 1.00),
+        pd!("Wet", 0.50),
+    ];
     static CRUSH: &[FxParamDesc] = &[pd!("Bits", 0.70), pd!("Rate", 1.00), pd!("Wet", 1.00)];
     static VINYL: &[FxParamDesc] = &[
         pd!("Wow", 0.20),
@@ -604,6 +727,36 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
     ];
     static CASSETTE: &[FxParamDesc] = &[pd!("Drive", 0.40), pd!("Wet", 1.00)];
     static SOFTCLIP: &[FxParamDesc] = &[pd!("Drive", 0.25), pd!("Wet", 1.00)];
+    /// `Curve` and `Oversamp` are lists of names, not knobs — the shapes are
+    /// filled in by `param_descs`, from the DSP's own enums, so a label can
+    /// never drift from what the processor does.
+    static SATURATOR: &[FxParamDesc] = &[
+        pd!("Drive", 0.30),
+        pd!("Curve", 0.00),
+        pd!("Bias", 0.50),
+        pd!("Tone", 1.00),
+        pd!("Output", 0.50),
+        pd!("Oversamp", 0.3333),
+        pd!("Wet", 1.00),
+    ];
+    /// Eight points of a curve, then what happens around it. The points come
+    /// first because that is the order `Saturator::waveshaper` reads them and
+    /// the order the panel draws them as a bank.
+    static WAVESHAPER: &[FxParamDesc] = &[
+        pd!("P1", 0.00),
+        pd!("P2", 0.143),
+        pd!("P3", 0.286),
+        pd!("P4", 0.429),
+        pd!("P5", 0.571),
+        pd!("P6", 0.714),
+        pd!("P7", 0.857),
+        pd!("P8", 1.00),
+        pd!("Drive", 0.00),
+        pd!("Tone", 1.00),
+        pd!("Output", 0.50),
+        pd!("Oversamp", 0.6667),
+        pd!("Wet", 1.00),
+    ];
     static TUBESAT: &[FxParamDesc] = &[pd!("Drive", 0.15), pd!("Tone", 0.30), pd!("Wet", 0.60)];
     static WIDENER: &[FxParamDesc] = &[pd!("Width", 0.50), pd!("Wet", 1.00)];
     static ISOLATOR: &[FxParamDesc] = &[
@@ -634,10 +787,18 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         Chorus => CHORUS,
         Flanger => FLANGER,
         Phaser => PHASER,
+        Tremolo | AutoPan => TREMOLO,
+        AutoFilter => AUTOFILTER,
+        BeatRepeat => BEATREPEAT,
+        Harmonizer => HARMONIZER,
+        FreqShifter | RingMod => FREQSHIFT,
+        Shimmer => SHIMMER,
         BitCrusher => CRUSH,
         Vinyl => VINYL,
         Cassette => CASSETTE,
         SoftClip => SOFTCLIP,
+        Saturator => SATURATOR,
+        WaveShaper => WAVESHAPER,
         TubeSat => TUBESAT,
         Widener => WIDENER,
         Isolator => ISOLATOR,
@@ -742,9 +903,11 @@ impl AudioFxEntry {
     pub fn new(kind: AudioFxKind) -> Self {
         let descs = fx_param_descs(kind);
         let params: Vec<f32> = descs.iter().map(|d| d.default).collect();
+        // By name, not by position: a built-in whose knobs must be in the
+        // processor's `set_param` order cannot always put `Wet` last.
         let wet = descs
-            .last()
-            .filter(|d| d.name == "Wet")
+            .iter()
+            .find(|d| d.name == "Wet")
             .map(|d| d.default)
             .unwrap_or(1.0);
         Self {
@@ -805,6 +968,14 @@ impl AudioFxEntry {
                 | Chorus
                 | Flanger
                 | Phaser
+                | Tremolo
+                | AutoPan
+                | AutoFilter
+                | BeatRepeat
+                | FreqShifter
+                | RingMod
+                | Shimmer
+                | Harmonizer
                 | BitCrusher
                 | Vinyl
                 | Widener
@@ -881,11 +1052,20 @@ impl AudioFxEntry {
         true
     }
 
-    /// True when knob `index` is choz's dry/wet rather than a plugin parameter.
+    /// True when knob `index` is choz's dry/wet rather than a parameter of the
+    /// processor itself.
+    ///
+    /// A hosted plugin gets one appended after its own; a built-in declares it
+    /// as a knob called `Wet`. **Both have to answer yes**: the dry/wet lives
+    /// in `entry.wet`, and that is what a rebuild re-applies — a built-in that
+    /// answered "no" here kept its mix in `params` alone and lost it the next
+    /// time anything rebuilt the chain.
     pub fn is_mix_param(&self, index: usize) -> bool {
         match &self.plugin {
             Some(c) => index == c.params.len(),
-            None => false,
+            None => fx_param_descs(self.kind)
+                .get(index)
+                .is_some_and(|d| d.name == "Wet"),
         }
     }
 
@@ -915,6 +1095,147 @@ impl AudioFxEntry {
                 let mut descs = fx_param_descs(self.kind).to_vec();
                 // The preset row is a list of names, not a number: the same
                 // control a plugin's enumerated parameter gets.
+                // Same for the saturator's curve and oversampling factor:
+                // there is nothing between two curves, so they are named
+                // positions rather than a knob with a number on it.
+                if self.kind == AudioFxKind::Saturator || self.kind == AudioFxKind::WaveShaper {
+                    use choz_engine::fx::oversample::Factor;
+                    use choz_engine::fx::saturator::Curve;
+                    if let Some(d) = descs.iter_mut().find(|d| d.name == "Curve") {
+                        d.shape = ParamShape::Named(
+                            Curve::ALL
+                                .iter()
+                                .map(|c| (c.to_norm(), c.label().to_string()))
+                                .collect(),
+                        );
+                    }
+                    if let Some(d) = descs.iter_mut().find(|d| d.name == "Oversamp") {
+                        d.shape = ParamShape::Named(
+                            Factor::ALL
+                                .iter()
+                                .map(|f| (f.to_norm(), f.label().to_string()))
+                                .collect(),
+                        );
+                    }
+                }
+                // The detector mode, the EQ's target and the soloed band are
+                // positions with names, not numbers: "0.5" says nothing about
+                // whether the detector is following peaks or loudness.
+                // A modulation shape, a filter mode and a grid division are
+                // all names. The lists come from the DSP's own enums, so a
+                // label cannot drift from what the processor does.
+                if matches!(
+                    self.kind,
+                    AudioFxKind::Tremolo | AudioFxKind::AutoPan | AudioFxKind::AutoFilter
+                ) {
+                    use choz_engine::fx::lfo::Wave;
+                    if let Some(d) = descs.iter_mut().find(|d| d.name == "Shape") {
+                        d.shape = ParamShape::Named(
+                            Wave::ALL
+                                .iter()
+                                .map(|w| (w.to_norm(), w.label().to_string()))
+                                .collect(),
+                        );
+                    }
+                }
+                if self.kind == AudioFxKind::AutoFilter {
+                    use choz_engine::fx::auto_filter::FilterMode;
+                    if let Some(d) = descs.iter_mut().find(|d| d.name == "Mode") {
+                        d.shape = ParamShape::Named(
+                            FilterMode::ALL
+                                .iter()
+                                .map(|m| (m.to_norm(), m.label().to_string()))
+                                .collect(),
+                        );
+                    }
+                }
+                // A voice count, a chord shape, a key and a scale are all
+                // names. A knob at 0.4 does not say "four voices in D minor".
+                if self.kind == AudioFxKind::Harmonizer {
+                    use choz_engine::fx::autotune::{ScaleType, NOTE_NAMES};
+                    use choz_engine::fx::harmonizer::{Shape, VOICE_COUNTS};
+                    let named = |d: &mut FxParamDesc, items: Vec<String>| {
+                        let last = items.len().saturating_sub(1).max(1) as f32;
+                        d.shape = ParamShape::Named(
+                            items
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, n)| (i as f32 / last, n))
+                                .collect(),
+                        );
+                    };
+                    for d in descs.iter_mut() {
+                        match d.name.as_ref() {
+                            "Voices" => {
+                                named(d, VOICE_COUNTS.iter().map(|c| c.to_string()).collect())
+                            }
+                            "Shape" => named(
+                                d,
+                                Shape::ALL.iter().map(|s| s.label().to_string()).collect(),
+                            ),
+                            "Key" => {
+                                named(d, NOTE_NAMES.iter().map(|n| (*n).to_string()).collect())
+                            }
+                            "Scale" => named(
+                                d,
+                                ScaleType::ALL
+                                    .iter()
+                                    .map(|s| s.label().to_string())
+                                    .collect(),
+                            ),
+                            _ => {}
+                        }
+                    }
+                }
+                if self.kind == AudioFxKind::BeatRepeat {
+                    use choz_engine::fx::beat_repeat::{GRAINS, INTERVALS};
+                    let named = |list: &[(f32, &str)]| {
+                        let last = (list.len() - 1) as f32;
+                        ParamShape::Named(
+                            list.iter()
+                                .enumerate()
+                                .map(|(i, (_, name))| (i as f32 / last, (*name).to_string()))
+                                .collect(),
+                        )
+                    };
+                    if let Some(d) = descs.iter_mut().find(|d| d.name == "Interval") {
+                        d.shape = named(&INTERVALS);
+                    }
+                    if let Some(d) = descs.iter_mut().find(|d| d.name == "Grain") {
+                        d.shape = named(&GRAINS);
+                    }
+                }
+                if self.kind == AudioFxKind::Compressor {
+                    use choz_engine::fx::compressor::Detect;
+                    if let Some(d) = descs.iter_mut().find(|d| d.name == "Detect") {
+                        d.shape = ParamShape::Named(
+                            Detect::ALL
+                                .iter()
+                                .map(|m| (m.to_norm(), m.label().to_string()))
+                                .collect(),
+                        );
+                    }
+                }
+                if self.kind == AudioFxKind::ParamEq {
+                    use choz_engine::fx::parametric_eq::EqMode;
+                    if let Some(d) = descs.iter_mut().find(|d| d.name == "Mode") {
+                        d.shape = ParamShape::Named(
+                            EqMode::ALL
+                                .iter()
+                                .map(|m| (m.to_norm(), m.label().to_string()))
+                                .collect(),
+                        );
+                    }
+                    if let Some(d) = descs.iter_mut().find(|d| d.name == "Solo") {
+                        d.shape = ParamShape::Named(vec![
+                            (0.0, "off".to_string()),
+                            (0.25, "Low".to_string()),
+                            (0.5, "LowMid".to_string()),
+                            (0.75, "HiMid".to_string()),
+                            (1.0, "High".to_string()),
+                        ]);
+                    }
+                }
                 if self.kind == AudioFxKind::GraphicEq {
                     let last = choz_engine::fx::EQ_PRESETS.len().saturating_sub(1).max(1) as f32;
                     let points = choz_engine::fx::EQ_PRESETS

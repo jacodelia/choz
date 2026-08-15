@@ -25,6 +25,1372 @@ Todo lo de abajo — desde el commit inicial hasta hoy — es lo que lleva:
 - empaquetado `.deb`/`.rpm`/`install.sh` con entrada de escritorio, y una superficie de control de ejemplo para ESP32-S3 táctil.
 
 
+### 2026-08-15 (quinquies) — Harmonizer, y lo que AutoTune no es
+
+#### Añadido
+- **`Harmonizer`**: hasta ocho voces transpuestas, en la tonalidad.
+  - **Diatónico, no paralelo** — y esto es lo que lo hace musical: con clave y
+    escala puestas, un intervalo es un **número de grados de la escala**, no un
+    número fijo de semitonos. Una tercera sobre un Do en Do mayor es Mi (cuatro
+    semitonos); sobre un Re es Fa (tres). Desplazar todo una distancia
+    constante es el sonido de un pitch shifter barato, y se equivoca justo
+    donde se nota. `Chromatic` **es** "sin tonalidad", así que la armonía
+    paralela sigue estando, como una opción y no como un fallo.
+  - **Formas con nombre** en vez de ocho knobs de intervalo (ocho knobs es una
+    matriz): `3rds`, `5ths`, `OCT`, `ABOVE`, `BELOW`, `CLUSTER`, truncadas al
+    número de voces (1, 2, 4 u 8).
+  - **Micro-afinación** (`Detune`, hasta 25 cents repartidos entre las voces —
+    dos copias exactamente al mismo tono son una copia más fuerte), **delay
+    escalonado** por voz (llegar a la vez es un chorus; llegar 20 ms después es
+    otro cantante), **seguidor de envolvente** (las voces abren con la entrada,
+    así que un armonizador sobre un micro no canta en los huecos) y **anchura**
+    estéreo.
+  - Ocho voces **no** suenan ocho veces más fuerte: las copias están
+    correlacionadas, y hay un test que lo fija.
+- **`fx/shift.rs`**: el pitch shifter de dos cabezas, extraído de `shimmer.rs`,
+  que ahora comparten el shimmer y el armonizador. Estaba a punto de haber una
+  copia por efecto. 3 tests propios: la octava, la quinta, la octava abajo, la
+  unidad como cable, y acotado a cualquier ratio.
+
+#### Revisado: qué es y qué no es AutoTune
+Contra la lista pedida, y hay que decirlo claro porque los nombres se parecen:
+`AutoTune` es un **corrector de afinación monofónico** y eso es lo que hace
+bien. **No** tiene motor sinte de 8 voces, ni voz de ordenador, ni talkbox, ni
+pitch shifting polifónico — y no son ajustes que le falten, son otros efectos.
+El corrector *sigue* un tono; un motor de síntesis *genera* uno. Están en el
+roadmap con lo que costaría cada uno y en qué orden salen a cuenta (el vocoder
+primero: el banco de filtros ya está).
+- Lo único de esa lista que sí sale hoy —armonías orgánicas— es el
+  `Harmonizer`. Sus intervalos **no vienen de MIDI**: un `FxProcessor` recibe
+  audio y nada más, por diseño. La armonía dirigida por acordes vive en la
+  sección de algoritmos de entrada, donde hay notas.
+
+#### Roadmap
+- Sección nueva: **exportar los 44 efectos propios como plugins CLAP**.
+  `FxProcessor` ya tiene la forma de un plugin y choz ya hostea CLAP, así que
+  falta la otra mitad. CLAP encaja mejor que LV2 para esto por una razón
+  concreta: **no hay TTL** —los metadatos viven en el código, no en cientos de
+  líneas de Turtle que se desincronizan— y la *factory* publica los 44 desde un
+  solo binario. Lo que no viaja está anotado: el medidor y los presets son del
+  panel, no del DSP.
+
+### 2026-08-15 (quater) — Pure Data: medido primero, y la medida decidió la arquitectura
+
+El roadmap decía cuál era la primera prueba y por qué: *"cargar libpd, correr un
+patch de dos objetos sobre un bloque de audio, y medir qué cuesta. Si eso no
+sale, lo demás sobra."* Salió, y además contestó una pregunta que no se había
+hecho.
+
+#### Medido (libpd 0.56.2 de Debian)
+- Un patch de ganancia (`adc~ → *~ 0.5 → dac~`) cuesta **0.03 % del callback** a
+  128, 256 y 512 frames. Pure Data no es la parte cara de nada.
+- **Cero reservas de memoria por bloque.** Pd reserva cuando el grafo *cambia*,
+  no mientras corre.
+- **`libpd_new_instance()` devuelve null**: sin `PDINSTANCE`, hay **una Pd por
+  proceso**. Eso decide la arquitectura entera — dos efectos de Pd no pueden
+  convivir en un choz, así que **cada patch es un proceso**, que es justo lo que
+  `choz-plugin-sandbox` ya hace. La licencia sale gratis de ahí: el hijo enlaza
+  libpd (LGPL), el binario de choz no lo enlaza.
+- Detalle que costó una medida falsa: **sin `pd dsp 1` libpd no calcula nada** y
+  devuelve ceros muy rápido. La primera pasada de la sonda dio un coste
+  maravilloso y una salida de exactamente cero.
+
+#### Añadido
+- **`crates/choz-plugin-pd`**: lector de `.pd` (texto plano, **sin necesidad de
+  Pd instalado** — es lo que permite listar patches y decir por qué uno no
+  aparece), clasificación `Effect` / `InputAlgorithm` / `Unusable` según lo que
+  el patch conecta, y el camino real con libpd tras la feature `pd`, apagada por
+  defecto: un host que no compila sin Pure Data instalado es un host que nadie
+  puede compilar.
+- El parser separa por **puntos y coma sin escapar**, no por líneas: Pd parte
+  las líneas largas y escapa los `;` de verdad como `\;`, así que un parser por
+  líneas leería medio nombre de objeto. Con test.
+- 4 tests, uno de ellos el camino completo con libpd: patch abierto, bloque
+  procesado, `0.4 → 0.2`, y el segundo `open` rechazado porque hay una Pd por
+  proceso.
+
+### 2026-08-15 (ter) — Dónde se satura, dicho en pantalla
+
+Queda algo de saturación después de arreglar el callback. Las dos formas de
+saturar que quedaban no las decía nadie.
+
+#### Añadido
+- **Techo suave en el trim de entrada, y un `CLIP` que lo dice.** Un trim que
+  llega a +24 dB llega más allá de fondo de escala, y una señal pasada de ahí
+  es una onda cuadrada: satura lo que sale **y** le da al detector de tono una
+  forma de onda cuyo periodo ya no es el que se tocó. El techo es `tanh` —
+  degrada en compresión y no en una esquina — y se **cuenta**, porque un trim
+  que limita en silencio es un trim mal puesto. El knob `IN` escribe `CLIP` en
+  amarillo mientras ocurra.
+- **`CLIP` en la línea del transporte** cuando la mezcla pasa de fondo de
+  escala. Ahí clipa el dispositivo, y un clip duro es el peor sonido que puede
+  hacer una mesa. choz no lo limita —es un nivel, y el mixer es donde se pone—
+  pero deja de ser algo que hay que adivinar.
+
+#### Notas
+- Con esto el camino entero dice dónde se está pasando: el jack de entrada
+  tiene su nivel en el cajón IN, el trim avisa si recorta, cada efecto tiene su
+  medidor IN/OUT en la caja `SLOT`, y la salida avisa si clipa.
+- 2 tests: el trim limitando y contándolo (y no contando cuando cabe), y la
+  salida contando lo que pasa de fondo de escala.
+
+### 2026-08-15 (bis) — El detector se comía el callback, y con él el grafo entero
+
+Corrección de lo que dije ayer. Achaqué la degradación del audio del sistema al
+quantum forzado, y el usuario señaló lo que no encajaba: **pasa sólo al activar
+`A→M`**, y el quantum se fuerza al arrancar. Tenía razón, y el mecanismo real es
+peor.
+
+#### Corregido
+- **El detector se llevaba entre el 27 % y el 41 % del plazo del callback**
+  (medido, en debug; 15.7 % en release), *antes* del instrumento y de la cadena
+  de efectos. Un callback que se pasa de su plazo no glitchea a choz: glitchea
+  **el grafo**, y toda aplicación de la máquina se entrecorta con él. Eso es lo
+  que se oía como "encender ftom estropea el sonido de YouTube", y era cierto.
+  - **La causa**: el bucle de la función de diferencia leía la ventana a través
+    del anillo — **dos `%` por muestra, unas 300 000 por análisis** — y ensanchaba
+    a `f64` dos veces por iteración. Ambas cosas, dentro del hilo de audio.
+  - **El arreglo**: la ventana se endereza una vez por análisis (1024 copias) y
+    el bucle recorre dos slices planos, sin envolvente y vectorizable; la suma
+    interna se acumula en `f32` y se ensancha una sola vez al final (`running`
+    sigue en `f64`, que es la que crece de verdad).
+  - Medido después: **1.6 % del callback** a 128 frames. Diez veces menos.
+- Test permanente (`#[ignore]`, porque es un reloj) que falla si el análisis
+  vuelve a pasar del 8 % del callback en release. Se corre a mano:
+  `cargo test --release -p choz-engine --lib -- --ignored what_one_block`.
+
+#### Notas
+- El arreglo del quantum de ayer **sigue siendo correcto** y sigue haciendo
+  falta —forzar el reloj del grafo no es de choz— pero no era esto.
+- En **debug** el detector todavía cuesta un 20 % del callback a 128 frames.
+  choz se ejecuta en release (`cargo run --release`, o el paquete instalado);
+  en debug, con un plugin hosteado además, el presupuesto sigue siendo justo.
+
+### 2026-08-15 — choz le estaba moviendo el reloj a toda la máquina
+
+El reporte que lo destapó: **el sonido de YouTube también se oía saturado y sin
+definición mientras choz usaba esa entrada**. YouTube no pasa por choz, así que
+lo que fallaba no era el DSP.
+
+#### Corregido
+- **choz forzaba `node.force-quantum` y `node.force-rate` en el grafo entero**,
+  en cada arranque, siempre que el búfer fuera ≥ 128 — es decir, siempre. Y eso
+  no mueve el nodo de choz: mueve **PipeWire**. Todas las demás aplicaciones
+  pasan a resamplearse a lo que choz pidió, y un navegador reproduciendo 44.1
+  kHz por un headset que estaba contento a su ritmo sale fino y distorsionado.
+  - Ahora se respeta el ajuste que ya existía: `PW quantum: system` (0, el
+    valor por defecto) **pide** un periodo y no fuerza nada. Cualquier otro
+    valor fuerza ese quantum, con el suelo de 128 frames intacto porque un
+    quantum de 64 tira los endpoints de una interfaz USB.
+  - El ajuste llevaba desde que se escribió mostrándose en pantalla,
+    guardándose en `ui.json` y **sin aplicarse nunca**. Choz hacía justo lo
+    contrario de lo que decía la fila.
+- **La velocity se clavaba en 127.** Era `sqrt(rms) * 3`, que satura con
+  cualquier cosa por encima de −19 dBFS; y en cuanto el trim está lo bastante
+  alto para que el detector oiga un micrófono, **todas** las notas son 127. Un
+  mda ePiano a 127 durante toda una toma es exactamente la saturación
+  reportada. Ahora la escala va **del gate a fondo de escala**: lo más flojo que
+  cuenta como nota es velocity 1 y 0 dBFS es 127, así que sigue a `SENS` y no
+  necesita constante propia. Subir el trim ya no convierte cada nota en un
+  fortissimo.
+
+#### Añadido
+- **La nota que `A→M` está traduciendo se ve en el visor MIDI IN**, pedido: se
+  enciende en el teclado y en el ROLL como cualquier otra. Esas notas nacen en
+  el callback de audio y nunca viajan como MIDI, así que ésta era la única
+  vista donde no se podían ver — y un conversor que no se puede mirar sólo se
+  puede creer o no. Se apaga sola al cambiar de nota o al callarse, porque
+  nadie le manda un note-off.
+
+#### Notas
+- 3 tests: el quantum no forzado con el ajuste por defecto, la velocity leída
+  desde el gate (flojo < normal < fuerte, y "normal" con margen por encima), y
+  la nota convertida encendiendo su tecla y apagándose sola.
+- **Lo que queda de tu reporte y no es de choz**: la estática y el ruido de
+  fondo del H340 (incluidas las teclas) es lo que el micro capta con la
+  ganancia del previo donde esté puesta. Con el `PW quantum` ya sin forzar,
+  vuelve a probar: si YouTube suena bien otra vez, ése era el problema.
+
+### 2026-08-14 (septendecies) — La sibilancia se plegaba encima de la nota, y el `A→M` gana su dry/wet
+
+Reporte clave: **como multiefecto directo del micro suena perfecto**, y sólo
+`A→M` falla — cuesta que entre en dB negativos, y cuando entra "convierte el
+ruido en una frecuencia pero no en una nota".
+
+#### Corregido
+- **La diezmación era un filtro de caja.** Bajar de 48 kHz a 16 se hacía
+  promediando 3 muestras, y un promedio de 3 muestras deja pasar casi todo lo
+  que hay por encima de 8 kHz — que en una voz es **mucho**: sibilancia, aire,
+  el siseo de la sala. Todo eso se plegaba (alias) justo encima de la banda
+  donde vive la nota, así que el detector encontraba *un* periodo, pero no el
+  que se había cantado. Ahora hay un paso-bajo de verdad a **3.5 kHz** (dos
+  secciones, al rate de entrada) **antes** de promediar: por encima de la nota
+  más aguda que reporta y muy por debajo del Nyquist del rate de trabajo, así
+  que no quita nada de las notas y quita todo lo que se plegaría sobre ellas.
+  - Medido: un tono de 220 Hz con un siseo de 9.5 kHz encima **nunca** se
+    asentaba en la nota; ahora sí. Es el par simétrico del paso-alto contra el
+    retumbe: uno limpia por debajo de las notas y el otro por encima.
+- **El gate por defecto baja a −61 dBFS.** El nivel con el que se compara se
+  mide **después** de esos dos filtros, y los filtros quitan energía real de una
+  voz: lo que en el medidor de entrada marca −50 dBFS llega al detector más
+  bajo. Un gate por encima de la señal se lee como "no hace nada", que es el
+  peor de los dos fallos. `SENS` sigue yendo de −70 a −20 para subirlo.
+
+#### Añadido
+- **Dry/wet del `A→M`**, pedido: aparece **al encender el conversor** y no
+  antes (apagado no hay nada que mezclar), empieza en 100 % —el instrumento
+  solo, que es lo que hacía cuando no había elección— y el clic lo baja por
+  cuartos y da la vuelta; la rueda lo empuja y se para en los topes. Con él a
+  0 % se oye la entrada tal cual, y a la mitad la guitarra debajo del sinte que
+  está tocando, que es el sonido que casi todo el mundo busca de un conversor.
+  - `Slot.pitch_mix` en el motor con su comando, `RackSlot.pitch_mix` en la UI,
+    guardado en el proyecto (`None` en un fichero viejo = todo instrumento).
+  - Un segundo scratch (`RtState.dry`) sostiene la entrada mientras el
+    instrumento escribe sobre el primero. Reservado una vez, como el resto.
+
+#### Notas
+- 4 tests nuevos: la sibilancia sin tapar la nota, la mezcla del conversor en
+  sus tres puntos (todo instrumento, todo entrada, mitad y mitad), el control
+  apareciendo sólo con el conversor encendido y su vuelta al dar la vuelta.
+- Roadmap: dos secciones nuevas — **algoritmos de entrada como clasificación**
+  (el arpegiador y `A→M` son el mismo tipo de cosa y hoy son dos casos
+  especiales cableados en sitios distintos) y **Pure Data / Max MSP**, con las
+  decisiones que hay que tomar antes de escribir nada: hostear libpd en vez de
+  escribir un intérprete, la licencia LGPL contra el MIT de choz, el sandbox
+  que ya existe como sitio para correrlo, y que de Max lo honesto es importar
+  lo que se pueda y decir qué no.
+
+### 2026-08-14 (sedecies) — El knob que cortaba el sonido, el micro que se colaba y un trim que no llegaba
+
+Tres del mismo reporte con la UMC1820 delante.
+
+#### Corregido
+- **Mover un knob cortaba el sonido** en delay, space echo, Z5, Protocosmos y
+  cualquier cosa con cola. Había **dos caminos** para mover un parámetro y sólo
+  uno miraba `takes_live_params`: el del ratón y las flechas reconstruía la
+  cadena entera en **cada paso**, y una cadena reconstruida son procesadores
+  nuevos — el delay pierde sus ecos, el space echo su cinta, el granular sus
+  granos. Ahora los dos caminos hacen lo mismo: el valor va al procesador vivo,
+  y sólo se reconstruye lo que de verdad se construye una vez. Además se marca
+  en vez de hacerse, así que arrastrar un knob por el panel es **una**
+  reconstrucción al final del drenado y no una por paso.
+- **El micrófono se colaba junto al instrumento con `A→M` encendido.** El búfer
+  que se le pasa al instrumento todavía lleva la entrada, y `render` **no está
+  obligado a sobrescribir** lo que le dan: un plugin sin notas que tocar puede
+  sumar o puede no tocarlo. Se limpia antes de que el instrumento toque, que es
+  justo lo que este modo existe para garantizar. Test que falla sin la línea.
+- **El trim de entrada llegaba a +6 dB**, que para un micro dinámico es nada:
+  había que cantarle a dos centímetros para que `A→M` oyera una nota. Ahora
+  tiene su propio techo, **+24 dB** (`MAX_IN_GAIN`, separado del de la salida
+  del slot, que es otra cosa), y el knob se lee **en dB** en vez de como un
+  multiplicador — "×8.30" no es un número con el que nadie ajusta un micrófono.
+
+#### Notas
+- 2 tests nuevos: los cinco efectos que el usuario nombró sin reconstruir la
+  cadena al mover un knob (y `FilterBank`, que sí la necesita, todavía
+  pidiéndola), y el `A→M` sin filtrar la entrada hacia la mezcla.
+
+### 2026-08-14 (quindecies) — `A→M` estable: el retumbe fuera y un suelo de duración
+
+Pedido con la UMC1820 delante: que la nota se estabilice lo máximo posible, que
+el MIDI se mueva poco, sin microtonalidad, y una sola voz de polifonía.
+
+#### Corregido
+- **El retumbe de la sala volvía sordo al detector.** Un micro en una habitación
+  siempre trae algo por debajo de la nota más grave —una mesa, un ventilador, un
+  previo, pisadas— y a un detector de periodo eso le da un periodo. Medido: un
+  tono de 220 Hz con un retumbe de 41 Hz **5 dB más fuerte** hacía que el
+  tracker no reportara **nada en absoluto**, porque la mezcla no es periódica en
+  ninguno de los dos periodos. Ahora la entrada se pasa por un paso-alto a
+  60 Hz, justo bajo `MIN_NOTE`, de **24 dB/octava** (dos secciones): el retumbe
+  suele ser más fuerte que la nota, y una pendiente suave lo deja más fuerte
+  todavía. La diezmación que ya había es el otro extremo del filtro.
+  - `Biquad::highpass` en `fx/utility.rs`, al lado del `lowpass` que ya estaba.
+
+#### Añadido
+- **`MIN_NOTE_ANALYSES`: un suelo de ~130 ms antes de que nada pueda sustituir
+  a la nota que suena.** Los controles que había deciden *si una lectura es una
+  nota*; éste decide **cada cuánto se permite que la salida cambie**, que es lo
+  que se oye: un sinte re-disparado cada 30 ms es un zumbido fueran cuales
+  fueran las notas. Medido con dos notas alternándose cada 85 ms: **24
+  note-ons sin el suelo, 14 con él**.
+  - Cuesta lo que dice: una escala más rápida que eso sale con menos notas. Es
+    el trato de un conversor monofónico —una voz, sostenida— y por eso es una
+    constante y no un knob: quien quiera cada semitono de una escala rápida
+    quiere un teclado.
+
+#### Notas
+- **Sin microtonalidad, y estructuralmente**: `PitchEvent` no tiene ninguna
+  variante que lleve una fracción, así que no hay por dónde mandar pitch bend.
+  Un cuarto de tono sale como **una** nota entera y la fracción se queda en la
+  pantalla. Test nuevo de punta a punta.
+- **Una sola voz**, también con test: sobre un arpegio, un glissando, un
+  silencio y una vuelta, en ningún momento hay dos notas sonando a la vez.
+- Dos cambios que **no** se quedaron porque no se ganaron su sitio: sustituir
+  "N análisis seguidos" por una votación por mayoría, y un guardián de saltos de
+  octava. Los dos pasaban sus tests igual con la regla vieja —las lecturas malas
+  ya las rechaza el umbral de claridad antes de llegar ahí—, así que se
+  revirtieron en vez de quedarse como complejidad sin efecto medible.
+
+### 2026-08-14 (quaterdecies) — Una mezcla que no llega a ningún sitio lo dice
+
+Siguiendo el mismo reporte: el nombre del dispositivo de salida se guarda, y un
+**nombre sobrevive a la caja que lo llevaba**. Con la UMC1820 apagada, choz
+arrancaba pidiendo un sink que ya no tiene puertos, `connect()` se rendía con un
+`eprintln!` a un fichero de log que nadie abre, y la mezcla se calculaba entera
+para no ir a ninguna parte. Desde fuera: el WAVE se mueve, los medidores de FX
+marcan, y no se oye nada — indistinguible de un efecto roto.
+
+#### Añadido
+- **Caída a un sink que existe**: si el guardado no tiene puertos de playback,
+  `connect()` busca otro en el grafo (prefiriendo un `alsa_output` real sobre un
+  loopback) y dice cuál usó en su lugar. Devuelve además **a qué sink acabó
+  yendo y cuántos de nuestros puertos llegaron**, así que `output_device` deja de
+  ser lo que se pidió y pasa a ser lo que se consiguió.
+- **`AudioEngine::output_wired()`** y, con él, `NOT CONNECTED` en amarillo en la
+  línea `OUT` del panel TRANSPORT. Sin motor abierto también avisa: un stream
+  que nunca abrió es la versión más ruidosa de "no sale nada".
+- Los fallos de conexión de salida ya no se descartan uno a uno: cada
+  `connect_ports_by_name` que falla se nombra.
+
+#### Notas
+- Es el mismo bug de forma que el de la captura de ayer: **un fallo que sólo va
+  al log es un fallo invisible**. Los dos sitios donde choz se cablea al grafo
+  lo tenían, y los dos hablan ahora.
+- 1 test: la línea del transporte avisando cuando nada está cableado.
+
+### 2026-08-14 (terdecies) — El nivel de cada jack, `mtof` fuera, `TAP` en su sitio
+
+Tres cosas del reporte de hardware: el audio entrante sigue sin oírse, y las
+otras dos son decisiones del usuario.
+
+#### Añadido
+- **`meter::capture_levels`: el pico de cada jack de entrada**, publicado en el
+  callback antes de que ningún slot decida nada, y escrito en la fila de ese
+  jack en el cajón IN (`3  capture_1   -12dB`, o `--` cuando no llega nada).
+  Es la lectura que separa las tres formas en que el audio en vivo desaparece —
+  **no llega** (la conexión no se hizo o el dispositivo no está abierto), **llega
+  y no se rutea**, y **se rutea y el problema es el efecto**— que sin ella se
+  ven exactamente igual. Dos rondas de este reporte se han ido en distinguirlas
+  a ciegas.
+- **Las conexiones de captura de JACK ya no se hacen con el error descartado.**
+  Eran un `let _ = connect_ports_by_name(...)`: si PipeWire se negaba, choz se
+  quedaba con puertos de entrada cableados a nada y **nadie se enteraba** —
+  idéntico a un efecto roto. Ahora dice cuáles fallaron y por qué.
+
+#### Eliminado
+- **`mtof` entero** (`crates/choz-ui/src/mtof.rs`, el botón `M→P`, `AMT`, los
+  campos del slot y del proyecto, el modo de puntero y sus siete tests).
+  Decisión del usuario: choz lleva **`ftom` y nada más** — audio a notas, para
+  meter una guitarra o un micro en un plugin como Surge XT sin una cápsula MIDI
+  tipo GI-20. La dirección contraria (una nota moviendo un parámetro) no es lo
+  que este programa hace.
+
+#### Cambiado
+- **`TAP` se dibuja sobre el borde superior de la caja del arpegiador**, a la
+  derecha, en vez de flotar en la fila de encima. Es un gesto del arpegiador y
+  ahora está donde vive; en las formas que *son* una fila de botones sigue en la
+  fila, porque allí no hay caja sobre la que ponerlo.
+
+#### Notas
+- El timing del arpegiador queda **aplazado por decisión explícita**, con el
+  coste ya medido escrito en el roadmap.
+
+### 2026-08-14 (duodecies) — La deriva de la captura, en pantalla
+
+Lo añadido ayer abrió una pregunta que sólo el hardware podía contestar ("¿cuánto
+deriva en mi máquina?") y ninguna forma de contestarla salvo tocar una hora y
+ver. Ahora es un número.
+
+#### Añadido
+- **`meter::capture_health`**: dos contadores relajados que `drain_capture`
+  mueve sólo cuando algo va mal — **late** (un bloque en el que la entrada no
+  había producido bastante, rellenado con silencio) y **dropped** (muestras
+  tiradas porque la entrada iba por delante y el backlog se estaba volviendo
+  latencia). Se ponen a cero al reabrir el stream, así que los números son del
+  dispositivo que está abierto ahora.
+- **El cajón IN los escribe** en su cabecera —`AUDIO IN (2) · 3 late, 512
+  dropped`— y **calla mientras se porta bien**: un contador a cero es ruido en
+  un panel de este ancho. Es la diferencia entre "mi micro chasquea a veces" y
+  algo que se puede señalar y medir.
+- Sólo se mueven en los backends cpal: el cliente JACK nativo entrega captura y
+  reproducción al mismo callback, así que no hay contra qué derivar.
+
+#### Notas
+- 2 tests: el anillo contando sus dos derivas (un bloque corto = un `late`, y el
+  backlog recortado contado en muestras), y la cabecera del cajón callando en
+  reposo y hablando en cuanto los contadores se mueven.
+
+### 2026-08-14 (undecies) — choz como multiefecto sin JACK: entrada de audio elegible
+
+Reportado desde el hardware: micrófono de un headset H340 seleccionado, el visor
+WAVE mostrando señal, y los efectos sin hacer nada. Diagnóstico: **fuera del
+cliente JACK nativo no existía ningún camino de captura**. `build_input_stream`
+no aparecía en el código; `rescan_inputs` respondía literalmente "audio input
+needs the native JACK client"; y `all_capture_ports()` abre su *propio* cliente
+de sondeo, así que el cajón IN ofrecía micrófonos que el backend en marcha no
+podía entregar.
+
+#### Añadido
+- **Captura por cpal** (ALSA, PulseAudio, PipeWire). Un stream de entrada propio
+  y un anillo sin locks (`rtrb`) hasta el callback de salida: JACK entrega
+  reproducción y captura al **mismo** callback, cpal les da callbacks distintos
+  con relojes distintos, y entre dos hilos de audio lo único que puede pasar es
+  un anillo.
+- **`RtState::drain_capture`**, que responde por las dos derivas: **corto** (la
+  entrada aún no ha producido) rellena con silencio en vez de repetir audio
+  viejo; **largo** (la entrada va por delante) tira todo lo que pase de dos
+  bloques de reserva, porque un anillo al que se le deja llenarse es latencia
+  que crece toda la noche y no vuelve.
+- **Fila `Input` en `EDIT → Settings → AUDIO → Engine`**, debajo de `Device`:
+  cicla `(off)` y los dispositivos de captura del sistema, **aplica al momento**
+  igual que la salida, y se guarda en `ui.json` (`audio.input_device`). Empieza
+  apagada y un `ui.json` viejo abre apagado: un host que se queda con el
+  micrófono al arrancar es un host que nadie pidió.
+- **El rate no se negocia**: la captura se abre al rate al que ya corre el motor
+  o no se abre, y el error dice que se cambie en Settings. Un micrófono que sale
+  un tono más agudo es peor que uno que explica por qué no abre.
+- **El cajón IN dice dónde encenderla** cuando no hay entrada:
+  `AUDIO IN (0) — EDIT > Settings > AUDIO > Input`. "Aquí no hay nada" y "esto
+  no funciona" se ven igual, y esa confusión es exactamente la de este reporte.
+- `rescan_inputs` ya no falla fuera de JACK: reabre el dispositivo, así que un
+  headset enchufado después de arrancar aparece.
+
+#### Notas
+- El camino motor→FX **ya era correcto** y ahora hay dos tests que lo fijan: un
+  efecto sobre una tab alimentada por captura procesa la entrada, y lo hace
+  **con el transporte parado** — un multiefecto no es un secuenciador, un
+  micrófono no espera al botón de play. Ninguno de los dos existía; por eso el
+  fallo pudo llegar hasta el hardware.
+- 3 tests nuevos: los dos de arriba más el del anillo en sus dos derivas
+  (bloque exacto, anillo vacío = silencio, y 100 bloques encolados recortados a
+  la reserva quedándose con lo **reciente**, no con lo viejo).
+- Cambiar de dispositivo de entrada reconstruye el stream, y un stream nuevo no
+  tiene slots: pasa por `rebuild_rack()`, el mismo camino que el cambio de
+  salida. Se extrajo `AudioEngine::restart_cpal()` para que las dos puntas del
+  audio compartan esa operación en vez de tener cada una su copia.
+
+### 2026-08-14 (decies) — Un knob que se desliga vuelve a su sitio, y 563 líneas menos
+
+#### Añadido
+- **`mtof` devuelve el parámetro al desligarlo.** Ligar apunta las notas a un
+  knob *y se acuerda de dónde estaba*; desligar lo pone de vuelta. Mientras
+  estuvo ligado el valor era de la nota, no del usuario, así que dejarlo donde
+  cayó la última es dejar un knob en un sitio que no eligió nadie. Re-apuntar a
+  otro knob devuelve el primero y **lee el "antes" del segundo después de la
+  devolución**, para no grabar como suyo el valor que dejó una nota.
+  - `RackSlot.mtof_prev` **no se guarda en el proyecto**: es el valor del knob
+    de *esta* sesión, y un número de otra se restauraría sobre el plugin que
+    hoy esté en ese slot.
+  - Lo que no se puede leer no se puede devolver: `target_value` sólo ve la tab
+    activa y su FX seleccionado, así que ligar en una unidad y desligar desde
+    otra deja el parámetro donde lo dejaron las notas. Es el mismo límite que
+    tienen las automatizaciones, y por el mismo motivo.
+
+#### Eliminado
+- **`registry.rs`, `scanner.rs` y `plugin_types.rs`** — 563 líneas de infra
+  vieja, casi toda `#[allow(dead_code)]`, a la que sólo llegaba un campo
+  (`App.registry`) que nadie leía nunca. El roadmap llevaba desde julio con
+  "decidir si se borra"; decidido. El camino real son los crates
+  `choz-plugin-*` más `paths.rs`, y ahora es el único.
+
+#### Notas
+- **El timing del arpegiador se queda pendiente a propósito**, y el roadmap
+  lleva ahora por qué: programar las notas con sello de tiempo deja el error en
+  un bloque (1–3 ms) en vez de en cero, y para que sea exacto hay que partir el
+  render por slot en los puntos donde caen las notas — o sea llamar a
+  `source.render` varias veces por bloque con trozos pequeños, que para un
+  plugin hosteado es otra cosa. Más sacar la generación de notas de donde vive
+  el ruteo, y `MIDI OUT`, que no se puede programar por adelantado. 5 ms de
+  retraso contra tocar todo eso: no sale a cuenta hoy.
+- 2 tests nuevos de `mtof` (el knob volviendo al desligar, y re-apuntar
+  devolviendo el primero sin heredar su valor).
+
+### 2026-08-14 (nonies) — Analizador de espectro (fase 6, y con ella el punto 2 entero)
+
+#### Añadido
+- **Anillo sin diezmar en el meter** (`meter::SPECTRUM_POINTS`, 2048 muestras):
+  el anillo `wave` que ya existía guarda **un punto por rebanada de bloque**,
+  que es un dibujo de la envolvente y nada sobre lo que se pueda correr una
+  FFT. El nuevo guarda cada frame — un store relajado por frame, que es lo que
+  cuesta un bloque de 256 — y a 48 kHz son 43 ms de sonido y 23 Hz por bin.
+- **`choz-ui/src/spectrum.rs`**: ventana de Hann, FFT radix-2 iterativa escrita
+  a mano (40 líneas; una dependencia cuyo planificador SIMD no vale nada a este
+  tamaño), magnitudes en dB con suelo a −78, y **peak hold por bin** que baja
+  1.4 dB por redibujo. Por bin y no por columna: redimensionar el panel no tira
+  los picos. Corre **en el hilo de UI y sólo con su pestaña en pantalla** — una
+  FFT que nadie mira es una FFT que nadie debe pagar.
+- **Pestaña `SPEC`** en el panel MIDI IN (`MIDI │ KEYS │ ROLL │ WAVE │ SPEC │
+  ACTIVITY`): media-cuadros, así que un panel de ocho filas lleva dieciséis
+  escalones; escala **logarítmica** de 20 Hz a 20 kHz, el pico sostenido
+  dibujado **encima** de la barra y en otro color, y una fila de eje con
+  `100 / 1k / 10k` — sin eso una escala logarítmica es un dibujo de nada en
+  particular. Cada columna se queda con **el bin más alto** que cubre, no con
+  la media: en el agudo una columna cubre cientos de bins, y promediar esconde
+  justo el pico que el analizador existe para enseñar.
+- La escala está calibrada: un seno a fondo de escala lee 0 dB y la mitad de
+  amplitud lee 6 dB menos, que es la única forma de saber que es una escala y
+  no una forma.
+
+#### Notas
+- 10 tests: el tono en su bin y a su nivel, los −6 dB al partir la amplitud por
+  dos, el silencio en el suelo con el peak hold todavía bajando, el peak hold
+  llegando al suelo, las octavas del mismo ancho, el tono en su columna, el
+  ancho cero, la transformada contra un impulso y contra DC, el dibujo con el
+  tono en la columna que le toca y el silencio vacío, y el panel sin sitio.
+- Con esto la **fase 6 y el punto 2 del roadmap quedan cerrados**. Las reglas
+  de DSP y el patrón de tests por efecto se mudan del roadmap a
+  `docs/architecture.md`, que es donde vive lo que sigue siendo ley.
+
+### 2026-08-14 (octies) — Frecuencia y espacio (fase 5 del punto 2)
+
+#### Añadido
+- **`FreqShifter` y `RingMod`**, un procesador con dos usos de la misma
+  portadora. Multiplicar por un seno da **las dos** bandas laterales — eso es el
+  ring mod, y es una línea. Quedarse con una sola necesita la señal analítica:
+  el par de cadenas all-pass (Hilbert polifásico) que mantienen 90° de
+  diferencia en toda la banda, y entonces `out = re·cos(θ) + im·sin(θ)`.
+  **No es un pitch shifter**: mueve cada parcial los mismos Hz, así que un
+  sonido armónico deja de serlo — que es justo para lo que se usa.
+- **`ShimmerReverb`**: pre-delay → reverb → pitch shift **dentro del lazo** →
+  paso-bajo de amortiguación → realimentación. Dentro, no después: uno detrás
+  daría una sola copia transpuesta y ningún ascenso. Reutiliza el `Reverb`
+  Freeverb que ya existía; el shifter es de dos cabezas cruzadas con `sin²/cos²`
+  (que suman exactamente uno, así que el salto de cada cabeza cae donde esa
+  cabeza está callada). Desplazamiento **cuantizado a semitonos** de −12 a +24:
+  un shimmer a 11.6 semitonos está desafinado con lo que sea que suene.
+- Medido: 43 dB de rechazo de la banda lateral no deseada en el shifter, y el
+  segundo octavado del shimmer se ve en la cola a los dos segundos.
+
+#### Corregido / decidido
+- **La cadena que lleva el retardo de una muestra del par de Hilbert era la
+  equivocada.** Con el retardo en la cadena B el rechazo era de 16 dB —
+  audible como "el shifter produce las dos bandas". Con él en la A, 43 dB.
+  Medido con un Goertzel, que es la única forma honesta de elegir el convenio
+  de signos de un par de Hilbert.
+- **El shimmer realimentaba un escalar por chunk**, así que el resultado
+  dependía del tamaño de bloque (0.33 de diferencia entre 512 y 97 muestras).
+  Ahora el reverb se procesa **frame a frame** y el lazo tiene exactamente una
+  muestra de retardo, venga el bloque que venga. Se fue el búfer de scratch.
+- **El shifter leía hacia atrás**: `read` se usaba como distancia y a la vez se
+  incrementaba, así que la cabeza retrocedía. Ahora la distancia a la cabeza de
+  escritura se **cierra** a `ratio − 1` por muestra y envuelve en la ventana.
+- **El lazo no se estabiliza con una constante.** El reverb de dentro es un
+  banco de peines *resonantes*: su ganancia en sus resonancias está muy por
+  encima del 1.17 que enseña con ruido de banda ancha, y se mueve con el tamaño
+  de sala. Medido, a 0.26 de realimentación todavía crecía sin límite a los
+  diez segundos. La solución es estructural — un **saturador en el lazo**
+  (`tanh` escalado, techo 1/3) —, no un número: con poca realimentación se
+  apaga, y al máximo se asienta en un wash en vez de explotar.
+- **La "reverb de sala barata" no se escribe**: el Freeverb que ya existe *es*
+  una reverb de sala con `Room` bajo, y su preset de 0.30 ya está ahí. Una
+  segunda sería el mismo algoritmo con otro nombre.
+
+#### Notas
+- 11 tests nuevos: el tono desplazado 200 Hz aterrizando en 1200 y no en 800,
+  el desplazamiento negativo, el shift a cero sin mover el nivel, el ring mod
+  dando las dos bandas iguales, el shifter subiendo la octava por su cuenta, la
+  cola del shimmer trepando, sin realimentación no trepando, el lazo apagándose
+  con poca y acotado a tope, el tamaño de bloque irrelevante, y los extremos.
+
+### 2026-08-14 (septies) — Modulación y tiempo (fase 4 del punto 2)
+
+Cuatro efectos nuevos y un delay que ya no lee en enteros. Todo cuelga de un
+LFO único, porque siete formas copiadas en cuatro ficheros son siete formas que
+acaban siendo distintas.
+
+#### Añadido
+- **`fx/lfo.rs`** — el LFO que usan todos: siete formas (seno, triángulo,
+  sierra, rampa, cuadrada, S&H y random suave), **desfase estéreo** y estado
+  aleatorio **por canal**, redibujado cuando envuelve *su* fase — un offset que
+  escalona los dos canales a la vez no es un offset. xorshift de semilla fija:
+  la misma sesión da el mismo temblor, que es lo único que hace testeable una
+  modulación aleatoria.
+- **`Tremolo` y `AutoPan`**: un procesador, dos efectos (como `Saturator` y
+  `WaveShaper`). El trémolo modula **hacia abajo desde la unidad**, así que
+  encenderlo nunca sube el nivel de la tab; el auto-pan es de potencia
+  constante, así que barrer la imagen no hace un bache en el centro. El `Pan`
+  estático se queda como está: "esta tab un poco a la izquierda" no es una
+  modulación.
+- **`AutoFilter`**: SVF de Simper con **coeficientes por canal** (dos cutoffs
+  distintos es lo que significa un desfase estéreo), LFO con las siete formas,
+  seguidor de envolvente con cantidad **con signo** (negativo = se cierra al
+  tocar más fuerte) y modos LP/BP/HP. La envolvente escucha **la entrada, no la
+  salida**: si oyera su propio filtrado, un filtro que se cierra se cerraría
+  más y el efecto se comería a sí mismo.
+- **`BeatRepeat`** sincronizado al transporte de choz. Cada `Interval` negras
+  tira un dado contra `Chance`; si gana, **captura pasando la señal** (un beat
+  repeat que se calla mientras escucha es un agujero en el compás) y luego
+  repite el grano con `Decay` por vuelta. **Transporte parado = pasa de largo**:
+  la posición no avanza, así que no hay rejilla, e inventarla lo pondría donde
+  el resto del rack no está.
+- **Delay modulado, con interpolación**: lectura fraccionaria (`read_frac`) y
+  knobs `ModRate`/`ModDepth`. Las dos cabezas van a media fase, así que las
+  repeticiones se ensanchan en vez de sólo desafinarse. El ping-pong ya estaba.
+
+#### Corregido
+- **El knob `Wet` de un built-in se perdía en cada rebuild.** `is_mix_param`
+  sólo decía "sí" para plugins, así que la mezcla de un efecto propio vivía en
+  `params` y no en `entry.wet` — que es lo que la cadena vuelve a aplicar.
+  Bajabas el Wet de un delay, añadías otro efecto, y el delay volvía a estar al
+  100 %. Ahora un desc llamado `Wet` **es** el dry/wet, venga de un plugin o no.
+- **`BeatRepeat` cruzaba de compás con un click de 0.375** cuando un repeat
+  daba paso a una captura nueva: el fundido de salida sólo se armaba al volver
+  al silencio. Salir de un repeat siempre lo arma, vaya a donde vaya.
+- **La rejilla derivaba en `f32`**: sumar 4e-5 a una posición que crece, 48 000
+  veces, movía el límite de compás 30 muestras antes de tiempo. La posición se
+  cuenta ahora en `f64` desde el principio del bloque, no acumulando.
+
+#### Notas
+- Tremolo, auto-pan, auto-filter y beat repeat toman valores **en vivo**
+  (`takes_live_params`), así que mover un knob no reconstruye la cadena — que
+  en el beat repeat significaría tirar el grano capturado.
+- Los coeficientes del auto-filter se recalculan **cada 16 frames**, no cada
+  muestra: a 20 Hz de LFO eso es un tercio de milisegundo de retraso, por la
+  dieciseisava parte de las `tan()`.
+- 22 tests nuevos (5 del LFO, 6 del trémolo/auto-pan, 5 del auto-filter,
+  6 del beat repeat) + 2 del delay modulado.
+
+### 2026-08-14 (sexies) — `WaveShaper`: la curva se dibuja (fase 3 del punto 2)
+
+El roadmap decía "el DSP es el mismo waveshaper con una tabla en vez de una
+fórmula". Lo es, literalmente: **no hay procesador nuevo**.
+
+#### Añadido
+- **`AudioFxKind::WaveShaper`** — el mismo `Saturator`, construido por
+  `Saturator::waveshaper()`. El oversampler, el bloqueo de DC, el filtro de tono
+  y el medidor son lo que hace usable a un waveshaper y ya estaban ahí; lo único
+  que cambia es de dónde sale la curva. `Shape::{Curve, Table}` sustituye al
+  campo `curve`, y `name()` responde `WaveShaper` o `Saturator` según cuál sea.
+- **`saturator::Table`**: ocho puntos (`TABLE_POINTS`) repartidos sobre −1…+1,
+  rectas entre ellos y **plano fuera** — no extrapolado, porque una recta que
+  sigue subiendo es un waveshaper que no puede prometer salida acotada, y todas
+  las demás curvas de este fichero sí pueden. Por defecto es la identidad: meter
+  el efecto y no tocar nada no cambia nada.
+- **La curva se edita dibujándola**: los ocho puntos se pintan con
+  `draw_eq_bank` — la misma función que dibuja el EQ gráfico, que ya trae sus
+  rects de clic y su cursor. **No hay editor de curvas que escribir**: el dibujo
+  *es* el editor. Las etiquetas de las columnas son el nivel de entrada
+  (`-1.0 … +1.0`), no `P1…P8`, porque "P3" no dice dónde cae el punto.
+- Oversampling por defecto **4x**: una tabla con esquinas hace mucho más
+  aliasing que un `tanh`, y la esquina es justo lo que se ha dibujado a mano.
+
+#### Corregido
+- El test `every_preset_names_knobs_that_exist` tenía **su propia copia** de la
+  lista de efectos; ahora usa `ALL_FX_KINDS`. La copia se habría quedado atrás
+  justo el día en que se añade un efecto, que es el día en que el test sirve.
+
+#### Notas
+- 3 tests de DSP (la identidad es un cable, cualquier curva dibujada acotada y
+  finita —incluida la de dientes de sierra entre raíles a 8x—, y una curva
+  invertida invierte la señal) + 1 de UI (los ocho puntos con su rect, la
+  identidad subiendo de izquierda a derecha y el eje de entrada escrito).
+- Una identidad **no** sale idéntica muestra a muestra: el bloqueo de DC a 10 Hz
+  y el tono a 18 kHz dejan un par de grados de fase a 220 Hz. Lo que el test
+  exige es que el nivel no se mueva.
+
+### 2026-08-14 (quinquies) — Dinámica y EQ de verdad (fase 2 del punto 2)
+
+Los cuatro procesadores de dinámica y EQ que ya existían tenían la topología
+correcta y los controles de una demo. Esto les pone lo que decide si sirven.
+
+#### Añadido
+- **Detector del compresor**: `Detect::{Peak, Rms, RmsFast}` — ventana de
+  30 ms y de 3 ms, calculada como un polo sobre `x²`. Es la diferencia entre
+  tratar una caja como un pico o como parte del nivel, y se elige por su nombre
+  (`ParamShape::Named` sacada del enum del DSP, no una etiqueta a mano).
+- **Stereo link** (0..1) en compresor y limitador: con 1 los dos canales siguen
+  al más alto, con 0 cada uno se comprime solo. Hay **dos envolventes y dos
+  suavizadores de ganancia**, no uno; el link mezcla el detector, que es donde
+  se decide si un canal duro arrastra al otro y mueve la imagen.
+- **Paso-alto de sidechain** (20–500 Hz) sobre el detector, no sobre el audio:
+  un bombo deja de mandar en la ganancia sin que el bombo se vaya de la mezcla.
+  A 20 Hz está apagado de verdad, porque ahí no hay nada que quitar.
+- **Lookahead real en el limitador**: anillo entrelazado dimensionado una vez
+  (10 ms a 192 kHz), el detector mira la muestra que llega y la ganancia se
+  aplica a la que ya pasó, así que el ataque llega con la ganancia abajo. Se
+  reporta por `FxProcessor::latency_samples`, o sea que la caja `SLOT` ya lo
+  escribe en ms. Knob `Look` de 0 a 10 ms.
+- **Histéresis y máquina de estados en el gate**: `GateState::{Closed, Attack,
+  Open, Hold, Release}` sustituye a `is_open` + contador (dos cosas que podían
+  contradecirse). Abre en `Thresh` y cierra en `Thresh − Hyst`: con un solo
+  umbral, una señal parada encima castañetea varias veces por segundo.
+- **EQ paramétrico apuntable**: `EqMode::{Stereo, L only, R only, Mid, Side}`.
+  Un juego de bandas con destino, no dos curvas que editar — cubre "quita la
+  sibilancia sólo de los lados" y "la suciedad está en la izquierda" por el
+  precio de un knob. El componente que no se procesa sale **byte por byte** como
+  entró.
+- **Solo por banda** (`Solo`: off + las cuatro bandas): un paso-banda a la
+  frecuencia y Q de la banda elegida, con su biquad reservado en el constructor
+  — escuchar una banda no reserva memoria.
+- **Curva de respuesta dibujada** bajo los knobs del EQ (6 filas, 20 Hz–20 kHz
+  en log, ±18 dB), en verde lo que sube y en rojo lo que baja, con marcas en
+  100/1k/10k. Sale de `ParametricEq::response_db`, que calcula |H(e^jw)| **de
+  los mismos coeficientes que procesan el audio**: un test comprueba contra un
+  seno que lo dibujado y lo medido no se separan más de 0.5 dB. Si no quedan
+  filas, no se dibuja y no consume ninguna.
+
+#### Corregido
+- **El knob `HiMid` del EQ paramétrico no movía nada**: el constructor escribía
+  `bands[3].gain_db` dos veces y la segunda (`High`) pisaba la primera. Y
+  `bands[0]` era un paso-alto fijo a 80 Hz que ningún knob alcanzaba y por el
+  que pasaba todo. Ahora son **cuatro knobs y cuatro bandas**: shelf grave,
+  peak a 250, peak a 2k y shelf agudo, con `MidQ` sobre los dos peaks. El
+  preset "Presence", que movía el knob muerto, ahora hace lo que dice.
+- El mapeo de parámetros del EQ vive en `ParametricEq::from_params`, y lo
+  llaman tanto la cadena como el dibujo de la curva: dos copias serían una
+  curva que miente el día que se toque una de ellas.
+
+#### Notas
+- El orden de los knobs de compresor, limitador y gate **es** el orden de
+  `set_param` del procesador, porque los tres toman valores en vivo
+  (`takes_live_params`) y el índice del knob es el índice que se escribe.
+- 10 tests nuevos: lookahead contra el primer pico, RMS dejando pasar una
+  espiga de 1 ms que el pico sí caza, el link decidiendo si un canal agacha al
+  otro, el sidechain sordo a 40 Hz, la histéresis sosteniendo una señal parada
+  entre los dos umbrales, el hold contando, mid/side dejando intacto lo que no
+  procesa, el solo dejando sólo su banda, la curva contra un seno, y la curva
+  rindiéndose cuando no hay filas.
+
+### 2026-08-14 (quater) — Una tab puede tocar hacia fuera (MIDI OUT)
+
+Punto 1.1 del roadmap: el destino que faltaba de la cadena `fuente → ARP →
+destino`. El arpegiador ya no termina forzosamente en el plugin de su propia tab.
+
+#### Añadido
+- **`midi::MidiOut`**: puerto de salida abierto por nombre, con la lista de lo
+  que tiene sonando. Corta **nota por nota**, no con CC 123: un sintetizador que
+  ignora "all notes off" queda zumbando hasta que se apaga, y la lista de lo que
+  está pisado está justo ahí. Se comparte por nombre (`App.midi_outs`) porque
+  ALSA le da un puerto a un cliente y dos tabs apuntando al mismo serían dos
+  conexiones que no se pueden abrir.
+- **`RackSlot.midi_out: Option<String>`** — el **nombre**, no un índice: los
+  puertos van y vienen, y un índice a una lista que cambió con choz cerrado
+  apunta al sintetizador de otro. Se guarda en el proyecto.
+- **Sección `MIDI OUT` en el cajón OUT**, con la misma gramática que los canales:
+  Enter/clic liga, otra vez desliga, y la fila dice qué tabs ya la usan
+  (`← tab 1,2`).
+- **Un solo embudo**: `App::send_note` es por donde pasan las teclas, lo que
+  toca el arpegiador y los note-offs del `PANIC`. Un segundo destino que unos
+  caminos conocen y otros no es un sintetizador zumbando por el camino que se
+  olvidó.
+
+#### Notas
+- `PANIC` alcanza los puertos abiertos, que es lo mínimo que se le pide al botón
+  cuando hay un cable de por medio.
+- 395 tests, `clippy --workspace --all-targets -D warnings` limpio.
+
+### 2026-08-14 (ter) — Reloj MIDI externo
+
+Lo último que le faltaba al arpegiador para tocar con otra máquina: esclavizarse
+a un reloj de fuera.
+
+#### Añadido
+- **`ClockCounter` en `midi.rs`**, dentro del callback del puerto — que es el
+  último sitio donde el sello de tiempo es honesto; un pulso leído desde el
+  bucle de UI trae la jitter de ese bucle. Cuenta los 0xF8 y **promedia sobre
+  una negra entera** (24 pulsos): un solo intervalo carga con toda la jitter del
+  cable y del emisor. El pulso que cierra una negra **abre la siguiente**, o
+  cada medición perdería un tiempo.
+- **`InputEvent::Clock(ClockMsg)`** con `Start`, `Continue`, `Stop` y
+  `Tempo(bpm)` — un mensaje por negra, no veinticuatro. Sin puerto de origen:
+  hay un reloj, y dos puertos mandándolo es un problema de cableado, no algo que
+  promediar.
+- **`START` rebobina y arranca, `CONTINUE` arranca donde quedó, `STOP` para** —
+  esa es la diferencia entre los dos primeros, y es la que hace útil el
+  `CONTINUE`. El tempo se escribe directo al transporte: el emisor **es** el
+  reloj, y suavizarlo aquí pondría a choz un tiempo por detrás de lo que está
+  acompañando.
+- **Interruptor `CLK INT ○ / CLK EXT ●`** en el panel TRANSPORT, guardado en
+  `ui.json`. Es un interruptor a propósito: un puerto que manda reloj todo el
+  día se quedaría con el tempo en cuanto se enchufa, y eso no es algo que
+  descubrir a mitad de un tema.
+- El monitor MIDI muestra las líneas de `CLOCK`, así que se ve llegar el reloj
+  antes de encender nada.
+
+#### Notas
+- Con esto **el arpegiador no tiene pendientes** en el roadmap.
+- 394 tests, `clippy --workspace --all-targets -D warnings` limpio.
+
+### 2026-08-14 (bis) — Fuera el secuenciador; el arpegiador se elige con listas
+
+Dos decisiones del usuario en la misma sesión: **las opciones con nombre se
+eligen de una lista**, alcanzable con teclado, y **el secuenciador se va** — la
+tab lleva un arpegiador y nada más.
+
+#### Añadido
+- **`ModalKind::ArpChoice`**: los knobs con nombres (`MODE`, `DIV`, `OCT`)
+  abren su lista con **Enter** desde el teclado y con un **segundo clic** sobre
+  el que ya tiene el cursor — la misma regla que siguen los knobs de los FX. Los
+  interruptores no abren nada: dos posiciones no son un menú, Enter los cambia.
+  En la forma compacta, los botones con nombres **abren la lista** en vez de
+  recorrerla: pulsar ocho veces para llegar a `RANDOM` no es una forma de
+  elegir.
+- **El teclado llega al arpegiador aunque no haya caja de knobs**: `k` lo
+  alcanza siempre que esté encendido, y en la fila de botones **se marca el
+  control que tiene las flechas**. Antes, en una pantalla corta, la fila era
+  sólo para el ratón.
+- **Botón `TAP`**, siempre visible con el arpegiador encendido, con el tempo al
+  lado (`TAP 120`). Nunca es un knob: un tap es un gesto, y un gesto no tiene
+  posición a la que girar. Con `SYNC` puesto **mueve el transporte**, que es el
+  reloj que se está contando.
+
+#### Quitado
+- **El secuenciador entero**: modo `SEQ`, `REC`, `REST`, `CLR`, `TIE`, el
+  transporte `▶ ‖ ■`, la tira de pasos y su edición, las ocho secuencias, la
+  longitud de patrón y la transposición tocando. Con ellos se van
+  `SeqStep`/`PlayMode`/`Transport`, los campos `arp_*` del proyecto (un archivo
+  viejo sigue cargando: serde ignora lo que no conoce) y ~40 % de `arp.rs`.
+- Las tres acciones de MIDI learn del transporte (`▶/‖`, `■`, `REC`) **se
+  conservan como variantes muertas** de `TriggerAction`: una variante
+  desconocida es un error de parseo, y un error de parseo es un rack perdido.
+  No las ofrece el picker y no hacen nada.
+
+#### Notas
+- 391 tests, `clippy --workspace --all-targets -D warnings` limpio.
+
+### 2026-08-14 — Modo acorde y longitud de patrón
+
+Tercera pasada del clon de KeyStep. De la lista original queda una sola cosa: el
+reloj MIDI externo.
+
+#### Añadido
+- **Modo acorde** (`CHORD`). Encenderlo **con un acorde pisado lo memoriza**;
+  encenderlo con las manos quietas conserva el que hubiera — usar el que ya
+  tienes es el caso normal, y borrarlo haría del interruptor un gesto
+  destructivo. Después, una tecla toca esa forma **desde donde se toque**.
+  - Las notas que la tecla trae entran en `held` como cualquier otra, así que
+    los ocho modos, las octavas y el latch siguen funcionando sobre ellas sin
+    tocar nada.
+  - Soltar la tecla **se lleva lo que trajo**: esas notas nunca se pulsaron, y
+    nadie más mandaría sus note-offs.
+  - El botón dice cuántas notas hay memorizadas (`CHORD ●3`): un modo acorde sin
+    acorde se ve igual que uno que funciona hasta que pulsas una tecla.
+- **Longitud de patrón** (`LEN`), independiente de lo grabado: un riff de dos
+  compases recortado a uno está **a un knob** de volver a ser de dos, mientras
+  que borrar los pasos es volver a grabar. Los pasos de más se conservan; poner
+  la longitud igual al patrón es no tener longitud.
+  - Se guarda (`arp_length`), y se olvida al cambiar de secuencia o de patrón:
+    una longitud pertenece al patrón sobre el que se midió.
+
+#### Notas
+- 419 tests, `clippy --workspace --all-targets -D warnings` limpio.
+
+### 2026-08-13 (terdecies) — Ligaduras y grabación al vuelo
+
+Segunda pasada del clon de KeyStep: las dos cosas que separaban "escribir notas"
+de "grabar una parte".
+
+#### Añadido
+- **Ligadura (`TIE`) por paso.** `SeqStep.tie` (`#[serde(default)]`): el paso
+  **no suelta en su gate** y la nota que continúa en el siguiente **no se vuelve
+  a atacar** — se queda pisada, que es lo que significa ligar. La que no
+  continúa sí se suelta en el límite, porque ahí es donde termina.
+  - Botón `TIE` junto a `REST`: con un paso elegido liga ése; sin ninguno, el
+    **último grabado**, que es como se escribe una ligadura metiendo una parte
+    paso a paso — tocas la nota, pulsas TIE, y dura dos.
+  - La marca va **sobre el chip que sostiene** (`2:D#4‿`), no entre dos: la
+    tira envuelve, y una marca en el hueco caería al otro lado del salto de
+    línea.
+- **Grabar al vuelo.** Armar `REC` mientras la secuencia corre **graba encima**
+  en vez de empezar de cero: cada tecla cae en el paso sobre el que se tocó, y
+  el patrón que está sonando no se tira. Parado, `REC` sigue empezando uno
+  nuevo — las dos mitades de lo que graba un KeyStep.
+  - **Cuantización al paso más cercano, no al que suena**: una tecla pasada la
+    mitad del paso iba dirigida al siguiente. Redondear siempre hacia abajo
+    atrasa un paso a cualquiera que toque ligeramente adelantado, y un
+    secuenciador que castiga eso no lo usa nadie.
+
+#### Notas
+- Del clon quedan: modo acorde, longitud de patrón independiente de lo grabado
+  (+`SKIP`), y reloj MIDI externo.
+- 417 tests, `clippy --workspace --all-targets -D warnings` limpio.
+
+### 2026-08-13 (duodecies) — El arpegiador, más cerca de un KeyStep
+
+El usuario fijó el objetivo: el arpegiador/secuenciador es un clon del **Arturia
+KeyStep**. Esto es la primera pasada contra esa lista.
+
+#### Añadido
+- **Los ocho modos del KeyStep, en su orden**: `UP`, `DOWN`, `INCL`, `EXCL`,
+  `RANDOM`, `ORDER`, `UP×2`, `DN×2`.
+  - `INCL` (Inclusive) **repite las notas de los extremos** y `EXCL` (lo que
+    antes se llamaba `UP-DN`) no: es la única diferencia entre los dos modos, y
+    la que decide si una tríada suena pareja o tartamudea en las puntas.
+  - `×2` toca cada nota dos veces; la dirección ya la puso el orden.
+  - `ORDER` es el antiguo `PLAYED` (mismo comportamiento, el nombre del
+    hardware).
+- **Las ocho divisiones**: `1/4`, `1/4T`, `1/8`, `1/8T`, `1/16`, `1/16T`,
+  `1/32`, `1/32T` — faltaban el tresillo de negra y el de fusa.
+- **Transposición tocando** (el gesto del KeyStep): una tecla mientras el
+  secuenciador corre **mueve el patrón entero** en vez de añadir una nota suya.
+  Do central lo devuelve a como se grabó, y el transporte lo escribe (`+7 st`)
+  para que una secuencia que vuelve en otro tono no parezca un bug. Es una
+  ejecución, no parte del patrón: no se guarda.
+- **Ocho secuencias por tab** (SEQ 1–8), con knob `SEQ` y botón en la forma
+  compacta. Cambiar de una a otra **suelta lo que la anterior tenía sonando** —
+  esas notas son suyas y nadie más mandaría sus note-offs.
+  - Se guardan las ocho (`arp_patterns` + `arp_seq`); un proyecto de antes trae
+    una sola (`arp_pattern`) y **carga como la primera**.
+
+#### Notas
+- Lo que falta para el clon está anotado en el roadmap: ligaduras (TIE) por
+  paso, modo acorde, grabación en tiempo real contra el reloj, longitud de
+  patrón independiente de lo grabado, y reloj MIDI externo (24/48 ppqn).
+- 413 tests, `clippy --workspace --all-targets -D warnings` limpio.
+
+### 2026-08-13 (undecies) — Editar un paso ya grabado
+
+Lo que faltaba del secuenciador: se grababa, se borraba y se añadían silencios,
+pero cambiar la nota del paso 3 era volver a grabar la parte entera.
+
+#### Añadido
+- **Tira de pasos** bajo el transporte del secuenciador: un chip por paso con
+  sus notas (`2:D#4`, `5:—` para un silencio), la cabeza lectora marcada y el
+  paso elegido resaltado. Clic elige, otro clic en el mismo devuelve las teclas
+  a tocar — no hay otro gesto para "deja de editar" —, y la rueda camina la
+  selección.
+- **Con un paso elegido, la tecla que se toca lo reescribe**: las teclas dentro
+  de 40 ms siguen siendo un acorde (la misma ventana que grabando, porque es el
+  mismo gesto), y una tecla después de esa ventana **sustituye** lo que había.
+  Un paso que sólo pudiera ganar notas no se podría corregir.
+  - **El cursor no avanza solo**: escribir una tirada es para lo que está `REC`;
+    esto es para la que salió mal, y un cursor que corriera pondría la
+    corrección en el paso siguiente.
+- `REST` silencia el paso elegido (y sigue añadiendo uno cuando no hay ninguno);
+  **`DEL STEP`** aparece sólo con un paso elegido y lo borra, dejando el cursor
+  donde estaba — borrar dos veces borra hacia abajo, como una lista.
+- **El teclado del ordenador pasa por el arpegiador** cuando la tab lo tiene
+  encendido, igual que una tecla MIDI. Era la única entrada que ni arpegiaba ni
+  podía escribir un paso, que es justo para lo que sirve elegir uno.
+
+#### Notas
+- La tira **no puede pasar de dos filas**: un patrón de sesenta y cuatro pasos
+  echaría la cadena de FX fuera del panel. Se dibuja una ventana calculada
+  (`strip_window`) que siempre incluye el paso en el que se está trabajando —
+  medida, no recortada: un chip recortado se lleva su rect, y un paso que no se
+  puede clicar es un paso que no se puede arreglar.
+- 409 tests, `clippy --workspace --all-targets -D warnings` limpio.
+
+### 2026-08-13 (decies) — El arpegiador se engancha al transporte
+
+Primer pendiente del punto 1 del roadmap: el arpegiador tenía su propio BPM y
+nada más.
+
+#### Añadido
+- **`ArpSettings.sync`** (knob `SYNC`, y botón en la forma compacta). Con él
+  puesto:
+  - **el tempo es el del transporte** (`ArpSettings::tempo`), así que lo que la
+    fila imprime y lo que el reloj usa salen del mismo sitio y no pueden
+    discrepar;
+  - **el paso lo dice la posición de la canción, no una cuenta de duraciones**
+    (`Arp::grid_step`): el índice se saca de `transport().ppq()` dividido por la
+    división, y un paso vence cuando ese número cambia. Nada se acumula, dos
+    tabs quedan en fase entre sí y con un plugin sincronizado, y un hilo de UI
+    ocupado ya no puede arrastrar la rejilla — el reloj lo lleva el callback de
+    audio, que es quien avanza el transporte.
+  - el swing se aplica sobre la rejilla: la off-beat no llega hasta que ha
+    pasado su parte del paso.
+  - **el knob de BPM mueve el transporte** en vez de un número que no suena:
+    hay un reloj, y eso es la tab pidiendo que vaya más rápido.
+- **Con el transporte parado, sigue sonando**: no hay rejilla a la que
+  engancharse, así que corre libre al tempo del transporte. Alguien sosteniendo
+  un acorde quiere oírlo, no que le expliquen por qué no.
+- `#[serde(default)]`, así que los proyectos guardados siguen cargando.
+
+#### Notas
+- Lo que queda del punto de timing es **resolución**, no deriva: `Arp::tick`
+  sigue viviendo en el bucle de UI (5 ms), de modo que un paso puede sonar hasta
+  5 ms tarde — pero ya no *desplaza* la rejilla, porque el número del paso viene
+  de la posición y no de la suma de los anteriores.
+- 407 tests, `clippy --workspace --all-targets -D warnings` limpio.
+
+### 2026-08-13 (nonies) — El arpegiador tiene knobs, y toma la forma que la pantalla aguanta
+
+El requerimiento original pedía knobs para el arpegiador; la sesión anterior los
+había cambiado por una fila de botones que envuelve, argumentando altura. Ahora
+están los dos, y **la altura disponible decide cuál se dibuja** — no un ajuste,
+no una preferencia: las filas que quedan.
+
+#### Añadido
+- **`ArpSettings::{knobs, norm, set_norm}` + `ArpParam`**: el arpegiador
+  expuesto como parámetros normalizados (ON, PLAY, MODE, DIV, BPM, GATE, SWING,
+  OCT, LATCH) con su `ParamShape` — interruptor, lista de nombres o continuo.
+  Se dibujan con **`draw_knob_box`, la caja que ya existía** para los FX y el
+  instrumento: el diseño no se toca, el arpegiador se adapta a él.
+  - **Los knobs se direccionan por lo que son, nunca por su posición**: en modo
+    secuenciador no hay `MODE` ni `LATCH`, así que un índice significa otro
+    control según el modo. Misma lección que los presets de fábrica.
+  - Escriben por `ArpEdit::Knob`, o sea por `edit_arp`, que ya sabía parar lo
+    que sonaba al cambiar de modo y soltar el acorde al desenganchar el latch.
+- **Tres formas, elegidas por las filas libres** (`ArpShape`):
+  - **caja con borde y título** donde el RACK tiene sitio (≥ 5 + 7 filas);
+  - **los mismos knobs sin marco** dos filas más baratos — que es la diferencia
+    entre tener knobs o no en una pantalla de 5" (un panel de 800×480 con una
+    fuente legible deja al rack unas trece filas);
+  - **la fila de botones que envuelve** cuando ni eso cabe.
+  Nada desaparece en ninguna de las tres; sólo cambia la forma. Y cuando sólo
+  entra una fila de knobs, la caja **hace scroll con el cursor** como las otras
+  dos, así que los de abajo se alcanzan.
+- `draw_knob_box` acepta `bordered`: sin marco, tres filas en vez de cinco.
+- **`RackFocus::Arp`**: `k` cicla FX → INSTRUMENT → ARP → FX, saltándose las
+  cajas que no están en pantalla. Flechas mueven el cursor, `w`/`s` giran,
+  Enter/segundo clic pasan a la siguiente posición de un knob con nombres, y la
+  rueda gira el que esté debajo del ratón.
+- El interruptor `ARP` es el primer knob de la caja: la fila de cabecera que lo
+  llevaba **es una fila**, y una fila es lo que escasea.
+
+#### Notas
+- La caja de FX ya no se dibuja "activa" cuando las flechas están en otra: con
+  tres cajas en el panel, "no es la del instrumento" dejó de significar "es la
+  de los FX".
+- 406 tests, `clippy --workspace --all-targets -D warnings` limpio.
+
+### 2026-08-13 (octies) — Las filas de botones del RACK envuelven, y `mtof` tiene cantidad
+
+Dos pendientes del punto 1 del roadmap.
+
+#### Añadido
+- **`ButtonRow`** en `fx_chain_panel`: una fila de botones que **pasa a la línea
+  siguiente** cuando se acaba el panel, y devuelve el rect de todo lo que
+  dibuja. La usan la fila `INSTR`, la del arpegiador, la del transporte del
+  secuenciador y la cadena de FX — que ya envolvía por su cuenta y ahora no
+  tiene copia propia.
+  - **Por qué no la caja de knobs** que proponía el roadmap: una caja con borde
+    cuesta cinco filas, y el RACK no las tiene — es exactamente el motivo por el
+    que la fila `ARP` se colapsa a un interruptor cuando está apagada. Envolver
+    cuesta una fila y sólo cuando hace falta.
+  - Cada botón se pinta donde se mide, así que una etiqueta traducida corre a
+    los siguientes en vez de dejar sus rects atrás. Ese bug se arregló dos veces
+    sobre offsets a mano; ésta es la forma que no puede tenerlo.
+- **Botón `AMT` de `mtof`**, al lado del destino y sólo cuando hay destino: el
+  clic recorre 25 → 50 → 75 → 100 → 25 (el mismo gesto que `GATE` del
+  arpegiador) y **la rueda acota en vez de dar la vuelta** — una rueda que salta
+  del tope a un cuarto no se usa dos veces.
+
+#### Notas
+- El test del arpegiador aprieta el panel a 80 columnas con todo encendido:
+  los diez interruptores tienen rect, ninguno se sale del panel, ocupan más de
+  una fila, y un clic en el que quedó envuelto sigue llegando.
+- 404 tests, `clippy --workspace --all-targets -D warnings` limpio.
+
+### 2026-08-13 (septies) — Los cajones IN y OUT hacen scroll
+
+El primer gotcha de la lista del roadmap ("es lo primero que va a doler"):
+ningún cajón se desplazaba, y el cajón IN lista **todos** los puertos de captura
+del sistema (una UMC1820 son ocho, más el micro del portátil, más la otra
+tarjeta). En una terminal baja las últimas filas se pintaban fuera del panel y
+no había forma de llegar a ellas.
+
+#### Añadido
+- **`drawer::{list_height, list_scroll}`** — la ventana visible de una lista.
+  **No hay offset de scroll guardado en ninguna parte**: la ventana es función
+  del cursor, igual que la caja de knobs del RACK. Sin segundo estado que
+  mantener en sincronía con una lista que cambia debajo, sin nada que
+  reinicializar, y —lo que importa— el dibujo y los rects de clic **no pueden
+  desviarse**, porque los dos llaman a la misma función.
+- `source_panel::input_window` envuelve las dos para el panel IN, que además
+  tiene el banner de MIDI learn clavado abajo y por tanto menos filas.
+- **Los títulos dicen dónde está la ventana** (`INPUTS ↕ 8-14/21`) en vez de
+  gastar una fila en un indicador.
+- **La rueda del ratón sobre un cajón mueve su cursor**, que es lo que desplaza
+  la vista. En una lista donde cada fila es algo sobre lo que se actúa, eso es
+  para lo que sirve la rueda.
+
+#### Notas
+- El test nuevo comprueba lo que se rompía: con 20 puertos y 7 filas de alto, la
+  última fila **tiene rect**, ese rect está en la última línea de la lista, y el
+  panel pinta ahí ese puerto — dibujo y hit-test contrastados contra el mismo
+  buffer.
+- Con esto el punto 1.2 del roadmap (filas de ruteo nuevas en el cajón IN) deja
+  de estar bloqueado.
+- 402 tests, `clippy --workspace --all-targets -D warnings` limpio.
+
+### 2026-08-13 (sexies) — Medidores, latencia y presets de fábrica
+
+Lo que quedaba de la fase 1 del punto 2 del roadmap: las tres piezas de
+infraestructura que faltaban.
+
+#### Añadido
+- **`choz_ports::FxMeter`** — pico de entrada y de salida como dos atómicos
+  compartidos, escritos con `Relaxed` desde el callback y leídos cuando la UI
+  redibuja. El mismo camino que `SandboxStatus`, y por la misma razón: el
+  procesador es del hilo de audio en cuanto se entrega.
+- **Todo efecto de una cadena está medido**, sin que ninguno lo sepa:
+  `fx_chain::Metered` envuelve cada procesador al construir la cadena y toma el
+  pico a la ida y a la vuelta de un `process_block` que no se entera. La
+  alternativa era un par de campos dentro de cada efecto — treinta copias de las
+  mismas dos líneas, y **cero medidores para un plugin hosteado**, que es
+  justo donde se pregunta "¿está llegando algo a esto?". Coste: dos pasadas por
+  bloque y por efecto, un `max` por muestra sobre unos cientos.
+- **`FxProcessor::latency_samples()`** — lo que un efecto retrasa la señal.
+  `AutoTune` reporta la ventana de su shifter; el resto, cero. La cadena lo suma
+  (`AudioEngine::slot_latency`) y la caja `SLOT` lo escribe en milisegundos. No
+  hay compensación: no hay arreglo contra el que alinear, pero el número es la
+  diferencia entre "el rack va pesado" y "el limitador cuesta 5 ms".
+- **La caja `SLOT` lleva el medidor en su título** (`IN -6.0 OUT -7.2 dB`) y la
+  latencia al lado. En el título porque la caja es una fila de botones: una
+  segunda fila para dos números costaba una fila de knobs.
+- **Presets de fábrica** (`choz-ui/src/fx_presets.rs`): 17 efectos con tres o
+  cuatro cada uno — Slapback/Eighth Note/Dub, Room/Hall/Plate/Cathedral, Vocal
+  Glue/Drum Punch/Bus Glue/Squash, Tape Warmth/Tube Drive/Fuzz Fold… Botón
+  `PRESET` en la caja `SLOT` y tecla `P`.
+  - **Van en la UI, no en el DSP**: un preset son posiciones de knob, y el orden
+    de los knobs lo define `fx_param_descs` de este crate; una tabla junto al DSP
+    sería una segunda descripción de ese orden, libre de desviarse.
+  - **Se indexan por nombre de parámetro, no por posición**: el día que se
+    inserte un knob en medio, un índice apunta a otra cosa en silencio. Un
+    nombre que ya no existe lo caza el test.
+  - **Se aplican por `set_fx_param`**, la misma puerta que un knob, un CC y el
+    picker: el procesador vivo se entera, la copia de trabajo se queda con el
+    valor y el rebuild se marca cuando hace falta. Un preset que escribiera
+    `params` a mano sería un cuarto camino que equivocarse.
+  - Lo que ya tenía **knob** de preset (el EQ gráfico con la lista de Winamp,
+    AutoTune, la curva del saturador) se queda como está: eso son posiciones
+    automatizables de un parámetro, no un menú aparte.
+
+#### Notas
+- Un preset que toca `Wet` escribe también `entry.wet`, que es de donde lee el
+  rebuild: si no, el preset dura hasta que algo reconstruya la cadena.
+- 400 tests en el workspace, `clippy --workspace --all-targets -D warnings`
+  limpio.
+
+### 2026-08-13 (quinquies) — Infraestructura de DSP y un saturador general
+
+Fase 1 del punto 2 del roadmap, más el efecto que la justifica.
+
+#### Añadido
+- **`fx/oversample.rs`** — `Oversampler` a 1x/2x/4x/8x, cascada de etapas de 2x
+  con lowpass Butterworth de **4º orden** por etapa, cada una a su propia
+  frecuencia. Más `Tone` (lowpass logarítmico 400 Hz–18 kHz), que todos los
+  no-lineales quieren y ninguno quiere tener.
+- **`fx/smooth.rs`** — `Smoothed`: un polo, consciente del sample rate, para que
+  un knob movido entre bloques no meta un escalón en la onda.
+- **`fx/saturator.rs`** — **`Saturator`**: ocho curvas (soft, hard, tubo, cinta,
+  foldback, wavefolder, diodo, polinómica), drive exponencial, bias, tono
+  después de la curva, bloqueo de DC, ganancia de salida, oversampling elegible
+  y medidores de pico de entrada y salida.
+
+#### Lo que se midió y lo que se aprendió
+- **El orden del filtro decide si el oversampling sirve.** Con 2 polos la
+  primera reflexión a 23 kHz baja apenas 10 dB, así que encadenar etapas topa
+  contra el filtro y no contra el factor: 8x quedaba en un 15 % de 1x. Con 4
+  polos por etapa, **por debajo del 10 %**. Medido con Goertzel sobre el 7º
+  armónico de 5 kHz, que se refleja a 13 kHz — el sitio donde más se oye y donde
+  no hay nada armónico que lo tape.
+- **`Smoothed` tiene que saltar al destino, no sólo acercarse.** En `f32`,
+  `target - diff·coeff` llega a un punto fijo con el hueco todavía en ~1e-5
+  cerca de 0.75: el paso cae por debajo del ulp del resultado y el valor se
+  queda ahí para siempre. Inaudible, pero deja "¿llegó el parámetro?" sin
+  respuesta. Salta bajo 1e-5.
+- **El `Foldback` es forma cerrada, no un bucle.** Reflejar `while |y| > 1` es
+  trabajo ilimitado para una entrada sin acotar, que es justo lo que no puede
+  haber en el hilo de audio. El triángulo al que converge esa reflexión se
+  calcula de una vez y vale `x` dentro de ±1.
+- **Las curvas van normalizadas.** Sin compensar la ganancia del drive,
+  "qué curva suena mejor" es sólo "qué curva suena más fuerte".
+- **El bloqueador de DC no es opcional** con bias: una curva asimétrica devuelve
+  offset, y un offset cuesta headroom sin sonar. Tarda ~50 ms en asentarse (polo
+  a 10 Hz), que es lo que mide el test de silencio.
+- `Curve` y `Oversamp` se dibujan como **listas de nombres**, sacadas de los
+  enums del DSP: no hay nada entre dos curvas, y la etiqueta no puede desviarse
+  de lo que hace el procesador.
+
+396 tests.
+
+### 2026-08-13 (quater) — `mtof`: una nota como control
+
+La otra salida del ruteo: que una nota mueva un **parámetro** en vez de tocar un
+instrumento. `crates/choz-ui/src/mtof.rs`.
+
+#### Añadido
+- Botón **`M→P`** en la línea INSTR: arma el puntero, un clic en cualquier knob
+  liga el destino, un clic fuera lo desliga. La etiqueta dice a dónde apunta.
+- Cada nota que suena en esa tab —de las teclas **o del arpegiador**— escribe el
+  valor por `apply_target`, la misma función que usa un CC de MIDI learn. Un
+  sitio decide qué significa cada destino; una nota es una cosa más que lo mueve.
+- Destino y cantidad se guardan en el proyecto.
+
+#### La decisión que importa: dos conversiones, no una
+- **Destino con unidad `Hz` y rango declarado** (un parámetro de plugin): se
+  escribe la frecuencia real, **en escala logarítmica**. Una octava mide siempre
+  lo mismo; lineal, un rango 20 Hz–20 kHz gasta tres cuartos del recorrido por
+  encima de donde se toca.
+- **Cualquier otro destino**: key tracking sobre `pitch::{MIN_NOTE, MAX_NOTE}`.
+  Un `FxParamDesc` de choz no declara ni rango ni unidad —sólo nombre, default y
+  forma—, así que "escribir 440 Hz" ahí no es una conversión, es un invento. Y
+  key tracking es lo que se quiere casi siempre: que el filtro siga al teclado.
+- La nota MIDI más alta son 12.5 kHz, no 20: con un rango que llega a 20 kHz el
+  teclado **no** alcanza el tope, y fingir que sí mentiría sobre la frecuencia.
+
+377 tests.
+
+### 2026-08-13 (ter) — Secuenciador de pasos
+
+La otra mitad del punto: el mismo `Arp` gana `PlayMode::{Arp, Seq}`. Mismo
+reloj, mismo gate, mismo swing; lo único que cambia es de dónde salen las notas,
+que es la razón de que sean una máquina y no dos.
+
+#### Añadido
+- **Grabación en vivo** (`REC`): cada tecla es un paso, y **las teclas pisadas a
+  la vez —dentro de 40 ms— son un acorde en un solo paso**. Sin rejilla contra
+  la que cuantizar, esa ventana es la única pista que distingue un acorde de
+  cuatro pasos. Armar el grabador **vacía** el patrón: sobregrabar encima de una
+  secuencia que no se ve es como un grabador en vivo deja de ser usable.
+- **Transporte propio**: `▶ ‖` y `■`. Son dos botones porque hacen cosas
+  distintas — `■` rebobina, `‖` conserva la posición.
+- **`TAP`**: media de los últimos 4 golpes, y un hueco de más de 2 s empieza una
+  cuenta nueva en vez de promediar la espera. Los golpes son negras, sea cual sea
+  la división, que es lo que significa un tap tempo en cualquier caja.
+- **`REST`** (silencio con duración) y **`CLR`**. Un secuenciador que no puede
+  escribir silencio toca un solo ritmo.
+- Botón de **`SWING`**, que estaba implementado y probado desde la mañana y no
+  tenía forma de moverse desde la UI.
+- **Seis acciones nuevas de MIDI learn**: `ARP ON/OFF`, `▶/‖`, `■`, `TAP`, `REC`
+  y `LATCH` — lo que hace falta con las dos manos ocupadas. El resto de la línea
+  son ajustes, y un ajuste no merece un pedal.
+- El patrón se guarda en el proyecto (`project::Slot.arp_pattern`), **aparte** de
+  los ajustes: `ArpSettings` es `Copy` porque el panel toma una copia cada frame,
+  y un `Vec` dentro le quitaría esa propiedad.
+
+#### Detalles
+- `MAX_STEPS = 64`. Se graba en vivo: sin tope, una tecla trabada bajo un repeat
+  escribe hasta quedarse sin memoria.
+- Un paso es un acorde, así que hay **varias** notas que soltar: `release`
+  vacía la lista en vez de limpiarla, o se quedan colgadas.
+- `PLAY` no tiene reloj con el que agendar, así que el primer paso vence **ya**;
+  esperar al siguiente tick hacía que el botón pareciera fallar.
+- La línea `ARP` ya no cabe en 120 columnas con todo encendido — el transporte
+  bajó a una segunda fila, y sólo aparece en modo `SEQ`: en `ARP` las teclas
+  *son* el transporte, y dibujar botones muertos diría lo contrario.
+
+372 tests.
+
+### 2026-08-13 (bis) — Arpegiador por tab
+
+Primera mitad del secuenciador MIDI del roadmap. `crates/choz-ui/src/arp.rs`.
+
+#### Añadido
+- **Un arpegiador por tab**, apagado por defecto: modos `UP` / `DOWN` /
+  `UP-DN` / `PLAYED` / `RANDOM`, divisiones de `1/4` a `1/32` con tresillos,
+  BPM propio (20–300), gate, swing, hasta 4 octavas apiladas y latch.
+- Línea `ARP` en el RACK: apagado es **un interruptor**, encendido despliega sus
+  ajustes en la misma fila — una caja de seis filas para algo que la mayoría de
+  las tabs no enciende es alto que el RACK no tiene. `A` lo enciende; los
+  botones se pulsan con el ratón.
+- Se guarda en el proyecto (`project::Slot.arp`, `#[serde(default)]`, así que un
+  proyecto viejo carga igual y suena igual).
+
+#### Por qué está donde está
+- **No es un `FxProcessor` y no puede serlo.** `process_block` recibe audio
+  interleaved y devuelve audio: no hay por dónde emitir una nota. Vive donde se
+  resuelve el ruteo, que hoy es el hilo de UI. `Arp::tick` **recibe el
+  instante** en lugar de leer el reloj, de forma que moverlo al engine (timing
+  exacto contra el transporte) no toca la lógica ni los tests.
+- El bucle de eventos pasa a despertar cada **5 ms** mientras algún patrón
+  suena, 50 ms en reposo. Un paso que cae dentro de 50 ms se oye tarde.
+
+#### Detalles que costaron pensarse
+- Un tick tardío **no corre la rejilla** (el siguiente paso se cuenta desde el
+  anterior, no desde ahora) **ni dispara una ráfaga** para recuperar el tiempo
+  perdido: si el siguiente ya quedó atrás, se re-ancla al presente. Lo primero
+  arrastraría el tempo en un hilo ocupado; lo segundo sonaría a metralleta.
+- Una nota que al apilar octavas se pasaría de 127 se **descarta**; envolverla
+  metería un bajo en medio de una subida.
+- `RANDOM` es determinista (xorshift con semilla fija): dos arpegiadores con los
+  mismos ajustes tocan lo mismo, que es lo que hace reproducible un informe.
+- Cada `note_on` que emite tiene su `note_off`: `PANIC` y apagar el arpegiador
+  sueltan lo que estuviera sonando. Nadie más va a mandar esos note-off.
+
+12 tests del arpegiador, 364 en total.
+
+### 2026-08-13 — Visualizador de teclado MIDI y paquete de Arch
+
+Los dos primeros puntos del roadmap, implementados.
+
+#### Añadido
+- **Pestañas `KEYS` y `ROLL` en el panel `MIDI IN`.** `KEYS` dibuja un piano de
+  dos filas (negras arriba con `▄`, cuerpos blancos debajo, etiquetas de octava
+  cuando hay alto) que se enciende con lo que entra; `ROLL` deja caer las mismas
+  notas hacia ese teclado en una ventana de 4 s. Estado en `KeyboardState`
+  (`views/midi_monitor.rs`): mapa de 128 teclas + anillo de 256 notas de
+  **presupuesto fijo** — las viejas se pisan, nada crece con el tiempo.
+- **Tres modos de color**, `C` para rotarlos, guardado en `ui.json`:
+  `CHANNEL` (un tono por canal, sacado de la misma rueda HSV que el logo),
+  `INSTRUMENT` (la tab que realmente lo está tocando) y `VELOCITY` (el color del
+  tema escalado por la fuerza).
+- Los CC **no encienden teclas**: fila propia bajo el piano, con `BEND` y `MOD`
+  siempre visibles y los últimos controladores vistos detrás.
+
+#### Decisiones que cuestan explicar y no repetir
+- Se alimenta en `drain_midi` **después** de resolver el ruteo, que es lo único
+  que permite pintar una tecla del color de su tab. No reutiliza `App.sounding`:
+  ésa indexa slots y existe para que un note-off llegue donde fue su note-on.
+- **Un note-on con velocity 0 es un note-off** — hay hardware que sólo lo dice
+  así, y leerlo literal deja la tecla encendida el resto de la sesión.
+- **No hay timeout de notas colgadas.** Un pad sostenido un minuto es una nota
+  sostenida; apagarla sola sería mentir sobre el caso fácil para acertar el
+  raro. `PANIC` limpia el teclado a la vez que manda los note-off de verdad.
+- La tecla es `C` mayúscula: `c` minúscula conecta una entrada en el cajón IN, y
+  el teclado no tiene foco propio con el que desambiguar.
+
+#### Empaquetado
+- **Arch Linux**: `packaging/arch/PKGBUILD.in` (`choz-bin`, x86_64 + aarch64 +
+  armv7h) y `mkpkgbuild.sh`, que rellena versión y los tres `sha256` desde los
+  tarballs publicados. Un tarball que falte es **error**, no un placeholder que
+  reviente en la máquina de otro — y los sumas se asignan a variables antes del
+  `sed` porque un fallo dentro de `$( )` usado como argumento se traga el
+  código de salida.
+- Job `arch` en `release.yml`: dentro de `archlinux:base-devel`, genera
+  `.SRCINFO` con `makepkg --printsrcinfo`, pasa `namcap`, adjunta ambos al
+  release y empuja al AUR **sólo si existe** el secreto `AUR_SSH_KEY`.
+- `depends=(alsa-lib …)` con **JACK en `optdepends`**: se `dlopen`ea, así que
+  declararlo dependencia bloquearía la instalación en una máquina ALSA perfecta.
+  Sin hooks de caché en `package()` — pacman ya los dispara por su cuenta.
+
+352 tests, clippy `--workspace --all-targets -D warnings` limpio.
+
+### 2026-08-12 — La 1.0.0 verificada desde fuera, y dos bugs que salieron de mirarla
+
+El tag `v1.0.0` ya apuntaba a los arreglos de empaquetado y el workflow había
+reconstruido los artefactos, así que lo que quedaba del punto 1 del roadmap era
+**comprobarlo sobre los paquetes publicados**, no sobre el árbol. Sin `gh` en
+esta máquina: `curl` contra `api.github.com` y `dpkg-deb` sobre lo descargado.
+
+#### Verificado
+- El `.deb` publicado lleva binario, `choz-launcher`, `choz.desktop`, los siete
+  PNG más el SVG, el `.xml` del MIME y el copyright.
+- **Cero rutas `/home/jorge`** dentro del binario (`strings | grep -c`), que era
+  el otro síntoma del 2026-08-10.
+- `SHA256SUMS.txt` cuadra con lo descargado, y los tarballs de `armv7` y
+  `aarch64` traen ELF de su arquitectura (`ARM EABI5` y `ARM aarch64`). El
+  armv7, que en local no se pudo cruzar por la red del contenedor, sí lo
+  construyó el CI.
+
+#### Arreglado
+- **`install.sh` dentro de un tarball de release llamaba a `cargo build`.** Sin
+  `--binary` iba directo a compilar **con el binario ejecutable a su lado**: el
+  usuario que baja un `.tar.gz` es justo el que no tiene toolchain, y lo que
+  veía era `rustup could not choose a version of cargo to run`. Ahora, si
+  `$HERE/choz` es ejecutable, ése es el binario y lo dice. Test:
+  `the_installer_uses_the_binary_shipped_beside_it`.
+- **Los botones `◀ ▶` del banco sólo respondían en parte.** Los rects de clic de
+  la línea `BANK` (y los de la línea `INSTR`) partían de un desplazamiento fijo
+  —`inner.x + 2 + 8`, o sea `"  BANK  "` en inglés— mientras el texto se dibuja
+  traducido: con `BANCO` el rect queda corrido una columna, media flecha no
+  reacciona y la celda de al lado sí. Ahora la posición se acumula de las
+  anchuras reales de los spans (`line_width`, con `Span::width`, que a
+  diferencia de `chars().count()` no miente con CJK). Test:
+  `the_whole_bank_arrow_is_clickable_after_the_label_is_translated`, que pulsa
+  **cada columna** del botón con el idioma en español.
+
+#### Documentación
+- `docs/roadmap.md` reescrito con los pendientes nuevos: visualizador de teclado
+  MIDI, paquete de Arch Linux, secuenciador/arpegiador MIDI con su ruteo y
+  `mtof`, y la ampliación de la suite de efectos.
+
+341 tests.
+
 ### 2026-08-10 — El `.deb` llevaba el binario y nada más
 
 Reportado: choz instalado no aparece en el menú de inicio de Linux. Y aparte:

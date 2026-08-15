@@ -5,7 +5,7 @@
 //! `flume` channel; the UI loop drains that channel and calls `engine.note_on`
 //! (the sole producer of the RT note ring).
 
-pub use crate::input::{BendMsg, CcMsg, InputEvent, InputSource, NoteMsg, ProgramMsg};
+pub use crate::input::{BendMsg, CcMsg, ClockMsg, InputEvent, InputSource, NoteMsg, ProgramMsg};
 
 /// All available MIDI **input** port names (what devices we can listen to).
 pub fn list_input_ports() -> Vec<String> {
@@ -19,7 +19,7 @@ pub fn list_input_ports() -> Vec<String> {
     }
 }
 
-/// All available MIDI **output** port names (shown for reference, like Carla).
+/// All available MIDI **output** port names: what a tab can play *to*.
 pub fn list_output_ports() -> Vec<String> {
     match midir::MidiOutput::new("choz-scan-out") {
         Ok(m) => m
@@ -71,6 +71,10 @@ pub fn connect_inputs(
         // MSB only — SF2 banks are 0..128 and the LSB is what this keyboard
         // (and most others) always leaves at 0.
         let mut bank = 0u8;
+        // The clock is counted here rather than upstream: this callback is
+        // handed the port's own timestamp, and it is the last place that number
+        // is honest — a pulse read from a UI loop has that loop's jitter in it.
+        let mut clock = ClockCounter::default();
         // Each connection tags its events with its index in `names`, which is
         // the list the caller gets back — so index ↔ port name stay aligned.
         let source = InputSource::Midi(names.len());
@@ -78,6 +82,10 @@ pub fn connect_inputs(
             &port,
             "choz-in-conn",
             move |_ts, data, _| {
+                if let Some(msg) = clock.feed(data, _ts) {
+                    let _ = txc.send(InputEvent::Clock(msg));
+                    return;
+                }
                 match parse(data) {
                     Some(Msg::Note {
                         channel,
@@ -139,6 +147,153 @@ fn is_disabled(port: &str, disabled: &[String]) -> bool {
     disabled
         .iter()
         .any(|d| port == d || port.starts_with(&format!("{d}:")))
+}
+
+// ─── Output ─────────────────────────────────────────────────────────────────
+
+/// An open MIDI output: what a tab plays, on somebody else's synth.
+///
+/// The arpeggiator is the reason this exists. Everything in choz until now
+/// ended at its own instrument, and an arpeggiator that can only drive the
+/// plugin in the same tab is half of one — the other half is a desk full of
+/// hardware that has no arpeggiator of its own.
+///
+/// Sending is best-effort: a port that has gone away (a synth switched off
+/// mid-set) drops its notes rather than taking the rack with it. What it must
+/// not do is leave them **sounding**, which is what [`Self::all_notes_off`] is
+/// for.
+pub struct MidiOut {
+    name: String,
+    conn: midir::MidiOutputConnection,
+    /// Notes sent and not yet stopped, so a disconnection can end them.
+    sounding: Vec<u8>,
+}
+
+impl MidiOut {
+    /// Open the port called `name`. `None` when there is no such port — a saved
+    /// project naming a synth that is not plugged in today is a normal Tuesday,
+    /// not an error worth stopping for.
+    pub fn open(name: &str) -> Option<Self> {
+        let out = midir::MidiOutput::new("choz-out").ok()?;
+        let port = out
+            .ports()
+            .into_iter()
+            .find(|p| out.port_name(p).as_deref() == Ok(name))?;
+        let conn = out.connect(&port, "choz-out-conn").ok()?;
+        Some(Self {
+            name: name.to_string(),
+            conn,
+            sounding: Vec::new(),
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Channel is 0-based on the wire, as everywhere else in this crate.
+    pub fn note_on(&mut self, channel: u8, note: u8, vel: u8) {
+        if self
+            .conn
+            .send(&[0x90 | (channel & 0x0F), note, vel])
+            .is_ok()
+            && !self.sounding.contains(&note)
+        {
+            self.sounding.push(note);
+        }
+    }
+
+    pub fn note_off(&mut self, channel: u8, note: u8) {
+        let _ = self.conn.send(&[0x80 | (channel & 0x0F), note, 0]);
+        self.sounding.retain(|n| *n != note);
+    }
+
+    /// Every note this port was told to play, stopped one by one.
+    ///
+    /// Note-offs rather than CC 123: a hardware synth that ignores "all notes
+    /// off" is a synth that drones until it is power-cycled, and the list of
+    /// what is actually down is right here.
+    pub fn all_notes_off(&mut self, channel: u8) {
+        for note in std::mem::take(&mut self.sounding) {
+            let _ = self.conn.send(&[0x80 | (channel & 0x0F), note, 0]);
+        }
+    }
+}
+
+impl Drop for MidiOut {
+    fn drop(&mut self) {
+        self.all_notes_off(0);
+    }
+}
+
+impl std::fmt::Debug for MidiOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MidiOut({})", self.name)
+    }
+}
+
+/// Counts the clock of one port into something worth sending on.
+///
+/// Twenty-four pulses is a quarter note, so a quarter's worth of them is one
+/// tempo reading — averaging over the quarter rather than over one interval,
+/// because a single pulse carries every bit of jitter the cable and the sender
+/// have between them.
+#[derive(Default)]
+struct ClockCounter {
+    /// Pulses since the reading, and when that run started (microseconds, the
+    /// port's own clock).
+    pulses: u32,
+    started: u64,
+}
+
+/// Pulses per quarter note on MIDI's clock wire. Fixed by the standard.
+const CLOCK_PPQ: u32 = 24;
+
+impl ClockCounter {
+    /// Feed a raw message. `Some` when it was a clock byte worth passing on;
+    /// `None` for a pulse that is still being counted, and for anything that is
+    /// not the clock at all.
+    fn feed(&mut self, data: &[u8], stamp: u64) -> Option<ClockMsg> {
+        match data.first().copied()? {
+            // A run of pulses is only a tempo once there is a quarter of it.
+            0xF8 => {
+                if self.pulses == 0 {
+                    self.started = stamp;
+                    self.pulses = 1;
+                    return None;
+                }
+                self.pulses += 1;
+                if self.pulses <= CLOCK_PPQ {
+                    return None;
+                }
+                let elapsed = stamp.saturating_sub(self.started);
+                // This pulse opens the next quarter, so the count restarts at
+                // one rather than at zero: dropping it would lose a beat of
+                // every measurement.
+                self.pulses = 1;
+                self.started = stamp;
+                if elapsed == 0 {
+                    return None;
+                }
+                Some(ClockMsg::Tempo(60_000_000.0 / elapsed as f32))
+            }
+            // A transport command restarts the count: the run that was being
+            // measured belongs to whatever was playing before.
+            0xFA => {
+                self.pulses = 0;
+                Some(ClockMsg::Start)
+            }
+            0xFB => {
+                self.pulses = 0;
+                Some(ClockMsg::Continue)
+            }
+            0xFC => {
+                self.pulses = 0;
+                Some(ClockMsg::Stop)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// A raw MIDI message choz cares about.
@@ -217,6 +372,60 @@ fn parse(data: &[u8]) -> Option<Msg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Twenty-four pulses is a quarter note, so a quarter of them is one tempo
+    /// reading — and the pulse that closes a quarter opens the next, or every
+    /// measurement would lose a beat.
+    #[test]
+    fn a_quarter_of_pulses_is_one_tempo_reading() {
+        let mut c = ClockCounter::default();
+        // 120 BPM: a quarter is half a second, so a pulse every 20833 µs.
+        let step = 500_000 / CLOCK_PPQ as u64;
+        let mut stamp = 1_000_000u64;
+        for _ in 0..CLOCK_PPQ {
+            assert_eq!(c.feed(&[0xF8], stamp), None, "still counting");
+            stamp += step;
+        }
+        match c.feed(&[0xF8], stamp) {
+            Some(ClockMsg::Tempo(bpm)) => assert!((bpm - 120.0).abs() < 0.5, "{bpm}"),
+            other => panic!("expected a tempo, got {other:?}"),
+        }
+
+        // And straight into the next quarter, with no pulse lost.
+        for _ in 0..(CLOCK_PPQ - 1) {
+            stamp += step;
+            assert_eq!(c.feed(&[0xF8], stamp), None);
+        }
+        stamp += step;
+        assert!(matches!(c.feed(&[0xF8], stamp), Some(ClockMsg::Tempo(_))));
+    }
+
+    /// The three transport bytes come through as themselves, and they restart
+    /// the count: the run being measured belonged to what was playing before.
+    #[test]
+    fn start_continue_and_stop_come_through_and_reset_the_count() {
+        let mut c = ClockCounter::default();
+        assert_eq!(c.feed(&[0xFA], 0), Some(ClockMsg::Start));
+        assert_eq!(c.feed(&[0xFB], 0), Some(ClockMsg::Continue));
+        assert_eq!(c.feed(&[0xFC], 0), Some(ClockMsg::Stop));
+        // Not the clock at all: the parser downstream gets it.
+        assert_eq!(c.feed(&[0x90, 60, 100], 0), None);
+
+        let step = 500_000 / CLOCK_PPQ as u64;
+        let mut stamp = 0u64;
+        for _ in 0..CLOCK_PPQ {
+            c.feed(&[0xF8], stamp);
+            stamp += step;
+        }
+        c.feed(&[0xFA], stamp);
+        // Counting starts again from here, so the next quarter is not reported
+        // one pulse early.
+        for _ in 0..CLOCK_PPQ {
+            assert_eq!(c.feed(&[0xF8], stamp), None);
+            stamp += step;
+        }
+        assert!(matches!(c.feed(&[0xF8], stamp), Some(ClockMsg::Tempo(_))));
+    }
 
     #[test]
     fn parses_note_on_off_and_ignores_others() {

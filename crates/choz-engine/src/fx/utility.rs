@@ -148,6 +148,25 @@ impl Biquad {
             z2: 0.0,
         }
     }
+    /// RBJ highpass, the same form. Used to take the room out from under a
+    /// signal before anything tries to measure its period.
+    pub(crate) fn highpass(fc: f32, sr: f32, q: f32) -> Self {
+        let w0 = 2.0 * std::f32::consts::PI * (fc / sr).clamp(1e-4, 0.49);
+        let (sn, cs) = w0.sin_cos();
+        let alpha = sn / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        let b0 = (1.0 + cs) / (2.0 * a0);
+        Self {
+            b0,
+            b1: -(1.0 + cs) / a0,
+            b2: b0,
+            a1: (-2.0 * cs) / a0,
+            a2: (1.0 - alpha) / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+
     #[inline]
     pub(crate) fn process(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.z1;
@@ -175,7 +194,7 @@ impl Oversampler2x {
         }
     }
     #[inline]
-    pub(crate) fn process<F: Fn(f32) -> f32>(&mut self, x: f32, f: F) -> f32 {
+    pub(crate) fn process<F: FnMut(f32) -> f32>(&mut self, x: f32, mut f: F) -> f32 {
         let mid = 0.5 * (self.last + x); // upsampled sample between last and x
         self.last = x;
         let _ = self.lp.process(f(mid)); // first half-rate sample (discarded)

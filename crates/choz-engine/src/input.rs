@@ -86,8 +86,30 @@ pub enum ControlMsg {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InputEvent {
     Note(NoteMsg),
+    /// The MIDI clock of whatever is upstream: a drum machine, a DAW, a
+    /// KeyStep. Not tagged with a source — there is one clock, and two ports
+    /// sending it is a setup problem rather than something to average.
+    Clock(ClockMsg),
     Cc(CcMsg),
     Program(ProgramMsg),
     Bend(BendMsg),
     Control(ControlMsg),
+}
+
+/// What arrives on MIDI's clock wire, once it is worth telling anybody about.
+///
+/// The pulses themselves (0xF8, twenty-four to the quarter) are counted where
+/// they land — in the port's own callback, which is the only place with a
+/// timestamp that has not been through a UI loop. What comes out of here is one
+/// message per quarter with the tempo those pulses implied, plus the three
+/// transport commands.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ClockMsg {
+    /// Play from the top.
+    Start,
+    /// Play from where it stopped.
+    Continue,
+    Stop,
+    /// The tempo the last twenty-four pulses were sent at.
+    Tempo(f32),
 }

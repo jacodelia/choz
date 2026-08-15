@@ -80,7 +80,7 @@ choz/
 │   │       ├── engine.rs        # RT audio engine: slots, mixer, cpal callback
 │   │       ├── sources.rs       # TestTone / WavPlayer / Sf2Synth (AudioSource impls)
 │   │       ├── input.rs         # InputSource / NoteMsg / InputEvent
-│   │       ├── midi.rs          # Hardware MIDI input (midir → flume), incl. CC
+│   │       ├── midi.rs          # Hardware MIDI in (midir → flume) + clock + MIDI out
 │   │       ├── osc.rs           # OSC UDP listener (notes + remote control)
 │   │       ├── fx_chain.rs      # Builds FX processor chains from specs
 │   │       ├── pitch.rs         # Audio in → notes out (YIN), for the A→M button
@@ -91,10 +91,7 @@ choz/
 │   │       ├── sfz.rs           # SFZ parser + 32-voice sampler (samples decoded on load)
 │   │       ├── quarantine.rs    # Probe a plugin in a child process; cache the verdict
 │   │       ├── sandboxed.rs     # AudioSource/FxProcessor backed by a child process
-│   │       ├── registry.rs      # Legacy plugin registry (largely stub)
-│   │       ├── scanner.rs       # Legacy filesystem discovery (largely stub)
-│   │       ├── plugin_types.rs  # Legacy plugin format enum / host port trait
-│   │       └── fx/              # 34 DSP processors (see below)
+│   │       └── fx/              # 35 DSP processors (see below)
 │   ├── choz-plugin-clap/
 │   │   └── src/
 │   │       ├── lib.rs           # Discovery + ClapPluginInfo
@@ -129,6 +126,7 @@ choz/
 │           ├── editor.rs        # X11 window thread hosting a plugin's own GUI
 │           ├── source.rs        # Instrument model, AudioFxKind, FxCategory, param descs
 │           ├── project.rs       # choz-project.yml save model (serde_yaml)
+│           ├── arp.rs           # Per-tab arpeggiator + step sequencer (one clock)
 │           ├── automation.rs    # Lanes against the beat, addressed like MIDI learn
 │           ├── settings.rs      # ui.json: color, language, audio + OSC settings
 │           ├── file_browser.rs  # Filesystem browser (files and DIR_PICK mode)
@@ -143,14 +141,14 @@ choz/
 │               ├── source_panel.rs    # INPUTS panel (inside the IN drawer)
 │               ├── fx_chain_panel.rs  # RACK panel; returns its own RackLayout
 │               ├── splash.rs          # Startup splash
-│               ├── midi_monitor.rs    # Tabs: MIDI arrivals / WAVE / ACTIVITY
+│               ├── midi_monitor.rs    # Tabs: MIDI / KEYS / ROLL / WAVE / ACTIVITY
 │               ├── background.rs      # Desktop: flat colour or image, in cells
 │               ├── kitty_bg.rs        # The same image at real pixel resolution,
 │               │                      # under the cell backgrounds (kitty et al)
 │               └── theme.rs           # Colours, and the wash panels blend with
 ```
 
-FX processors under `crates/choz-engine/src/fx/` (34 built-ins, each with its own tests):
+FX processors under `crates/choz-engine/src/fx/` (35 built-ins, each with its own tests):
 
 ```
 fx/
@@ -185,12 +183,32 @@ fx/
 ├── vinyl.rs        # Vinyl simulation (wow, flutter, crackle)
 ├── cassette.rs     # Cassette tape simulation
 ├── pedal.rs        # AMBER FANG + VELVET FUZZ (2x-oversampled waveshaping)
+├── saturator.rs    # The general waveshaper: 8 curves, bias, tone, 1x–8x
+├── oversample.rs   # Reusable 1x/2x/4x/8x oversampling + a log tone control
+├── smooth.rs       # One-pole parameter smoothing, sample-rate aware
 ├── utility.rs      # Gain, PhaseInvert, MonoMaker, SoftClipper, TubeSaturation,
 │                   # plus shared Biquad / Oversampler2x helpers
 ├── widener.rs      # Stereo widener
 ├── looper.rs       # Live looper
 └── pan.rs          # Constant-power stereo panner
 ```
+
+### Shared DSP pieces
+
+Two things every nonlinear effect needs, so neither belongs to one of them:
+
+- **`oversample.rs`** — a waveshaper multiplies harmonic content, and whatever
+  it makes above Nyquist folds back down as inharmonic tones. Running the curve
+  at 2×, 4× or 8× and filtering before decimating throws that away instead.
+  Each halving stage carries a **4th-order** Butterworth: with two poles the
+  first reflection is barely 10 dB down and cascading stages hits a floor set by
+  the filter rather than by the factor — measured, 8× went from 15 % of the
+  aliasing to under 10 %. The factor is a parameter, not a policy: it is worth
+  it for a hard clipper and pure waste for anything linear.
+- **`smooth.rs`** — a knob is set between blocks and read every sample; the step
+  between the two is a click. One pole, so there is no corner. It snaps to the
+  target once the gap drops below 1e-5, because in `f32` the recursion reaches a
+  fixed point while still that far away.
 
 ## Crate Dependency Graph
 
@@ -375,11 +393,28 @@ nothing.
 
 ### Where the inputs come from
 
-`jack_backend::all_capture_ports()` returns **every** capture port in the graph,
-grouped by owning node, and the client registers one input port per entry and
-wires them one for one. There is no input-device selection any more: the user
-picks a *channel*, and `AudioEngine::input_ports()` gives the UI the port behind
-each one, which is what the drawer groups its rows by.
+Live audio has **two shapes**, and `AudioEngine::input_ports()` hides the
+difference from the UI: it always answers "one name per input channel", and the
+drawer groups its rows by the part before the colon.
+
+*On the native JACK client*, `jack_backend::all_capture_ports()` returns **every**
+capture port in the graph, grouped by owning node, and the client registers one
+input port per entry and wires them one for one. There is no device to choose:
+the user picks a *channel*.
+
+*On ALSA / PulseAudio / PipeWire* (the cpal backends) there is no graph to wire,
+so choz opens a capture **device** — chosen in `EDIT → Settings → AUDIO →
+Input`, remembered in `ui.json` as `audio.input_device`, and off until asked
+for. Its channels are the input channels.
+
+The two backends differ in one more way that matters: JACK hands playback and
+capture to the *same* callback, so the backend fills `RtState::capture`
+directly. cpal gives them their own devices and their own callbacks on their own
+clocks, so the input stream pushes into a lock-free ring (`RtState::capture_rx`)
+and `drain_capture` empties one block of it at the top of the output callback.
+That drain answers for both ends of the drift: short fills with silence, long
+throws the backlog away — a ring allowed to fill is latency that grows all night
+and never comes back.
 
 This replaced asking the *sink* for its capture ports, which is what choz used to
 do — and on PipeWire an interface is two nodes, so an eight-input UMC1820
@@ -395,6 +430,42 @@ there: the rows drew, the clicks did nothing.
 `ponytail:` a slot's `in_pair` indexes that flat list, so unplugging a card
 shifts what a saved project points at. Names in the project would fix it; a
 rescan is the honest workaround until someone hits it.
+
+### Where the notes go
+
+A tab's notes end at its own instrument, and — when the OUT drawer's `MIDI OUT`
+section has one bound — at a **MIDI port** as well. That is the destination the
+arpeggiator is for: a desk of hardware with no arpeggiator of its own.
+
+Everything goes through `App::send_note`: the keys, the arpeggiator's own
+events, and the note-offs `PANIC` sends. A second destination that some paths
+know about and others do not is a synth left droning by whichever path was
+forgotten, so there is exactly one funnel.
+
+`midi::MidiOut` keeps the list of what it has sounding and stops it note by note
+rather than with CC 123 — a hardware synth that ignores "all notes off" drones
+until it is power-cycled, and the list of what is actually down is right there.
+Connections are **shared by port name** (`App.midi_outs`): ALSA hands a port to
+one client, so two tabs pointed at the same synth have to be one connection. The
+tab stores the **name**, not an index: ports come and go, and an index into a
+list that changed while choz was closed points at somebody else's synth.
+
+### The clock, from outside
+
+`midi.rs` counts MIDI clock **inside the port's own callback**, which is the last
+place the timestamp is honest — a pulse read from the UI loop carries that
+loop's jitter. Twenty-four pulses is a quarter, so a quarter of them is one
+`ClockMsg::Tempo`: averaging over the beat rather than over one interval, which
+carries every bit of jitter the cable and the sender have between them. The
+pulse that closes a quarter opens the next one, or every reading would lose a
+beat.
+
+`START` rewinds and rolls, `CONTINUE` rolls from where it stopped, `STOP` stops.
+The tempo is written straight to the transport: the sender **is** the clock, and
+smoothing it here would put choz a beat behind whatever it is playing with. The
+`CLK INT/EXT` switch in the TRANSPORT panel is what turns any of this on, and it
+is a switch on purpose — a port that sends clock all day would otherwise take
+the tempo over the moment it is plugged in.
 
 ### Audio in, notes out (`A→M`)
 
@@ -463,6 +534,16 @@ monitor's **WAVE** and **ACTIVITY** tabs (`F5`, or click the strip) are just two
 drawings of that, next to the messages, because "did the note arrive" and "did
 anything come out" are the same question asked twice.
 
+The **KEYS** and **ROLL** tabs answer the first question with a picture instead
+of a log. `KeyboardState` (in `midi_monitor.rs`) is a 128-slot map of what is
+held plus a fixed ring of recent notes for the falling view, fed from
+`drain_midi` **after** routing is resolved, so a key can be coloured by the tab
+that is playing it (`KeyColor::{Channel, Instrument, Velocity}`, saved in
+`ui.json`). It is deliberately not `App.sounding`: that one indexes slots and
+exists so a note-off reaches the tab its note-on went to, and merging the two is
+how notes get stuck. There is no stuck-note timeout either — a held pad is a
+held note; `PANIC` is what clears both the rack and the picture.
+
 ## FX Chain Processing Pipeline
 
 ```mermaid
@@ -478,7 +559,7 @@ flowchart LR
     SRC --> FX1 --> FX2 --> FXn --> FX5 --> MIX --> OUT
 ```
 
-`source::MAX_FX = 5` is the single source of truth for the chain length.
+`source::MAX_FX = 12` is the single source of truth for the chain length.
 
 Each FX processor implements the `FxProcessor` trait:
 
@@ -499,6 +580,53 @@ lets a CLAP instrument be tweaked live, RT-safely.
 Processing is zero-allocation in the audio callback — all buffers are
 pre-allocated and updated in place.
 
+### Rules every built-in effect follows
+
+Not style, law — an effect that breaks one of these breaks the audio thread for
+everything else in the rack:
+
+- no allocations, locks, I/O or logging inside `process_block`;
+- sample-rate aware, and re-derived when the rate changes under it;
+- parameters smoothed wherever a jump would click;
+- deterministic, unless randomness is part of the effect — and then from a
+  fixed seed, so a session repeats and a test can exist;
+- `reset()` that leaves nothing behind;
+- output bounded: an effect that can run away takes the mix bus with it, so a
+  feedback loop is bounded **structurally** (a saturator) and not by a constant
+  someone measured once.
+
+The test pattern each one follows: silence, an impulse, a sine, noise, mono and
+stereo, both ends of every parameter, a sample-rate change, tiny and huge
+blocks, automation, and NaN/Inf — plus whatever that effect specifically claims
+(attenuation for an EQ, gain reduction over threshold for a compressor, the
+delay time measured off an impulse, decay for a reverb).
+
+### Pitch, and the two shifters
+
+There are two pitch shifters and that is deliberate.
+`autotune::shifter::RetuneShifter` cuts its jumps on a **detected period**,
+which is what makes a corrector clean on a voice at ratios near 1 — it needs a
+detector behind it. `fx::shift::VoiceShifter` takes any ratio and needs
+nothing, paying for it with a light warble; it is what the shimmer's feedback
+loop and the harmoniser's voices share. Two shifters for two jobs, one
+implementation of each.
+
+`pitch::PitchTracker` (`A→M`) runs **inside the audio callback**, so what it
+costs comes out of the same budget as the instrument and the whole FX chain —
+and a callback that misses its deadline glitches the **graph**, not just choz.
+It is band-limited at both ends before it measures (60 Hz high-pass under the
+lowest note, 3.5 kHz low-pass before decimating), and its inner loop reads two
+plain slices rather than walking a ring. There is an `#[ignore]`d test that
+measures what one block costs; run it when the detector is touched.
+
+### Measurement
+
+`choz-engine::meter` publishes what the output sounds like: peak, RMS, a
+decimated waveform window, and an **undecimated** ring (`SPECTRUM_POINTS`) for
+anything that measures frequency. The FFT that reads it lives in
+`choz-ui::spectrum` and runs on the **UI thread** — the callback writes samples
+and nothing else.
+
 ## UI Layout
 
 ```mermaid
@@ -510,8 +638,9 @@ flowchart TB
             SP["INPUTS Panel<br/>SCAN INPUTS button<br/>MIDI ports + OSC, with tab bindings<br/>every capture jack, grouped by card"]
         end
         subgraph Mid["RACK — everything the drawers leave"]
-            FXP["RACK Panel<br/>tabs · mixer strip · INSTR buttons · BANK<br/>FX chain row · knob grid · SLOT buttons"]
+            FXP["RACK Panel<br/>tabs · mixer strip · INSTR buttons · BANK · ARP<br/>FX chain row · knob grid · SLOT buttons"]
             TR["TRANSPORT<br/>[PLAY] [STOP] · OUT device"]
+            MM["MIDI IN monitor<br/>tabs: MIDI · KEYS · ROLL · WAVE · SPEC · ACTIVITY"]
         end
         subgraph Right["OUT drawer (F3) — 3 cols shut, 34% open"]
             OP["Output devices + one row per device channel<br/>Enter on a device reloads the rack,<br/>Enter on a channel sends the active tab there,<br/>←/→ set one side only"]
@@ -527,6 +656,15 @@ flowchart TB
 
 Knobs are laid out by `param_grid(width, n)`, which wraps onto more rows and
 scrolls with the cursor, so a 16-parameter effect still fits.
+
+**A click rect is never a hand-computed offset.** Every panel returns the
+rectangles it drew (`RackLayout`, `ModalRects`, the monitor's tab strip) and the
+mouse router only ever consults those. The rule has a specific reason: the text
+before a button can be translated, so `inner.x + 2 + 8` is right in English and
+wrong in Spanish — which is how the bank arrows ended up answering one column to
+the left of where they were painted. Positions are accumulated from the widths
+of the spans actually pushed (`Span::width`, not `chars().count()`, which lies
+about CJK).
 
 ## Modals
 
@@ -615,9 +753,10 @@ Discovery for every other format is filesystem-only:
   today: every format in `PluginFormat` is hosted. The branch stays for the day a
   new one is added.
 
-`registry.rs`, `scanner.rs` and `plugin_types.rs` are the earlier, largely stubbed
-plugin infrastructure; the live path is the per-format crates plus `paths.rs`.
-Unifying or deleting them is still open (see [roadmap.md](roadmap.md)).
+There is one plugin path and it is this one: the per-format crates plus
+`paths.rs`. The earlier `registry.rs` / `scanner.rs` / `plugin_types.rs` — 563
+lines of stubs behind `#[allow(dead_code)]`, reached only by a field nothing
+read — were deleted rather than unified.
 
 ### Surviving third-party code
 
@@ -797,7 +936,10 @@ of truth; tests redirect it with `XDG_STATE_HOME`).
 
 `packaging/` holds everything that turns a build into something installed:
 `install.sh` (finds an older copy in `~/.local/bin`, `/usr/local/bin` and
-`/usr/bin`, asks it `choz --version`, removes it, then installs), the `.desktop`
+`/usr/bin`, asks it `choz --version`, removes it, then installs; in a release
+tarball it uses the **binary shipped beside it** rather than building — the
+person who downloaded a `.tar.gz` is exactly the one without a toolchain), the
+`.desktop`
 entry, the `hicolor` icon and the `application/x-choz-project` MIME type for
 `*.choz.yml`. `.deb` and `.rpm` metadata live in `crates/choz-ui/Cargo.toml` and
 install the same files; both replace the previous version by package name.
@@ -848,7 +990,7 @@ listens on, with no choz-side change at all.
 | `ratatui-image` | 8 | About-dialog logo in the terminal |
 | `cpal` | 0.15 | Cross-platform audio I/O (ALSA / JACK) |
 | `jack` | 0.11 | JACK audio server bindings |
-| `midir` | 0.10 | MIDI input |
+| `midir` | 0.10 | MIDI input and output |
 | `rosc` | 0.11 | OSC message parsing |
 | `oxisynth` / `soundfont` | 0.1 | SF2 synthesis and preset listing |
 | `hound` | 3 | WAV decoding |

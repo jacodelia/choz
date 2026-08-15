@@ -35,6 +35,10 @@ pub fn build_processor(
             let damping = p(2);
             let mut d = fx::DelayLine::new(delay_ms, feedback, damping);
             d.set_ping_pong(p(3) > 0.5);
+            // 4 is the dry/wet, which the chain applies itself.
+            d.set_crossfeed(p(5));
+            d.set_mod_rate(p(6) * 10.0);
+            d.set_mod_depth_ms(p(7) * 50.0);
             Box::new(d)
         }
         "reverb" => {
@@ -57,12 +61,17 @@ pub fn build_processor(
             c.release_ms = 10.0 + p(3) * 990.0;
             c.makeup_db = p(4) * 24.0;
             c.knee_db = p(5) * 12.0;
+            c.detect = fx::compressor::Detect::from_norm(p(6));
+            c.stereo_link = p(7);
+            c.sc_hpf_hz = 20.0 + p(8) * 480.0;
             Box::new(c)
         }
         "limiter" => {
-            let mut lim = fx::Compressor::limiter();
+            let mut lim = fx::Compressor::limiter(sample_rate);
             lim.threshold_db = -(1.0 - p(0)) * 12.0;
             lim.release_ms = 1.0 + p(1) * 199.0;
+            lim.lookahead_ms = p(2) * 10.0;
+            lim.stereo_link = p(3);
             Box::new(lim)
         }
         "gate" => {
@@ -72,20 +81,12 @@ pub fn build_processor(
             g.hold_ms = 1.0 + p(2) * 499.0;
             g.release_ms = 10.0 + p(3) * 990.0;
             g.floor_db = -(1.0 - p(4)) * 80.0;
+            g.hysteresis_db = p(5) * 24.0;
             Box::new(g)
         }
-        "parameq" => {
-            let mut eq = fx::ParametricEq::new();
-            eq.bands[1].gain_db = (p(0) - 0.5) * 36.0;
-            eq.bands[2].gain_db = (p(1) - 0.5) * 36.0;
-            eq.bands[3].gain_db = (p(2) - 0.5) * 36.0;
-            eq.bands[3].kind = fx::EqBandKind::HighShelf;
-            eq.bands[3].gain_db = (p(3) - 0.5) * 36.0;
-            eq.bands[1].freq = 20.0 * (800.0f32 / 20.0).powf(p(4));
-            eq.bands[3].freq = 1000.0 * 20.0f32.powf(p(5));
-            eq.bands[2].q = 0.1 + p(6) * 9.9;
-            Box::new(eq)
-        }
+        // The interface builds the same EQ to draw its curve, so the mapping
+        // lives with the processor rather than here.
+        "parameq" => Box::new(fx::ParametricEq::from_params(params, sample_rate)),
         // Ten bands and a preamp, all of them knobs — so a CC can ride one
         // band. `p(11)` picks a Winamp preset, which fills the bands unless the
         // user has moved them (a preset is a starting point, not a lock).
@@ -126,6 +127,32 @@ pub fn build_processor(
             Box::new(at)
         }
         "filterbank" => Box::new(fx::FilterBankFx::new(sample_rate)),
+        // One processor, two effects: the LFO points at level or at balance.
+        "tremolo" => Box::new(fx::Tremolo::with_params(
+            fx::ModTarget::Tremolo,
+            sample_rate,
+            params,
+        )),
+        "autopan" => Box::new(fx::Tremolo::with_params(
+            fx::ModTarget::AutoPan,
+            sample_rate,
+            params,
+        )),
+        "autofilter" => Box::new(fx::AutoFilter::with_params(sample_rate, params)),
+        // One carrier, two uses: one sideband or both.
+        "freqshifter" => Box::new(fx::FreqShift::with_params(
+            fx::Carrier::Shift,
+            sample_rate,
+            params,
+        )),
+        "ringmod" => Box::new(fx::FreqShift::with_params(
+            fx::Carrier::Ring,
+            sample_rate,
+            params,
+        )),
+        "shimmer" => Box::new(fx::ShimmerReverb::with_params(sample_rate, params)),
+        "harmonizer" => Box::new(fx::Harmonizer::with_params(sample_rate, params)),
+        "beatrepeat" => Box::new(fx::BeatRepeat::with_params(sample_rate, params)),
         "chorus" => {
             let mut c = fx::Chorus::new();
             c.rate = 0.05 + p(0) * 4.95;
@@ -164,6 +191,10 @@ pub fn build_processor(
             Box::new(v)
         }
         "cassette" => Box::new(fx::Cassette::new()),
+        // The general waveshaper: curve and oversampling are its own knobs.
+        "saturator" => Box::new(fx::Saturator::with_params(sample_rate, params)),
+        // The same processor: the curve is drawn instead of computed.
+        "waveshaper" => Box::new(fx::Saturator::waveshaper(sample_rate, params)),
         "softclip" => {
             let mut s = fx::SoftClipper::new();
             s.drive = 1.0 + p(0) * 9.0;
@@ -324,6 +355,78 @@ fn build_clap_fx(
     Some(Box::new(eff))
 }
 
+/// Every effect in a chain, metered — without a single effect knowing about it.
+///
+/// The alternative was a pair of peak fields inside each processor (which is
+/// what the `Saturator` grew first, and what the roadmap called out): thirty-odd
+/// copies of the same two lines, and no meter at all for a hosted plugin, which
+/// is exactly where "is anything even reaching this?" gets asked. Here the peak
+/// is taken on the way in and on the way out of a `process_block` that has no
+/// idea it is being watched.
+///
+/// Cost: two passes over the block per effect. A peak is a compare per sample
+/// over a few hundred of them — next to the effect it wraps, nothing.
+///
+/// Everything else is forwarded. A wrapper that swallowed `editor()` would take
+/// a plugin's window away, which is the trap with this shape.
+struct Metered {
+    inner: Box<dyn fx::FxProcessor>,
+    meter: choz_ports::FxMeter,
+}
+
+impl fx::FxProcessor for Metered {
+    fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
+        let input = choz_ports::FxMeter::peak_of(buf);
+        self.inner.process_block(buf, sample_rate);
+        self.meter.publish(input, choz_ports::FxMeter::peak_of(buf));
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+        self.meter.clear();
+    }
+
+    fn set_mix(&mut self, wet: f32) {
+        self.inner.set_mix(wet);
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn params(&self) -> Vec<choz_ports::FxParam> {
+        self.inner.params()
+    }
+
+    fn set_param(&mut self, index: usize, value: f32) {
+        self.inner.set_param(index, value);
+    }
+
+    fn editor(&self) -> Option<choz_ports::EditorHandle> {
+        self.inner.editor()
+    }
+
+    fn param_touch(&self) -> Option<choz_ports::TouchHandle> {
+        self.inner.param_touch()
+    }
+
+    fn state(&self) -> Option<choz_ports::StateHandle> {
+        self.inner.state()
+    }
+
+    fn sandbox(&self) -> Option<choz_ports::SandboxStatus> {
+        self.inner.sandbox()
+    }
+
+    fn meter(&self) -> Option<choz_ports::FxMeter> {
+        Some(self.meter.clone())
+    }
+
+    fn latency_samples(&self) -> u32 {
+        self.inner.latency_samples()
+    }
+}
+
 pub fn build_chain_from_specs(
     specs: &[FxSpec],
     sample_rate: u32,
@@ -346,7 +449,10 @@ pub fn build_chain_from_specs(
                 None => build_processor(&s.kind, &s.params, sample_rate)?,
             };
             proc.set_mix(s.wet);
-            Some(proc)
+            Some(Box::new(Metered {
+                inner: proc,
+                meter: choz_ports::FxMeter::default(),
+            }) as Box<dyn fx::FxProcessor>)
         })
         .collect()
 }
@@ -419,6 +525,41 @@ mod tests {
             spec("reverb", None),
         ];
         assert_eq!(build_chain_from_specs(&specs, 48_000, 256).len(), 2);
+    }
+
+    /// Every effect in a built chain is metered, whatever it is — that is the
+    /// whole point of doing it in the wrapper instead of inside each processor.
+    /// And a chain reports the delay its effects add.
+    #[test]
+    fn a_built_chain_meters_every_effect_and_reports_its_latency() {
+        // Gain at 0.5 is a knob position, not a factor; what matters is that
+        // both sides of it read something and neither is stuck at zero.
+        let mut chain = build_chain_from_specs(&[spec("gain", None)], 48_000, 256);
+        let meter = chain[0].meter().expect("the wrapper meters everything");
+        assert_eq!(meter.peaks(), (0.0, 0.0), "nothing has gone through yet");
+
+        let mut buf = [0.0f32; 512];
+        for (i, s) in buf.iter_mut().enumerate() {
+            *s = 0.5 * (2.0 * std::f32::consts::PI * (i / 2) as f32 / 64.0).sin();
+        }
+        chain[0].process_block(&mut buf, 48_000);
+        let (input, output) = meter.peaks();
+        assert!((input - 0.5).abs() < 0.02, "input peak: {input}");
+        assert!(output > 0.0 && output.is_finite(), "output peak: {output}");
+
+        // Silence after signal reads as silence: a needle that stays up is a
+        // needle nobody believes.
+        chain[0].process_block(&mut [0.0f32; 512], 48_000);
+        assert_eq!(meter.peaks(), (0.0, 0.0));
+
+        // A gain stage delays nothing; AutoTune holds a shifter window, and the
+        // wrapper must pass that number through rather than answer for it.
+        assert_eq!(chain[0].latency_samples(), 0);
+        let tuned = build_chain_from_specs(&[spec("autotune", None)], 48_000, 256);
+        assert!(
+            tuned[0].latency_samples() > 0,
+            "AutoTune reports its shifter window"
+        );
     }
 
     /// Every FX, built with a mid-range param set, must stay numerically sane

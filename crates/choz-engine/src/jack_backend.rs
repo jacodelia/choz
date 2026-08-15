@@ -17,7 +17,7 @@ pub const CLIENT_NAME: &str = "choz";
 /// Ceiling on ports we register per direction. Interfaces above this are still
 /// usable, just not to their last channels.
 /// ponytail: a constant, not a setting — nothing here has more than 32 jacks.
-const MAX_PORTS: usize = 32;
+pub(crate) const MAX_PORTS: usize = 32;
 
 /// The RT side: the shared engine state plus this client's ports.
 pub struct JackRt {
@@ -153,9 +153,14 @@ pub(crate) fn in_order(mut ports: Vec<String>) -> Vec<String> {
     ports
 }
 
+/// What the audio ended up connected to: the sink's name and how many of our
+/// output ports reached it.
+pub type Wiring = Option<(String, usize)>;
+
 /// Open the client, register the ports, wire them to `sink` when one is named,
-/// and start processing. Returns the live client and the number of output ports
-/// actually registered.
+/// and start processing. Returns the live client, the number of output ports
+/// registered, and — when a sink was asked for — which one the audio actually
+/// ended up going to and how many of our ports reached it.
 ///
 /// `capture` is the graph ports our inputs are wired to, one for one — see
 /// [`all_capture_ports`]. Its length *is* the input channel count.
@@ -164,7 +169,7 @@ pub fn start(
     capture: &[String],
     outs: usize,
     state: RtState,
-) -> Result<(Handle, usize)> {
+) -> Result<(Handle, usize, Wiring)> {
     let ins = capture.len();
     let (client, _status) = Client::new(CLIENT_NAME, ClientOptions::NO_START_SERVER)
         .context("cannot reach the JACK graph (is PipeWire's JACK layer installed?)")?;
@@ -191,26 +196,56 @@ pub fn start(
     // Wiring happens after activation: ports only exist in the graph once the
     // client is live. A sink that went away is not fatal — choz still runs,
     // just unconnected, and the user can patch it anywhere.
+    let mut wired_to = None;
     if let Some(sink) = sink {
-        if let Err(e) = connect(handle.as_client(), &our_outs, sink) {
-            eprintln!("choz: {e}");
+        match connect(handle.as_client(), &our_outs, sink) {
+            Ok((name, wired)) => wired_to = Some((name, wired)),
+            Err(e) => eprintln!("choz: {e}"),
         }
     }
     // Capture: every input jack in the graph, wired one for one. A device that
-    // vanished between the scan and here just fails to connect.
+    // vanished between the scan and here just fails to connect — but **say
+    // so**. Swallowing these is how choz ends up with input ports wired to
+    // nothing, which looks exactly like a broken effect: the rows are there,
+    // the routing is there, and the signal never arrives.
+    let mut failed = 0usize;
     for (from, ours) in capture.iter().zip(our_ins.iter()) {
-        let _ = handle.as_client().connect_ports_by_name(from, ours);
+        if let Err(e) = handle.as_client().connect_ports_by_name(from, ours) {
+            if failed < 3 {
+                eprintln!("choz: cannot wire capture '{from}' -> '{ours}': {e}");
+            }
+            failed += 1;
+        }
     }
-    Ok((handle, outs))
+    if failed > 0 {
+        eprintln!(
+            "choz: {failed} of {} capture ports could not be wired; those channels will be silent",
+            capture.len()
+        );
+    }
+    Ok((handle, outs, wired_to))
 }
 
 /// Wire our outputs to `sink`, channel for channel: `out_1` → the sink's first
 /// playback port.
-fn connect(client: &Client, our_outs: &[String], sink: &str) -> Result<()> {
-    let targets = sink_ports(client, sink);
+///
+/// **Falls back to a sink that exists.** The saved output is a name, and a
+/// name outlives the box it belonged to: an interface switched off since last
+/// time leaves choz wired to nothing, which is silence that looks exactly like
+/// a broken effect. Returns the sink actually wired to and how many ports were
+/// joined, so the caller can say which one it ended up on.
+fn connect(client: &Client, our_outs: &[String], sink: &str) -> Result<(String, usize)> {
+    let mut name = sink.to_string();
+    let mut targets = sink_ports(client, sink);
     if targets.is_empty() {
-        anyhow::bail!("output '{sink}' has no playback ports; leaving choz unconnected");
+        let Some(other) = any_sink_with_ports(client) else {
+            anyhow::bail!("output '{sink}' is gone and the graph has no other sink");
+        };
+        eprintln!("choz: output '{sink}' has no playback ports; using '{other}' instead");
+        targets = sink_ports(client, &other);
+        name = other;
     }
+    let mut wired = 0usize;
     for (ours, target) in our_outs.iter().zip(targets.iter()) {
         // Drop whatever the graph auto-connected us to, or the same audio
         // reaches two sinks.
@@ -219,8 +254,36 @@ fn connect(client: &Client, our_outs: &[String], sink: &str) -> Result<()> {
                 let _ = client.disconnect_ports_by_name(ours, &old);
             }
         }
-        let _ = client.connect_ports_by_name(ours, target);
+        match client.connect_ports_by_name(ours, target) {
+            Ok(()) => wired += 1,
+            Err(e) => eprintln!("choz: cannot wire '{ours}' -> '{target}': {e}"),
+        }
     }
+    Ok((name, wired))
+}
 
-    Ok(())
+/// Any node in the graph with playback ports, preferring a real card over a
+/// loopback or a monitor.
+fn any_sink_with_ports(client: &Client) -> Option<String> {
+    let mut owners: Vec<String> = Vec::new();
+    for port in client.ports(
+        None,
+        Some(super::engine::JACK_AUDIO),
+        jack::PortFlags::IS_INPUT,
+    ) {
+        let Some((owner, _)) = port.rsplit_once(':') else {
+            continue;
+        };
+        if owner == CLIENT_NAME || owner == super::engine::CPAL_JACK_CLIENT {
+            continue;
+        }
+        if !owners.iter().any(|o| o == owner) {
+            owners.push(owner.to_string());
+        }
+    }
+    owners
+        .iter()
+        .find(|o| o.starts_with("alsa_output"))
+        .or_else(|| owners.first())
+        .cloned()
 }
