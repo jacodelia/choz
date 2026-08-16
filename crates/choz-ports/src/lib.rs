@@ -87,6 +87,86 @@ pub trait FxProcessor: Send {
     fn sandbox(&self) -> Option<SandboxStatus> {
         None
     }
+
+    /// Peak in and out of the last block, when this processor publishes them.
+    /// Taken once, next to [`FxProcessor::editor`] — after that the processor
+    /// belongs to the RT thread. Default `None`: an effect that meters nothing.
+    fn meter(&self) -> Option<FxMeter> {
+        None
+    }
+
+    /// How many samples of delay this processor adds to the signal.
+    ///
+    /// Anything with lookahead or an FFT window has some, and it is a constant
+    /// of the algorithm, not of the block size — so it is asked once, off the
+    /// RT thread, where the editor and the meter are taken. Default `0`: most
+    /// effects answer the same block they were given.
+    fn latency_samples(&self) -> u32 {
+        0
+    }
+}
+
+// ─── Meters ─────────────────────────────────────────────────────────────────
+
+/// Peak in and out of one effect's last block, for a meter the interface can
+/// draw.
+///
+/// The processor belongs to the audio thread the moment it is handed over, so
+/// the numbers travel the way [`SandboxStatus`]'s do: shared atomics, written
+/// relaxed from the callback, read whenever the UI redraws. A reading one block
+/// stale is a reading that is right.
+#[derive(Clone)]
+pub struct FxMeter {
+    /// `[input, output]` peak, as `f32` bits.
+    peaks: std::sync::Arc<[std::sync::atomic::AtomicU32; 2]>,
+}
+
+impl Default for FxMeter {
+    fn default() -> Self {
+        Self {
+            peaks: std::sync::Arc::new([
+                std::sync::atomic::AtomicU32::new(0),
+                std::sync::atomic::AtomicU32::new(0),
+            ]),
+        }
+    }
+}
+
+impl std::fmt::Debug for FxMeter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (i, o) = self.peaks();
+        write!(f, "FxMeter({i:.3} -> {o:.3})")
+    }
+}
+
+impl FxMeter {
+    /// Publish one block's peaks. Two relaxed stores, nothing else.
+    pub fn publish(&self, input: f32, output: f32) {
+        self.peaks[0].store(input.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        self.peaks[1].store(output.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `(input, output)` peak of the last block, linear.
+    pub fn peaks(&self) -> (f32, f32) {
+        let read =
+            |i: usize| f32::from_bits(self.peaks[i].load(std::sync::atomic::Ordering::Relaxed));
+        (read(0), read(1))
+    }
+
+    /// Forget the last block: a chain that stopped should not leave a frozen
+    /// needle behind. Called from `reset`, which is not the RT path.
+    pub fn clear(&self) {
+        self.publish(0.0, 0.0);
+    }
+
+    /// Peak of an interleaved block. The one pass every metering effect makes,
+    /// written once here — and it skips anything non-finite, because a plugin
+    /// that emits a NaN must not freeze the meter at NaN forever.
+    pub fn peak_of(buf: &[f32]) -> f32 {
+        buf.iter()
+            .filter(|s| s.is_finite())
+            .fold(0.0f32, |m, s| m.max(s.abs()))
+    }
 }
 
 // ─── Sources ────────────────────────────────────────────────────────────────
@@ -468,6 +548,21 @@ impl Transport {
     /// (VST2 `ppqPos`, VST3 `projectTimeMusic`, CLAP's beat position).
     pub fn ppq(&self) -> f64 {
         self.samples() as f64 / self.sample_rate() as f64 * (self.bpm() as f64 / 60.0)
+    }
+
+    /// Put the clock at `beats` quarter notes, which is where a **host's**
+    /// transport says we are.
+    ///
+    /// choz's own clock is counted in frames and only ever moves forward, so
+    /// this is the one door for a timeline somebody else owns: the exported
+    /// CLAP plugins follow the DAW they are loaded into. Converting through
+    /// frames rather than storing beats keeps a single source of position —
+    /// two of them would disagree the moment the tempo changed.
+    pub fn set_position_beats(&self, beats: f64) {
+        let per_beat = self.sample_rate() as f64 * 60.0 / self.bpm().max(1.0) as f64;
+        let samples = (beats.max(0.0) * per_beat) as u64;
+        self.samples
+            .store(samples, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// A bar's length in quarter notes. 4/4 is four, 6/8 is three, 7/8 is 3.5 —

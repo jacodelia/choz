@@ -60,6 +60,13 @@ pub struct Slot {
     pub fx: Vec<Fx>,
     /// MIDI-learn bindings that target this tab.
     pub midi_learn: Vec<Binding>,
+    /// The tab's arpeggiator. Added later, so `default` (off) keeps every
+    /// project written before it loadable and sounding the same.
+    /// A MIDI port this tab also plays to, by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub midi_out: Option<String>,
+    #[serde(default)]
+    pub arp: crate::arp::ArpSettings,
 }
 
 fn default_channel() -> u8 {
@@ -90,9 +97,26 @@ pub struct Mixer {
     /// instead of its instrument.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_pair: Option<(usize, usize)>,
+    /// **The names of those two jacks**, which is what actually identifies
+    /// them.
+    ///
+    /// The pair above is an index into a flat list of every capture port in the
+    /// system, and that list moves: unplug an interface and every index after
+    /// it shifts by two, so a project reopened without the card was quietly
+    /// listening to somebody else's microphone. The names are matched first and
+    /// the indices are only the fallback for projects written before this
+    /// existed — same reasoning as `midi_out`, which has stored a name all
+    /// along.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_ports: Option<(String, String)>,
     /// Audio in, notes out. Added later, hence the default.
     #[serde(default)]
     pub pitch_to_midi: bool,
+    /// How much of a converting tab is the instrument rather than the audio
+    /// that drove it. Added later; `None` means "all instrument", which is
+    /// what it did before there was a choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pitch_mix: Option<f32>,
     /// Trim on the audio input, and the level `A→M` calls a note. Both added
     /// later; `None` means "whatever the defaults are now".
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -216,7 +240,9 @@ mod tests {
                     solo: false,
                     out_pair: Some((2, 3)),
                     in_pair: None,
+                    in_ports: None,
                     pitch_to_midi: false,
+                    pitch_mix: None,
                     in_gain: None,
                     in_gate: None,
                 },
@@ -234,6 +260,19 @@ mod tests {
                     target: crate::LearnTarget::Gain(0),
                     label: "tab 1 \u{00b7} VOL".into(),
                 }],
+                midi_out: Some("Some Synth:in 0".into()),
+                arp: crate::arp::ArpSettings {
+                    on: true,
+                    mode: crate::arp::ArpMode::UpDown,
+                    div: crate::arp::TimeDiv::EighthTriplet,
+                    bpm: 96.0,
+                    sync: true,
+                    gate: 0.4,
+                    swing: 0.1,
+                    octaves: 2,
+                    latch: true,
+                    chord: true,
+                },
             }],
         }
     }

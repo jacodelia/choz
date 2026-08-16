@@ -6,10 +6,16 @@
 //! MIT-licensed crate (and the asymmetric-ordering quirk of the original is
 //! fixed here: both outputs are mixed from the *pre-mix* echoes).
 
+use super::lfo::{Lfo, Wave};
 use super::FxProcessor;
 
 /// Stereo delay (ping-pong capable).
 pub struct DelayLine {
+    /// Modulation of the delay time: rate in Hz and depth in milliseconds.
+    /// Depth 0 = off, and off means the read head sits exactly where it did.
+    mod_rate: f32,
+    mod_depth_ms: f32,
+    lfo: Lfo,
     buf_l: Vec<f32>,
     buf_r: Vec<f32>,
     /// Write head (frames).
@@ -36,6 +42,9 @@ impl DelayLine {
     pub fn new(delay_ms: f32, feedback: f32, damp: f32) -> Self {
         let max_cap = 192001; // ~4 s @ 48 kHz
         Self {
+            mod_rate: 0.3,
+            mod_depth_ms: 0.0,
+            lfo: Lfo::new(),
             buf_l: vec![0.0; max_cap],
             buf_r: vec![0.0; max_cap],
             write: 0,
@@ -78,6 +87,16 @@ impl DelayLine {
         self.delay_frames = frames.clamp(1, self.buf_l.len() - 1);
     }
 
+    pub fn set_mod_rate(&mut self, hz: f32) {
+        self.mod_rate = hz.clamp(0.0, 10.0);
+    }
+
+    /// How far the read head wanders, in milliseconds. This is what turns the
+    /// delay into a chorus-ish, tape-ish one; 0 leaves it exactly where it was.
+    pub fn set_mod_depth_ms(&mut self, ms: f32) {
+        self.mod_depth_ms = ms.clamp(0.0, 50.0);
+    }
+
     #[inline]
     fn read(&self, buf: &[f32], offset: usize) -> f32 {
         let cap = buf.len();
@@ -87,6 +106,24 @@ impl DelayLine {
             cap - (offset - self.write)
         };
         buf[idx % cap]
+    }
+
+    /// Read `offset` frames back, where `offset` need not be a whole number.
+    ///
+    /// Linear interpolation between the two neighbouring samples. Without it a
+    /// moving delay time jumps a whole sample at a time and every jump is a
+    /// click — which is why "modulated" and "interpolated" are one feature and
+    /// not two.
+    // ponytail: linear. All-pass or cubic the day the high end of a fast sweep
+    // sounds dull enough to bother anyone.
+    #[inline]
+    fn read_frac(&self, buf: &[f32], offset: f32) -> f32 {
+        let cap = buf.len();
+        let whole = offset.floor();
+        let frac = offset - whole;
+        let a = self.read(buf, (whole as usize).min(cap - 2));
+        let b = self.read(buf, (whole as usize + 1).min(cap - 1));
+        a + (b - a) * frac
     }
 
     #[inline]
@@ -107,13 +144,28 @@ impl FxProcessor for DelayLine {
             self.update_delay_frames();
         }
         let d = self.delay_frames.max(1);
+        let sr = sample_rate as f32;
+        // The modulation cannot pull the read head past the write head (that
+        // would read the future) nor beyond the buffer, so the swing is capped
+        // by what is actually there.
+        let depth_frames = (self.mod_depth_ms * 0.001 * sr).min(d.saturating_sub(1) as f32);
+        let modulated = depth_frames > 0.0;
         let frames = buf.len() / 2;
         for i in 0..frames {
             let dry_l = buf[i * 2];
             let dry_r = buf[i * 2 + 1];
 
-            let read_l = self.read(&self.buf_l, d);
-            let read_r = self.read(&self.buf_r, d);
+            let (read_l, read_r) = if modulated {
+                // Half a cycle apart: the two heads wander in opposition, which
+                // is what widens the repeats instead of just detuning them.
+                let m = self.lfo.tick(Wave::Sine, self.mod_rate, sr, 0.5);
+                (
+                    self.read_frac(&self.buf_l, d as f32 + m[0] * depth_frames),
+                    self.read_frac(&self.buf_r, d as f32 + m[1] * depth_frames),
+                )
+            } else {
+                (self.read(&self.buf_l, d), self.read(&self.buf_r, d))
+            };
 
             // L/R crossfeed: continuous blend of the two echo channels. Both
             // outputs are mixed from the pre-blend reads (symmetric). cross=0 →
@@ -182,6 +234,8 @@ impl FxProcessor for DelayLine {
             ),
             FxParam::new("Wet", self.wet, 0.0, 1.0, ""),
             FxParam::new("Cross", self.cross, 0.0, 1.0, ""),
+            FxParam::new("ModRate", self.mod_rate / 10.0, 0.0, 10.0, "Hz"),
+            FxParam::new("ModDepth", self.mod_depth_ms / 50.0, 0.0, 50.0, "ms"),
         ]
     }
 
@@ -197,6 +251,8 @@ impl FxProcessor for DelayLine {
             3 => self.ping_pong = v >= 0.5,
             4 => self.wet = v,
             5 => self.cross = v,
+            6 => self.mod_rate = v * 10.0,
+            7 => self.mod_depth_ms = v * 50.0,
             _ => {}
         }
     }
@@ -243,6 +299,61 @@ mod tests {
             buf[200].abs() < 0.01,
             "L echo should be silent, got {}",
             buf[200]
+        );
+    }
+
+    /// The read head has to move, and it has to move *smoothly*: without
+    /// interpolation a wandering delay steps a whole sample at a time and every
+    /// step is a click.
+    #[test]
+    fn a_modulated_delay_moves_its_read_head_without_stepping() {
+        let sr = 48000u32;
+        let mut dl = DelayLine::new(100.0, 0.0, 0.0);
+        dl.set_mix(1.0);
+        dl.set_mod_rate(2.0);
+        dl.set_mod_depth_ms(5.0);
+        // A steady tone: modulating the delay of a sine detunes it, so the
+        // output is the same tone with its phase walking.
+        let frames = 24000;
+        let mut buf = vec![0.0f32; frames * 2];
+        for i in 0..frames {
+            let s = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sr as f32).sin();
+            buf[i * 2] = s;
+            buf[i * 2 + 1] = s;
+        }
+        dl.process_block(&mut buf, sr);
+        let tail: Vec<f32> = buf[12000..].iter().step_by(2).copied().collect();
+        // Bounded, finite, and no sample-to-sample jump bigger than a 440 Hz
+        // sine can make on its own (≈0.06 at this rate). A stepping read head
+        // shows up here as a jump of the order of the signal itself.
+        let biggest = tail
+            .windows(2)
+            .fold(0.0f32, |m, w| m.max((w[1] - w[0]).abs()));
+        assert!(tail.iter().all(|s| s.is_finite()));
+        assert!(biggest < 0.2, "the read head stepped by {biggest}");
+        assert!(
+            tail.iter().fold(0.0f32, |m, s| m.max(s.abs())) > 0.5,
+            "the echo went missing"
+        );
+    }
+
+    /// Depth 0 is the delay that was here before: same echo, same place.
+    #[test]
+    fn no_modulation_leaves_the_delay_exactly_where_it_was() {
+        let sr = 1000u32;
+        let run = |depth: f32| {
+            let mut dl = DelayLine::new(100.0, 0.0, 0.0);
+            dl.set_mix(1.0);
+            dl.set_mod_depth_ms(depth);
+            let mut buf = vec![0.0f32; 400];
+            buf[0] = 1.0;
+            dl.process_block(&mut buf, sr);
+            buf
+        };
+        assert_eq!(run(0.0)[200], run(0.0)[200]);
+        assert!(
+            run(0.0)[200] > 0.5,
+            "the unmodulated echo is where it always was"
         );
     }
 

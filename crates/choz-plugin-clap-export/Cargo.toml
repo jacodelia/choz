@@ -1,0 +1,23 @@
+[package]
+name = "choz-plugin-clap-export"
+version.workspace = true
+edition.workspace = true
+description = "choz's own effects, published as a CLAP plugin bundle for other hosts."
+
+[lib]
+# cdylib is the `.clap` itself; rlib so the ABI can be exercised by a test in
+# this process, without a DAW and without dlopen.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The raw CLAP ABI. `clack-host` is what choz *hosts* with; the plugin half of
+# clack is not vendored here, and the ABI is small enough that the LV2 side was
+# written the same way.
+clap-sys = "0.5"
+choz-engine.workspace = true
+choz-ports.workspace = true
+
+# Only for the test that loads the built bundle the way a DAW does: choz's own
+# CLAP host.
+[dev-dependencies]
+choz-plugin-clap.workspace = true

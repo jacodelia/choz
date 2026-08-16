@@ -35,6 +35,53 @@ pub fn drawer_width(open: bool, total: u16, pct: u16, min: u16) -> u16 {
     (total * pct / 100).max(min).min(half).max(HANDLE_W)
 }
 
+/// How many list rows fit in a drawer of outer rect `area`, under `top` header
+/// lines and above `extra` lines pinned at the bottom (the MIDI-learn banner).
+///
+/// Takes the **outer** rect and subtracts the two border rows itself: the draw
+/// code has the inner rect and the hit-test code has the outer one, and the two
+/// disagreeing by one is exactly the bug this whole thing is about.
+pub fn list_height(area: Rect, top: usize, extra: usize) -> usize {
+    (area.height as usize)
+        .saturating_sub(2)
+        .saturating_sub(top)
+        .saturating_sub(extra)
+}
+
+/// First visible row of a list `rows` long showing `height` of them at once,
+/// with `cursor` on screen.
+///
+/// **There is no scroll offset stored anywhere.** The window is a function of
+/// the cursor, which is the same thing the rack's knob box does: no second
+/// piece of state to keep in step with the list, nothing to reset when the list
+/// changes under it, and the draw and the click rects cannot drift apart
+/// because both call this.
+///
+/// The cost is that the wheel moves the cursor rather than the view. On a list
+/// where every row is a thing you act on, that is what a wheel is for anyway.
+pub fn list_scroll(cursor: usize, rows: usize, height: usize) -> usize {
+    if height == 0 || rows <= height {
+        return 0;
+    }
+    cursor
+        .saturating_sub(height - 1)
+        .min(rows.saturating_sub(height))
+}
+
+/// What the drawer's title says about a list that does not fit: where the
+/// window is, so "there is more" is visible without spending a row on it.
+fn scroll_hint(scroll: usize, rows: usize, height: usize) -> String {
+    if height == 0 || rows <= height {
+        return String::new();
+    }
+    format!(
+        " \u{2195} {}-{}/{}",
+        scroll + 1,
+        (scroll + height).min(rows),
+        rows
+    )
+}
+
 fn border_style(focused: bool) -> Style {
     if focused {
         Style::default()
@@ -107,13 +154,16 @@ pub struct OutRow {
 /// The open OUT drawer: the output devices, then the device's channel pairs so
 /// a rack tab can be sent to any jack of the interface.
 pub fn draw_output_panel(f: &mut Frame, area: Rect, focused: bool, rows: &[OutRow], cursor: usize) {
+    let height = list_height(area, OUTPUT_LIST_TOP, 0);
+    let scroll = list_scroll(cursor, rows.len(), height);
     let title = format!(
-        " {} ",
+        " {}{} ",
         if focused {
             format!("{} [ACTIVE]", t("OUT"))
         } else {
             t("OUT").to_string()
-        }
+        },
+        scroll_hint(scroll, rows.len(), height)
     );
     let block = Block::default()
         .title(title)
@@ -141,7 +191,7 @@ pub fn draw_output_panel(f: &mut Frame, area: Rect, focused: bool, rows: &[OutRo
     if rows.is_empty() {
         lines.push(Line::from(Span::styled("   (no outputs found)", dim)));
     }
-    for (i, row) in rows.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate().skip(scroll).take(height) {
         if row.header {
             lines.push(Line::from(Span::styled(format!(" {}", row.label), dim)));
             continue;
@@ -172,6 +222,38 @@ pub fn draw_output_panel(f: &mut Frame, area: Rect, focused: bool, rows: &[OutRo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The window always contains the cursor, never runs past the end, and
+    /// stays at zero while the list fits — the three things a click rect
+    /// computed from it depends on.
+    #[test]
+    fn the_window_follows_the_cursor_and_stops_at_the_end() {
+        // Fits: no scrolling, whatever the cursor does.
+        assert_eq!(list_scroll(0, 5, 8), 0);
+        assert_eq!(list_scroll(4, 5, 8), 0);
+
+        // Twenty rows through a window of seven.
+        assert_eq!(list_scroll(0, 20, 7), 0, "the top stays at the top");
+        assert_eq!(list_scroll(6, 20, 7), 0, "the last visible row is still 0");
+        assert_eq!(list_scroll(7, 20, 7), 1, "one past it moves by one");
+        assert_eq!(list_scroll(19, 20, 7), 13, "the end shows the last seven");
+        assert_eq!(list_scroll(99, 20, 7), 13, "and never goes past them");
+
+        for cursor in 0..20 {
+            let s = list_scroll(cursor, 20, 7);
+            assert!((s..s + 7).contains(&cursor), "cursor {cursor} off screen");
+        }
+
+        // A drawer with no room for a list asks for none.
+        assert_eq!(list_scroll(5, 20, 0), 0);
+        assert_eq!(list_height(Rect::new(0, 0, 20, 4), 3, 0), 0);
+        assert_eq!(list_height(Rect::new(0, 0, 20, 12), 3, 0), 7);
+        assert_eq!(
+            list_height(Rect::new(0, 0, 20, 12), 3, 2),
+            5,
+            "learn banner"
+        );
+    }
 
     #[test]
     fn closed_is_a_handle_open_never_eats_the_rack() {

@@ -45,6 +45,9 @@ struct ChildSpec {
 
 impl ChildSpec {
     fn spawn(&self) -> Result<std::process::Child> {
+        if self.format == PluginFormat::Pd {
+            return self.spawn_pd();
+        }
         std::process::Command::new(&self.exe)
             .env(crate::WORKER_ENV, "1")
             .arg(SANDBOX_WORKER_FLAG)
@@ -58,6 +61,45 @@ impl ChildSpec {
             .spawn()
             .context("cannot start the plugin sandbox")
     }
+
+    /// A Pure Data patch is served by `choz-pd-host`, not by choz itself: that
+    /// binary is the one that links libpd, and choz deliberately does not.
+    ///
+    /// Looked for next to the choz binary first — that is where a build and an
+    /// install both put it — then on `$PATH`. `CHOZ_PD_HOST` overrides both.
+    fn spawn_pd(&self) -> Result<std::process::Child> {
+        let exe = pd_host_exe();
+        std::process::Command::new(&exe)
+            .arg(&self.path)
+            .arg(&self.shm_name)
+            .arg(self.frames.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "cannot start {} — Pure Data patches need it, and it is built with \
+                     `cargo build -p choz-plugin-pd --features pd` (libpd installed)",
+                    exe.display()
+                )
+            })
+    }
+}
+
+/// Where the Pure Data child lives.
+fn pd_host_exe() -> PathBuf {
+    const EXE: &str = "choz-pd-host";
+    if let Some(explicit) = std::env::var_os("CHOZ_PD_HOST") {
+        return PathBuf::from(explicit);
+    }
+    if let Some(beside) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join(EXE)))
+        .filter(|p| p.is_file())
+    {
+        return beside;
+    }
+    PathBuf::from(EXE)
 }
 
 /// The host end: a plugin instance living in another process.

@@ -73,8 +73,36 @@ pub const HYSTERESIS: f32 = 0.2;
 pub const MIN_NOTE: u8 = 33; // A1, 55 Hz — a bass's low string
 pub const MAX_NOTE: u8 = 96; // C7
 
+/// Where the input is high-passed before it is measured, in Hz.
+///
+/// Just under [`MIN_NOTE`] (55 Hz). **A microphone in a room is not a signal
+/// generator**: under the lowest note anyone plays there is always a desk, a
+/// fan, a preamp, feet — and a period detector handed a 40 Hz rumble finds the
+/// rumble's period, which is a note an octave and a half below what was
+/// played. Measured on a 220 Hz tone with a rumble 5 dB louder than it: without
+/// this the tracker reports **nothing at all**, because the mixture is not
+/// periodic at either period.
+///
+/// Two sections, so it is 24 dB per octave rather than 12: the rumble is often
+/// louder than the note, and a gentle slope leaves it louder still.
+const RUMBLE_HZ: f32 = 60.0;
+
 /// Rate the detector works at. Everything above 8 kHz is harmonics.
 const WORK_RATE: f32 = 16_000.0;
+
+/// Where the input is low-passed **before** it is decimated, in Hz.
+///
+/// Comfortably above [`MAX_NOTE`] (2093 Hz) and comfortably below the working
+/// rate's Nyquist (8 kHz), so it takes nothing from the notes and everything
+/// from what would fold on top of them.
+///
+/// Averaging `decim` samples — which is all the decimation used to be — is a
+/// box filter, and a box filter leaks. A voice carries far more energy above
+/// 8 kHz than a string does (sibilance, breath, a room's hiss), and all of it
+/// came back down on top of the note: the detector then finds *a* period, just
+/// not the one that was sung. Measured on a 220 Hz tone with a 9.5 kHz hiss
+/// over it: without this the tracker never settles on the note at all.
+const ANTIALIAS_HZ: f32 = 3_500.0;
 
 /// Decimated samples the window holds: 64 ms at 16 kHz, three and a half
 /// periods of the lowest note the tracker will report.
@@ -94,6 +122,12 @@ pub struct PitchTracker {
     /// Partial average being accumulated for the next decimated sample.
     acc: f32,
     acc_n: usize,
+    /// Takes what is above the notes off before decimating, so it cannot fold
+    /// back down on top of them. Runs at the **input** rate.
+    antialias: [crate::fx::utility::Biquad; 2],
+    /// Takes the room out from under the signal, after decimating. The other
+    /// end of the same idea.
+    rumble: [crate::fx::utility::Biquad; 2],
     /// Ring of recent decimated samples: the window the detector works on.
     window: Vec<f32>,
     write: usize,
@@ -102,6 +136,9 @@ pub struct PitchTracker {
     since: usize,
     /// Scratch for the difference function, sized once.
     diff: Vec<f32>,
+    /// The ring, straightened out. Copying 1024 floats once an analysis buys a
+    /// difference-function loop with no wrap in it — see `yin`.
+    linear: Vec<f32>,
     /// The note currently sounding, if any.
     sounding: Option<u8>,
     /// How far the heard pitch is from the note being played, in cents. Never
@@ -110,6 +147,9 @@ pub struct PitchTracker {
     cents: i32,
     /// A note seen but not yet believed: `(note, how many analyses in a row)`.
     candidate: Option<(u8, u32)>,
+    /// Analyses since the note now sounding started. What stops the output
+    /// from moving faster than a note lasts.
+    held_for: u32,
     /// Analyses the signal has been under the gate; a few in a row end the note.
     quiet: u32,
     /// How loud the last analysed window was, for velocity.
@@ -125,15 +165,41 @@ pub struct PitchTracker {
 /// and enough to sit out the slide between two notes.
 const STEADY_ANALYSES: u32 = 3;
 
+/// How long a note must have been sounding before anything is allowed to
+/// replace it, in analyses. At an 8 ms hop, ~130 ms.
+///
+/// This is the difference between a converter and a controller ribbon. The
+/// checks above decide *whether a reading is a note*; this one decides **how
+/// often the output is allowed to change at all**, which is the thing a player
+/// actually hears: a synth re-triggered every 30 ms is a buzz whatever the
+/// notes were, and no amount of per-reading cleverness fixes that.
+///
+/// It costs exactly what it says: a real run of notes faster than this comes
+/// out as fewer notes. That is the trade a monophonic converter is for — one
+/// voice, held — and it is why this is a floor and not a knob: a player who
+/// wants every semitone of a fast run wants a keyboard.
+// ponytail: one constant. A setting the day someone wants the trade moved,
+// not before — and then it belongs next to `SENS`, which is the other one.
+const MIN_NOTE_ANALYSES: u32 = 16;
+
+/// The narrowest velocity range, in dB. Only reached if the gate is set
+/// absurdly high; below this the scale would be a switch rather than a range.
+const MIN_VELOCITY_RANGE_DB: f32 = 24.0;
+
 /// How clean the reading must be to start a note, and to replace one.
 const ONSET_CLARITY: f32 = 0.85;
 const CHANGE_CLARITY: f32 = 0.90;
 
-/// Default gate, -55 dBFS. A headset microphone through a laptop's preamp is
-/// far quieter than a guitar through a DI, and a gate above the signal reads
-/// as "it does nothing at all" — which is the worse failure. `SENS` on the
-/// mixer strip is there to put it back up where a noisy pickup needs it.
-pub const DEFAULT_GATE: f32 = 0.0018;
+/// Default gate, -61 dBFS.
+///
+/// Lower than it looks it should be, on purpose: the level this is compared
+/// against is measured **after** the anti-alias and rumble filters, and those
+/// take real energy out of a voice — a signal that reads -50 dBFS on the input
+/// meter is quieter than that by the time the detector sees it. A gate above
+/// the signal reads as "it does nothing at all", which is the worse failure of
+/// the two. `SENS` on the mixer strip goes from -70 to -20 dBFS, so a noisy
+/// pickup can put it back where it needs to be.
+pub const DEFAULT_GATE: f32 = 0.0009;
 
 impl PitchTracker {
     pub fn new(sample_rate: u32) -> Self {
@@ -145,14 +211,22 @@ impl PitchTracker {
             work_rate: sr as f32 / decim as f32,
             acc: 0.0,
             acc_n: 0,
+            antialias: [crate::fx::utility::Biquad::lowpass(ANTIALIAS_HZ, sr as f32, 0.707); 2],
+            rumble: [crate::fx::utility::Biquad::highpass(
+                RUMBLE_HZ,
+                sr as f32 / decim as f32,
+                0.707,
+            ); 2],
             window: vec![0.0; WINDOW],
             write: 0,
             filled: false,
             since: 0,
             diff: vec![0.0; WINDOW / 2],
+            linear: vec![0.0; WINDOW],
             sounding: None,
             cents: 0,
             candidate: None,
+            held_for: 0,
             quiet: 0,
             level: 0.0,
             gate: DEFAULT_GATE,
@@ -172,6 +246,7 @@ impl PitchTracker {
     /// Stop whatever is sounding, e.g. when the feature is switched off.
     pub fn release(&mut self) -> Option<PitchEvent> {
         self.candidate = None;
+        self.held_for = 0;
         self.cents = 0;
         self.sounding.take().map(|note| PitchEvent::Off { note })
     }
@@ -199,12 +274,22 @@ impl PitchTracker {
         // pitches at once, neither of which is a note. So: the left side, which
         // is the channel the user assigned first.
         for frame in buf.chunks_exact(2) {
-            self.acc += frame[0];
+            // Band-limit first, average second. The other way round is what a
+            // box filter is, and a box filter is why a voice folded.
+            let mut x = frame[0];
+            for section in self.antialias.iter_mut() {
+                x = section.process(x);
+            }
+            self.acc += x;
             self.acc_n += 1;
             if self.acc_n < self.decim {
                 continue;
             }
-            self.window[self.write] = self.acc / self.acc_n as f32;
+            let mut decimated = self.acc / self.acc_n as f32;
+            for section in self.rumble.iter_mut() {
+                decimated = section.process(decimated);
+            }
+            self.window[self.write] = decimated;
             self.acc = 0.0;
             self.acc_n = 0;
             self.write = (self.write + 1) % WINDOW;
@@ -234,12 +319,14 @@ impl PitchTracker {
             if self.quiet >= 2 {
                 if let Some(note) = self.sounding.take() {
                     self.cents = 0;
+                    self.held_for = 0;
                     return ([Some(PitchEvent::Off { note }), None], 1);
                 }
             }
             return (NONE, 0);
         }
         self.quiet = 0;
+        self.held_for = self.held_for.saturating_add(1);
 
         let Some((freq, clarity)) = self.detect() else {
             return (NONE, 0);
@@ -274,6 +361,14 @@ impl PitchTracker {
                 self.candidate = None;
                 return (NONE, 0);
             }
+            // A note that has only just started does not get replaced. Every
+            // check before this one asks "is this reading a note?"; this one
+            // asks "has the last one lasted long enough to be one?", which is
+            // the question a listener is actually asking.
+            if self.held_for < MIN_NOTE_ANALYSES {
+                self.candidate = None;
+                return (NONE, 0);
+            }
         }
         // A pitch has to hold before it becomes a note. Without this, sliding
         // into a note machine-guns the synth: the window still holds the old
@@ -289,12 +384,28 @@ impl PitchTracker {
             return (NONE, 0);
         }
         self.candidate = None;
-        // Louder signal, harder note. The curve is gentle: a pickup's dynamic
-        // range is nothing like a keyboard's velocity scale.
-        let velocity = ((rms.sqrt() * 3.0).min(1.0) * 110.0) as u8 + 17;
+        // Louder signal, harder note — measured **in dB above the gate**, and
+        // that is the whole trick.
+        //
+        // The first version was `sqrt(rms) * 3`, which pins at 127 for anything
+        // above -19 dBFS. Once the input trim is up far enough for the detector
+        // to hear a microphone, *every* note is 127, and a piano played at 127
+        // for a whole take is the saturated mush this was reported as. Reading
+        // it against the gate means the softest thing that counts as a note is
+        // a soft note, whatever the trim happens to be set to, and the range
+        // above it is the player's dynamics rather than the preamp's.
+        // The scale runs from the gate to full scale, so it needs no constant
+        // of its own and it follows `SENS`: whatever counts as the softest note
+        // is velocity 1, and 0 dBFS is 127.
+        let db = 20.0 * rms.max(1e-9).log10();
+        let gate_db = 20.0 * self.gate.max(1e-9).log10();
+        let span = (-gate_db).max(MIN_VELOCITY_RANGE_DB);
+        let t = ((db - gate_db) / span).clamp(0.0, 1.0);
+        let velocity = (1.0 + t * 126.0) as u8;
         self.cents = ((exact - note as f32) * 100.0).round() as i32;
         // The off goes first: the other order lets the old note's release cut
         // the new one short.
+        self.held_for = 0;
         let off = self
             .sounding
             .replace(note)
@@ -318,14 +429,12 @@ impl PitchTracker {
         let half = WINDOW / 2;
         let min_lag = (self.work_rate / note_to_freq(MAX_NOTE)) as usize;
         let max_lag = (self.work_rate / note_to_freq(MIN_NOTE)) as usize;
-        let (period, clarity) = yin(
-            &self.window,
-            self.write,
-            half,
-            min_lag,
-            max_lag,
-            &mut self.diff,
-        )?;
+        // Oldest first, in order, so the seam cannot fall inside a period and
+        // the search below never has to wrap.
+        let (a, b) = self.window.split_at(self.write);
+        self.linear[..b.len()].copy_from_slice(b);
+        self.linear[b.len()..].copy_from_slice(a);
+        let (period, clarity) = yin(&self.linear, 0, half, min_lag, max_lag, &mut self.diff)?;
         Some((self.work_rate / period, clarity))
     }
 }
@@ -366,13 +475,35 @@ pub fn yin(
     let at = |i: usize| window[(start + i) % n];
 
     // d(τ), then normalised by the running mean of everything before it.
+    //
+    // The inner loop runs `half` times for every lag — 150k iterations for one
+    // analysis — so what it does *per iteration* is the whole cost. Reading
+    // through the ring meant two `%` per sample, three hundred thousand of them
+    // per analysis, inside the audio callback. A caller that hands the window
+    // in order (`start == 0`) gets the loop over two plain slices instead,
+    // which has no wrap in it at all and vectorises.
     let mut running = 0.0f64;
     diff[0] = 1.0;
     for (lag, slot) in diff.iter_mut().enumerate().take(max_lag + 1).skip(1) {
         let mut sum = 0.0f64;
-        for i in 0..half {
-            let d = at(i) as f64 - at(i + lag) as f64;
-            sum += d * d;
+        if start == 0 {
+            // `lag + half <= n` holds: `max_lag < half` and `half <= n / 2`.
+            // Accumulated in `f32` and widened once: the terms are squares of
+            // differences of samples, a few hundred of them, nowhere near
+            // where single precision starts losing the sum — and the widening
+            // was happening twice per iteration, which is most of a loop this
+            // tight. `running` stays `f64`: that one grows across every lag.
+            let mut acc = 0.0f32;
+            for (x, y) in window[..half].iter().zip(window[lag..lag + half].iter()) {
+                let d = x - y;
+                acc += d * d;
+            }
+            sum = acc as f64;
+        } else {
+            for i in 0..half {
+                let d = at(i) as f64 - at(i + lag) as f64;
+                sum += d * d;
+            }
         }
         running += sum;
         *slot = if running > 0.0 {
@@ -550,6 +681,161 @@ mod tests {
             "and down when nearer"
         );
         assert_eq!(freq_to_note_exact(0.0), 0.0, "silence is not a note");
+    }
+
+    /// Two notes traded faster than a note lasts. A converter that follows
+    /// every one re-triggers the synth twenty times a second, and that is a
+    /// buzz whatever the notes were. One voice, held, is what has to come out.
+    #[test]
+    fn the_output_cannot_change_faster_than_a_note_lasts() {
+        let sr = 48_000;
+        let mut t = PitchTracker::new(sr);
+        let mut tone = Tone::new();
+        let mut ons = 0usize;
+        // A4 and C5 swapped every ~85 ms, each held long enough to be heard as
+        // a note on its own.
+        for i in 0..24 {
+            let hz = if i % 2 == 0 { 440.0 } else { 523.25 };
+            for e in drain(&mut t, &mut tone, hz, sr, 16, 0.4) {
+                if matches!(e, PitchEvent::On { .. }) {
+                    ons += 1;
+                }
+            }
+        }
+        // Following every swap would be 24 note-ons over ~2 s. The floor on how
+        // long a note must last before anything replaces it cuts that down.
+        assert!(
+            ons <= 14,
+            "the output re-triggered faster than a note lasts: {ons} note-ons"
+        );
+    }
+
+    /// A microphone in a room is not a signal generator. Under the lowest note
+    /// the tracker will report there is always something — a desk, a fan, a
+    /// preamp, feet — and a period detector handed a 40 Hz rumble finds the
+    /// rumble's period, which is a note an octave and a half below what was
+    /// played. The input has to be cleaned before it is measured.
+    #[test]
+    fn rumble_under_the_lowest_note_does_not_become_the_note() {
+        let sr = 48_000;
+        let mut t = PitchTracker::new(sr);
+        let mut tone = Tone::new();
+        let mut rumble = Tone::new();
+        let mut ons: Vec<u8> = Vec::new();
+        for _ in 0..90 {
+            // A3 played into a mic that is also hearing the room.
+            let note = tone.block(220.0, sr, 256, 0.25);
+            let low = rumble.block(41.0, sr, 256, 0.45);
+            let mixed: Vec<f32> = note.iter().zip(low.iter()).map(|(a, b)| a + b).collect();
+            let (ev, n) = t.process(&mixed, sr);
+            for e in ev.iter().take(n).flatten() {
+                if let PitchEvent::On { note, .. } = e {
+                    ons.push(*note);
+                }
+            }
+        }
+        assert_eq!(
+            t.sounding(),
+            Some(57),
+            "A3 is what was played; the rumble is not a note. Reported: {ons:?}"
+        );
+    }
+
+    /// **No microtonality.** A quarter tone is not a note, and a converter that
+    /// tried to be exact about it would have to send pitch bend — which is a
+    /// second stream of MIDI moving all the time, the opposite of what a note
+    /// is for. What comes out is a whole note; how far off it the singer was
+    /// stays in the display, where it costs nobody anything.
+    #[test]
+    fn a_quarter_tone_still_comes_out_as_one_whole_note() {
+        let sr = 48_000;
+        let mut t = PitchTracker::new(sr);
+        let mut tone = Tone::new();
+        // A4 plus 50 cents: exactly between two notes.
+        let hz = 440.0 * 2f32.powf(0.5 / 12.0);
+        let events = drain(&mut t, &mut tone, hz, sr, 90, 0.4);
+        let ons: Vec<u8> = events
+            .iter()
+            .filter_map(|e| match e {
+                PitchEvent::On { note, .. } => Some(*note),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ons.len(), 1, "one note, not a hunt between two: {ons:?}");
+        assert!(
+            matches!(t.sounding(), Some(69) | Some(70)),
+            "and it is a whole note: {:?}",
+            t.sounding()
+        );
+        // The fraction is reported, never sent: `PitchEvent` has no variant
+        // that carries one, which is the strongest way to promise it.
+        assert!(t.cents().abs() <= 50, "the display keeps the fraction");
+    }
+
+    /// A voice is not a guitar: it carries a lot of energy above the band a
+    /// note lives in — sibilance, breath, a room's hiss — and the decimation
+    /// that takes 48 kHz down to 16 folds all of it back down on top of the
+    /// note. A period detector handed that finds *a* period, but not the one
+    /// that was sung, which is exactly "it turns the noise into a frequency
+    /// and not into a note".
+    #[test]
+    fn sibilance_does_not_fold_down_on_top_of_the_note() {
+        let sr = 48_000;
+        let mut t = PitchTracker::new(sr);
+        let mut tone = Tone::new();
+        let mut hiss = Tone::new();
+        let mut ons: Vec<u8> = Vec::new();
+        for _ in 0..90 {
+            // A3 sung, with the "s" of a consonant on top of it: energy above
+            // the working rate's Nyquist, which is where folding happens.
+            let note = tone.block(220.0, sr, 256, 0.3);
+            let sibilance = hiss.block(9_500.0, sr, 256, 0.35);
+            let mixed: Vec<f32> = note
+                .iter()
+                .zip(sibilance.iter())
+                .map(|(a, b)| a + b)
+                .collect();
+            let (ev, n) = t.process(&mixed, sr);
+            for e in ev.iter().take(n).flatten() {
+                if let PitchEvent::On { note, .. } = e {
+                    ons.push(*note);
+                }
+            }
+        }
+        assert_eq!(
+            t.sounding(),
+            Some(57),
+            "A3 was sung; the sibilance is not a note. Reported: {ons:?}"
+        );
+    }
+
+    /// Velocity is the player's dynamics, not the preamp's setting. Read from
+    /// full scale it pins at 127 for anything above -19 dBFS — and once the
+    /// trim is up far enough to hear a microphone, that is every note. A piano
+    /// played at 127 for a whole take is not a piano.
+    #[test]
+    fn velocity_is_read_from_the_gate_not_from_full_scale() {
+        let sr = 48_000;
+        let vel_of = |amp: f32| -> u8 {
+            let mut t = PitchTracker::new(sr);
+            let mut tone = Tone::new();
+            drain(&mut t, &mut tone, 220.0, sr, 90, amp)
+                .into_iter()
+                .find_map(|e| match e {
+                    PitchEvent::On { velocity, .. } => Some(velocity),
+                    _ => None,
+                })
+                .expect("a note")
+        };
+        let soft = vel_of(0.02);
+        let normal = vel_of(0.2);
+        let loud = vel_of(0.9);
+        assert!(soft < normal && normal < loud, "{soft} < {normal} < {loud}");
+        assert!(
+            normal < 120,
+            "a normal signal must leave headroom above it: {normal}"
+        );
+        assert!(soft < 60, "and a quiet one has to be quiet: {soft}");
     }
 
     /// The output is a keyboard: **one note, held**. A singer's vibrato inside
@@ -805,5 +1091,70 @@ mod tests {
             max_lag * (WINDOW / 2) < 200_000,
             "{max_lag} lags is the whole budget"
         );
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    /// What one block of tracking costs against the time the callback has.
+    ///
+    /// **This is not a nicety.** The tracker runs inside the audio callback, so
+    /// whatever it takes comes out of the same budget as the instrument and the
+    /// whole FX chain — and a callback that misses its deadline does not glitch
+    /// choz, it glitches **the graph**: every other application on the machine
+    /// stutters with it. That was reported as "turning on A→M makes the browser
+    /// sound bad", and it was true.
+    ///
+    /// Measured: 15.7 % of a 128-frame callback before the difference-function
+    /// loop stopped reading through the ring (two `%` per sample, 300k of them
+    /// per analysis) and stopped widening to `f64` twice per iteration. After:
+    /// 1.6 %.
+    ///
+    /// Ignored by default because it is a clock, and a clock on a busy machine
+    /// is a flaky test. Run it when the detector is touched:
+    ///
+    /// ```text
+    /// cargo test --release -p choz-engine --lib -- --ignored --nocapture what_one_block
+    /// ```
+    #[test]
+    #[ignore = "timing; run it deliberately, and in release"]
+    fn what_one_block_of_tracking_costs() {
+        let sr = 48_000u32;
+        for frames in [128usize, 256, 512] {
+            let mut t = PitchTracker::new(sr);
+            let buf: Vec<f32> = (0..frames)
+                .flat_map(|i| {
+                    let s = (2.0 * std::f32::consts::PI * 220.0 * i as f32 / sr as f32).sin() * 0.4;
+                    [s, s]
+                })
+                .collect();
+            for _ in 0..40 {
+                t.process(&buf, sr);
+            }
+            let n = 2000;
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                t.process(&buf, sr);
+            }
+            let per_block = start.elapsed().as_secs_f64() / n as f64;
+            let budget = frames as f64 / sr as f64;
+            let share = per_block / budget * 100.0;
+            eprintln!(
+                "frames={frames}: {:.3} ms/block, budget {:.3} ms => {share:.1}% of the callback",
+                per_block * 1000.0,
+                budget * 1000.0,
+            );
+            // Generous, because it is a clock: what it is really guarding
+            // against is a change that puts the analysis back to a third of the
+            // callback, not a percentage point either way.
+            if !cfg!(debug_assertions) {
+                assert!(
+                    share < 8.0,
+                    "the tracker is eating the callback again: {share:.1}% at {frames} frames"
+                );
+            }
+        }
     }
 }

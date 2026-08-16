@@ -82,18 +82,42 @@ fn the_deb_carries_the_desktop_files_in_the_base_table() {
     );
 
     for source in sources {
-        // The binary is the one path cargo-deb resolves itself: written exactly
-        // like this it is recognised as the Cargo target dir and rewritten under
-        // `--target`, which is what keeps the host binary out of an ARM package.
-        // It only exists after a release build, so it is not checked for here.
-        if source == "target/release/choz" {
-            continue;
-        }
         assert!(
-            root().join(&source).exists(),
+            exists(&source),
             "{source} is declared in the .deb and does not exist",
         );
     }
+}
+
+/// Whether a declared asset source is really there.
+///
+/// Two shapes are not plain files and are checked for what they are instead:
+///
+/// * **Anything under `target/release/`** is a build artefact — the binary, the
+///   CLAP bundle, the Pure Data child — and only exists after a release build.
+///   The binary is also the one path cargo-deb resolves itself: written exactly
+///   like this it is recognised as the Cargo target dir and rewritten under
+///   `--target`, which is what keeps a host binary out of an ARM package.
+/// * **A glob** (the wallpapers) is checked as "the directory is there and
+///   something in it matches", which is the thing that would actually break.
+fn exists(source: &str) -> bool {
+    // Paths are written relative to the crate that declares them, so they are
+    // resolved from there — `../../assets/…` is the repository's.
+    if source.trim_start_matches("../../").starts_with("target/release/") {
+        return true;
+    }
+    let Some((dir, pattern)) = source.rsplit_once('/') else {
+        return root().join(source).exists();
+    };
+    let Some(extension) = pattern.strip_prefix("*.") else {
+        return root().join(source).exists();
+    };
+    let Ok(entries) = std::fs::read_dir(root().join(dir)) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|e| e.path().extension().is_some_and(|x| x == extension))
 }
 
 /// Every asset source in a section: the first quoted string on a line inside an
@@ -123,11 +147,8 @@ fn the_rpm_carries_them_too() {
         );
     }
     for source in sources(&rpm) {
-        if source.ends_with("target/release/choz") {
-            continue;
-        }
         assert!(
-            root().join(&source).exists(),
+            exists(&source),
             "{source} is declared in the .rpm and does not exist",
         );
     }
@@ -166,6 +187,122 @@ fn both_formats_refresh_the_caches_after_install() {
         rpm.matches("update-desktop-database").count() >= 2,
         "the .rpm's scriptlets do not refresh the menu",
     );
+}
+
+/// The Arch package installs the same set as the other two.
+///
+/// It is a template, so nothing builds it in CI until a tag exists — which
+/// makes "it silently ships a binary and nothing else" exactly as easy here as
+/// it was in the `.deb`. Same check, read off the text.
+#[test]
+fn the_arch_pkgbuild_installs_the_desktop_files_too() {
+    let pkgbuild = std::fs::read_to_string(root().join("../../packaging/arch/PKGBUILD.in"))
+        .expect("read PKGBUILD.in");
+
+    for dest in REQUIRED_DESTINATIONS {
+        // The raster icons are installed by a loop over the sizes, so the 48px
+        // path is spelled `hicolor/$size/apps` — check the loop covers it.
+        let covered = pkgbuild.contains(&format!("$pkgdir/{dest}"))
+            || (dest.starts_with("usr/share/icons/hicolor/")
+                && pkgbuild.contains("hicolor/$size/apps")
+                && pkgbuild.contains("48x48"));
+        assert!(covered, "the PKGBUILD installs nothing into {dest}");
+    }
+    assert!(
+        pkgbuild.contains("$pkgdir/usr/bin/choz-launcher"),
+        "without the launcher the menu entry does nothing",
+    );
+    assert!(
+        pkgbuild.contains("/usr/share/licenses/"),
+        "Arch packages carry their licence",
+    );
+    // JACK is `dlopen`ed. Declaring it a dependency would make choz refuse to
+    // install on a perfectly good ALSA-only machine.
+    let depends = pkgbuild
+        .lines()
+        .find(|l| l.starts_with("depends="))
+        .expect("depends=");
+    assert!(depends.contains("alsa-lib"), "ALSA is not optional");
+    assert!(
+        !depends.contains("jack"),
+        "JACK is dlopened, so it belongs in optdepends: {depends}",
+    );
+
+    // Every placeholder the generator fills has to still be there — a template
+    // that lost one produces a PKGBUILD with an empty checksum, which fails on
+    // a user's machine rather than here.
+    for token in [
+        "@VERSION@",
+        "@SHA256_X86_64@",
+        "@SHA256_AARCH64@",
+        "@SHA256_ARMV7@",
+    ] {
+        assert!(
+            pkgbuild.contains(token),
+            "{token} is gone from the template"
+        );
+    }
+}
+
+/// The generator turns the template into something with no placeholders left.
+#[test]
+fn the_pkgbuild_generator_fills_every_placeholder() {
+    let dir = std::env::temp_dir().join(format!("choz_pkgbuild_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for target in [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "armv7-unknown-linux-gnueabihf",
+    ] {
+        std::fs::write(
+            dir.join(format!("choz-9.9.9-{target}.tar.gz")),
+            b"not a tarball",
+        )
+        .unwrap();
+    }
+
+    let script = root().join("../../packaging/arch/mkpkgbuild.sh");
+    let out = std::process::Command::new("sh")
+        .arg(&script)
+        .arg("9.9.9")
+        .arg(&dir)
+        .output()
+        .expect("sh is installed");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for token in [
+        "@VERSION@",
+        "@SHA256_X86_64@",
+        "@SHA256_AARCH64@",
+        "@SHA256_ARMV7@",
+    ] {
+        assert!(!text.contains(token), "{token} survived:\n{text}");
+    }
+    assert!(text.contains("pkgver=9.9.9"));
+    // Three distinct checksums, one per architecture — the first version of
+    // this script pasted the x86_64 sum into all three.
+    let sums: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("sha256sums_"))
+        .collect();
+    assert_eq!(sums.len(), 3, "{text}");
+
+    // A missing architecture must fail loudly rather than ship a placeholder.
+    std::fs::remove_file(dir.join("choz-9.9.9-armv7-unknown-linux-gnueabihf.tar.gz")).unwrap();
+    let out = std::process::Command::new("sh")
+        .arg(&script)
+        .arg("9.9.9")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a missing tarball is fatal");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The menu entry itself: the categories decide *where* it lands, and the user

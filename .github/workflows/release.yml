@@ -68,8 +68,18 @@ jobs:
           targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install Pure Data (libpd)
+        run: sudo apt-get update && sudo apt-get install -y puredata-dev
+
       - name: Build release binary
         run: cargo build --release --locked --bin ${{ env.BIN }}
+
+      # Shipped with choz: its own effects for other hosts, and the child that
+      # runs Pure Data patches (the only binary that links libpd).
+      - name: Build the CLAP bundle and the Pure Data host
+        run: |
+          cargo build --release --locked -p choz-plugin-clap-export
+          cargo build --release --locked -p choz-plugin-pd --features pd
 
       - name: Package tarball
         shell: bash
@@ -84,6 +94,14 @@ jobs:
           cp README.md LICENSE "dist/${NAME}/"
           cp packaging/install.sh "dist/${NAME}/"
           cp -r packaging/desktop "dist/${NAME}/"
+          # The wallpapers a fresh install opens with, choz's own effects as a
+          # CLAP plugin, and the Pure Data child. `install.sh` looks for all
+          # three beside itself.
+          cp -r assets "dist/${NAME}/"
+          cp target/release/libchoz_plugin_clap_export.so "dist/${NAME}/"
+          strip "dist/${NAME}/libchoz_plugin_clap_export.so"
+          cp target/release/choz-pd-host "dist/${NAME}/"
+          strip "dist/${NAME}/choz-pd-host"
           tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
           rm -rf "dist/${NAME}"
 
@@ -200,3 +218,77 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: release/*
+
+  # ── Arch Linux: PKGBUILD for the AUR ───────────────────────────────────────
+  #
+  # Runs after the release exists, because the checksums are taken from the
+  # published tarballs. The PKGBUILD and its .SRCINFO are attached to the same
+  # release, so a `choz-bin` package can be built from a tag with no extra
+  # infrastructure. Pushing to the AUR is opt-in: it only happens when
+  # `AUR_SSH_KEY` is configured.
+  arch:
+    name: Arch PKGBUILD
+    needs: [release]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    # `makepkg` refuses to run as root, and namcap is only packaged for Arch —
+    # so this whole job happens inside the distribution it targets.
+    container: archlinux:base-devel
+    steps:
+      - name: Install tooling
+        run: pacman -Sy --noconfirm git namcap
+
+      - uses: actions/checkout@v5
+
+      - name: Download the published tarballs
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Generate PKGBUILD
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          mkdir -p dist release
+          find artifacts -name '*.tar.gz' -exec cp {} dist/ \;
+          sh packaging/arch/mkpkgbuild.sh "$VER" dist > release/PKGBUILD
+          cat release/PKGBUILD
+
+      - name: Lint and generate .SRCINFO
+        shell: bash
+        run: |
+          # makepkg drops privileges rather than running as root, and the
+          # container has none of that set up — one throwaway user is enough.
+          useradd -m build
+          chown -R build:build "$PWD"
+          su build -c 'cd release && makepkg --printsrcinfo > .SRCINFO'
+          su build -c 'cd release && namcap PKGBUILD' || true
+          cat release/.SRCINFO
+
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            release/PKGBUILD
+            release/.SRCINFO
+
+      - name: Push to the AUR
+        if: ${{ env.AUR_SSH_KEY != '' }}
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        shell: bash
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur"
+          git config --global user.name "choz release bot"
+          git config --global user.email "jorgecodelia@gmail.com"
+          git clone ssh://aur@aur.archlinux.org/choz-bin.git aur
+          cp release/PKGBUILD release/.SRCINFO aur/
+          cd aur
+          git add PKGBUILD .SRCINFO
+          git commit -m "choz-bin ${GITHUB_REF_NAME#v}"
+          git push

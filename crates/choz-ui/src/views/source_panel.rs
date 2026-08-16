@@ -34,6 +34,25 @@ pub struct InputRow {
 /// Panel lines above the input list (active-tab line, scan-button line, hint).
 pub const INPUT_LIST_TOP: usize = 3;
 
+/// Lines the MIDI-learn banner takes at the bottom, when it is up: a blank one
+/// and the banner. They are pinned there, so the list gets that much less.
+pub const LEARN_LINES: usize = 2;
+
+/// Rows of the input list that fit, and the first one on screen. The hit-test
+/// in `compute_layout` calls this with the same arguments — one function, so a
+/// scrolled list cannot answer clicks for rows it is not showing.
+pub fn input_window(area: Rect, rows: usize, cursor: usize, learn: bool) -> (usize, usize) {
+    let height = crate::views::drawer::list_height(
+        area,
+        INPUT_LIST_TOP,
+        if learn { LEARN_LINES } else { 0 },
+    );
+    (
+        crate::views::drawer::list_scroll(cursor, rows, height),
+        height,
+    )
+}
+
 /// Label of the rescan button (translated, padded), so the panel and its click
 /// rect always agree on the width.
 fn scan_label() -> String {
@@ -57,12 +76,23 @@ pub fn draw_input_panel(
     } else {
         Style::default().fg(ui_border())
     };
+    let (scroll, height) = input_window(area, inputs.len(), input_cursor, learn.is_some());
     let title = format!(
-        " {} ",
+        " {}{} ",
         if focused {
             format!("{} [ACTIVE]", t("INPUTS"))
         } else {
             t("INPUTS").to_string()
+        },
+        if height > 0 && inputs.len() > height {
+            format!(
+                " \u{2195} {}-{}/{}",
+                scroll + 1,
+                (scroll + height).min(inputs.len()),
+                inputs.len()
+            )
+        } else {
+            String::new()
         }
     );
 
@@ -122,7 +152,7 @@ pub fn draw_input_panel(
     if inputs.is_empty() {
         lines.push(Line::from(Span::styled("   (no inputs found)", dim)));
     }
-    for (i, row) in inputs.iter().enumerate() {
+    for (i, row) in inputs.iter().enumerate().skip(scroll).take(height) {
         if row.header {
             lines.push(Line::from(Span::styled(format!(" {}", row.name), dim)));
             continue;

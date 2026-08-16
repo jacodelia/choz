@@ -1,0 +1,83 @@
+# Maintainer: Jorge Codelia <jorgecodelia@gmail.com>
+#
+# Template. `packaging/arch/mkpkgbuild.sh` fills the @…@ placeholders from a
+# built release and prints a real PKGBUILD; the release workflow attaches the
+# result to the GitHub Release and, when a key is configured, pushes it to the
+# AUR.
+#
+# This is the **binary** package: it installs the tarball the release already
+# built, so a user needs no Rust toolchain. A from-source `choz` package would
+# be a second PKGBUILD, not a flag here.
+pkgname=choz-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="Terminal audio plugin host — CLAP, LV2, LADSPA, DSSI, VST2 and VST3 in a TUI"
+arch=('x86_64' 'aarch64' 'armv7h')
+url="https://github.com/jacodelia/choz"
+license=('MIT')
+# ALSA is linked and choz cannot open a device without it. **JACK is not a
+# dependency**: it is `dlopen`ed at runtime, so a machine without it still gets
+# audio through ALSA — which is why it belongs in optdepends and nowhere else.
+depends=('alsa-lib' 'gcc-libs' 'glibc')
+optdepends=(
+  'jack2: JACK/PipeWire routing and per-channel outputs'
+  'pipewire-jack: same, on a PipeWire system'
+  'kitty: the terminal the launcher prefers — wallpaper at real pixel resolution'
+  'puredata: hosting Pure Data patches as effects and input algorithms'
+)
+provides=('choz')
+conflicts=('choz')
+
+_url="$url/releases/download/v$pkgver"
+source_x86_64=("$_url/choz-$pkgver-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("$_url/choz-$pkgver-aarch64-unknown-linux-gnu.tar.gz")
+source_armv7h=("$_url/choz-$pkgver-armv7-unknown-linux-gnueabihf.tar.gz")
+sha256sums_x86_64=('@SHA256_X86_64@')
+sha256sums_aarch64=('@SHA256_AARCH64@')
+sha256sums_armv7h=('@SHA256_ARMV7@')
+
+package() {
+  case "$CARCH" in
+    x86_64)  _dir="choz-$pkgver-x86_64-unknown-linux-gnu" ;;
+    aarch64) _dir="choz-$pkgver-aarch64-unknown-linux-gnu" ;;
+    armv7h)  _dir="choz-$pkgver-armv7-unknown-linux-gnueabihf" ;;
+  esac
+  cd "$srcdir/$_dir"
+
+  install -Dm755 choz "$pkgdir/usr/bin/choz"
+  # choz is a TUI: the desktop entry runs the launcher, which picks a terminal
+  # and sizes it. Without this binary the menu entry does nothing visible.
+  install -Dm755 desktop/choz-launcher "$pkgdir/usr/bin/choz-launcher"
+  install -Dm644 desktop/choz.desktop "$pkgdir/usr/share/applications/choz.desktop"
+  install -Dm644 desktop/choz-project.xml \
+    "$pkgdir/usr/share/mime/packages/choz-project.xml"
+
+  # The raster sizes are **not** a nicety: librsvg dropped the gdk-pixbuf SVG
+  # loader, so on a GTK3 desktop a scalable-only icon does not render and the
+  # menu draws a generic cog. The .svg stays for GTK4 and Qt.
+  install -Dm644 desktop/choz.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/choz.svg"
+  for size in 16x16 24x24 32x32 48x48 64x64 128x128 256x256; do
+    install -Dm644 "desktop/icons/$size/choz.png" \
+      "$pkgdir/usr/share/icons/hicolor/$size/apps/choz.png"
+  done
+
+  # The wallpapers a fresh install opens with, and where the picker starts.
+  for image in assets/*.jpg assets/*.png; do
+    [ -f "$image" ] || continue
+    install -Dm644 "$image" "$pkgdir/usr/share/choz/wallpapers/$(basename "$image")"
+  done
+
+  # choz's own 45 effects as a CLAP plugin, in the directory every CLAP host
+  # already searches, and the Pure Data child (the only binary linking libpd).
+  [ -f libchoz_plugin_clap_export.so ] &&
+    install -Dm644 libchoz_plugin_clap_export.so "$pkgdir/usr/lib/clap/choz.clap"
+  [ -f choz-pd-host ] && install -Dm755 choz-pd-host "$pkgdir/usr/bin/choz-pd-host"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}
+
+# No cache-refreshing hooks here on purpose: pacman fires
+# update-desktop-database, update-mime-database and gtk-update-icon-cache from
+# its own hooks. The Debian package carries a postinst because dpkg does not.

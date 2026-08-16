@@ -85,6 +85,17 @@ impl PitchCorrector {
         self.current_semitones
     }
 
+    /// The pitch ratio the shift currently amounts to.
+    ///
+    /// Read **before** [`Self::advance`] so a block can be given both ends of
+    /// its own movement: the smoother steps once per block, and a ratio that
+    /// steps once per block is a staircase in pitch — a few milliseconds of
+    /// constant pitch, then a jump. On a fast retune that is heard, and it is
+    /// heard as the effect being dirty rather than as the singer arriving.
+    pub fn ratio(&self) -> f32 {
+        ratio_of(self.current_semitones)
+    }
+
     /// Advance by `frames` samples towards `target_semitones` and return the
     /// pitch ratio to use for that block.
     ///
@@ -137,11 +148,15 @@ impl PitchCorrector {
         if !self.current_semitones.is_finite() {
             self.current_semitones = 0.0;
         }
-        let ratio = (2.0f32).powf(self.current_semitones / 12.0);
-        if ratio.is_finite() {
-            ratio.clamp(0.25, 4.0)
-        } else {
-            1.0
-        }
+        ratio_of(self.current_semitones)
+    }
+}
+
+fn ratio_of(semitones: f32) -> f32 {
+    let ratio = (2.0f32).powf(semitones / 12.0);
+    if ratio.is_finite() {
+        ratio.clamp(0.25, 4.0)
+    } else {
+        1.0
     }
 }

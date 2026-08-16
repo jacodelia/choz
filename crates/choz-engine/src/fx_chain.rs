@@ -2,6 +2,7 @@
 
 use crate::fx;
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct FxSpec {
     pub kind: String,
     pub enabled: bool,
@@ -21,6 +22,61 @@ pub struct PluginFxRef {
     pub id: String,
 }
 
+/// Every effect choz brings with it: the id [`build_processor`] answers to, and
+/// the name to show it under.
+///
+/// The match below is the other half of this list, and the two drifting apart
+/// is what a test here catches: an id nobody can build, or an effect nothing
+/// can reach. Anything that wants to walk the built-ins — the interface's ADD
+/// FX list, the CLAP export — walks this.
+pub const BUILT_IN_KINDS: &[(&str, &str)] = &[
+    ("delay", "Delay"),
+    ("reverb", "Reverb"),
+    ("grandelay", "Granular Delay"),
+    ("compressor", "Compressor"),
+    ("limiter", "Limiter"),
+    ("gate", "Gate"),
+    ("parameq", "Parametric EQ"),
+    ("graphiceq", "Graphic EQ"),
+    ("filter", "Filter"),
+    ("autotune", "Auto-Tune"),
+    ("filterbank", "Filter Bank"),
+    ("tremolo", "Tremolo"),
+    ("autopan", "Auto Pan"),
+    ("autofilter", "Auto Filter"),
+    ("freqshifter", "Frequency Shifter"),
+    ("ringmod", "Ring Modulator"),
+    ("shimmer", "Shimmer"),
+    ("harmonizer", "Harmonizer"),
+    ("vocoder", "Vocoder"),
+    ("beatrepeat", "Beat Repeat"),
+    ("chorus", "Chorus"),
+    ("flanger", "Flanger"),
+    ("phaser", "Phaser"),
+    ("bitcrusher", "Bitcrusher"),
+    ("vinyl", "Vinyl"),
+    ("cassette", "Cassette"),
+    ("saturator", "Saturator"),
+    ("waveshaper", "Wave Shaper"),
+    ("softclip", "Soft Clip"),
+    ("tubesat", "Tube Saturator"),
+    ("widener", "Widener"),
+    ("isolator", "Isolator"),
+    ("gain", "Gain"),
+    ("phaseinvert", "Phase Invert"),
+    ("monomaker", "Mono Maker"),
+    ("looper", "Looper"),
+    ("sidechain", "Sidechain Duck"),
+    ("expander", "Expander"),
+    ("pan", "Pan"),
+    ("protocosmos", "Protocosmos"),
+    ("spaceecho", "Space Echo"),
+    ("reversedelay", "Reverse Delay"),
+    ("amberfang", "Amber Fang"),
+    ("velvetfuzz", "Velvet Fuzz"),
+    ("z5texture", "Z5 Texture"),
+];
+
 pub fn build_processor(
     kind: &str,
     params: &[f32],
@@ -35,6 +91,10 @@ pub fn build_processor(
             let damping = p(2);
             let mut d = fx::DelayLine::new(delay_ms, feedback, damping);
             d.set_ping_pong(p(3) > 0.5);
+            // 4 is the dry/wet, which the chain applies itself.
+            d.set_crossfeed(p(5));
+            d.set_mod_rate(p(6) * 10.0);
+            d.set_mod_depth_ms(p(7) * 50.0);
             Box::new(d)
         }
         "reverb" => {
@@ -57,12 +117,17 @@ pub fn build_processor(
             c.release_ms = 10.0 + p(3) * 990.0;
             c.makeup_db = p(4) * 24.0;
             c.knee_db = p(5) * 12.0;
+            c.detect = fx::compressor::Detect::from_norm(p(6));
+            c.stereo_link = p(7);
+            c.sc_hpf_hz = 20.0 + p(8) * 480.0;
             Box::new(c)
         }
         "limiter" => {
-            let mut lim = fx::Compressor::limiter();
+            let mut lim = fx::Compressor::limiter(sample_rate);
             lim.threshold_db = -(1.0 - p(0)) * 12.0;
             lim.release_ms = 1.0 + p(1) * 199.0;
+            lim.lookahead_ms = p(2) * 10.0;
+            lim.stereo_link = p(3);
             Box::new(lim)
         }
         "gate" => {
@@ -72,20 +137,12 @@ pub fn build_processor(
             g.hold_ms = 1.0 + p(2) * 499.0;
             g.release_ms = 10.0 + p(3) * 990.0;
             g.floor_db = -(1.0 - p(4)) * 80.0;
+            g.hysteresis_db = p(5) * 24.0;
             Box::new(g)
         }
-        "parameq" => {
-            let mut eq = fx::ParametricEq::new();
-            eq.bands[1].gain_db = (p(0) - 0.5) * 36.0;
-            eq.bands[2].gain_db = (p(1) - 0.5) * 36.0;
-            eq.bands[3].gain_db = (p(2) - 0.5) * 36.0;
-            eq.bands[3].kind = fx::EqBandKind::HighShelf;
-            eq.bands[3].gain_db = (p(3) - 0.5) * 36.0;
-            eq.bands[1].freq = 20.0 * (800.0f32 / 20.0).powf(p(4));
-            eq.bands[3].freq = 1000.0 * 20.0f32.powf(p(5));
-            eq.bands[2].q = 0.1 + p(6) * 9.9;
-            Box::new(eq)
-        }
+        // The interface builds the same EQ to draw its curve, so the mapping
+        // lives with the processor rather than here.
+        "parameq" => Box::new(fx::ParametricEq::from_params(params, sample_rate)),
         // Ten bands and a preamp, all of them knobs — so a CC can ride one
         // band. `p(11)` picks a Winamp preset, which fills the bands unless the
         // user has moved them (a preset is a starting point, not a lock).
@@ -126,6 +183,33 @@ pub fn build_processor(
             Box::new(at)
         }
         "filterbank" => Box::new(fx::FilterBankFx::new(sample_rate)),
+        // One processor, two effects: the LFO points at level or at balance.
+        "tremolo" => Box::new(fx::Tremolo::with_params(
+            fx::ModTarget::Tremolo,
+            sample_rate,
+            params,
+        )),
+        "autopan" => Box::new(fx::Tremolo::with_params(
+            fx::ModTarget::AutoPan,
+            sample_rate,
+            params,
+        )),
+        "autofilter" => Box::new(fx::AutoFilter::with_params(sample_rate, params)),
+        // One carrier, two uses: one sideband or both.
+        "freqshifter" => Box::new(fx::FreqShift::with_params(
+            fx::Carrier::Shift,
+            sample_rate,
+            params,
+        )),
+        "ringmod" => Box::new(fx::FreqShift::with_params(
+            fx::Carrier::Ring,
+            sample_rate,
+            params,
+        )),
+        "shimmer" => Box::new(fx::ShimmerReverb::with_params(sample_rate, params)),
+        "harmonizer" => Box::new(fx::Harmonizer::with_params(sample_rate, params)),
+        "vocoder" => Box::new(fx::Vocoder::with_params(sample_rate, params)),
+        "beatrepeat" => Box::new(fx::BeatRepeat::with_params(sample_rate, params)),
         "chorus" => {
             let mut c = fx::Chorus::new();
             c.rate = 0.05 + p(0) * 4.95;
@@ -164,6 +248,10 @@ pub fn build_processor(
             Box::new(v)
         }
         "cassette" => Box::new(fx::Cassette::new()),
+        // The general waveshaper: curve and oversampling are its own knobs.
+        "saturator" => Box::new(fx::Saturator::with_params(sample_rate, params)),
+        // The same processor: the curve is drawn instead of computed.
+        "waveshaper" => Box::new(fx::Saturator::waveshaper(sample_rate, params)),
         "softclip" => {
             let mut s = fx::SoftClipper::new();
             s.drive = 1.0 + p(0) * 9.0;
@@ -263,7 +351,12 @@ pub(crate) fn build_plugin_fx(
     // Same policy as instruments: what the load probe caught dying on teardown
     // goes in its own process, so removing the effect costs a child — and so
     // does anything the user asked for by hand.
-    if crate::quarantine::wants_sandbox(r.format, &r.path, &r.id) {
+    //
+    // A Pure Data patch has no other way in: choz does not link libpd, and one
+    // process holds one Pd, so "in-process" is not a fallback that exists.
+    if r.format == crate::PluginFormat::Pd
+        || crate::quarantine::wants_sandbox(r.format, &r.path, &r.id)
+    {
         match crate::sandboxed::SandboxedEffect::build(
             r.format,
             &r.path,
@@ -274,6 +367,10 @@ pub(crate) fn build_plugin_fx(
             Ok(fx) => {
                 eprintln!("choz: hosting {} in its own process", r.path.display());
                 return Some(Box::new(fx));
+            }
+            Err(e) if r.format == crate::PluginFormat::Pd => {
+                eprintln!("choz: cannot run {}: {e}", r.path.display());
+                return None;
             }
             Err(e) => eprintln!(
                 "choz: sandbox for {} failed ({e}); hosting in-process",
@@ -324,6 +421,78 @@ fn build_clap_fx(
     Some(Box::new(eff))
 }
 
+/// Every effect in a chain, metered — without a single effect knowing about it.
+///
+/// The alternative was a pair of peak fields inside each processor (which is
+/// what the `Saturator` grew first, and what the roadmap called out): thirty-odd
+/// copies of the same two lines, and no meter at all for a hosted plugin, which
+/// is exactly where "is anything even reaching this?" gets asked. Here the peak
+/// is taken on the way in and on the way out of a `process_block` that has no
+/// idea it is being watched.
+///
+/// Cost: two passes over the block per effect. A peak is a compare per sample
+/// over a few hundred of them — next to the effect it wraps, nothing.
+///
+/// Everything else is forwarded. A wrapper that swallowed `editor()` would take
+/// a plugin's window away, which is the trap with this shape.
+struct Metered {
+    inner: Box<dyn fx::FxProcessor>,
+    meter: choz_ports::FxMeter,
+}
+
+impl fx::FxProcessor for Metered {
+    fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
+        let input = choz_ports::FxMeter::peak_of(buf);
+        self.inner.process_block(buf, sample_rate);
+        self.meter.publish(input, choz_ports::FxMeter::peak_of(buf));
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+        self.meter.clear();
+    }
+
+    fn set_mix(&mut self, wet: f32) {
+        self.inner.set_mix(wet);
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn params(&self) -> Vec<choz_ports::FxParam> {
+        self.inner.params()
+    }
+
+    fn set_param(&mut self, index: usize, value: f32) {
+        self.inner.set_param(index, value);
+    }
+
+    fn editor(&self) -> Option<choz_ports::EditorHandle> {
+        self.inner.editor()
+    }
+
+    fn param_touch(&self) -> Option<choz_ports::TouchHandle> {
+        self.inner.param_touch()
+    }
+
+    fn state(&self) -> Option<choz_ports::StateHandle> {
+        self.inner.state()
+    }
+
+    fn sandbox(&self) -> Option<choz_ports::SandboxStatus> {
+        self.inner.sandbox()
+    }
+
+    fn meter(&self) -> Option<choz_ports::FxMeter> {
+        Some(self.meter.clone())
+    }
+
+    fn latency_samples(&self) -> u32 {
+        self.inner.latency_samples()
+    }
+}
+
 pub fn build_chain_from_specs(
     specs: &[FxSpec],
     sample_rate: u32,
@@ -346,7 +515,10 @@ pub fn build_chain_from_specs(
                 None => build_processor(&s.kind, &s.params, sample_rate)?,
             };
             proc.set_mix(s.wet);
-            Some(proc)
+            Some(Box::new(Metered {
+                inner: proc,
+                meter: choz_ports::FxMeter::default(),
+            }) as Box<dyn fx::FxProcessor>)
         })
         .collect()
 }
@@ -355,42 +527,12 @@ pub fn build_chain_from_specs(
 mod tests {
     use super::*;
 
-    /// Every FX id the UI can build (kept in sync with `choz-ui`'s FX kinds).
-    const FX_IDS: &[&str] = &[
-        "delay",
-        "reverb",
-        "grandelay",
-        "compressor",
-        "limiter",
-        "gate",
-        "expander",
-        "parameq",
-        "graphiceq",
-        "filter",
-        "filterbank",
-        "chorus",
-        "flanger",
-        "phaser",
-        "bitcrusher",
-        "vinyl",
-        "cassette",
-        "softclip",
-        "tubesat",
-        "widener",
-        "isolator",
-        "gain",
-        "phaseinvert",
-        "monomaker",
-        "pan",
-        "looper",
-        "sidechain",
-        "protocosmos",
-        "spaceecho",
-        "reversedelay",
-        "z5texture",
-        "amberfang",
-        "velvetfuzz",
-    ];
+    /// The list under test is the one everything else walks — see
+    /// [`BUILT_IN_KINDS`]. There used to be a second copy here, which is
+    /// exactly the drift it was supposed to catch.
+    fn fx_ids() -> Vec<&'static str> {
+        BUILT_IN_KINDS.iter().map(|(id, _)| *id).collect()
+    }
 
     fn spec(kind: &str, plugin: Option<PluginFxRef>) -> FxSpec {
         FxSpec {
@@ -421,6 +563,41 @@ mod tests {
         assert_eq!(build_chain_from_specs(&specs, 48_000, 256).len(), 2);
     }
 
+    /// Every effect in a built chain is metered, whatever it is — that is the
+    /// whole point of doing it in the wrapper instead of inside each processor.
+    /// And a chain reports the delay its effects add.
+    #[test]
+    fn a_built_chain_meters_every_effect_and_reports_its_latency() {
+        // Gain at 0.5 is a knob position, not a factor; what matters is that
+        // both sides of it read something and neither is stuck at zero.
+        let mut chain = build_chain_from_specs(&[spec("gain", None)], 48_000, 256);
+        let meter = chain[0].meter().expect("the wrapper meters everything");
+        assert_eq!(meter.peaks(), (0.0, 0.0), "nothing has gone through yet");
+
+        let mut buf = [0.0f32; 512];
+        for (i, s) in buf.iter_mut().enumerate() {
+            *s = 0.5 * (2.0 * std::f32::consts::PI * (i / 2) as f32 / 64.0).sin();
+        }
+        chain[0].process_block(&mut buf, 48_000);
+        let (input, output) = meter.peaks();
+        assert!((input - 0.5).abs() < 0.02, "input peak: {input}");
+        assert!(output > 0.0 && output.is_finite(), "output peak: {output}");
+
+        // Silence after signal reads as silence: a needle that stays up is a
+        // needle nobody believes.
+        chain[0].process_block(&mut [0.0f32; 512], 48_000);
+        assert_eq!(meter.peaks(), (0.0, 0.0));
+
+        // A gain stage delays nothing; AutoTune holds a shifter window, and the
+        // wrapper must pass that number through rather than answer for it.
+        assert_eq!(chain[0].latency_samples(), 0);
+        let tuned = build_chain_from_specs(&[spec("autotune", None)], 48_000, 256);
+        assert!(
+            tuned[0].latency_samples() > 0,
+            "AutoTune reports its shifter window"
+        );
+    }
+
     /// Every FX, built with a mid-range param set, must stay numerically sane
     /// (no NaN/Inf, no runaway) across several blocks of a -6 dBFS sine.
     #[test]
@@ -429,7 +606,7 @@ mod tests {
         // build_processor reads only the params it needs; a uniform 0.5 vector
         // covers every kind's parameter count.
         let params = [0.5f32; 8];
-        for id in FX_IDS {
+        for id in fx_ids() {
             let mut proc = build_processor(id, &params, sr)
                 .unwrap_or_else(|| panic!("build_processor returned None for {id}"));
 

@@ -175,6 +175,12 @@ pub struct AudioSettings {
     pub backend: String,
     /// Output device name, or empty for the system default.
     pub device: String,
+    /// Capture device, for choz as a multi-effect. `None` = no live input,
+    /// `Some("")` = whatever the host calls default. Added later, hence the
+    /// default: an old `ui.json` opens with the microphone off, which is the
+    /// only polite way round.
+    #[serde(default)]
+    pub input_device: Option<String>,
     pub sample_rate: u32,
     pub buffer_size: u32,
     /// SF2 synthesis engine. choz only builds `oxisynth`; kept so a project
@@ -194,6 +200,15 @@ pub struct AudioSettings {
     /// default.
     #[serde(default = "default_time_sig")]
     pub time_sig: (u16, u16),
+    /// Whether the feedback guard is armed — see `choz_engine::feedback`. On
+    /// by default, and added later, so an old `ui.json` gets it armed: a guard
+    /// that is off because the file predates it is a guard nobody has.
+    #[serde(default = "default_true")]
+    pub feedback_guard: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_time_sig() -> (u16, u16) {
@@ -209,6 +224,7 @@ impl Default for AudioSettings {
         Self {
             backend: "AUTO".into(),
             device: String::new(),
+            input_device: None,
             sample_rate: 48_000,
             buffer_size: 256,
             sf2_engine: "oxisynth".into(),
@@ -217,6 +233,7 @@ impl Default for AudioSettings {
             jack_server_name: String::new(),
             bpm: default_bpm(),
             time_sig: default_time_sig(),
+            feedback_guard: true,
         }
     }
 }
@@ -308,6 +325,46 @@ impl RackMode {
     }
 }
 
+/// Where the wallpapers that ship with choz live, once it is installed.
+///
+/// Looked for in the order a running binary should trust: an explicit override,
+/// then next to the binary's own prefix (`…/bin/choz` → `…/share/choz/wallpapers`),
+/// then the system and user prefixes, and finally the repository's `assets/`
+/// for a checkout being run with `cargo run`.
+///
+/// `None` when none of them is there, which is what a bare `cargo build` in a
+/// stripped tree looks like — and then choz opens on the terminal's own
+/// background, exactly as it did before any of this.
+pub fn wallpaper_dir() -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(explicit) = std::env::var_os("CHOZ_WALLPAPERS") {
+        candidates.push(explicit.into());
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        // …/bin/choz → …/share/choz/wallpapers
+        if let Some(prefix) = exe.parent().and_then(|d| d.parent()) {
+            candidates.push(prefix.join("share/choz/wallpapers"));
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(std::path::PathBuf::from(home).join(".local/share/choz/wallpapers"));
+    }
+    candidates.push("/usr/share/choz/wallpapers".into());
+    candidates.push("/usr/local/share/choz/wallpapers".into());
+    // A checkout: `cargo run` from the repository root.
+    candidates.push("assets".into());
+    candidates.into_iter().find(|d| d.is_dir())
+}
+
+/// The image a fresh install opens with: the one this project ships as its own.
+pub fn shipped_wallpaper() -> Option<std::path::PathBuf> {
+    let dir = wallpaper_dir()?;
+    ["wallpaper.jpg", "wallpaper.png"]
+        .iter()
+        .map(|f| dir.join(f))
+        .find(|p| p.is_file())
+}
+
 /// How a background image fills the terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ImageFit {
@@ -394,6 +451,11 @@ pub struct UiSettings {
     /// the drawing code never reads it.
     #[serde(default)]
     pub theme_name: String,
+    /// Follow an outside MIDI clock instead of choz's own transport. Off by
+    /// default: a port that sends clock all day would otherwise take the tempo
+    /// over the moment it is plugged in.
+    #[serde(default)]
+    pub midi_clock: bool,
     /// How strongly the theme's panel colour is washed over a background image,
     /// 0..100 %. A photo behind the UI is beautiful and unreadable; this is the
     /// knob that trades one for the other.
@@ -412,6 +474,11 @@ pub struct UiSettings {
     /// this machine is set up, not of a single session.
     #[serde(default)]
     pub rack_mode: RackMode,
+    /// What colours a lit key in the monitor's KEYS/ROLL tabs. A property of how
+    /// this rig is played (one channel per tab, or one keyboard split by
+    /// velocity), so it outlives the session.
+    #[serde(default)]
+    pub key_colour: crate::views::midi_monitor::KeyColor,
 }
 
 /// Enough wash to read knobs and labels over a busy photo, without hiding it.
@@ -432,6 +499,8 @@ impl Default for UiSettings {
             background_tint: default_tint(),
             panel_tint: None,
             rack_mode: RackMode::default(),
+            key_colour: crate::views::midi_monitor::KeyColor::default(),
+            midi_clock: false,
         }
     }
 }
@@ -535,10 +604,26 @@ impl UiSettings {
     }
 
     pub fn load() -> Self {
-        std::fs::read_to_string(Self::path())
+        match std::fs::read_to_string(Self::path())
             .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+            .and_then(|s| serde_json::from_str::<Self>(&s).ok())
+        {
+            Some(saved) => saved,
+            // **First run.** A fresh install opens with the wallpaper it was
+            // installed with, rather than on a bare terminal — the images ship
+            // with the package for exactly that. Anything the user picks
+            // afterwards is in `ui.json` and this never runs again.
+            None => {
+                let mut fresh = Self::default();
+                if let Some(image) = shipped_wallpaper() {
+                    fresh.background = Background::Image {
+                        path: image,
+                        fit: ImageFit::Stretch,
+                    };
+                }
+                fresh
+            }
+        }
     }
 
     pub fn save(&self) {

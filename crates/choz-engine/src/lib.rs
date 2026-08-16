@@ -2,33 +2,32 @@
 //! plugin registry. Built on the RT-safe traits in `choz-ports`.
 
 pub mod cache;
+pub mod chord;
 pub mod engine;
+pub mod feedback;
 pub mod fx;
 pub mod fx_chain;
 pub mod input;
 mod jack_backend;
+pub mod maxpat;
 pub mod meter;
 pub mod midi;
 pub mod osc;
 pub mod paths;
 pub mod pitch;
-pub mod plugin_types;
 pub mod quarantine;
-pub mod registry;
 pub mod sandboxed;
-pub mod scanner;
 pub mod sfz;
 pub mod sources;
 
-pub use engine::AudioEngine;
+pub use engine::{AudioBackend, AudioEngine};
 
 /// Parameter index that means "choz's own dry/wet" in
 /// [`AudioEngine::set_fx_param`], rather than one of the processor's params.
 pub const FX_MIX_PARAM: usize = usize::MAX;
 pub use fx_chain::FxSpec;
+
 pub use paths::{FoundPlugin, PluginFormat, PluginPaths, SearchDir};
-pub use plugin_types::{PluginDescriptor, PluginKind};
-pub use registry::PluginRegistry;
 
 /// Scan every enabled directory of every format in `paths`.
 ///
@@ -371,6 +370,78 @@ pub fn read_plugin_params(
         PluginFormat::Ladspa | PluginFormat::Dssi => choz_plugin_ladspa::read_params(path, id),
         PluginFormat::Vst2 => choz_plugin_vst2::read_params(path, id),
         PluginFormat::Vst3 => choz_plugin_vst3::read_params(path, id),
+        // A Pure Data patch's knobs are its own on-screen controls — the ones
+        // that carry a receive symbol, because the rest cannot be moved from
+        // outside the canvas. Read from the file, so this needs no Pd.
+        PluginFormat::Pd => pd_params(path),
         _ => Vec::new(),
+    }
+}
+
+/// The controls of a `.pd` patch, as parameters.
+///
+/// Also the place that says, once and by name, which controls **cannot** be
+/// reached: a patch whose gain slider has no receive symbol sits at whatever
+/// that slider was saved at — zero, for a fresh one — and is silent with no
+/// error anywhere. Giving the slider a receive symbol in Pd is the fix, and
+/// nobody guesses that from silence.
+fn pd_params(path: &std::path::Path) -> Vec<PluginParam> {
+    let Ok(info) = choz_plugin_pd::read_patch(path) else {
+        return Vec::new();
+    };
+    let stuck = choz_plugin_pd::unreachable(&info);
+    if !stuck.is_empty() {
+        eprintln!(
+            "choz: {} has {} control(s) choz cannot move ({}). Give them a receive \
+             symbol in Pd (the slider's properties) and they become knobs here.",
+            path.display(),
+            stuck.len(),
+            stuck.join(", ")
+        );
+    }
+    choz_plugin_pd::addressable(&info)
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut p = PluginParam::plain_range(
+                i as u32,
+                c.name.clone(),
+                c.min as f64,
+                c.max as f64,
+                c.min as f64,
+            );
+            if c.toggle {
+                p.steps = 2;
+            }
+            p
+        })
+        .collect()
+}
+
+/// Locks for the things that are global to the **process**, so tests that move
+/// them do not move them under each other.
+///
+/// The transport and the meters are singletons by design — there is one
+/// output and one clock — and `cargo test` runs a crate's tests in parallel in
+/// one process. Two tests each rewinding the transport, or one clearing the
+/// meter while another renders into it, is a failure that looks like a bug in
+/// the code under test and is not one. **One lock per global**, in one place,
+/// or they do not serialise against each other: that was the first attempt.
+#[cfg(test)]
+pub(crate) mod test_locks {
+    use std::sync::{Mutex, MutexGuard};
+
+    static TRANSPORT: Mutex<()> = Mutex::new(());
+    static METER: Mutex<()> = Mutex::new(());
+
+    /// Held while a test moves the transport (rewind, play, tempo).
+    pub(crate) fn transport() -> MutexGuard<'static, ()> {
+        TRANSPORT.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Held while a test reads or clears the output meter — which every
+    /// `render` writes to.
+    pub(crate) fn meter() -> MutexGuard<'static, ()> {
+        METER.lock().unwrap_or_else(|e| e.into_inner())
     }
 }

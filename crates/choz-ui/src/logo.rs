@@ -37,7 +37,8 @@ fn generate() -> DynamicImage {
     DynamicImage::ImageRgba8(buf)
 }
 
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+/// Also used by the keyboard visualizer to give each MIDI channel a hue.
+pub(crate) fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
     let c = v * s;
     let hp = (h % 360.0) / 60.0;
     let x = c * (1.0 - (hp % 2.0 - 1.0).abs());

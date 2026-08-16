@@ -292,6 +292,11 @@ thread_local! {
 /// lives here rather than in the UI's test module because the panels' own tests
 /// need it too.
 ///
+/// **The transport rides on this lock as well.** It is another process-wide
+/// singleton, and one lock that orders everything global is simpler than two
+/// that do not order against each other — a test measuring a step against a
+/// playhead another test had just rewound failed about one run in four.
+///
 /// **Reentrant, deliberately.** A `std::sync::Mutex` is not, and the helpers
 /// that render a panel take this lock themselves — so a test that takes it and
 /// then renders deadlocks against itself, taking every other test waiting on

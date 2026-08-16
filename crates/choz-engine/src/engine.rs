@@ -45,10 +45,28 @@ pub(crate) struct Slot {
     /// tracker hears it. A guitar is nowhere near the level of a synth, and
     /// without this the two are stuck at whatever the interface's preamp gave.
     in_gain: f32,
+    /// Catches a microphone that has started to howl into the speakers it is
+    /// feeding — see [`crate::feedback`]. One per slot because the loop is per
+    /// input, armed globally because a room is a room.
+    guard: crate::feedback::FeedbackGuard,
     /// Audio in, notes out: `Some` while the tab is converting what it hears
     /// into notes for its own instrument. The tracker lives here because it is
     /// per slot and used only from the audio callback.
     pitch: Option<crate::pitch::PitchTracker>,
+    /// How much of a converting tab's output is the instrument rather than the
+    /// audio that drove it. 1 = only the instrument, 0 = only the input.
+    ///
+    /// A converter that can only replace the sound is half a tool: a guitar
+    /// doubled by a synth is the sound most people are after, and it needs the
+    /// guitar still there.
+    pitch_mix: f32,
+    /// Notes with a time on them, waiting for the block that contains it.
+    ///
+    /// Fixed size and never grown: this is the audio thread. A queue that
+    /// fills applies its oldest immediately rather than dropping it — a note
+    /// slightly early is a note, and a dropped note-on is silence while a
+    /// dropped note-off is a note that never stops.
+    pending: [Option<Scheduled>; MAX_SCHEDULED],
     /// Which notes this slot has been told to play, one bit per MIDI note.
     ///
     /// Panic uses it to send the exact note-offs that are missing, which is the
@@ -68,9 +86,55 @@ impl Slot {
             out_pair: (0, 1),
             in_pair: None,
             in_gain: 1.0,
+            guard: crate::feedback::FeedbackGuard::new(48_000.0),
             pitch: None,
+            pitch_mix: 1.0,
+            pending: [None; MAX_SCHEDULED],
             held: 0,
         }
+    }
+
+    /// Play a note now, and remember it for `PANIC`.
+    #[inline]
+    fn play(&mut self, note: u8, vel: u8, on: bool) {
+        if on {
+            self.held |= 1u128 << (note & 0x7F);
+            self.source.note_on(note, vel);
+        } else {
+            self.held &= !(1u128 << (note & 0x7F));
+            self.source.note_off(note);
+        }
+    }
+
+    /// Take a note, now or later. `at == 0` is now.
+    fn schedule(&mut self, at: u64, note: u8, vel: u8, on: bool) {
+        if at == 0 {
+            self.play(note, vel, on);
+            return;
+        }
+        if let Some(slot) = self.pending.iter_mut().find(|p| p.is_none()) {
+            *slot = Some(Scheduled { at, note, vel, on });
+            return;
+        }
+        // Full. A note slightly early is still the note; a dropped one is
+        // silence, or worse, a note that never stops.
+        self.play(note, vel, on);
+    }
+
+    /// The earliest pending note inside `[start, end)`, taken off the queue.
+    fn due(&mut self, start: u64, end: u64) -> Option<Scheduled> {
+        let mut best: Option<(usize, u64)> = None;
+        for (i, p) in self.pending.iter().enumerate() {
+            let Some(s) = p else { continue };
+            // Anything already past is due immediately: a block was missed, and
+            // the note is late rather than cancelled.
+            let when = s.at.max(start);
+            if when < end && best.is_none_or(|(_, b)| when < b) {
+                best = Some((i, when));
+            }
+        }
+        let (i, _) = best?;
+        self.pending[i].take()
     }
 
     /// Constant-power pan law → (left, right) channel gains.
@@ -120,6 +184,11 @@ pub(crate) enum EngineCommand {
         slot: usize,
         on: bool,
     },
+    /// Dry/wet of a converting tab: 1 = only the instrument.
+    SetSlotPitchMix {
+        slot: usize,
+        mix: f32,
+    },
     /// Trim on the slot's audio input, and how loud that input has to be before
     /// the pitch tracker calls it a note.
     SetSlotInTrim {
@@ -150,10 +219,17 @@ pub(crate) enum EngineCommand {
         slot: usize,
         note: u8,
         vel: u8,
+        /// Transport sample the note is **for**. `0` means "as soon as it
+        /// arrives", which is what every input that has no schedule of its own
+        /// sends: a key, a MIDI port, OSC. A generator that knows when its next
+        /// step lands sends that sample, and the callback splits its render
+        /// there rather than starting the note at the top of a block.
+        at: u64,
     },
     NoteOff {
         slot: usize,
         note: u8,
+        at: u64,
     },
     /// Silence every slot: the panic button. One command rather than a burst
     /// of note-offs, so the ring cannot fill up halfway through and leave a
@@ -244,6 +320,14 @@ pub struct AudioEngine {
     sandboxes: Vec<Option<choz_ports::SandboxStatus>>,
     /// Same, per FX: `fx_sandboxes[slot][fx]`.
     fx_sandboxes: Vec<Vec<Option<choz_ports::SandboxStatus>>>,
+    /// Peak in/out per effect, for the meter the rack draws:
+    /// `fx_meters[slot][fx]`. Captured where the editor is — the last moment
+    /// the UI can reach the processor.
+    fx_meters: Vec<Vec<Option<choz_ports::FxMeter>>>,
+    /// What each effect adds to the signal's delay, in samples:
+    /// `fx_latency[slot][fx]`. A constant of the algorithm, so it is read once,
+    /// here, instead of asked for on the audio thread.
+    fx_latency: Vec<Vec<u32>>,
     /// UI → RT: engine commands (add/remove slot, set fx, notes).
     cmd_tx: rtrb::Producer<EngineCommand>,
     /// RT → UI: retired slots/chains to drop off the audio thread.
@@ -256,9 +340,25 @@ pub struct AudioEngine {
     /// RT endpoints, taken by `start()` and moved into the callback.
     rt_endpoints: Option<RtEndpoints>,
     _stream: Option<BackendHandle>,
+    /// The live capture stream on the cpal backends. Held only to keep it
+    /// alive; dropping it stops the input, which is the whole point.
+    _input_stream: Option<cpal::Stream>,
+    /// Which input the user asked for: `None` = the host's default, and
+    /// `wants_input` is what decides whether one is opened at all.
+    input_device: Option<String>,
+    /// PipeWire quantum to force on the **whole graph**, or 0 to leave it
+    /// alone. See [`request_pipewire_period`] for why the default is 0.
+    force_quantum: u32,
+    /// Whether to open a capture stream on the cpal backends. Off by default:
+    /// a host that grabs the microphone on start-up is a host nobody asked.
+    wants_input: bool,
     /// Device output channels the running backend gives us. 2 on cpal; the
     /// interface's real count on the native JACK client.
     out_channels: usize,
+    /// How many of our output ports actually reached a sink. Zero means choz
+    /// is computing a mix that goes nowhere — silence that looks exactly like
+    /// a broken effect, so the interface says it out loud.
+    out_wired: usize,
     /// Device input channels available to slots (native JACK only).
     in_channels: usize,
     /// The graph port behind each input channel, in channel order — every
@@ -291,13 +391,38 @@ pub(crate) struct RtState {
     pub(crate) slots: Vec<Slot>,
     /// Pre-allocated per-slot mix scratch (interleaved stereo).
     pub(crate) scratch: Vec<f32>,
+    /// A second one, for holding a converting tab's input while its instrument
+    /// renders over the first.
+    pub(crate) dry: Vec<f32>,
     /// One pre-allocated buffer per device output channel. Slots sum into the
     /// pair they are routed to; the backend copies these to its ports.
     pub(crate) mix: Vec<Vec<f32>>,
     /// One pre-allocated buffer per device *input* channel, filled by the
     /// backend before `render` so a slot can process live audio.
     pub(crate) capture: Vec<Vec<f32>>,
+    /// Interleaved input coming from a **separate** cpal input stream.
+    ///
+    /// JACK hands playback and capture to one callback, so there it is `None`
+    /// and the backend writes `capture` directly. Every other backend gives
+    /// audio in and audio out their own callbacks on their own clocks, and a
+    /// lock-free ring is the only thing that may pass between two audio
+    /// threads.
+    pub(crate) capture_rx: Option<rtrb::Consumer<f32>>,
     pub(crate) sample_rate: u32,
+}
+
+/// Notes a slot can have waiting for their sample. Eight is two bars of
+/// sixteenths at the fastest an arpeggiator schedules ahead, and the overflow
+/// path is "play it now", not "lose it".
+const MAX_SCHEDULED: usize = 8;
+
+/// A note and the transport sample it is for.
+#[derive(Clone, Copy)]
+struct Scheduled {
+    at: u64,
+    note: u8,
+    vel: u8,
+    on: bool,
 }
 
 /// Smallest quantum choz will force on the graph. Forcing 64 frames onto a
@@ -315,24 +440,45 @@ const MIN_FORCED_QUANTUM: u32 = 128;
 /// whatever the graph happened to be running at, and force beats latency. A
 /// client started while the graph sat at 1024 stayed at 1024 (21 ms) no matter
 /// what buffer size the settings asked for. `PIPEWIRE_QUANTUM` writes
-/// `node.force-quantum`/`node.force-rate`, so the configured buffer size is what
-/// actually runs.
-fn request_pipewire_period(buffer_size: u32, sample_rate: u32) {
+/// `node.force-quantum` **and `node.force-rate`**, so the configured buffer size
+/// is what actually runs.
+///
+/// # Why it is off unless asked for
+///
+/// Because that force is not choz's to take. `force-quantum`/`force-rate` move
+/// the **whole graph**, not choz's node: every other application on the machine
+/// gets resampled to whatever choz asked for, and a browser playing 44.1 kHz
+/// through a headset that was happy at its own rate comes out thin and
+/// distorted while choz is running. That was reported, and it was choz doing
+/// it. The Settings row has said `PW quantum: system` all along — this makes
+/// that true instead of decorative.
+///
+/// `force` is that setting: 0 leaves the graph alone and only *asks*, anything
+/// else is the quantum to force. The floor still applies to the force, because
+/// a 64-frame quantum stalls a class-compliant USB interface.
+fn request_pipewire_period(buffer_size: u32, sample_rate: u32, force: u32) {
     let period = format!("{buffer_size}/{sample_rate}");
     unsafe { std::env::set_var("PIPEWIRE_LATENCY", &period) };
-    if buffer_size >= MIN_FORCED_QUANTUM {
-        unsafe { std::env::set_var("PIPEWIRE_QUANTUM", &period) };
-        eprintln!(
-            "choz: PipeWire period forced to {period} ({:.1} ms)",
-            period_ms(buffer_size, sample_rate)
-        );
-    } else {
-        // Leave any inherited force in place rather than pushing the graph below
-        // what the USB bus survives.
+    if force == 0 {
+        // Asking, not taking. Whatever the graph is running at, it keeps.
         unsafe { std::env::remove_var("PIPEWIRE_QUANTUM") };
         eprintln!(
-            "choz: PipeWire period requested {period}, not forced (< {MIN_FORCED_QUANTUM} frames)"
+            "choz: PipeWire period requested {period} ({:.1} ms), graph left alone",
+            period_ms(buffer_size, sample_rate)
         );
+        return;
+    }
+    if force >= MIN_FORCED_QUANTUM {
+        let forced = format!("{force}/{sample_rate}");
+        unsafe { std::env::set_var("PIPEWIRE_QUANTUM", &forced) };
+        eprintln!(
+            "choz: PipeWire quantum forced to {forced} ({:.1} ms) \u{2014} this moves the whole graph",
+            period_ms(force, sample_rate)
+        );
+    } else {
+        // Never below what the USB bus survives, whatever was asked for.
+        unsafe { std::env::remove_var("PIPEWIRE_QUANTUM") };
+        eprintln!("choz: PipeWire quantum {force} not forced (< {MIN_FORCED_QUANTUM} frames)");
     }
 }
 
@@ -395,13 +541,20 @@ impl AudioEngine {
             fx_states: Vec::new(),
             sandboxes: Vec::new(),
             fx_sandboxes: Vec::new(),
+            fx_meters: Vec::new(),
+            fx_latency: Vec::new(),
             cmd_tx,
             retired_rx,
             output_device: None,
             backend_pref: "AUTO".to_string(),
             rt_endpoints: Some(RtEndpoints { cmd_rx, retired_tx }),
             _stream: None,
+            _input_stream: None,
+            input_device: None,
+            wants_input: false,
+            force_quantum: 0,
             out_channels: 2,
+            out_wired: 0,
             in_channels: 0,
             input_ports: Vec::new(),
         }
@@ -449,7 +602,16 @@ impl AudioEngine {
             .take()
             .context("audio engine already started")?;
 
-        let state = self.new_rt_state(ep, 2, 0);
+        // Live input, when the user asked for one. Its own stream, its own
+        // clock, joined to the output by a ring — see `build_input_stream`.
+        let (in_stream, capture_rx, ins, in_name) = match self.open_cpal_input() {
+            Some((stream, rx, channels, name)) => (Some(stream), Some(rx), channels, Some(name)),
+            None => (None, None, 0, None),
+        };
+        let state = self.new_rt_state(ep, 2, ins, capture_rx);
+        if in_name.is_some() {
+            self.input_device = in_name;
+        }
 
         // On JACK the wanted name is a graph sink, not a cpal device: keep it
         // and patch the ports once the stream (and its ports) exist.
@@ -457,9 +619,11 @@ impl AudioEngine {
         let stream = build_stream(&device, &config, state)?;
         stream.play().context("failed to start audio stream")?;
         self._stream = Some(BackendHandle::Cpal(stream));
+        self._input_stream = in_stream;
         self.backend = backend;
         self.out_channels = 2;
-        self.in_channels = 0;
+        self.in_channels = ins;
+        self.input_ports = self.cpal_input_labels(ins);
         self.output_device = match (backend, wanted) {
             (AudioBackend::Jack, Some(sink)) => match jack_route_to(&sink, CPAL_JACK_CLIENT) {
                 Ok(()) => Some(sink),
@@ -487,7 +651,7 @@ impl AudioEngine {
         if !pipewire_is_running() && self.backend_pref != "JACK" {
             anyhow::bail!("no JACK graph detected");
         }
-        request_pipewire_period(self.buffer_size, self.sample_rate);
+        request_pipewire_period(self.buffer_size, self.sample_rate, self.force_quantum);
 
         let sink = self.output_device.clone().or_else(jack_current_sink);
         // An unknown sink still gets a stereo client: the user can patch it.
@@ -506,16 +670,22 @@ impl AudioEngine {
             .rt_endpoints
             .take()
             .context("audio engine already started")?;
-        let state = self.new_rt_state(ep, outs.max(2), ins);
+        let state = self.new_rt_state(ep, outs.max(2), ins, None);
 
         match crate::jack_backend::start(sink.as_deref(), &capture, outs.max(2), state) {
-            Ok((handle, channels)) => {
+            Ok((handle, channels, wired)) => {
                 self._stream = Some(BackendHandle::Jack(Box::new(handle)));
                 self.backend = AudioBackend::Jack;
                 self.out_channels = channels;
                 self.in_channels = ins;
                 self.input_ports = capture;
-                self.output_device = sink.or_else(jack_current_sink);
+                // The device the audio actually reached, which is not always
+                // the one that was asked for: a saved name outlives the box.
+                self.out_wired = wired.as_ref().map(|(_, n)| *n).unwrap_or(0);
+                self.output_device = wired
+                    .map(|(name, _)| name)
+                    .or(sink)
+                    .or_else(jack_current_sink);
                 Ok(())
             }
             Err(e) => {
@@ -544,13 +714,13 @@ impl AudioEngine {
         // Fresh rings: the old ones belong to the client we are about to drop.
         let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(CMD_RING);
         let (retired_tx, retired_rx) = rtrb::RingBuffer::new(CMD_RING);
-        let state = self.new_rt_state(RtEndpoints { cmd_rx, retired_tx }, outs, ins);
+        let state = self.new_rt_state(RtEndpoints { cmd_rx, retired_tx }, outs, ins, None);
 
         // Drop first: two live clients would fight over the name `choz`, and
         // the graph would rename the second one. If the new client then fails
         // to open there is no audio until the next attempt — the error says so.
         self._stream = None;
-        let (handle, channels) = crate::jack_backend::start(sink, &capture, outs, state)
+        let (handle, channels, wired) = crate::jack_backend::start(sink, &capture, outs, state)
             .context("cannot reopen the JACK client")?;
 
         self.cmd_tx = cmd_tx;
@@ -564,16 +734,31 @@ impl AudioEngine {
         self.fx_states.clear();
         self.sandboxes.clear();
         self.fx_sandboxes.clear();
+        self.fx_meters.clear();
+        self.fx_latency.clear();
         self._stream = Some(BackendHandle::Jack(Box::new(handle)));
         self.out_channels = channels;
         self.in_channels = ins;
         self.input_ports = capture;
-        self.output_device = sink.map(str::to_string).or_else(jack_current_sink);
+        self.out_wired = wired.as_ref().map(|(_, n)| *n).unwrap_or(0);
+        self.output_device = wired
+            .map(|(name, _)| name)
+            .or_else(|| sink.map(str::to_string))
+            .or_else(jack_current_sink);
         Ok(())
     }
 
     /// RT state sized for `outs` output and `ins` input channels.
-    fn new_rt_state(&self, ep: RtEndpoints, outs: usize, ins: usize) -> RtState {
+    ///
+    /// `capture_rx` is the ring a separate input stream fills; `None` on the
+    /// native JACK client, which writes the capture buffers itself.
+    fn new_rt_state(
+        &self,
+        ep: RtEndpoints,
+        outs: usize,
+        ins: usize,
+        capture_rx: Option<rtrb::Consumer<f32>>,
+    ) -> RtState {
         // Frames a callback can ever hand us: the configured buffer, but never
         // less than 8192 — cpal and PipeWire both hand out bigger blocks than
         // the size we asked for.
@@ -584,8 +769,10 @@ impl AudioEngine {
             retired_tx: ep.retired_tx,
             slots: Vec::with_capacity(MAX_SLOTS),
             scratch: vec![0.0; frames * 2],
+            dry: vec![0.0; frames * 2],
             mix: vec![vec![0.0; frames]; outs.max(2)],
             capture: vec![vec![0.0; frames]; ins],
+            capture_rx,
             sample_rate: self.sample_rate,
         }
     }
@@ -613,11 +800,99 @@ impl AudioEngine {
         self.output_device.as_deref()
     }
 
-    /// The graph port behind each input channel, in channel order. There is no
-    /// "input device" to choose any more: every capture jack in the system is
-    /// wired, so what the user picks is a **channel**.
+    /// Whether the mix is actually reaching a device.
+    ///
+    /// Only the native JACK client can answer honestly — it does its own
+    /// patching, so it knows. On cpal the stream *is* the connection: if it
+    /// opened, it is wired.
+    pub fn output_wired(&self) -> bool {
+        match self._stream {
+            Some(BackendHandle::Jack(_)) => self.out_wired > 0,
+            Some(BackendHandle::Cpal(_)) => true,
+            None => false,
+        }
+    }
+
+    /// The graph port behind each input channel, in channel order.
+    ///
+    /// Under the native JACK client this is every capture jack in the system,
+    /// so what the user picks is a **channel**. On the cpal backends (ALSA,
+    /// PulseAudio, PipeWire) there is one input *device* and these are its
+    /// channels, named after it.
     pub fn input_ports(&self) -> &[String] {
         &self.input_ports
+    }
+
+    /// Capture devices the current backend can open, by name.
+    ///
+    /// On JACK the answer is the graph's capture ports — there is no device to
+    /// choose, every jack is already wired — so this is the cpal list, which is
+    /// what the Settings row offers on ALSA / PulseAudio / PipeWire.
+    pub fn input_devices(&self) -> Vec<String> {
+        match cpal::default_host().input_devices() {
+            Ok(devs) => devs.filter_map(|d| d.name().ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// The capture device in use, if any.
+    pub fn input_device(&self) -> Option<&str> {
+        self.input_device.as_deref()
+    }
+
+    /// Whether a capture stream is open (or wanted, before the stream is up).
+    pub fn input_enabled(&self) -> bool {
+        self.wants_input
+    }
+
+    /// Choose the capture device. `None` turns live input off.
+    ///
+    /// Returns `true` when the stream had to be rebuilt, which loses every
+    /// engine slot — the caller reloads the rack, exactly as it does for an
+    /// output change. On the native JACK client there is nothing to choose and
+    /// this is a no-op: the graph's jacks are already all wired.
+    pub fn set_input_device(&mut self, name: Option<String>) -> Result<bool> {
+        if self.backend == AudioBackend::Jack
+            && matches!(self._stream, Some(BackendHandle::Jack(_)))
+        {
+            return Ok(false);
+        }
+        let same = self.input_device.as_deref() == name.as_deref();
+        let was = self.wants_input;
+        self.wants_input = name.is_some();
+        self.input_device = name;
+        if same && was == self.wants_input {
+            return Ok(false);
+        }
+        self.restart_cpal().map(|()| true)
+    }
+
+    /// Open the capture stream the user asked for, if any. Failure is not
+    /// fatal: choz plays without an input rather than not starting.
+    fn open_cpal_input(&self) -> Option<(cpal::Stream, rtrb::Consumer<f32>, usize, String)> {
+        if !self.wants_input {
+            return None;
+        }
+        match build_input_stream(
+            &cpal::default_host(),
+            self.input_device.as_deref(),
+            self.sample_rate,
+            self.buffer_size,
+        ) {
+            Ok(open) => Some(open),
+            Err(e) => {
+                eprintln!("choz: no audio input ({e})");
+                None
+            }
+        }
+    }
+
+    /// Channel labels for a cpal capture device: what the IN drawer lists.
+    fn cpal_input_labels(&self, channels: usize) -> Vec<String> {
+        let name = self.input_device.as_deref().unwrap_or("input");
+        (0..channels)
+            .map(|i| format!("{name}:in_{}", i + 1))
+            .collect()
     }
 
     /// Re-read the graph and rebuild the client, so a card plugged in after
@@ -625,7 +900,13 @@ impl AudioEngine {
     /// and the caller reloads the rack.
     pub fn rescan_inputs(&mut self) -> Result<bool> {
         if !matches!(self._stream, Some(BackendHandle::Jack(_))) {
-            anyhow::bail!("audio input needs the native JACK client");
+            // On the cpal backends there is a device rather than a graph, so a
+            // rescan is "open it again": a headset plugged in after start-up
+            // appears in the list, and re-opening picks up its channel count.
+            if self.wants_input {
+                return self.restart_cpal().map(|()| true);
+            }
+            return Ok(false);
         }
         // The sink may never have been named — PipeWire auto-connects us and
         // `output_device` stays empty until someone picks one. Reconnect to
@@ -665,10 +946,26 @@ impl AudioEngine {
             }
             _ => {}
         }
+        self.output_device = Some(name.to_string());
+        self.restart_cpal().map(|()| true)
+    }
+
+    /// Tear the cpal streams down and open them again from the current
+    /// preferences — output device, input device, rate, buffer.
+    ///
+    /// **Every engine slot is lost**: the RT state lives inside the callback
+    /// being dropped. The caller reloads the rack, which is what
+    /// `App::rebuild_rack` is for. Used by both device changes, because
+    /// "restart the audio" is one operation whichever end of it moved.
+    fn restart_cpal(&mut self) -> Result<()> {
+        let want = self.output_device.clone();
         let sound_server = detect_sound_server();
         let (device, config, backend) = self
-            .pick_backend(sound_server, Some(name))
-            .with_context(|| format!("cannot open output device '{name}'"))?;
+            .pick_backend(sound_server, want.as_deref())
+            .with_context(|| match want.as_deref() {
+                Some(name) => format!("cannot open output device '{name}'"),
+                None => "cannot open an output device".to_string(),
+            })?;
 
         // Fresh rings: the old ones are owned by the callback we're dropping.
         let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(CMD_RING);
@@ -677,14 +974,28 @@ impl AudioEngine {
         // retired ring would make it drop them itself — freeing a chain (dlclose
         // on a hosted plugin) inside the audio callback, which hangs the device.
         let (retired_tx, retired_rx) = rtrb::RingBuffer::new(CMD_RING);
-        let state = self.new_rt_state(RtEndpoints { cmd_rx, retired_tx }, 2, 0);
+        // The input goes up first: if the user asked for a capture device that
+        // cannot be opened, they should hear about it before the rack is torn
+        // down, and `open_cpal_input` has already said so on stderr.
+        let (in_stream, capture_rx, ins, in_name) = match self.open_cpal_input() {
+            Some((stream, rx, channels, name)) => (Some(stream), Some(rx), channels, Some(name)),
+            None => (None, None, 0, None),
+        };
+        if in_name.is_some() {
+            self.input_device = in_name;
+        }
+        let state = self.new_rt_state(RtEndpoints { cmd_rx, retired_tx }, 2, ins, capture_rx);
         let stream = build_stream(&device, &config, state)?;
         stream.play().context("failed to start audio stream")?;
 
-        // Drops the previous stream (and its slots).
+        // The numbers belong to the device that is open now.
+        crate::meter::capture_health().clear();
+        // Drops the previous streams (and its slots).
         self._stream = Some(BackendHandle::Cpal(stream));
+        self._input_stream = in_stream;
         self.out_channels = 2;
-        self.in_channels = 0;
+        self.in_channels = ins;
+        self.input_ports = self.cpal_input_labels(ins);
         self.cmd_tx = cmd_tx;
         self.retired_rx = retired_rx;
         self.slot_count = 0;
@@ -696,9 +1007,11 @@ impl AudioEngine {
         self.fx_states.clear();
         self.sandboxes.clear();
         self.fx_sandboxes.clear();
+        self.fx_meters.clear();
+        self.fx_latency.clear();
         self.backend = backend;
         self.output_device = device.name().ok();
-        Ok(true)
+        Ok(())
     }
 
     /// Choose a working (device, config, backend) without consuming RT state.
@@ -712,9 +1025,22 @@ impl AudioEngine {
         }
     }
 
+    /// Force a PipeWire quantum on the graph, or 0 to leave it alone. Applied
+    /// on the next [`Self::start`].
+    pub fn set_force_quantum(&mut self, frames: u32) {
+        self.force_quantum = frames;
+    }
+
     /// Ask for a specific output device on the next [`Self::start`].
     pub fn set_output_device_preference(&mut self, name: &str) {
         self.output_device = Some(name.to_string());
+    }
+
+    /// Ask for a capture device on the next [`Self::start`]. An empty name
+    /// means "the host default"; `None` means no live input at all.
+    pub fn set_input_device_preference(&mut self, name: Option<&str>) {
+        self.wants_input = name.is_some();
+        self.input_device = name.filter(|n| !n.is_empty()).map(str::to_string);
     }
 
     pub fn backend_preference(&self) -> &str {
@@ -733,7 +1059,7 @@ impl AudioEngine {
         }
         let force_jack = matches!(self.backend_pref.as_str(), "JACK" | "PIPEWIRE");
         if force_jack || pipewire_is_running() {
-            request_pipewire_period(self.buffer_size, self.sample_rate);
+            request_pipewire_period(self.buffer_size, self.sample_rate, self.force_quantum);
 
             match self.jack_device_config(want) {
                 Ok((dev, cfg)) => return Ok((dev, cfg, AudioBackend::Jack)),
@@ -829,6 +1155,24 @@ impl AudioEngine {
         self.fx_sandboxes.get(slot)?.get(fx).cloned().flatten()
     }
 
+    /// Peak in and out of FX `fx` in slot `slot`, when that effect meters
+    /// itself. `None` for everything that does not.
+    pub fn fx_meter(&self, slot: usize, fx: usize) -> Option<choz_ports::FxMeter> {
+        self.fx_meters.get(slot)?.get(fx).cloned().flatten()
+    }
+
+    /// How much delay slot `slot`'s FX chain adds, in samples: the sum of what
+    /// every effect in it reports.
+    ///
+    /// choz does not compensate it — there is no arrangement to line up
+    /// against — but the number is the difference between "the rack feels
+    /// sluggish" and "the lookahead limiter costs 5 ms", so the rack shows it.
+    pub fn slot_latency(&self, slot: usize) -> u32 {
+        self.fx_latency
+            .get(slot)
+            .map_or(0, |chain| chain.iter().copied().sum())
+    }
+
     fn drain_retired(&mut self) {
         while let Ok(retired) = self.retired_rx.pop() {
             drop(retired);
@@ -856,6 +1200,8 @@ impl AudioEngine {
         self.fx_touches.push(Vec::new());
         self.fx_states.push(Vec::new());
         self.fx_sandboxes.push(Vec::new());
+        self.fx_meters.push(Vec::new());
+        self.fx_latency.push(Vec::new());
         self.send(EngineCommand::AddSlot(source));
         self.slot_count += 1;
         Some(idx)
@@ -874,6 +1220,8 @@ impl AudioEngine {
             self.fx_states.remove(slot);
             self.sandboxes.remove(slot);
             self.fx_sandboxes.remove(slot);
+            self.fx_meters.remove(slot);
+            self.fx_latency.remove(slot);
         }
     }
 
@@ -889,6 +1237,8 @@ impl AudioEngine {
         self.fx_touches[slot] = fx.iter().map(|p| p.param_touch()).collect();
         self.fx_states[slot] = fx.iter().map(|p| p.state()).collect();
         self.fx_sandboxes[slot] = fx.iter().map(|p| p.sandbox()).collect();
+        self.fx_meters[slot] = fx.iter().map(|p| p.meter()).collect();
+        self.fx_latency[slot] = fx.iter().map(|p| p.latency_samples()).collect();
         self.send(EngineCommand::SetSlotFx { slot, fx });
     }
 
@@ -926,6 +1276,15 @@ impl AudioEngine {
     /// playing a synth. Only means anything on a tab fed by a capture pair.
     pub fn set_slot_pitch_to_midi(&mut self, slot: usize, on: bool) {
         self.send(EngineCommand::SetSlotPitchToMidi { slot, on });
+    }
+
+    /// How much of a converting tab is the instrument and how much is the
+    /// audio that drove it. 1 = only the instrument.
+    pub fn set_slot_pitch_mix(&mut self, slot: usize, mix: f32) {
+        if slot >= self.slot_count {
+            return;
+        }
+        self.send(EngineCommand::SetSlotPitchMix { slot, mix });
     }
 
     /// Trim the slot's audio input (linear `gain`) and set how loud it must be
@@ -1138,11 +1497,37 @@ impl AudioEngine {
 
     /// Send a note-on to one slot. Input→slot routing lives in the UI.
     pub fn note_on(&mut self, slot: usize, note: u8, vel: u8) {
-        self.send(EngineCommand::NoteOn { slot, note, vel });
+        self.send(EngineCommand::NoteOn {
+            slot,
+            note,
+            vel,
+            at: 0,
+        });
     }
 
     pub fn note_off(&mut self, slot: usize, note: u8) {
-        self.send(EngineCommand::NoteOff { slot, note });
+        self.send(EngineCommand::NoteOff { slot, note, at: 0 });
+    }
+
+    /// A note the sender knows the time of: `at` is an absolute transport
+    /// sample. The callback holds it until the block that contains it and
+    /// splits that slot's render there, so the note starts on the sample it
+    /// was written for and not at the top of whichever block noticed.
+    ///
+    /// This is what a generator with its own clock uses — the arpeggiator —
+    /// and it is the only way its resolution stops being the interface's wake
+    /// interval.
+    pub fn note_on_at(&mut self, slot: usize, note: u8, vel: u8, at: u64) {
+        self.send(EngineCommand::NoteOn {
+            slot,
+            note,
+            vel,
+            at,
+        });
+    }
+
+    pub fn note_off_at(&mut self, slot: usize, note: u8, at: u64) {
+        self.send(EngineCommand::NoteOff { slot, note, at });
     }
 
     /// Stop every note in every slot.
@@ -1178,6 +1563,7 @@ impl AudioEngine {
 fn audio_callback(buf: &mut [f32], state: &mut RtState) {
     state.apply_commands();
     let frames = buf.len() / 2;
+    state.drain_capture(frames);
     state.render(frames);
     for f in 0..frames {
         buf[f * 2] = state.mix[0][f];
@@ -1260,6 +1646,11 @@ impl RtState {
                         }
                     }
                 }
+                EngineCommand::SetSlotPitchMix { slot, mix } => {
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        s.pitch_mix = mix.clamp(0.0, 1.0);
+                    }
+                }
                 EngineCommand::SetSlotInTrim { slot, gain, gate } => {
                     if let Some(s) = state.slots.get_mut(slot) {
                         s.in_gain = gain.clamp(0.0, 8.0);
@@ -1298,16 +1689,23 @@ impl RtState {
                     }
                 }
                 // Notes are addressed to one slot; the UI already decided which.
-                EngineCommand::NoteOn { slot, note, vel } => {
+                //
+                // `at == 0` is "now" — a key, a port, OSC, anything with no
+                // schedule of its own — and goes straight through. Anything
+                // else waits for the block that contains its sample.
+                EngineCommand::NoteOn {
+                    slot,
+                    note,
+                    vel,
+                    at,
+                } => {
                     if let Some(s) = state.slots.get_mut(slot) {
-                        s.held |= 1u128 << (note & 0x7F);
-                        s.source.note_on(note, vel);
+                        s.schedule(at, note, vel, true);
                     }
                 }
-                EngineCommand::NoteOff { slot, note } => {
+                EngineCommand::NoteOff { slot, note, at } => {
                     if let Some(s) = state.slots.get_mut(slot) {
-                        s.held &= !(1u128 << (note & 0x7F));
-                        s.source.note_off(note);
+                        s.schedule(at, note, 0, false);
                     }
                 }
                 EngineCommand::Panic => {
@@ -1340,6 +1738,61 @@ impl RtState {
         }
     }
 
+    /// Pull one block of live input off the ring the input stream fills.
+    ///
+    /// Two audio clocks that are not the same clock: the input callback and
+    /// the output callback drift apart, so this has to answer for both ends of
+    /// that. **Short** (the input has not produced yet) fills the rest of the
+    /// block with silence rather than repeating stale audio. **Long** (the
+    /// input is running ahead) throws away everything beyond a small backlog,
+    /// because a ring that is allowed to fill is latency that grows all night
+    /// and never comes back.
+    // ponytail: drop/zero, no resampling. An adaptive resampler the day the
+    // drift is audible as pitch rather than as the occasional lost block.
+    pub(crate) fn drain_capture(&mut self, frames: usize) {
+        // Destructured so the ring can be drained while the buffers are
+        // written: two fields of one struct, borrowed apart.
+        let Self {
+            capture,
+            capture_rx,
+            ..
+        } = self;
+        let channels = capture.len();
+        let Some(rx) = capture_rx.as_mut() else {
+            return;
+        };
+        if channels == 0 || frames == 0 {
+            return;
+        }
+        let want = frames * channels;
+        // Two blocks of slack: enough that a late input callback does not
+        // starve us, little enough that the delay stays in milliseconds.
+        let backlog = want * 2;
+        let available = rx.slots();
+        if available > want + backlog {
+            let excess = available - want - backlog;
+            for _ in 0..excess {
+                if rx.pop().is_err() {
+                    break;
+                }
+            }
+            crate::meter::capture_health().dropped_samples(excess);
+        }
+        // Counted once per block, not once per missing sample: what matters is
+        // "this block had a hole in it", and a block is what the ear hears.
+        if available < want {
+            crate::meter::capture_health().late_block();
+        }
+        for f in 0..frames {
+            for ch in capture.iter_mut() {
+                let s = rx.pop().unwrap_or(0.0);
+                if let Some(dst) = ch.get_mut(f) {
+                    *dst = s;
+                }
+            }
+        }
+    }
+
     /// Copy one capture port's block into the matching input buffer.
     pub(crate) fn write_capture(&mut self, channel: usize, src: &[f32]) {
         let Some(dst) = self.capture.get_mut(channel) else {
@@ -1358,6 +1811,7 @@ impl RtState {
         let Self {
             slots,
             scratch,
+            dry,
             mix,
             capture,
             playing,
@@ -1370,6 +1824,10 @@ impl RtState {
             ch[..n].fill(0.0);
         }
         let playing = playing.load(Ordering::Relaxed);
+        // Where this block sits on the transport's timeline, taken **before**
+        // it is advanced: a scheduled note is a position on that line.
+        let block_start = choz_ports::transport().samples();
+        let block_end = block_start + frames as u64;
         // The host clock every plugin that syncs anything reads: it has to move
         // with the audio, so it is advanced here and nowhere else.
         let transport = choz_ports::transport();
@@ -1382,6 +1840,12 @@ impl RtState {
         }
         let n = (frames * 2).min(scratch.len());
         let sr = *sample_rate;
+
+        // What is arriving on each jack, before any slot decides what to do
+        // with it. This is the reading that says whether live audio is even
+        // reaching choz — the difference between a wiring problem and an
+        // effect problem, which look the same from a panel.
+        crate::meter::capture_levels().publish(capture, frames);
 
         for slot in slots.iter_mut() {
             // Synths always render (envelope tails / live keys); generators
@@ -1399,10 +1863,55 @@ impl RtState {
                     if !capture.is_empty() {
                         let (l, r) = (l.min(last_in), r.min(last_in));
                         let g = slot.in_gain;
+                        // A trim that reaches +24 dB reaches past full scale,
+                        // and a signal driven past full scale is a square wave:
+                        // it saturates what you hear **and** it hands the pitch
+                        // detector a waveform whose period is no longer the one
+                        // that was played. Soft, not hard — a `tanh` ceiling
+                        // degrades into compression instead of into a corner —
+                        // and counted, because a trim that is quietly limiting
+                        // is a trim that is set wrong.
+                        // **The trim belongs to the detector, not to the mix.**
+                        // With `A→M` on, the input is being *listened to*: the
+                        // trim is how loud the tracker hears it, and a guitar
+                        // needs a lot of it. Passing that same gain on to what
+                        // the player hears is why a tab that tracked well
+                        // sounded saturated — so the untouched input is kept
+                        // aside here and it is that one the `MIX` knob brings
+                        // back. The tab's own `VOL` is the level control; this
+                        // never was one.
+                        slot.guard.set_sample_rate(sr as f32);
+                        let listening = slot.pitch.is_some();
+                        let keep_dry = listening && slot.pitch_mix < 0.999;
+                        let mut clipped = false;
                         for f in 0..(n / 2) {
-                            sc[f * 2] = capture[l][f] * g;
-                            sc[f * 2 + 1] = capture[r][f] * g;
+                            // The guard watches the **left** channel's raw
+                            // sample and its answer is applied to both: a howl
+                            // is a property of the room, not of one side of a
+                            // stereo pair, and two independent ducks on one
+                            // signal would move the image while they worked.
+                            let guard = slot.guard.step(capture[l][f]);
+                            for (ch, src) in [l, r].into_iter().enumerate() {
+                                let raw = capture[src][f] * guard;
+                                if keep_dry {
+                                    dry[f * 2 + ch] = raw;
+                                }
+                                let x = raw * g;
+                                sc[f * 2 + ch] = if x.abs() > 1.0 {
+                                    clipped = true;
+                                    x.tanh()
+                                } else {
+                                    x
+                                };
+                            }
                         }
+                        if clipped {
+                            crate::meter::capture_health().clipped_block();
+                        }
+                        // What the guard is holding down, for the panel: a duck
+                        // nobody can see is indistinguishable from the room
+                        // having gone quiet on its own.
+                        crate::meter::capture_health().guard(slot.guard.reduction_db());
                     }
                     // With A→M on, the input is listened to rather than passed
                     // through: what comes out of the slot is its instrument
@@ -1430,16 +1939,90 @@ impl RtState {
                             tracker.cents(),
                             tracker.level(),
                         );
+                        // How much of the input comes back. `dry` already
+                        // holds it, untrimmed, from the loop above.
+                        let wet = slot.pitch_mix;
+                        let keep_dry = wet < 0.999;
+                        // **Clear it before the instrument plays.** The buffer
+                        // still holds the microphone, and `render` is not
+                        // required to overwrite what it was handed — a hosted
+                        // plugin with nothing to play may add to it, or leave
+                        // it alone entirely. Either way the input would leak
+                        // out alongside the synth, and how much of it comes
+                        // back is the player's decision, not the plugin's.
+                        sc.fill(0.0);
                         let written = slot.source.render(sc, sr);
                         for s in sc[written * 2..].iter_mut() {
                             *s = 0.0;
                         }
+                        if keep_dry {
+                            for (out, d) in sc.iter_mut().zip(dry[..n].iter()) {
+                                *out = *out * wet + *d * (1.0 - wet);
+                            }
+                        }
                     }
                 }
                 None => {
-                    let written = slot.source.render(sc, sr);
-                    for s in sc[written * 2..].iter_mut() {
-                        *s = 0.0;
+                    // **Split at the notes.** A slot with scheduled notes is
+                    // rendered in segments: apply what is due at a sample,
+                    // render up to the next one, repeat. That is what makes a
+                    // generator's timing the sample it asked for rather than
+                    // the top of whichever block noticed — the interface's
+                    // wake interval stops being the resolution.
+                    //
+                    // The cost is real and worth naming: a slot with notes in
+                    // the middle of a block calls `render` more than once, in
+                    // pieces. For choz's own sources that is nothing; for a
+                    // hosted plugin it is several small process calls instead
+                    // of one, which is legal, and which every host with
+                    // sample-accurate automation already does.
+                    let frames = n / 2;
+                    // Everything due this block, oldest first. A fixed array,
+                    // because this is the audio thread.
+                    let mut due: [Option<(usize, Scheduled)>; MAX_SCHEDULED] =
+                        [None; MAX_SCHEDULED];
+                    let mut count = 0usize;
+                    while count < MAX_SCHEDULED {
+                        let Some(ev) = slot.due(block_start, block_end) else {
+                            break;
+                        };
+                        // Anything already past lands on the first sample:
+                        // late, not lost.
+                        let offset = (ev.at.saturating_sub(block_start) as usize).min(frames);
+                        due[count] = Some((offset, ev));
+                        count += 1;
+                    }
+                    // Insertion sort over at most eight: the order they come
+                    // off the queue is not the order they are played in.
+                    for i in 1..count {
+                        let mut j = i;
+                        while j > 0 && due[j - 1].unwrap().0 > due[j].unwrap().0 {
+                            due.swap(j - 1, j);
+                            j -= 1;
+                        }
+                    }
+
+                    let mut at = 0usize;
+                    let mut next_event = 0usize;
+                    while at < frames {
+                        // Everything that lands on this sample, before the
+                        // segment that starts here is rendered.
+                        while next_event < count && due[next_event].unwrap().0 <= at {
+                            let ev = due[next_event].unwrap().1;
+                            slot.play(ev.note, ev.vel, ev.on);
+                            next_event += 1;
+                        }
+                        let end = due
+                            .get(next_event)
+                            .and_then(|d| d.map(|(o, _)| o))
+                            .unwrap_or(frames)
+                            .clamp(at + 1, frames);
+                        let seg = &mut sc[at * 2..end * 2];
+                        let written = slot.source.render(seg, sr);
+                        for s in seg[written * 2..].iter_mut() {
+                            *s = 0.0;
+                        }
+                        at = end;
                     }
                 }
             }
@@ -1473,6 +2056,68 @@ impl RtState {
 }
 
 // ─── Stream / config helpers ───────────────────────────────────────────────
+
+/// Open an input stream and return the ring its callback fills.
+///
+/// This is what makes choz a multi-effect on a box without JACK: cpal gives
+/// playback and capture their own devices and their own callbacks, so the only
+/// thing that can pass between them is a lock-free ring.
+///
+/// The rate is **not** negotiated: it is the one the engine already runs at. A
+/// capture stream at another rate would be transposed, and a microphone that
+/// comes out a tone higher is worse than one that says why it will not open.
+fn build_input_stream(
+    host: &cpal::Host,
+    name: Option<&str>,
+    sample_rate: u32,
+    buffer: u32,
+) -> Result<(cpal::Stream, rtrb::Consumer<f32>, usize, String)> {
+    let device = match name {
+        Some(want) => host
+            .input_devices()
+            .context("no audio input devices")?
+            .find(|d| d.name().is_ok_and(|n| n == want))
+            .with_context(|| format!("input device '{want}' is gone"))?,
+        None => host
+            .default_input_device()
+            .context("this host has no default input device")?,
+    };
+    let picked = device.name().unwrap_or_else(|_| "input".to_string());
+    let default = device
+        .default_input_config()
+        .context("the input device reports no usable format")?;
+    let channels = (default.channels() as usize).clamp(1, crate::jack_backend::MAX_PORTS);
+    let config = cpal::StreamConfig {
+        channels: channels as u16,
+        sample_rate: cpal::SampleRate(sample_rate),
+        buffer_size: cpal::BufferSize::Fixed(buffer.max(64)),
+    };
+    // Eight blocks: room for the input to run ahead of the output without the
+    // ring ever being the thing that drops audio. `drain_capture` is what keeps
+    // the backlog from growing into latency.
+    let capacity = (buffer.max(1024) as usize) * channels * 8;
+    let (mut tx, rx) = rtrb::RingBuffer::<f32>::new(capacity);
+    let stream = device
+        .build_input_stream(
+            &config,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                // A full ring means the output side stopped taking; dropping
+                // here is right, and it must never block an audio callback.
+                for s in data {
+                    if tx.push(*s).is_err() {
+                        break;
+                    }
+                }
+            },
+            |err| eprintln!("choz: audio input error: {err}"),
+            None,
+        )
+        .with_context(|| {
+            format!("cannot open '{picked}' at {sample_rate} Hz; try that rate in Settings → AUDIO")
+        })?;
+    stream.play().context("cannot start the input stream")?;
+    Ok((stream, rx, channels, picked))
+}
 
 fn build_stream(
     device: &cpal::Device,
@@ -1768,7 +2413,7 @@ mod tests {
     /// whatever the graph was doing (1024 = 21 ms, unplayable live).
     #[test]
     fn forces_the_quantum_only_when_usb_can_take_it() {
-        request_pipewire_period(256, 48000);
+        request_pipewire_period(256, 48000, 256);
         assert_eq!(
             std::env::var("PIPEWIRE_LATENCY").as_deref(),
             Ok("256/48000")
@@ -1780,11 +2425,27 @@ mod tests {
 
         // Below the floor choz still asks, but never forces — a 64-frame quantum
         // is what took the xHCI controller down.
-        request_pipewire_period(64, 48000);
+        request_pipewire_period(64, 48000, 64);
         assert_eq!(std::env::var("PIPEWIRE_LATENCY").as_deref(), Ok("64/48000"));
         assert!(
             std::env::var("PIPEWIRE_QUANTUM").is_err(),
             "64 frames must not be forced"
+        );
+
+        // And with the setting at its default choz **asks and does not take**:
+        // forcing moves the whole graph, so every other application on the
+        // machine is resampled to whatever choz wanted. That is not choz's to
+        // decide, and doing it anyway was heard as a browser going thin and
+        // distorted while choz was running.
+        request_pipewire_period(256, 48000, 0);
+        assert_eq!(
+            std::env::var("PIPEWIRE_LATENCY").as_deref(),
+            Ok("256/48000"),
+            "it still asks"
+        );
+        assert!(
+            std::env::var("PIPEWIRE_QUANTUM").is_err(),
+            "and leaves the graph alone"
         );
 
         unsafe { std::env::remove_var("PIPEWIRE_LATENCY") };
@@ -1966,11 +2627,607 @@ mod tests {
             retired_tx,
             slots: Vec::with_capacity(MAX_SLOTS),
             scratch: vec![0.0; 64],
+            dry: vec![0.0; 64],
             mix: vec![vec![0.0; 32]; outs],
             capture: vec![vec![0.0; 32]; ins],
+            capture_rx: None,
             sample_rate: 48_000,
         };
         (cmd_tx, retired_rx, state)
+    }
+
+    /// The ring between the input callback and the output callback, both ways
+    /// it can be wrong: not enough (the input has not produced yet) fills with
+    /// silence, and too much (the input is running ahead) is thrown away so the
+    /// backlog cannot turn into latency that grows all night.
+    #[test]
+    fn the_capture_ring_answers_for_both_kinds_of_drift() {
+        let (_tx, _rx, mut state) = mk_state_ch(2, 2);
+        let (mut tx, rx) = rtrb::RingBuffer::<f32>::new(4096);
+        state.capture_rx = Some(rx);
+        let health = crate::meter::capture_health();
+        health.clear();
+
+        // Exactly one block of a two-channel input: L = 1, R = 2.
+        for _ in 0..8 {
+            tx.push(1.0).unwrap();
+            tx.push(2.0).unwrap();
+        }
+        state.drain_capture(8);
+        assert!(state.capture[0][..8].iter().all(|s| *s == 1.0), "left");
+        assert!(state.capture[1][..8].iter().all(|s| *s == 2.0), "right");
+
+        // Nothing left: the next block is silence, not the last one repeated.
+        state.drain_capture(8);
+        assert!(
+            state.capture[0][..8].iter().all(|s| *s == 0.0),
+            "an empty ring is silence, got {:?}",
+            &state.capture[0][..8]
+        );
+
+        // The input runs away: 100 blocks queued, and the drain must not be
+        // reading hundred-block-old audio for the rest of the session.
+        for i in 0..(8 * 2 * 100) {
+            tx.push(i as f32).unwrap();
+        }
+        state.drain_capture(8);
+        let backlog = state.capture_rx.as_ref().unwrap().slots();
+        assert!(
+            backlog <= 8 * 2 * 2,
+            "the backlog should have been cut back, {backlog} samples left"
+        );
+        // And what came out is the *newest* audio, not the oldest.
+        assert!(
+            state.capture[0][0] > 1000.0,
+            "expected recent samples, got {}",
+            state.capture[0][0]
+        );
+
+        // Both kinds of trouble are counted, because "does it drift on my
+        // machine" has to be answerable without playing it for an hour.
+        let (late, dropped) = health.counts();
+        assert_eq!(late, 1, "one block was short and one was counted");
+        assert!(
+            dropped > 1000,
+            "the backlog it threw away is counted: {dropped}"
+        );
+        health.clear();
+        assert_eq!(health.counts(), (0, 0));
+    }
+
+    /// choz as a multi-effect: a tab fed by a capture pair, with an effect on
+    /// it, has to come out **processed**. This is the whole "plug a microphone
+    /// in and put a reverb on it" case, and nothing covered it.
+    #[test]
+    fn an_effect_on_a_capture_fed_tab_processes_the_input() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
+        let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 2);
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(crate::sources::Silence)))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotIn {
+                slot: 0,
+                pair: Some((0, 1)),
+            })
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotFx {
+                slot: 0,
+                fx: vec![Box::new(AddFx(1.0))],
+            })
+            .unwrap();
+        state.apply_commands();
+        // A microphone, arriving.
+        for ch in state.capture.iter_mut() {
+            ch.fill(0.25);
+        }
+        state.render(8);
+
+        let c = std::f32::consts::FRAC_1_SQRT_2;
+        assert!(
+            (state.mix[0][0] - 1.25 * c).abs() < 1e-5,
+            "the effect should have processed the input, got {}",
+            state.mix[0][0]
+        );
+    }
+
+    /// `A→M` plays its instrument and **nothing else**. The buffer handed to
+    /// the instrument still holds the microphone, and `render` is not required
+    /// to overwrite what it was given — a plugin with nothing to play may add
+    /// to it or leave it alone. Either way the input would leak out next to the
+    /// synth, which is the one thing this mode exists to prevent.
+    #[test]
+    fn audio_to_midi_does_not_leak_the_input() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
+        /// A source that adds to the buffer instead of filling it, which is
+        /// what a plugin idling on an empty note list does.
+        struct Adder;
+        impl AudioSource for Adder {
+            fn render(&mut self, out: &mut [f32], _sr: u32) -> usize {
+                for s in out.iter_mut() {
+                    *s += 0.0;
+                }
+                out.len() / 2
+            }
+            fn plays_on_transport_stop(&self) -> bool {
+                true
+            }
+        }
+
+        let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 2);
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(Adder)))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotIn {
+                slot: 0,
+                pair: Some((0, 1)),
+            })
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotPitchToMidi { slot: 0, on: true })
+            .unwrap();
+        state.apply_commands();
+        for ch in state.capture.iter_mut() {
+            ch.fill(0.5);
+        }
+        state.render(8);
+        assert!(
+            state.mix[0][..8].iter().all(|s| s.abs() < 1e-6),
+            "the microphone reached the mix: {:?}",
+            &state.mix[0][..8]
+        );
+    }
+
+    /// The converter's dry/wet: how much of the input comes back with the
+    /// instrument. All wet is the instrument alone; anything less brings the
+    /// guitar back under the synth it is driving, which is the sound most
+    /// people are actually after.
+    #[test]
+    fn the_converter_can_bring_the_input_back_under_the_instrument() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
+        /// Renders a constant, so the two halves of the blend are told apart.
+        struct Dc(f32);
+        impl AudioSource for Dc {
+            fn render(&mut self, out: &mut [f32], _sr: u32) -> usize {
+                out.fill(self.0);
+                out.len() / 2
+            }
+            fn plays_on_transport_stop(&self) -> bool {
+                true
+            }
+        }
+
+        let run = |mix: f32| -> f32 {
+            let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 2);
+            cmd_tx
+                .push(EngineCommand::AddSlot(Box::new(Dc(1.0))))
+                .unwrap();
+            cmd_tx
+                .push(EngineCommand::SetSlotIn {
+                    slot: 0,
+                    pair: Some((0, 1)),
+                })
+                .unwrap();
+            cmd_tx
+                .push(EngineCommand::SetSlotPitchToMidi { slot: 0, on: true })
+                .unwrap();
+            cmd_tx
+                .push(EngineCommand::SetSlotPitchMix { slot: 0, mix })
+                .unwrap();
+            state.apply_commands();
+            for ch in state.capture.iter_mut() {
+                ch.fill(0.5);
+            }
+            state.render(8);
+            // Undo the constant-power pan so the numbers are the blend itself.
+            state.mix[0][0] / std::f32::consts::FRAC_1_SQRT_2
+        };
+        assert!(
+            (run(1.0) - 1.0).abs() < 1e-5,
+            "all wet is the instrument alone"
+        );
+        assert!((run(0.0) - 0.5).abs() < 1e-5, "all dry is the input alone");
+        assert!(
+            (run(0.5) - 0.75).abs() < 1e-5,
+            "and half is half of each: {}",
+            run(0.5)
+        );
+    }
+
+    /// **The whole path a live microphone takes**: capture buffers → the tab's
+    /// FX chain → the mix.
+    ///
+    /// Written because "I plugged a microphone into the Harmonizer and got no
+    /// response" kept being answered by measuring the effect on its own, which
+    /// only ever said the effect was fine. This one asks the question the
+    /// report actually asks: does what comes in a capture jack reach the
+    /// effects on that tab, and does what they produce reach the output?
+    #[test]
+    fn live_input_reaches_the_tabs_fx_chain_and_comes_back_out() {
+        let _clock = crate::test_locks::transport();
+        struct Silent;
+        impl AudioSource for Silent {
+            fn render(&mut self, out: &mut [f32], _sr: u32) -> usize {
+                out.fill(0.0);
+                out.len() / 2
+            }
+            fn plays_on_transport_stop(&self) -> bool {
+                true
+            }
+        }
+
+        let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 2);
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(Silent)))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotIn {
+                slot: 0,
+                pair: Some((0, 1)),
+            })
+            .unwrap();
+        // A harmoniser, exactly as the rack builds one: from a spec.
+        let spec = crate::fx_chain::FxSpec {
+            kind: "harmonizer".into(),
+            enabled: true,
+            wet: 1.0,
+            params: vec![0.334, 0.0, 0.0, 0.20, 0.32, 0.36, 0.50, 1.0, 1.0],
+            plugin: None,
+        };
+        let chain = crate::fx_chain::build_chain_from_specs(&[spec], 48_000, 64);
+        assert_eq!(chain.len(), 1, "the harmoniser built");
+        cmd_tx
+            .push(EngineCommand::SetSlotFx { slot: 0, fx: chain })
+            .unwrap();
+        state.apply_commands();
+
+        // A tone in the capture buffers, block after block, and the tail is
+        // what the tab put out.
+        let mut worst = 0.0f32;
+        for block in 0..40 {
+            for (ch, buf) in state.capture.iter_mut().enumerate() {
+                for (i, s) in buf.iter_mut().enumerate() {
+                    let n = (block * 32 + i) as f32;
+                    *s = 0.3 * (std::f32::consts::TAU * 220.0 * n / 48_000.0).sin();
+                    let _ = ch;
+                }
+            }
+            for m in state.mix.iter_mut() {
+                m.fill(0.0);
+            }
+            state.render(64);
+            if block > 20 {
+                worst = worst.max(
+                    state.mix[0]
+                        .iter()
+                        .chain(state.mix[1].iter())
+                        .fold(0.0f32, |a, s| a.max(s.abs())),
+                );
+            }
+        }
+        assert!(
+            worst > 0.02,
+            "the microphone never reached the FX chain: peak {worst}"
+        );
+    }
+
+    /// **The input trim is the detector's, not the mix's.**
+    ///
+    /// Reported from a real guitar: a tab that tracked well sounded saturated,
+    /// because the only way to make the tracker hear was `IN`, and `IN` was
+    /// also multiplying what came back through `MIX`. Turning one knob had to
+    /// wreck the other. Now the trim reaches the tracker and nothing else — the
+    /// tab's `VOL` is the level control, and it always was.
+    #[test]
+    fn the_input_trim_does_not_reach_what_comes_back_through_the_mix() {
+        let _clock = crate::test_locks::transport();
+        struct Silent;
+        impl AudioSource for Silent {
+            fn render(&mut self, out: &mut [f32], _sr: u32) -> usize {
+                out.fill(0.0);
+                out.len() / 2
+            }
+            fn plays_on_transport_stop(&self) -> bool {
+                true
+            }
+        }
+
+        let heard = |trim: f32| -> f32 {
+            let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 2);
+            cmd_tx
+                .push(EngineCommand::AddSlot(Box::new(Silent)))
+                .unwrap();
+            cmd_tx
+                .push(EngineCommand::SetSlotIn {
+                    slot: 0,
+                    pair: Some((0, 1)),
+                })
+                .unwrap();
+            cmd_tx
+                .push(EngineCommand::SetSlotPitchToMidi { slot: 0, on: true })
+                .unwrap();
+            // All dry: what comes out is the input and nothing else.
+            cmd_tx
+                .push(EngineCommand::SetSlotPitchMix { slot: 0, mix: 0.0 })
+                .unwrap();
+            cmd_tx
+                .push(EngineCommand::SetSlotInTrim {
+                    slot: 0,
+                    gain: trim,
+                    gate: crate::pitch::DEFAULT_GATE,
+                })
+                .unwrap();
+            state.apply_commands();
+            for ch in state.capture.iter_mut() {
+                ch.fill(0.25);
+            }
+            state.render(8);
+            state.mix[0][0] / std::f32::consts::FRAC_1_SQRT_2
+        };
+
+        let unity = heard(1.0);
+        assert!((unity - 0.25).abs() < 1e-5, "unity trim is the input: {unity}");
+        for trim in [2.0f32, 6.0] {
+            let loud = heard(trim);
+            assert!(
+                (loud - unity).abs() < 1e-5,
+                "trim {trim} moved what the player hears: {loud} vs {unity}"
+            );
+        }
+    }
+
+    /// A trim that reaches +24 dB reaches past full scale. Driven past it the
+    /// signal is a square wave: it saturates what comes out, and it hands the
+    /// pitch detector a waveform whose period is not the one that was played.
+    /// The ceiling is soft so it degrades into compression, and it is counted
+    /// so the panel can say which knob to turn down.
+    #[test]
+    fn a_trim_past_full_scale_is_limited_and_counted() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
+        let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 2);
+        let health = crate::meter::capture_health();
+        health.clear();
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(crate::sources::Silence)))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotIn {
+                slot: 0,
+                pair: Some((0, 1)),
+            })
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotInTrim {
+                slot: 0,
+                gain: 8.0,
+                gate: crate::pitch::DEFAULT_GATE,
+            })
+            .unwrap();
+        state.apply_commands();
+        for ch in state.capture.iter_mut() {
+            ch.fill(0.5); // ×8 = 4.0, four times over
+        }
+        state.render(8);
+
+        let peak = state.mix[0][..8].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            peak < 1.05,
+            "the ceiling should hold it near full scale, got {peak}"
+        );
+        assert!(peak > 0.5, "and it should still be loud: {peak}");
+        assert!(health.clipping() > 0, "and it has to say it is limiting");
+
+        // A trim that fits leaves the signal alone and says nothing.
+        health.clear();
+        cmd_tx
+            .push(EngineCommand::SetSlotInTrim {
+                slot: 0,
+                gain: 1.0,
+                gate: crate::pitch::DEFAULT_GATE,
+            })
+            .unwrap();
+        state.apply_commands();
+        state.render(8);
+        assert_eq!(health.clipping(), 0, "a trim that fits is not limiting");
+        health.clear();
+    }
+
+    /// **Sample-accurate notes.** A note with a transport sample on it starts
+    /// on that sample, not at the top of whichever block noticed it — the slot
+    /// is rendered in segments and the note is applied between them. That is
+    /// the whole point: the resolution stops being how often the interface
+    /// wakes up.
+    #[test]
+    fn a_scheduled_note_starts_on_the_sample_it_was_written_for() {
+        /// Silent until told to play, then a constant. Where the constant
+        /// starts *is* the note's timing, visible in the buffer.
+        struct Switch(bool);
+        impl AudioSource for Switch {
+            fn render(&mut self, out: &mut [f32], _sr: u32) -> usize {
+                out.fill(if self.0 { 1.0 } else { 0.0 });
+                out.len() / 2
+            }
+            fn note_on(&mut self, _n: u8, _v: u8) {
+                self.0 = true;
+            }
+            fn note_off(&mut self, _n: u8) {
+                self.0 = false;
+            }
+            fn plays_on_transport_stop(&self) -> bool {
+                true
+            }
+        }
+
+        let _g = crate::test_locks::transport();
+        let _m = crate::test_locks::meter();
+        let t = choz_ports::transport();
+        let was = t.playing();
+        t.set_sample_rate(48_000);
+        t.set_playing(true);
+        t.rewind();
+
+        let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 0);
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(Switch(false))))
+            .unwrap();
+        // Nine samples into a sixteen-sample block.
+        cmd_tx
+            .push(EngineCommand::NoteOn {
+                slot: 0,
+                note: 60,
+                vel: 100,
+                at: 9,
+            })
+            .unwrap();
+        state.apply_commands();
+        state.render(16);
+
+        let c = std::f32::consts::FRAC_1_SQRT_2;
+        for f in 0..9 {
+            assert!(
+                state.mix[0][f].abs() < 1e-6,
+                "silent until sample 9, but frame {f} is {}",
+                state.mix[0][f]
+            );
+        }
+        for f in 9..16 {
+            assert!(
+                (state.mix[0][f] - c).abs() < 1e-5,
+                "sounding from sample 9, but frame {f} is {}",
+                state.mix[0][f]
+            );
+        }
+
+        t.set_playing(was);
+    }
+
+    /// Two notes in one block, and the second one stops what the first
+    /// started. Both land where they were written, which a queue that only
+    /// looked at the first event of a block would get wrong.
+    #[test]
+    fn several_scheduled_notes_in_one_block_all_land() {
+        struct Switch(bool);
+        impl AudioSource for Switch {
+            fn render(&mut self, out: &mut [f32], _sr: u32) -> usize {
+                out.fill(if self.0 { 1.0 } else { 0.0 });
+                out.len() / 2
+            }
+            fn note_on(&mut self, _n: u8, _v: u8) {
+                self.0 = true;
+            }
+            fn note_off(&mut self, _n: u8) {
+                self.0 = false;
+            }
+            fn plays_on_transport_stop(&self) -> bool {
+                true
+            }
+        }
+
+        let _g = crate::test_locks::transport();
+        let _m = crate::test_locks::meter();
+        let t = choz_ports::transport();
+        let was = t.playing();
+        t.set_sample_rate(48_000);
+        t.set_playing(true);
+        t.rewind();
+
+        let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 0);
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(Switch(false))))
+            .unwrap();
+        // Pushed out of order on purpose: the queue is not the running order.
+        cmd_tx
+            .push(EngineCommand::NoteOff {
+                slot: 0,
+                note: 60,
+                at: 12,
+            })
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::NoteOn {
+                slot: 0,
+                note: 60,
+                vel: 100,
+                at: 4,
+            })
+            .unwrap();
+        state.apply_commands();
+        state.render(16);
+
+        let c = std::f32::consts::FRAC_1_SQRT_2;
+        let sounding: Vec<bool> = (0..16).map(|f| state.mix[0][f].abs() > c * 0.5).collect();
+        let expected: Vec<bool> = (0..16).map(|f| (4..12).contains(&f)).collect();
+        assert_eq!(sounding, expected, "the note should run from 4 to 12");
+
+        t.set_playing(was);
+    }
+
+    /// A note with no time on it is still immediate — every input that has no
+    /// schedule of its own sends one, and none of them may be delayed.
+    #[test]
+    fn a_note_without_a_time_plays_at_once() {
+        let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 0);
+        let played = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(RecordingSynth(
+                played.clone(),
+            ))))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::NoteOn {
+                slot: 0,
+                note: 64,
+                vel: 100,
+                at: 0,
+            })
+            .unwrap();
+        state.apply_commands();
+        assert_eq!(
+            *played.lock(),
+            vec![(true, 64)],
+            "an untimed note is played by `apply_commands`, before any render"
+        );
+    }
+
+    /// The same tab with the transport stopped. A multi-effect is not a
+    /// sequencer: a microphone does not wait for the play button.
+    #[test]
+    fn a_capture_fed_tab_works_with_the_transport_stopped() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
+        let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 2);
+        state.playing.store(false, Ordering::Relaxed);
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(crate::sources::Silence)))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotIn {
+                slot: 0,
+                pair: Some((0, 1)),
+            })
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotFx {
+                slot: 0,
+                fx: vec![Box::new(AddFx(1.0))],
+            })
+            .unwrap();
+        state.apply_commands();
+        for ch in state.capture.iter_mut() {
+            ch.fill(0.25);
+        }
+        state.render(8);
+        assert!(
+            state.mix[0][0].abs() > 0.1,
+            "a stopped transport must not mute the input, got {}",
+            state.mix[0][0]
+        );
     }
 
     /// Per-slot output routing: two slots on different pairs of a 6-channel
@@ -1978,6 +3235,8 @@ mod tests {
     /// "MIDI → plugin → out 5/6" rests on.
     #[test]
     fn slots_land_on_the_output_pair_they_are_routed_to() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         let (mut cmd_tx, _retired, mut state) = mk_state_ch(6, 0);
         cmd_tx
             .push(EngineCommand::AddSlot(Box::new(DcSource(0.25))))
@@ -2018,6 +3277,8 @@ mod tests {
     /// instead of panicking or going silent.
     #[test]
     fn an_out_of_range_pair_folds_onto_the_last_channel() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 0);
         cmd_tx
             .push(EngineCommand::AddSlot(Box::new(DcSource(0.5))))
@@ -2042,6 +3303,8 @@ mod tests {
     /// chain over the live audio instead — "AUDIO 1/2 → plugin → out 5/6".
     #[test]
     fn a_slot_routed_to_an_input_pair_processes_live_audio() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         let (mut cmd_tx, _retired, mut state) = mk_state_ch(4, 2);
         cmd_tx
             .push(EngineCommand::AddSlot(Box::new(DcSource(0.9))))
@@ -2082,6 +3345,8 @@ mod tests {
 
     #[test]
     fn mixes_slots_and_applies_per_slot_fx() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         let (mut cmd_tx, _retired, mut state) = mk_state();
 
         cmd_tx
@@ -2111,6 +3376,8 @@ mod tests {
 
     #[test]
     fn mixer_strip_applies_gain_pan_mute() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         let (mut cmd_tx, _retired, mut state) = mk_state();
         cmd_tx
             .push(EngineCommand::AddSlot(Box::new(DcSource(1.0))))
@@ -2153,6 +3420,8 @@ mod tests {
 
     #[test]
     fn notes_reach_only_their_target_slot() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         let (mut cmd_tx, _retired, mut state) = mk_state();
         let a = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
         let b = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -2167,6 +3436,7 @@ mod tests {
                 slot: 1,
                 note: 60,
                 vel: 100,
+                at: 0,
             })
             .unwrap();
 
@@ -2181,6 +3451,7 @@ mod tests {
                 slot: 99,
                 note: 62,
                 vel: 100,
+                at: 0,
             })
             .unwrap();
         cmd_tx
@@ -2201,6 +3472,8 @@ mod tests {
 
     #[test]
     fn pedals_and_wheels_reach_the_targeted_slot_only() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         let (mut cmd_tx, _retired, mut state) = mk_state();
         let quiet = Expressive::default();
         let played = Expressive::default();
@@ -2263,6 +3536,8 @@ mod tests {
 
     #[test]
     fn set_slot_source_swaps_and_retires_the_old_one() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         let (mut cmd_tx, mut retired_rx, mut state) = mk_state();
         cmd_tx
             .push(EngineCommand::AddSlot(Box::new(DcSource(0.5))))
@@ -2289,6 +3564,8 @@ mod tests {
 
     #[test]
     fn remove_slot_returns_it_off_rt() {
+        // Shares the process-wide transport: `render` advances it.
+        let _clock = crate::test_locks::transport();
         let (mut cmd_tx, mut retired_rx, mut state) = mk_state();
         cmd_tx
             .push(EngineCommand::AddSlot(Box::new(DcSource(0.5))))

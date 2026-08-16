@@ -78,6 +78,7 @@ pub enum MenuAction {
     RescanPlugins,
     SaveProject,
     LoadProject,
+    ImportMax,
     About,
 }
 
@@ -87,6 +88,8 @@ static FILE_MENU: &[MenuItem] = &[
     MenuItem::sep(),
     MenuItem::item("Save project\u{2026}", "", MenuAction::SaveProject),
     MenuItem::item("Open project\u{2026}", "", MenuAction::LoadProject),
+    MenuItem::sep(),
+    MenuItem::item("Import Max patch\u{2026}", "", MenuAction::ImportMax),
     MenuItem::sep(),
     MenuItem::item("Quit", "q", MenuAction::Quit),
 ];

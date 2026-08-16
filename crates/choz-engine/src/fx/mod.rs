@@ -22,15 +22,25 @@ pub mod gate;
 pub mod autotune;
 // ── EQ ───────────────────────────────────────────────────────────────────────
 pub mod graphic_eq;
+pub mod harmonizer;
 pub mod parametric_eq;
 // ── Modulation ───────────────────────────────────────────────────────────────
+pub mod auto_filter;
+pub mod beat_repeat;
 pub mod chorus;
 pub mod flanger;
+pub mod freq_shift;
+pub mod lfo;
 pub mod phaser;
+pub mod tremolo;
 // ── Spatial ──────────────────────────────────────────────────────────────────
 pub mod widener;
 // ── Utility ──────────────────────────────────────────────────────────────────
+pub mod oversample;
+pub mod saturator;
+pub mod smooth;
 pub mod utility;
+pub mod vocoder;
 // ── New processors ───────────────────────────────────────────────────────────
 pub mod expander;
 pub mod pan;
@@ -38,6 +48,8 @@ pub mod pan;
 pub mod pedal;
 pub mod protocosmos;
 pub mod reverse;
+pub mod shift;
+pub mod shimmer;
 pub mod space_echo;
 pub mod z5_texture;
 
@@ -56,19 +68,27 @@ pub use vinyl::VinylSim;
 // Dynamics
 pub use compressor::Compressor;
 pub use gate::Gate;
+pub use saturator::{Curve, Saturator};
 // Pitch
 pub use autotune::{AutoTune, AutoTuneMode, AutoTuneParameters, ScaleType};
 // EQ
 pub use graphic_eq::{GraphicEq, EQ_BANDS, EQ_FREQS, PRESETS as EQ_PRESETS};
+pub use harmonizer::Harmonizer;
 pub use parametric_eq::{EqBandKind, ParametricEq};
 // Modulation
+pub use auto_filter::{AutoFilter, FilterMode};
+pub use beat_repeat::BeatRepeat;
 pub use chorus::Chorus;
 pub use flanger::Flanger;
+pub use freq_shift::{Carrier, FreqShift};
+pub use lfo::{Lfo, Wave};
 pub use phaser::Phaser;
+pub use tremolo::{ModTarget, Tremolo};
 // Spatial
 pub use widener::StereoWidener;
 // Utility
 pub use utility::{Gain, MonoMaker, PhaseInvert, SoftClipper, TubeSaturation};
+pub use vocoder::Vocoder;
 // New
 pub use expander::Expander;
 pub use pan::Pan;
@@ -76,6 +96,8 @@ pub use pan::Pan;
 pub use pedal::{AmberFang, VelvetFuzz};
 pub use protocosmos::Protocosmos;
 pub use reverse::ReverseDelay;
+pub use shift::VoiceShifter;
+pub use shimmer::ShimmerReverb;
 pub use space_echo::SpaceEcho;
 pub use z5_texture::{Z5Meter, Z5Texture, Z5_WAVE_BINS};
 
