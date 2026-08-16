@@ -258,6 +258,9 @@ pub struct CaptureHealth {
     dropped: AtomicU32,
     /// Blocks where the input trim pushed the signal past full scale.
     clipped: AtomicU32,
+    /// How much the feedback guard is holding the input down, in dB, as `f32`
+    /// bits. Zero when it is holding nothing.
+    guard_db: AtomicU32,
 }
 
 pub fn capture_health() -> &'static CaptureHealth {
@@ -265,6 +268,7 @@ pub fn capture_health() -> &'static CaptureHealth {
         late: AtomicU32::new(0),
         dropped: AtomicU32::new(0),
         clipped: AtomicU32::new(0),
+        guard_db: AtomicU32::new(0),
     };
     &H
 }
@@ -292,6 +296,20 @@ impl CaptureHealth {
         self.clipped.load(Ordering::Relaxed)
     }
 
+    /// Called once a block while live audio is coming in: how much the
+    /// feedback guard is currently pulling the input down.
+    pub fn guard(&self, db: f32) {
+        let db = if db.is_finite() { db.min(0.0) } else { 0.0 };
+        self.guard_db.store(db.to_bits(), Ordering::Relaxed);
+    }
+
+    /// What the guard is holding down right now, in dB. `0.0` means it is not
+    /// holding anything — see [`crate::feedback`] for what it does and what it
+    /// deliberately does not.
+    pub fn guard_db(&self) -> f32 {
+        f32::from_bits(self.guard_db.load(Ordering::Relaxed))
+    }
+
     /// `(late blocks, dropped samples)` since the last clear.
     pub fn counts(&self) -> (u32, u32) {
         (
@@ -306,6 +324,7 @@ impl CaptureHealth {
         self.late.store(0, Ordering::Relaxed);
         self.dropped.store(0, Ordering::Relaxed);
         self.clipped.store(0, Ordering::Relaxed);
+        self.guard_db.store(0, Ordering::Relaxed);
     }
 }
 

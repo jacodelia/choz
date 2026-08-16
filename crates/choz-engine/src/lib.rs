@@ -2,11 +2,14 @@
 //! plugin registry. Built on the RT-safe traits in `choz-ports`.
 
 pub mod cache;
+pub mod chord;
 pub mod engine;
+pub mod feedback;
 pub mod fx;
 pub mod fx_chain;
 pub mod input;
 mod jack_backend;
+pub mod maxpat;
 pub mod meter;
 pub mod midi;
 pub mod osc;
@@ -23,6 +26,7 @@ pub use engine::{AudioBackend, AudioEngine};
 /// [`AudioEngine::set_fx_param`], rather than one of the processor's params.
 pub const FX_MIX_PARAM: usize = usize::MAX;
 pub use fx_chain::FxSpec;
+
 pub use paths::{FoundPlugin, PluginFormat, PluginPaths, SearchDir};
 
 /// Scan every enabled directory of every format in `paths`.
@@ -366,8 +370,52 @@ pub fn read_plugin_params(
         PluginFormat::Ladspa | PluginFormat::Dssi => choz_plugin_ladspa::read_params(path, id),
         PluginFormat::Vst2 => choz_plugin_vst2::read_params(path, id),
         PluginFormat::Vst3 => choz_plugin_vst3::read_params(path, id),
+        // A Pure Data patch's knobs are its own on-screen controls — the ones
+        // that carry a receive symbol, because the rest cannot be moved from
+        // outside the canvas. Read from the file, so this needs no Pd.
+        PluginFormat::Pd => pd_params(path),
         _ => Vec::new(),
     }
+}
+
+/// The controls of a `.pd` patch, as parameters.
+///
+/// Also the place that says, once and by name, which controls **cannot** be
+/// reached: a patch whose gain slider has no receive symbol sits at whatever
+/// that slider was saved at — zero, for a fresh one — and is silent with no
+/// error anywhere. Giving the slider a receive symbol in Pd is the fix, and
+/// nobody guesses that from silence.
+fn pd_params(path: &std::path::Path) -> Vec<PluginParam> {
+    let Ok(info) = choz_plugin_pd::read_patch(path) else {
+        return Vec::new();
+    };
+    let stuck = choz_plugin_pd::unreachable(&info);
+    if !stuck.is_empty() {
+        eprintln!(
+            "choz: {} has {} control(s) choz cannot move ({}). Give them a receive \
+             symbol in Pd (the slider's properties) and they become knobs here.",
+            path.display(),
+            stuck.len(),
+            stuck.join(", ")
+        );
+    }
+    choz_plugin_pd::addressable(&info)
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut p = PluginParam::plain_range(
+                i as u32,
+                c.name.clone(),
+                c.min as f64,
+                c.max as f64,
+                c.min as f64,
+            );
+            if c.toggle {
+                p.steps = 2;
+            }
+            p
+        })
+        .collect()
 }
 
 /// Locks for the things that are global to the **process**, so tests that move

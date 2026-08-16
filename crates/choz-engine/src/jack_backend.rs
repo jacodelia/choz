@@ -235,15 +235,20 @@ pub fn start(
 /// a broken effect. Returns the sink actually wired to and how many ports were
 /// joined, so the caller can say which one it ended up on.
 fn connect(client: &Client, our_outs: &[String], sink: &str) -> Result<(String, usize)> {
-    let mut name = sink.to_string();
-    let mut targets = sink_ports(client, sink);
+    let name = sink.to_string();
+    let targets = sink_ports(client, sink);
     if targets.is_empty() {
-        let Some(other) = any_sink_with_ports(client) else {
-            anyhow::bail!("output '{sink}' is gone and the graph has no other sink");
-        };
-        eprintln!("choz: output '{sink}' has no playback ports; using '{other}' instead");
-        targets = sink_ports(client, &other);
-        name = other;
+        // **Nothing automatic.** choz used to pick another sink when the chosen
+        // one had no ports, which meant an interface being off moved the whole
+        // rig to the laptop speakers without being asked — mid-set, and audibly.
+        // The device is the user's choice and only the user changes it: this
+        // stays unconnected, the TRANSPORT panel says `NOT CONNECTED`, and the
+        // OUT drawer is where it gets picked again.
+        eprintln!(
+            "choz: output '{sink}' has no playback ports — staying unconnected. \
+             Pick one in the OUT drawer (F3), or 'r' there to rescan."
+        );
+        return Ok((name, 0));
     }
     let mut wired = 0usize;
     for (ours, target) in our_outs.iter().zip(targets.iter()) {
@@ -262,28 +267,3 @@ fn connect(client: &Client, our_outs: &[String], sink: &str) -> Result<(String, 
     Ok((name, wired))
 }
 
-/// Any node in the graph with playback ports, preferring a real card over a
-/// loopback or a monitor.
-fn any_sink_with_ports(client: &Client) -> Option<String> {
-    let mut owners: Vec<String> = Vec::new();
-    for port in client.ports(
-        None,
-        Some(super::engine::JACK_AUDIO),
-        jack::PortFlags::IS_INPUT,
-    ) {
-        let Some((owner, _)) = port.rsplit_once(':') else {
-            continue;
-        };
-        if owner == CLIENT_NAME || owner == super::engine::CPAL_JACK_CLIENT {
-            continue;
-        }
-        if !owners.iter().any(|o| o == owner) {
-            owners.push(owner.to_string());
-        }
-    }
-    owners
-        .iter()
-        .find(|o| o.starts_with("alsa_output"))
-        .or_else(|| owners.first())
-        .cloned()
-}
