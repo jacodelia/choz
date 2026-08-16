@@ -25,6 +25,566 @@ Todo lo de abajo — desde el commit inicial hasta hoy — es lo que lleva:
 - empaquetado `.deb`/`.rpm`/`install.sh` con entrada de escritorio, y una superficie de control de ejemplo para ESP32-S3 táctil.
 
 
+## [1.1.0] — 2026-08-16
+
+Lo que trae, sobre la 1.0.0:
+
+- **Pure Data hosteado**: un `.pd` con `adc~` y `dac~` es un efecto más de la
+  cadena, corriendo en su propio proceso (`choz-pd-host`, el único binario que
+  enlaza libpd), y **sus sliders son knobs en el rack** cuando llevan símbolo de
+  recepción — los que no, se nombran para que se sepa por qué el patch calla.
+- **Los 45 efectos propios, publicados como un `.clap`** para Bitwig, Reaper,
+  Carla o cualquier host CLAP, siguiendo el transporte del anfitrión. El
+  instalador y los paquetes lo ponen donde el host lo busca.
+- **Guardia de acople** en la entrada: baja 18 dB cuando la señal crece y sigue
+  creciendo, y suelta al segundo. Interruptor en Settings → AUDIO.
+- **`A→M` y AutoTune, endurecidos**: anti-alias y paso-alto de sala en el
+  detector, mediana de tres, y el trim de entrada dejó de ser también el nivel
+  de la mezcla — que es lo que sonaba saturado.
+- **Harmonizer**: suena al nivel que debe (era 7 dB más bajo) y puede **seguir
+  el acorde de un teclado MIDI**, con interruptor y canal propios.
+- **Importador de Max/MSP**: lee un `.maxpat`, conserva lo que tiene
+  equivalente y **nombra lo que no**.
+- Los jacks de captura se guardan por nombre, así que un proyecto reabierto sin
+  la tarjeta no escucha el micrófono de otra cosa; los wallpapers viajan con el
+  programa y una instalación nueva abre con el suyo; Pure Data entra en la
+  instalación por defecto y CI construye ese camino.
+- **Quitado**: la sección de algoritmos de entrada, que existió durante una
+  tarde. Queda el arpegiador.
+
+530 tests, `clippy --workspace --all-targets -D warnings` limpio.
+
+### 2026-08-16 (bis) — Enter apaga el arpegiador
+
+#### Corregido
+- **Enter no podía apagarlo.** Su interruptor es el primer knob de la caja, y
+  Enter *empujaba* ese knob hacia arriba — que en algo de dos posiciones
+  significa "encendido", y otra vez "encendido". Un interruptor se pulsa, no se
+  empuja: ahora Enter lo cambia en los dos sentidos.
+- Lo demás que hace Enter en esa caja no se movió: sobre un knob cuyas
+  posiciones tienen nombre (modo, división, octavas) sigue abriendo la lista.
+
+### 2026-08-16 — Fuera la sección de algoritmos: queda el arpegiador
+
+Decisión del usuario, dicha a mitad de construirla: la sección de algoritmos de
+entrada se va entera y la pestaña vuelve a tener **un arpegiador**, con su
+interruptor donde siempre estuvo.
+
+#### Quitado
+- La caja `ALGO` y todo lo que colgaba de ella: la lista por tab, el `+ ADD`,
+  los interruptores por fila, el `DEL`, su modal, sus acciones de ratón, sus
+  teclas y sus destinos de MIDI learn.
+- **`choz-ui/src/algo.rs`** — con el trait `InputAlgorithm`, que se había
+  escrito precisamente cuando apareció un segundo implementador y se queda sin
+  ninguno ahora que el arpegiador es el único.
+- **`choz-engine/src/note_algo.rs`**, el driver que movía un patch de Pd desde
+  el bucle de interfaz.
+- **La vuelta de notas del puente del sandbox** (`out_midi`, `OutMidiLink`,
+  `take_notes`) y el camino MIDI del hijo de Pure Data. Existían para eso y
+  para nada más; código sin quien lo llame es peor que código que no está.
+- `PatchRole::InputAlgorithm`: un `.pd` con `adc~` y `dac~` es un **efecto**, y
+  las notas que tenga son asunto suyo.
+
+#### Sin tocar
+- El arpegiador, entero: modos, divisiones, `SYNC`, `TAP`, latch, acorde y su
+  ruteo.
+- Los patches de Pure Data **como efectos**, con sus sliders convertidos en
+  knobs — que es lo que se arregló ayer y sigue funcionando igual.
+- `A→M`, que nunca estuvo en la lista, y el acorde MIDI del Harmonizer, que usa
+  su propio canal (`chord.rs`) y no tiene que ver con esto.
+
+529 tests, clippy limpio con y sin `--features pd`.
+
+### 2026-08-15 (unvicies) — Por qué un patch de Pd no sonaba: tres causas, las tres reales
+
+Reportado: "añadí `/home/jorge/Pd` al escaneo y no funcionó", con dos patches de
+ejemplo. Ninguna de las tres causas era la que parecía.
+
+#### Corregido
+- **Un formato que el `plugin-paths.json` guardado no conoce se quedaba sin
+  directorios.** Todo fichero de rutas es anterior al último formato añadido, así
+  que `PD` llegó con **ningún sitio donde buscar** — y eso se vive como "choz no
+  encuentra mis patches" y se contesta escribiendo una ruta a mano (la del
+  usuario acabó siendo `/home/jorge/Pd/.pd`, que no existe). Ahora, al cargar, se
+  rellenan con sus valores por defecto **sólo** los formatos que el fichero no
+  menciona: lo que el usuario editó manda siempre.
+- **libpd no es Pure Data**: arranca sin ruta de búsqueda, así que todo objeto
+  que Pd trae como abstracción —`rev1~`, `rev2~`, `hilbert~`, todo `extra`—
+  fallaba al crearse. El patch abría con un agujero y el efecto no hacía nada.
+  `choz-pd-host` añade ahora la carpeta del patch, un `externals/` al lado, los
+  `extra` del sistema y `$PD_PATH`.
+- **Pd hablaba solo**: sus mensajes —incluido "couldn't create"— iban a una
+  consola que nadie lee. Ahora pasan por el log de choz, y el hook se instala
+  **antes** de `libpd_init` porque las primeras quejas salen durante el arranque.
+
+#### Añadido
+- **Los controles de un patch son knobs en choz.** `read_patch` lee ahora los
+  `hsl`, `vsl`, `nbx`, `tgl` y `radio` de la ventana: nombre, rango, y —lo que
+  decide todo— **si tienen símbolo de recepción**. Los que lo tienen se publican
+  como parámetros (`read_plugin_params` contesta para `PD`) y moverlos en el rack
+  mueve el control dentro de Pd, escalado a su propio rango.
+- **Los que no lo tienen se nombran en voz alta.** Es la causa de que los dos
+  patches de ejemplo sonaran a nada: sus sliders son `empty empty`, y un
+  `hsl` recién puesto vale **cero** — el patch entero multiplicado por cero, sin
+  error en ninguna parte. El log dice ahora cuáles son y qué hacer:
+  ponerles un símbolo de recepción en las propiedades del slider.
+- Verificado con los patches reales: con `gain` y `room` nombrados, el reverb
+  pasa de un pico de 0.000 a 1.52 movido desde choz, a través del proceso hijo.
+
+#### Nota
+- **El `hsl` de un patch tiene que estar escrito entero.** Pd no crea uno al que
+  le faltan campos, aunque el lector de choz sea tolerante. Costó un test.
+
+### 2026-08-15 (vicies) — El Harmonizer sigue el teclado, y su `Wet` dejaba de existir al reconstruir
+
+#### Añadido
+- **Entrada MIDI en el Harmonizer, y sólo en él.** Dos parámetros nuevos al
+  final de su lista (el orden de los anteriores está congelado: un CC aprendido
+  en `Wet` sigue en `Wet`): **`MIDI`**, un interruptor, y **`Ch`**, la lista de
+  los dieciséis canales — que por ser una lista se abre como un modal en vez de
+  recorrerse con la flecha.
+  - Con el interruptor puesto, **la armonía es el acorde que se toca**: la nota
+    más grave es la raíz y las de encima son los intervalos, sin escala ni
+    tonalidad de por medio, porque la mano ya eligió las notas. Sin nada
+    pulsado se queda el último acorde: un armonizador que se calla al levantar
+    las manos no se puede tocar.
+  - **La referencia es el tab activo**, y sólo él.
+  - **En MULTI se deshabilita**: allí cada tab responde a su canal, y un acorde
+    global sería el teclado de otro decidiendo esta armonía.
+- El acorde viaja por `choz-engine/src/chord.rs`: un singleton de nueve
+  atómicos, publicado por la interfaz y leído en el callback, igual que el
+  transporte. **`FxProcessor` sigue siendo audio y sólo audio** — esta es la
+  puerta más pequeña que deja entrar lo pedido sin ponerle un puerto de notas a
+  los cuarenta y cinco efectos.
+
+#### Corregido
+- **`Harmonizer::with_params` no leía su propio `Wet`** (índice 8), así que
+  cada reconstrucción de la cadena —añadir otro efecto, reabrir un proyecto—
+  devolvía la mezcla a la mitad por debajo del knob.
+- **`intervals()` mentía**: recalculaba desde la forma y la tonalidad en vez de
+  decir lo que las voces hacen. Con un acorde mandando, eso era una respuesta
+  de otro efecto. Ahora cada voz guarda su transposición y eso es lo que se
+  reporta.
+
+#### Verificado
+- Test nuevo en el motor: **la captura llega a la cadena de FX de su tab y
+  vuelve a la mezcla**. Escrito porque "conecté el micro al Harmonizer y no
+  pasa nada" se estaba contestando midiendo el efecto suelto, que sólo sabía
+  decir que el efecto estaba bien.
+
+### 2026-08-15 (undevicies) — El Harmonizer sonaba 7 dB por debajo de lo que entraba
+
+Reportado: micrófono del headset al Harmonizer, **ninguna respuesta**. Estaba
+funcionando; salía tan por debajo que no se oía.
+
+#### Corregido
+- **Las voces se dividían por su número y no por su raíz.** Cantan notas
+  distintas, así que son incoherentes y lo que se suma es la potencia: `1/√n`,
+  no `1/n`. Eran 3 dB de menos con dos voces y 9 con ocho.
+- **El seguidor de envolvente abría contra un nivel absoluto.** Un micrófono de
+  headset vive sobre -40 dBFS y el umbral estaba puesto en una constante, así
+  que las voces no pasaban de medio abiertas por fuerte que se cantara. Ahora la
+  envolvente rápida se lee **contra el pico reciente de la propia señal**, con
+  lo que abre igual con una línea caliente que con un micro flojo.
+- Medido: a pleno wet la salida pasa de **-7,2 dB bajo la entrada a -4,7 dB**, y
+  —lo que importaba— ese número **ya no depende del nivel de entrada**. Los
+  -4,7 restantes son el panorama: con dos voces cada canal lleva una, y la suma
+  de las dos tiene la potencia de la entrada.
+- Test nuevo `the_harmony_is_as_loud_as_the_input_at_any_level`, con una línea
+  caliente y un micro 30 dB por debajo. Comprobado que **falla con el código
+  anterior**.
+
+#### Notas para el que mida esto otra vez
+- **Un desplazador de línea de retardo hace warble, y el warble reparte la
+  energía en bandas laterales.** Midiendo un solo bin de frecuencia el tercero
+  salía a -9,7 dB y la octava a -39, y por ahí se llega a "el desplazador está
+  roto" — que es donde casi se arregla lo que no estaba mal. Con ruido (que no
+  tiene fase que cancelar) y con RMS total: **la entrada y la salida miden lo
+  mismo a cualquier intervalo**. La medida correcta es la potencia, no el bin.
+- Se probó y se **descartó** cambiar `VoiceShifter` a cabezas alternas: la
+  premisa era esa medición equivocada, y no se pudo demostrar que sonara mejor.
+
+### 2026-08-15 (duodevicies) — `A→M` vuelve a ser independiente
+
+Corrección del usuario: `ftom` no va dentro de la sección de algoritmos.
+
+#### Cambiado
+- **`A→M` sale de la lista `ALGO`** y vuelve a su propio interruptor en la línea
+  de entrada, con sus knobs `IN`/`SENS`/`MIX`. La lista queda en `OFF`, `ARP` y
+  `PD`.
+- **Y deja de ser excluyente**: el arpegiador y un patch siguen turnándose entre
+  ellos —los dos deciden qué notas llegan al instrumento, y dos a la vez
+  tendrían que ponerse de acuerdo en el orden— pero ninguno de los dos apaga ya
+  el conversor, ni él a ellos. Una tab puede convertir su guitarra en notas
+  **y** arpegiar el resultado, que es lo que meterlo en la lista había
+  prohibido sin que nadie lo pidiera.
+- El razonamiento está escrito donde vive: `A→M` lee audio, y el audio sólo
+  existe en el callback; la lista decide qué le pasa a las **notas** camino del
+  instrumento. Son preguntas distintas y ahora se responden por separado.
+
+### 2026-08-15 (septendecies) — El roadmap queda en una sola cosa
+
+Decisión del usuario: cerrar todo lo pendiente salvo el plugin CLAP que genera
+notas, que resuelve él porque la parte difícil es una definición y no código.
+
+#### Cambiado
+- **`docs/roadmap.md` queda en 166 líneas y un único punto abierto.** Se
+  cerraron las tres secciones que quedaban: la voz (ya estaba decidida), **las
+  comprobaciones con hardware delante** y las deudas conocidas.
+- **Lo que se cerró sin hacerse queda dicho donde se va a leer**, no borrado: el
+  primer gotcha del documento dice ahora que **todo el DSP está verificado
+  contra señales sintéticas y no contra una habitación**, y que cuando algo
+  suene raro con el equipo delante ésa es la primera hipótesis — con los
+  nombres de las constantes que hay que mover (`GROWTH_CHECKS`, `DUCK`,
+  `STEADY_ANALYSES`, `MEDIAN_ANALYSES`, `SENS`/`IN`). Las decisiones cerradas
+  (un algoritmo por tab, `A→M` fuera del trait, el `.pd` con `adc~` y `dac~`, el
+  dispositivo que no cambia solo, JSFX inexistente) pasan a la misma sección
+  como "no se vuelven a discutir sin una razón nueva".
+- **README**: libpd entra en la tabla de dependencias de ejecución (opcional, y
+  decide qué se construye), y una tabla nueva dice qué pone un install además
+  del binario — el `.clap` de los efectos, los wallpapers y `choz-pd-host` —
+  con `--no-clap` documentado.
+
+#### Pendiente, y sólo esto
+- **Un plugin CLAP que genere notas** en la sección de algoritmos de entrada.
+  Lo que falta antes del código es la definición que el usuario se reservó: si
+  la lista se limita a plugins "de algoritmos compositivos" o se ofrece
+  cualquier CLAP con salida de notas. **Un CLAP no declara ser compositivo**; lo
+  más cercano que da el formato es "puerto de notas de salida y ninguno de
+  audio", que es una heurística y deja fuera a los que también suenan.
+
+### 2026-08-15 (sedecies) — Ocho decisiones del usuario, aplicadas
+
+El usuario contestó las ocho preguntas que bloqueaban el roadmap. Lo que
+cambió en el código:
+
+#### Cambiado
+- **Nada de cambiar de dispositivo solo.** Cuando el sink elegido no tenía
+  puertos, choz se pasaba a otro y lo decía en el log: una interfaz apagada
+  movía el equipo entero a los altavoces del portátil, en mitad de lo que
+  fuera. Ahora se queda **desconectado**, TRANSPORT escribe `NOT CONNECTED` y
+  el mensaje dice dónde elegir otro. El dispositivo lo cambia el usuario, con
+  `r` en el cajón OUT, y nadie más. (`any_sink_with_ports`, borrada.)
+- **Un `.pd` necesita `adc~` **y** `dac~`** para que choz lo hostee. Los
+  sliders y el MIDI son opcionales; `noteout` es lo que además lo convierte en
+  algoritmo de entrada. Un patch que sólo tiene notas ya no se ofrece: no hay
+  forma de la ranura para algo que ni toma ni devuelve audio.
+- **El `.clap` de los 45 efectos se instala con choz**, no bajo bandera:
+  `~/.clap/choz.clap` desde el instalador, `/usr/lib/clap/choz.clap` desde el
+  `.deb`, el `.rpm` y el PKGBUILD de Arch. `--no-clap` para quien no lo quiera.
+- **Los wallpapers viajan con el programa** (`share/choz/wallpapers`) y una
+  instalación nueva **abre con el que trae** — `settings::shipped_wallpaper`,
+  que sólo se consulta cuando no hay `ui.json` todavía. El selector de imagen
+  arranca ahí, y en `assets/` cuando se corre desde el repositorio.
+- **Pure Data entra en la instalación por defecto**: `install.sh` pide libpd por
+  nombre (con el paquete de cada distro), construye `choz-pd-host` con
+  `--features pd` y lo instala junto a choz. Sin libpd **no falla**: instala sin
+  esa mitad y lo dice. El `.deb` lo recomienda, Arch lo lleva en `optdepends`, y
+  **CI instala `puredata-dev`** y construye y prueba ese camino, tests de punta
+  a punta incluidos.
+
+#### Cerrado sin código
+- **Sinte de 8 voces controlado por voz**: no. La tab con `A→M` + un plugin ya
+  lo hace.
+- **Pitch shifting polifónico**: no; lo cubre el `Harmonizer`.
+- **JSFX**: confirmado que se borró en 2026-08-06 y no queda nada en el código.
+  La línea del roadmap que lo llamaba deuda estaba mal.
+- **Encadenar algoritmos por tab**: no. Lo que se quiere en su lugar es poder
+  **insertar un plugin CLAP que genere notas** en esa sección, y eso es lo único
+  que queda como código pendiente en el roadmap.
+
+#### Corregido
+- Una línea del roadmap decía que los LV2 con `worker#schedule` se rechazaban.
+  **Está soportado** desde que se portó el host; lo que se rechaza se dice
+  plugin a plugin, con el nombre de la feature que falta.
+
+### 2026-08-15 (quindecies) — Los jacks por nombre, y el flake que llevaba cuatro sesiones
+
+#### Corregido
+- **Un proyecto guarda ahora el nombre de sus jacks de captura**
+  (`Mixer.in_ports`), no sólo el índice. La lista de puertos de captura es
+  plana y global: desenchufa una interfaz y todos los índices posteriores se
+  corren, así que un proyecto reabierto sin la tarjeta estaba escuchando el
+  micrófono de otra cosa y no lo decía. Ahora manda el nombre; y si el jack ya
+  no está, la tab se abre **sin entrada de audio** —que se ve— en vez de con la
+  equivocada, que no. Un proyecto viejo, que sólo tiene el índice, sigue
+  cargando como cargaba.
+- **`arp::tests::a_synced_step_is_scheduled_ahead_of_the_sample_it_is_for`
+  fallaba una de cada cuatro corridas** desde que existe, y no era un bug de
+  timing: el transporte es uno por proceso y ese test medía un paso contra un
+  playhead que otro acababa de rebobinar. Ahora los tests que tocan el
+  transporte toman el mismo cerrojo que los que tocan idioma y color —una sola
+  cola para todo lo global es más simple que dos que no se ordenan entre sí.
+
+#### Cambiado
+- **`docs/roadmap.md` podado**: 660 líneas a 216. Los puntos cerrados
+  (arpegiador, algoritmos de entrada, Pure Data / Max, export CLAP) y los
+  bloques "Hecho" salen del documento — están en este CHANGELOG, día por día y
+  con los porqués. Lo que queda es lo que queda: la voz (aplazada a propósito),
+  lo que sólo se comprueba con hardware delante, y una sección nueva de **deudas
+  conocidas decididas a propósito**, para que ninguna decisión que estaba
+  enterrada en un punto cerrado se pierda al borrarlo.
+
+### 2026-08-15 (quaterdecies) — Max/MSP: importar lo que se pueda, y decir el resto
+
+Punto 3.4 del roadmap, el último sin empezar. **No hay runtime de Max
+empotrable** —no existe un libpd para Max y no va a existir—, así que prometer
+compatibilidad sería mentir. Lo que sí se puede es leer el patch y ser claro.
+
+#### Añadido
+- **`choz-engine/src/maxpat.rs`**: un `.maxpat` es JSON, así que se lee sin Max
+  instalado. Sigue los cables desde `adc~`/`plugin~`, convierte los objetos que
+  tienen equivalente real entre los efectos propios de choz, y **nombra uno por
+  uno los que no**. Sin `adc~` del que tirar, lee en orden de fichero y lo dice.
+  - La tabla de equivalencias es corta a propósito: sólo donde la equivalencia
+    es de verdad (`overdrive~`→saturador, `freeverb~`→reverb, `lores~`→filtro,
+    `comb~`/`tapout~`→delay, `limi~`→limitador…). Adivinar produciría un patch
+    que suena parecido y no es el que se escribió, y nadie sabría en qué parte.
+  - Los argumentos de un objeto de Max están en sus unidades y **no se
+    convierten**: cada efecto entra con sus knobs al medio.
+  - Un bucle de realimentación en el patch no cuelga el recorrido; el comentario
+    y los botones no salen en la lista de descartados (enterrarían lo que
+    importa).
+- **FILE → Import Max patch…**: elige el `.maxpat`, mete en la cadena de la
+  pestaña activa lo que quepa (`MAX_FX`) y **abre un informe** con lo que entró
+  y lo que no. El informe no es un `eprintln` en un log: lo que un import *no*
+  pudo hacer es la mitad que hay que leer.
+
+#### Notas
+- Sólo se sigue el **primer** camino de audio. Un patch que se abre en tres
+  ramas paralelas y las suma es un mezclador, y un mezclador no es una cadena de
+  inserto; coger la primera y nombrar el resto es la respuesta que se puede
+  comprobar de oído.
+
+### 2026-08-15 (terdecies) — El trim era del detector, y un guardia contra el acople
+
+Dos cosas que reportó el usuario tocando: seguía sonando saturado con `A→M` o
+AutoTune activos, y el acople de la entrada molesta en cuanto entra una
+distorsión o una reverb sumada a un delay.
+
+#### Corregido
+- **El trim de entrada era también el nivel de la mezcla.** Con `A→M`, `IN` es
+  lo que oye el detector —una guitarra necesita mucho— y esa misma ganancia se
+  colaba en lo que el jugador escucha por `MIX`. Subir uno estropeaba el otro
+  por construcción. Ahora la señal que vuelve por `MIX` es la del jack, sin
+  tocar; el nivel de la pestaña es su `VOL`, que siempre lo fue.
+- **Lo mismo dentro de AutoTune**: su `InGain` multiplicaba el audio *y* el
+  análisis. Ahora sólo levanta el análisis y el knob se llama **`Sens`**, como
+  el de `A→M`; `OutGain` es el único control de nivel. Test: 18 dB de `Sens` no
+  mueven el pico de salida, y 24 dB sí meten una voz por debajo de la puerta
+  dentro del detector.
+
+#### Añadido
+- **Guardia de acople** (`choz-engine/src/feedback.rs`): mira la entrada y busca
+  lo único que un acople siempre hace —**crecer, y seguir creciendo**— y baja la
+  entrada 18 dB cuando lo ve, en 20 ms, soltándola en algo más de un segundo
+  cuando la sala se calla. Va **antes del trim**, porque ahí es donde se cierra
+  el lazo; bajar la salida dejaría la reverb de la pestaña alimentando el micro.
+  - **No es un supresor de realimentación**: uno de verdad busca la frecuencia
+    y la nota; eso es un banco de filtros y otro proyecto. Éste compra los
+    segundos que se tarda en llegar a un fader.
+  - Lo que **no** hace, y hay test de cada uno: una nota tenida fuerte no se
+    toca, una que decae tampoco, y algo bajo que sube (un arco, un fundido) está
+    por debajo del suelo (-26 dBFS) y ni se mira.
+  - Interruptor en EDIT → Settings → AUDIO → Engine (`Feedback guard`,
+    encendido por defecto y guardado en `ui.json`), y **se ve mientras actúa**:
+    la fila dice `ON (holding -18 dB)` y el cajón IN escribe `GUARD -18 dB`.
+- **`packaging/install.sh --with-clap`**: instala los 45 efectos de choz como
+  `~/.clap/choz.clap` para usarlos en otro host, y `--uninstall` se lo lleva.
+  Opcional a propósito: escribe fuera de `--prefix`, en un directorio que es del
+  usuario.
+
+### 2026-08-15 (duodecies) — AutoTune tenía los mismos agujeros que `A→M`
+
+Reportado por el usuario: "el efecto autotune tiene el mismo problema de ruidos
+que tenía ftom". Lo tenía, literalmente: su detector es el gemelo del de `A→M` y
+se quedó sin las tres cosas que aquél aprendió con una guitarra y un micro
+delante.
+
+#### Corregido
+- **La diezmación era un promedio**, es decir su propio filtro anti-alias, y un
+  promedio es un filtro que fuga. Un siseo de 9,5 kHz —sibilancia, aire, la sala—
+  se doblaba encima de la nota: medido, el detector reportaba **+91 cents** sobre
+  un tono de 220 Hz. Ahora se pasa-baja a 3,5 kHz **antes** de promediar.
+- **Nada quitaba la sala por debajo.** Con un retumbe de 41 Hz más fuerte que la
+  voz, el detector **no encontraba nota ninguna**. Ahora hay un paso-alto a 55 Hz
+  de dos secciones (24 dB/oct) sobre la señal diezmada.
+- **Cada ventana salía tal cual**: una sola mala —una consonante, una puerta—
+  movía el ratio de corrección de ese bloque, y eso se oye como warble. Ahora la
+  frecuencia que sale es la **mediana de las tres últimas**, y una ventana que
+  pierde confianza **sostiene** la nota dos análisis en vez de soltar la
+  corrección de golpe (soltarla es un clic).
+- **El ratio escalonaba por bloque.** El suavizador da un paso por bloque y ese
+  valor se usaba para las 512 muestras enteras: plano, salto, plano. Ahora el
+  shifter recibe el ratio **en los dos extremos del bloque** y lo camina muestra
+  a muestra (un `add` por muestra).
+- **La puerta baja a -56 dBFS** (era -50): el nivel se mide *después* de los
+  filtros nuevos, que quitan energía real de una voz. La misma lección que `A→M`
+  aprendió a -61.
+- **El análisis va por el camino rápido de YIN**: la ventana se endereza antes de
+  llamar, que es lo que evita dos `%` por muestra en el bucle interno.
+
+#### Añadido
+- **La nota de AutoTune se ve en `MIDI IN`**: el panel del monitor enciende la
+  nota a la que está corrigiendo, junto a la de `A→M`. `KeyboardState` lleva
+  ahora una nota por fuente (`Converted::{PitchToMidi, AutoTune}`) y cada una
+  apaga sólo la suya. Esas notas se deciden en el callback y no viajan como
+  MIDI: este panel es el único sitio donde se pueden mirar.
+- Cuatro tests que **fallan sin los arreglos** (comprobado quitándolos): retumbe
+  bajo la voz, siseo encima, una ventana mala aislada, y el efecto entero con
+  voz + retumbe + siseo a la vez (sin filtros oía 433,8 Hz donde se cantaba 445).
+  Más uno de que el ratio se camina y no salta, y otro del monitor.
+
+#### Notas
+- **AutoTune no manda MIDI a ningún puerto**, y esto no lo cambia: lo que se ve
+  es la nota a la que apunta. Sacarla por un puerto MIDI es otra cosa — lo que
+  hace `A→M` — y sigue sin pedirse.
+- El medidor de AutoTune es uno por proceso: con dos en el rack, el último en
+  correr es el que se ve, igual que en su propia lectura del RACK.
+
+### 2026-08-15 (undecies) — El tercer algoritmo, y el trait que se lo ganó
+
+Punto 3.3 del roadmap, y con él la mitad de dentro del punto 2: un patch de
+Pure Data que saca notas es ahora una entrada más de la caja `ALGO`, al lado
+del arpegiador.
+
+#### Añadido
+- **Notas de vuelta por el puente**: `out_midi` en la cabecera de
+  `choz-plugin-sandbox`, con `Sandbox::out_midi_link()` (el hijo, desde dentro
+  de su closure de proceso) y `Host::take_out_midi()` (el anfitrión, después de
+  cada bloque). Mismo tamaño fijo y misma regla que el camino de ida: lleno =
+  se tira lo nuevo, porque ninguno de los dos lados reserva memoria.
+- **`choz-pd-host` habla notas en los dos sentidos**: `libpd_noteon` para lo
+  que entra, `libpd_set_noteonhook` para lo que sale.
+- **`choz_engine::note_algo::PatchAlgorithm`**: el patch corriendo en su
+  proceso, movido por `tick(now)`. El reloj de Pd avanza con los bloques que se
+  le dan, así que un tick pide **tantos bloques como tiempo real ha pasado** —
+  y si la interfaz se quedó parada, se recorta en vez de disparar una ráfaga de
+  notas atrasadas.
+- **`InputAlgorithm`** (`choz-ui/src/algo.rs`): notas entran, notas salen, más
+  un tick. Lo implementan el arpegiador y el patch. **`A→M` no**, y está
+  escrito por qué: lee audio, y el audio sólo existe en el callback — el
+  argumento `audio: &[f32]` que el roadmap dibujaba no lo podría rellenar nadie
+  desde este lado. Sigue en la misma lista y sigue siendo excluyente.
+- **La caja `ALGO` ofrece `PD`** cuando hay patches con `noteout` en las rutas
+  de búsqueda, con su modal para elegir cuál. El patch se guarda en el proyecto
+  (`algo_patch`), y uno que ya no está en la máquina se avisa y se salta, como
+  un plugin que falta.
+
+#### Notas
+- **El proceso se sincroniza solo**: cada tick compara el patch de la pestaña
+  con el que su proceso arrancó. Así no hay una segunda lista que acordarse de
+  tocar cada vez que una pestaña se añade, se borra o se mueve.
+- **Un patch que no arranca se dice una vez** y la pestaña se queda sin
+  algoritmo — si no, se intentaría arrancar en cada tick.
+- **PANIC se lleva el proceso**, porque un patch sigue a su propio reloj y
+  pedirle que pare no es lo mismo que quitarlo.
+- El timing de las notas de un patch es el del bucle de interfaz (unos
+  milisegundos), no el de muestra exacta que el arpegiador ganó en el engine.
+  La misma discusión aplazada, con la misma respuesta cuando toque: programar
+  por adelantado con una muestra de transporte.
+
+### 2026-08-15 (decies) — Los 45 efectos de choz, fuera de choz
+
+Punto 5 del roadmap. Un `.clap` que publica **los 45 efectos**, cargable en
+Bitwig, Reaper, Carla o cualquier host CLAP — verificado cargándolo con el host
+CLAP de choz, por dlopen, como haría un DAW.
+
+#### Añadido
+- **`choz-plugin-clap-export`** (`cdylib` + `rlib`): entry point, una factory y
+  dos extensiones (`audio-ports`, `params`) contra **`clap-sys`** en crudo, que
+  es sobre lo que ya se apoya el `clack-host` que choz usa para hostear. No hay
+  framework de plugin de por medio, igual que en el lado LV2.
+  - Instalar: `cargo build --release -p choz-plugin-clap-export` y copiar
+    `libchoz_plugin_clap_export.so` a `~/.clap/choz.clap`.
+- **`fx_chain::BUILT_IN_KINDS`**: la lista de efectos propios (id + nombre), al
+  lado del `match` que los construye. La copia que vivía en los tests se ha
+  borrado — era exactamente la deriva que debía cazar — y hay un test en la
+  interfaz que compara su lista con ésta en los dos sentidos.
+- **El dry/wet viaja como último parámetro**: dentro de choz lo aplica la
+  cadena, y fuera no hay cadena que lo aplique.
+- Los valores se publican como posiciones 0..1 y `value_to_text` los escribe en
+  las unidades del efecto (`480.00 ms`, no `0.24`).
+
+#### Notas
+- **El transporte del host manda**: `follow_host_transport` lleva tempo, compás,
+  posición en negras y play/stop del DAW al reloj global de choz en cada bloque,
+  así que `BeatRepeat` exportado sigue al proyecto en el que está. Sin
+  transporte, el reloj avanza con el bloque. (`Transport::set_position_beats`
+  es la única puerta para una línea de tiempo ajena.)
+- **Verificación sin DAW**: cuatro tests llaman al ABI en el propio proceso
+  (factory, descriptores, extensiones, un bloque de audio) y uno más
+  (`tests/real_host.rs`) copia el `.so` a un `.clap`, lo escanea con
+  `choz_plugin_clap::scan_directory`, lo instancia con `ClapEffect::build` y le
+  mete un bloque. Los 45 aparecen desde un solo fichero.
+- **Un efecto exportado es el DSP, no el panel**: el medidor, los presets, la
+  curva del EQ y el banco de puntos del waveshaper se quedan en la interfaz de
+  choz. Darles ventana propia es otro proyecto.
+- **La automatización de muestra exacta se aplana** a propósito: los efectos de
+  choz toman un parámetro como "a partir de ahora", así que respetar el sello
+  de tiempo obligaría a partir cada bloque para una diferencia inaudible.
+
+### 2026-08-15 (nonies) — Pure Data suena: un patch es un efecto más
+
+Puntos 3.1 y 3.2 del roadmap. Un `.pd` se escanea, se elige en ADD FX y procesa
+audio **en su propio proceso**, medido de punta a punta contra la libpd 0.56.2
+de Debian.
+
+#### Añadido
+- **`choz-pd-host`** (`crates/choz-plugin-pd/src/bin/`, sólo con
+  `--features pd`): el único binario que enlaza libpd. Se engancha a la misma
+  región compartida que el sandbox de plugins y sirve bloques. Así la LGPL de
+  libpd se queda de este lado de la frontera de procesos, y la regla de "una Pd
+  por proceso" —que no es un detalle, es la arquitectura— se cumple sola.
+- **`PluginFormat::Pd`**: extensión `.pd`, `$PD_PATH`, y los sitios donde la
+  gente guarda patches (`~/pd`, `~/.local/share/pd`, `~/Documents/Pd`,
+  `/usr/share/pd/patches`). Con eso el escaneo, el cache, la lista de rutas de
+  Settings y el chip `PD` de ADD FX salen del código que ya existía.
+- **El escaneo lee el patch**: un `.pd` es un documento, no un plugin, así que
+  sólo se ofrecen como efecto los que conectan audio. Los que sacan notas son
+  algoritmos de entrada y esperan a su sección; los que no conectan nada no se
+  listan. Todo eso sin Pure Data instalado — el fichero es texto.
+- **Test de punta a punta** (`crates/choz-engine/tests/pd_patch.rs`): un patch
+  de ganancia cargado como efecto de la cadena, 51 bloques, y el 0.4 vuelve
+  como 0.2. Se salta **diciéndolo** cuando `choz-pd-host` no está construido.
+
+#### Notas
+- **Sin `choz-pd-host` no hay silencio raro**: el efecto no se crea y el log
+  dice cómo construirlo. `CHOZ_PD_HOST` apunta a otro sitio si hace falta.
+- Un patch no tiene ventana que choz pueda empotrar (el canvas de Pd es otro
+  programa), así que el hijo declara `editor_present = false` y no aparece
+  botón `GUI`.
+
+### 2026-08-15 (octies) — El algoritmo de entrada es una elección, no dos interruptores
+
+El punto 2 del roadmap, en su primera mitad: el arpegiador y `A→M` dejan de ser
+dos excepciones cableadas y pasan a ser **dos entradas de la misma lista**.
+
+#### Añadido
+- **`crates/choz-ui/src/algo.rs`**: `InputAlgo::{Off, Arp, PitchToMidi}`, qué
+  algoritmo son las dos banderas de una tab (`of`), cuáles puede elegir
+  (`options` — `A→M` sólo con audio entrando) y los knobs de la caja
+  (`knobs`, que construyen la lista una sola vez para el panel y para la
+  interfaz: una caja cuyos knobs no son los que se editan mueve otro mando).
+- **La caja ARP del RACK es ahora la caja `ALGO`**, siempre presente: su primer
+  knob es el algoritmo, y debajo van los mandos del que esté corriendo. El
+  botón de la fila corta —el que había para encender el arpegiador— nombra el
+  algoritmo y camina al siguiente.
+
+#### Cambiado
+- **Uno por tab, y exclusivo.** Elegir uno retira el otro, por la puerta que
+  sea: el knob `ALGO`, el botón de la fila, el botón `A→M` de la línea de
+  entrada o un CC aprendido. La exclusión vive en los dos interruptores que ya
+  existían (`edit_arp` y `toggle_pitch_to_midi`, que se llaman entre sí y
+  terminan porque el segundo siempre está *apagando*), así que todo lo que un
+  cambio arrastra —parar las notas que el arpegiador tenía cogidas, avisar al
+  motor de la conversión— sigue pasando donde pasaba.
+- **Las implementaciones no se movieron**: el arpegiador sigue en el bucle de
+  interfaz y `A→M` en el callback de audio. Lo que cambia es que elegir uno es
+  una elección y no dos interruptores que podían contradecirse. El trait común
+  (`process(notas, audio, ahora) -> notas`) espera al tercer algoritmo, que es
+  quien tiene que decidir su forma.
+
 ### 2026-08-15 (septies) — El arpegiador en muestras, y el punto 1 cerrado
 
 El ítem que llevaba aplazado desde el principio, hecho como pidió el usuario:

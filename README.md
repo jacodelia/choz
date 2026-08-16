@@ -18,9 +18,10 @@ Built with Rust, ratatui and cpal. Provides a TUI for managing note inputs, inst
 
 ## Status
 
-**1.0.0.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
-LADSPA, DSSI, VST2 and VST3 plugins are really hosted** — instruments and audio
-effects, with their own parameters and their own windows — and choz installs as a
+**1.1.0.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
+LADSPA, DSSI, VST2, VST3 and Pure Data patches are really hosted** — instruments
+and audio effects, with their own parameters and their own windows — choz's own
+45 effects are published as a CLAP plugin for other hosts, and choz installs as a
 `.deb`, an `.rpm` or a script, with an entry in the desktop menu.
 
 ### Plugin formats
@@ -354,6 +355,7 @@ third by hand:
 | `libc` | yes | nothing runs |
 | `libasound.so.2` (ALSA) | yes | choz starts but opens no audio device |
 | `libjack.so.0` | **optional** — `dlopen`ed at runtime | choz uses ALSA; no JACK/PipeWire routing, no per-channel outputs |
+| `libpd` (Pure Data) | **optional** — linked only by `choz-pd-host` | choz installs and runs; Pure Data patches cannot be hosted |
 | X11 | not linked | plugin windows go through `x11rb`, which speaks the protocol itself |
 
 That is why the `.deb` declares only `libasound2t64` and `libc6`: JACK is a
@@ -363,11 +365,13 @@ without ALSA**, and that is read off the built packages rather than intended:
 the `.rpm` requires `libasound.so.2()(64bit)` down to its `ALSA_0.9` symbol
 versions, so `apt` and `rpm -i` both stop. JACK is a `Recommends` in both.
 
-`install.sh` checks both before it copies anything. **A missing ALSA stops the
-install** — a choz that starts and then opens no device looks like a bug in choz,
-not a missing package — and it prints the command for your distribution. A
-missing JACK is only a note. `--skip-deps-check` installs anyway, which is right
-when you are staging an install for a machine that is not this one.
+`install.sh` checks all three before it copies anything. **A missing ALSA stops
+the install** — a choz that starts and then opens no device looks like a bug in
+choz, not a missing package — and it prints the command for your distribution. A
+missing JACK is only a note; a missing libpd is a note **and** it decides what
+gets built: without it choz installs without the Pure Data half rather than
+failing over it. `--skip-deps-check` installs anyway, which is right when you are
+staging an install for a machine that is not this one.
 
 ### Install
 
@@ -376,15 +380,23 @@ architecture (x86-64, aarch64, armv7), a `.deb`, an `.rpm` and a `PKGBUILD` for
 Arch, plus `SHA256SUMS.txt`:
 
 ```bash
-tar xzf choz-1.0.0-x86_64-unknown-linux-gnu.tar.gz
-cd choz-1.0.0-x86_64-unknown-linux-gnu
+tar xzf choz-1.1.0-x86_64-unknown-linux-gnu.tar.gz
+cd choz-1.1.0-x86_64-unknown-linux-gnu
 ./install.sh            # uses the binary shipped beside it — no cargo involved
 ```
 
-The tarball carries the binary, the launcher, the desktop entry, every icon size
-and the MIME type, so the script installs the same set the `.deb` does. On ARM,
-remember that **plugins are native binaries**: a Raspberry Pi loads plugins built
-for ARM, not the x86 ones.
+The tarball carries the binary, the launcher, the desktop entry, every icon size,
+the MIME type, the wallpapers, choz's own effects as a CLAP plugin and the Pure
+Data host — the same set the `.deb` installs. On ARM, remember that **plugins are
+native binaries**: a Raspberry Pi loads plugins built for ARM, not the x86 ones.
+
+**What an install puts down besides choz itself:**
+
+| What | Where | Why |
+|---|---|---|
+| `choz.clap` | `~/.clap` (script) or `/usr/lib/clap` (packages) | choz's own 45 effects, usable from Bitwig, Reaper, Carla or any CLAP host. `--no-clap` skips it. |
+| Wallpapers | `<prefix>/share/choz/wallpapers` | A fresh install opens on the image choz ships with, and the picker starts there. |
+| `choz-pd-host` | next to `choz` | The only binary that links libpd — installed when libpd is present. |
 
 **From a checkout** — the same script builds first:
 
@@ -393,6 +405,7 @@ for ARM, not the x86 ones.
 ./packaging/install.sh --prefix /usr/local
 ./packaging/install.sh --binary target/release/choz   # skip the build
 ./packaging/install.sh --skip-deps-check   # install without checking ALSA
+./packaging/install.sh --no-clap          # skip choz's effects as a CLAP plugin
 ./packaging/install.sh --uninstall
 ```
 
@@ -471,7 +484,7 @@ paints over the TUI.
 ## Architecture
 
 ```
-choz/                       9 crates, version 1.0.0
+choz/                      11 crates, version 1.1.0
 ├── crates/
 │   ├── choz-ports/         RT-safe traits every host implements: AudioSource,
 │   │                       FxProcessor, PluginEditor, PluginParam, SandboxStatus
@@ -479,7 +492,10 @@ choz/                       9 crates, version 1.0.0
 │   │                       plugin scan cache, quarantine, sandbox policy
 │   │   ├── engine.rs       RT callback, slots, EngineCommand ring
 │   │   ├── jack_backend.rs Native JACK client — one port per device channel
-│   │   ├── fx/             34 built-in DSP effects
+│   │   ├── fx/             45 built-in DSP effects
+│   │   ├── chord.rs        The chord being held, for the harmoniser's MIDI in
+│   │   ├── feedback.rs     Catches a microphone that starts to howl
+│   │   ├── maxpat.rs       Reads a Max/MSP patch and says what can be kept
 │   │   ├── sources.rs      WAV, SF2 (oxisynth)
 │   │   ├── sfz.rs          SFZ parser + 32-voice sampler
 │   │   ├── paths.rs        Per-format search paths, Carla-style
@@ -490,6 +506,9 @@ choz/                       9 crates, version 1.0.0
 │   ├── choz-plugin-ladspa/ LADSPA + DSSI (they share a descriptor)
 │   ├── choz-plugin-vst2/   VST2 host — the published binary interface, no SDK
 │   ├── choz-plugin-vst3/   VST3 host — pure-Rust COM bindings, no Steinberg SDK
+│   ├── choz-plugin-pd/     Pure Data patches as effects; `choz-pd-host` is the
+│   │                       only binary that links libpd (feature `pd`)
+│   ├── choz-plugin-clap-export/ choz's own 45 effects, published as one `.clap`
 │   ├── choz-plugin-sandbox/ Shared-memory transport for out-of-process hosting
 │   │                       (audio blocks and the plugin's window)
 │   └── choz-ui/            The `choz` binary: TUI, rack, modals, drawers,
@@ -516,7 +535,7 @@ ring so they are freed off the RT thread.
 
 | | |
 |---|---|
-| choz | **1.0.0** |
+| choz | **1.1.0** |
 | Rust edition | 2021 (`choz-plugin-lv2` is 2024) |
 | Toolchain tested | rustc 1.97.1 |
 | Platform | Linux. ALSA/JACK/PipeWire. Released for x86-64, aarch64 and armv7 |
