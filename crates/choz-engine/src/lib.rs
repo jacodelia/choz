@@ -406,12 +406,18 @@ fn pd_params(path: &std::path::Path) -> Vec<PluginParam> {
             // **Not `min`.** Pd saves a slider at whatever it was left at,
             // which for a patch written on the canvas is zero, and a chain of
             // multiplies that all start at zero is a patch that makes no sound
-            // and no complaint. So a knob starts at unity when its range
-            // contains 1 — the gain-shaped case, which is most of them — and
-            // halfway otherwise. A toggle still starts off.
+            // and no complaint.
+            //
+            // Nor the top of the range, which was the first try and was worse:
+            // a `0..1` slider at 1 is a feedback amount at 1, and the user's
+            // own `delay.pd` then grows without bound — measured, 0.3 in, past
+            // 500 out and still climbing. So: unity for the wide ranges (a gain
+            // of `0..10` is a gain, and 1 is where it does nothing), halfway for
+            // a `0..1` (audible and stable whatever it turns out to control),
+            // and a toggle starts off.
             let start = match c.toggle {
                 true => c.min,
-                false if (c.min..=c.max).contains(&1.0) => 1.0,
+                false if c.max > 1.0 => 1.0,
                 false => c.min + (c.max - c.min) * 0.5,
             };
             let mut p = PluginParam::plain_range(
