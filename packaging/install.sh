@@ -125,9 +125,6 @@ check_runtime_deps() {
         say "note: no ldconfig here, so the runtime libraries were not checked"
         return 0
     fi
-    # Pure Data. choz builds `choz-pd-host` with `--features pd`, which links
-    # libpd — so without it the build fails rather than quietly producing a
-    # choz that cannot open a patch. Named here, with the package to install.
     # Pure Data. Part of a default install, so it is asked for by name — but
     # **not fatal**: without it choz installs and runs, with the one feature
     # missing and said out loud, which beats refusing to install over an
@@ -135,9 +132,9 @@ check_runtime_deps() {
     if ! ldconfig -p 2>/dev/null | grep -q 'libpd\.so'; then
         WITH_PD=0
         say "libpd is missing — Pure Data patches will not be hostable."
-        say "  Debian/Ubuntu: sudo apt install puredata-dev"
+        say "  Debian/Ubuntu: sudo apt install libpd-dev   (not puredata-dev)"
         say "  Arch:          sudo pacman -S puredata      (libpd from the AUR)"
-        say "  Fedora:        sudo dnf install puredata-devel"
+        say "  Fedora:        sudo dnf install libpd-devel"
         say "  Install it and run this again to get that half."
     fi
     if ! ldconfig -p 2>/dev/null | grep -q 'libasound\.so\.2'; then

@@ -23,7 +23,7 @@ optdepends=(
   'jack2: JACK/PipeWire routing and per-channel outputs'
   'pipewire-jack: same, on a PipeWire system'
   'kitty: the terminal the launcher prefers — wallpaper at real pixel resolution'
-  'puredata: hosting Pure Data patches as effects and input algorithms'
+  'libpd: hosting Pure Data patches as effects'
 )
 provides=('choz')
 conflicts=('choz')

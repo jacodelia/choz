@@ -54,6 +54,22 @@ Lo que trae, sobre la 1.0.0:
 
 530 tests, `clippy --workspace --all-targets -D warnings` limpio.
 
+### 2026-08-16 (ter) — CI decía la verdad: el paquete es `libpd-dev`
+
+#### Corregido
+- **`puredata-dev` no trae `libpd.so`.** Trae las cabeceras para escribir
+  externals de Pd; la biblioteca que `-lpd` necesita la trae **`libpd-dev`**
+  (comprobado con `dpkg -S`: `libpd-dev` da `/usr/lib/*/libpd.so` y
+  `/usr/include/pd/z_libpd.h`). Con el nombre equivocado, CI compilaba los once
+  crates y **fallaba al enlazar**, que es la forma más cara de equivocarse.
+  Cambiado en `ci.yml`, en `release.yml`, en `install.sh` y en el README.
+- CI comprueba ahora que `libpd.so` existe **antes** de construir nada con la
+  feature, así que la próxima vez el mensaje dirá lo que pasa en vez de dejar un
+  error del enlazador.
+- El tarball de ARM lleva también los wallpapers: son ficheros y viajan a
+  cualquier arquitectura, mientras que el `.clap` y el hijo de Pd son nativos y
+  se construyen sólo en x86_64 (`install.sh` se salta lo que no esté a su lado).
+
 ### 2026-08-16 (bis) — Enter apaga el arpegiador
 
 #### Corregido
