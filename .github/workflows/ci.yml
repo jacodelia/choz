@@ -17,11 +17,20 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      # libpd comes with `puredata-dev`. It is here because Pure Data support
-      # is part of a default install, so the path that links libpd has to be
-      # built and tested rather than only compiled on the machine that wrote it.
+      # **`libpd-dev`, not `puredata-dev`.** Pd's own dev package carries the
+      # headers for writing externals; the one that ships `libpd.so` — which is
+      # what `-lpd` needs — is `libpd-dev`. Getting this wrong builds every
+      # crate and then fails at the link, which is exactly what it did.
+      #
+      # It is installed here because Pure Data support is part of a default
+      # install, so the path that links libpd has to be built and tested rather
+      # than only compiled on the machine that wrote it.
       - name: Install audio dev libraries
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libjack-dev puredata-dev
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libjack-dev libpd-dev
+      - name: Check libpd is really there
+        run: |
+          ldconfig -p | grep -q 'libpd\.so' \
+            || { echo "libpd-dev did not provide libpd.so — the Pd steps below cannot link"; exit 1; }
       - name: Build
         run: cargo build --workspace --verbose
       - name: Test
@@ -34,8 +43,10 @@ jobs:
       # skips loudly when the child is not built.
       - name: Build and test with Pure Data
         run: |
-          cargo build --release -p choz-plugin-pd --features pd
-          cargo test -p choz-plugin-pd --features pd
           cargo clippy -p choz-plugin-pd --features pd --all-targets -- -D warnings
+          cargo test -p choz-plugin-pd --features pd
+          # Debug, because that is where `pd_patch` looks for the child. It
+          # skips loudly rather than silently when the child is not built, so
+          # the build above is what makes the test mean anything.
           cargo build -p choz-plugin-pd --features pd
           cargo test -p choz-engine --test pd_patch

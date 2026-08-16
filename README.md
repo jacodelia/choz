@@ -355,7 +355,7 @@ third by hand:
 | `libc` | yes | nothing runs |
 | `libasound.so.2` (ALSA) | yes | choz starts but opens no audio device |
 | `libjack.so.0` | **optional** — `dlopen`ed at runtime | choz uses ALSA; no JACK/PipeWire routing, no per-channel outputs |
-| `libpd` (Pure Data) | **optional** — linked only by `choz-pd-host` | choz installs and runs; Pure Data patches cannot be hosted |
+| `libpd` (Pure Data) | **optional** — linked only by `choz-pd-host`, from `libpd-dev` (not `puredata-dev`) | choz installs and runs; Pure Data patches cannot be hosted |
 | X11 | not linked | plugin windows go through `x11rb`, which speaks the protocol itself |
 
 That is why the `.deb` declares only `libasound2t64` and `libc6`: JACK is a

@@ -31,8 +31,14 @@ Lo que trae, sobre la 1.0.0:
 
 - **Pure Data hosteado**: un `.pd` con `adc~` y `dac~` es un efecto más de la
   cadena, corriendo en su propio proceso (`choz-pd-host`, el único binario que
-  enlaza libpd), y **sus sliders son knobs en el rack** cuando llevan símbolo de
-  recepción — los que no, se nombran para que se sepa por qué el patch calla.
+  enlaza libpd), y **todos sus sliders son knobs en el rack**. Los que el patch
+  no nombra (`empty empty`, que es como Pd guarda un slider salvo que alguien
+  escriba el símbolo a mano — o sea, casi todos) los nombra choz en una **copia**
+  que es lo que suena; el archivo del usuario no se toca. Medido con
+  `delay.pd`: cinco sliders sin nombre, patch mudo antes, 3.0 de pico ahora.
+  Los knobs además arrancan en la unidad cuando el rango la contiene, y no en el
+  mínimo: una cadena de multiplicaciones que empieza en cero es silencio sin un
+  solo error.
 - **Los 45 efectos propios, publicados como un `.clap`** para Bitwig, Reaper,
   Carla o cualquier host CLAP, siguiendo el transporte del anfitrión. El
   instalador y los paquetes lo ponen donde el host lo busca.
@@ -53,6 +59,22 @@ Lo que trae, sobre la 1.0.0:
   tarde. Queda el arpegiador.
 
 530 tests, `clippy --workspace --all-targets -D warnings` limpio.
+
+### 2026-08-16 (ter) — CI decía la verdad: el paquete es `libpd-dev`
+
+#### Corregido
+- **`puredata-dev` no trae `libpd.so`.** Trae las cabeceras para escribir
+  externals de Pd; la biblioteca que `-lpd` necesita la trae **`libpd-dev`**
+  (comprobado con `dpkg -S`: `libpd-dev` da `/usr/lib/*/libpd.so` y
+  `/usr/include/pd/z_libpd.h`). Con el nombre equivocado, CI compilaba los once
+  crates y **fallaba al enlazar**, que es la forma más cara de equivocarse.
+  Cambiado en `ci.yml`, en `release.yml`, en `install.sh` y en el README.
+- CI comprueba ahora que `libpd.so` existe **antes** de construir nada con la
+  feature, así que la próxima vez el mensaje dirá lo que pasa en vez de dejar un
+  error del enlazador.
+- El tarball de ARM lleva también los wallpapers: son ficheros y viajan a
+  cualquier arquitectura, mientras que el `.clap` y el hijo de Pd son nativos y
+  se construyen sólo en x86_64 (`install.sh` se salta lo que no esté a su lado).
 
 ### 2026-08-16 (bis) — Enter apaga el arpegiador
 

@@ -73,14 +73,21 @@ pub struct PatchInfo {
 pub struct PatchControl {
     /// The label drawn next to it, or the object's name when it has none.
     pub name: String,
-    /// The symbol it listens on. **`None` is the important case**: a control
-    /// with no receive symbol cannot be moved by anything outside the patch,
-    /// including this host — see [`PatchInfo::controls`].
-    pub receive: Option<String>,
+    /// The symbol choz sends to. Always something: a control the patch names
+    /// itself keeps that name, and one that names nothing is **given** one —
+    /// see [`patched_source`] for how, and why that is not rude.
+    pub receive: String,
+    /// Whether that symbol came from the patch or from choz.
+    pub named_by_patch: bool,
     pub min: f32,
     pub max: f32,
     /// On/off rather than a range.
     pub toggle: bool,
+    /// Which statement of the file this control is, and which word of it holds
+    /// its receive symbol. That is all [`patched_source`] needs to fill one in
+    /// without touching a byte of anything else.
+    statement: usize,
+    receive_word: usize,
 }
 
 impl PatchInfo {
@@ -130,7 +137,7 @@ pub fn read_patch(path: &Path) -> anyhow::Result<PatchInfo> {
     // Pd escapes a real semicolon as `\;`, and statements are separated by the
     // unescaped ones. Lines wrap, so the file is one stream of statements and
     // not one statement per line.
-    for statement in split_statements(&text) {
+    for (index, statement) in split_statements(&text).into_iter().enumerate() {
         let mut words = statement.split_whitespace();
         // `#X obj <x> <y> <name> …` is the only shape that declares an object.
         if words.next() != Some("#X") {
@@ -149,7 +156,8 @@ pub fn read_patch(path: &Path) -> anyhow::Result<PatchInfo> {
             // whether anybody outside the patch can reach them.
             "hsl" | "vsl" | "nbx" | "tgl" | "hradio" | "vradio" => {
                 let rest: Vec<&str> = words.collect();
-                if let Some(control) = read_control(object, &rest) {
+                let nth = info.controls.len();
+                if let Some(control) = read_control(object, &rest, index, nth) {
                     info.controls.push(control);
                 }
             }
@@ -173,41 +181,58 @@ pub fn read_patch(path: &Path) -> anyhow::Result<PatchInfo> {
 /// `empty` is Pd's way of writing "no symbol", and a control whose receive is
 /// `empty` is one this host cannot move — which is worth knowing before the
 /// patch is played rather than after.
-fn read_control(kind: &str, args: &[&str]) -> Option<PatchControl> {
+/// The symbol choz gives a control the patch left unnamed.
+///
+/// Numbered by position in the file, so the same file always gets the same
+/// symbols — the interface and the child both work them out rather than
+/// agreeing on a list at run time.
+fn generated_symbol(index: usize) -> String {
+    format!("choz-p{index}")
+}
+
+fn read_control(kind: &str, args: &[&str], statement: usize, index: usize) -> Option<PatchControl> {
     let at = |i: usize| args.get(i).copied().unwrap_or("empty");
     let symbol = |s: &str| match s {
         "empty" | "-" | "" => None,
         other => Some(other.trim_start_matches('\\').to_string()),
     };
     let number = |s: &str| s.parse::<f32>().ok();
-    let (receive, label, min, max, toggle) = match kind {
+    // Where the receive symbol sits, counted from the object's name — which is
+    // word 4 of the statement (`#X obj x y hsl …`).
+    let (receive_arg, label_arg, min, max, toggle) = match kind {
         "hsl" | "vsl" | "nbx" => (
-            symbol(at(7)),
-            at(8).to_string(),
+            7,
+            8,
             number(at(2)).unwrap_or(0.0),
             number(at(3)).unwrap_or(1.0),
             false,
         ),
-        "tgl" => (symbol(at(3)), at(4).to_string(), 0.0, 1.0, true),
+        "tgl" => (3, 4, 0.0, 1.0, true),
         "hradio" | "vradio" => (
-            symbol(at(5)),
-            at(6).to_string(),
+            5,
+            6,
             0.0,
             number(at(3)).map(|n| (n - 1.0).max(1.0)).unwrap_or(7.0),
             false,
         ),
         _ => return None,
     };
+    let from_patch = symbol(at(receive_arg));
+    let label = at(label_arg).to_string();
     let name = match label.as_str() {
         "empty" | "-" | "" => kind.to_string(),
         other => other.replace('_', " "),
     };
     Some(PatchControl {
         name,
-        receive,
+        named_by_patch: from_patch.is_some(),
+        receive: from_patch.unwrap_or_else(|| generated_symbol(index)),
         min,
         max,
         toggle,
+        statement,
+        // `#X obj x y <kind> …`: five words before the arguments start.
+        receive_word: 4 + receive_arg + 1,
     })
 }
 
@@ -256,35 +281,105 @@ pub fn scan_directory(dir: &Path) -> Vec<(PathBuf, PatchInfo)> {
     out
 }
 
-/// The controls a host can actually move, in the order it should show them.
+/// The controls a host can move, in the order it should show them.
 ///
-/// **The order is the contract** between the two sides: the interface builds
-/// its knobs from this list and the child maps a parameter index back to a
-/// receive symbol with the same call, so index `n` is the same control in both
-/// processes without either of them saying so out loud.
+/// **All of them.** A control the patch names is addressed by that name, and
+/// one it leaves unnamed is given a name — see [`patched_source`]. The order is
+/// the contract between the two sides: the interface builds its knobs from this
+/// list and the child maps a parameter index back to a symbol with the same
+/// call, so index `n` is the same control in both processes without either of
+/// them saying so out loud.
 pub fn addressable(info: &PatchInfo) -> Vec<&PatchControl> {
-    info.controls
-        .iter()
-        .filter(|c| c.receive.is_some())
-        .collect()
+    info.controls.iter().collect()
 }
 
-/// The controls that exist on the canvas and **cannot be reached** — no receive
-/// symbol, so nothing outside the patch can move them.
+/// The controls choz had to name itself, because the patch named nothing.
 ///
-/// Worth naming rather than counting: a patch whose gain slider is one of these
-/// is a patch that sits at whatever the slider was saved at, which for a fresh
-/// `hsl` is **zero**. That is silence with no error anywhere, and it is the
-/// single most likely reason a patch "does nothing" in a host with no canvas.
-pub fn unreachable(info: &PatchInfo) -> Vec<&str> {
+/// Worth knowing rather than hiding: what runs is a **copy** of the patch with
+/// those symbols filled in, and anybody comparing the two files should be told
+/// why they differ.
+pub fn renamed(info: &PatchInfo) -> Vec<&str> {
     info.controls
         .iter()
-        .filter(|c| c.receive.is_none())
+        .filter(|c| !c.named_by_patch)
         .map(|c| c.name.as_str())
         .collect()
 }
 
-/// A patch loaded into this process's one Pd.
+/// The patch's text with a receive symbol on every control that lacked one.
+///
+/// # Why this exists
+///
+/// A slider in Pd is only reachable from outside if it carries a **receive
+/// symbol**, and Pd leaves that empty by default — so the usual patch, written
+/// by somebody who was looking at the canvas while they used it, has five
+/// sliders that nothing can move. In Pd that is fine: you drag them. In a host
+/// with no canvas it means the patch is stuck wherever it was saved, which for
+/// a fresh slider is **zero**, which is silence with no error anywhere.
+///
+/// The alternatives were asking every user to edit every patch, or this: choz
+/// opens a **copy** with the symbols filled in. The original file is never
+/// touched, the copy differs only in those words, and the names are worked out
+/// from the file's own order so both processes arrive at the same ones without
+/// having to agree.
+pub fn patched_source(text: &str, info: &PatchInfo) -> String {
+    // Statement index → the word to fill in, for the ones that need it.
+    let mut wanted: std::collections::HashMap<usize, (usize, &str)> =
+        std::collections::HashMap::new();
+    for control in info.controls.iter().filter(|c| !c.named_by_patch) {
+        wanted.insert(
+            control.statement,
+            (control.receive_word, control.receive.as_str()),
+        );
+    }
+    if wanted.is_empty() {
+        return text.to_string();
+    }
+    // Rebuilt statement by statement, and only the one word moves: everything
+    // else — the escapes, the spacing, the trailing `, f 5` — is copied.
+    let mut out = String::with_capacity(text.len() + wanted.len() * 12);
+    for (index, statement) in split_statements(text).into_iter().enumerate() {
+        let piece = match wanted.get(&index) {
+            Some((word, symbol)) => replace_word(&statement, *word, symbol),
+            None => statement,
+        };
+        out.push_str(piece.trim_start());
+        // One statement per line, like Pd writes them: the copy is a file a
+        // person may well open to see what choz changed.
+        out.push_str(";\n");
+    }
+    out
+}
+
+/// Replace the `n`-th whitespace-separated word of `line`, keeping the rest of
+/// the bytes exactly as they were.
+fn replace_word(line: &str, n: usize, with: &str) -> String {
+    let mut out = String::with_capacity(line.len() + with.len());
+    let mut word = 0;
+    let mut cursor = 0usize;
+    while let Some(start) = line[cursor..].find(|c: char| !c.is_whitespace()) {
+        let start = cursor + start;
+        let end = line[start..]
+            .find(char::is_whitespace)
+            .map(|i| start + i)
+            .unwrap_or(line.len());
+        if word == n {
+            out.push_str(&line[..start]);
+            out.push_str(with);
+            out.push_str(&line[end..]);
+            return out;
+        }
+        word += 1;
+        cursor = end;
+        if cursor >= line.len() {
+            break;
+        }
+    }
+    // Fewer words than asked for: nothing to replace, so nothing changes.
+    line.to_string()
+}
+
+/// A patch loaded into this process's one Pd./// A patch loaded into this process's one Pd.
 ///
 /// **One per process.** Not a rule this crate invented — `libpd_new_instance`
 /// returns null on a build without `PDINSTANCE`, which is what Debian ships,
@@ -298,16 +393,47 @@ pub struct Patch {
 
 impl Patch {
     /// Open `path` in this process's Pd, at `sample_rate`, and switch DSP on.
+    /// Open `path` in this process's Pd, at `sample_rate`, and switch DSP on.
+    ///
+    /// What is actually opened is a **copy** whose controls all carry a receive
+    /// symbol — see [`patched_source`]. The copy sits next to nothing the user
+    /// owns (a temporary directory), and the original's folder goes on Pd's
+    /// search path so the patch still finds its own abstractions and samples.
     pub fn open(path: &Path, sample_rate: u32) -> anyhow::Result<Self> {
         let info = read_patch(path)?;
         #[cfg(feature = "pd")]
         {
-            imp::open(path, sample_rate)?;
+            let source = std::fs::read_to_string(path)?;
+            let patched = patched_source(&source, &info);
+            let renamed = renamed(&info);
+            let to_open = if patched == source {
+                path.to_path_buf()
+            } else {
+                // One directory per process, so two chozes never share a file.
+                let dir = std::env::temp_dir().join(format!("choz-pd-{}", std::process::id()));
+                std::fs::create_dir_all(&dir)?;
+                let copy = dir.join(
+                    path.file_name()
+                        .unwrap_or_else(|| std::ffi::OsStr::new("patch.pd")),
+                );
+                std::fs::write(&copy, &patched)?;
+                eprintln!(
+                    "choz: {} has {} control(s) the patch does not name ({}); \
+                     playing a copy with names filled in, the original is untouched",
+                    path.display(),
+                    renamed.len(),
+                    renamed.join(", ")
+                );
+                copy
+            };
+            // The original's folder either way: that is where its abstractions
+            // and its sound files live.
+            imp::open_with_home(&to_open, path.parent(), sample_rate)?;
             Ok(Self { info })
         }
         #[cfg(not(feature = "pd"))]
         {
-            let _ = sample_rate;
+            let _ = (sample_rate, patched_source("", &info));
             anyhow::bail!(
                 "'{}' needs Pure Data support, which this build does not have \
                  (rebuild with --features pd, and libpd installed)",
@@ -335,11 +461,8 @@ impl Patch {
         let Some(control) = addressable(&self.info).get(index).copied() else {
             return;
         };
-        let Some(receive) = control.receive.as_deref() else {
-            return;
-        };
         let v = control.min + value.clamp(0.0, 1.0) * (control.max - control.min);
-        imp::send_float(receive, v);
+        imp::send_float(&control.receive, v);
     }
 
 }
@@ -406,7 +529,14 @@ mod imp {
         }
     }
 
-    pub(super) fn open(path: &Path, sample_rate: u32) -> anyhow::Result<()> {
+    /// `home` is the folder the patch really lives in, which is where its
+    /// abstractions and its sound files are — not the folder of the copy that
+    /// is being opened.
+    pub(super) fn open_with_home(
+        path: &Path,
+        home: Option<&Path>,
+        sample_rate: u32,
+    ) -> anyhow::Result<()> {
         if STARTED.swap(true, Ordering::SeqCst) {
             anyhow::bail!(
                 "this process already has a patch open, and libpd has one Pd per process"
@@ -430,6 +560,10 @@ mod imp {
             // folder first (that is where a project keeps its abstractions),
             // then an `externals` beside it, then Pd's own `extra`.
             let mut search: Vec<String> = vec![dir.to_string_lossy().into_owned()];
+            if let Some(home) = home {
+                search.push(home.to_string_lossy().into_owned());
+                search.push(home.join("externals").to_string_lossy().into_owned());
+            }
             search.push(dir.join("externals").to_string_lossy().into_owned());
             search.extend(SYSTEM_EXTRA.iter().map(|p| p.to_string()));
             if let Some(env) = std::env::var_os("PD_PATH") {
@@ -639,10 +773,11 @@ mod tests {
     /// headless host has to know about each: **whether it can be moved**.
     ///
     /// Both halves of this came from two real patches. A slider with no receive
-    /// symbol —  Pd's default when you drop one on a canvas — cannot be
-    /// addressed from outside, and a gain slider like that holds the whole
-    /// patch at zero: silence, with no error anywhere, which is exactly how it
-    /// was reported.
+    /// symbol — Pd's default when you drop one on a canvas — could not be
+    /// addressed from outside, and a gain slider like that held the whole patch
+    /// at zero: silence, with no error anywhere, which is exactly how it was
+    /// reported. So choz names those itself, in a copy, and every control is a
+    /// knob.
     #[test]
     fn a_patch_says_which_controls_a_host_can_move() {
         let dir = std::env::temp_dir().join("choz-pd-controls");
@@ -661,19 +796,37 @@ mod tests {
         assert_eq!(info.role(), PatchRole::Effect);
         assert_eq!(info.controls.len(), 3);
 
-        // The two with a receive symbol are the knobs a host gets, in order.
+        // All three are knobs, in the file's own order — which is the contract
+        // between the interface and the child process.
         let usable = addressable(&info);
-        assert_eq!(usable.len(), 2);
+        assert_eq!(usable.len(), 3);
         assert_eq!(usable[0].name, "GAIN");
-        assert_eq!(usable[0].receive.as_deref(), Some("gain"));
+        assert_eq!(usable[0].receive, "gain", "the patch named this one");
         assert_eq!((usable[0].min, usable[0].max), (0.0, 10.0));
         assert!(!usable[0].toggle);
-        assert_eq!(usable[1].name, "Bypass");
-        assert!(usable[1].toggle, "a toggle is two positions, not a range");
+        assert_eq!(usable[2].name, "Bypass");
+        assert!(usable[2].toggle, "a toggle is two positions, not a range");
 
-        // And the one without is named, because "my patch does nothing" is
-        // answered by that name and by nothing else.
-        assert_eq!(unreachable(&info), vec!["Room"]);
+        // The one the patch left unnamed is the one choz names, and it says so.
+        assert_eq!(renamed(&info), vec!["Room"]);
+        assert_eq!(usable[1].receive, "choz-p1");
+
+        // The copy that gets played differs in exactly that one word.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let patched = patched_source(&text, &info);
+        assert!(
+            patched.contains("0 0 empty choz-p1 Room"),
+            "the unnamed slider got a symbol: {patched}"
+        );
+        assert!(
+            patched.contains("0 0 empty gain GAIN") && patched.contains("empty bypass Bypass"),
+            "and nothing else moved: {patched}"
+        );
+        assert_eq!(
+            read_patch(&path).unwrap(),
+            info,
+            "the file on disk is untouched"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
