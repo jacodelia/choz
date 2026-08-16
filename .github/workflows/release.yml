@@ -155,6 +155,12 @@ jobs:
       - name: Build release binary (cross)
         run: cross build --release --locked --target ${{ matrix.target }} --bin ${{ env.BIN }}
 
+      # choz's own effects for other hosts. Pure Rust, so `cross` builds it like
+      # anything else — unlike `choz-pd-host`, which links libpd and is x86_64
+      # only here. The `.deb` below lists this file, so it has to exist.
+      - name: Build the CLAP bundle (cross)
+        run: cross build --release --locked --target ${{ matrix.target }} -p choz-plugin-clap-export
+
       - name: Package tarball
         shell: bash
         run: |
@@ -166,9 +172,12 @@ jobs:
           cp packaging/install.sh "dist/${NAME}/"
           cp -r packaging/desktop "dist/${NAME}/"
           # The wallpapers are just files, so they travel on every
-          # architecture. The `.clap` and the Pure Data child are native and
-          # are built on x86_64 only; `install.sh` skips what is not beside it.
+          # architecture, and the `.clap` is cross-built just above. The Pure
+          # Data child is the one that stays on x86_64 — it links libpd, and
+          # `cross` has none for the target; `install.sh` skips what is not
+          # beside it.
           cp -r assets "dist/${NAME}/"
+          cp "target/${{ matrix.target }}/release/libchoz_plugin_clap_export.so" "dist/${NAME}/"
           tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
           rm -rf "dist/${NAME}"
 

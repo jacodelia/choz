@@ -97,6 +97,33 @@ assets = [
 #   cargo deb -p choz-ui --variant arm --target aarch64-unknown-linux-gnu
 [package.metadata.deb.variants.arm]
 depends = "libasound2t64 | libasound2, libc6"
+# **The whole list again, minus one line.** A variant that declares `assets`
+# replaces the table above rather than adding to it, and the ARM build has one
+# file the x86_64 build has: `choz-pd-host` links libpd, `cross` has no libpd for
+# the target, so it is never built and `cargo deb` stops dead on the missing
+# asset — which is exactly how the 1.1.0 release failed. Pure Data on a Pi is a
+# `cargo build -p choz-plugin-pd --features pd` on the Pi itself.
+#
+# The `.clap` **is** here: it is pure Rust, `cross` builds it like any other
+# crate, and a Pi running Bitwig or Carla should get choz's effects too.
+assets = [
+    ["target/release/choz", "usr/bin/", "755"],
+    ["../../packaging/desktop/choz-launcher", "usr/bin/", "755"],
+    ["../../packaging/desktop/choz.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/desktop/choz.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["../../packaging/desktop/icons/16x16/choz.png", "usr/share/icons/hicolor/16x16/apps/", "644"],
+    ["../../packaging/desktop/icons/24x24/choz.png", "usr/share/icons/hicolor/24x24/apps/", "644"],
+    ["../../packaging/desktop/icons/32x32/choz.png", "usr/share/icons/hicolor/32x32/apps/", "644"],
+    ["../../packaging/desktop/icons/48x48/choz.png", "usr/share/icons/hicolor/48x48/apps/", "644"],
+    ["../../packaging/desktop/icons/64x64/choz.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["../../packaging/desktop/icons/128x128/choz.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
+    ["../../packaging/desktop/icons/256x256/choz.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["../../packaging/desktop/choz-project.xml", "usr/share/mime/packages/", "644"],
+    ["../../README.md", "usr/share/doc/choz/README.md", "644"],
+    ["../../assets/*.jpg", "usr/share/choz/wallpapers/", "644"],
+    ["../../assets/*.png", "usr/share/choz/wallpapers/", "644"],
+    ["target/release/libchoz_plugin_clap_export.so", "usr/lib/clap/choz.clap", "644"],
+]
 
 [package.metadata.generate-rpm]
 name = "choz"
