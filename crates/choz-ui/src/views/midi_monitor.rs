@@ -249,9 +249,35 @@ pub struct KeyboardState {
     ccs: Vec<(u8, u8)>,
     bend: u16,
     modulation: u8,
-    /// The note `A→M` is converting right now, so it can be put out when it
-    /// changes. Kept apart from `keys` because nothing sends its note-off.
-    converted: Option<u8>,
+    /// The notes made *inside* choz rather than played into it, so each can be
+    /// put out when it changes. Kept apart from `keys` because nothing sends
+    /// their note-offs. Indexed by [`Converted`].
+    converted: [Option<u8>; Converted::COUNT],
+}
+
+/// Where a note choz made itself came from.
+///
+/// Both of these are decided in the audio callback and never travel as MIDI, so
+/// this monitor is the only place they can be watched — and one of them is the
+/// note an effect is *correcting towards*, which is the number that says
+/// whether AutoTune is aiming where the singer meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Converted {
+    /// `A→M`: the tab's audio input, played as notes.
+    PitchToMidi,
+    /// AutoTune's target note — what it is pulling the voice onto.
+    AutoTune,
+}
+
+impl Converted {
+    pub const COUNT: usize = 2;
+
+    fn index(self) -> usize {
+        match self {
+            Converted::PitchToMidi => 0,
+            Converted::AutoTune => 1,
+        }
+    }
 }
 
 impl Default for KeyboardState {
@@ -261,7 +287,7 @@ impl Default for KeyboardState {
             roll: VecDeque::with_capacity(ROLL_MAX),
             ccs: Vec::with_capacity(CC_SHOWN),
             bend: 8192,
-            converted: None,
+            converted: [None; Converted::COUNT],
             modulation: 0,
         }
     }
@@ -270,20 +296,22 @@ impl Default for KeyboardState {
 impl KeyboardState {
     /// Feed one arrived message. `slot` is where the routing sent it, when it
     /// was sent anywhere — that is what the `INSTRUMENT` colour mode reads.
-    /// Light (or put out) the note a tab's `A→M` converter is playing.
+    /// Light (or put out) a note choz made itself: `A→M`'s, or the one
+    /// AutoTune is correcting towards.
     ///
     /// Those notes are made in the audio callback and never travel as MIDI, so
     /// nothing else here would ever see them — and a converter you cannot watch
     /// is one you can only trust or not. Called once per redraw with whatever
-    /// the tracker is on now, so it lights up and goes out on its own.
-    pub fn feed_converted(&mut self, note: Option<u8>, slot: Option<usize>) {
-        if self.converted == note {
+    /// each source is on now, so they light up and go out on their own.
+    pub fn feed_converted(&mut self, source: Converted, note: Option<u8>, slot: Option<usize>) {
+        let i = source.index();
+        if self.converted[i] == note {
             return;
         }
-        if let Some(old) = self.converted.take() {
+        if let Some(old) = self.converted[i].take() {
             self.release(old);
         }
-        self.converted = note;
+        self.converted[i] = note;
         if let Some(n) = note.filter(|n| (*n as usize) < 128) {
             self.keys[n as usize] = Some(KeyLit {
                 channel: 0,
@@ -301,6 +329,28 @@ impl KeyboardState {
                 end: None,
             });
         }
+    }
+
+    /// The notes held on one MIDI channel, low to high.
+    ///
+    /// What the harmoniser's MIDI input reads: the chord under the hand right
+    /// now, not the stream of events that built it. `slot` narrows it to the
+    /// notes that were routed to one tab, which is what "the active tab is the
+    /// reference" means.
+    ///
+    /// **`channel` is 1..16**, the way a musician and the panel say it; on the
+    /// wire and in [`KeyLit`] it is 0-based.
+    pub fn held_on_channel(&self, channel: u8, slot: Option<usize>) -> Vec<u8> {
+        let wire = channel.saturating_sub(1);
+        self.keys
+            .iter()
+            .enumerate()
+            .filter_map(|(note, lit)| {
+                let lit = lit.as_ref()?;
+                let same_tab = slot.is_none() || lit.slot.is_none() || lit.slot == slot;
+                (lit.channel == wire && same_tab).then_some(note as u8)
+            })
+            .collect()
     }
 
     /// Which notes are lit right now. For a test, and for anything that wants
@@ -1283,7 +1333,7 @@ mod tests {
         let mut state = KeyboardState::default();
         assert!(!state.drawn_keys().contains(&60), "nothing yet");
 
-        state.feed_converted(Some(60), Some(0));
+        state.feed_converted(Converted::PitchToMidi, Some(60), Some(0));
         assert!(
             state.drawn_keys().contains(&60),
             "the converted note lights"
@@ -1291,13 +1341,40 @@ mod tests {
 
         // The tracker moves to another note: nothing sends a note-off for the
         // old one, so putting it out is this function's job.
-        state.feed_converted(Some(64), Some(0));
+        state.feed_converted(Converted::PitchToMidi, Some(64), Some(0));
         let lit = state.drawn_keys();
         assert!(lit.contains(&64) && !lit.contains(&60), "lit: {lit:?}");
 
         // And silence puts the last one out.
-        state.feed_converted(None, Some(0));
+        state.feed_converted(Converted::PitchToMidi, None, Some(0));
         assert!(state.drawn_keys().is_empty(), "and it goes out");
+    }
+
+    /// AutoTune's target note shows too, and the two sources do not put each
+    /// other out.
+    ///
+    /// The note an effect is *correcting towards* is decided in the callback
+    /// and says so nowhere else — so a singer watching this panel is the only
+    /// way to see that AutoTune is aiming where they meant.
+    #[test]
+    fn autotune_lights_the_note_it_is_aiming_at() {
+        let mut state = KeyboardState::default();
+        state.feed_converted(Converted::PitchToMidi, Some(60), Some(0));
+        state.feed_converted(Converted::AutoTune, Some(69), Some(1));
+        let lit = state.drawn_keys();
+        assert!(lit.contains(&60) && lit.contains(&69), "lit: {lit:?}");
+
+        // Each source puts out its own note and only its own.
+        state.feed_converted(Converted::AutoTune, Some(71), Some(1));
+        let lit = state.drawn_keys();
+        assert!(
+            lit.contains(&60) && lit.contains(&71) && !lit.contains(&69),
+            "lit: {lit:?}"
+        );
+
+        state.feed_converted(Converted::AutoTune, None, None);
+        let lit = state.drawn_keys();
+        assert_eq!(lit, vec![60], "the converter's note is still its own");
     }
 
     /// The spectrum tab draws where the tone is, marks the decades, and does

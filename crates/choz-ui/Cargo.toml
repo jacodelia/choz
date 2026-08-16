@@ -33,7 +33,7 @@ priority = "optional"
 # on ALSA. That makes it a recommendation, which apt installs by default and the
 # user can decline.
 depends = "$auto"
-recommends = "libjack-jackd2-0 | libjack0"
+recommends = "libjack-jackd2-0 | libjack0, puredata"
 # Refresh the menu, MIME and icon caches. Debian ships triggers that usually do
 # this; "usually" is how an application installs and never appears in the menu.
 maintainer-scripts = "../../packaging/debian"
@@ -75,6 +75,17 @@ assets = [
     ["../../packaging/desktop/icons/256x256/choz.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
     ["../../packaging/desktop/choz-project.xml", "usr/share/mime/packages/", "644"],
     ["../../README.md", "usr/share/doc/choz/README.md", "644"],
+    # The wallpapers ship with the program: a fresh install opens on the image
+    # choz was built with rather than on a bare terminal, and the picker starts
+    # in this directory. See `settings::wallpaper_dir`.
+    ["../../assets/*.jpg", "usr/share/choz/wallpapers/", "644"],
+    ["../../assets/*.png", "usr/share/choz/wallpapers/", "644"],
+    # choz's own 45 effects, as a CLAP plugin for any other host. Installed
+    # system-wide, which is a directory every CLAP host already searches.
+    ["target/release/libchoz_plugin_clap_export.so", "usr/lib/clap/choz.clap", "644"],
+    # The only binary that links libpd, and the one the engine looks for beside
+    # choz itself when a tab runs a Pure Data patch.
+    ["target/release/choz-pd-host", "usr/bin/", "755"],
 ]
 
 # Cross-compiled packages, where `$auto` cannot help: reading an ARM binary's
@@ -121,6 +132,12 @@ assets = [
     { source = "../../packaging/desktop/icons/256x256/choz.png", dest = "/usr/share/icons/hicolor/256x256/apps/choz.png", mode = "644" },
     { source = "../../packaging/desktop/choz-project.xml", dest = "/usr/share/mime/packages/choz-project.xml", mode = "644" },
     { source = "../../README.md", dest = "/usr/share/doc/choz/README.md", mode = "644", doc = true },
+    # Same three as the .deb: the wallpapers a fresh install opens with, choz's
+    # own effects as a CLAP plugin, and the Pure Data child.
+    { source = "../../assets/*.jpg", dest = "/usr/share/choz/wallpapers/", mode = "644" },
+    { source = "../../assets/*.png", dest = "/usr/share/choz/wallpapers/", mode = "644" },
+    { source = "../../target/release/libchoz_plugin_clap_export.so", dest = "/usr/lib/clap/choz.clap", mode = "644" },
+    { source = "../../target/release/choz-pd-host", dest = "/usr/bin/choz-pd-host", mode = "755" },
 ]
 
 [dependencies]

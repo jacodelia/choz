@@ -729,6 +729,10 @@ pub fn draw_fx_chain_panel(
     // The tab's arpeggiator: settings plus where its sequencer is. Drawn as one
     // line while it is off, two when it is on.
     arp: crate::arp::ArpView<'_>,
+    // Which input algorithm the tab runs, and the knobs of the ALGO box — the
+    // picker first, then whatever the running algorithm owns. Both come from
+    // the interface rather than being worked out again here: a box whose knobs
+    // are not the knobs being edited moves the wrong control.
     // Where this tab's notes are pointed, when they are pointed anywhere, and
     // over how much of that parameter's range.
     // Meter, latency and presets of the selected FX — everything the SLOT box

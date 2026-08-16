@@ -97,6 +97,18 @@ pub struct Mixer {
     /// instead of its instrument.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_pair: Option<(usize, usize)>,
+    /// **The names of those two jacks**, which is what actually identifies
+    /// them.
+    ///
+    /// The pair above is an index into a flat list of every capture port in the
+    /// system, and that list moves: unplug an interface and every index after
+    /// it shifts by two, so a project reopened without the card was quietly
+    /// listening to somebody else's microphone. The names are matched first and
+    /// the indices are only the fallback for projects written before this
+    /// existed — same reasoning as `midi_out`, which has stored a name all
+    /// along.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_ports: Option<(String, String)>,
     /// Audio in, notes out. Added later, hence the default.
     #[serde(default)]
     pub pitch_to_midi: bool,
@@ -228,6 +240,7 @@ mod tests {
                     solo: false,
                     out_pair: Some((2, 3)),
                     in_pair: None,
+                    in_ports: None,
                     pitch_to_midi: false,
                     pitch_mix: None,
                     in_gain: None,

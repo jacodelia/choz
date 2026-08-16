@@ -305,6 +305,10 @@ enum ModalKind {
     /// The positions of one **named** arpeggiator knob: the mode, the division,
     /// which sequence, how long it plays.
     ArpChoice,
+    /// Pick a Max/MSP patch to import into the active tab's chain.
+    ImportMax,
+    /// What that import kept, and — the half that matters — what it could not.
+    MaxReport,
     /// The positions of one **named** FX parameter — a preset, a key, a scale,
     /// a mode. Stepping through eighteen Winamp presets with an arrow key is a
     /// list pretending to be a knob; this is the list.
@@ -372,6 +376,7 @@ const ENGINE_ROWS: &[&str] = &[
     "Buffer size",
     "Tempo",
     "Time signature",
+    "Feedback guard",
     "SF2 engine",
 ];
 
@@ -395,7 +400,7 @@ const OSC_ROWS: &[&str] = &["Enable OSC", "Port mode", "UDP port", "TCP port"];
 
 /// Format chips of the ADD FX modal.
 const FX_FORMATS: &[&str] = &[
-    "ALL", "BUILT-IN", "CLAP", "LV2", "VST2", "VST3", "LADSPA", "DSSI",
+    "ALL", "BUILT-IN", "CLAP", "LV2", "VST2", "VST3", "LADSPA", "DSSI", "PD",
 ];
 
 /// One offer in the ADD FX list: a built-in or a scanned plugin.
@@ -718,6 +723,9 @@ struct App {
     /// Discovered CLAP *audio effects*, offered in the ADD FX modal after the
     /// built-ins.
     fx_plugins: Vec<source::PluginFx>,
+    /// Whether a chord is currently being published for a harmoniser, so it is
+    /// cleared once rather than on every frame that has nothing to say.
+    chord_published: bool,
 
     /// Rack slots (one per source). Slot at index i mirrors engine slot i.
     slots: Vec<RackSlot>,
@@ -869,6 +877,7 @@ impl App {
             plugin_paths: choz_engine::PluginPaths::load(),
             synth_cursor: 0,
             fx_plugins: Vec::new(),
+            chord_published: false,
             slots: Vec::new(),
             active_slot: 0,
             fx_chain: Vec::new(),
@@ -1808,7 +1817,9 @@ impl App {
     fn arp_knobs(&self) -> Vec<(arp::ArpParam, &'static str, f32, source::ParamShape)> {
         self.slots
             .get(self.active_slot)
-            .map(|s| s.arp.view().knobs())
+            .map(|s| {
+                s.arp.view().knobs()
+            })
             .unwrap_or_default()
     }
 
@@ -1860,6 +1871,26 @@ impl App {
             return;
         };
         self.set_arp_knob(index, shape.nudge(value, delta));
+    }
+
+    /// What Enter does to an arpeggiator knob: **flip a switch**, step anything
+    /// else on by one.
+    ///
+    /// The difference matters on the very first knob, which is the
+    /// arpeggiator's own on/off. Enter used to nudge it *up*, and a switch
+    /// nudged up when it is already on stays on — so Enter could start the
+    /// arpeggiator and never stop it.
+    fn press_arp_knob(&mut self, index: usize) {
+        let Some((_, _, value, shape)) = self.arp_knobs().get(index).cloned() else {
+            return;
+        };
+        match shape {
+            source::ParamShape::Toggle => {
+                let flipped = if value >= 0.5 { 0.0 } else { 1.0 };
+                self.set_arp_knob(index, flipped);
+            }
+            _ => self.set_arp_knob(index, shape.nudge(value, 1.0)),
+        }
     }
 
     /// The active tab's instrument parameters as knobs: name and 0..1 position.
@@ -1975,6 +2006,11 @@ impl App {
             slot + 1,
             if on { "on" } else { "off" }
         );
+        // **Independent on purpose.** `A→M` turns the tab's audio into notes
+        // inside the callback; the ALGO list decides what happens to notes on
+        // the way to the instrument. They are different questions, so this
+        // switch retires nothing and nothing retires it — a tab can convert a
+        // guitar and arpeggiate the result.
     }
 
     /// How much of a converting tab's output is the instrument.
@@ -2435,8 +2471,10 @@ impl App {
     /// otherwise.
     fn open_wallpaper_browser(&mut self) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let assets = cwd.join("assets");
-        let start = if assets.is_dir() { assets } else { cwd };
+        // Where the shipped images are on an installed copy, the repository's
+        // `assets/` in a checkout, and the working directory when neither is
+        // there.
+        let start = settings::wallpaper_dir().unwrap_or(cwd);
         let mut modal = Modal::new(
             ModalKind::Wallpaper,
             views::modal::ListModal::new("BACKGROUND IMAGE", Vec::new()),
@@ -2519,6 +2557,18 @@ impl App {
             {
                 let (num, den) = choz_ports::transport().time_signature();
                 format!("  {:>14}  {num}/{den}", "Time signature")
+            },
+            // What it is doing right now, not just whether it is armed: a
+            // guard that has caught something is the one thing worth seeing
+            // here, and the IN drawer says it too.
+            {
+                let db = choz_engine::meter::capture_health().guard_db();
+                let state = match (a.feedback_guard, db < -0.1) {
+                    (false, _) => "OFF".to_string(),
+                    (true, false) => "ON".to_string(),
+                    (true, true) => format!("ON  (holding {db:.0} dB)"),
+                };
+                format!("  {:>14}  {state}", "Feedback guard")
             },
             // choz only builds oxisynth; the row exists so the setting matches
             // seqterm's file, not to pretend there is a choice.
@@ -2783,6 +2833,14 @@ impl App {
                 self.ui.audio.time_sig = (num, den);
                 self.ui.save();
             }
+            // The guard is a switch, so either arrow — or Enter — flips it.
+            (SEC_ENGINE, 7) => {
+                self.ui.audio.feedback_guard = !self.ui.audio.feedback_guard;
+                choz_engine::feedback::arm(self.ui.audio.feedback_guard);
+                self.ui.save();
+                self.refresh_modal();
+                return true;
+            }
             // SF2 engine and the read-only rows below it take no input.
             (SEC_ENGINE, _) => return true,
 
@@ -3005,6 +3063,8 @@ impl App {
             // not moved since; rebuilding it here would only re-read the same
             // names.
             ModalKind::FxChoice | ModalKind::FxPreset | ModalKind::ArpChoice => return,
+            // Built when the import ran; there is nothing to re-read.
+            ModalKind::MaxReport => return,
             ModalKind::Learn => {
                 let targets = self.modal.as_ref().unwrap().targets.clone();
                 targets
@@ -3101,7 +3161,10 @@ impl App {
                 }
                 rows
             }
-            ModalKind::AddPath | ModalKind::SaveProject | ModalKind::LoadProject => self
+            ModalKind::AddPath
+            | ModalKind::SaveProject
+            | ModalKind::LoadProject
+            | ModalKind::ImportMax => self
                 .modal
                 .as_ref()
                 .unwrap()
@@ -3426,6 +3489,32 @@ impl App {
                     None => true,
                 }
             }
+            ModalKind::ImportMax => {
+                let picked = self.modal.as_mut().and_then(|m| {
+                    let b = m.browser.as_mut()?;
+                    b.cursor = i;
+                    b.select()
+                });
+                match picked {
+                    Some(file_browser::Action::EnterDir(d)) => {
+                        if let Some(b) = self.modal.as_mut().and_then(|m| m.browser.as_mut()) {
+                            b.set_dir(d);
+                        }
+                        self.refresh_modal();
+                        false
+                    }
+                    Some(file_browser::Action::PickFile(file)) => {
+                        self.import_maxpat(&file);
+                        // The report replaces this modal rather than closing it:
+                        // what an import could **not** do is the half worth
+                        // reading, and a log line is not where anybody looks.
+                        false
+                    }
+                    None => true,
+                }
+            }
+            // Nothing to select: it is a list of what happened.
+            ModalKind::MaxReport => true,
             ModalKind::SaveProject => {
                 let picked = self.modal.as_mut().and_then(|m| {
                     let b = m.browser.as_mut()?;
@@ -3707,6 +3796,11 @@ impl App {
                         solo: slot.solo,
                         out_pair: Some(slot.out_pair),
                         in_pair: slot.in_pair,
+                        // The jacks by name, which is what survives an
+                        // interface being unplugged.
+                        in_ports: slot.in_pair.and_then(|(l, r)| {
+                            Some((self.in_ports.get(l)?.clone(), self.in_ports.get(r)?.clone()))
+                        }),
                     },
                     fx,
                     midi_learn,
@@ -3846,7 +3940,7 @@ impl App {
             rack.mute = slot.mixer.mute;
             rack.solo = slot.mixer.solo;
             rack.out_pair = slot.mixer.out_pair.unwrap_or((0, 1));
-            rack.in_pair = slot.mixer.in_pair;
+            rack.in_pair = resolve_in_pair(&self.in_ports, &slot.mixer);
             rack.pitch_to_midi = slot.mixer.pitch_to_midi;
             rack.pitch_mix = slot.mixer.pitch_mix.unwrap_or(1.0).clamp(0.0, 1.0);
             rack.in_gain = slot.mixer.in_gain.unwrap_or(1.0).clamp(0.0, MAX_IN_GAIN);
@@ -3856,6 +3950,9 @@ impl App {
                 .unwrap_or(choz_engine::pitch::DEFAULT_GATE);
             rack.channel = slot.channel.clamp(1, 16);
             rack.arp = arp::Arp::new(slot.arp);
+            // A patch that is no longer on this machine is said out loud and
+            // dropped, like a missing plugin: the tab loads without it rather
+            // than the project failing.
             rack.midi_out = slot.midi_out.clone();
             self.slots.push(rack);
 
@@ -3973,6 +4070,80 @@ impl App {
         self.modal = Some(modal);
         self.load_rack_only = false;
         self.refresh_modal();
+    }
+
+    /// File > Import Max patch: pick the `.maxpat`, then keep what can be kept.
+    fn open_import_max(&mut self) {
+        let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let mut modal = Modal::new(
+            ModalKind::ImportMax,
+            views::modal::ListModal::new("IMPORT MAX PATCH", Vec::new()),
+        );
+        modal.browser = Some(file_browser::FileBrowser::open(&start, &["maxpat"]));
+        modal.list.note =
+            "  Max cannot be run here - what has an equivalent is kept, the rest is named"
+                .to_string();
+        self.modal = Some(modal);
+        self.refresh_modal();
+    }
+
+    /// Read a Max patch into the active tab's FX chain, then show what happened.
+    ///
+    /// **There is no Max runtime**, here or anywhere embeddable, so this is an
+    /// import and not a host: the objects with a real equivalent among choz's
+    /// own effects become effects, and every object without one is named. A
+    /// patch that comes back as two effects and nine names is telling the
+    /// truth about itself.
+    fn import_maxpat(&mut self, path: &std::path::Path) {
+        let import = match choz_engine::maxpat::read_maxpat(path) {
+            Ok(import) => import,
+            Err(e) => {
+                eprintln!("choz: {}: {e}", path.display());
+                self.modal = None;
+                return;
+            }
+        };
+        let mut lines: Vec<String> = Vec::new();
+        let mut added = 0usize;
+        let mut over = 0usize;
+        for spec in &import.chain {
+            let Some(kind) = source::AudioFxKind::from_id(&spec.kind) else {
+                continue;
+            };
+            if self.fx_chain.len() >= source::MAX_FX {
+                over += 1;
+                continue;
+            }
+            self.fx_chain.push(AudioFxEntry::new(kind));
+            added += 1;
+            lines.push(format!("  + {}", kind.label()));
+        }
+        if added > 0 {
+            self.rebuild_fx();
+        }
+        if over > 0 {
+            lines.push(format!(
+                "  \u{00B7} {over} more did not fit: a chain holds {}",
+                source::MAX_FX
+            ));
+        }
+        for object in &import.dropped {
+            lines.push(format!("  \u{2014} no equivalent: {object}"));
+        }
+        if !import.followed_cords {
+            lines.push("  \u{00B7} read in file order: no adc~ or plugin~ to follow".to_string());
+        }
+        if lines.is_empty() {
+            lines.push("  nothing in this patch has an equivalent here".to_string());
+        }
+        eprintln!("choz: {}", import.summary());
+
+        let mut modal = Modal::new(
+            ModalKind::MaxReport,
+            views::modal::ListModal::new(format!("IMPORTED {}", import.name), lines),
+        );
+        modal.list.note = "  Max patches are not run here; this is what could be kept".to_string();
+        self.modal = Some(modal);
     }
 
     fn load_project_from(&mut self, path: &std::path::Path) {
@@ -4382,14 +4553,29 @@ impl App {
             // behaving — a counter at zero is noise on a panel this narrow —
             // and a number the moment it is not, which is the difference
             // between "my microphone crackles" and something to point at.
-            let (late, dropped) = choz_engine::meter::capture_health().counts();
+            let health = choz_engine::meter::capture_health();
+            let (late, dropped) = health.counts();
             let drift = match (late, dropped) {
                 (0, 0) => String::new(),
                 (l, 0) => format!("  \u{00B7} {l} late"),
                 (0, d) => format!("  \u{00B7} {d} dropped"),
                 (l, d) => format!("  \u{00B7} {l} late, {d} dropped"),
             };
-            format!("{} ({}){}", i18n::t("AUDIO IN"), ports.len(), drift)
+            // And what the feedback guard is holding down, while it is holding
+            // it: a duck nobody can see is indistinguishable from the room
+            // having gone quiet by itself, and the player needs to know it was
+            // choz that pulled the microphone down.
+            let guard = match health.guard_db() {
+                db if db < -0.1 => format!("  \u{00B7} GUARD {db:.0} dB"),
+                _ => String::new(),
+            };
+            format!(
+                "{} ({}){}{}",
+                i18n::t("AUDIO IN"),
+                ports.len(),
+                drift,
+                guard
+            )
         };
         rows.push((InTarget::None, header(&title)));
         let active = self.slots.get(self.active_slot).and_then(|s| s.in_pair);
@@ -5792,6 +5978,53 @@ impl App {
         }
     }
 
+    /// Publish the chord the harmoniser follows, if any harmoniser is asking.
+    ///
+    /// Read from the keys the monitor already tracks — the notes **held**, not
+    /// the events that arrived — and narrowed to the tab on screen, which is
+    /// what "the active tab is the reference" means. Nothing is published when
+    /// no harmoniser has its MIDI switch on, so the effect stays exactly as it
+    /// was for everybody else.
+    ///
+    /// **Off in MULTI**: there, every tab answers its own channel and a single
+    /// process-wide chord would be one keyboard deciding another tab's harmony.
+    /// The switch says so on the panel rather than doing something surprising.
+    fn publish_chord(&mut self) {
+        let channel = match self.ui.rack_mode == settings::RackMode::Multi {
+            true => None,
+            false => self.harmonizer_midi_channel(),
+        };
+        let Some(channel) = channel else {
+            // Only clear it once, so this is not a store per frame forever.
+            if self.chord_published {
+                choz_engine::chord::chord().clear();
+                self.chord_published = false;
+            }
+            return;
+        };
+        let held = self
+            .keyboard
+            .held_on_channel(channel, Some(self.active_slot));
+        choz_engine::chord::chord().set(&held);
+        self.chord_published = true;
+    }
+
+    /// The channel the active tab's harmoniser is listening to, if it has one
+    /// and its switch is on. `Ch` is the last parameter and `MIDI` the one
+    /// before it — see the harmoniser's `params`.
+    fn harmonizer_midi_channel(&self) -> Option<u8> {
+        const MIDI: usize = 9;
+        const CHANNEL: usize = 10;
+        self.fx_chain
+            .iter()
+            .filter(|e| e.enabled && e.kind == source::AudioFxKind::Harmonizer)
+            .find(|e| e.params.get(MIDI).copied().unwrap_or(0.0) >= 0.5)
+            .map(|e| {
+                let v = e.params.get(CHANNEL).copied().unwrap_or(0.0);
+                1 + (v.clamp(0.0, 1.0) * 15.0).round() as u8
+            })
+    }
+
     /// Called once per UI tick: age active notes and send note-off at expiry.
     fn tick_notes(&mut self) {
         if self.active_notes.is_empty() {
@@ -5827,17 +6060,51 @@ impl App {
                     }
                 }
             }
+            // Resolved before the engine borrow: whether a tab runs an
+            // algorithm is a question about `self`, and the engine is `self`
+            // too.
+            let direct: Vec<(u8, usize)> = ends
+                .iter()
+                .flat_map(|(n, targets)| targets.iter().map(move |slot| (*n, *slot)))
+                .filter(|(_, slot)| !self.slots.get(*slot).is_some_and(|s| s.arp.is_on()))
+                .collect();
             if let Some(ref mut engine) = self.audio_engine {
-                for (n, targets) in &ends {
-                    for slot in targets {
-                        if self.slots.get(*slot).is_some_and(|s| s.arp.is_on()) {
-                            continue;
-                        }
-                        engine.note_off(*slot, *n);
-                    }
+                for (n, slot) in direct {
+                    engine.note_off(slot, n);
                 }
             }
             self.active_notes.retain(|(n, _)| !expired.contains(n));
+        }
+    }
+}
+
+/// Which capture jacks a saved tab meant.
+///
+/// The pair in the file is an index into a flat list of every capture port in
+/// the system, and that list moves the moment an interface is unplugged: every
+/// index past it shifts, and a project reopened without the card was listening
+/// to somebody else's microphone without saying so. So the **names** win when
+/// they are there and still exist.
+///
+/// When they are there and do *not* exist, the routing is dropped rather than
+/// guessed: the tab comes back playing its instrument, which is obvious, while
+/// the wrong jack is not. Projects written before the names existed still fall
+/// back to the index, because that is all they say.
+fn resolve_in_pair(
+    ports: &[String],
+    mixer: &project::Mixer,
+) -> Option<(usize, usize)> {
+    let Some((left, right)) = mixer.in_ports.as_ref() else {
+        return mixer.in_pair;
+    };
+    let find = |name: &String| ports.iter().position(|p| p == name);
+    match (find(left), find(right)) {
+        (Some(l), Some(r)) => Some((l, r)),
+        _ => {
+            eprintln!(
+                "choz: capture jack not here any more, tab loads without audio in: {left} / {right}"
+            );
+            None
         }
     }
 }
@@ -6027,6 +6294,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Screen>>, app: &mut App) -> 
                 // Start audio engine after splash is ready
                 let audio = app.ui.audio.clone();
                 let mut eng = engine::AudioEngine::new(audio.sample_rate, audio.buffer_size);
+                // Armed before a single block is rendered: the run-away it
+                // exists for can happen on the first one.
+                choz_engine::feedback::arm(audio.feedback_guard);
                 eng.set_backend_preference(&audio.backend);
                 if !audio.device.is_empty() {
                     eng.set_output_device_preference(&audio.device);
@@ -6072,6 +6342,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Screen>>, app: &mut App) -> 
         app.drain_midi();
         app.tick_arps();
         app.tick_notes();
+        app.publish_chord();
         app.poll_editor();
         app.poll_plugin_touch();
         app.tick_automation();
@@ -6763,9 +7034,10 @@ fn handle_fx_keys(app: &mut App, key: KeyCode) {
         // Enter opens the list. Stepping through eighteen Winamp presets with
         // an arrow key is a knob pretending to be a menu.
         KeyCode::Enter if app.rack_focus == RackFocus::Arp => {
-            // A knob with names is a list; one with two places just flips.
+            // A knob with names is a list; one with two places flips — **both
+            // ways**, so Enter turns the arpeggiator off as readily as on.
             if !app.open_arp_choice(app.arp_param) {
-                app.nudge_arp_knob(app.arp_param, 1.0);
+                app.press_arp_knob(app.arp_param);
             }
         }
         KeyCode::Enter if app.rack_focus != RackFocus::Instrument => {
@@ -7303,6 +7575,7 @@ fn apply_menu_action(app: &mut App, action: menu::MenuAction) {
         A::PluginPaths => app.open_paths_modal(),
         A::SaveProject => app.open_save_project(),
         A::LoadProject => app.open_load_project(),
+        A::ImportMax => app.open_import_max(),
         A::RescanPlugins => {
             app.discover_synths(true);
             eprintln!("choz: rescanned plugin paths: {} found", app.plugins.len());
@@ -7962,9 +8235,30 @@ fn ui(f: &mut Frame, app: &mut App) {
             .iter()
             .position(|s| s.in_pair.is_some() && s.pitch_to_midi);
         app.keyboard.feed_converted(
+            views::midi_monitor::Converted::PitchToMidi,
             converting.and_then(|_| choz_engine::meter::pitch_meter().note()),
             converting,
         );
+        // And what AutoTune is aiming at, for the same reason: it decides a
+        // note in the callback, corrects towards it, and says so nowhere a
+        // player can watch. The tab is the first one with an AutoTune enabled —
+        // the meter is one per process, so with two of them the last one to run
+        // is the one being shown, which is what its own readout does too.
+        let tuning = app.slots.iter().position(|s| {
+            s.fx_chain
+                .iter()
+                .any(|e| e.enabled && e.kind == source::AudioFxKind::AutoTune)
+        });
+        let tuned = tuning.and_then(|_| {
+            let m = choz_engine::fx::autotune::meter::meter().read();
+            (m.voiced && m.target_frequency > 0.0).then(|| {
+                (69.0f32 + 12.0 * (m.target_frequency / 440.0).log2())
+                    .round()
+                    .clamp(0.0, 127.0) as u8
+            })
+        });
+        app.keyboard
+            .feed_converted(views::midi_monitor::Converted::AutoTune, tuned, tuning);
         // The FFT runs here, on the UI thread, and only while its tab is on
         // screen. The rate comes from the transport, which the engine sets when
         // the stream opens — the analyser has no other way to know what a bin
@@ -9942,6 +10236,46 @@ mod tests {
             .arp
             .tick(t + std::time::Duration::from_millis(500), &mut out);
         assert!(out.is_empty(), "already stopped by the toggle: {out:?}");
+    }
+
+    /// **Enter turns the arpeggiator off as well as on.**
+    ///
+    /// Its switch is the first knob of the box, and Enter used to *nudge* that
+    /// knob up — which on something with two positions means "on" and then
+    /// "on" again. Reported as exactly that: no way to stop it from the
+    /// keyboard. A switch is pressed, not nudged; the other knobs still step.
+    #[test]
+    fn enter_flips_the_arpeggiators_switch_both_ways() {
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        app.rack_focus = RackFocus::Arp;
+        // The switch is the first knob; the cursor starts there.
+        app.arp_param = 0;
+        assert_eq!(app.arp_knobs()[0].1, "ARP");
+        assert!(!app.slots[0].arp.is_on());
+
+        handle_fx_keys(&mut app, KeyCode::Enter);
+        assert!(app.slots[0].arp.is_on(), "Enter starts it");
+
+        handle_fx_keys(&mut app, KeyCode::Enter);
+        assert!(!app.slots[0].arp.is_on(), "and Enter stops it");
+
+        // And nothing else about Enter moved: on a knob whose positions have
+        // names it still opens the list rather than flipping anything.
+        app.edit_arp(ArpEdit::Toggle);
+        let mode = app
+            .arp_knobs()
+            .iter()
+            .position(|(p, ..)| *p == arp::ArpParam::Mode)
+            .expect("the mode knob is in the box");
+        app.arp_param = mode;
+        handle_fx_keys(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::ArpChoice),
+            "a list of names opens as a list"
+        );
     }
 
     /// The buttons on the ARP line are drawn where they are clicked, and only
@@ -12773,6 +13107,226 @@ mod tests {
         );
     }
 
+    /// The interface's list of built-ins and the engine's are the same list.
+    ///
+    /// They are written down twice — the interface needs a category, a label
+    /// and a parameter layout the engine has no use for — so what keeps them
+    /// honest is this: an effect the interface offers and the engine cannot
+    /// build is a dead row, and one the engine has that the interface never
+    /// lists is an effect nobody can reach (and, since the CLAP export walks
+    /// the engine's list, one that exists *outside* choz but not inside it).
+    #[test]
+    fn the_interface_and_the_engine_agree_on_which_effects_exist() {
+        let ui: std::collections::BTreeSet<&str> =
+            source::ALL_FX_KINDS.iter().map(|k| k.id()).collect();
+        let engine: std::collections::BTreeSet<&str> = choz_engine::fx_chain::BUILT_IN_KINDS
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(
+            ui.difference(&engine).collect::<Vec<_>>(),
+            Vec::<&&str>::new(),
+            "the interface offers effects the engine cannot build"
+        );
+        assert_eq!(
+            engine.difference(&ui).collect::<Vec<_>>(),
+            Vec::<&&str>::new(),
+            "the engine has effects nothing in the interface lists"
+        );
+    }
+
+    /// A saved tab finds its jacks by **name**, because the index moves.
+    ///
+    /// Unplug an interface and every capture index past it shifts by two, so a
+    /// project reopened without the card used to listen to somebody else's
+    /// microphone and say nothing. Names first; and when the jack is really
+    /// gone the routing is dropped rather than guessed, because a tab playing
+    /// its instrument is obvious and the wrong microphone is not.
+    #[test]
+    fn a_saved_tab_finds_its_capture_jacks_by_name() {
+        let mixer = |ports: Option<(&str, &str)>| project::Mixer {
+            gain: 1.0,
+            pan: 0.0,
+            mute: false,
+            solo: false,
+            out_pair: Some((0, 1)),
+            in_pair: Some((0, 1)),
+            in_ports: ports.map(|(l, r)| (l.to_string(), r.to_string())),
+            pitch_to_midi: false,
+            pitch_mix: None,
+            in_gain: None,
+            in_gate: None,
+        };
+        // The card that was first when this was saved is now second: the
+        // indices say 0/1 and the names say otherwise. The names win.
+        let now = [
+            "onboard:capture_1".to_string(),
+            "onboard:capture_2".to_string(),
+            "UMC1820:capture_1".to_string(),
+            "UMC1820:capture_2".to_string(),
+        ];
+        assert_eq!(
+            resolve_in_pair(&now, &mixer(Some(("UMC1820:capture_1", "UMC1820:capture_2")))),
+            Some((2, 3))
+        );
+
+        // The card is not plugged in at all: no audio in, rather than the
+        // laptop's microphone pretending to be it.
+        assert_eq!(
+            resolve_in_pair(&now, &mixer(Some(("MOTU:capture_7", "MOTU:capture_8")))),
+            None
+        );
+
+        // A project written before the names existed still says what it can.
+        assert_eq!(resolve_in_pair(&now, &mixer(None)), Some((0, 1)));
+    }
+
+    /// The harmoniser's MIDI input: a switch, a channel, the active tab as the
+    /// reference — and nothing at all in MULTI.
+    #[test]
+    fn the_harmonizer_follows_the_keyboard_only_when_it_is_asked_to() {
+        use views::midi_monitor::Converted;
+        let chord = choz_engine::chord::chord();
+        chord.clear();
+
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        app.fx_chain
+            .push(AudioFxEntry::new(source::AudioFxKind::Harmonizer));
+
+        // A chord held on channel 3, routed to the tab on screen.
+        for note in [60u8, 64, 67] {
+            app.keyboard.feed(
+                &midi::InputEvent::Note(midi::NoteMsg {
+                    source: choz_engine::input::InputSource::Midi(0),
+                    channel: 2,
+                    on: true,
+                    note,
+                    vel: 100,
+                }),
+                Some(0),
+            );
+        }
+        let _ = Converted::PitchToMidi;
+
+        // The switch is off: nothing is published, whatever is held.
+        app.publish_chord();
+        let mut out = [0u8; choz_engine::chord::MAX_NOTES];
+        assert_eq!(chord.read(&mut out), 0, "off means off");
+
+        // On, and pointed at channel 3 (the knob is 0..1 across sixteen).
+        app.fx_chain[0].params[9] = 1.0;
+        app.fx_chain[0].params[10] = 2.0 / 15.0;
+        app.publish_chord();
+        assert_eq!(chord.read(&mut out), 3, "the chord reaches the effect");
+        assert_eq!(&out[..3], &[60, 64, 67]);
+
+        // Another channel: the same keys are somebody else's.
+        app.fx_chain[0].params[10] = 0.0;
+        app.publish_chord();
+        assert_eq!(chord.read(&mut out), 0, "channel 1 is not channel 3");
+
+        // MULTI turns the whole thing off: there, every tab answers its own
+        // channel and one process-wide chord would be the wrong keyboard.
+        app.fx_chain[0].params[10] = 2.0 / 15.0;
+        app.publish_chord();
+        assert_eq!(chord.read(&mut out), 3);
+        app.ui.rack_mode = settings::RackMode::Multi;
+        app.publish_chord();
+        assert_eq!(chord.read(&mut out), 0, "no chord in MULTI");
+        chord.clear();
+    }
+
+    /// A Max patch imports into the chain, and the report names what it could
+    /// not bring — which is the half of an import that is worth reading.
+    #[test]
+    fn a_max_patch_imports_what_it_can_and_names_what_it_cannot() {
+        let dir = std::env::temp_dir().join("choz-ui-maxpat");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let patch = dir.join("guitar.maxpat");
+        std::fs::write(
+            &patch,
+            r#"{"patcher":{"boxes":[
+                {"box":{"id":"obj-1","maxclass":"newobj","text":"adc~"}},
+                {"box":{"id":"obj-2","maxclass":"newobj","text":"overdrive~"}},
+                {"box":{"id":"obj-3","maxclass":"newobj","text":"gizmo~ 2048"}},
+                {"box":{"id":"obj-4","maxclass":"newobj","text":"freeverb~"}},
+                {"box":{"id":"obj-5","maxclass":"newobj","text":"dac~"}}
+            ],"lines":[
+                {"patchline":{"source":["obj-1",0],"destination":["obj-2",0]}},
+                {"patchline":{"source":["obj-2",0],"destination":["obj-3",0]}},
+                {"patchline":{"source":["obj-3",0],"destination":["obj-4",0]}},
+                {"patchline":{"source":["obj-4",0],"destination":["obj-5",0]}}
+            ]}}"#,
+        )
+        .unwrap();
+
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        app.import_maxpat(&patch);
+
+        let kinds: Vec<&str> = app.fx_chain.iter().map(|e| e.kind.label()).collect();
+        assert_eq!(kinds, vec!["SATURATOR", "REVERB"], "in signal order");
+
+        let modal = app.modal.as_ref().expect("the report opens by itself");
+        assert_eq!(modal.kind, ModalKind::MaxReport);
+        let report = modal.list.items.join("\n");
+        assert!(report.contains("gizmo~"), "it names what it dropped:\n{report}");
+        assert!(report.contains("SATURATOR"), "and what it kept:\n{report}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The feedback guard is a switch in Settings and a reading in the IN
+    /// drawer, and both say the same thing.
+    ///
+    /// A guard that is working invisibly is indistinguishable from the room
+    /// having gone quiet on its own — which is exactly the moment a player
+    /// needs to know it was choz that pulled the microphone down.
+    #[test]
+    fn the_feedback_guard_is_switchable_and_says_when_it_is_holding() {
+        let _guard = ui_guard();
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.in_ports = vec!["capture_1".to_string(), "capture_2".to_string()];
+
+        // Armed by default, and the row says so.
+        assert!(app.ui.audio.feedback_guard);
+        let rows = app.engine_rows();
+        let row = rows
+            .iter()
+            .find(|r| r.contains("Feedback guard"))
+            .expect("the row is in the Engine section");
+        assert!(row.contains("ON"), "{row}");
+
+        // Holding something down: both the row and the drawer say how much.
+        choz_engine::meter::capture_health().guard(-18.0);
+        let rows = app.engine_rows();
+        let row = rows.iter().find(|r| r.contains("Feedback guard")).unwrap();
+        assert!(row.contains("holding"), "{row}");
+        let drawer = app.in_targets();
+        assert!(
+            drawer.iter().any(|(_, row)| row.name.contains("GUARD")),
+            "the drawer says it too: {:?}",
+            drawer.iter().map(|(_, r)| &r.name).collect::<Vec<_>>()
+        );
+
+        // Off is off, everywhere: the engine's own switch follows the setting.
+        app.ui.audio.feedback_guard = false;
+        choz_engine::feedback::arm(false);
+        assert!(!choz_engine::feedback::armed());
+        let rows = app.engine_rows();
+        let row = rows.iter().find(|r| r.contains("Feedback guard")).unwrap();
+        assert!(row.contains("OFF"), "{row}");
+
+        choz_engine::feedback::arm(true);
+        choz_engine::meter::capture_health().clear();
+    }
+
     /// AutoTune is a built-in like any other: it is in the ADD FX list, under a
     /// category of its own, and it builds into a real processor.
     #[test]
@@ -13553,8 +14107,7 @@ mod tests {
             .filter(|(b, _)| {
                 matches!(
                     b,
-                    B::ArpOn
-                        | B::ArpTap
+                    B::ArpTap
                         | B::ArpMode
                         | B::ArpDiv
                         | B::ArpRateDown
@@ -13568,7 +14121,9 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(arp.len(), 12, "every switch is drawn: {arp:?}");
+        // Eleven: the arpeggiator's own controls. Its on/off is not among them
+        // any more — that switch is the button on the ALGO row above.
+        assert_eq!(arp.len(), 11, "every switch is drawn: {arp:?}");
         for (b, r) in &arp {
             assert!(r.x + r.width <= 80, "{b:?} runs past the panel: {r:?}");
         }

@@ -917,6 +917,11 @@ mod tests {
     /// gone by can only ever be played late.
     #[test]
     fn a_synced_step_is_scheduled_ahead_of_the_sample_it_is_for() {
+        // The transport is one per process and several tests move it; they all
+        // take turns on the same lock. Without this the step was measured
+        // against a playhead another test had just rewound, which failed about
+        // one run in four and looked like a timing bug for four sessions.
+        let _g = crate::views::theme::ui_guard();
         let t = choz_ports::transport();
         let was = t.playing();
         t.set_sample_rate(48_000);
@@ -982,6 +987,7 @@ mod tests {
     /// "now" — exactly what they were before any of this.
     #[test]
     fn the_free_running_clock_still_plays_immediately() {
+        let _g = crate::views::theme::ui_guard();
         let t = choz_ports::transport();
         let was = t.playing();
         t.set_playing(false);
