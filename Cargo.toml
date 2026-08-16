@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/choz-ports", "crates/choz-engine", "crates/choz-plugin-clap", "crates/choz-plugin-lv2", "crates/choz-plugin-ladspa", "crates/choz-plugin-vst2", "crates/choz-plugin-vst3", "crates/choz-plugin-sandbox", "crates/choz-plugin-pd", "crates/choz-ui"]
+members = ["crates/choz-ports", "crates/choz-engine", "crates/choz-plugin-clap", "crates/choz-plugin-lv2", "crates/choz-plugin-ladspa", "crates/choz-plugin-vst2", "crates/choz-plugin-vst3", "crates/choz-plugin-sandbox", "crates/choz-plugin-pd", "crates/choz-plugin-clap-export", "crates/choz-ui"]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "A terminal-based audio plugin host — like Carla for the terminal"
 
@@ -34,6 +34,7 @@ choz-plugin-ladspa = { path = "crates/choz-plugin-ladspa" }
 choz-plugin-vst2 = { path = "crates/choz-plugin-vst2" }
 choz-plugin-vst3 = { path = "crates/choz-plugin-vst3" }
 choz-plugin-sandbox = { path = "crates/choz-plugin-sandbox" }
+choz-plugin-clap-export = { path = "crates/choz-plugin-clap-export" }
 
 # ─── Release profile ──────────────────────────────────────────────────────────
 #

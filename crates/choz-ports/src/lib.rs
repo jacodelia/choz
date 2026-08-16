@@ -550,6 +550,21 @@ impl Transport {
         self.samples() as f64 / self.sample_rate() as f64 * (self.bpm() as f64 / 60.0)
     }
 
+    /// Put the clock at `beats` quarter notes, which is where a **host's**
+    /// transport says we are.
+    ///
+    /// choz's own clock is counted in frames and only ever moves forward, so
+    /// this is the one door for a timeline somebody else owns: the exported
+    /// CLAP plugins follow the DAW they are loaded into. Converting through
+    /// frames rather than storing beats keeps a single source of position —
+    /// two of them would disagree the moment the tempo changed.
+    pub fn set_position_beats(&self, beats: f64) {
+        let per_beat = self.sample_rate() as f64 * 60.0 / self.bpm().max(1.0) as f64;
+        let samples = (beats.max(0.0) * per_beat) as u64;
+        self.samples
+            .store(samples, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// A bar's length in quarter notes. 4/4 is four, 6/8 is three, 7/8 is 3.5 —
     /// the numerator counts notes of `1/denominator`, and a quarter is four of
     /// the denominator's own units.

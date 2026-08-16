@@ -306,12 +306,13 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "choz-engine"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "choz-plugin-clap",
  "choz-plugin-ladspa",
  "choz-plugin-lv2",
+ "choz-plugin-pd",
  "choz-plugin-sandbox",
  "choz-plugin-vst2",
  "choz-plugin-vst3",
@@ -334,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "choz-plugin-clap"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "choz-ports",
@@ -346,8 +347,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "choz-plugin-clap-export"
+version = "1.1.0"
+dependencies = [
+ "choz-engine",
+ "choz-plugin-clap",
+ "choz-ports",
+ "clap-sys",
+]
+
+[[package]]
 name = "choz-plugin-ladspa"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "choz-ports",
@@ -356,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "choz-plugin-lv2"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "choz-ports",
@@ -371,15 +382,16 @@ dependencies = [
 
 [[package]]
 name = "choz-plugin-pd"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
+ "choz-plugin-sandbox",
  "choz-ports",
 ]
 
 [[package]]
 name = "choz-plugin-sandbox"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -387,7 +399,7 @@ dependencies = [
 
 [[package]]
 name = "choz-plugin-vst2"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "choz-ports",
@@ -396,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "choz-plugin-vst3"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "choz-ports",
@@ -407,11 +419,11 @@ dependencies = [
 
 [[package]]
 name = "choz-ports"
-version = "1.0.0"
+version = "1.1.0"
 
 [[package]]
 name = "choz-ui"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "base64-simd",
