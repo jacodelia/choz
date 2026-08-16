@@ -438,7 +438,10 @@ unsafe extern "C" fn ports_get(
     if index != 0 || info.is_null() {
         return false;
     }
-    let mut name = [0i8; clap_sys::string_sizes::CLAP_NAME_SIZE];
+    // `c_char` is `i8` on x86_64 and **`u8` on ARM**, so writing the array as
+    // `[0i8; _]` compiles here and fails on a Raspberry Pi build. Let the
+    // platform say what a char is.
+    let mut name = [0 as c_char; clap_sys::string_sizes::CLAP_NAME_SIZE];
     for (slot, byte) in name.iter_mut().zip(b"Stereo\0".iter()) {
         *slot = *byte as c_char;
     }
@@ -490,7 +493,10 @@ unsafe extern "C" fn params_get_info(
         None if index == exported.params.len() => (MIX_NAME, 1.0),
         None => return false,
     };
-    let mut name = [0i8; clap_sys::string_sizes::CLAP_NAME_SIZE];
+    // `c_char` is `i8` on x86_64 and **`u8` on ARM**, so writing the array as
+    // `[0i8; _]` compiles here and fails on a Raspberry Pi build. Let the
+    // platform say what a char is.
+    let mut name = [0 as c_char; clap_sys::string_sizes::CLAP_NAME_SIZE];
     for (slot, byte) in name.iter_mut().zip(label.as_bytes().iter()) {
         *slot = *byte as c_char;
     }
@@ -961,7 +967,8 @@ mod tests {
             let plugin = open("org.choz.fx.delay");
             let params = ((*plugin).get_extension.unwrap())(plugin, CLAP_EXT_PARAMS.as_ptr())
                 as *const clap_plugin_params;
-            let mut buffer = [0i8; 64];
+            // `c_char`, not `i8`: the same thing on x86_64, `u8` on ARM.
+            let mut buffer = [0 as c_char; 64];
             assert!(((*params).value_to_text.unwrap())(
                 plugin,
                 0,
