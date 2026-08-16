@@ -23,6 +23,7 @@ optdepends=(
   'jack2: JACK/PipeWire routing and per-channel outputs'
   'pipewire-jack: same, on a PipeWire system'
   'kitty: the terminal the launcher prefers — wallpaper at real pixel resolution'
+  'puredata: hosting Pure Data patches as effects and input algorithms'
 )
 provides=('choz')
 conflicts=('choz')
@@ -60,6 +61,18 @@ package() {
     install -Dm644 "desktop/icons/$size/choz.png" \
       "$pkgdir/usr/share/icons/hicolor/$size/apps/choz.png"
   done
+
+  # The wallpapers a fresh install opens with, and where the picker starts.
+  for image in assets/*.jpg assets/*.png; do
+    [ -f "$image" ] || continue
+    install -Dm644 "$image" "$pkgdir/usr/share/choz/wallpapers/$(basename "$image")"
+  done
+
+  # choz's own 45 effects as a CLAP plugin, in the directory every CLAP host
+  # already searches, and the Pure Data child (the only binary linking libpd).
+  [ -f libchoz_plugin_clap_export.so ] &&
+    install -Dm644 libchoz_plugin_clap_export.so "$pkgdir/usr/lib/clap/choz.clap"
+  [ -f choz-pd-host ] && install -Dm755 choz-pd-host "$pkgdir/usr/bin/choz-pd-host"
 
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"

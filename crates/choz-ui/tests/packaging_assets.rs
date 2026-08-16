@@ -82,18 +82,42 @@ fn the_deb_carries_the_desktop_files_in_the_base_table() {
     );
 
     for source in sources {
-        // The binary is the one path cargo-deb resolves itself: written exactly
-        // like this it is recognised as the Cargo target dir and rewritten under
-        // `--target`, which is what keeps the host binary out of an ARM package.
-        // It only exists after a release build, so it is not checked for here.
-        if source == "target/release/choz" {
-            continue;
-        }
         assert!(
-            root().join(&source).exists(),
+            exists(&source),
             "{source} is declared in the .deb and does not exist",
         );
     }
+}
+
+/// Whether a declared asset source is really there.
+///
+/// Two shapes are not plain files and are checked for what they are instead:
+///
+/// * **Anything under `target/release/`** is a build artefact — the binary, the
+///   CLAP bundle, the Pure Data child — and only exists after a release build.
+///   The binary is also the one path cargo-deb resolves itself: written exactly
+///   like this it is recognised as the Cargo target dir and rewritten under
+///   `--target`, which is what keeps a host binary out of an ARM package.
+/// * **A glob** (the wallpapers) is checked as "the directory is there and
+///   something in it matches", which is the thing that would actually break.
+fn exists(source: &str) -> bool {
+    // Paths are written relative to the crate that declares them, so they are
+    // resolved from there — `../../assets/…` is the repository's.
+    if source.trim_start_matches("../../").starts_with("target/release/") {
+        return true;
+    }
+    let Some((dir, pattern)) = source.rsplit_once('/') else {
+        return root().join(source).exists();
+    };
+    let Some(extension) = pattern.strip_prefix("*.") else {
+        return root().join(source).exists();
+    };
+    let Ok(entries) = std::fs::read_dir(root().join(dir)) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|e| e.path().extension().is_some_and(|x| x == extension))
 }
 
 /// Every asset source in a section: the first quoted string on a line inside an
@@ -123,11 +147,8 @@ fn the_rpm_carries_them_too() {
         );
     }
     for source in sources(&rpm) {
-        if source.ends_with("target/release/choz") {
-            continue;
-        }
         assert!(
-            root().join(&source).exists(),
+            exists(&source),
             "{source} is declared in the .rpm and does not exist",
         );
     }

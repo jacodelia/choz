@@ -237,6 +237,63 @@ fn the_installer_uses_the_binary_shipped_beside_it() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// choz's own effects go where other hosts look, **by default**, and
+/// `--uninstall` takes them away again.
+///
+/// They are choz's own DSP rather than somebody else's plugin, so a default
+/// install ships them; `--no-clap` is for whoever does not want them. The
+/// bundle is prebuilt here — building it inside a test would cost a release
+/// compile of the whole engine.
+#[test]
+fn the_clap_bundle_is_installed_by_default_and_removable() {
+    let tmp = std::env::temp_dir().join(format!("choz_clap_install_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (prefix, home) = (tmp.join("prefix"), tmp.join("home"));
+    std::fs::create_dir_all(&home).unwrap();
+    // Stand in for the built cdylib: the script only copies it.
+    let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/release");
+    std::fs::create_dir_all(&target).unwrap();
+    let bundle = target.join("libchoz_plugin_clap_export.so");
+    let existed = bundle.exists();
+    if !existed {
+        std::fs::write(&bundle, b"not really a plugin").unwrap();
+    }
+
+    let out = run(
+        &prefix,
+        &home,
+        &["--binary", env!("CARGO_BIN_EXE_choz"), "--skip-deps-check"],
+    );
+    let installed = home.join(".clap/choz.clap");
+    assert!(installed.exists(), "the bundle is installed: {out}");
+    assert!(out.contains("45 effects"), "and it says so: {out}");
+    // And the wallpapers, which is what a fresh install opens with.
+    let wallpaper = prefix.join("share/choz/wallpapers/wallpaper.jpg");
+    assert!(wallpaper.exists(), "the wallpapers ship too: {out}");
+
+    let out = run(&prefix, &home, &["--uninstall"]);
+    assert!(!installed.exists(), "and uninstall takes it away: {out}");
+    assert!(!wallpaper.exists(), "wallpapers too: {out}");
+
+    // Whoever does not want the plugin says so.
+    let out = run(
+        &prefix,
+        &home,
+        &[
+            "--binary",
+            env!("CARGO_BIN_EXE_choz"),
+            "--skip-deps-check",
+            "--no-clap",
+        ],
+    );
+    assert!(!installed.exists(), "--no-clap means no plugin: {out}");
+
+    if !existed {
+        let _ = std::fs::remove_file(&bundle);
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 fn copy_tree(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap() {

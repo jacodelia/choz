@@ -68,8 +68,18 @@ jobs:
           targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install Pure Data (libpd)
+        run: sudo apt-get update && sudo apt-get install -y puredata-dev
+
       - name: Build release binary
         run: cargo build --release --locked --bin ${{ env.BIN }}
+
+      # Shipped with choz: its own effects for other hosts, and the child that
+      # runs Pure Data patches (the only binary that links libpd).
+      - name: Build the CLAP bundle and the Pure Data host
+        run: |
+          cargo build --release --locked -p choz-plugin-clap-export
+          cargo build --release --locked -p choz-plugin-pd --features pd
 
       - name: Package tarball
         shell: bash
@@ -84,6 +94,14 @@ jobs:
           cp README.md LICENSE "dist/${NAME}/"
           cp packaging/install.sh "dist/${NAME}/"
           cp -r packaging/desktop "dist/${NAME}/"
+          # The wallpapers a fresh install opens with, choz's own effects as a
+          # CLAP plugin, and the Pure Data child. `install.sh` looks for all
+          # three beside itself.
+          cp -r assets "dist/${NAME}/"
+          cp target/release/libchoz_plugin_clap_export.so "dist/${NAME}/"
+          strip "dist/${NAME}/libchoz_plugin_clap_export.so"
+          cp target/release/choz-pd-host "dist/${NAME}/"
+          strip "dist/${NAME}/choz-pd-host"
           tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
           rm -rf "dist/${NAME}"
 

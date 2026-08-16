@@ -5,6 +5,8 @@
 #   ./packaging/install.sh --prefix /usr/local
 #   ./packaging/install.sh --binary target/release/choz     skip the build
 #   ./packaging/install.sh --skip-deps-check      install without checking ALSA
+#   ./packaging/install.sh --no-clap      skip choz's own effects as a CLAP
+#                                         plugin (they are installed by default)
 #   ./packaging/install.sh --uninstall
 #
 # What it will never touch, install or uninstall: ~/.local/state/choz. The
@@ -15,6 +17,12 @@ PREFIX="${PREFIX:-$HOME/.local}"
 BINARY=""
 UNINSTALL=0
 SKIP_DEPS=0
+# choz's 45 effects as one `.clap`, for Bitwig/Reaper/Carla. Installed **with
+# the program**: they are choz's own DSP, not a third-party plugin, and a host
+# that ships its effects only to itself is a host whose effects nobody else can
+# use. `--no-clap` skips it; `CLAP_DIR` moves it.
+WITH_CLAP=1
+CLAP_DIR="${CLAP_DIR:-$HOME/.clap}"
 # Where an older copy may be hiding, whatever prefix is asked for now.
 # `CHOZ_SEARCH_BINS` narrows that (the test suite sets it empty): this list is
 # the one thing here that reaches outside `--prefix`, and deleting a binary
@@ -30,12 +38,15 @@ while [ $# -gt 0 ]; do
         --binary) BINARY="${2:?--binary needs a path}"; shift 2 ;;
         --uninstall) UNINSTALL=1; shift ;;
         --skip-deps-check) SKIP_DEPS=1; shift ;;
+        --with-clap) WITH_CLAP=1; shift ;;
+        --no-clap) WITH_CLAP=0; shift ;;
         -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
 done
 
 BIN_DIR="$PREFIX/bin"
+WALLPAPER_DIR="$PREFIX/share/choz/wallpapers"
 APP_DIR="$PREFIX/share/applications"
 ICON_DIR="$PREFIX/share/icons/hicolor/scalable/apps"
 # The raster sizes. **Not a nicety**: GTK 3 loads theme icons through
@@ -58,6 +69,9 @@ remove_installed() {
             say "cannot remove $bin ($version): no write permission — try sudo"
         fi
     done
+    [ -f "$CLAP_DIR/choz.clap" ] && rm -f "$CLAP_DIR/choz.clap"
+    [ -f "$BIN_DIR/choz-pd-host" ] && rm -f "$BIN_DIR/choz-pd-host"
+    [ -d "$WALLPAPER_DIR" ] && rm -rf "$WALLPAPER_DIR"
     for f in "$BIN_DIR/choz-launcher" "$APP_DIR/choz.desktop" \
              "$ICON_DIR/choz.svg" "$MIME_DIR/choz-project.xml"; do
         [ -e "$f" ] && rm -f "$f" && say "removed $f"
@@ -88,6 +102,10 @@ if [ "$UNINSTALL" = 1 ]; then
     exit 0
 fi
 
+# Whether Pure Data support goes in. Decided by the dependency check below,
+# because it is what has to link.
+WITH_PD=1
+
 # What choz needs on the machine that runs it. Checked rather than assumed: the
 # binary links ALSA and glibc, and *dlopens* libjack at runtime — so JACK and
 # PipeWire are optional, and a box without them still gets audio through ALSA.
@@ -106,6 +124,21 @@ check_runtime_deps() {
     if ! command -v ldconfig >/dev/null 2>&1; then
         say "note: no ldconfig here, so the runtime libraries were not checked"
         return 0
+    fi
+    # Pure Data. choz builds `choz-pd-host` with `--features pd`, which links
+    # libpd — so without it the build fails rather than quietly producing a
+    # choz that cannot open a patch. Named here, with the package to install.
+    # Pure Data. Part of a default install, so it is asked for by name — but
+    # **not fatal**: without it choz installs and runs, with the one feature
+    # missing and said out loud, which beats refusing to install over an
+    # effect format somebody may never open.
+    if ! ldconfig -p 2>/dev/null | grep -q 'libpd\.so'; then
+        WITH_PD=0
+        say "libpd is missing — Pure Data patches will not be hostable."
+        say "  Debian/Ubuntu: sudo apt install puredata-dev"
+        say "  Arch:          sudo pacman -S puredata      (libpd from the AUR)"
+        say "  Fedora:        sudo dnf install puredata-devel"
+        say "  Install it and run this again to get that half."
     fi
     if ! ldconfig -p 2>/dev/null | grep -q 'libasound\.so\.2'; then
         say "libasound.so.2 (ALSA) is missing — choz would start and open no audio device."
@@ -130,16 +163,23 @@ if [ -z "$BINARY" ] && [ -x "$HERE/choz" ]; then
     say "using the binary shipped next to this script ($BINARY)"
 fi
 
+# The dependency check runs **before** the build: whether libpd is here decides
+# what gets built, not just what gets warned about.
+check_runtime_deps
+
 if [ -z "$BINARY" ]; then
     command -v cargo >/dev/null 2>&1 || die "no cargo and no --binary; nothing to install"
     say "building (release)…"
     ( cd "$HERE/.." && cargo build --release --bin choz )
     BINARY="$HERE/../target/release/choz"
+    if [ "$WITH_PD" -eq 1 ]; then
+        say "building the Pure Data host…"
+        ( cd "$HERE/.." && cargo build --release -p choz-plugin-pd --features pd )
+    fi
 fi
 [ -x "$BINARY" ] || die "$BINARY is not an executable"
 
 new_version=$("$BINARY" --version 2>/dev/null || echo "choz (unknown)")
-check_runtime_deps
 
 # Upgrade means replacing what is there, not installing alongside it.
 remove_installed
@@ -155,7 +195,56 @@ for size in $ICON_SIZES; do
         "$PREFIX/share/icons/hicolor/$size/apps/choz.png"
 done
 install -m 644 "$HERE/desktop/choz-project.xml" "$MIME_DIR/choz-project.xml"
+
+# The wallpapers ship with the program: a fresh install opens on the one choz
+# was built with rather than on a bare terminal, and the picker starts here.
+# Looked for beside this script first (a release tarball) and in the repository
+# second (a checkout).
+for dir in "$HERE/../assets" "$HERE/assets"; do
+    [ -d "$dir" ] || continue
+    mkdir -p "$WALLPAPER_DIR"
+    for image in "$dir"/*.jpg "$dir"/*.png; do
+        [ -f "$image" ] || continue
+        install -m 644 "$image" "$WALLPAPER_DIR/$(basename "$image")"
+    done
+    say "installed the wallpapers into $WALLPAPER_DIR"
+    break
+done
+
+# The Pure Data child. It is the only binary that links libpd, and the engine
+# looks for it next to choz itself.
+if [ "$WITH_PD" -eq 1 ] && [ -x "$HERE/../target/release/choz-pd-host" ]; then
+    install -m 755 "$HERE/../target/release/choz-pd-host" "$BIN_DIR/choz-pd-host"
+    say "installed the Pure Data host"
+elif [ "$WITH_PD" -eq 1 ] && [ -x "$HERE/choz-pd-host" ]; then
+    install -m 755 "$HERE/choz-pd-host" "$BIN_DIR/choz-pd-host"
+    say "installed the Pure Data host"
+fi
+
 say "installed $new_version into $PREFIX"
+
+# choz's own effects, for other hosts. Part of the install: they are choz's DSP,
+# and a host that keeps its effects to itself is one whose effects nobody else
+# can reach. Built here when it is not already, because a shared object has to
+# match the machine — same as choz itself. `--no-clap` skips it.
+if [ "$WITH_CLAP" -eq 1 ]; then
+    bundle="$HERE/../target/release/libchoz_plugin_clap_export.so"
+    [ -f "$bundle" ] || bundle="$HERE/libchoz_plugin_clap_export.so"
+    # Only in a checkout: a release tarball has no Cargo.toml and nothing to
+    # build with, and it ships the bundle beside this script instead.
+    if [ ! -f "$bundle" ] && [ -f "$HERE/../Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
+        say "building choz's effects as a CLAP plugin…"
+        ( cd "$HERE/.." && cargo build --release -p choz-plugin-clap-export )
+        bundle="$HERE/../target/release/libchoz_plugin_clap_export.so"
+    fi
+    if [ -f "$bundle" ]; then
+        mkdir -p "$CLAP_DIR"
+        install -m 644 "$bundle" "$CLAP_DIR/choz.clap"
+        say "installed choz's 45 effects into $CLAP_DIR/choz.clap"
+    else
+        say "note: no CLAP bundle to install (no cargo and none shipped) — skipping"
+    fi
+fi
 
 refresh_caches
 
