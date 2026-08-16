@@ -54,6 +54,17 @@ impl jack::ProcessHandler for JackRt {
 /// A live JACK client. Dropping it deactivates and unregisters everything.
 pub type Handle = AsyncClient<(), JackRt>;
 
+/// The rate the graph is actually running at. `None` when it can't be reached.
+///
+/// This is a **fact**, unlike the rate saved in the settings, which is a wish:
+/// PipeWire hands every JACK client the graph's rate and nothing negotiates it
+/// per client. Asking before the engine builds anything is the only way to
+/// build it for the right rate.
+pub fn graph_rate() -> Option<u32> {
+    let (client, _) = Client::new("choz-probe", ClientOptions::NO_START_SERVER).ok()?;
+    Some(client.sample_rate() as u32)
+}
+
 /// Playback/capture port counts of `sink` as the graph currently publishes it.
 /// `None` when the graph can't be reached; `(0, 0)` when the name is unknown.
 pub fn device_channels(sink: &str) -> Option<(usize, usize)> {
