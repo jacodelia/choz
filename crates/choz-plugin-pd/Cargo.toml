@@ -11,6 +11,14 @@ description = "Pure Data patches as choz effects, one Pd per process"
 default = []
 pd = []
 
+# The child process that runs a patch. Only with the feature: it links libpd,
+# and it is the *only* thing that does — which is what keeps libpd's LGPL out
+# of the choz binary.
+[[bin]]
+name = "choz-pd-host"
+required-features = ["pd"]
+
 [dependencies]
 anyhow.workspace = true
 choz-ports.workspace = true
+choz-plugin-sandbox.workspace = true

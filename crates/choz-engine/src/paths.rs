@@ -20,6 +20,9 @@ pub enum PluginFormat {
     Clap,
     Sf2,
     Sfz,
+    /// Pure Data patches. Not a binary plugin: a text file Pd runs, hosted in
+    /// a process of its own because libpd allows exactly one Pd per process.
+    Pd,
 }
 
 impl PluginFormat {
@@ -33,6 +36,7 @@ impl PluginFormat {
         PluginFormat::Clap,
         PluginFormat::Sf2,
         PluginFormat::Sfz,
+        PluginFormat::Pd,
     ];
 
     pub fn label(self) -> &'static str {
@@ -45,6 +49,7 @@ impl PluginFormat {
             PluginFormat::Clap => "CLAP",
             PluginFormat::Sf2 => "SF2",
             PluginFormat::Sfz => "SFZ",
+            PluginFormat::Pd => "PD",
         }
     }
 
@@ -67,6 +72,7 @@ impl PluginFormat {
             PluginFormat::Clap => Some("CLAP_PATH"),
             PluginFormat::Sf2 => Some("SF2_PATH"),
             PluginFormat::Sfz => Some("SFZ_PATH"),
+            PluginFormat::Pd => Some("PD_PATH"),
         }
     }
 
@@ -80,6 +86,7 @@ impl PluginFormat {
             PluginFormat::Clap => (&["clap"], false),
             PluginFormat::Sf2 => (&["sf2", "sf3"], false),
             PluginFormat::Sfz => (&["sfz"], false),
+            PluginFormat::Pd => (&["pd"], false),
         }
     }
 
@@ -100,6 +107,7 @@ impl PluginFormat {
                 | PluginFormat::Vst3
                 | PluginFormat::Sf2
                 | PluginFormat::Sfz
+                | PluginFormat::Pd
         )
     }
 
@@ -127,6 +135,9 @@ impl PluginFormat {
                 PathBuf::from("/usr/share/soundfonts"),
             ],
             PluginFormat::Sfz => vec![PathBuf::from("/usr/share/sounds/sfz")],
+            // Pd has no installed-patch convention the way plugins do: a patch
+            // is a document. These are where people keep them.
+            PluginFormat::Pd => vec![PathBuf::from("/usr/share/pd/patches")],
         };
         let user_dirs: Vec<Option<PathBuf>> = match self {
             PluginFormat::Ladspa => vec![user(".ladspa")],
@@ -137,6 +148,7 @@ impl PluginFormat {
             PluginFormat::Clap => vec![user(".clap")],
             PluginFormat::Sf2 => vec![user(".local/share/sounds/sf2"), user(".sounds")],
             PluginFormat::Sfz => vec![user(".sfz")],
+            PluginFormat::Pd => vec![user("pd"), user(".local/share/pd"), user("Documents/Pd")],
         };
         dirs.extend(user_dirs.into_iter().flatten());
 
@@ -203,13 +215,31 @@ impl From<PluginPaths> for StoredPaths {
 impl<'de> Deserialize<'de> for PluginPaths {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let stored = StoredPaths::deserialize(d)?;
-        Ok(PluginPaths {
-            entries: stored
-                .entries
-                .into_iter()
-                .filter_map(|(label, dirs)| Some((PluginFormat::from_label(&label)?, dirs)))
-                .collect(),
-        })
+        let mut entries: Vec<(PluginFormat, Vec<SearchDir>)> = stored
+            .entries
+            .into_iter()
+            .filter_map(|(label, dirs)| Some((PluginFormat::from_label(&label)?, dirs)))
+            .collect();
+        // **A format the file has never heard of gets its defaults**, not an
+        // empty list.
+        //
+        // Every `plugin-paths.json` predates whichever format was added last —
+        // and until this, that format arrived with nowhere to look, which reads
+        // as "choz cannot find my patches" and is answered by typing a path by
+        // hand. Found exactly that way: a `PD` section that did not exist,
+        // because the file was written before Pure Data was a format.
+        //
+        // Only the formats the file does *not* mention are filled in: a user
+        // who has edited a list, including down to nothing, has said something
+        // and it stands.
+        let defaults = PluginPaths::default();
+        for (format, dirs) in defaults.entries {
+            if !entries.iter().any(|(f, _)| *f == format) {
+                entries.push((format, dirs));
+            }
+        }
+        entries.sort_by_key(|(f, _)| *f);
+        Ok(PluginPaths { entries })
     }
 }
 
@@ -317,9 +347,26 @@ pub fn scan_dir(dir: &Path, format: PluginFormat) -> Vec<FoundPlugin> {
     let (exts, bundles) = format.matcher();
     let mut out = Vec::new();
     scan_into(dir, format, exts, bundles, 0, &mut out);
+    if format == PluginFormat::Pd {
+        out.retain(pd_effect);
+    }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out.dedup_by(|a, b| a.path == b.path);
     out
+}
+
+/// A `.pd` file is a document, not a plugin: half of them are a GUI, a helper
+/// or an abstraction with nothing to connect audio to. The file says which it
+/// is — it is text — so the scan reads it instead of listing patches that
+/// cannot be an effect.
+fn pd_effect(found: &FoundPlugin) -> bool {
+    match choz_plugin_pd::read_patch(&found.path) {
+        Ok(info) => info.role() == choz_plugin_pd::PatchRole::Effect,
+        Err(e) => {
+            eprintln!("choz: cannot read {}: {e}", found.path.display());
+            false
+        }
+    }
 }
 
 /// The single-path counterpart of [`scan_dir`]: describe `path` itself when it
@@ -417,6 +464,75 @@ pub fn formats_present(dir: &Path) -> Vec<(PluginFormat, usize)> {
 mod tests {
     use super::*;
 
+    /// A directory of `.pd` files is a directory of documents: only the ones
+    /// that actually process audio are effects. The file says so in text, so
+    /// this holds on a machine with no Pure Data at all.
+    #[test]
+    fn only_the_patches_that_process_audio_are_listed_as_effects() {
+        let dir = std::env::temp_dir().join("choz-paths-pd");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("gain.pd"),
+            "#N canvas 0 0 1 1 12;\n#X obj 0 0 adc~;\n#X obj 0 1 dac~;\n",
+        )
+        .unwrap();
+        // Notes out: an input algorithm, not an effect — it belongs next to the
+        // arpeggiator, and offering it here would be offering silence.
+        std::fs::write(
+            dir.join("arp.pd"),
+            "#N canvas 0 0 1 1 12;\n#X obj 0 0 notein;\n#X obj 0 1 noteout;\n",
+        )
+        .unwrap();
+        // Neither: nothing to wire it to.
+        std::fs::write(
+            dir.join("gui.pd"),
+            "#N canvas 0 0 1 1 12;\n#X obj 0 0 bng 15 250 50 0;\n",
+        )
+        .unwrap();
+
+        let found = scan_dir(&dir, PluginFormat::Pd);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].name, "gain");
+        assert!(!found[0].is_instrument, "a patch is an effect, not a synth");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    /// A saved file written before a format existed still gets that format's
+    /// default directories.
+    ///
+    /// Every `plugin-paths.json` predates whichever format was added last. With
+    /// an empty list that format simply never finds anything, and the only
+    /// clue is the absence of results — which is how "I added my Pd folder and
+    /// it did not work" started: there was no `PD` section to add it to, and
+    /// the path went in by hand with a typo in it.
+    #[test]
+    fn a_format_the_saved_file_never_heard_of_gets_its_defaults() {
+        // A file from before Pure Data was a format: it knows LV2 and nothing
+        // else, and its LV2 list is the user's own.
+        let json = r#"{"entries":[["LV2",[{"path":"/opt/my-lv2","enabled":true}]]]}"#;
+        let paths: PluginPaths = serde_json::from_str(json).unwrap();
+
+        // What the user said stands, exactly as they said it.
+        let lv2 = paths.dirs(PluginFormat::Lv2);
+        assert_eq!(lv2.len(), 1);
+        assert_eq!(lv2[0].path, Path::new("/opt/my-lv2"));
+
+        // And everything the file never mentioned has somewhere to look.
+        for &format in PluginFormat::ALL {
+            assert!(
+                !paths.dirs(format).is_empty(),
+                "{} would search nowhere",
+                format.label()
+            );
+        }
+        assert!(paths
+            .dirs(PluginFormat::Pd)
+            .iter()
+            .any(|d| d.path.ends_with("pd")));
+    }
+
     #[test]
     fn defaults_cover_the_carla_locations() {
         let dirs = PluginFormat::Lv2.default_dirs();
@@ -431,6 +547,11 @@ mod tests {
     /// A config written by a build that knew one more format must still load,
     /// keeping every directory the user edited by hand. Dropping the whole file
     /// would silently reset their paths to the defaults.
+    ///
+    /// The formats it *does* know are filled in from the defaults — see
+    /// [`a_format_the_saved_file_never_heard_of_gets_its_defaults`] — so what
+    /// this checks is that the unknown one leaves no trace and the edited ones
+    /// come through untouched.
     #[test]
     fn an_unknown_format_is_skipped_instead_of_failing_the_file() {
         let json = r#"{"entries":[
@@ -441,8 +562,8 @@ mod tests {
         let cfg: PluginPaths = serde_json::from_str(json).expect("unknown format must not fail");
         assert_eq!(
             cfg.entries.len(),
-            2,
-            "the unknown one is dropped, the rest survive"
+            PluginFormat::ALL.len(),
+            "the unknown one is dropped and the known ones are all there"
         );
         assert_eq!(
             cfg.dirs(PluginFormat::Vst2)[0].path,

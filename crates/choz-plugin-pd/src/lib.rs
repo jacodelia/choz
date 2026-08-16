@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 /// run: to wire a patch up you have to know how many channels it takes and
 /// gives, and to offer it in a list you have to know it is loadable before
 /// starting a process for it.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct PatchInfo {
     /// Name shown in the picker: the file stem.
     pub name: String,
@@ -54,42 +54,60 @@ pub struct PatchInfo {
     pub takes_audio: bool,
     /// `dac~` present: the patch writes to the host's output.
     pub gives_audio: bool,
-    /// `notein`/`midiin` present: the patch wants note events. That is what
-    /// makes a patch an **input algorithm** rather than an effect.
-    pub takes_notes: bool,
-    /// `noteout`/`midiout` present: the patch produces note events.
-    pub gives_notes: bool,
     /// Objects the patch uses, in the order they appear. Kept because "why
     /// will this patch not load" is otherwise unanswerable.
     pub objects: Vec<String>,
+    /// The patch's on-screen controls: sliders, number boxes and toggles.
+    ///
+    /// **This is how a headless host plays a patch.** Pd's controls are part of
+    /// the patch rather than of the objects around them, and a slider left at
+    /// zero holds the whole patch at zero — which is what a gain slider does
+    /// while nobody is looking at the canvas. choz has no canvas, so the ones
+    /// that can be addressed become knobs and the ones that cannot are named
+    /// out loud.
+    pub controls: Vec<PatchControl>,
+}
+
+/// One control of a patch, as the file describes it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PatchControl {
+    /// The label drawn next to it, or the object's name when it has none.
+    pub name: String,
+    /// The symbol it listens on. **`None` is the important case**: a control
+    /// with no receive symbol cannot be moved by anything outside the patch,
+    /// including this host — see [`PatchInfo::controls`].
+    pub receive: Option<String>,
+    pub min: f32,
+    pub max: f32,
+    /// On/off rather than a range.
+    pub toggle: bool,
 }
 
 impl PatchInfo {
     /// What choz can do with this patch, if anything.
+    ///
+    /// **The bar is `adc~` and `dac~`**, both of them. A patch choz can host is
+    /// one that takes the host's audio and gives it back — that is what a slot
+    /// in an FX chain *is*, and a patch that only half connects leaves the
+    /// other half of the slot doing nothing. Everything else about a patch is
+    /// optional: sliders, MIDI, whatever it does inside.
     pub fn role(&self) -> PatchRole {
-        match (
-            self.takes_audio || self.gives_audio,
-            self.takes_notes || self.gives_notes,
-        ) {
-            // Notes out is what an input algorithm is, whether it got there
-            // from audio (a tracker) or from notes (an arpeggiator).
-            (_, true) if self.gives_notes => PatchRole::InputAlgorithm,
-            (true, _) => PatchRole::Effect,
-            _ => PatchRole::Unusable,
+        match self.takes_audio && self.gives_audio {
+            true => PatchRole::Effect,
+            false => PatchRole::Unusable,
         }
     }
 }
 
-/// Where a patch belongs in choz.
+/// Where a patch belongs in choz. Both cases turn on `adc~` **and** `dac~`;
+/// see [`PatchInfo::role`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchRole {
     /// Audio in, audio out: an entry in the FX chain.
     Effect,
-    /// Notes out: an entry in the input-algorithm section, next to the
-    /// arpeggiator.
-    InputAlgorithm,
-    /// Neither, so there is nothing to connect it to. Listed with the reason
-    /// rather than hidden: "my patch does not appear" is the worst failure.
+    /// It does not connect to the host's audio at both ends, so there is
+    /// nothing to plug it into. Said out loud rather than hidden: "my patch
+    /// does not appear" is the worst failure.
     Unusable,
 }
 
@@ -127,13 +145,70 @@ pub fn read_patch(path: &Path) -> anyhow::Result<PatchInfo> {
         match object {
             "adc~" => info.takes_audio = true,
             "dac~" => info.gives_audio = true,
-            "notein" | "midiin" => info.takes_notes = true,
-            "noteout" | "midiout" => info.gives_notes = true,
+            // The GUI objects, whose arguments say what they control and
+            // whether anybody outside the patch can reach them.
+            "hsl" | "vsl" | "nbx" | "tgl" | "hradio" | "vradio" => {
+                let rest: Vec<&str> = words.collect();
+                if let Some(control) = read_control(object, &rest) {
+                    info.controls.push(control);
+                }
+            }
             _ => {}
         }
         info.objects.push(object.to_string());
     }
     Ok(info)
+}
+
+/// One GUI object's arguments, in Pd's own order.
+///
+/// ```text
+/// hsl  w h min max log init send receive label …
+/// vsl  w h min max log init send receive label …
+/// nbx  size h min max log init send receive label …
+/// tgl  size init send receive label …
+/// hradio size new_old init number send receive label …
+/// ```
+///
+/// `empty` is Pd's way of writing "no symbol", and a control whose receive is
+/// `empty` is one this host cannot move — which is worth knowing before the
+/// patch is played rather than after.
+fn read_control(kind: &str, args: &[&str]) -> Option<PatchControl> {
+    let at = |i: usize| args.get(i).copied().unwrap_or("empty");
+    let symbol = |s: &str| match s {
+        "empty" | "-" | "" => None,
+        other => Some(other.trim_start_matches('\\').to_string()),
+    };
+    let number = |s: &str| s.parse::<f32>().ok();
+    let (receive, label, min, max, toggle) = match kind {
+        "hsl" | "vsl" | "nbx" => (
+            symbol(at(7)),
+            at(8).to_string(),
+            number(at(2)).unwrap_or(0.0),
+            number(at(3)).unwrap_or(1.0),
+            false,
+        ),
+        "tgl" => (symbol(at(3)), at(4).to_string(), 0.0, 1.0, true),
+        "hradio" | "vradio" => (
+            symbol(at(5)),
+            at(6).to_string(),
+            0.0,
+            number(at(3)).map(|n| (n - 1.0).max(1.0)).unwrap_or(7.0),
+            false,
+        ),
+        _ => return None,
+    };
+    let name = match label.as_str() {
+        "empty" | "-" | "" => kind.to_string(),
+        other => other.replace('_', " "),
+    };
+    Some(PatchControl {
+        name,
+        receive,
+        min,
+        max,
+        toggle,
+    })
 }
 
 /// Split a Pd file into statements on unescaped semicolons.
@@ -181,6 +256,34 @@ pub fn scan_directory(dir: &Path) -> Vec<(PathBuf, PatchInfo)> {
     out
 }
 
+/// The controls a host can actually move, in the order it should show them.
+///
+/// **The order is the contract** between the two sides: the interface builds
+/// its knobs from this list and the child maps a parameter index back to a
+/// receive symbol with the same call, so index `n` is the same control in both
+/// processes without either of them saying so out loud.
+pub fn addressable(info: &PatchInfo) -> Vec<&PatchControl> {
+    info.controls
+        .iter()
+        .filter(|c| c.receive.is_some())
+        .collect()
+}
+
+/// The controls that exist on the canvas and **cannot be reached** — no receive
+/// symbol, so nothing outside the patch can move them.
+///
+/// Worth naming rather than counting: a patch whose gain slider is one of these
+/// is a patch that sits at whatever the slider was saved at, which for a fresh
+/// `hsl` is **zero**. That is silence with no error anywhere, and it is the
+/// single most likely reason a patch "does nothing" in a host with no canvas.
+pub fn unreachable(info: &PatchInfo) -> Vec<&str> {
+    info.controls
+        .iter()
+        .filter(|c| c.receive.is_none())
+        .map(|c| c.name.as_str())
+        .collect()
+}
+
 /// A patch loaded into this process's one Pd.
 ///
 /// **One per process.** Not a rule this crate invented — `libpd_new_instance`
@@ -222,6 +325,23 @@ impl Patch {
     pub fn process(&mut self, buf: &mut [f32]) {
         imp::process(buf);
     }
+
+    /// Move one of the patch's controls, by its position in [`addressable`].
+    ///
+    /// `value` is 0..1, the way every parameter in choz travels; it is scaled
+    /// to the control's own range here, where the range is known.
+    #[cfg(feature = "pd")]
+    pub fn set_control(&mut self, index: usize, value: f32) {
+        let Some(control) = addressable(&self.info).get(index).copied() else {
+            return;
+        };
+        let Some(receive) = control.receive.as_deref() else {
+            return;
+        };
+        let v = control.min + value.clamp(0.0, 1.0) * (control.max - control.min);
+        imp::send_float(receive, v);
+    }
+
 }
 
 #[cfg(feature = "pd")]
@@ -241,9 +361,50 @@ mod imp {
         fn libpd_start_message(maxlen: c_int) -> c_int;
         fn libpd_add_float(x: f32);
         fn libpd_finish_message(recv: *const c_char, msg: *const c_char) -> c_int;
+        fn libpd_add_to_search_path(path: *const c_char);
+        fn libpd_float(recv: *const c_char, x: f32) -> c_int;
+        fn libpd_set_printhook(hook: extern "C" fn(*const c_char));
+    }
+
+    /// Where Pd's own abstractions live on a Linux box.
+    ///
+    /// **libpd is not Pure Data**: it carries no installation, so it starts
+    /// with an empty search path and every object that Pd itself ships as an
+    /// abstraction — `rev1~`, `rev2~`, `rev3~`, `hilbert~`, `complex-mod~`, all
+    /// of `extra` — fails to create. The patch still opens, with a hole where
+    /// that object was, and the effect does nothing. That is exactly how a
+    /// reverb patch built around `rev2~` arrived here as "it does not work".
+    const SYSTEM_EXTRA: &[&str] = &[
+        "/usr/lib/puredata/extra",
+        "/usr/lib/pd/extra",
+        "/usr/local/lib/pd/extra",
+    ];
+
+    /// Everything Pd prints — including "couldn't create" — goes to choz's log.
+    ///
+    /// Without this, a missing object is silent: Pd says so on a console
+    /// nobody is reading, and the host has no way to know the patch came up
+    /// half built.
+    extern "C" fn print_out(text: *const c_char) {
+        if text.is_null() {
+            return;
+        }
+        let msg = unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy();
+        let msg = msg.trim_end();
+        if !msg.is_empty() {
+            eprintln!("pd: {msg}");
+        }
     }
 
     static STARTED: AtomicBool = AtomicBool::new(false);
+
+    /// Send a float to a receive symbol, which is how a host moves a control
+    /// that has one.
+    pub(super) fn send_float(receive: &str, value: f32) {
+        if let Ok(name) = CString::new(receive) {
+            unsafe { libpd_float(name.as_ptr(), value) };
+        }
+    }
 
     pub(super) fn open(path: &Path, sample_rate: u32) -> anyhow::Result<()> {
         if STARTED.swap(true, Ordering::SeqCst) {
@@ -259,7 +420,28 @@ mod imp {
         let c_name = CString::new(name)?;
         let c_dir = CString::new(dir.to_string_lossy().into_owned())?;
         unsafe {
+            // **The print hook goes on before `libpd_init`**: Pd prints its
+            // banner and its first complaints during init, and a hook set
+            // afterwards misses exactly the messages that say why a patch came
+            // up half built.
+            libpd_set_printhook(print_out);
             libpd_init();
+            // Where to look for objects the patch names: the patch's own
+            // folder first (that is where a project keeps its abstractions),
+            // then an `externals` beside it, then Pd's own `extra`.
+            let mut search: Vec<String> = vec![dir.to_string_lossy().into_owned()];
+            search.push(dir.join("externals").to_string_lossy().into_owned());
+            search.extend(SYSTEM_EXTRA.iter().map(|p| p.to_string()));
+            if let Some(env) = std::env::var_os("PD_PATH") {
+                search.extend(
+                    std::env::split_paths(&env).map(|p| p.to_string_lossy().into_owned()),
+                );
+            }
+            for path in search {
+                if let Ok(c) = CString::new(path) {
+                    libpd_add_to_search_path(c.as_ptr());
+                }
+            }
             libpd_init_audio(2, 2, sample_rate as c_int);
             if libpd_openfile(c_name.as_ptr(), c_dir.as_ptr()).is_null() {
                 anyhow::bail!("Pure Data would not open {}", path.display());
@@ -329,18 +511,39 @@ mod tests {
         let info = read_patch(&fx).unwrap();
         assert_eq!(info.name, "gain");
         assert!(info.takes_audio && info.gives_audio);
-        assert!(!info.gives_notes);
         assert_eq!(info.role(), PatchRole::Effect);
         assert!(info.objects.iter().any(|o| o == "*~"), "{:?}", info.objects);
 
-        // Notes out is an input algorithm, wherever the notes came from.
+        // Notes are neither here nor there: what decides whether choz can host
+        // a patch is the audio pair, and a patch may do whatever else it likes.
         let algo = write(
             &dir,
             "arp.pd",
-            "#N canvas 0 0 450 300 12;\n#X obj 20 20 notein;\n#X obj 20 60 noteout;\n",
+            "#N canvas 0 0 450 300 12;\n\
+             #X obj 20 20 adc~;\n\
+             #X obj 20 40 dac~;\n\
+             #X obj 20 60 notein;\n\
+             #X obj 20 80 noteout;\n",
         );
         let info = read_patch(&algo).unwrap();
-        assert_eq!(info.role(), PatchRole::InputAlgorithm);
+        assert_eq!(info.role(), PatchRole::Effect);
+
+        // Notes and nothing else is **not** hostable: there is no slot shape
+        // for a patch that neither takes the audio nor gives any back.
+        let notes_only = write(
+            &dir,
+            "notes-only.pd",
+            "#N canvas 0 0 450 300 12;\n#X obj 20 20 notein;\n#X obj 20 60 noteout;\n",
+        );
+        assert_eq!(read_patch(&notes_only).unwrap().role(), PatchRole::Unusable);
+
+        // Half connected is not connected: audio in with nowhere to go.
+        let half = write(
+            &dir,
+            "half.pd",
+            "#N canvas 0 0 450 300 12;\n#X obj 20 20 adc~;\n#X obj 20 60 *~ 0.5;\n",
+        );
+        assert_eq!(read_patch(&half).unwrap().role(), PatchRole::Unusable);
 
         // Neither: there is nothing to wire it to, and saying so beats hiding it.
         let dud = write(
@@ -350,9 +553,9 @@ mod tests {
         );
         assert_eq!(read_patch(&dud).unwrap().role(), PatchRole::Unusable);
 
-        // And the directory scan finds all three, by name.
+        // And the directory scan finds them all, by name.
         let found = scan_directory(&dir);
-        assert_eq!(found.len(), 3, "{found:?}");
+        assert_eq!(found.len(), 5, "{found:?}");
         assert_eq!(found[0].1.name, "arp");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -381,10 +584,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The real thing, end to end: a gain patch loaded into libpd, a block
-    /// through it, and the number that comes out. Only with the feature on and
-    /// Pure Data installed — everywhere else the crate still builds and the
-    /// test above covers what it says instead.
+    /// The real thing, end to end: a patch loaded into libpd, a block through
+    /// it, and the number that comes out. Only with the feature on and Pure
+    /// Data installed — everywhere else the crate still builds and the tests
+    /// above cover what it says instead.
     #[cfg(feature = "pd")]
     #[test]
     fn a_patch_processes_a_block() {
@@ -432,4 +635,46 @@ mod tests {
         assert!(err.contains("--features pd"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// A patch's on-screen controls, read from the file, with the one thing a
+    /// headless host has to know about each: **whether it can be moved**.
+    ///
+    /// Both halves of this came from two real patches. A slider with no receive
+    /// symbol —  Pd's default when you drop one on a canvas — cannot be
+    /// addressed from outside, and a gain slider like that holds the whole
+    /// patch at zero: silence, with no error anywhere, which is exactly how it
+    /// was reported.
+    #[test]
+    fn a_patch_says_which_controls_a_host_can_move() {
+        let dir = std::env::temp_dir().join("choz-pd-controls");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write(
+            &dir,
+            "sliders.pd",
+            "#N canvas 0 0 450 300 12;\n\
+             #X obj 148 32 adc~ 1;\n\
+             #X obj 152 280 dac~;\n\
+             #X obj 216 52 hsl 170 20 0 10 0 0 empty gain GAIN -2 -10 0 12;\n\
+             #X obj 365 142 hsl 170 20 0 1 0 0 empty empty Room -2 -10 0 12;\n\
+             #X obj 100 200 tgl 19 0 empty bypass Bypass 17 7 0 10;\n",
+        );
+        let info = read_patch(&path).unwrap();
+        assert_eq!(info.role(), PatchRole::Effect);
+        assert_eq!(info.controls.len(), 3);
+
+        // The two with a receive symbol are the knobs a host gets, in order.
+        let usable = addressable(&info);
+        assert_eq!(usable.len(), 2);
+        assert_eq!(usable[0].name, "GAIN");
+        assert_eq!(usable[0].receive.as_deref(), Some("gain"));
+        assert_eq!((usable[0].min, usable[0].max), (0.0, 10.0));
+        assert!(!usable[0].toggle);
+        assert_eq!(usable[1].name, "Bypass");
+        assert!(usable[1].toggle, "a toggle is two positions, not a range");
+
+        // And the one without is named, because "my patch does nothing" is
+        // answered by that name and by nothing else.
+        assert_eq!(unreachable(&info), vec!["Room"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

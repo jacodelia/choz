@@ -2,6 +2,7 @@
 
 use crate::fx;
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct FxSpec {
     pub kind: String,
     pub enabled: bool,
@@ -20,6 +21,61 @@ pub struct PluginFxRef {
     pub path: std::path::PathBuf,
     pub id: String,
 }
+
+/// Every effect choz brings with it: the id [`build_processor`] answers to, and
+/// the name to show it under.
+///
+/// The match below is the other half of this list, and the two drifting apart
+/// is what a test here catches: an id nobody can build, or an effect nothing
+/// can reach. Anything that wants to walk the built-ins — the interface's ADD
+/// FX list, the CLAP export — walks this.
+pub const BUILT_IN_KINDS: &[(&str, &str)] = &[
+    ("delay", "Delay"),
+    ("reverb", "Reverb"),
+    ("grandelay", "Granular Delay"),
+    ("compressor", "Compressor"),
+    ("limiter", "Limiter"),
+    ("gate", "Gate"),
+    ("parameq", "Parametric EQ"),
+    ("graphiceq", "Graphic EQ"),
+    ("filter", "Filter"),
+    ("autotune", "Auto-Tune"),
+    ("filterbank", "Filter Bank"),
+    ("tremolo", "Tremolo"),
+    ("autopan", "Auto Pan"),
+    ("autofilter", "Auto Filter"),
+    ("freqshifter", "Frequency Shifter"),
+    ("ringmod", "Ring Modulator"),
+    ("shimmer", "Shimmer"),
+    ("harmonizer", "Harmonizer"),
+    ("vocoder", "Vocoder"),
+    ("beatrepeat", "Beat Repeat"),
+    ("chorus", "Chorus"),
+    ("flanger", "Flanger"),
+    ("phaser", "Phaser"),
+    ("bitcrusher", "Bitcrusher"),
+    ("vinyl", "Vinyl"),
+    ("cassette", "Cassette"),
+    ("saturator", "Saturator"),
+    ("waveshaper", "Wave Shaper"),
+    ("softclip", "Soft Clip"),
+    ("tubesat", "Tube Saturator"),
+    ("widener", "Widener"),
+    ("isolator", "Isolator"),
+    ("gain", "Gain"),
+    ("phaseinvert", "Phase Invert"),
+    ("monomaker", "Mono Maker"),
+    ("looper", "Looper"),
+    ("sidechain", "Sidechain Duck"),
+    ("expander", "Expander"),
+    ("pan", "Pan"),
+    ("protocosmos", "Protocosmos"),
+    ("spaceecho", "Space Echo"),
+    ("reversedelay", "Reverse Delay"),
+    ("amberfang", "Amber Fang"),
+    ("velvetfuzz", "Velvet Fuzz"),
+    ("z5texture", "Z5 Texture"),
+];
 
 pub fn build_processor(
     kind: &str,
@@ -295,7 +351,12 @@ pub(crate) fn build_plugin_fx(
     // Same policy as instruments: what the load probe caught dying on teardown
     // goes in its own process, so removing the effect costs a child — and so
     // does anything the user asked for by hand.
-    if crate::quarantine::wants_sandbox(r.format, &r.path, &r.id) {
+    //
+    // A Pure Data patch has no other way in: choz does not link libpd, and one
+    // process holds one Pd, so "in-process" is not a fallback that exists.
+    if r.format == crate::PluginFormat::Pd
+        || crate::quarantine::wants_sandbox(r.format, &r.path, &r.id)
+    {
         match crate::sandboxed::SandboxedEffect::build(
             r.format,
             &r.path,
@@ -306,6 +367,10 @@ pub(crate) fn build_plugin_fx(
             Ok(fx) => {
                 eprintln!("choz: hosting {} in its own process", r.path.display());
                 return Some(Box::new(fx));
+            }
+            Err(e) if r.format == crate::PluginFormat::Pd => {
+                eprintln!("choz: cannot run {}: {e}", r.path.display());
+                return None;
             }
             Err(e) => eprintln!(
                 "choz: sandbox for {} failed ({e}); hosting in-process",
@@ -462,42 +527,12 @@ pub fn build_chain_from_specs(
 mod tests {
     use super::*;
 
-    /// Every FX id the UI can build (kept in sync with `choz-ui`'s FX kinds).
-    const FX_IDS: &[&str] = &[
-        "delay",
-        "reverb",
-        "grandelay",
-        "compressor",
-        "limiter",
-        "gate",
-        "expander",
-        "parameq",
-        "graphiceq",
-        "filter",
-        "filterbank",
-        "chorus",
-        "flanger",
-        "phaser",
-        "bitcrusher",
-        "vinyl",
-        "cassette",
-        "softclip",
-        "tubesat",
-        "widener",
-        "isolator",
-        "gain",
-        "phaseinvert",
-        "monomaker",
-        "pan",
-        "looper",
-        "sidechain",
-        "protocosmos",
-        "spaceecho",
-        "reversedelay",
-        "z5texture",
-        "amberfang",
-        "velvetfuzz",
-    ];
+    /// The list under test is the one everything else walks — see
+    /// [`BUILT_IN_KINDS`]. There used to be a second copy here, which is
+    /// exactly the drift it was supposed to catch.
+    fn fx_ids() -> Vec<&'static str> {
+        BUILT_IN_KINDS.iter().map(|(id, _)| *id).collect()
+    }
 
     fn spec(kind: &str, plugin: Option<PluginFxRef>) -> FxSpec {
         FxSpec {
@@ -571,7 +606,7 @@ mod tests {
         // build_processor reads only the params it needs; a uniform 0.5 vector
         // covers every kind's parameter count.
         let params = [0.5f32; 8];
-        for id in FX_IDS {
+        for id in fx_ids() {
             let mut proc = build_processor(id, &params, sr)
                 .unwrap_or_else(|| panic!("build_processor returned None for {id}"));
 
