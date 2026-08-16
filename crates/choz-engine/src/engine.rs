@@ -482,6 +482,13 @@ fn request_pipewire_period(buffer_size: u32, sample_rate: u32, force: u32) {
     }
 }
 
+/// The rate to build the engine for: the graph's when it reported one, the
+/// saved one when it did not. A graph that answers `0` has not started its
+/// driver yet and is telling us nothing.
+fn adopt_rate(saved: u32, graph: Option<u32>) -> u32 {
+    graph.filter(|r| *r > 0).unwrap_or(saved)
+}
+
 fn period_ms(buffer_size: u32, sample_rate: u32) -> f32 {
     buffer_size as f32 * 1000.0 / sample_rate.max(1) as f32
 }
@@ -650,6 +657,22 @@ impl AudioEngine {
     fn start_jack_native(&mut self) -> Result<()> {
         if !pipewire_is_running() && self.backend_pref != "JACK" {
             anyhow::bail!("no JACK graph detected");
+        }
+        // The graph's rate beats the saved one. `ui.json` is a preference; the
+        // running graph is a fact, and JACK never negotiates it per client: it
+        // hands out whatever the graph runs at and the client is expected to
+        // keep up. Building oxisynth (and every plugin, and the pitch tracker)
+        // for 48000 while JACK is delivering 44100 plays the whole rig a
+        // semitone and a half flat, for as long as the session lasts, with
+        // nothing anywhere saying why.
+        let adopted = adopt_rate(self.sample_rate, crate::jack_backend::graph_rate());
+        if adopted != self.sample_rate {
+            eprintln!(
+                "choz: the JACK graph runs at {adopted} Hz, not the saved {} Hz \u{2014} following the graph",
+                self.sample_rate
+            );
+            self.sample_rate = adopted;
+            choz_ports::transport().set_sample_rate(adopted);
         }
         request_pipewire_period(self.buffer_size, self.sample_rate, self.force_quantum);
 
@@ -2407,6 +2430,18 @@ pub fn build_instrument(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A graph that says what rate it runs at is believed over the settings —
+    /// that mismatch is what detunes every synth in the rack. A graph that says
+    /// nothing (unreachable, or a driver that hasn't started) leaves the saved
+    /// rate alone.
+    #[test]
+    fn the_graph_rate_beats_the_saved_one() {
+        assert_eq!(adopt_rate(48_000, Some(44_100)), 44_100);
+        assert_eq!(adopt_rate(48_000, Some(48_000)), 48_000);
+        assert_eq!(adopt_rate(48_000, None), 48_000, "no graph, no opinion");
+        assert_eq!(adopt_rate(48_000, Some(0)), 48_000, "0 Hz is not an answer");
+    }
 
     /// The configured buffer size has to reach PipeWire as a *force*, or
     /// pipewire-jack's inherited `node.force-quantum` wins and the node runs at
