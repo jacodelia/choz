@@ -45,6 +45,10 @@ pub(crate) struct Slot {
     /// tracker hears it. A guitar is nowhere near the level of a synth, and
     /// without this the two are stuck at whatever the interface's preamp gave.
     in_gain: f32,
+    /// Catches a microphone that has started to howl into the speakers it is
+    /// feeding — see [`crate::feedback`]. One per slot because the loop is per
+    /// input, armed globally because a room is a room.
+    guard: crate::feedback::FeedbackGuard,
     /// Audio in, notes out: `Some` while the tab is converting what it hears
     /// into notes for its own instrument. The tracker lives here because it is
     /// per slot and used only from the audio callback.
@@ -82,6 +86,7 @@ impl Slot {
             out_pair: (0, 1),
             in_pair: None,
             in_gain: 1.0,
+            guard: crate::feedback::FeedbackGuard::new(48_000.0),
             pitch: None,
             pitch_mix: 1.0,
             pending: [None; MAX_SCHEDULED],
@@ -1866,10 +1871,32 @@ impl RtState {
                         // degrades into compression instead of into a corner —
                         // and counted, because a trim that is quietly limiting
                         // is a trim that is set wrong.
+                        // **The trim belongs to the detector, not to the mix.**
+                        // With `A→M` on, the input is being *listened to*: the
+                        // trim is how loud the tracker hears it, and a guitar
+                        // needs a lot of it. Passing that same gain on to what
+                        // the player hears is why a tab that tracked well
+                        // sounded saturated — so the untouched input is kept
+                        // aside here and it is that one the `MIX` knob brings
+                        // back. The tab's own `VOL` is the level control; this
+                        // never was one.
+                        slot.guard.set_sample_rate(sr as f32);
+                        let listening = slot.pitch.is_some();
+                        let keep_dry = listening && slot.pitch_mix < 0.999;
                         let mut clipped = false;
                         for f in 0..(n / 2) {
+                            // The guard watches the **left** channel's raw
+                            // sample and its answer is applied to both: a howl
+                            // is a property of the room, not of one side of a
+                            // stereo pair, and two independent ducks on one
+                            // signal would move the image while they worked.
+                            let guard = slot.guard.step(capture[l][f]);
                             for (ch, src) in [l, r].into_iter().enumerate() {
-                                let x = capture[src][f] * g;
+                                let raw = capture[src][f] * guard;
+                                if keep_dry {
+                                    dry[f * 2 + ch] = raw;
+                                }
+                                let x = raw * g;
                                 sc[f * 2 + ch] = if x.abs() > 1.0 {
                                     clipped = true;
                                     x.tanh()
@@ -1881,6 +1908,10 @@ impl RtState {
                         if clipped {
                             crate::meter::capture_health().clipped_block();
                         }
+                        // What the guard is holding down, for the panel: a duck
+                        // nobody can see is indistinguishable from the room
+                        // having gone quiet on its own.
+                        crate::meter::capture_health().guard(slot.guard.reduction_db());
                     }
                     // With A→M on, the input is listened to rather than passed
                     // through: what comes out of the slot is its instrument
@@ -1908,12 +1939,10 @@ impl RtState {
                             tracker.cents(),
                             tracker.level(),
                         );
-                        // Keep the input, if any of it is wanted back.
+                        // How much of the input comes back. `dry` already
+                        // holds it, untrimmed, from the loop above.
                         let wet = slot.pitch_mix;
                         let keep_dry = wet < 0.999;
-                        if keep_dry {
-                            dry[..n].copy_from_slice(&sc[..n]);
-                        }
                         // **Clear it before the instrument plays.** The buffer
                         // still holds the microphone, and `render` is not
                         // required to overwrite what it was handed — a hosted
@@ -2808,6 +2837,148 @@ mod tests {
             "and half is half of each: {}",
             run(0.5)
         );
+    }
+
+    /// **The whole path a live microphone takes**: capture buffers → the tab's
+    /// FX chain → the mix.
+    ///
+    /// Written because "I plugged a microphone into the Harmonizer and got no
+    /// response" kept being answered by measuring the effect on its own, which
+    /// only ever said the effect was fine. This one asks the question the
+    /// report actually asks: does what comes in a capture jack reach the
+    /// effects on that tab, and does what they produce reach the output?
+    #[test]
+    fn live_input_reaches_the_tabs_fx_chain_and_comes_back_out() {
+        let _clock = crate::test_locks::transport();
+        struct Silent;
+        impl AudioSource for Silent {
+            fn render(&mut self, out: &mut [f32], _sr: u32) -> usize {
+                out.fill(0.0);
+                out.len() / 2
+            }
+            fn plays_on_transport_stop(&self) -> bool {
+                true
+            }
+        }
+
+        let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 2);
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(Silent)))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotIn {
+                slot: 0,
+                pair: Some((0, 1)),
+            })
+            .unwrap();
+        // A harmoniser, exactly as the rack builds one: from a spec.
+        let spec = crate::fx_chain::FxSpec {
+            kind: "harmonizer".into(),
+            enabled: true,
+            wet: 1.0,
+            params: vec![0.334, 0.0, 0.0, 0.20, 0.32, 0.36, 0.50, 1.0, 1.0],
+            plugin: None,
+        };
+        let chain = crate::fx_chain::build_chain_from_specs(&[spec], 48_000, 64);
+        assert_eq!(chain.len(), 1, "the harmoniser built");
+        cmd_tx
+            .push(EngineCommand::SetSlotFx { slot: 0, fx: chain })
+            .unwrap();
+        state.apply_commands();
+
+        // A tone in the capture buffers, block after block, and the tail is
+        // what the tab put out.
+        let mut worst = 0.0f32;
+        for block in 0..40 {
+            for (ch, buf) in state.capture.iter_mut().enumerate() {
+                for (i, s) in buf.iter_mut().enumerate() {
+                    let n = (block * 32 + i) as f32;
+                    *s = 0.3 * (std::f32::consts::TAU * 220.0 * n / 48_000.0).sin();
+                    let _ = ch;
+                }
+            }
+            for m in state.mix.iter_mut() {
+                m.fill(0.0);
+            }
+            state.render(64);
+            if block > 20 {
+                worst = worst.max(
+                    state.mix[0]
+                        .iter()
+                        .chain(state.mix[1].iter())
+                        .fold(0.0f32, |a, s| a.max(s.abs())),
+                );
+            }
+        }
+        assert!(
+            worst > 0.02,
+            "the microphone never reached the FX chain: peak {worst}"
+        );
+    }
+
+    /// **The input trim is the detector's, not the mix's.**
+    ///
+    /// Reported from a real guitar: a tab that tracked well sounded saturated,
+    /// because the only way to make the tracker hear was `IN`, and `IN` was
+    /// also multiplying what came back through `MIX`. Turning one knob had to
+    /// wreck the other. Now the trim reaches the tracker and nothing else — the
+    /// tab's `VOL` is the level control, and it always was.
+    #[test]
+    fn the_input_trim_does_not_reach_what_comes_back_through_the_mix() {
+        let _clock = crate::test_locks::transport();
+        struct Silent;
+        impl AudioSource for Silent {
+            fn render(&mut self, out: &mut [f32], _sr: u32) -> usize {
+                out.fill(0.0);
+                out.len() / 2
+            }
+            fn plays_on_transport_stop(&self) -> bool {
+                true
+            }
+        }
+
+        let heard = |trim: f32| -> f32 {
+            let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 2);
+            cmd_tx
+                .push(EngineCommand::AddSlot(Box::new(Silent)))
+                .unwrap();
+            cmd_tx
+                .push(EngineCommand::SetSlotIn {
+                    slot: 0,
+                    pair: Some((0, 1)),
+                })
+                .unwrap();
+            cmd_tx
+                .push(EngineCommand::SetSlotPitchToMidi { slot: 0, on: true })
+                .unwrap();
+            // All dry: what comes out is the input and nothing else.
+            cmd_tx
+                .push(EngineCommand::SetSlotPitchMix { slot: 0, mix: 0.0 })
+                .unwrap();
+            cmd_tx
+                .push(EngineCommand::SetSlotInTrim {
+                    slot: 0,
+                    gain: trim,
+                    gate: crate::pitch::DEFAULT_GATE,
+                })
+                .unwrap();
+            state.apply_commands();
+            for ch in state.capture.iter_mut() {
+                ch.fill(0.25);
+            }
+            state.render(8);
+            state.mix[0][0] / std::f32::consts::FRAC_1_SQRT_2
+        };
+
+        let unity = heard(1.0);
+        assert!((unity - 0.25).abs() < 1e-5, "unity trim is the input: {unity}");
+        for trim in [2.0f32, 6.0] {
+            let loud = heard(trim);
+            assert!(
+                (loud - unity).abs() < 1e-5,
+                "trim {trim} moved what the player hears: {loud} vs {unity}"
+            );
+        }
     }
 
     /// A trim that reaches +24 dB reaches past full scale. Driven past it the

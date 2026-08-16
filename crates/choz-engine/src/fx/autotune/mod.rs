@@ -76,6 +76,8 @@ pub fn preset_index(norm: f32) -> usize {
 /// assignment rather than a list of setters that can be forgotten.
 #[derive(Debug, Clone, Copy)]
 pub struct AutoTuneParameters {
+    /// How much the **analysis** is lifted before the detector's gate sees it.
+    /// Not an input level: what comes out of the effect does not move with it.
     pub input_gain_db: f32,
     pub retune_speed_ms: f32,
     pub correction: f32,
@@ -218,13 +220,20 @@ impl AutoTune {
         let out_gain = db_to_lin(self.params.output_gain_db);
 
         // ── De-interleave, and the mono sum the analysis works on ───────────
+        //
+        // **The input gain belongs to the analysis, not to the signal.** A
+        // quiet voice needs it to get over the detector's gate, and putting
+        // that same gain into the audio is why a tab that tracked well came out
+        // saturated: the only knob that made it hear was also the one that made
+        // it loud. `OutGain` is the level control; this one is how hard it
+        // listens, which is why it reads `Sens`.
         let mut sum_sq = 0.0f64;
         for f in 0..frames {
-            let l = sanitise(buf[f * 2]) * in_gain;
-            let r = sanitise(buf[f * 2 + 1]) * in_gain;
+            let l = sanitise(buf[f * 2]);
+            let r = sanitise(buf[f * 2 + 1]);
             self.chan_in[0][f] = l;
             self.chan_in[1][f] = r;
-            let m = (l + r) * 0.5;
+            let m = (l + r) * 0.5 * in_gain;
             self.mono[f] = m;
             sum_sq += (m as f64) * (m as f64);
         }
@@ -246,7 +255,10 @@ impl AutoTune {
             Some(t) if est.frequency_hz > 0.0 => 12.0 * (t / est.frequency_hz).log2(),
             _ => 0.0,
         };
-        let ratio = self.corrector.advance(error_semitones, frames);
+        // Both ends of the block: the smoother steps once per block, and the
+        // shifter walks between them rather than holding a stair.
+        let ratio_from = self.corrector.ratio();
+        let ratio_to = self.corrector.advance(error_semitones, frames);
 
         // The period the grains are cut on is the **detected** one; it is what
         // the input actually contains. The ratio moves their spacing.
@@ -261,7 +273,7 @@ impl AutoTune {
                 &self.chan_in[ch][..frames],
                 &mut self.chan_out[ch][..frames],
             );
-            self.shifters[ch].process(input, output, ratio, period);
+            self.shifters[ch].process(input, output, ratio_from, ratio_to, period);
         }
 
         // ── Delay the dry, then mix ─────────────────────────────────────────
@@ -372,8 +384,10 @@ impl FxProcessor for AutoTune {
                 1200.0,
                 "Hz",
             ),
+            // How hard the detector listens, **not** an input level: see
+            // `process_chunk`.
             FxParam::new(
-                "InGain",
+                "Sens",
                 norm(p.input_gain_db, -24.0, 24.0),
                 -24.0,
                 24.0,

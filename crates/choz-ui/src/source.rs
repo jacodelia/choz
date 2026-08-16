@@ -628,7 +628,7 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         pd!("A4", 0.50),
         pd!("MinHz", 0.03),
         pd!("MaxHz", 1.00),
-        pd!("InGain", 0.50),
+        pd!("Sens", 0.50),
         pd!("OutGain", 0.50),
         pd!("Wet", 1.00),
     ];
@@ -722,6 +722,15 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         pd!("Env", 0.50),
         pd!("Width", 1.00),
         pd!("Wet", 0.50),
+        // Follow a keyboard instead of the shape and key: a switch, and the
+        // channel it listens on. The channel's list of names is built where the
+        // other named shapes are — a `static` cannot hold one.
+        FxParamDesc {
+            name: Cow::Borrowed("MIDI"),
+            default: 0.0,
+            shape: ParamShape::Toggle,
+        },
+        pd!("Ch", 0.00),
     ];
     /// Bands and carrier are lists of names; the rest are knobs.
     static VOCODER: &[FxParamDesc] = &[
@@ -1200,6 +1209,10 @@ impl AudioFxEntry {
                                     .map(|s| s.label().to_string())
                                     .collect(),
                             ),
+                            // Sixteen channels are a list, not a knob: nudging
+                            // through them one arrow press at a time is what a
+                            // picker is for.
+                            "Ch" => named(d, (1..=16).map(|c| c.to_string()).collect()),
                             _ => {}
                         }
                     }

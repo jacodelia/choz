@@ -57,10 +57,23 @@ pub trait PitchShifter {
     fn reset(&mut self);
     /// Samples the output runs behind the input.
     fn latency_samples(&self) -> usize;
-    /// `input` and `output` are the same length; `pitch_ratio` above 1 raises.
+    /// `input` and `output` are the same length; a ratio above 1 raises.
+    ///
+    /// The ratio is given at **both ends of the block** and walked across it.
+    /// The corrector moves once per block, and holding its answer for the whole
+    /// block makes the pitch a staircase — flat for a few milliseconds, then a
+    /// step. Interpolating costs one add per sample and removes the step.
+    ///
     /// `period` is the detected period in samples, or 0 when unvoiced — with no
     /// period there is nothing to jump by, so the input passes through.
-    fn process(&mut self, input: &[f32], output: &mut [f32], pitch_ratio: f32, period: f32);
+    fn process(
+        &mut self,
+        input: &[f32],
+        output: &mut [f32],
+        ratio_from: f32,
+        ratio_to: f32,
+        period: f32,
+    );
 }
 
 pub struct RetuneShifter {
@@ -149,13 +162,25 @@ impl PitchShifter for RetuneShifter {
         self.latency
     }
 
-    fn process(&mut self, input: &[f32], output: &mut [f32], pitch_ratio: f32, period: f32) {
+    fn process(
+        &mut self,
+        input: &[f32],
+        output: &mut [f32],
+        ratio_from: f32,
+        ratio_to: f32,
+        period: f32,
+    ) {
         let voiced = period.is_finite() && period >= 2.0 && (period as usize) < MAX_PERIOD;
         // Unvoiced: no period to jump by, so no shift either. Reading at 1 is a
         // plain delay, which is what should come out of a consonant.
-        let ratio = match pitch_ratio {
+        let clean = |r: f32| match r {
             r if voiced && r.is_finite() => r.clamp(0.5, 2.0) as f64,
             _ => 1.0,
+        };
+        let (from, to) = (clean(ratio_from), clean(ratio_to));
+        let step = match input.len() {
+            0 => 0.0,
+            n => (to - from) / n as f64,
         };
         if voiced {
             self.period = if self.period > 1.0 {
@@ -173,6 +198,8 @@ impl PitchShifter for RetuneShifter {
         let slack = p;
 
         for (n, &x) in input.iter().enumerate() {
+            // Where the ratio is *at this sample*, not where the block ended up.
+            let ratio = from + step * n as f64;
             let len = self.buf.len();
             self.buf[(self.written as usize) % len] = if x.is_finite() { x } else { 0.0 };
             self.written += 1;

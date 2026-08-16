@@ -471,7 +471,7 @@ fn the_shifter_moves_the_pitch_and_leaves_the_length_alone() {
                     v
                 })
                 .collect();
-            s.process(&input, &mut out, ratio, period);
+            s.process(&input, &mut out, ratio, ratio, period);
             // The output is the same length as the input. That is the whole
             // reason this is not a resampler.
             assert_eq!(out.len(), input.len());
@@ -509,7 +509,7 @@ fn an_unvoiced_block_passes_through_the_shifter() {
     let mut out = vec![0.0; frames];
     // Long enough for the latency to clear.
     for _ in 0..4 {
-        s.process(&input, &mut out, 1.5, 0.0);
+        s.process(&input, &mut out, 1.5, 1.5, 0.0);
     }
     // With no period there is nothing to cut grains on, so the input is what
     // comes back — delayed, but itself.
@@ -527,13 +527,13 @@ fn the_shifter_never_emits_a_nan() {
     let mut s = RetuneShifter::new(48_000.0);
     let mut out = vec![0.0; 512];
     let nasty = vec![f32::NAN; 512];
-    s.process(&nasty, &mut out, f32::NAN, f32::NAN);
+    s.process(&nasty, &mut out, f32::NAN, f32::NAN, f32::NAN);
     assert!(
         out.iter().all(|x| x.is_finite()),
         "NaN in must not be NaN out"
     );
     let big = vec![1e30f32; 512];
-    s.process(&big, &mut out, 1e30, 1e30);
+    s.process(&big, &mut out, 1e30, 1e30, 1e30);
     assert!(out.iter().all(|x| x.is_finite()));
 }
 
@@ -883,7 +883,7 @@ fn the_shifter_cannot_make_the_signal_louder() {
                 })
                 .collect();
             let in_peak = input.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-            s.process(&input, &mut out, ratio, sr / hz);
+            s.process(&input, &mut out, ratio, ratio, sr / hz);
             if pass >= 3 {
                 peak = peak.max(out.iter().fold(0.0f32, |m, x| m.max(x.abs())));
                 assert!(
@@ -934,4 +934,256 @@ fn latency_is_reported_and_constant() {
     let mut at = AutoTune::new(48_000.0);
     run(&mut at, 220.0, 48_000.0, 20);
     assert_eq!(at.latency_samples(), l);
+}
+
+// ─── Phase 5: what a microphone in a room actually sends ────────────────────
+
+/// A voice with a rumble under it is still a voice.
+///
+/// The same failure `A→M` had, found on a guitar first: under the lowest note
+/// anyone sings there is a desk, a fan, a preamp — and a period detector handed
+/// a 40 Hz rumble finds the rumble's period, which is a note an octave and a
+/// half below what was sung. AutoTune then corrects *towards* that note, which
+/// is the worst thing this effect can do.
+#[test]
+fn a_rumble_under_the_voice_is_not_the_note() {
+    let sr = 48_000.0f32;
+    let mut d = PitchDetector::new(sr);
+    let (mut voice, mut rumble) = (Tone::new(), Tone::new());
+    let mut last = PitchEstimate::SILENT;
+    for _ in 0..120 {
+        // The rumble is **louder than the note**, which is what a cheap stand
+        // on a wooden floor actually does.
+        let note = voice.voice(220.0, sr, 256, 0.15);
+        let low = rumble.block(41.0, sr, 256, 0.45);
+        let mono: Vec<f32> = note
+            .chunks_exact(2)
+            .zip(low.chunks_exact(2))
+            .map(|(n, l)| (n[0] + l[0]) * 0.5)
+            .collect();
+        last = d.process(&mono);
+    }
+    assert!(last.voiced, "a sung note with a rumble under it is a note");
+    let cents = 1200.0 * (last.frequency_hz / 220.0).log2();
+    assert!(
+        cents.abs() < 50.0,
+        "220 Hz was sung; the detector heard {:.1} Hz ({cents:+.0} cents)",
+        last.frequency_hz
+    );
+}
+
+/// And a voice with hiss over it is still a voice.
+///
+/// The decimation used to be a plain average, i.e. its own anti-alias filter,
+/// and a box filter leaks: sibilance and room hiss folded back down on top of
+/// the note, and the detector locked onto the mixture.
+#[test]
+fn hiss_above_the_notes_does_not_fold_onto_them() {
+    let sr = 48_000.0f32;
+    let mut d = PitchDetector::new(sr);
+    let (mut voice, mut hiss) = (Tone::new(), Tone::new());
+    let mut last = PitchEstimate::SILENT;
+    for _ in 0..120 {
+        let note = voice.voice(220.0, sr, 256, 0.2);
+        // 9.5 kHz: above everything the detector cares about, and exactly what
+        // folds onto the notes when the only filter is an average.
+        let above = hiss.block(9_500.0, sr, 256, 0.4);
+        let mono: Vec<f32> = note
+            .chunks_exact(2)
+            .zip(above.chunks_exact(2))
+            .map(|(n, h)| (n[0] + h[0]) * 0.5)
+            .collect();
+        last = d.process(&mono);
+    }
+    assert!(last.voiced, "hiss over a note does not un-sing it");
+    let cents = 1200.0 * (last.frequency_hz / 220.0).log2();
+    assert!(
+        cents.abs() < 50.0,
+        "220 Hz was sung; the detector heard {:.1} Hz ({cents:+.0} cents)",
+        last.frequency_hz
+    );
+}
+
+/// One bad window does not move the correction.
+///
+/// Every hop's answer used to go straight out, so a single window that found a
+/// harmonic — one consonant, one door — bent the voice for that block. The
+/// median of three throws it away and keeps the note.
+#[test]
+fn a_single_bad_window_does_not_become_the_note() {
+    let sr = 48_000.0f32;
+    let mut d = PitchDetector::new(sr);
+    let mut t = Tone::new();
+    for _ in 0..80 {
+        let stereo = t.voice(220.0, sr, 256, 0.2);
+        let mono: Vec<f32> = stereo.chunks_exact(2).map(|f| f[0]).collect();
+        d.process(&mono);
+    }
+    let settled = d.estimate();
+    assert!(settled.voiced);
+
+    // One window of something else entirely, then straight back to the note.
+    let mut other = Tone::new();
+    for _ in 0..2 {
+        let stereo = other.voice(330.0, sr, 256, 0.2);
+        let mono: Vec<f32> = stereo.chunks_exact(2).map(|f| f[0]).collect();
+        d.process(&mono);
+    }
+    let after = d.estimate();
+    let moved = 1200.0 * (after.frequency_hz / settled.frequency_hz).log2();
+    assert!(
+        moved.abs() < 120.0,
+        "one interrupted window moved the answer by {moved:+.0} cents"
+    );
+}
+
+/// The pitch moves *through* a block, not at the end of one.
+///
+/// The corrector steps once per block. Holding its answer for the whole block
+/// and then jumping is a staircase in pitch — flat, step, flat — and on a fast
+/// retune it is heard as the effect being dirty rather than as the singer
+/// arriving.
+#[test]
+fn the_shift_is_walked_across_the_block_and_not_stepped() {
+    const BLOCK: usize = 512;
+    let sr = 48_000.0f32;
+    let hz = 220.0;
+    let period = sr / hz;
+    // **One continuous sine**, sliced into blocks. Restarting the phase every
+    // block puts a corner in the *input*, and the shifter faithfully reproduces
+    // it a latency later — which looks exactly like the click being hunted.
+    let signal: Vec<f32> = (0..BLOCK * 40)
+        .map(|i| 0.4 * (std::f32::consts::TAU * hz * i as f32 / sr).sin())
+        .collect();
+
+    let mut ramped = RetuneShifter::new(sr);
+    let mut stepped = RetuneShifter::new(sr);
+    let up = 2.0f32.powf(1.0 / 12.0);
+    let (mut a, mut b) = (vec![0.0; BLOCK], vec![0.0; BLOCK]);
+    // Past the latency with no shift at all, so the block under test is the one
+    // where the ratio moves.
+    for chunk in signal.chunks_exact(BLOCK).take(20) {
+        ramped.process(chunk, &mut a, 1.0, 1.0, period);
+        stepped.process(chunk, &mut b, 1.0, 1.0, period);
+    }
+    let block = &signal[BLOCK * 20..BLOCK * 21];
+    ramped.process(block, &mut a, 1.0, up, period);
+    stepped.process(block, &mut b, up, up, period);
+
+    // The ramp is real: reading at a rate that grows through the block cannot
+    // land on the same samples as reading at the final rate from the first one.
+    assert!(
+        a.iter().zip(b.iter()).any(|(x, y)| (x - y).abs() > 1e-4),
+        "the ratio was not walked across the block"
+    );
+
+    // And nothing in it is a click. One sample of this sine moves by at most
+    // 0.4 · 2π · 220/48000 ≈ 0.012, so anything an order of magnitude past that
+    // is a corner rather than a wave — which is what a staircase in pitch, or a
+    // crossfade that does not line up, sounds like.
+    let biggest = |v: &[f32]| v.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max);
+    assert!(
+        biggest(&a) < 0.05,
+        "a step of {:.4} between two samples is a click",
+        biggest(&a)
+    );
+    assert!(a.iter().all(|s| s.is_finite()));
+}
+
+/// The whole effect, on the signal a microphone in a room actually sends: a
+/// voice that is flat, with a rumble under it and hiss over it.
+///
+/// This is the test that says the two filters are worth their cost. Without
+/// them the detector locks onto the rumble or onto the folded hiss, and
+/// AutoTune corrects a voice towards a note nobody sang — which is not "a bit
+/// noisy", it is the effect actively making things worse.
+#[test]
+fn a_voice_in_a_room_is_still_corrected_to_the_note_it_meant() {
+    let sr = 48_000.0f32;
+    let mut at = AutoTune::new(sr);
+    at.params.retune_speed_ms = 10.0;
+    at.params.scale = ScaleType::Chromatic;
+    at.apply_params();
+
+    // 445 Hz — a little sharp of A4 — under a 41 Hz rumble louder than it and
+    // over a 9.5 kHz hiss.
+    let (mut voice, mut rumble, mut hiss) = (Tone::new(), Tone::new(), Tone::new());
+    for _ in 0..80 {
+        let note = voice.block(445.0, sr, 512, 0.25);
+        let low = rumble.block(41.0, sr, 512, 0.45);
+        let high = hiss.block(9_500.0, sr, 512, 0.2);
+        let mut buf: Vec<f32> = note
+            .iter()
+            .zip(low.iter())
+            .zip(high.iter())
+            .map(|((n, l), h)| n + l + h)
+            .collect();
+        at.process_block(&mut buf, sr as u32);
+        assert!(buf.iter().all(|s| s.is_finite()));
+    }
+
+    let m = at.reading();
+    assert!(m.voiced, "a sung note in a room is still a note");
+    assert!(
+        (m.detected_frequency - 445.0).abs() < 10.0,
+        "445 Hz was sung; it heard {:.1} Hz",
+        m.detected_frequency
+    );
+    assert!(
+        (m.target_frequency - 440.0).abs() < 0.5,
+        "and aims at A4, not at whatever the room was doing: {:.1} Hz",
+        m.target_frequency
+    );
+}
+
+/// **The input gain is the detector's, not the signal's.**
+///
+/// Reported from a real microphone: a voice that tracked well came out
+/// saturated, because the only knob that got the detector over its gate was
+/// also multiplying the audio. Now `Sens` lifts the analysis and leaves the
+/// sound where it was; `OutGain` is the level control, and it is the only one.
+#[test]
+fn the_sensitivity_lifts_the_analysis_and_not_the_output() {
+    let sr = 48_000.0f32;
+    let peak = |db: f32| -> f32 {
+        let mut at = AutoTune::new(sr);
+        at.params.input_gain_db = db;
+        at.apply_params();
+        let mut t = Tone::new();
+        let mut worst = 0.0f32;
+        for i in 0..60 {
+            let mut buf = t.block(440.0, sr, 512, 0.2);
+            at.process_block(&mut buf, sr as u32);
+            // The first blocks are the shifter filling its delay line.
+            if i > 40 {
+                worst = worst.max(buf.iter().fold(0.0f32, |a, s| a.max(s.abs())));
+            }
+        }
+        worst
+    };
+
+    let flat = peak(0.0);
+    let lifted = peak(18.0);
+    assert!(flat > 0.05, "there is a signal to compare: {flat}");
+    assert!(
+        (lifted - flat).abs() < 0.02,
+        "18 dB of sensitivity moved the output: {lifted} vs {flat}"
+    );
+
+    // And it does reach the detector: a voice under the gate is heard once the
+    // sensitivity is up, which is the whole point of the knob.
+    let voiced_at = |db: f32| -> bool {
+        let mut at = AutoTune::new(sr);
+        at.params.input_gain_db = db;
+        at.apply_params();
+        let mut t = Tone::new();
+        for _ in 0..80 {
+            // Well under the detector's gate on its own.
+            let mut buf = t.voice(220.0, sr, 512, 0.0006);
+            at.process_block(&mut buf, sr as u32);
+        }
+        at.reading().voiced
+    };
+    assert!(!voiced_at(0.0), "that quiet, it is under the gate");
+    assert!(voiced_at(24.0), "and the sensitivity is what gets it over");
 }

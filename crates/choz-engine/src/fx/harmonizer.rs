@@ -119,22 +119,62 @@ impl Shape {
 /// what it will do before it is turned.
 pub const VOICE_COUNTS: [usize; 4] = [1, 2, 4, 8];
 
+/// The longest a voice can lag, in samples: 50 ms at 96 kHz, which is the
+/// delay knob's top at the highest rate choz opens.
+const MAX_DELAY: usize = 4800;
+
 struct Voice {
     shifter: VoiceShifter,
+    /// What this voice is actually transposed by, in semitones. Kept rather
+    /// than recomputed: with a chord driving the harmony there is nothing to
+    /// recompute it *from*, and [`Harmonizer::intervals`] used to answer with
+    /// the shape's intervals whatever the voices were really doing.
+    semitones: f32,
     level: f32,
     /// Constant-power pan, precomputed.
     gain: [f32; 2],
     delay_frames: f32,
+    /// The voice's own delay line, **after** the shift.
+    ///
+    /// It used to reuse the shifter's input line (`VoiceShifter::tap`), which
+    /// cost no memory and was wrong: that line holds the signal *before* it is
+    /// transposed, so every voice with a delay came out at the original pitch.
+    /// With the two-voice default that meant half the harmony was a slapback of
+    /// the input — measured as the fifth sitting 42 dB under the dry, which is
+    /// "the harmoniser does nothing" to anybody listening.
+    delay: Vec<f32>,
+    write: usize,
 }
 
 impl Voice {
     fn new() -> Self {
         Self {
             shifter: VoiceShifter::new(),
+            semitones: 0.0,
             level: 1.0,
             gain: [std::f32::consts::FRAC_1_SQRT_2; 2],
             delay_frames: 0.0,
+            delay: vec![0.0; MAX_DELAY],
+            write: 0,
         }
+    }
+
+    /// Push one shifted sample in and take out what is due, interpolated
+    /// between the two samples the fractional delay falls between.
+    #[inline]
+    fn delayed(&mut self, x: f32) -> f32 {
+        let len = self.delay.len();
+        self.delay[self.write] = x;
+        self.write = (self.write + 1) % len;
+        if self.delay_frames < 1.0 {
+            return x;
+        }
+        let back = self.delay_frames.min((len - 2) as f32);
+        let whole = back.floor();
+        let frac = back - whole;
+        let i = (self.write + len - whole as usize - 1) % len;
+        let j = (i + len - 1) % len;
+        self.delay[i] * (1.0 - frac) + self.delay[j] * frac
     }
 }
 
@@ -149,6 +189,19 @@ pub struct Harmonizer {
     scale: Scale,
     key: u8,
     kind: ScaleType,
+    /// Follow the notes held on a MIDI keyboard instead of the shape and key.
+    ///
+    /// Off by default, and off is what every project written before it says.
+    /// When on, the harmony is **the chord being played**: the lowest held note
+    /// is the root and the ones above it are the intervals, so a musician plays
+    /// the harmony rather than describing it.
+    midi: bool,
+    /// Which MIDI channel that keyboard is on, 1..16. Read by the interface,
+    /// which is the only thing here that can see a MIDI port.
+    midi_channel: u8,
+    /// The chord generation this was last built from, so a rebuild only happens
+    /// when the hand on the keyboard moves.
+    chord_seen: u32,
     /// Cents of detune spread across the voices.
     detune: f32,
     /// Milliseconds the last voice lags by; the rest are spread under it.
@@ -156,6 +209,15 @@ pub struct Harmonizer {
     /// How much the input's envelope opens the voices, 0..1.
     env_amount: f32,
     env: Smoothed,
+    /// A slow peak of the same signal, so the envelope above is read as **how
+    /// loud this is compared with how loud it has been** rather than against an
+    /// absolute number.
+    ///
+    /// The absolute version is what made the harmoniser collapse on a quiet
+    /// source: a headset microphone sits around -30 dBFS, the gate opened on a
+    /// fixed 0.25, and the voices never came past half open however hard
+    /// somebody sang. A follower has to follow the singer, not the meter.
+    peak: f32,
     width: f32,
     mix: f32,
     sample_rate: f32,
@@ -172,11 +234,15 @@ impl Harmonizer {
             scale: Scale::new(0, ScaleType::Major),
             key: 0,
             kind: ScaleType::Major,
+            midi: false,
+            midi_channel: 1,
+            chord_seen: 0,
             detune: 8.0,
             delay_ms: 18.0,
             env_amount: 0.5,
             // 40 ms: opens with a syllable, not with a waveform.
             env: Smoothed::new(0.0, 40.0, sr),
+            peak: 0.0,
             width: 1.0,
             mix: 0.5,
             sample_rate: sr,
@@ -199,8 +265,25 @@ impl Harmonizer {
         h.delay_ms = get(5, 0.36) * 50.0;
         h.env_amount = get(6, 0.5).clamp(0.0, 1.0);
         h.width = get(7, 1.0).clamp(0.0, 1.0);
+        // 8 is the dry/wet, which **was not read here** — so every rebuild of
+        // the chain (adding another effect, reopening a project) put the knob
+        // back to half whatever it had been set to.
+        h.mix = get(8, 0.5).clamp(0.0, 1.0);
+        h.midi = get(9, 0.0) >= 0.5;
+        h.set_midi_channel(get(10, 0.0));
         h.rebuild();
         h
+    }
+
+    /// 1..16, from a knob position.
+    pub fn set_midi_channel(&mut self, v: f32) {
+        self.midi_channel = 1 + (v.clamp(0.0, 1.0) * 15.0).round() as u8;
+    }
+
+    /// Which MIDI channel this harmoniser listens to, and whether it listens at
+    /// all. The interface reads both: it is the side that can see a keyboard.
+    pub fn midi_input(&self) -> Option<u8> {
+        self.midi.then_some(self.midi_channel)
     }
 
     pub fn set_voices(&mut self, v: f32) {
@@ -234,9 +317,10 @@ impl Harmonizer {
     /// or a display, and the one number that says whether the harmony is
     /// diatonic or parallel.
     pub fn intervals(&self) -> Vec<f32> {
-        let steps = self.shape.steps();
-        (0..self.count)
-            .map(|i| self.semitones_for(steps[i], i))
+        self.voices
+            .iter()
+            .take(self.count)
+            .map(|v| v.semitones)
             .collect()
     }
 
@@ -280,18 +364,44 @@ impl Harmonizer {
     /// and calls `powf`, and none of that belongs in a callback.
     fn rebuild(&mut self) {
         self.scale = Scale::new(self.key, self.kind);
+        // With MIDI on, the chord replaces the shape: the intervals are the
+        // ones being held, measured from the lowest note. Nothing held leaves
+        // the last chord standing — a harmoniser that stops the moment the
+        // hands come off the keys is one nobody can play.
+        let mut held = [0u8; crate::chord::MAX_NOTES];
+        let chord = match self.midi {
+            true => crate::chord::chord().read(&mut held),
+            false => 0,
+        };
         let steps = self.shape.steps();
-        let count = self.count;
+        let count = match chord > 1 {
+            true => (chord - 1).min(MAX_VOICES),
+            false => self.count,
+        };
         let width = self.width;
         let delay_ms = self.delay_ms;
         let sr = self.sample_rate;
-        // Level so eight voices are not eight times one voice: the copies are
-        // correlated, so they add nearer to `n` than to `√n`.
-        let level = 1.0 / (count as f32).max(1.0);
+        // Level so eight voices are not eight times one voice.
+        //
+        // **`1/√n`, not `1/n`.** The voices sing *different notes*, so they are
+        // uncorrelated and their powers add, not their amplitudes — dividing by
+        // `n` took another 3 dB off two voices and 9 dB off eight. Measured
+        // against a 220 Hz tone with the two-voice default: full wet came out
+        // **7.2 dB under the dry**, which is a harmony that is technically
+        // there and practically inaudible, and is what "the harmoniser does
+        // nothing" turned out to mean.
+        let level = 1.0 / (count as f32).max(1.0).sqrt();
         for i in 0..MAX_VOICES {
-            let semis = self.semitones_for(steps[i.min(steps.len() - 1)], i);
+            // Chord: the interval from the root to the i-th note above it, in
+            // semitones and needing no scale at all — the hand already chose
+            // the notes. Otherwise the shape, walked through the key.
+            let semis = match chord > 1 && i + 1 < chord {
+                true => (held[i + 1] as i32 - held[0] as i32) as f32,
+                false => self.semitones_for(steps[i.min(steps.len() - 1)], i),
+            };
             let voice = &mut self.voices[i];
             voice.shifter.set_semitones(semis);
+            voice.semitones = semis;
             voice.level = level;
             // Fanned across the image, and the odd one in the middle.
             let pan = if count > 1 {
@@ -308,10 +418,14 @@ impl Harmonizer {
             } else {
                 0.0
             };
-            voice.delay_frames = (delay_ms * share * 0.001 * sr)
-                .clamp(0.0, (super::shift::SHIFT_WINDOW * 2 - 2) as f32);
+            voice.delay_frames = (delay_ms * share * 0.001 * sr).clamp(0.0, (MAX_DELAY - 2) as f32);
         }
         self.dirty = false;
+        self.chord_seen = crate::chord::chord().generation();
+        // The voice count follows the chord while it is driving.
+        if chord > 1 {
+            self.count = count;
+        }
     }
 }
 
@@ -323,12 +437,19 @@ impl super::FxProcessor for Harmonizer {
             self.env.set_sample_rate(sr);
             self.dirty = true;
         }
+        // A hand that moved on the keyboard is a rebuild, and only that: the
+        // generation is one relaxed load per block.
+        if self.midi && crate::chord::chord().generation() != self.chord_seen {
+            self.dirty = true;
+        }
         if self.dirty {
             self.rebuild();
         }
         let count = self.count;
         let mix = self.mix;
         let env_amount = self.env_amount;
+        // Two seconds to fall by 1/e, as a per-sample coefficient.
+        let peak_decay = (-1.0 / (2.0 * sr)).exp();
 
         for frame in buf.chunks_exact_mut(2) {
             let (dry_l, dry_r) = (frame[0], frame[1]);
@@ -336,22 +457,32 @@ impl super::FxProcessor for Harmonizer {
             // pair would be transposing two different signals into one chord.
             let mono = (dry_l + dry_r) * 0.5;
 
-            self.env.set_target(mono.abs().min(1.0));
+            let level = mono.abs().min(1.0);
+            self.env.set_target(level);
             let e = self.env.tick();
-            // At 0 the voices are always open; at 1 they follow the input.
-            let open = 1.0 - env_amount + env_amount * (e * 4.0).min(1.0);
+            // The slow peak: straight up, and a couple of seconds to fall. It
+            // is the reference the fast envelope is read against.
+            self.peak = if level > self.peak {
+                level
+            } else {
+                self.peak * peak_decay
+            };
+            // How open the voices are: the fast envelope as a **fraction of how
+            // loud this signal has been**, so a quiet microphone opens them as
+            // wide as a hot line does. Half of the recent peak counts as fully
+            // open — a syllable is well past that, a gap between them is not.
+            let reference = self.peak.max(1e-4) * 0.5;
+            let open = 1.0 - env_amount + env_amount * (e / reference).min(1.0);
 
             let mut wet = [0.0f32; 2];
             for voice in self.voices.iter_mut().take(count) {
                 // Every voice is written every sample even when its delay is
                 // zero: the line has to keep moving or the tap reads the past
                 // of a stopped clock.
+                // Shift first, delay second. The other order is what made
+                // every delayed voice come out at the original pitch.
                 let shifted = voice.shifter.process(mono);
-                let sound = if voice.delay_frames > 1.0 {
-                    voice.shifter.tap(voice.delay_frames)
-                } else {
-                    shifted
-                };
+                let sound = voice.delayed(shifted);
                 let g = sound * voice.level * open;
                 wet[0] += g * voice.gain[0];
                 wet[1] += g * voice.gain[1];
@@ -365,8 +496,11 @@ impl super::FxProcessor for Harmonizer {
     fn reset(&mut self) {
         for v in self.voices.iter_mut() {
             v.shifter.reset();
+            v.delay.fill(0.0);
+            v.write = 0;
         }
         self.env.snap(0.0);
+        self.peak = 0.0;
     }
 
     fn set_mix(&mut self, wet: f32) {
@@ -399,6 +533,16 @@ impl super::FxProcessor for Harmonizer {
             FxParam::new("Env", self.env_amount, 0.0, 1.0, ""),
             FxParam::new("Width", self.width, 0.0, 1.0, ""),
             FxParam::new("Wet", self.mix, 0.0, 1.0, ""),
+            // The order is frozen: a CC learned on `Wet` has to stay on `Wet`,
+            // so these two go on the end.
+            FxParam::new("MIDI", self.midi as u8 as f32, 0.0, 1.0, ""),
+            FxParam::new(
+                "Ch",
+                (self.midi_channel.clamp(1, 16) - 1) as f32 / 15.0,
+                1.0,
+                16.0,
+                "",
+            ),
         ]
     }
 
@@ -426,6 +570,14 @@ impl super::FxProcessor for Harmonizer {
                 self.dirty = true;
             }
             8 => self.mix = v,
+            9 => {
+                self.midi = v >= 0.5;
+                self.dirty = true;
+            }
+            10 => {
+                self.set_midi_channel(v);
+                self.dirty = true;
+            }
             _ => {}
         }
     }
@@ -621,4 +773,104 @@ mod tests {
             h.reset();
         }
     }
+    /// **The harmony comes out as loud as what went in**, and it does so at any
+    /// input level.
+    ///
+    /// This is the test that would have caught the report "I plugged a headset
+    /// microphone into the harmoniser and got no response at all". Two things
+    /// were taking it away: the voices were divided by their count when they
+    /// should be divided by its square root (they sing different notes, so
+    /// their powers add and not their amplitudes), and the envelope follower
+    /// opened against an **absolute** level — so a microphone sitting at
+    /// -40 dBFS never opened the voices past half however hard anybody sang.
+    ///
+    /// Measured on power, not on a single frequency bin: a delay-line shifter
+    /// warbles, and a warble spreads a tone into sidebands that a one-bin
+    /// measurement reads as silence. That mistake is how this was nearly
+    /// "fixed" in the wrong place.
+    #[test]
+    fn the_harmony_is_as_loud_as_the_input_at_any_level() {
+        let sr = 48_000.0f32;
+        let rms = |v: &[f32]| {
+            (v.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>() / v.len() as f64).sqrt()
+        };
+
+        // A hot line and a quiet microphone, 30 dB apart.
+        for amp in [0.4f32, 0.012] {
+            let mut h = Harmonizer::new(sr as u32);
+            h.set_mix(1.0);
+            let (mut input, mut output) = (0.0f64, 0.0f64);
+            for block in 0..40 {
+                let mut buf: Vec<f32> = (0..512)
+                    .flat_map(|i| {
+                        let n = block * 512 + i;
+                        let s = amp * (std::f32::consts::TAU * 220.0 * n as f32 / sr).sin();
+                        [s, s]
+                    })
+                    .collect();
+                let before = rms(&buf);
+                h.process_block(&mut buf, sr as u32);
+                // The first blocks are the shifter filling its line and the
+                // follower finding the signal.
+                if block > 20 {
+                    input += before * before;
+                    output += rms(&buf).powi(2);
+                }
+            }
+            let loss = 10.0 * (output / input).max(1e-12).log10();
+            assert!(
+                loss > -7.0,
+                "at amp {amp} the wet output is {loss:.1} dB under the input"
+            );
+        }
+    }
+
+    /// The chord being played decides the harmony, and the lowest note is the
+    /// root it is measured from.
+    ///
+    /// What was asked for: "make the harmony follow what I play on the piano".
+    /// With the switch off, nothing about the effect changes — which is the
+    /// other half of the promise.
+    #[test]
+    fn a_held_chord_becomes_the_harmony() {
+        let sr = 48_000.0;
+        let mut h = Harmonizer::new(sr as u32);
+
+        // Off: the shape and the key decide, and the chord is ignored.
+        crate::chord::chord().set(&[60, 63, 70]);
+        h.set_param(9, 0.0);
+        let by_shape = h.intervals();
+        assert!(!by_shape.is_empty());
+
+        // On: a minor third and a fifth above the root, whatever the key says.
+        h.set_param(9, 1.0);
+        h.process_block(&mut [0.0f32; 64], sr as u32);
+        let played = h.intervals();
+        assert_eq!(played.len(), 2, "two notes above the root: {played:?}");
+        assert!((played[0] - 3.0).abs() < 0.01, "{played:?}");
+        assert!((played[1] - 10.0).abs() < 0.01, "{played:?}");
+
+        // A new chord under the hand is a new harmony.
+        crate::chord::chord().set(&[60, 64, 67]);
+        h.process_block(&mut [0.0f32; 64], sr as u32);
+        let played = h.intervals();
+        assert!((played[0] - 4.0).abs() < 0.01, "{played:?}");
+        assert!((played[1] - 7.0).abs() < 0.01, "{played:?}");
+
+        // And with the switch off again it is back to the shape.
+        h.set_param(9, 0.0);
+        h.process_block(&mut [0.0f32; 64], sr as u32);
+        assert_eq!(h.intervals().len(), by_shape.len());
+
+        // The channel is a setting the interface reads; the DSP only stores it.
+        h.set_param(9, 1.0);
+        h.set_param(10, 0.0);
+        assert_eq!(h.midi_input(), Some(1));
+        h.set_param(10, 1.0);
+        assert_eq!(h.midi_input(), Some(16));
+        h.set_param(9, 0.0);
+        assert_eq!(h.midi_input(), None);
+        crate::chord::chord().clear();
+    }
+
 }
