@@ -380,35 +380,46 @@ pub fn read_plugin_params(
 
 /// The controls of a `.pd` patch, as parameters.
 ///
-/// Also the place that says, once and by name, which controls **cannot** be
-/// reached: a patch whose gain slider has no receive symbol sits at whatever
-/// that slider was saved at — zero, for a fresh one — and is silent with no
-/// error anywhere. Giving the slider a receive symbol in Pd is the fix, and
-/// nobody guesses that from silence.
+/// Every control becomes a knob, including the ones the patch does not name.
+/// A slider with no receive symbol used to be unreachable — the patch sat at
+/// whatever that slider was saved at, zero for a fresh one, and was silent
+/// with no error anywhere. choz now names those itself in the copy it plays,
+/// so they work; this only says, by name, which ones it had to name.
 fn pd_params(path: &std::path::Path) -> Vec<PluginParam> {
     let Ok(info) = choz_plugin_pd::read_patch(path) else {
         return Vec::new();
     };
-    let stuck = choz_plugin_pd::unreachable(&info);
-    if !stuck.is_empty() {
+    let named = choz_plugin_pd::renamed(&info);
+    if !named.is_empty() {
         eprintln!(
-            "choz: {} has {} control(s) choz cannot move ({}). Give them a receive \
-             symbol in Pd (the slider's properties) and they become knobs here.",
+            "choz: {} has {} control(s) the patch does not name ({}); choz names them \
+             in its own copy so they work as knobs. The file itself is untouched.",
             path.display(),
-            stuck.len(),
-            stuck.join(", ")
+            named.len(),
+            named.join(", ")
         );
     }
     choz_plugin_pd::addressable(&info)
         .into_iter()
         .enumerate()
         .map(|(i, c)| {
+            // **Not `min`.** Pd saves a slider at whatever it was left at,
+            // which for a patch written on the canvas is zero, and a chain of
+            // multiplies that all start at zero is a patch that makes no sound
+            // and no complaint. So a knob starts at unity when its range
+            // contains 1 — the gain-shaped case, which is most of them — and
+            // halfway otherwise. A toggle still starts off.
+            let start = match c.toggle {
+                true => c.min,
+                false if (c.min..=c.max).contains(&1.0) => 1.0,
+                false => c.min + (c.max - c.min) * 0.5,
+            };
             let mut p = PluginParam::plain_range(
                 i as u32,
                 c.name.clone(),
                 c.min as f64,
                 c.max as f64,
-                c.min as f64,
+                start as f64,
             );
             if c.toggle {
                 p.steps = 2;

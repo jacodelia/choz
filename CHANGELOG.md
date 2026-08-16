@@ -31,8 +31,14 @@ Lo que trae, sobre la 1.0.0:
 
 - **Pure Data hosteado**: un `.pd` con `adc~` y `dac~` es un efecto más de la
   cadena, corriendo en su propio proceso (`choz-pd-host`, el único binario que
-  enlaza libpd), y **sus sliders son knobs en el rack** cuando llevan símbolo de
-  recepción — los que no, se nombran para que se sepa por qué el patch calla.
+  enlaza libpd), y **todos sus sliders son knobs en el rack**. Los que el patch
+  no nombra (`empty empty`, que es como Pd guarda un slider salvo que alguien
+  escriba el símbolo a mano — o sea, casi todos) los nombra choz en una **copia**
+  que es lo que suena; el archivo del usuario no se toca. Medido con
+  `delay.pd`: cinco sliders sin nombre, patch mudo antes, 3.0 de pico ahora.
+  Los knobs además arrancan en la unidad cuando el rango la contiene, y no en el
+  mínimo: una cadena de multiplicaciones que empieza en cero es silencio sin un
+  solo error.
 - **Los 45 efectos propios, publicados como un `.clap`** para Bitwig, Reaper,
   Carla o cualquier host CLAP, siguiendo el transporte del anfitrión. El
   instalador y los paquetes lo ponen donde el host lo busca.

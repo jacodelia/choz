@@ -151,6 +151,49 @@ fn main() {
     );
     drop(chain);
 
+    // The same patch with the slider **unnamed** — `empty empty`, which is how
+    // Pd saves one unless somebody typed a receive symbol into its properties,
+    // and therefore how nearly every patch in the wild is. choz names it in the
+    // copy it plays, so it works exactly like the one above.
+    let unnamed = dir.join("unnamed.pd");
+    std::fs::write(
+        &unnamed,
+        "#N canvas 0 0 450 300 12;\n\
+         #X obj 20 20 adc~ 1;\n\
+         #X obj 20 60 *~;\n\
+         #X obj 20 100 dac~;\n\
+         #X obj 200 40 hsl 170 20 0 1 0 0 empty empty Gain -2 -10 0 12 #c6ffc7 #000000 #000000 0 1;\n\
+         #X connect 0 0 1 0;\n\
+         #X connect 1 0 2 0;\n\
+         #X connect 1 0 2 1;\n\
+         #X connect 3 0 1 1;\n",
+    )
+    .unwrap();
+    let params = choz_engine::read_plugin_params(PluginFormat::Pd, &unnamed, "");
+    assert_eq!(params.len(), 1, "unnamed sliders are knobs too: {params:?}");
+    assert_eq!(params[0].name, "Gain", "and keep the patch's own label");
+
+    let spec = FxSpec {
+        kind: String::new(),
+        enabled: true,
+        wet: 1.0,
+        params: Vec::new(),
+        plugin: Some(PluginFxRef {
+            format: PluginFormat::Pd,
+            path: unnamed,
+            id: String::new(),
+        }),
+    };
+    let mut chain = build_chain_from_specs(&[spec], SR, FRAMES);
+    assert_eq!(chain.len(), 1);
+    assert!(peak_with(&mut chain, 0.0) < 0.01, "slider down is silence");
+    assert!(
+        peak_with(&mut chain, 1.0) > 0.2,
+        "slider up is the signal — the patch itself names nothing, so this is \
+         the copy choz filled in doing its job"
+    );
+    drop(chain);
+
     // A patch with nothing to connect audio to is not offered as an effect —
     // the scan reads the file and says so, without Pure Data being involved.
     std::fs::write(
