@@ -36,6 +36,7 @@ and audio effects, with their own parameters and their own windows — choz's ow
 | **VST3**   | ✅ | ✅ | ✅ | ✅ `IPlugView` + Linux run loop |
 | **LADSPA** | ✅ | — | ✅ | ❌ (format has no GUI) |
 | **DSSI**   | ✅ | ✅ | ✅ | ❌ |
+| **Pure Data** | ✅ `.pd` | — | ✅ | ❌ (patch has no embeddable window) |
 | **SFZ**    | ✅ | ✅ | — | — |
 | **SF2**    | ✅ | ✅ (oxisynth) | — | — |
 
@@ -81,6 +82,31 @@ sudo dnf install @development-tools alsa-lib-devel jack-audio-connection-kit-dev
 works against PipeWire's JACK layer too, which is the usual setup. **No X11
 headers**: the plugin windows go through `x11rb`, which speaks the protocol
 itself and links no C library.
+
+### System requirements
+
+| | Minimum | Notes |
+|---|---|---|
+| **OS** | Linux with glibc | The audio backends are ALSA and JACK, and the plugin sandbox re-runs the binary per directory. No macOS or Windows build. |
+| **Architecture** | x86-64, aarch64 or armv7 | Exactly what the releases ship: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` (Pi 3/4/5), `armv7-unknown-linux-gnueabihf` (Pi 2, Zero 2 W). |
+| **Audio** | ALSA (`libasound.so.2`) | Required — without it choz starts and opens no device. JACK/PipeWire is optional and `dlopen`ed. |
+| **Terminal** | Any 24-bit-colour terminal | The wallpaper and logo render as halfblocks anywhere; kitty, Ghostty and WezTerm additionally get the graphics protocol. |
+| **Terminal size** | 80×24 | Panels drop their optional rows as they shrink rather than breaking, but below this the rack and the monitor stop being readable together. |
+| **Plugin windows** | X11 or XWayland | Only needed to *open* a plugin's own window. Every parameter is a knob in the RACK without it. |
+| **Toolchain** (source only) | Rust stable, 2021 edition | Not needed for a release install. |
+
+**Real-time privileges are optional but wanted.** choz runs without them; a
+buffer small enough to play through needs them. What actually matters is
+`rtprio` and `memlock` for your user — on a distribution with rtkit and
+`@audio` set up, being in the `audio` group is usually the whole job:
+
+```bash
+ulimit -r -l          # want a non-zero rtprio and unlimited memlock
+groups | grep audio   # the usual way to get them
+```
+
+Plugins are **native binaries**: an ARM install loads ARM plugins, not the x86
+ones sitting in the same directory.
 
 ### Compile
 

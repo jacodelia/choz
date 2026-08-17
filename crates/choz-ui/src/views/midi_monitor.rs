@@ -28,6 +28,74 @@ pub fn note_name(note: u8) -> String {
     format!("{}{}", NOTE_NAMES[note as usize % 12], note as i16 / 12 - 1)
 }
 
+/// Chord shapes, as semitone steps up from the root paired with the suffix
+/// that names them.
+///
+/// **Order matters.** The list is searched top to bottom, so the four-note
+/// shapes come first: C-E-G-B contains C-E-G, and answering "C" to a hand
+/// playing Cmaj7 is not wrong so much as useless. Within a size, the shapes a
+/// player is likelier to be holding come first.
+const CHORD_SHAPES: &[(&[u8], &str)] = &[
+    (&[0, 4, 7, 11], "maj7"),
+    (&[0, 4, 7, 10], "7"),
+    (&[0, 3, 7, 10], "m7"),
+    (&[0, 3, 7, 11], "m(maj7)"),
+    (&[0, 3, 6, 10], "m7b5"),
+    (&[0, 3, 6, 9], "dim7"),
+    (&[0, 4, 7, 9], "6"),
+    (&[0, 3, 7, 9], "m6"),
+    (&[0, 4, 8, 10], "7#5"),
+    (&[0, 4, 6, 10], "7b5"),
+    (&[0, 2, 4, 7], "add9"),
+    (&[0, 5, 7, 10], "7sus4"),
+    (&[0, 4, 7], ""),
+    (&[0, 3, 7], "m"),
+    (&[0, 3, 6], "dim"),
+    (&[0, 4, 8], "aug"),
+    (&[0, 5, 7], "sus4"),
+    (&[0, 2, 7], "sus2"),
+    (&[0, 7], "5"),
+];
+
+/// Name the chord `notes` spells, or `None` when it does not spell one.
+///
+/// `notes` is MIDI numbers in any order; the **lowest** is the bass, which is
+/// what decides whether the answer is `C` or `C/E`. Octaves and doublings are
+/// folded away first, so a chord voiced across three octaves names the same as
+/// the same chord under one hand.
+///
+/// Returns `None` rather than guessing: two notes that are not a fifth, or a
+/// cluster matching no shape, has no name worth printing, and inventing one is
+/// worse than a blank.
+pub fn chord_name(notes: &[u8]) -> Option<String> {
+    if notes.len() < 2 {
+        return None;
+    }
+    let bass = *notes.iter().min()? % 12;
+    let mut classes: Vec<u8> = notes.iter().map(|n| n % 12).collect();
+    classes.sort_unstable();
+    classes.dedup();
+
+    // Try every note as the root. The bass is tried first so that a chord in
+    // root position never comes back as an inversion of something else.
+    let roots = std::iter::once(bass).chain(classes.iter().copied().filter(|c| *c != bass));
+    for root in roots {
+        let mut steps: Vec<u8> = classes.iter().map(|c| (c + 12 - root) % 12).collect();
+        steps.sort_unstable();
+        let Some((_, suffix)) = CHORD_SHAPES.iter().find(|(shape, _)| *shape == steps) else {
+            continue;
+        };
+        let name = format!("{}{suffix}", NOTE_NAMES[root as usize]);
+        // A root that is not in the bass is an inversion, and a player reading
+        // the panel wants to see which one.
+        return Some(match root == bass {
+            true => name,
+            false => format!("{name}/{}", NOTE_NAMES[bass as usize]),
+        });
+    }
+    None
+}
+
 /// The common controllers, so the monitor says "SUSTAIN" instead of "CC 64"
 /// when the user steps on a pedal.
 fn cc_name(cc: u8) -> Option<&'static str> {
@@ -129,44 +197,39 @@ fn line(event: &InputEvent, ports: &[String]) -> Line<'static> {
 /// twice, and answering the second one needs no MIDI at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MonitorTab {
+    /// The message log, the spectrum and the level meters, side by side.
+    ///
+    /// One tab rather than three because they answer one question between
+    /// them — *did it arrive, what came out, how loud* — and reading it meant
+    /// cycling tabs and holding the other two from memory.
     #[default]
-    Midi,
-    /// A piano keyboard lit by what is arriving.
+    Monitor,
+    /// A piano keyboard lit by what is arriving, and the chord it spells.
     Keys,
-    /// The same notes as bars falling towards that keyboard.
-    Roll,
-    /// The output's shape, as a travelling window.
+    /// The output's shape, stacked into a history.
     Wave,
-    /// How loud it is: peak and RMS, held and decaying.
-    Activity,
-    /// What frequencies are in it: an FFT, logarithmic, with peak hold.
-    Spectrum,
 }
 
 impl MonitorTab {
-    pub const ALL: [MonitorTab; 6] = [
-        MonitorTab::Midi,
-        MonitorTab::Keys,
-        MonitorTab::Roll,
-        MonitorTab::Wave,
-        MonitorTab::Spectrum,
-        MonitorTab::Activity,
-    ];
+    pub const ALL: [MonitorTab; 3] = [MonitorTab::Monitor, MonitorTab::Keys, MonitorTab::Wave];
 
     pub fn label(self) -> &'static str {
         match self {
-            MonitorTab::Midi => "MIDI",
+            MonitorTab::Monitor => "MONITOR",
             MonitorTab::Keys => "KEYS",
-            MonitorTab::Roll => "ROLL",
             MonitorTab::Wave => "WAVE",
-            MonitorTab::Activity => "ACTIVITY",
-            MonitorTab::Spectrum => "SPEC",
         }
     }
 
     /// Whether this tab draws the keyboard, and so answers the colour key.
     pub fn is_keyboard(self) -> bool {
-        matches!(self, MonitorTab::Keys | MonitorTab::Roll)
+        matches!(self, MonitorTab::Keys)
+    }
+
+    /// Whether the FFT has to run this frame. It costs a 2048-point transform
+    /// on the UI thread, so it only runs when something is drawing it.
+    pub fn needs_spectrum(self) -> bool {
+        matches!(self, MonitorTab::Monitor)
     }
 
     pub fn next(self) -> Self {
@@ -214,21 +277,6 @@ pub struct KeyLit {
     pub slot: Option<usize>,
 }
 
-/// One note in the falling-notes view: when it started, and when it stopped.
-#[derive(Debug, Clone, Copy)]
-struct RollNote {
-    note: u8,
-    channel: u8,
-    slot: Option<usize>,
-    start: Instant,
-    /// `None` while the key is still down.
-    end: Option<Instant>,
-}
-
-/// How far back the roll looks. Longer needs a taller panel to say anything.
-const ROLL_WINDOW: Duration = Duration::from_secs(4);
-/// Fixed budget: the oldest note is overwritten rather than the buffer growing.
-const ROLL_MAX: usize = 256;
 /// How many controllers are shown under the keyboard.
 const CC_SHOWN: usize = 3;
 
@@ -244,7 +292,6 @@ const CC_SHOWN: usize = 3;
 #[derive(Debug)]
 pub struct KeyboardState {
     keys: [Option<KeyLit>; 128],
-    roll: VecDeque<RollNote>,
     /// Last few controllers seen, newest first: `(cc, value)`.
     ccs: Vec<(u8, u8)>,
     bend: u16,
@@ -284,7 +331,6 @@ impl Default for KeyboardState {
     fn default() -> Self {
         Self {
             keys: [None; 128],
-            roll: VecDeque::with_capacity(ROLL_MAX),
             ccs: Vec::with_capacity(CC_SHOWN),
             bend: 8192,
             converted: [None; Converted::COUNT],
@@ -318,16 +364,6 @@ impl KeyboardState {
                 vel: 100,
                 slot,
             });
-            if self.roll.len() == ROLL_MAX {
-                self.roll.pop_front();
-            }
-            self.roll.push_back(RollNote {
-                note: n,
-                channel: 0,
-                slot,
-                start: Instant::now(),
-                end: None,
-            });
         }
     }
 
@@ -353,10 +389,10 @@ impl KeyboardState {
             .collect()
     }
 
-    /// Which notes are lit right now. For a test, and for anything that wants
-    /// to know what the keyboard is showing without redrawing it.
-    #[cfg(test)]
-    pub(crate) fn drawn_keys(&self) -> Vec<u8> {
+    /// Which notes are lit right now, low to high, whatever channel they came
+    /// on. This is what the chord readout names: a player holding a chord is
+    /// not thinking about which channel each finger is on.
+    pub fn held(&self) -> Vec<u8> {
         self.keys
             .iter()
             .enumerate()
@@ -364,16 +400,17 @@ impl KeyboardState {
             .collect()
     }
 
-    /// Put a note out: the key and whatever bar is still falling for it.
+    /// Which notes are lit right now. For a test, and for anything that wants
+    /// to know what the keyboard is showing without redrawing it.
+    #[cfg(test)]
+    pub(crate) fn drawn_keys(&self) -> Vec<u8> {
+        self.held()
+    }
+
+    /// Put a note out.
     fn release(&mut self, note: u8) {
         if (note as usize) < 128 {
             self.keys[note as usize] = None;
-        }
-        for r in self.roll.iter_mut().rev() {
-            if r.note == note && r.end.is_none() {
-                r.end = Some(Instant::now());
-                break;
-            }
         }
     }
 
@@ -392,29 +429,10 @@ impl KeyboardState {
                     vel: m.vel,
                     slot,
                 });
-                if self.roll.len() == ROLL_MAX {
-                    self.roll.pop_front();
-                }
-                self.roll.push_back(RollNote {
-                    note: m.note,
-                    channel: m.channel,
-                    slot,
-                    start: Instant::now(),
-                    end: None,
-                });
             }
             InputEvent::Note(m) => {
                 if (m.note as usize) < 128 {
                     self.keys[m.note as usize] = None;
-                }
-                // Close the newest open bar for that note.
-                if let Some(r) = self
-                    .roll
-                    .iter_mut()
-                    .rev()
-                    .find(|r| r.note == m.note && r.end.is_none())
-                {
-                    r.end = Some(Instant::now());
                 }
             }
             InputEvent::Cc(m) => {
@@ -439,12 +457,11 @@ impl KeyboardState {
     /// easy case to be clever about the rare one.
     pub fn clear(&mut self) {
         self.keys = [None; 128];
-        self.roll.clear();
         self.bend = 8192;
         self.modulation = 0;
     }
 
-    /// Which keys are down, for tests and for the roll's colouring.
+    /// Which keys are down, and how they were played.
     pub fn lit(&self, note: u8) -> Option<KeyLit> {
         self.keys.get(note as usize).copied().flatten()
     }
@@ -467,9 +484,6 @@ impl KeyboardState {
 
 /// Default window: the range `pitch.rs` tracks, which also covers a 61-key
 /// controller. Anything outside scrolls the view rather than being dropped.
-const DEFAULT_LO: u8 = 36; // C2
-const DEFAULT_HI: u8 = 96; // C7
-
 fn is_black(note: u8) -> bool {
     matches!(note % 12, 1 | 3 | 6 | 8 | 10)
 }
@@ -506,46 +520,109 @@ fn hue_of(n: u32) -> Color {
     Color::Rgb(r, g, b)
 }
 
-/// Which note each column of the keyboard belongs to.
-///
-/// Two columns per white key, and the black key sits on the **second** column
-/// of the white key below it — which is where it sits on a real keyboard, and
-/// is what makes the 2-3 grouping readable without drawing any borders.
-fn key_columns(lo: u8, hi: u8, width: usize) -> Vec<(Option<u8>, u8)> {
-    let mut cols: Vec<(Option<u8>, u8)> = Vec::with_capacity(width);
-    let mut note = lo;
-    while note <= hi && cols.len() < width {
-        if is_black(note) {
-            note += 1;
-            continue;
-        }
-        let black = (note < hi && is_black(note + 1)).then_some(note + 1);
-        cols.push((None, note));
-        if cols.len() < width {
-            cols.push((black, note));
-        }
-        note += 1;
-    }
-    cols
+/// The full piano: A0 (MIDI 21) up to C8 (108). Eighty-eight keys, of which
+/// fifty-two are white — and one column per white key is what makes the whole
+/// instrument fit a panel narrower than a hundred cells.
+const PIANO_LO: u8 = 21;
+const PIANO_HI: u8 = 108;
+
+/// Unlit key colours: ivory, and the dark the black keys sit at.
+const WHITE_KEY: Color = Color::Rgb(214, 219, 228);
+const BLACK_KEY: Color = Color::Rgb(28, 31, 38);
+
+/// Every white key of the piano, low to high.
+fn piano_whites() -> Vec<u8> {
+    (PIANO_LO..=PIANO_HI).filter(|n| !is_black(*n)).collect()
 }
 
-/// The range to draw: the default window, widened to whatever is sounding
-/// outside it, and clamped to what fits.
-fn visible_range(state: &KeyboardState, width: usize) -> (u8, u8) {
-    let (mut lo, mut hi) = (DEFAULT_LO, DEFAULT_HI);
-    if let Some((slo, shi)) = state.sounding_range() {
-        lo = lo.min(slo);
-        hi = hi.max(shi);
+/// The white keys to draw in `width` columns, one column each.
+///
+/// The whole piano when it fits, which it does from 52 columns up. Below that
+/// the view is a window onto it, held over whatever is sounding — a keyboard
+/// scrolled away from the notes being played answers nothing.
+fn visible_whites(state: &KeyboardState, width: usize) -> Vec<u8> {
+    let all = piano_whites();
+    if width >= all.len() || width == 0 {
+        return all;
     }
-    // Two columns per white key; drop octaves from the top until it fits.
-    let whites = |lo: u8, hi: u8| (lo..=hi).filter(|n| !is_black(*n)).count();
-    while whites(lo, hi) * 2 > width && hi > lo + 12 {
-        hi -= 12;
+    // Centre the window on what is sounding, or on middle C when nothing is.
+    let centre = match state.sounding_range() {
+        Some((lo, hi)) => (lo as usize + hi as usize) / 2,
+        None => 60,
+    };
+    let at = all
+        .iter()
+        .position(|w| *w as usize >= centre)
+        .unwrap_or(all.len() / 2);
+    let start = at.saturating_sub(width / 2).min(all.len() - width);
+    all[start..start + width].to_vec()
+}
+
+/// The keyboard: black keys on the top row, white key bodies below, octave
+/// numbers under those.
+///
+/// One column per white key, and the black keys are drawn with half-blocks
+/// straddling the boundary they really sit on — the right half of the white
+/// below them and the left half of the white above. A white key with a black
+/// on each side (D, G, A) ends up fully covered, and *that* is what turns the
+/// top row into the piano's 2-and-3 grouping instead of an even dotted line:
+///
+/// ```text
+///  ▐█▌ ▐███▌ ▐█▌ ▐███▌
+///  ███████████████████
+///  1     2
+/// ```
+fn keyboard_lines(state: &KeyboardState, mode: KeyColor, width: usize) -> Vec<Line<'static>> {
+    let whites = visible_whites(state, width);
+    let colour_of = |note: u8, unlit: Color| match state.lit(note) {
+        Some(k) => key_colour(mode, &k),
+        None => unlit,
+    };
+
+    let mut blacks: Vec<Span> = Vec::with_capacity(whites.len());
+    let mut bodies: Vec<Span> = Vec::with_capacity(whites.len());
+    let mut labels: Vec<Span> = Vec::with_capacity(whites.len());
+    for &w in &whites {
+        let white = colour_of(w, WHITE_KEY);
+
+        // The black keys touching this white key, if they are on the piano.
+        let left = w.checked_sub(1).filter(|n| *n >= PIANO_LO && is_black(*n));
+        let right = Some(w + 1).filter(|n| *n <= PIANO_HI && is_black(*n));
+        let glyph = match (left.is_some(), right.is_some()) {
+            (true, true) => '\u{2588}',
+            (true, false) => '\u{258C}',
+            (false, true) => '\u{2590}',
+            (false, false) => ' ',
+        };
+        // One cell cannot colour its two halves apart, so a lit black key wins
+        // the cell it shares: a key being played is the thing being looked for.
+        let black = [left, right]
+            .into_iter()
+            .flatten()
+            .find(|n| state.lit(*n).is_some())
+            .map(|n| colour_of(n, BLACK_KEY))
+            .unwrap_or(BLACK_KEY);
+        blacks.push(Span::styled(
+            glyph.to_string(),
+            Style::default().fg(black).bg(white),
+        ));
+        bodies.push(Span::styled(
+            "\u{2588}".to_string(),
+            Style::default().fg(white),
+        ));
+
+        // Octave numbers under each C, one cell wide so they cannot collide
+        // with the key next door. C4 is middle C, as everywhere else.
+        let label = match w % 12 == 0 {
+            true => char::from_digit((w as u32 / 12).saturating_sub(1), 10).unwrap_or(' '),
+            false => ' ',
+        };
+        labels.push(Span::styled(
+            label.to_string(),
+            Style::default().fg(if label == ' ' { DIM } else { HEADER }),
+        ));
     }
-    while whites(lo, hi) * 2 > width && lo + 12 < hi {
-        lo += 12;
-    }
-    (lo, hi)
+    vec![Line::from(blacks), Line::from(bodies), Line::from(labels)]
 }
 
 /// The piano keyboard, lit by what is arriving.
@@ -553,13 +630,26 @@ fn draw_keys(f: &mut Frame, area: Rect, state: &KeyboardState, mode: KeyColor) {
     if area.height == 0 || area.width == 0 {
         return;
     }
+    let height = area.height as usize;
     let mut lines = keyboard_lines(state, mode, area.width as usize);
-    // Below the keys: the wheels and the last few controllers. They are what
+    // The octave labels are the first thing to go when the panel is short: a
+    // C2/C3/C4 ruler is a nicety, where the chord and the wheels below it are
+    // readings. Without this, a seven-row panel spent its last row on the
+    // ruler and pushed the pedals off the bottom.
+    if height < lines.len() + 2 {
+        lines.pop();
+    }
+    // The chord goes directly under the keys, before the controllers: it is
+    // the thing being read while both hands are busy.
+    if height > lines.len() {
+        lines.push(chord_line(state));
+    }
+    // Below that: the wheels and the last few controllers. They are what
     // a player checks after "did the note arrive" — and CCs never light a key.
-    if area.height as usize > lines.len() {
+    if height > lines.len() {
         lines.push(controller_line(state));
     }
-    if area.height as usize > lines.len() {
+    if height > lines.len() {
         lines.push(Line::from(Span::styled(
             format!("  colour: {}  [C]", mode.label()),
             Style::default().fg(DIM),
@@ -571,46 +661,44 @@ fn draw_keys(f: &mut Frame, area: Rect, state: &KeyboardState, mode: KeyColor) {
     );
 }
 
-/// The keyboard itself: black keys on top, white key bodies below, and the C
-/// octave labels under them when there is room.
-fn keyboard_lines(state: &KeyboardState, mode: KeyColor, width: usize) -> Vec<Line<'static>> {
-    let (lo, hi) = visible_range(state, width);
-    let cols = key_columns(lo, hi, width);
-
-    let mut blacks: Vec<Span> = Vec::with_capacity(cols.len());
-    let mut whites: Vec<Span> = Vec::with_capacity(cols.len());
-    let mut labels = String::new();
-    for &(black, white) in &cols {
-        match black {
-            Some(n) => {
-                let (ch, colour) = match state.lit(n) {
-                    Some(k) => ('\u{2584}', key_colour(mode, &k)),
-                    None => ('\u{2584}', Color::Rgb(40, 44, 52)),
-                };
-                blacks.push(Span::styled(ch.to_string(), Style::default().fg(colour)));
-            }
-            None => blacks.push(Span::raw(" ")),
-        }
-        let colour = match state.lit(white) {
-            Some(k) => key_colour(mode, &k),
-            None => Color::Rgb(150, 158, 172),
-        };
-        whites.push(Span::styled(
-            "\u{2588}".to_string(),
-            Style::default().fg(colour),
+/// The chord under the hand: its name, then the notes that spell it.
+///
+/// A hand holding notes that name no chord still gets the note list — that is
+/// the half that says the keys arrived, and it must not vanish just because
+/// the shape has no name.
+fn chord_line(state: &KeyboardState) -> Line<'static> {
+    let held = state.held();
+    if held.is_empty() {
+        return Line::from(Span::styled(
+            "  \u{2014}",
+            Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
         ));
-        // One label per C, written across the two columns of that key.
-        if white % 12 == 0 {
-            labels.push_str(&note_name(white));
-        } else if labels.len() < whites.len() {
-            labels.push(' ');
-        }
     }
-    vec![
-        Line::from(blacks),
-        Line::from(whites),
-        Line::from(Span::styled(labels, Style::default().fg(DIM))),
-    ]
+    let notes = held
+        .iter()
+        .map(|n| note_name(*n))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // The headline, in American notation throughout: the chord when the notes
+    // spell one, the note itself when only one is down. A single key is the
+    // commonest thing on this panel and it always has a name, so answering it
+    // with a dash was the readout being pedantic at the player's expense.
+    let (headline, style) = match (held.as_slice(), chord_name(&held)) {
+        (_, Some(name)) => (name, Style::default().fg(OK).add_modifier(Modifier::BOLD)),
+        ([one], None) => (
+            note_name(*one),
+            Style::default().fg(OK).add_modifier(Modifier::BOLD),
+        ),
+        // Two notes that are not a fifth are an interval, and more than that
+        // with no match is a cluster. Neither is an error, so neither gets a
+        // warning colour.
+        _ => ("\u{2014}".to_string(), Style::default().fg(DIM)),
+    };
+    Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(format!("{headline:<10}"), style),
+        Span::styled(notes, Style::default().fg(theme::text())),
+    ])
 }
 
 /// Wheels first, then the last controllers seen — the two that get looked at
@@ -657,59 +745,6 @@ fn controller_line(state: &KeyboardState) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Falling notes: time runs down the panel, newest at the top, landing on the
-/// keyboard drawn at the bottom.
-fn draw_roll(f: &mut Frame, area: Rect, state: &KeyboardState, mode: KeyColor) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-    let width = area.width as usize;
-    let keyboard = keyboard_lines(state, mode, width);
-    let roll_rows = (area.height as usize).saturating_sub(keyboard.len());
-    let (lo, hi) = visible_range(state, width);
-    let cols = key_columns(lo, hi, width);
-
-    let now = Instant::now();
-    let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
-    for row in 0..roll_rows {
-        // Row 0 is the oldest edge of the window, the last row the present, so
-        // a held note grows downward towards its key.
-        let age = ROLL_WINDOW.mul_f32(1.0 - (row as f32 + 0.5) / roll_rows.max(1) as f32);
-        let spans: Vec<Span> = cols
-            .iter()
-            .map(|&(black, white)| {
-                let note = black.unwrap_or(white);
-                let hit = state.roll.iter().rev().find(|r| {
-                    r.note == note
-                        && now.saturating_duration_since(r.start) >= age
-                        && r.end
-                            .is_none_or(|e| now.saturating_duration_since(e) <= age)
-                });
-                match hit {
-                    Some(r) => Span::styled(
-                        "\u{2588}".to_string(),
-                        Style::default().fg(key_colour(
-                            mode,
-                            &KeyLit {
-                                channel: r.channel,
-                                vel: 100,
-                                slot: r.slot,
-                            },
-                        )),
-                    ),
-                    None => Span::raw(" "),
-                }
-            })
-            .collect();
-        lines.push(Line::from(spans));
-    }
-    lines.extend(keyboard);
-    f.render_widget(
-        Paragraph::new(lines).style(super::theme::panel_style()),
-        area,
-    );
-}
-
 /// Draw the monitor. `events` is oldest-first; the newest ones are shown at the
 /// bottom, so the eye follows new arrivals downward like a terminal log.
 #[allow(clippy::too_many_arguments)]
@@ -724,6 +759,8 @@ pub fn draw_midi_monitor(
     // The analyser keeps its peak hold between frames, so it is owned by the
     // application and lent here rather than built per redraw.
     spectrum: &crate::spectrum::Spectrum,
+    // Likewise a history, and for the same reason.
+    wave: &WaveHistory,
 ) -> Vec<(MonitorTab, Rect)> {
     let block = Block::default()
         .title(" MIDI IN ")
@@ -773,30 +810,80 @@ pub fn draw_midi_monitor(
     }
 
     match tab {
-        MonitorTab::Keys => {
-            draw_keys(f, inner, keyboard, key_colour_mode);
-            return rects;
-        }
-        MonitorTab::Roll => {
-            draw_roll(f, inner, keyboard, key_colour_mode);
-            return rects;
-        }
-        MonitorTab::Wave => {
-            draw_wave(f, inner);
-            return rects;
-        }
-        MonitorTab::Activity => {
-            draw_activity(f, inner);
-            return rects;
-        }
-        MonitorTab::Spectrum => {
-            draw_spectrum(f, inner, spectrum);
-            return rects;
-        }
-        MonitorTab::Midi => {}
+        MonitorTab::Keys => draw_keys(f, inner, keyboard, key_colour_mode),
+        MonitorTab::Wave => draw_wave(f, inner, wave),
+        MonitorTab::Monitor => draw_monitor_columns(f, inner, events, ports, spectrum),
+    }
+    rects
+}
+
+/// The message log, the spectrum and the meters, three columns across.
+///
+/// Below a width the columns stop being readable — a spectrum four cells wide
+/// is not a spectrum — so a narrow panel drops back to the message log alone,
+/// which is the one of the three that still says something at any size.
+fn draw_monitor_columns(
+    f: &mut Frame,
+    area: Rect,
+    events: &[InputEvent],
+    ports: &[String],
+    spectrum: &crate::spectrum::Spectrum,
+) {
+    /// Under this, three columns is worse than one.
+    const MIN_FOR_COLUMNS: u16 = 60;
+    if area.width < MIN_FOR_COLUMNS {
+        draw_message_log(f, area, events, ports);
+        return;
     }
 
-    let rows = inner.height as usize;
+    // The log gets the most: it is text and wraps badly, where the other two
+    // are pictures that survive being squeezed.
+    let log_w = area.width * 2 / 5;
+    let spec_w = (area.width - log_w) / 2;
+    let act_w = area.width - log_w - spec_w;
+
+    let header = |f: &mut Frame, x: u16, w: u16, text: &str| {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("\u{2500}\u{2500} {text} "),
+                Style::default().fg(HEADER).add_modifier(Modifier::BOLD),
+            )))
+            .style(super::theme::panel_style()),
+            Rect::new(x, area.y, w, 1),
+        );
+    };
+    let body = |x: u16, w: u16| Rect::new(x, area.y + 1, w, area.height.saturating_sub(1));
+
+    header(f, area.x, log_w, "MIDI");
+    header(f, area.x + log_w, spec_w, "SPEC");
+    header(f, area.x + log_w + spec_w, act_w, "ACTIVITY");
+    if area.height < 2 {
+        return;
+    }
+
+    // Vertical rules between the columns, so three pictures do not read as one
+    // wide one.
+    for col in [area.x + log_w - 1, area.x + log_w + spec_w - 1] {
+        for row in area.y..area.y + area.height {
+            f.render_widget(
+                Paragraph::new(Span::styled("\u{2502}", Style::default().fg(DIM)))
+                    .style(super::theme::panel_style()),
+                Rect::new(col, row, 1, 1),
+            );
+        }
+    }
+
+    draw_message_log(f, body(area.x, log_w - 1), events, ports);
+    draw_spectrum(f, body(area.x + log_w, spec_w - 1), spectrum);
+    draw_activity(f, body(area.x + log_w + spec_w, act_w));
+}
+
+/// The message log on its own: newest at the bottom, like a terminal.
+fn draw_message_log(f: &mut Frame, area: Rect, events: &[InputEvent], ports: &[String]) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let rows = area.height as usize;
     let lines: Vec<Line> = if events.is_empty() {
         vec![Line::from(Span::styled(
             "waiting for MIDI…",
@@ -808,54 +895,132 @@ pub fn draw_midi_monitor(
             .map(|e| line(e, ports))
             .collect()
     };
-
     f.render_widget(
         Paragraph::new(lines).style(super::theme::panel_style()),
-        inner,
+        area,
     );
-    rects
 }
 
-/// The output's shape: a window of the mixed signal, oldest on the left.
+/// How many traces are kept. More than any panel is tall, so resizing taller
+/// does not start from an empty stack.
+const WAVE_TRACES: usize = 64;
+/// How often a new trace is taken. Tied to the clock, not to the redraw, so
+/// the stack drifts at the same speed whatever the frame rate is doing.
+const WAVE_INTERVAL: Duration = Duration::from_millis(70);
+/// How many rows a full-scale peak reaches above its own baseline. This is the
+/// number that makes the picture: at 1 the traces never touch and it reads as a
+/// bar chart, and too high turns the panel into a smear.
+const WAVE_PEAK_ROWS: f32 = 5.0;
+/// Sub-cell steps, filling from the bottom of a cell.
+const WAVE_STEPS: [char; 8] = [
+    '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}',
+];
+
+/// The stack of past traces the WAVE tab draws.
 ///
-/// Half-blocks, so one row of cells carries two rows of resolution — the same
-/// trick the wallpaper uses, and the reason this reads as a wave rather than as
-/// a bar chart.
-fn draw_wave(f: &mut Frame, area: Rect) {
-    let wave = choz_engine::meter::meter().wave();
-    let rows = area.height as usize;
-    let cols = area.width as usize;
+/// Lives in the application rather than the view because it is a history: a
+/// view that rebuilt it per frame would only ever have the present, which is
+/// the one thing this picture is not about.
+pub struct WaveHistory {
+    /// Newest first. Each trace is `meter::WAVE_POINTS` magnitudes, 0..1.
+    traces: VecDeque<Vec<f32>>,
+    last: Instant,
+}
+
+impl Default for WaveHistory {
+    fn default() -> Self {
+        Self {
+            traces: VecDeque::with_capacity(WAVE_TRACES),
+            // Far enough back that the first frame takes a trace instead of
+            // waiting out an interval on an empty panel.
+            last: Instant::now() - WAVE_INTERVAL,
+        }
+    }
+}
+
+impl WaveHistory {
+    /// Take a trace if enough time has passed. Called once per redraw.
+    pub fn tick(&mut self) {
+        self.tick_at(Instant::now())
+    }
+
+    fn tick_at(&mut self, now: Instant) {
+        if now.duration_since(self.last) < WAVE_INTERVAL {
+            return;
+        }
+        self.last = now;
+        // Magnitude, not the signed sample: a ridge rises from its baseline,
+        // and the sign of one decimated point is noise at this resolution.
+        let trace: Vec<f32> = choz_engine::meter::meter()
+            .wave()
+            .iter()
+            .map(|s| s.abs())
+            .collect();
+        if self.traces.len() == WAVE_TRACES {
+            self.traces.pop_back();
+        }
+        self.traces.push_front(trace);
+    }
+}
+
+/// The output's shape as a stack of traces: one ridge per moment, the newest
+/// along the bottom, older ones climbing away from it.
+///
+/// Each ridge is drawn as a **line** with everything under it blanked, and the
+/// ridges are painted back to front, so a loud moment hides the quiet ones
+/// behind it. That occlusion is the whole effect — without it this is a pile of
+/// overlapping curves, and with it the panel shows dynamics over time.
+fn draw_wave(f: &mut Frame, area: Rect, history: &WaveHistory) {
+    let (rows, cols) = (area.height as usize, area.width as usize);
     if rows == 0 || cols == 0 {
         return;
     }
-    // Auto-gain so a quiet signal is still a picture, with a floor so silence
-    // does not become noise magnified to full scale.
-    let peak = wave.iter().fold(0.02f32, |m, s| m.max(s.abs()));
-    let mid = (rows * 2) as f32 / 2.0;
+    // Auto-gain across the whole stack, not per trace: normalising each trace
+    // on its own would make silence as tall as a chord.
+    let peak = history
+        .traces
+        .iter()
+        .flat_map(|t| t.iter())
+        .fold(0.02f32, |m, s| m.max(*s));
 
-    let mut lines: Vec<Line> = Vec::with_capacity(rows);
-    for row in 0..rows {
-        let spans: Vec<Span> = (0..cols)
-            .map(|col| {
-                let s = wave[col * wave.len() / cols.max(1)] / peak;
-                let y = mid - s * (mid - 1.0);
-                // The two half-cells this character covers.
-                let (top, bottom) = ((row * 2) as f32, (row * 2 + 1) as f32);
-                let hit = |cell: f32| (y - cell).abs() < 1.0;
-                let ch = match (hit(top), hit(bottom)) {
-                    (true, true) => '\u{2588}',
-                    (true, false) => '\u{2580}',
-                    (false, true) => '\u{2584}',
-                    // The centre line, so a silent signal is still a signal.
-                    _ if (row * 2 + 1) as f32 == mid.floor() => '\u{2500}',
-                    _ => ' ',
-                };
-                let colour = if ch == '\u{2500}' { DIM } else { ACCENT };
-                Span::styled(ch.to_string(), Style::default().fg(colour))
-            })
-            .collect();
-        lines.push(Line::from(spans));
+    let mut grid = vec![vec![(' ', DIM); cols]; rows];
+    // Back to front: the oldest trace is furthest up and gets painted over.
+    for (age, trace) in history.traces.iter().enumerate().take(rows).rev() {
+        let baseline = rows - 1 - age;
+        // Older traces recede. Not to the background — a trace that fades to
+        // invisible takes its silhouette with it, and the silhouettes are what
+        // give the stack depth.
+        let shade = 1.0 - (age as f32 / rows as f32) * 0.75;
+        let colour = Color::Rgb(
+            (120.0 * shade) as u8,
+            (200.0 * shade) as u8,
+            (255.0 * shade) as u8,
+        );
+        for col in 0..cols {
+            let amp = trace[col * trace.len() / cols.max(1)] / peak;
+            let height = (amp.clamp(0.0, 1.0) * WAVE_PEAK_ROWS).min(baseline as f32);
+            let full = height.floor() as usize;
+            let top = baseline - full;
+            // Everything between the ridge and its own baseline is blanked, so
+            // whatever was drawn there by an older trace is hidden.
+            for row in grid.iter_mut().take(baseline + 1).skip(top) {
+                row[col] = (' ', DIM);
+            }
+            let step = ((height.fract() * 8.0) as usize).min(7);
+            grid[top][col] = (WAVE_STEPS[step], colour);
+        }
     }
+
+    let lines: Vec<Line> = grid
+        .into_iter()
+        .map(|row| {
+            Line::from(
+                row.into_iter()
+                    .map(|(ch, c)| Span::styled(ch.to_string(), Style::default().fg(c)))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
     f.render_widget(
         Paragraph::new(lines).style(super::theme::panel_style()),
         area,
@@ -1093,7 +1258,7 @@ mod tests {
     }
 
     fn render(events: &[InputEvent], ports: &[String], w: u16, h: u16) -> String {
-        render_tab(events, ports, w, h, MonitorTab::Midi)
+        render_tab(events, ports, w, h, MonitorTab::Monitor)
     }
 
     /// Draw a keyboard tab over a test backend and return the screen.
@@ -1106,9 +1271,10 @@ mod tests {
     ) -> String {
         use ratatui::{backend::TestBackend, Terminal};
         let spec = crate::spectrum::Spectrum::new();
+        let wave = WaveHistory::default();
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| {
-            draw_midi_monitor(f, f.area(), &[], &[], tab, state, mode, &spec);
+            draw_midi_monitor(f, f.area(), &[], &[], tab, state, mode, &spec, &wave);
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
@@ -1122,9 +1288,20 @@ mod tests {
     fn cells_coloured(state: &KeyboardState, mode: KeyColor, w: u16, h: u16) -> Vec<Color> {
         use ratatui::{backend::TestBackend, Terminal};
         let spec = crate::spectrum::Spectrum::new();
+        let wave = WaveHistory::default();
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| {
-            draw_midi_monitor(f, f.area(), &[], &[], MonitorTab::Keys, state, mode, &spec);
+            draw_midi_monitor(
+                f,
+                f.area(),
+                &[],
+                &[],
+                MonitorTab::Keys,
+                state,
+                mode,
+                &spec,
+                &wave,
+            );
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
@@ -1266,26 +1443,106 @@ mod tests {
         }
     }
 
-    /// A note outside the default window still has to be visible: the view
-    /// follows what is being played.
+    /// The black keys must land in the piano's 2-and-3 groups, or the row is a
+    /// dotted line and not a keyboard. Checked on the glyphs, which is where
+    /// the grouping actually comes from.
     #[test]
-    fn the_view_follows_notes_below_the_default_window() {
-        let mut k = KeyboardState::default();
-        k.feed(&note_on(24, 0, 100), Some(0)); // C1, below C2
-        let (lo, _hi) = visible_range(&k, 200);
-        assert!(lo <= 24, "the window opened downwards, got {lo}");
+    fn the_black_keys_fall_into_two_and_three_groups() {
+        let k = KeyboardState::default();
+        let lines = keyboard_lines(&k, KeyColor::Channel, 200);
+        let blacks: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+
+        // One octave of the pattern, starting at C: C▐ D█ E▌ F▐ G█ A█ B▌.
+        assert!(
+            blacks.contains("\u{2590}\u{2588}\u{258C}\u{2590}\u{2588}\u{2588}\u{258C}"),
+            "the 2-group then the 3-group: {blacks}"
+        );
+        // A white key with a black on each side is fully covered; one with a
+        // black on neither side (E→F, B→C) leaves the gap that separates the
+        // groups.
+        assert_eq!(
+            blacks.chars().filter(|c| *c == '\u{2588}').count(),
+            21,
+            "D, G and A of each full octave: {blacks}"
+        );
     }
 
-    /// The roll draws the same notes as bars and lands them on the keyboard.
+    /// Lit keys change colour — the whole point of the panel. Both colours of
+    /// key, because a black key shares its cell with the white beneath it and
+    /// that is exactly where a lit one could get lost.
     #[test]
-    fn the_roll_draws_the_keyboard_under_the_bars() {
+    fn playing_a_key_changes_its_colour() {
+        let idle = KeyboardState::default();
+        let quiet = keyboard_lines(&idle, KeyColor::Channel, 200);
+
+        // A white key: middle C.
         let mut k = KeyboardState::default();
         k.feed(&note_on(60, 0, 100), Some(0));
-        let screen = render_keys(&k, KeyColor::Channel, MonitorTab::Roll, 60, 12);
-        assert!(screen.contains("ROLL"));
+        let lit = keyboard_lines(&k, KeyColor::Channel, 200);
+        let col = piano_whites().iter().position(|w| *w == 60).unwrap();
+        assert_ne!(
+            lit[1].spans[col].style.fg, quiet[1].spans[col].style.fg,
+            "the white key body changed colour"
+        );
+        assert_ne!(
+            lit[0].spans[col].style.bg, quiet[0].spans[col].style.bg,
+            "and so did the part of it showing between the black keys"
+        );
+
+        // A black key: C#4. It shares its cells with C4 and D4, and must win
+        // the foreground of at least one of them.
+        let mut k = KeyboardState::default();
+        k.feed(&note_on(61, 0, 100), Some(0));
+        let lit = keyboard_lines(&k, KeyColor::Channel, 200);
         assert!(
-            screen.lines().rev().take(4).any(|l| l.contains('\u{2588}')),
-            "the keyboard is at the bottom:\n{screen}"
+            (col..=col + 1).any(|c| lit[0].spans[c].style.fg != quiet[0].spans[c].style.fg),
+            "the lit black key took the cell it shares"
+        );
+    }
+
+    /// Given the room, the whole piano is drawn — all 88 keys, A0 to C8.
+    #[test]
+    fn a_wide_panel_draws_the_whole_eighty_eight() {
+        let whites = visible_whites(&KeyboardState::default(), 200);
+        assert_eq!(whites.len(), 52, "52 white keys on an 88-key piano");
+        assert_eq!(whites.first().copied(), Some(PIANO_LO), "starts at A0");
+        assert_eq!(whites.last().copied(), Some(PIANO_HI), "ends at C8");
+        // 88 keys means the 36 black ones are in range too.
+        let blacks = (PIANO_LO..=PIANO_HI).filter(|n| is_black(*n)).count();
+        assert_eq!(blacks + whites.len(), 88);
+    }
+
+    /// One column per white key, so the whole piano fits from 52 columns up —
+    /// which is what makes an 80-column terminal enough.
+    #[test]
+    fn the_piano_fits_in_fifty_two_columns() {
+        assert_eq!(visible_whites(&KeyboardState::default(), 52).len(), 52);
+        assert_eq!(
+            visible_whites(&KeyboardState::default(), 51).len(),
+            51,
+            "one short and it becomes a window, not a squeeze"
+        );
+    }
+
+    /// Too narrow for the whole piano, the window holds over what is playing:
+    /// a keyboard scrolled away from the notes answers nothing.
+    #[test]
+    fn a_narrow_keyboard_windows_onto_what_is_sounding() {
+        let mut k = KeyboardState::default();
+        k.feed(&note_on(24, 0, 100), Some(0)); // C1, near the bottom
+        let whites = visible_whites(&k, 20);
+        assert_eq!(whites.len(), 20);
+        assert!(
+            whites.contains(&24),
+            "the note being played is on screen: {whites:?}"
+        );
+
+        let mut k = KeyboardState::default();
+        k.feed(&note_on(103, 0, 100), Some(0)); // G7, near the top
+        let whites = visible_whites(&k, 20);
+        assert!(
+            whites.contains(&103),
+            "and so is one at the other end: {whites:?}"
         );
     }
 
@@ -1377,8 +1634,11 @@ mod tests {
         assert_eq!(lit, vec![60], "the converter's note is still its own");
     }
 
-    /// The spectrum tab draws where the tone is, marks the decades, and does
-    /// not fall over in a panel two rows tall.
+    /// The spectrum draws where the tone is and marks the decades.
+    ///
+    /// Rendered straight into a known rect rather than through the tab: the
+    /// spectrum is one of three columns now, and a test that has to re-derive
+    /// the column arithmetic is testing the layout, not the analyser.
     #[test]
     fn the_spectrum_draws_a_tone_where_it_belongs() {
         use ratatui::{backend::TestBackend, Terminal};
@@ -1389,38 +1649,23 @@ mod tests {
             .collect();
         spec.analyse(&tone);
 
-        let (w, h) = (64u16, 10u16);
+        let (w, h) = (62u16, 10u16);
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| {
-            draw_midi_monitor(
-                f,
-                f.area(),
-                &[],
-                &[],
-                MonitorTab::Spectrum,
-                &KeyboardState::default(),
-                KeyColor::default(),
-                &spec,
-            );
-        })
-        .unwrap();
+        term.draw(|f| draw_spectrum(f, f.area(), &spec)).unwrap();
         let buf = term.backend().buffer().clone();
         let rows: Vec<String> = (0..h)
             .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect())
             .collect();
         let screen = rows.join("\n");
-        assert!(screen.contains("SPEC"), "the tab is in the strip: {screen}");
         assert!(screen.contains("1k"), "the decades are marked: {screen}");
 
-        // The tallest column is the one 1 kHz belongs to. The panel has a
-        // border, so the plot starts one column in.
-        let plot_w = (w - 2) as usize;
+        let plot_w = w as usize;
         let expect = spec.marker_col(1000.0, plot_w).unwrap();
         let height_of = |col: usize| {
             rows.iter()
                 .filter(|r| {
                     r.chars()
-                        .nth(col + 1)
+                        .nth(col)
                         .is_some_and(|c| c == '\u{2588}' || c == '\u{2584}' || c == '\u{2580}')
                 })
                 .count()
@@ -1436,26 +1681,33 @@ mod tests {
         assert_eq!(height_of(quiet), 0, "silence should stay empty:\n{screen}");
     }
 
-    /// Two rows is a panel with no room for a plot; it must not panic.
+    /// Panels with no room for a plot must not panic — through the tab, which
+    /// is where the column arithmetic can underflow.
     #[test]
-    fn the_spectrum_survives_a_panel_with_no_room() {
+    fn the_monitor_survives_a_panel_with_no_room() {
         use ratatui::{backend::TestBackend, Terminal};
         let spec = crate::spectrum::Spectrum::new();
-        for h in [1u16, 2, 3] {
-            let mut term = Terminal::new(TestBackend::new(20, h)).unwrap();
-            term.draw(|f| {
-                draw_midi_monitor(
-                    f,
-                    f.area(),
-                    &[],
-                    &[],
-                    MonitorTab::Spectrum,
-                    &KeyboardState::default(),
-                    KeyColor::default(),
-                    &spec,
-                );
-            })
-            .unwrap();
+        let wave = WaveHistory::default();
+        for tab in MonitorTab::ALL {
+            for h in [1u16, 2, 3, 4] {
+                for w in [1u16, 4, 20, 59, 60, 61, 120] {
+                    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                    term.draw(|f| {
+                        draw_midi_monitor(
+                            f,
+                            f.area(),
+                            &[],
+                            &[],
+                            tab,
+                            &KeyboardState::default(),
+                            KeyColor::default(),
+                            &spec,
+                            &wave,
+                        );
+                    })
+                    .unwrap();
+                }
+            }
         }
     }
 
@@ -1478,6 +1730,7 @@ mod tests {
                 &KeyboardState::default(),
                 KeyColor::default(),
                 &crate::spectrum::Spectrum::new(),
+                &WaveHistory::default(),
             );
         })
         .unwrap();
@@ -1540,53 +1793,229 @@ mod tests {
         }
     }
 
-    /// Three tabs, and each one shows its own thing. WAVE and ACTIVITY read the
-    /// engine's meter, so with no audio running they draw an empty picture
-    /// rather than nothing at all — "no signal" is information.
+    /// Three tabs, and each one shows its own thing. MONITOR carries the log,
+    /// the spectrum and the meters side by side, so all three headers are on
+    /// the one screen.
     #[test]
-    fn the_monitor_has_three_tabs_and_each_draws_its_own() {
+    fn the_monitor_tab_carries_all_three_columns() {
         choz_engine::meter::meter().clear();
-        let midi = render_tab(&[], &[], 60, 10, MonitorTab::Midi);
-        assert!(midi.contains("MIDI") && midi.contains("WAVE") && midi.contains("ACTIVITY"));
+        let monitor = render_tab(&[], &[], 80, 10, MonitorTab::Monitor);
+        for header in ["MIDI", "SPEC", "ACTIVITY"] {
+            assert!(
+                monitor.contains(header),
+                "missing {header} column:\n{monitor}"
+            );
+        }
         assert!(
-            midi.contains("waiting for MIDI"),
-            "the MIDI tab is the messages"
+            monitor.contains("waiting for MIDI"),
+            "the log column is still the messages:\n{monitor}"
+        );
+        assert!(
+            monitor.contains("PEAK") && monitor.contains("RMS"),
+            "the meters are on the same screen:\n{monitor}"
+        );
+        choz_engine::meter::meter().clear();
+    }
+
+    /// Too narrow for three columns, the log is what survives: a spectrum a few
+    /// cells wide says nothing, and the messages still do.
+    #[test]
+    fn a_narrow_monitor_keeps_the_log_and_drops_the_columns() {
+        let narrow = render_tab(&[], &[], 40, 10, MonitorTab::Monitor);
+        assert!(
+            narrow.contains("waiting for MIDI"),
+            "the log survives:\n{narrow}"
+        );
+        assert!(
+            !narrow.contains("ACTIVITY"),
+            "the columns are gone, not squeezed:\n{narrow}"
+        );
+    }
+
+    /// Chord naming: the shapes a player actually holds, including the ones
+    /// that only differ by one note, and the inversions.
+    #[test]
+    fn chords_are_named_from_the_notes_held() {
+        // Triads, in root position.
+        assert_eq!(chord_name(&[60, 64, 67]).as_deref(), Some("C"));
+        assert_eq!(chord_name(&[60, 63, 67]).as_deref(), Some("Cm"));
+        assert_eq!(chord_name(&[60, 63, 66]).as_deref(), Some("Cdim"));
+        assert_eq!(chord_name(&[60, 64, 68]).as_deref(), Some("Caug"));
+        assert_eq!(chord_name(&[60, 65, 67]).as_deref(), Some("Csus4"));
+
+        // A seventh must not be reported as the triad hiding inside it.
+        assert_eq!(chord_name(&[60, 64, 67, 71]).as_deref(), Some("Cmaj7"));
+        assert_eq!(chord_name(&[60, 64, 67, 70]).as_deref(), Some("C7"));
+        assert_eq!(chord_name(&[60, 63, 67, 70]).as_deref(), Some("Cm7"));
+
+        // Octaves and doublings fold away.
+        assert_eq!(
+            chord_name(&[36, 60, 64, 67, 72, 76]).as_deref(),
+            Some("C"),
+            "the same chord spread over three octaves is the same chord"
         );
 
-        let wave = render_tab(&[], &[], 60, 10, MonitorTab::Wave);
+        // Root not in the bass is an inversion, and says so.
+        assert_eq!(chord_name(&[64, 67, 72]).as_deref(), Some("C/E"));
+        assert_eq!(chord_name(&[67, 72, 76]).as_deref(), Some("C/G"));
+    }
+
+    /// A shape with no name gets no name. Guessing is worse than a blank.
+    #[test]
+    fn a_cluster_is_not_given_an_invented_name() {
+        assert_eq!(chord_name(&[]), None, "nothing held");
+        assert_eq!(chord_name(&[60]), None, "one note is not a chord");
+        assert_eq!(chord_name(&[60, 61]), None, "a semitone is not a chord");
+        assert_eq!(chord_name(&[60, 61, 62, 63]).as_deref(), None, "a cluster");
+        // But a bare fifth is worth naming — it is what a hand plays.
+        assert_eq!(chord_name(&[60, 67]).as_deref(), Some("C5"));
+    }
+
+    /// The chord readout is on the KEYS tab, and it names what is held.
+    #[test]
+    fn the_keys_tab_shows_the_chord_being_held() {
+        let mut k = KeyboardState::default();
+        for note in [60, 64, 67, 71] {
+            k.feed(&note_on(note, 0, 100), Some(0));
+        }
+        let screen = render_keys(&k, KeyColor::Channel, MonitorTab::Keys, 70, 10);
+        assert!(screen.contains("Cmaj7"), "the chord is named:\n{screen}");
+        assert!(screen.contains("C4"), "and its notes are listed:\n{screen}");
+    }
+
+    /// One key down is named too, in American notation — it is the commonest
+    /// thing on this panel and it always has a name.
+    #[test]
+    fn a_single_key_is_named_as_a_note() {
+        for (note, expect) in [(60u8, "C4"), (69, "A4"), (61, "C#4"), (21, "A0")] {
+            let mut k = KeyboardState::default();
+            k.feed(&note_on(note, 0, 100), Some(0));
+            let screen = render_keys(&k, KeyColor::Channel, MonitorTab::Keys, 70, 10);
+            assert!(
+                screen.contains(expect),
+                "one key down should read {expect}:\n{screen}"
+            );
+        }
+    }
+
+    /// Nothing held is a dash, not a stale chord from the last thing played.
+    #[test]
+    fn the_chord_readout_empties_when_the_hands_come_off() {
+        let mut k = KeyboardState::default();
+        for note in [60, 64, 67] {
+            k.feed(&note_on(note, 0, 100), Some(0));
+        }
+        assert!(render_keys(&k, KeyColor::Channel, MonitorTab::Keys, 70, 10).contains(" C "));
+        for note in [60, 64, 67] {
+            k.feed(&note_off(note), Some(0));
+        }
+        let screen = render_keys(&k, KeyColor::Channel, MonitorTab::Keys, 70, 10);
         assert!(
-            !wave.contains("waiting for MIDI"),
-            "a different tab, different content"
+            !screen.contains("C4 E4 G4"),
+            "the note list cleared:\n{screen}"
         );
+    }
+
+    /// The WAVE stack: a trace per interval, newest along the bottom, and the
+    /// ridges occlude what is behind them.
+    #[test]
+    fn the_wave_stacks_traces_with_the_newest_at_the_bottom() {
+        let mut wave = WaveHistory::default();
+        let now = Instant::now();
+
+        // Silence first, then a loud block: the loud trace must end up below
+        // the quiet ones, because it arrived later.
+        choz_engine::meter::meter().clear();
+        wave.tick_at(now);
+        let loud: Vec<f32> = (0..512).flat_map(|_| [0.9f32, 0.9]).collect();
+        choz_engine::meter::meter().publish(&loud);
+        for i in 1..4 {
+            wave.tick_at(now + WAVE_INTERVAL * i);
+        }
+        assert_eq!(wave.traces.len(), 4, "one trace per interval");
         assert!(
-            wave.contains('\u{2500}'),
-            "silence still draws its centre line"
+            wave.traces[0][0] > wave.traces[3][0],
+            "newest is first, and it is the loud one"
         );
 
-        // A block through the meter and the wave has something in it.
-        let buf: Vec<f32> = (0..512)
+        // A tick before the interval elapses takes nothing.
+        wave.tick_at(now + WAVE_INTERVAL * 3);
+        assert_eq!(wave.traces.len(), 4, "the interval gates the stack");
+
+        choz_engine::meter::meter().clear();
+    }
+
+    /// The stack is bounded: a long session must not grow the buffer.
+    #[test]
+    fn the_wave_stack_is_a_fixed_budget() {
+        let mut wave = WaveHistory::default();
+        let now = Instant::now();
+        for i in 0..(WAVE_TRACES * 2) {
+            wave.tick_at(now + WAVE_INTERVAL * (i as u32 + 1));
+        }
+        assert_eq!(
+            wave.traces.len(),
+            WAVE_TRACES,
+            "the oldest fall off the top"
+        );
+    }
+
+    /// The ridges track amplitude and hide what is behind them — that
+    /// occlusion is the picture.
+    #[test]
+    fn ridges_track_amplitude_and_occlude_what_is_behind() {
+        let mut wave = WaveHistory::default();
+        let now = Instant::now();
+        // A ramp across the block, so the trace is quiet on the left and loud
+        // on the right. A flat signal would draw a flat line and prove nothing.
+        let ramp: Vec<f32> = (0..2048)
             .flat_map(|i| {
-                let s = 0.8 * (2.0 * std::f32::consts::PI * i as f32 / 32.0).sin();
-                [s, s]
+                let a = i as f32 / 2048.0;
+                [a, a]
             })
             .collect();
-        choz_engine::meter::meter().publish(&buf);
-        let wave = render_tab(&[], &[], 60, 10, MonitorTab::Wave);
+        choz_engine::meter::meter().publish(&ramp);
+        for i in 0..10 {
+            wave.tick_at(now + WAVE_INTERVAL * (i + 1));
+        }
+
+        use ratatui::{backend::TestBackend, Terminal};
+        let (w, h) = (40u16, 12u16);
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw_wave(f, f.area(), &wave)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let screen = rows.join("\n");
+
+        // Topmost drawn cell of a column: the ridge of the trace in front.
+        let ridge = |col: usize| {
+            (0..h as usize).find(|&r| {
+                rows[r]
+                    .chars()
+                    .nth(col)
+                    .is_some_and(|c| WAVE_STEPS.contains(&c))
+            })
+        };
+        let quiet = ridge(1).expect("a ridge on the quiet side");
+        let loud = ridge(w as usize - 2).expect("a ridge on the loud side");
         assert!(
-            wave.chars()
-                .any(|c| c == '\u{2588}' || c == '\u{2580}' || c == '\u{2584}'),
-            "the shape of the sound: {wave}"
+            loud < quiet,
+            "the loud column rides higher (smaller row) than the quiet one: \
+             loud={loud} quiet={quiet}\n{screen}"
         );
 
-        let activity = render_tab(&[], &[], 60, 10, MonitorTab::Activity);
-        assert!(
-            activity.contains("PEAK") && activity.contains("RMS"),
-            "{activity}"
-        );
-        assert!(
-            activity.contains("dB"),
-            "levels in dB, not in fractions: {activity}"
-        );
+        // Under a ridge, down to the bottom, nothing from an older trace shows
+        // through: that region belongs to the trace in front of it.
+        for (row, text) in rows.iter().enumerate().skip(loud + 1) {
+            let cell = text.chars().nth(w as usize - 2).unwrap();
+            assert!(
+                cell == ' ' || WAVE_STEPS.contains(&cell),
+                "row {row} under the ridge should be blanked or a nearer \
+                 ridge, got {cell:?}\n{screen}"
+            );
+        }
         choz_engine::meter::meter().clear();
     }
 
@@ -1603,19 +2032,20 @@ mod tests {
                 f.area(),
                 &[],
                 &[],
-                MonitorTab::Midi,
+                MonitorTab::Monitor,
                 &KeyboardState::default(),
                 KeyColor::default(),
                 &crate::spectrum::Spectrum::new(),
+                &WaveHistory::default(),
             );
         })
         .unwrap();
         assert_eq!(rects.len(), MonitorTab::ALL.len());
-        assert_eq!(rects[0].0, MonitorTab::Midi);
+        assert_eq!(rects[0].0, MonitorTab::Monitor);
         assert!(rects[1].1.x > rects[0].1.x, "left to right");
         assert!(rects.iter().all(|(_, r)| r.height == 1));
 
-        assert_eq!(MonitorTab::Midi.next(), MonitorTab::Keys);
-        assert_eq!(MonitorTab::Activity.next(), MonitorTab::Midi, "it wraps");
+        assert_eq!(MonitorTab::Monitor.next(), MonitorTab::Keys);
+        assert_eq!(MonitorTab::Wave.next(), MonitorTab::Monitor, "it wraps");
     }
 }

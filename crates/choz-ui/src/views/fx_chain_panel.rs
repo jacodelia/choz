@@ -334,9 +334,18 @@ fn gate_db(gate: f32) -> String {
 }
 
 /// Instrument-line button labels.
-pub const BTN_SOURCE: &str = " SOURCE ";
-pub const BTN_PRESET: &str = " BANK/PRESET ";
-pub const BTN_LEARN: &str = " MIDI LEARN ";
+///
+/// Keys, not finished text: all three have translations that were never
+/// reached because the buttons drew the constant directly. `btn()` puts them
+/// back through `t()` and re-adds the padding the layout expects.
+pub const BTN_SOURCE: &str = "SOURCE";
+pub const BTN_PRESET: &str = "BANK/PRESET";
+pub const BTN_LEARN: &str = "MIDI LEARN";
+
+/// A button label, translated and padded to sit inside its box.
+pub fn btn(key: &str) -> String {
+    format!(" {} ", crate::i18n::t(key))
+}
 /// Audio in → notes out. Only offered on a tab fed by a capture pair.
 pub const BTN_A2M: &str = " A\u{2192}M ";
 
@@ -979,13 +988,10 @@ pub fn draw_fx_chain_panel(
         Style::default().fg(ui_text()),
     );
     for (btn, text) in [
-        (RackButton::Source, Some(BTN_SOURCE.to_string())),
+        (RackButton::Source, Some(btn(BTN_SOURCE))),
         // Bank/preset only exists while the tab holds a SoundFont.
-        (
-            RackButton::Preset,
-            has_presets.then(|| BTN_PRESET.to_string()),
-        ),
-        (RackButton::Learn, Some(BTN_LEARN.to_string())),
+        (RackButton::Preset, has_presets.then(|| btn(BTN_PRESET))),
+        (RackButton::Learn, Some(btn(BTN_LEARN))),
         // A guitar into a synth: only offered where there is audio coming in.
         (
             RackButton::PitchToMidi,

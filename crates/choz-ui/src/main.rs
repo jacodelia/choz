@@ -275,6 +275,32 @@ enum InTarget {
 }
 
 /// Which picker the open modal is. Every one of them draws through
+/// What the scanning thread sends back. The scan walks one directory per
+/// child process, so `Step` lands between children and `Done` exactly once.
+enum ScanMsg {
+    Step {
+        done: usize,
+        total: usize,
+        label: String,
+    },
+    Done(Vec<choz_engine::FoundPlugin>),
+}
+
+/// A plugin rescan running off the UI thread.
+///
+/// The scan spawns a child process per directory and can take tens of seconds
+/// on a full plugin collection; doing it inline froze the whole TUI — no
+/// redraw, no keys, and (worse) no arpeggiator clock — until it finished.
+struct ScanJob {
+    rx: std::sync::mpsc::Receiver<ScanMsg>,
+    /// Last reported position, so the bar holds its value between messages
+    /// instead of flickering back to zero on every frame.
+    done: usize,
+    total: usize,
+    /// The directory being walked, already shortened for display.
+    label: String,
+}
+
 /// `views::modal::draw_list_modal`, so they share the scrollbar, the
 /// SELECT/CANCEL buttons and one set of mouse rects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,6 +368,11 @@ enum ThemeRow {
     /// does not mean reopening Settings each time.
     Done,
 }
+
+/// Below this peak an input jack reads `--` instead of a number: -90 dBFS,
+/// which is under every converter's idle noise floor and over anything a player
+/// can produce. A live ADC is never truly at zero.
+const SILENCE: f32 = 3.163e-5;
 
 /// Width of the tint slider's bar, in cells.
 const TINT_BAR_WIDTH: usize = 20;
@@ -742,6 +773,9 @@ struct App {
     menu: Option<menu::MenuState>,
     /// About dialog visibility.
     about_open: bool,
+    /// The running plugin rescan, if any. `Some` also means "the progress
+    /// modal is up" — there is no separate flag to keep in step.
+    scan: Option<ScanJob>,
     /// Pre-rendered logo image protocol (ratatui-image), built at startup.
     logo: Option<ratatui_image::protocol::Protocol>,
     /// Notes sounding right now and **the slots their note-on went to**.
@@ -854,6 +888,9 @@ struct App {
     /// to survive between redraws, and it is updated only while its tab is on
     /// screen — an FFT nobody is looking at is an FFT nobody should pay for.
     spectrum: spectrum::Spectrum,
+    /// The WAVE tab's stack of past traces. Same reasoning as `spectrum`: it is
+    /// a history, so it cannot be rebuilt per frame.
+    wave: views::midi_monitor::WaveHistory,
     quit: bool,
 
     layout: RefCell<UiLayout>,
@@ -887,6 +924,7 @@ impl App {
             modal: None,
             menu: None,
             about_open: false,
+            scan: None,
             logo: logo::build_logo(),
             active_notes: Vec::new(),
             note_tx,
@@ -937,6 +975,7 @@ impl App {
             monitor_tab: views::midi_monitor::MonitorTab::default(),
             keyboard: views::midi_monitor::KeyboardState::default(),
             spectrum: spectrum::Spectrum::new(),
+            wave: views::midi_monitor::WaveHistory::default(),
             quit: false,
             layout: RefCell::new(UiLayout::default()),
             splash: SplashState::new(),
@@ -952,11 +991,86 @@ impl App {
             return;
         };
         let paths = self.plugin_paths.clone();
-        self.plugins = if force {
+        let found = if force {
             engine.rescan_plugins(&paths)
         } else {
             engine.cached_plugins(&paths)
         };
+        self.apply_plugins(found);
+    }
+
+    /// Start a rescan on a background thread and put the progress modal up.
+    /// A second call while one is running is ignored: two scans would fight
+    /// over the same cache file for no gain.
+    fn start_rescan(&mut self) {
+        if self.scan.is_some() || self.audio_engine.is_none() {
+            return;
+        }
+        let paths = self.plugin_paths.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // The scan needs nothing from the engine — `rescan_plugins` only calls
+        // the free `scan_all` — so the thread carries the paths and nothing
+        // else, and no lock is shared with the audio side.
+        std::thread::spawn(move || {
+            let found = choz_engine::cache::rescan(|| {
+                choz_engine::scan_all_with_progress(&paths, |step| {
+                    // A closed channel means the UI is gone; the scan still
+                    // finishes and writes its cache, which is the cheap and
+                    // useful outcome, so the send result is deliberately
+                    // dropped rather than used to bail out.
+                    let _ = tx.send(ScanMsg::Step {
+                        done: step.done,
+                        total: step.total,
+                        label: format!("{} {}", step.format.label(), step.dir.display()),
+                    });
+                })
+            });
+            let _ = tx.send(ScanMsg::Done(found));
+        });
+        self.scan = Some(ScanJob {
+            rx,
+            done: 0,
+            total: 0,
+            label: String::new(),
+        });
+    }
+
+    /// Drain whatever the scanning thread has said since the last frame. Called
+    /// once per event-loop turn, so the bar advances at the redraw rate.
+    fn poll_scan(&mut self) {
+        let Some(job) = self.scan.as_mut() else {
+            return;
+        };
+        let mut finished = None;
+        loop {
+            match job.rx.try_recv() {
+                Ok(ScanMsg::Step { done, total, label }) => {
+                    job.done = done;
+                    job.total = total;
+                    job.label = label;
+                }
+                Ok(ScanMsg::Done(found)) => {
+                    finished = Some(found);
+                    break;
+                }
+                // A thread that died without sending `Done` must not leave the
+                // modal up forever, so a broken channel closes the job too.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            }
+        }
+        self.scan = None;
+        if let Some(found) = finished {
+            self.apply_plugins(found);
+            eprintln!("choz: rescanned plugin paths: {} found", self.plugins.len());
+        }
+    }
+
+    /// Sort a finished scan into the lists the pickers read. Split out of
+    /// [`Self::discover_synths`] because the background rescan produces the
+    /// same `Vec` on another thread and has to land it the same way.
+    fn apply_plugins(&mut self, found: Vec<choz_engine::FoundPlugin>) {
+        self.plugins = found;
         self.synths = self
             .plugins
             .iter()
@@ -1817,9 +1931,7 @@ impl App {
     fn arp_knobs(&self) -> Vec<(arp::ArpParam, &'static str, f32, source::ParamShape)> {
         self.slots
             .get(self.active_slot)
-            .map(|s| {
-                s.arp.view().knobs()
-            })
+            .map(|s| s.arp.view().knobs())
             .unwrap_or_default()
     }
 
@@ -4605,8 +4717,14 @@ impl App {
             // `--` is a channel nothing is arriving on, whatever the routing
             // says, and no effect downstream can fix that.
             let peak = choz_engine::meter::capture_levels().peak(ch);
+            // Gated at -90 dBFS, not at the old -100. A converter with nothing
+            // plugged in still converts its own noise floor: the UMC-1820 and
+            // the H340 both idle around -98 dB, which the old gate let through
+            // and printed as a live-looking number on a dead jack — exactly the
+            // confusion the `--` is here to prevent. Nothing anyone plays sits
+            // below -90.
             let level = match peak {
-                p if p > 1e-5 => format!("  {:>4.0}dB", 20.0 * p.log10()),
+                p if p > SILENCE => format!("  {:>4.0}dB", 20.0 * p.log10()),
                 _ => "    --  ".to_string(),
             };
             rows.push((
@@ -6090,10 +6208,7 @@ impl App {
 /// guessed: the tab comes back playing its instrument, which is obvious, while
 /// the wrong jack is not. Projects written before the names existed still fall
 /// back to the index, because that is all they say.
-fn resolve_in_pair(
-    ports: &[String],
-    mixer: &project::Mixer,
-) -> Option<(usize, usize)> {
+fn resolve_in_pair(ports: &[String], mixer: &project::Mixer) -> Option<(usize, usize)> {
     let Some((left, right)) = mixer.in_ports.as_ref() else {
         return mixer.in_pair;
     };
@@ -6338,6 +6453,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Screen>>, app: &mut App) -> 
         }
 
         handle_events(app)?;
+        app.poll_scan();
         app.poll_midi_hotplug();
         app.drain_midi();
         app.tick_arps();
@@ -7576,10 +7692,7 @@ fn apply_menu_action(app: &mut App, action: menu::MenuAction) {
         A::SaveProject => app.open_save_project(),
         A::LoadProject => app.open_load_project(),
         A::ImportMax => app.open_import_max(),
-        A::RescanPlugins => {
-            app.discover_synths(true);
-            eprintln!("choz: rescanned plugin paths: {} found", app.plugins.len());
-        }
+        A::RescanPlugins => app.start_rescan(),
         A::About => app.about_open = true,
     }
 }
@@ -7865,11 +7978,14 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
 
     match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            if rects.list.is_some_and(|r| r.contains(pos)) {
+            if rects.list.is_some_and(|r| r.contains(pos))
+                || rects.scrollbar.is_some_and(|r| r.contains(pos))
+            {
+                // Three rows a notch: one is a crawl on a list of hundreds.
                 let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
-                    -1
+                    -3
                 } else {
-                    1
+                    3
                 };
                 if let Some(m) = app.modal.as_mut() {
                     m.list.move_cursor(delta);
@@ -7877,7 +7993,25 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                         b.cursor = m.list.cursor;
                     }
                 }
-                app.refresh_modal();
+                // **No `refresh_modal` here.** It rebuilds every row string from
+                // scratch (and for ADD FX re-walks the categories), which on a
+                // few hundred plugins is what made the wheel feel like treacle.
+                // Nothing it rebuilds depends on the cursor — only the filter
+                // and the sidebar do, and neither moved.
+            }
+        }
+        // Dragging the scrollbar, and clicking anywhere on its track, jump the
+        // cursor there. Without this the bar is decoration: it draws, but the
+        // mouse falls through to the rows behind it.
+        MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
+            if rects.scrollbar.is_some_and(|r| r.contains(pos)) =>
+        {
+            let track = rects.scrollbar.unwrap();
+            if let Some(m) = app.modal.as_mut() {
+                m.list.drag_to(track, mouse.row);
+                if let Some(b) = m.browser.as_mut() {
+                    b.cursor = m.list.cursor;
+                }
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
@@ -8263,10 +8397,16 @@ fn ui(f: &mut Frame, app: &mut App) {
         // screen. The rate comes from the transport, which the engine sets when
         // the stream opens — the analyser has no other way to know what a bin
         // is worth in Hz.
-        if app.monitor_tab == views::midi_monitor::MonitorTab::Spectrum {
+        if app.monitor_tab.needs_spectrum() {
             app.spectrum
                 .set_sample_rate(choz_ports::transport().sample_rate() as f32);
             app.spectrum.update();
+        }
+        // The stack only advances while it is being looked at. A history taken
+        // off screen would scroll past unseen and be gone by the time the tab
+        // came back, which is worse than starting empty.
+        if app.monitor_tab == views::midi_monitor::MonitorTab::Wave {
+            app.wave.tick();
         }
         let log: Vec<midi::InputEvent> = app.midi_log.iter().copied().collect();
         let tabs = views::midi_monitor::draw_midi_monitor(
@@ -8278,6 +8418,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             &app.keyboard,
             app.ui.key_colour,
             &app.spectrum,
+            &app.wave,
         );
         app.layout.borrow_mut().monitor_tabs = tabs;
     }
@@ -8317,6 +8458,11 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
     if app.about_open {
         draw_about(f, app, area);
+    }
+    // Above everything, including About: the scan blocks what those dialogs
+    // would act on.
+    if let Some(ref job) = app.scan {
+        draw_scan_progress(f, job, area);
     }
 
     // Status bar
@@ -8462,7 +8608,7 @@ fn draw_transport(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let block = Block::default()
-        .title(" TRANSPORT ")
+        .title(format!(" {} ", i18n::t("TRANSPORT")))
         .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_style(border_style)
@@ -8790,13 +8936,12 @@ fn draw_menu_dropdown(f: &mut Frame, app: &App, state: menu::MenuState, menubar_
         } else {
             Style::default().fg(Color::White).bg(PANEL_BG)
         };
-        let pad = (inner.width as usize).saturating_sub(item.label.len() + item.shortcut.len() + 1);
-        let text = format!(
-            " {}{}{} ",
-            item.label,
-            " ".repeat(pad.max(1)),
-            item.shortcut
-        );
+        // The bar's own labels were translated and the items under them were
+        // not, so every dropdown opened in English whatever the language said.
+        let label = i18n::t(item.label);
+        let pad =
+            (inner.width as usize).saturating_sub(label.chars().count() + item.shortcut.len() + 1);
+        let text = format!(" {}{}{} ", label, " ".repeat(pad.max(1)), item.shortcut);
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(text, st))),
             Rect::new(inner.x, y, inner.width, 1),
@@ -8804,6 +8949,68 @@ fn draw_menu_dropdown(f: &mut Frame, app: &App, state: menu::MenuState, menubar_
         item_rects.push((i, Rect::new(inner.x, y, inner.width, 1)));
     }
     app.layout.borrow_mut().menu_item_rects = item_rects;
+}
+
+/// The plugin rescan's progress box. Drawn from [`App::scan`], so it is up for
+/// exactly as long as the thread is running.
+fn draw_scan_progress(f: &mut Frame, job: &ScanJob, area: Rect) {
+    f.render_widget(Clear, area);
+    f.render_widget(Block::default().style(Style::default().bg(BACKDROP)), area);
+
+    let popup = centered_rect(60, 22, area);
+    draw_modal_shadow(f, popup, area);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(format!(" {} ", i18n::t("Rescanning plugin paths")))
+        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .style(views::theme::overlay_style());
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    if inner.height < 3 || inner.width < 8 {
+        return;
+    }
+
+    // `total` is 0 until the first message arrives; showing 0 % beats dividing
+    // by it.
+    let pct = match job.total {
+        0 => 0,
+        t => (job.done * 100 / t) as u16,
+    };
+    let bar_w = inner.width.saturating_sub(2) as usize;
+    let filled = bar_w * pct as usize / 100;
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("\u{2588}".repeat(filled), Style::default().fg(ACCENT)),
+            Span::styled("\u{2591}".repeat(bar_w - filled), Style::default().fg(DIM)),
+        ])),
+        Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), 1),
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("{pct:>3}%   {} / {}", job.done, job.total),
+            Style::default().fg(HEADER).add_modifier(Modifier::BOLD),
+        ))),
+        Rect::new(inner.x + 1, inner.y + 1, inner.width.saturating_sub(2), 1),
+    );
+    // The directory in flight, tail-first: the end of a long path is the part
+    // that says which one it is.
+    if inner.height >= 3 {
+        let w = inner.width.saturating_sub(2) as usize;
+        let n = job.label.chars().count();
+        let shown: String = match n > w {
+            true => format!(
+                "\u{2026}{}",
+                job.label.chars().skip(n - w + 1).collect::<String>()
+            ),
+            false => job.label.clone(),
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(shown, Style::default().fg(DIM)))),
+            Rect::new(inner.x + 1, inner.y + 2, inner.width.saturating_sub(2), 1),
+        );
+    }
 }
 
 fn draw_about(f: &mut Frame, app: &App, area: Rect) {
@@ -13166,7 +13373,10 @@ mod tests {
             "UMC1820:capture_2".to_string(),
         ];
         assert_eq!(
-            resolve_in_pair(&now, &mixer(Some(("UMC1820:capture_1", "UMC1820:capture_2")))),
+            resolve_in_pair(
+                &now,
+                &mixer(Some(("UMC1820:capture_1", "UMC1820:capture_2")))
+            ),
             Some((2, 3))
         );
 
@@ -13274,7 +13484,10 @@ mod tests {
         let modal = app.modal.as_ref().expect("the report opens by itself");
         assert_eq!(modal.kind, ModalKind::MaxReport);
         let report = modal.list.items.join("\n");
-        assert!(report.contains("gizmo~"), "it names what it dropped:\n{report}");
+        assert!(
+            report.contains("gizmo~"),
+            "it names what it dropped:\n{report}"
+        );
         assert!(report.contains("SATURATOR"), "and what it kept:\n{report}");
 
         let _ = std::fs::remove_dir_all(&dir);

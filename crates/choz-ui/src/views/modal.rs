@@ -67,6 +67,22 @@ impl ListModal {
             (self.sidebar_cursor as isize + delta).clamp(0, last as isize) as usize;
     }
 
+    /// Put the cursor where a click at `row` inside the scrollbar `track` points.
+    /// The fraction runs over the whole list, so the top of the track is the
+    /// first item and the bottom is the last, whatever the viewport height.
+    pub fn drag_to(&mut self, track: Rect, row: u16) {
+        let last = self.items.len().saturating_sub(1);
+        if last == 0 || track.height == 0 {
+            return;
+        }
+        let offset = row.saturating_sub(track.y).min(track.height - 1) as usize;
+        // Round to nearest so the bottom cell of the track reaches the last
+        // item instead of stopping one short.
+        self.cursor =
+            (offset * last + (track.height as usize - 1) / 2) / (track.height as usize - 1).max(1);
+        self.cursor = self.cursor.min(last);
+    }
+
     pub fn cycle_filter(&mut self, delta: isize) {
         if self.filters.is_empty() {
             return;
@@ -94,6 +110,9 @@ pub struct ModalRects {
     pub sidebar: Vec<(usize, Rect)>,
     /// The list body — wheel events inside it scroll the list.
     pub list: Option<Rect>,
+    /// The scrollbar **track**, arrow heads excluded, so a click maps straight
+    /// onto a scroll fraction. `None` when the list fits and no bar is drawn.
+    pub scrollbar: Option<Rect>,
 }
 
 /// Truncate to `max` chars.
@@ -276,9 +295,19 @@ pub fn draw_list_modal(
     // Scrollbar: only when the list doesn't fit.
     if m.items.len() > rows && rows > 0 {
         let sb = Rect::new(list_area.x + list_area.width, y, 1, rows as u16);
-        let mut state = ScrollbarState::new(m.items.len())
+        // `content_length` is the number of scroll *positions*, not the number
+        // of items: ratatui clamps the thumb to `content_length - 1`, so
+        // passing `items.len()` makes the thumb both too short and unable to
+        // reach the bottom of the track. The last scroll offset is
+        // `items.len() - rows`, so there are one more than that many of them.
+        let mut state = ScrollbarState::new(m.items.len() - rows + 1)
             .viewport_content_length(rows)
             .position(m.scroll);
+        // The track the thumb actually moves in, which is the bar minus the two
+        // arrow heads. Hit-testing anything wider makes a drag jump.
+        if rows > 2 {
+            rects.scrollbar = Some(Rect::new(sb.x, sb.y + 1, 1, sb.height - 2));
+        }
         f.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(Some("\u{25B2}"))
@@ -449,5 +478,82 @@ mod tests {
             m.filter, 2,
             "cycling back from the first filter wraps to the last"
         );
+    }
+
+    /// The thumb has to be able to reach the bottom of its track, and be sized
+    /// by the viewport rather than by one row. Passing `items.len()` as the
+    /// content length got both wrong: a stubby thumb that stopped short.
+    #[test]
+    fn the_scrollbar_thumb_spans_the_track_and_reaches_the_end() {
+        let items: Vec<String> = (0..200).map(|i| format!("item {i}")).collect();
+        let mut m = ListModal::new("PICK", items);
+
+        let (_, rects) = render(&mut m, 40, 20);
+        let track = rects.scrollbar.expect("a 200-item list does not fit");
+
+        // Bottom of the list: the thumb's last cell must be the track's last.
+        m.cursor = 199;
+        let (screen, _) = render(&mut m, 40, 20);
+        let rows: Vec<&str> = screen
+            .as_str()
+            .split("")
+            .filter(|s| !s.is_empty())
+            .collect();
+        let cell = |x: u16, y: u16| rows[(y as usize) * 40 + x as usize];
+        let last = track.y + track.height - 1;
+        assert_eq!(
+            cell(track.x, last),
+            "\u{2588}",
+            "scrolled to the end, the thumb sits on the last track cell"
+        );
+
+        // And at the top it is off the bottom again — otherwise the test above
+        // would pass with a thumb that filled the whole track.
+        m.cursor = 0;
+        let (screen, _) = render(&mut m, 40, 20);
+        let rows: Vec<&str> = screen
+            .as_str()
+            .split("")
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_ne!(
+            rows[(last as usize) * 40 + track.x as usize],
+            "\u{2588}",
+            "at the top the thumb must not still cover the end of the track"
+        );
+    }
+
+    /// Dragging the bar is the whole point of exporting its rect: the ends must
+    /// land on the first and last item, not near them.
+    #[test]
+    fn dragging_the_scrollbar_maps_its_ends_to_the_first_and_last_item() {
+        let items: Vec<String> = (0..200).map(|i| format!("item {i}")).collect();
+        let mut m = ListModal::new("PICK", items);
+        let (_, rects) = render(&mut m, 40, 20);
+        let track = rects.scrollbar.expect("a 200-item list does not fit");
+
+        m.drag_to(track, track.y);
+        assert_eq!(m.cursor, 0, "the top of the track is the first item");
+
+        m.drag_to(track, track.y + track.height - 1);
+        assert_eq!(m.cursor, 199, "the bottom of the track is the last item");
+
+        // Every cell maps linearly onto the list. An even-height track has no
+        // exact middle cell, so the check is against the ratio the cell really
+        // stands for, not against a hand-picked "half".
+        let span = (track.height - 1) as usize;
+        for cell in 0..=span {
+            m.drag_to(track, track.y + cell as u16);
+            let expect = cell * 199 / span;
+            assert!(
+                m.cursor.abs_diff(expect) <= 1,
+                "cell {cell} of {span} should land near item {expect}, got {}",
+                m.cursor
+            );
+        }
+
+        // A click past the end clamps instead of panicking on the subtraction.
+        m.drag_to(track, track.y + track.height + 50);
+        assert_eq!(m.cursor, 199);
     }
 }

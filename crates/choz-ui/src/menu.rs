@@ -31,11 +31,16 @@ impl MenuKind {
     }
 
     /// Widest item label — used to size the dropdown.
+    ///
+    /// Measured on the **translated** label, in characters: "Import Max
+    /// patch…" is shorter than "Importer un patch Max…", and sizing from the
+    /// English would clip the French. Characters, not bytes, or every accent
+    /// would widen the box by one.
     pub fn width(self) -> u16 {
         let w = self
             .items()
             .iter()
-            .map(|i| i.label.len() + i.shortcut.len() + 4)
+            .map(|i| crate::i18n::t(i.label).chars().count() + i.shortcut.len() + 4)
             .max()
             .unwrap_or(10);
         w as u16
