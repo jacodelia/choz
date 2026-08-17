@@ -36,13 +36,64 @@ pub use paths::{FoundPlugin, PluginFormat, PluginPaths, SearchDir};
 /// of the whole app. Falls back to scanning in-process when the child can't be
 /// spawned at all (no `current_exe`, no fork).
 pub fn scan_all(paths: &PluginPaths) -> Vec<FoundPlugin> {
+    scan_all_with_progress(paths, |_| {})
+}
+
+/// One directory about to be scanned, and where it sits in the run. `done` is
+/// how many are finished, so `done == total` never appears — the last report
+/// comes *before* the last directory is walked.
+#[derive(Debug, Clone)]
+pub struct ScanStep<'a> {
+    pub done: usize,
+    pub total: usize,
+    pub format: PluginFormat,
+    pub dir: &'a std::path::Path,
+}
+
+impl ScanStep<'_> {
+    /// 0..=100, for a progress bar. A run with no directories reads as done.
+    pub fn percent(&self) -> u16 {
+        match self.total {
+            0 => 100,
+            t => (self.done * 100 / t) as u16,
+        }
+    }
+}
+
+/// [`scan_all`], reporting each directory before it is walked.
+///
+/// The unit is the directory, not the plugin: a directory is one child process
+/// and its contents are unknown until it answers, so there is nothing finer to
+/// count without making the scan itself slower than the progress it reports.
+///
+/// `on_step` runs on the calling thread, between child processes — a caller
+/// scanning in the background can publish straight from it.
+pub fn scan_all_with_progress(
+    paths: &PluginPaths,
+    mut on_step: impl FnMut(ScanStep<'_>),
+) -> Vec<FoundPlugin> {
+    let jobs: Vec<(PluginFormat, &std::path::Path)> = paths
+        .entries
+        .iter()
+        .flat_map(|(format, dirs)| {
+            dirs.iter()
+                .filter(|d| d.enabled)
+                .map(move |d| (*format, d.path.as_path()))
+        })
+        .collect();
+    let total = jobs.len();
+
     let mut out = Vec::new();
-    for (format, dirs) in paths.entries.iter() {
-        for dir in dirs.iter().filter(|d| d.enabled) {
-            match scan_dir_out_of_process(*format, &dir.path) {
-                Some(found) => out.extend(found),
-                None => out.extend(scan_one(*format, &dir.path)),
-            }
+    for (done, (format, dir)) in jobs.into_iter().enumerate() {
+        on_step(ScanStep {
+            done,
+            total,
+            format,
+            dir,
+        });
+        match scan_dir_out_of_process(format, dir) {
+            Some(found) => out.extend(found),
+            None => out.extend(scan_one(format, dir)),
         }
     }
     out.sort_by_key(|p| (p.format, p.name.to_lowercase()));
