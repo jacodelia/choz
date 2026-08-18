@@ -428,3 +428,79 @@ fn control_ports_carry_their_unit() {
         "{uri} has a port with a unit but no parameter carries it"
     );
 }
+
+/// A bundle that ships `pset:Preset`s must list them with their labels, and
+/// picking one must change the sound. Skipped when no installed instrument
+/// publishes presets (mda's DX10 has 32 of them).
+#[test]
+fn bundle_presets_are_listed_and_applied() {
+    let _guard = plugin_lock();
+    let candidates: Vec<Lv2PluginInfo> = installed()
+        .into_iter()
+        .filter(|p| p.is_instrument)
+        .collect();
+    if candidates.is_empty() {
+        eprintln!("no LV2 instruments installed; skipping");
+        return;
+    }
+
+    let mut checked = false;
+    for info in candidates {
+        let listed = choz_plugin_lv2::presets::scan(&info.bundle_dir, &info.uri, &info.ports);
+        if listed.is_empty() {
+            continue;
+        }
+        let Some(mut inst) = Lv2Instrument::build(&info.bundle_dir, &info.uri, SR, BLOCK) else {
+            continue;
+        };
+        let Some(browser) = inst.presets() else {
+            panic!("{} has presets but offers no browser", info.name);
+        };
+        let list = browser.list();
+        assert_eq!(list.len(), listed.len());
+        for p in &list {
+            assert!(!p.name.is_empty(), "a preset with no label: {p:?}");
+            assert!(!p.key.is_empty(), "a preset with no URI: {p:?}");
+        }
+        if list.len() < 2 {
+            continue;
+        }
+
+        // Same note, two presets: the plugin must not sound identical, or the
+        // port values never reached it.
+        let render = |inst: &mut Lv2Instrument| {
+            inst.note_on(60, 110);
+            let mut out = vec![0.0f32; 1024];
+            let mut captured = Vec::new();
+            for _ in 0..60 {
+                inst.render(&mut out, SR);
+                captured.extend_from_slice(&out);
+            }
+            inst.note_off(60);
+            for _ in 0..60 {
+                inst.render(&mut out, SR);
+            }
+            captured
+        };
+        browser.load(&list[0].key);
+        let first = render(&mut inst);
+        browser.load(&list[list.len() - 1].key);
+        let last = render(&mut inst);
+        assert_ne!(
+            first,
+            last,
+            "{}: '{}' and '{}' render the same audio",
+            info.name,
+            list[0].name,
+            list[list.len() - 1].name
+        );
+
+        // A URI that is not one of ours changes nothing rather than panicking.
+        browser.load("http://example.com/not-a-preset");
+        checked = true;
+        break;
+    }
+    if !checked {
+        eprintln!("no LV2 instrument here publishes presets; skipping");
+    }
+}

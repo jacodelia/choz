@@ -143,6 +143,9 @@ pub mod opcode {
     pub const GET_PARAM_LABEL: i32 = 6;
     pub const GET_PARAM_DISPLAY: i32 = 7;
     pub const GET_PARAM_NAME: i32 = 8;
+    /// `effGetProgramNameIndexed`: the name of program `index`, without
+    /// selecting it — the only way to list a VST2's programs.
+    pub const GET_PROGRAM_NAME_INDEXED: i32 = 29;
     pub const SET_SAMPLE_RATE: i32 = 10;
     pub const SET_BLOCK_SIZE: i32 = 11;
     pub const MAIN_RESUME: i32 = 12; // suspend=0, resume=1 via value

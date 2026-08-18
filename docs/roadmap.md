@@ -5,7 +5,7 @@ día por día y con los porqués; cómo encajan las piezas, en
 [architecture.md](architecture.md). Este documento se poda cuando un punto se
 cierra, para que lo que quede sea sólo lo que queda.
 
-Última actualización: 2026-08-15.
+Última actualización: 2026-08-17.
 
 ## Estado en una línea
 
@@ -20,14 +20,133 @@ a notas), AutoTune y un arpegiador por tab; 45 efectos
 propios (**la suite está completa**), que además se publican como un `.clap`
 para usarlos en cualquier otro host; un patch de Max se importa hasta donde se
 puede, diciendo qué no; y hay guardia de acople en la entrada. **La 1.0.0 está
-publicada y sus paquetes verificados; la 1.1.0 es este árbol.** 526 tests, `clippy --workspace
+publicada y sus paquetes verificados; la 1.2.0 es este árbol.** 563 tests, `clippy --workspace
 --all-targets -D warnings` limpio.
 
-**No queda código pendiente.** Lo cerrado se fue de aquí el 2026-08-15 y el
-2026-08-16; las comprobaciones con hardware delante quedaron dichas en los
-gotchas, que es donde se van a leer.
+Lo cerrado se fue de aquí el 2026-08-15 y el 2026-08-16; las comprobaciones con
+hardware delante quedaron dichas en los gotchas, que es donde se van a leer.
+**Los bancos de presets de plugins se hicieron enteros el 2026-08-17** —las
+ocho fases, cada una probada contra plugins instalados— y quedan abajo como
+registro de qué da cada formato y por qué se hizo así, no como pendiente.
 
 ---
+
+## Cerrado el 2026-08-17: bancos de presets de plugins
+
+### Qué da cada formato, y qué se hizo
+
+Antes, `BANK / PRESET` sólo existía para SoundFonts: `RackSlot::presets` era un
+`Vec<Sf2Preset>` y un plugin cargado en el tab no ofrecía nada. Ahora la misma
+tecla lista los patches del plugin, con nombre, en los cinco formatos que
+pueden decirlos.
+
+No hay un "banco" genérico: cada formato lo publica distinto, y lo que un
+plugin concreto declare importa más que lo que el formato permita. Verificado
+con el Surge XT 1.3.4 instalado en esta máquina (2026-08-17):
+
+| formato | de dónde salen los nombres | Surge XT |
+|---|---|---|
+| CLAP | `clap.preset-discovery` (factory) + `clap.preset-load` | ✅ ambas; 3008 patches en `/usr/share/surge-xt/patches_factory` |
+| VST2 | `numPrograms` + `effGetProgramNameIndexed`, cambio con `SET_PROGRAM` | no hay build VST2 |
+| LV2 | `pset:Preset` en el `.ttl` | ❌ un preset dummy con `rdfs:label ""` |
+| DSSI | `get_program` / `select_program` del descriptor | n/a |
+| VST3 | `IUnitInfo` + program lists | plumbing COM, el más caro |
+| LADSPA | no tiene presets en el formato | nunca |
+
+Orden de trabajo. Cada fase deja algo usable; ninguna necesita a la siguiente.
+
+- **F0 — plumbing común. HECHO (2026-08-17).** `PresetHandle` en `choz-ports` (`list()` →
+  `Vec<PresetEntry>`, `load(i)`), calcado de `StateHandle`: se toma **antes** de
+  que la fuente se vaya al thread RT, porque cargar un preset no es RT-safe en
+  ningún formato. El engine lo guarda por slot en `set_slot_source`, igual que
+  `states[slot]`. La UI deja de mirar `Vec<Sf2Preset>` y pasa a una lista de
+  etiquetas con su `apply`, de modo que SF2 y plugin comparten modal, `◀ ▶` y
+  binding MIDI. **Sin esto no hay fase que valga**, y con esto un plugin sin
+  presets se comporta como hoy (lista vacía, la tecla avisa).
+- **F1 — CLAP. HECHO (2026-08-17).** `crates/choz-plugin-clap/src/presets.rs`.
+  Medido contra el Surge XT instalado: **3008 patches en 111 ms**, 314
+  categorías, y cargar uno cambia el estado y el sonido. Verificado también
+  con TyrellN6 de u-he, que publica la misma extensión. **Lo que hace y lo que
+  no**: se le piden al proveedor sus *locations* y sus extensiones, y el host
+  camina esos directorios — el nombre del patch es el del archivo y la
+  categoría es el directorio. **No** se llama a `get_metadata`, que sería una
+  llamada al plugin por archivo (3008 para Surge) y a cambio daría los tags y
+  el `load_key`; por eso un plugin que meta varios presets en un solo archivo
+  contenedor todavía no se lista bien, y por eso el `load_key` que se manda es
+  vacío. Cargar es asíncrono: el plugin aplica el patch en su bloque siguiente.
+  El scan de preset-discovery: proveedores → locations → 
+  `MetadataReceiver` → `(nombre, load_key)`, y `clap.preset-load` para
+  aplicarlo. `clack-extensions` ya trae el módulo `preset_discovery` (feature
+  apagada en el `Cargo.toml` de `choz-plugin-clap`), así que es API de Rust y
+  no ABI de C a mano. Es la única fase que le sirve a Surge XT.
+- **F2 — VST2. HECHO y probado (2026-08-17).** `numPrograms` +
+  `effGetProgramNameIndexed`, y el `SET_PROGRAM` que ya estaba. Un plugin con
+  un solo programa no ofrece navegador: no hay nada que elegir. **El único
+  VST2 multiprograma de esta máquina es Pianoteq 9** (`Pianoteq_9.so` dentro de
+  su bundle LV2 — el mismo binario exporta las dos ABIs): 32 programas con
+  nombre real ("NY Steinway D Classical", "Bösendorfer VC Warm"). El TyrellN6
+  VST2 de `~/repo/TyrellN6-16976` declara **un** programa: u-he navega sus
+  presets por su cuenta en VST2, y sólo en VST3 expone los 128.
+  El test se corre con `CHOZ_VST2_DIR="/home/jorge/repo/Pianoteq 9/x86-64bit/Pianoteq 9.lv2"`
+  y se salta solo si no encuentra ninguno. **Cómo se verifica, y por qué así**:
+  con `effGetProgram`, no con el audio — Pianoteq sin licencia no suena y no
+  cambia su chunk, y aun así cambia de programa correctamente. Ese fue el
+  motivo de agregar `PluginPresets::current()`, que además hace que el selector
+  abra en el preset en el que el plugin realmente está.
+- **F3 — DSSI. HECHO y probado (2026-08-17).** Se destrabó sola en cuanto hubo
+  sintes con qué probar (el usuario tenía `fluidsynth-dssi`, `hexter` y
+  `whysynth` instalados). **No hizo falta la celda compartida**: la lista se lee
+  al construir (`get_program`, que es donde sí hay acceso) y elegir un programa
+  se pide con **un `AtomicU64`** —`dirty | bank | program`— que el hilo de audio
+  levanta al principio de `run()` y aplica con `select_program`, que es donde
+  tiene que ejecutarse. Un load relajado por bloque, sin locks, sin
+  asignaciones. La clave del `PresetEntry` es `"bank:program"`. Probado con
+  hexter (128 patches de la ROM del DX7), WhySynth (397) y FluidSynth-DSSI
+  (189 con FluidR3 cargado): en los tres, dos programas distintos suenan
+  distinto.
+
+- **F4 — LV2. HECHO (2026-08-17).** `crates/choz-plugin-lv2/src/presets.rs`.
+  Los `pset:Preset` del manifest, siguiendo su `rdfs:seeAlso`, resueltos a
+  índices de puerto en el momento de cargar; aplicar uno son unos pocos stores
+  en el buffer de control que el plugin ya lee (el mismo camino que usa su
+  propia ventana). Probado con mda DX10: **32 presets con nombre**, y cargar
+  dos distintos suena distinto. **Lo que falta**: los presets que además
+  cargan `state:state` (una muestra, una wavetable) llegan sólo con su mitad
+  de puertos de control; ninguno de los bundles instalados aquí los usa.
+- **F5 — VST3. HECHO (2026-08-17), y salió barato.** `IUnitInfo` ya está en las
+  bindings del crate `vst3`, así que no hubo COM a mano: `getProgramListCount`
+  / `getProgramListInfo` / `getProgramName` para la lista. **El detalle que
+  importa**: VST3 no tiene una llamada para elegir programa — se elige con el
+  *parámetro* marcado `kIsProgramChange`, y hay que escribirlo en los dos
+  lados, en el controlador (para que su ventana muestre el cambio) y en el
+  `EditFeed` (para que el procesador lo oiga). Escribir sólo el controlador es
+  exactamente el bug que ya había mordido con las perillas de Surge XT.
+  Probado con TyrellN6 y TripleCheese de u-he: **128 programas cada uno**, y
+  cambiar de programa cambia el audio. **Surge XT en VST3 no publica program
+  lists** — para Surge sigue siendo CLAP el camino.
+- **F6 — navegación. HECHO (2026-08-17).** 3008 entradas no se recorren con `◀ ▶`, y
+  el dato medido cambia el plan: Surge no declara 8 categorías sino **314**
+  (`A.Liv / Basses`, `Altenberg / Drums`…), porque son dos niveles de
+  directorio. Como chips no entran. Lo que sí entra es el **primer** nivel (el
+  banco: `A.Liv`, `Altenberg`, `Factory`…) en los chips que `ListModal` ya
+  dibuja, con `◀ ▶` moviéndose **dentro** del banco. Así quedó: el primer chip
+  es "todos los bancos", Tab los cicla, y una fila elegida aplica el preset al
+  que apunta y no la posición que ocupa en la vista filtrada. Si con eso no alcanza, filtro tipeado reusando `TextEdit`
+  (el del prompt de guardar proyecto) — pero recién cuando se demuestre que
+  hace falta.
+
+- **F7 — `configure` de DSSI en la interfaz. HECHO (2026-08-17).** Un SF2
+  elegido con "Open SF2…" sobre un tab que toca un DSSI **no reemplaza el
+  instrumento**: le manda `load=<ruta>`. Los pares se guardan por tab, viajan
+  en el proyecto (`instrument.config`, que es lo que la convención DSSI pide) y
+  se reaplican al reabrirlo. `AudioEngine::load_dssi` construye, configura y
+  recién entonces entrega la fuente al hilo de audio — el único momento
+  seguro, porque `configure` abre archivos y una vez en el slot la instancia es
+  del callback. Con `config` vacío es exactamente `load_plugin`, sandbox
+  incluido; **con settings que mandar construye en proceso**, porque el puente
+  del sandbox todavía no tiene mensaje para `configure`. La lista de programas
+  se relee después de configurar, así que FluidSynth-DSSI pasa de no tener
+  ninguno a tener los 189 del SoundFont.
 
 ## Pendiente
 
@@ -38,6 +157,38 @@ primer punto de los gotchas antes de dudar de un número.
 
 ## Notas / gotchas para el que retome
 
+- **FluidSynth-DSSI no se puede instanciar dos veces en un proceso.** Arrastra
+  libinstpatch, cuyo registro de tipos de GLib no sobrevive a que se destruya la
+  primera instancia: la segunda construcción **segfaultea**, y antes de eso GLib
+  avisa con `cannot register existing type 'IpatchConverter'`. Descubierto
+  porque la suite entera empezó a caerse de forma intermitente el 2026-08-17.
+  Lo que se hizo: `choz-plugin-ladspa` ahora mantiene mapeadas las bibliotecas
+  para la vida del proceso (`LOADED_LIBS`, calcado de `choz-plugin-lv2`, que
+  tuvo el mismo problema con los plugins Qt de Rui), y la suite construye cada
+  plugin DSSI **una sola vez**. Lo que **no** está resuelto: cargar
+  FluidSynth-DSSI en un tab, quitarlo y volver a cargarlo sigue siendo el mismo
+  camino. La red que ya existe para esto es la cuarentena y el sandbox, pero la
+  sonda instancia el plugin **una** vez en un hijo, así que no lo detecta —
+  haría falta que probara dos.
+- **Un CC ahora sabe de qué controlador vino** (2026-08-17). Una asignación de
+  MIDI learn es `(fuente, CC, destino)`, no `(CC, destino)`: en un escenario con
+  dos teclados los dos mandan CC 1, y sin la fuente el mod wheel de uno movía lo
+  que se había asignado con el otro. La regla, que es la misma que ya seguían
+  las notas: **cada controlador maneja las tabs asignadas a él**, esté en
+  pantalla la que esté; **sólo cuando varias tabs comparten el mismo puerto**
+  decide la tab activa (y antes que ella, un canal reclamado). Dos asignaciones
+  pueden compartir un CC si mueven **tabs distintas** o unidades de FX
+  distintas; en cualquier otro caso la nueva reemplaza a la vieja. Las
+  asignaciones guardadas antes de esto no tienen fuente y siguen respondiendo a
+  cualquiera — hay que volver a aprenderlas para que se separen por teclado.
+- **Un DSSI que no aparece como instrumento casi seguro exporta
+  `run_multiple_synths` y no `run_synth`.** Fue el caso de FluidSynth-DSSI, que
+  durante meses se listó como efecto y no se podía cargar. Y un DSSI que carga
+  pero no suena casi seguro espera un `configure`: FluidSynth-DSSI no tiene
+  **nada** hasta que se le da `load=<sf2>`, y WhySynth sonaba en silencio
+  simplemente porque no tenía ningún programa seleccionado. Los tres de esta
+  máquina (`/usr/lib/dssi`) cubren las dos formas del formato y son con lo que
+  se probó todo.
 - **Todo el DSP está verificado contra señales sintéticas, no contra una
   habitación.** Las comprobaciones con hardware delante —la interfaz apagada y
   encendida, los ocho jacks de la UMC1820, la deriva de dos relojes reales, el

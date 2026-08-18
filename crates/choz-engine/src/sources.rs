@@ -194,9 +194,14 @@ impl Sf2Synth {
     pub fn load(path: &Path, bank: u8, preset: u8, sample_rate: u32) -> Result<Self> {
         use oxisynth::{MidiEvent, SoundFont, Synth, SynthDescriptor};
 
+        // 0.2 is oxisynth's (and FluidSynth's) default for a reason: a voice
+        // peaks around -6 dBFS on its own, so anything above ~0.3 clips as soon
+        // as a chord is held — measured at 1.0 a four-note chord already hit
+        // 1.15 and a two-handed one 2.7. Loudness belongs to the slot's VOL,
+        // which has a fader; clipping inside the synth has no way back.
         let desc = SynthDescriptor {
             sample_rate: sample_rate as f32,
-            gain: 1.0,
+            gain: 0.2,
             ..Default::default()
         };
         let mut synth =
@@ -229,6 +234,29 @@ impl Sf2Synth {
             buf_r: vec![0.0; SF2_MAX_FRAMES],
         })
     }
+}
+
+/// The parameters an SF2 slot shows in the instrument editor.
+///
+/// A SoundFont has no plugin parameters, but oxisynth runs a reverb **and** a
+/// chorus of its own, on by default, fed by each preset's send amounts. Stacked
+/// under choz's FX chain that is two reverbs and a chorus nobody asked for — so
+/// the two sends are switchable. Presets that send nothing (plenty of them) are
+/// unaffected either way.
+pub fn sf2_params() -> Vec<choz_ports::PluginParam> {
+    ["SF2 Reverb", "SF2 Chorus"]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| choz_ports::PluginParam {
+            id: i as u32,
+            name: (*name).to_string(),
+            min: 0.0,
+            max: 1.0,
+            default: 1.0,
+            steps: 2,
+            ..Default::default()
+        })
+        .collect()
 }
 
 /// One selectable program in a SoundFont.
@@ -325,6 +353,25 @@ impl AudioSource for Sf2Synth {
         });
     }
 
+    /// `0` = the SoundFont's own reverb send, `1` = its chorus send, both as
+    /// on/off. See [`sf2_params`] for why they are here at all.
+    ///
+    /// RT-safe: `set_gen` writes a channel generator offset and re-derives the
+    /// live voices' sends. **Not** `set_chorus_params`, which rebuilds the
+    /// chorus modulation table — 4.3 ms measured, an xrun every toggle.
+    fn set_param(&mut self, index: usize, value: f32) {
+        let gen = match index {
+            0 => oxisynth::GeneratorType::ReverbSend,
+            1 => oxisynth::GeneratorType::ChorusSend,
+            _ => return,
+        };
+        // The offset is additive on top of what the preset asks for, and the
+        // send is clamped at 0: -1000 (=-100%) zeroes any preset, whatever it
+        // set. Anything else leaves the SoundFont's own amount alone.
+        let offset = if value >= 0.5 { 0.0 } else { -1000.0 };
+        let _ = self.synth.set_gen(0, gen, offset);
+    }
+
     fn program_change(&mut self, bank: u8, preset: u8) {
         // RT-safe: this only looks the preset up in the already-loaded font and
         // Arc-clones it into the channel.
@@ -393,6 +440,79 @@ mod tests {
             after < held * 0.5,
             "lifting the pedal releases: {after} vs {held}"
         );
+    }
+
+    /// A held chord must stay inside the converter. The synth renders into a
+    /// mixer, an FX chain and a fader that all assume \u{00B1}1.0; a SoundFont
+    /// that leaves no headroom is distortion nothing downstream can undo.
+    #[test]
+    fn a_held_chord_leaves_headroom() {
+        let path = std::path::Path::new("/usr/share/sounds/sf2/FluidR3_GM.sf2");
+        if !path.exists() {
+            return; // ponytail: no bundled SF2 to test against, skip rather than fail.
+        }
+        let mut synth = Sf2Synth::load(path, 0, 0, 48_000).expect("load SF2");
+        // Two hands' worth, hard.
+        for i in 0..12u8 {
+            synth.note_on(48 + i * 4, 110);
+        }
+        let mut loudest = 0.0f32;
+        for _ in 0..40 {
+            loudest = loudest.max(peak(&mut synth, 512));
+        }
+        assert!(loudest > 0.05, "the chord has to sound at all: {loudest}");
+        assert!(loudest < 1.0, "a chord must not clip the synth: {loudest}");
+    }
+
+    /// The SF2 reverb / chorus switches have to actually reach the synth: off
+    /// must change what comes out for a preset that sends to them, and the
+    /// toggle must stay cheap enough for the audio thread.
+    #[test]
+    fn the_sf2_send_switches_change_the_sound() {
+        let path = std::path::Path::new("/usr/share/sounds/sf2/FluidR3_GM.sf2");
+        if !path.exists() {
+            return; // ponytail: no bundled SF2 to test against, skip rather than fail.
+        }
+        let render = |off: bool| {
+            let mut s = Sf2Synth::load(path, 0, 0, 48_000).expect("load SF2");
+            if off {
+                s.set_param(0, 0.0); // reverb send
+                s.set_param(1, 0.0); // chorus send
+            }
+            s.note_on(60, 110);
+            let mut out = vec![0.0f32; 4096];
+            let mut all = Vec::new();
+            for _ in 0..30 {
+                s.render(&mut out, 48_000);
+                all.extend_from_slice(&out);
+            }
+            all
+        };
+        let (wet, dry) = (render(false), render(true));
+        let diff: f32 = wet
+            .iter()
+            .zip(&dry)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            diff > 1e-4,
+            "switching the sends off must be audible: {diff}"
+        );
+
+        // …and back on again is the sound we started from.
+        let mut s = Sf2Synth::load(path, 0, 0, 48_000).expect("load SF2");
+        s.set_param(0, 0.0);
+        s.set_param(1, 0.0);
+        s.set_param(0, 1.0);
+        s.set_param(1, 1.0);
+        s.note_on(60, 110);
+        let mut out = vec![0.0f32; 4096];
+        let mut back = Vec::new();
+        for _ in 0..30 {
+            s.render(&mut out, 48_000);
+            back.extend_from_slice(&out);
+        }
+        assert_eq!(back, wet, "on is the SoundFont's own amount, unchanged");
     }
 
     #[test]

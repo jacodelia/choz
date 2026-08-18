@@ -258,3 +258,72 @@ fn every_installed_effect_is_safe_to_host() {
         );
     }
 }
+
+/// A CLAP instrument that publishes a preset browser must list it and load from
+/// it — the whole point of the BANK key on a plugin tab.
+///
+/// Skipped on a machine with no such plugin. With Surge XT installed this walks
+/// its ~3000 factory patches and loads one.
+#[test]
+fn a_clap_instruments_preset_browser_lists_and_loads() {
+    let _guard = plugin_lock();
+    let instruments: Vec<choz_plugin_clap::ClapPluginInfo> =
+        choz_plugin_clap::default_search_paths()
+            .into_iter()
+            .flat_map(|d| choz_plugin_clap::scan_directory(&d))
+            .filter(|p| p.is_instrument)
+            .collect();
+
+    let Some((info, list)) = instruments
+        .iter()
+        .map(|i| (i, choz_plugin_clap::presets::scan(&i.path)))
+        .find(|(_, list)| !list.is_empty())
+    else {
+        eprintln!("no CLAP instrument with a preset browser installed; skipping");
+        return;
+    };
+
+    // A listed preset has to be usable as it stands: a name to show and a key
+    // to load. An entry with an empty key is a row that does nothing.
+    for p in list.iter().take(50) {
+        assert!(!p.name.is_empty(), "a preset with no name: {p:?}");
+        assert!(!p.key.is_empty(), "a preset with no key: {p:?}");
+    }
+
+    let Some(mut inst) =
+        choz_plugin_clap::host::ClapInstrument::build(&info.path, &info.id, 48_000, 512)
+    else {
+        eprintln!("{} would not instantiate; skipping", info.name);
+        return;
+    };
+    let browser = inst
+        .presets()
+        .expect("the instance offers the same browser");
+    assert_eq!(browser.list().len(), list.len());
+
+    // Loading is asynchronous in practice — the plugin applies the patch on its
+    // next block — so the state is read after rendering, not before.
+    let render = |inst: &mut choz_plugin_clap::host::ClapInstrument| {
+        let mut out = vec![0.0f32; 1024];
+        for _ in 0..40 {
+            inst.render(&mut out, 48_000);
+        }
+    };
+    render(&mut inst);
+    let before = inst.state().and_then(|s| s.save()).unwrap_or_default();
+    browser.load(&list[list.len() / 2].key);
+    render(&mut inst);
+    let after = inst.state().and_then(|s| s.save()).unwrap_or_default();
+    if before.is_empty() {
+        eprintln!(
+            "{} reports no state; the load could not be observed",
+            info.name
+        );
+        return;
+    }
+    assert_ne!(before, after, "loading a preset must change the patch");
+
+    // A key that is not one of ours is ignored rather than fatal.
+    browser.load("/nowhere/at/all.fxp");
+    render(&mut inst);
+}

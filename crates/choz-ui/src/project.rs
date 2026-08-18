@@ -81,6 +81,11 @@ pub struct Binding {
     pub target: crate::LearnTarget,
     #[serde(default)]
     pub label: String,
+    /// Which controller the CC has to come from, `"MIDI:<port>"` / `"OSC"`.
+    /// Absent in projects written before bindings knew, and absent for a
+    /// binding learned from anything but a port — both mean "any source".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -148,6 +153,11 @@ pub struct Instrument {
     /// Written as text so the project stays a readable YAML file.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub state: String,
+    /// DSSI only: the `configure` key/values the plugin was given. Saving these
+    /// is what the DSSI convention asks of a host, and without them a project
+    /// with FluidSynth-DSSI in it reopens with no SoundFont and no sound.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config: Vec<(String, String)>,
 }
 
 /// One FX in a chain, with every knob as the UI shows it (0..1).
@@ -232,6 +242,7 @@ mod tests {
                     preset: Some(4),
                     params: Vec::new(),
                     state: String::new(),
+                    config: Vec::new(),
                 },
                 mixer: Mixer {
                     gain: 0.8,
@@ -256,6 +267,7 @@ mod tests {
                     state: String::new(),
                 }],
                 midi_learn: vec![Binding {
+                    source: None,
                     cc: 74,
                     target: crate::LearnTarget::Gain(0),
                     label: "tab 1 \u{00b7} VOL".into(),

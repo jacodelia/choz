@@ -16,6 +16,7 @@ pub mod abi;
 
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -100,8 +101,13 @@ unsafe fn enumerate_dssi(lib: &Library, path: &Path, out: &mut Vec<PluginInfo>) 
         if ladspa.is_null() {
             continue;
         }
-        // A DSSI descriptor without run_synth is just an effect.
-        let is_synth = unsafe { (*d).run_synth.is_some() };
+        // A synth is one that can be *run* as a synth. `run_multiple_synths`
+        // counts: it is what a plugin exports when one engine serves several
+        // instances (fluidsynth-dssi does exactly this, and calling it with a
+        // single handle is what the DSSI spec says a host may do). Looking only
+        // at `run_synth` filed FluidSynth-DSSI as an effect and left it
+        // unloadable.
+        let is_synth = unsafe { (*d).run_synth.is_some() || (*d).run_multiple_synths.is_some() };
         if let Some(info) = unsafe { info_from(ladspa, path, i as u32, is_synth) } {
             labels.push(info.label.clone());
             out.push(info);
@@ -255,8 +261,23 @@ struct Instance {
     pending_midi: Vec<[u8; 3]>,
     /// Scratch the RT thread converts `pending_midi` into; pre-allocated.
     events: Vec<snd_seq_event_t>,
+    /// `(bank, program, name)` as the plugin listed them at load time. DSSI
+    /// plugins build this list once (hexter's 32 patches per bank, the
+    /// SoundFont FluidSynth-DSSI was given) and it does not change under us.
+    programs: Vec<(u32, u32, String)>,
+    /// The program the UI last asked for, picked up by the audio thread.
+    ///
+    /// A shared cell rather than a lock: `select_program` has to run where the
+    /// instance lives, which is the audio thread, and the UI has no other way
+    /// to reach it. One `AtomicU64` — `dirty | bank | program` — costs a
+    /// relaxed load per block and cannot block the callback.
+    program_request: Arc<AtomicU64>,
     activated: bool,
 }
+
+/// Set on [`Instance::program_request`] when the UI has asked for a program;
+/// cleared by the audio thread once it has been selected.
+const PROGRAM_REQUESTED: u64 = 1 << 63;
 
 // SAFETY: an Instance owns its plugin handle exclusively — it is created on the
 // UI thread, then moved to the audio thread and never shared.
@@ -289,6 +310,7 @@ fn build(
     let lib = Arc::new(
         unsafe { Library::new(path) }.with_context(|| format!("dlopen {}", path.display()))?,
     );
+    keep_loaded(&lib);
 
     // Find the descriptor whose label matches, through the right entry point.
     let (descriptor, dssi) = unsafe { find_descriptor(&lib, label, want_synth)? };
@@ -342,6 +364,8 @@ fn build(
         params,
         pending_midi: Vec::with_capacity(MAX_PENDING_MIDI),
         events: Vec::with_capacity(MAX_PENDING_MIDI),
+        programs: Vec::new(),
+        program_request: Arc::new(AtomicU64::new(0)),
         activated: false,
     };
     inst.connect_all();
@@ -349,7 +373,41 @@ fn build(
         unsafe { activate(handle) };
     }
     inst.activated = true;
+    inst.programs = unsafe { read_programs(&inst) };
     Ok(inst)
+}
+
+/// The programs a DSSI plugin declares, asked for one by one until it stops
+/// answering. Non-RT: it happens once, at load.
+///
+/// # Safety
+/// `inst` must hold a live handle and, if any, a live DSSI descriptor.
+unsafe fn read_programs(inst: &Instance) -> Vec<(u32, u32, String)> {
+    if inst.dssi.is_null() {
+        return Vec::new();
+    }
+    let Some(get) = (unsafe { (*inst.dssi).get_program }) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for i in 0.. {
+        let d = unsafe { get(inst.handle, i) };
+        if d.is_null() {
+            break;
+        }
+        let name = unsafe { cstr((*d).name) }.unwrap_or_default();
+        out.push((
+            unsafe { (*d).bank } as u32,
+            unsafe { (*d).program } as u32,
+            name,
+        ));
+        // A plugin that keeps answering forever is a plugin with a bug, and a
+        // host that keeps asking is a host that hangs.
+        if out.len() >= 4096 {
+            break;
+        }
+    }
+    out
 }
 
 /// # Safety
@@ -370,8 +428,10 @@ unsafe fn find_descriptor(
                 continue;
             }
             if unsafe { cstr((*ladspa).label) }.as_deref() == Some(label) {
-                if want_synth && unsafe { (*d).run_synth.is_none() } {
-                    bail!("DSSI plugin {label} has no run_synth; not an instrument");
+                if want_synth
+                    && unsafe { (*d).run_synth.is_none() && (*d).run_multiple_synths.is_none() }
+                {
+                    bail!("DSSI plugin {label} has no way to run as a synth; not an instrument");
                 }
                 return Ok((ladspa, d));
             }
@@ -427,9 +487,49 @@ impl Instance {
         }
     }
 
+    /// Send one DSSI `configure` key/value. Returns the plugin's error string,
+    /// if it complained.
+    ///
+    /// This is how a DSSI synth is told the things that are not parameters —
+    /// FluidSynth-DSSI takes `load` with the path to a SoundFont, and without
+    /// it the plugin runs and stays silent, which is exactly how it looked
+    /// here. Not RT-safe (it reads files): UI thread only, before or between
+    /// blocks.
+    fn configure(&self, key: &str, value: &str) -> Option<String> {
+        if self.dssi.is_null() {
+            return Some("not a DSSI plugin".into());
+        }
+        let configure = unsafe { (*self.dssi).configure }?;
+        let (k, v) = (
+            std::ffi::CString::new(key).ok()?,
+            std::ffi::CString::new(value).ok()?,
+        );
+        // SAFETY: live handle; the plugin copies out of both strings during the
+        // call. The message it may return is ours to free — `free`, because the
+        // plugin allocated it with `malloc`.
+        let msg = unsafe { configure(self.handle, k.as_ptr(), v.as_ptr()) };
+        if msg.is_null() {
+            return None;
+        }
+        let out = unsafe { cstr(msg) };
+        unsafe { libc_free(msg as *mut std::os::raw::c_void) };
+        out
+    }
+
     /// Run `frames` of audio. DSSI synths get the queued MIDI as ALSA events.
     fn run(&mut self, frames: usize) {
         if !self.dssi.is_null() {
+            // A program the UI asked for, applied here because `select_program`
+            // has to run where the instance is.
+            let req = self.program_request.load(Ordering::Relaxed);
+            if req & PROGRAM_REQUESTED != 0 {
+                self.program_request.store(0, Ordering::Relaxed);
+                if let Some(select) = unsafe { (*self.dssi).select_program } {
+                    let bank = ((req >> 32) & 0x7FFF_FFFF) as std::os::raw::c_ulong;
+                    let program = (req & 0xFFFF_FFFF) as std::os::raw::c_ulong;
+                    unsafe { select(self.handle, bank, program) };
+                }
+            }
             self.events.clear();
             for msg in &self.pending_midi {
                 if let Some(ev) = snd_seq_event_t::from_midi(*msg, 0) {
@@ -444,6 +544,25 @@ impl Instance {
                         frames as std::os::raw::c_ulong,
                         self.events.as_mut_ptr(),
                         self.events.len() as std::os::raw::c_ulong,
+                    )
+                };
+                return;
+            }
+            // The other half of the format: one call for a group of instances
+            // sharing an engine. choz gives each tab its own instance, so the
+            // group is always of one — which the spec allows, and which is the
+            // only way to run FluidSynth-DSSI at all.
+            if let Some(run_multi) = unsafe { (*self.dssi).run_multiple_synths } {
+                let mut handle = self.handle;
+                let mut events = self.events.as_mut_ptr();
+                let mut count = self.events.len() as std::os::raw::c_ulong;
+                unsafe {
+                    run_multi(
+                        1,
+                        &mut handle,
+                        frames as std::os::raw::c_ulong,
+                        &mut events,
+                        &mut count,
                     )
                 };
                 return;
@@ -581,6 +700,49 @@ pub struct DssiInstrument {
     inst: Instance,
 }
 
+/// A DSSI synth's own programs.
+///
+/// Listed once at load (`get_program`), selected through the instance's shared
+/// request cell — the audio thread is where `select_program` has to happen, and
+/// it is the only side that can still reach the plugin once the source has
+/// moved there.
+struct DssiPresets {
+    programs: Vec<(u32, u32, String)>,
+    request: Arc<AtomicU64>,
+}
+
+impl choz_ports::PluginPresets for DssiPresets {
+    fn list(&self) -> Vec<choz_ports::PresetEntry> {
+        self.programs
+            .iter()
+            .map(|(bank, program, name)| choz_ports::PresetEntry {
+                name: if name.trim().is_empty() {
+                    format!("Program {program}")
+                } else {
+                    name.clone()
+                },
+                // DSSI banks are numbers, not names: the picker files them as
+                // "Bank 0" so its chips still say something.
+                category: format!("Bank {bank}"),
+                key: format!("{bank}:{program}"),
+            })
+            .collect()
+    }
+
+    fn load(&self, key: &str) {
+        let Some((bank, program)) = key.split_once(':') else {
+            return;
+        };
+        let (Ok(bank), Ok(program)) = (bank.parse::<u32>(), program.parse::<u32>()) else {
+            return;
+        };
+        self.request.store(
+            PROGRAM_REQUESTED | ((bank as u64) << 32) | program as u64,
+            Ordering::Relaxed,
+        );
+    }
+}
+
 impl DssiInstrument {
     /// Load the DSSI synth `label` from `path`. `None` on any failure.
     pub fn build(path: &Path, label: &str, sample_rate: u32, max_block: u32) -> Option<Self> {
@@ -592,9 +754,33 @@ impl DssiInstrument {
             }
         }
     }
+
+    /// Send a DSSI `configure` key/value to this synth. See
+    /// [`Instance::configure`]: it is how FluidSynth-DSSI is given a SoundFont.
+    ///
+    /// The program list is read again afterwards: FluidSynth-DSSI has **no**
+    /// programs until it is given a SoundFont, and every program it then has
+    /// came out of that file.
+    pub fn configure(&mut self, key: &str, value: &str) -> Option<String> {
+        let msg = self.inst.configure(key, value);
+        // SAFETY: the instance is live and still ours — nothing has moved it to
+        // the audio thread yet, which is the only place that would race.
+        self.inst.programs = unsafe { read_programs(&self.inst) };
+        msg
+    }
 }
 
 impl AudioSource for DssiInstrument {
+    fn presets(&self) -> Option<choz_ports::PresetsHandle> {
+        if self.inst.programs.is_empty() {
+            return None;
+        }
+        Some(Arc::new(DssiPresets {
+            programs: self.inst.programs.clone(),
+            request: Arc::clone(&self.inst.program_request),
+        }) as choz_ports::PresetsHandle)
+    }
+
     fn render(&mut self, output: &mut [f32], _sample_rate: u32) -> usize {
         let mut done = 0;
         let total = output.len() / 2;
@@ -650,4 +836,32 @@ impl AudioSource for DssiInstrument {
     fn plays_on_transport_stop(&self) -> bool {
         true
     }
+}
+
+/// Libraries `dlopen`ed so far, held for the life of the process.
+///
+/// A plugin binary is not safe to unload and load again. FluidSynth-DSSI drags
+/// in libinstpatch, which registers GLib types on load; the second time round
+/// GLib says `cannot register existing type 'IpatchConverter'` and the process
+/// hangs. Rui's Qt plugins crash in `_dl_close` for a neighbouring reason, which
+/// is why `choz-plugin-lv2` grew the same list first. Real hosts don't unload
+/// plugin binaries either.
+///
+/// ponytail: bounded by how many distinct plugins one session touches, and the
+/// instances themselves are still cleaned up properly.
+static LOADED_LIBS: std::sync::Mutex<Vec<Arc<Library>>> = std::sync::Mutex::new(Vec::new());
+
+fn keep_loaded(lib: &Arc<Library>) {
+    LOADED_LIBS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Arc::clone(lib));
+}
+
+// `free(3)`, for the strings DSSI plugins hand back from `configure`. Declared
+// here rather than pulling in `libc` for one symbol: it is in the C runtime
+// every plugin is already linked against.
+unsafe extern "C" {
+    #[link_name = "free"]
+    fn libc_free(p: *mut std::os::raw::c_void);
 }

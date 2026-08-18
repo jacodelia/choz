@@ -18,6 +18,7 @@
 pub mod discovery;
 pub mod editor;
 pub mod lv2_abi;
+pub mod presets;
 pub mod state;
 pub mod ttl;
 
@@ -1135,6 +1136,8 @@ fn touch_of(
 pub struct Lv2Instrument {
     inst: Lv2Instance,
     params: Vec<PluginParam>,
+    /// The bundle's `pset:Preset`s, resolved to port indices at load time.
+    presets: Vec<presets::Lv2Preset>,
     /// Built once at load: `editor()` is called from the UI thread and must not
     /// dlopen anything, and building it here is also what makes the GUI button
     /// appear only for plugins that really have a window.
@@ -1159,9 +1162,11 @@ impl Lv2Instrument {
         let params = params_of(&inst.info);
         inst.apply_defaults(&params);
         let editor = build_editor(&inst, sample_rate);
+        let presets = presets::scan(bundle_dir, uri, &inst.info.ports);
         Some(Self {
             inst,
             params,
+            presets,
             editor,
         })
     }
@@ -1192,6 +1197,16 @@ impl AudioSource for Lv2Instrument {
         Some(Arc::new(state::Lv2State {
             shared: Arc::clone(&self.inst.state),
         }) as choz_ports::StateHandle)
+    }
+
+    fn presets(&self) -> Option<choz_ports::PresetsHandle> {
+        if self.presets.is_empty() {
+            return None;
+        }
+        Some(Arc::new(presets::Lv2Presets::new(
+            Arc::clone(&self.inst.controls),
+            self.presets.clone(),
+        )) as choz_ports::PresetsHandle)
     }
 
     fn render(&mut self, output: &mut [f32], _sample_rate: u32) -> usize {

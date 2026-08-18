@@ -60,6 +60,123 @@ Lo que trae, sobre la 1.0.0:
 
 530 tests, `clippy --workspace --all-targets -D warnings` limpio.
 
+## [1.2.0] — 2026-08-17
+
+Lo que trae, sobre la 1.1.0. Todo salió de una sesión tocando en vivo con un
+Keystation Pro 88 y un KeyStep 32, así que todo está medido contra el equipo y
+los plugins de esa máquina, no contra señales sintéticas.
+
+### El selector de bancos, para plugins y no sólo para SoundFonts
+
+La tecla `BANK` lista los patches del plugin del tab, con nombre, en los cinco
+formatos que pueden decirlos. No hay un "banco" genérico: cada formato lo
+publica distinto y lo que un plugin concreto declare importa más que lo que el
+formato permita.
+
+- **CLAP** (`clap.preset-discovery` + `clap.preset-load`): **3008 patches de
+  Surge XT en 111 ms**, 314 categorías. Al proveedor se le piden sus
+  *locations* y sus extensiones y el host camina esos directorios; **no** se
+  llama a `get_metadata`, que sería una llamada al plugin por archivo. El
+  precio: un plugin que empaquete varios presets en un contenedor todavía no se
+  lista bien. Verificado también con TyrellN6 de u-he.
+- **VST3**: `IUnitInfo` ya estaba en las bindings, así que no hubo COM a mano.
+  VST3 no tiene llamada para elegir programa — se elige con el *parámetro*
+  marcado `kIsProgramChange`, y hay que escribirlo **en el controlador y en el
+  `EditFeed`**; escribir sólo el controlador es el bug que ya había mordido con
+  las perillas de Surge. TyrellN6 y TripleCheese: 128 programas cada uno.
+- **LV2**: los `pset:Preset` del manifest, resueltos a índices de puerto al
+  cargar. mda DX10: 32 presets. Los presets que además cargan `state:state`
+  llegan sólo con su mitad de puertos de control.
+- **DSSI**: `get_program` al construir, y elegir programa se pide con **un
+  `AtomicU64`** que el hilo de audio levanta al principio de `run()` — sin
+  locks ni asignaciones en el callback. hexter 128, WhySynth 397.
+- **VST2**: `numPrograms` + `effGetProgramNameIndexed`. Probado con Pianoteq 9
+  (32 programas); se verifica con `effGetProgram` y no con el audio, porque un
+  plugin sin licencia no suena y aun así cambia de programa. De ahí salió
+  `PluginPresets::current()`, que además hace que el selector abra en el preset
+  en el que el plugin realmente está.
+- **Navegación**: 3008 entradas no se recorren con `◀ ▶`. Los chips del modal
+  son los bancos (el primer nivel: `Factory`, `A.Liv`…), Tab los cicla, y las
+  flechas se mueven **dentro** del banco.
+
+### DSSI: por qué FluidSynth no funcionaba
+
+Dos causas, las dos en choz.
+
+- **Se clasificaba como efecto.** DSSI tiene dos formas de correr un sinte y
+  choz sólo miraba `run_synth`; FluidSynth-DSSI exporta `run_multiple_synths`
+  porque comparte un motor entre instancias. Se listaba con
+  `is_instrument = false` y no se podía cargar. Ahora vale cualquiera de las
+  dos, con un grupo de una sola instancia.
+- **Y sin SoundFont no suena.** `configure` es cómo DSSI dice lo que no es un
+  parámetro, y no estaba implementado. Ahora un SF2 elegido con "Open SF2…"
+  sobre un tab DSSI **no reemplaza el instrumento**: le manda `load=<ruta>`, y
+  aparecen sus 189 programas. Los pares se guardan en el proyecto
+  (`instrument.config`) y se reaplican al reabrirlo. Se mandan al construir, que
+  es el único momento seguro: `configure` abre archivos y una vez en el slot la
+  instancia es del callback de audio.
+
+De paso: WhySynth sonaba en silencio simplemente porque no tenía ningún
+programa seleccionado.
+
+Y una limitación que esto destapó: **FluidSynth-DSSI no se puede instanciar dos
+veces en un proceso**. Arrastra libinstpatch, cuyo registro de tipos de GLib no
+sobrevive a que se destruya la primera instancia, y la segunda construcción
+segfaultea (`cannot register existing type 'IpatchConverter'` justo antes).
+`choz-plugin-ladspa` ahora mantiene las bibliotecas mapeadas para la vida del
+proceso —calcado de `choz-plugin-lv2`, que tuvo el mismo problema con los
+plugins Qt— y eso arregla la parte de recargar el binario; **quitar el plugin de
+un tab y volver a cargarlo sigue siendo el mismo camino**, y la sonda de
+cuarentena no lo detecta porque instancia una sola vez. Queda anotado en los
+gotchas del roadmap.
+
+### Un CC ahora sabe de qué controlador vino
+
+Con dos teclados en el escenario los dos mandan CC 1, y una asignación de MIDI
+learn era `(CC, destino)`: el mod wheel de uno movía lo que se había asignado
+con el otro. Ahora es **`(fuente, CC, destino)`**, con la misma regla que ya
+seguían las notas: cada controlador maneja las tabs asignadas a él, esté en
+pantalla la que esté, y **sólo cuando varias tabs comparten un puerto** decide
+la tab activa (antes que ella, un canal reclamado). Dos asignaciones pueden
+compartir un CC si mueven tabs distintas o unidades de FX distintas. Las
+asignaciones guardadas antes de esto no tienen fuente y siguen respondiendo a
+cualquiera: hay que volver a aprenderlas para que se separen por teclado.
+
+### Guardar proyectos, completo
+
+Antes "Save project…" sólo pedía carpeta, escribía siempre `choz-project.yml` y
+**pisaba lo que hubiera sin avisar**, con el resultado en un `eprintln!` que en
+una TUI no ve nadie.
+
+- Se pide el nombre, con caret y edición en su sitio.
+- Si el archivo existe, la confirmación es **un modal de verdad** con dos filas,
+  y el cursor arranca en "renombrar": dos Enter seguidos no pisan el set de
+  nadie.
+- **File → Save project** reescribe el archivo del que vino el proyecto sin
+  preguntar; **Save project as…** siempre pregunta, arrancando en la carpeta y
+  el nombre del proyecto actual. Abrir un proyecto también apunta ahí.
+
+### El SF2 saturaba
+
+`Sf2Synth` fijaba `gain: 1.0` en oxisynth, cuyo default (y el de FluidSynth) es
+**0.2** — cinco veces de más, +14 dB. Medido con DSoundFontV4 y el preset 010
+(music box): una nota sola picaba 0.545 y **un acorde de cuatro ya pasaba de
+1.0** (1.148); con las dos manos, 2.693. No hay limiter en el camino: el mixer
+suma, la cadena procesa y la placa recorta duro. Por eso "satura y pierde
+definición" justo después de tocar un rato, cuando el sustain acumula voces.
+Corregido a 0.2, con test de regresión que falla con el valor viejo. Suena más
+bajo: se sube con el VOL del slot, que sí tiene fader — el clipping dentro del
+synth no se deshace después.
+
+También: los SoundFonts tienen ahora dos interruptores en el editor de
+instrumento (`p`) para la reverb y el chorus **internos de oxisynth**, que
+vienen activos por defecto y se suman a los de la cadena. Se aplican con
+`set_gen(ReverbSend/ChorusSend, -1000)` — 932 ns, RT-safe — y **no** con
+`set_chorus_params(level: 0)`, que cronometré en **4.3 ms** porque reconstruye
+la tabla de modulación del chorus: un xrun garantizado en cada toque.
+
+---
+
 ### 2026-08-16 (ter) — CI decía la verdad: el paquete es `libpd-dev`
 
 #### Corregido
@@ -2851,7 +2968,7 @@ Cierra el punto 1 de Pendiente: el mecanismo estaba hecho la sesión anterior, f
 
 ## Estado actual
 
-- **211 tests** con harness + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **563 tests** con harness + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio.
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
 - `cargo test --workspace` completa entero, sin `--no-fail-fast`.

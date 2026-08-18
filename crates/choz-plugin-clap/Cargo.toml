@@ -13,7 +13,7 @@ clack-host = "0.1.0"
 clap-sys = "0.5"
 # audio-ports: needed to match a plugin's real channel counts (mono plugins
 # reject a hardcoded stereo layout).
-clack-extensions = { version = "0.1.0", features = ["audio-ports", "params", "gui", "timer", "clack-host"] }
+clack-extensions = { version = "0.1.0", features = ["audio-ports", "params", "gui", "timer", "preset-discovery", "clack-host"] }
 
 [dev-dependencies]
 # Only for examples/gui_probe: a real window to parent the GUIs into.

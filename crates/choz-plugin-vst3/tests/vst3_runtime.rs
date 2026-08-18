@@ -13,7 +13,15 @@ const BLOCK: u32 = 256;
 
 #[test]
 fn installed_vst3_plugins_scan_host_and_sound() {
-    let found = scan_directory(std::path::Path::new("/usr/lib/vst3"));
+    // Both places choz itself looks: the system bundles and the user's own
+    // (`~/.vst3`), because which of the two ships the interesting plugin is an
+    // accident of how it was installed.
+    let mut found = scan_directory(std::path::Path::new("/usr/lib/vst3"));
+    if let Some(home) = std::env::var_os("HOME") {
+        found.extend(scan_directory(
+            &std::path::PathBuf::from(home).join(".vst3"),
+        ));
+    }
     if found.is_empty() {
         eprintln!("no VST3 plugins installed; skipping");
         return;
@@ -135,6 +143,62 @@ fn installed_vst3_plugins_scan_host_and_sound() {
         assert!(peak > 1e-4, "{} made no sound on note-on", info.name);
         hosted += 1;
         break;
+    }
+
+    // Program lists, where a plugin has them: named programs, and picking one
+    // changes what comes out. VST3 selects a program through the parameter
+    // flagged `kIsProgramChange`, so this also proves that change reaches the
+    // processor and not just the controller.
+    let mut with_programs = 0;
+    for info in found.iter().filter(|p| p.is_instrument) {
+        let Some(mut inst) = Vst3Instrument::build(&info.path, SR, BLOCK) else {
+            continue;
+        };
+        let Some(browser) = inst.presets() else {
+            continue;
+        };
+        let list = browser.list();
+        assert!(!list.is_empty(), "{} offers an empty browser", info.name);
+        for p in list.iter().take(20) {
+            assert!(!p.name.is_empty(), "{}: a program with no name", info.name);
+            assert!(!p.key.is_empty(), "{}: a program with no key", info.name);
+        }
+        if list.len() < 2 {
+            continue;
+        }
+
+        let render = |inst: &mut Vst3Instrument| {
+            inst.note_on(60, 100);
+            let mut captured = Vec::new();
+            for _ in 0..40 {
+                let mut buf = vec![0.0f32; BLOCK as usize * 2];
+                inst.render(&mut buf, SR);
+                captured.extend_from_slice(&buf);
+            }
+            inst.note_off(60);
+            for _ in 0..40 {
+                let mut buf = vec![0.0f32; BLOCK as usize * 2];
+                inst.render(&mut buf, SR);
+            }
+            captured
+        };
+        browser.load(&list[0].key);
+        let first = render(&mut inst);
+        browser.load(&list[list.len() / 2].key);
+        let other = render(&mut inst);
+        assert_ne!(
+            first, other,
+            "{}: two programs render identical audio",
+            info.name
+        );
+
+        // A key that names no program of ours is ignored, not fatal.
+        browser.load("not-a-program");
+        with_programs += 1;
+        break;
+    }
+    if with_programs == 0 {
+        eprintln!("no installed VST3 instrument publishes program lists; that half was skipped");
     }
 
     assert!(
