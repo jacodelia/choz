@@ -88,7 +88,12 @@ Orden de trabajo. Cada fase deja algo usable; ninguna necesita a la siguiente.
   VST2 de `~/repo/TyrellN6-16976` declara **un** programa: u-he navega sus
   presets por su cuenta en VST2, y sólo en VST3 expone los 128.
   El test se corre con `CHOZ_VST2_DIR="/home/jorge/repo/Pianoteq 9/x86-64bit/Pianoteq 9.lv2"`
-  y se salta solo si no encuentra ninguno. **Cómo se verifica, y por qué así**:
+  y se salta solo si no encuentra ninguno. **Ojo con esa variable**: Pianoteq
+  sin licencia carga, acepta notas y renderiza silencio, así que el test viejo
+  de parámetros —que exige que alguno mueva el sonido— lo saltea en vez de
+  fallar. Y la suite de VST2 lleva desde hoy el mismo lock de plugin que las
+  demás: dos tests instanciando los Zam a la vez los hacía fallar su propia
+  aserción (`bufferSize != 0`) y llevarse el binario entero. **Cómo se verifica, y por qué así**:
   con `effGetProgram`, no con el audio — Pianoteq sin licencia no suena y no
   cambia su chunk, y aun así cambia de programa correctamente. Ese fue el
   motivo de agregar `PluginPresets::current()`, que además hace que el selector

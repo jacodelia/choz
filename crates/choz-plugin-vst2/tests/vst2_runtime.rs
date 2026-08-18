@@ -7,6 +7,19 @@ use choz_ports::{AudioSource, FxProcessor};
 const SR: u32 = 48_000;
 const BLOCK: u32 = 256;
 
+/// Serialises every test that dlopens a plugin.
+///
+/// The harness runs test *functions* in parallel and both of these load the
+/// same shared objects. The DPF-based Zam plugins assert on their own
+/// half-initialised state when two threads instantiate them at once
+/// (`assertion failure: "bufferSize != 0"`, then a SIGSEGV that takes the whole
+/// binary down) — the LV2, CLAP, VST3 and DSSI suites all carry this lock for
+/// the same reason. This one only grew a second test today.
+fn plugin_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn installed() -> Vec<Vst2PluginInfo> {
     let mut found = scan_directory(std::path::Path::new("/usr/lib/vst"));
     // The stock directory holds only effects on most machines. `CHOZ_VST2_DIR`
@@ -35,6 +48,7 @@ fn sine_block(frames: usize) -> Vec<f32> {
 /// parallel — so all the plugin work lives in this single function.
 #[test]
 fn installed_vst2_plugins_scan_host_and_expose_params() {
+    let _guard = plugin_lock();
     let found = installed();
     if found.is_empty() {
         eprintln!("no VST2 plugins installed; skipping");
@@ -71,7 +85,12 @@ fn installed_vst2_plugins_scan_host_and_expose_params() {
             peak
         };
         inst.note_on(60, 100);
-        let _ = render(&mut inst);
+        // A plugin that makes no sound of its own cannot demonstrate anything
+        // about its parameters. Pianoteq without a licence is exactly this: it
+        // loads, it accepts notes and it renders silence. Try the next one.
+        if render(&mut inst) <= 1e-4 {
+            continue;
+        }
         // Sweep a few parameters; at least one has to move the sound, or choz
         // cannot control this plugin at all.
         let mut changed = false;
@@ -184,6 +203,7 @@ fn installed_vst2_plugins_scan_host_and_expose_params() {
 /// most effects, and both u-he synths (they browse their own presets instead).
 #[test]
 fn vst2_programs_are_listed_and_selected() {
+    let _guard = plugin_lock();
     let found = installed();
     if found.is_empty() {
         eprintln!("no VST2 plugins installed; skipping");
