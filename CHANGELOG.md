@@ -177,6 +177,28 @@ la tabla de modulación del chorus: un xrun garantizado en cada toque.
 
 ---
 
+## [1.2.1] — 2026-08-17
+
+Sólo tests: el binario es el mismo que la 1.2.0. Lo que arregla son dos
+fallos que ninguna corrida por crate mostraba y que sólo aparecían al correr
+`cargo test --workspace` entero.
+
+- **`vst2_runtime` se llevaba el binario entero con un SIGSEGV**, de forma
+  intermitente, desde que la suite tiene un segundo test. El harness corre las
+  funciones de test en paralelo y las dos abren los mismos Zam, que están
+  hechos con DPF y fallan su propia aserción (`bufferSize != 0`) cuando dos
+  hilos los instancian a la vez. Lleva ahora el mismo lock que las suites de
+  LV2, CLAP, VST3 y DSSI.
+- **Con `CHOZ_VST2_DIR` apuntando a Pianoteq** —que es como se corre el test
+  nuevo de programas— fallaba el test viejo de parámetros: Pianoteq sin
+  licencia carga, acepta notas y renderiza silencio, así que ningún parámetro
+  puede demostrar que mueve el sonido. Un plugin que no suena no demuestra nada
+  sobre sus parámetros: se saltea, no se falla.
+
+563 tests, `clippy --workspace --all-targets` limpio.
+
+---
+
 ### 2026-08-16 (ter) — CI decía la verdad: el paquete es `libpd-dev`
 
 #### Corregido
