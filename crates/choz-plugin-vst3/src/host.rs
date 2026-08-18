@@ -485,6 +485,14 @@ pub struct StateCell {
     _lib: Arc<Library>,
 }
 
+impl StateCell {
+    /// The controller, for whoever else needs it — the preset browser reads its
+    /// program lists through the same cell the state does.
+    pub fn controller(&self) -> Option<&ComPtr<IEditController>> {
+        self.controller.as_ref()
+    }
+}
+
 // SAFETY: only touched under the mutex, from the UI thread, while the instance
 // is alive — which is exactly what `Some` marks.
 unsafe impl Send for StateCell {}
@@ -1082,6 +1090,12 @@ impl Vst3RealInstance {
     }
 
     /// The plugin's own state blob: its patch, not just its parameter values.
+    /// The plugin's program lists, when it has any and a way to select them.
+    pub fn presets(&self) -> Option<choz_ports::PresetsHandle> {
+        crate::presets::Vst3Presets::new(Arc::clone(&self.shared_state), self.edits.clone())
+            .map(|p| Arc::new(p) as choz_ports::PresetsHandle)
+    }
+
     pub fn state(&self) -> Option<choz_ports::StateHandle> {
         Some(Arc::new(Vst3State {
             shared: Arc::clone(&self.shared_state),
@@ -1430,7 +1444,7 @@ fn c_arr_to_string(buf: &[char8]) -> String {
 }
 
 /// Convert a fixed UTF-16 `TChar` array (VST3 String128) to a Rust String.
-fn w_arr_to_string(buf: &[TChar]) -> String {
+pub fn w_arr_to_string(buf: &[TChar]) -> String {
     let units: Vec<u16> = buf.iter().copied().take_while(|&c| c != 0).collect();
     String::from_utf16_lossy(&units).trim().to_string()
 }

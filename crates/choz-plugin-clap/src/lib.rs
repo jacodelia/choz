@@ -34,6 +34,7 @@ pub fn read_params(path: &Path, plugin_id: &str) -> Vec<PluginParam> {
 
 pub mod editor;
 pub mod host;
+pub mod presets;
 pub mod state;
 
 /// Scan a directory tree for `.clap` plugins.

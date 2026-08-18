@@ -310,6 +310,10 @@ pub struct AudioEngine {
     states: Vec<Option<choz_ports::StateHandle>>,
     /// Same, per FX: `fx_states[slot][fx]`.
     fx_states: Vec<Vec<Option<choz_ports::StateHandle>>>,
+    /// Each slot's instrument preset browser, when the plugin has one. Same
+    /// capture moment, same reason: listing and loading a preset are main-thread
+    /// work that the RT copy of the source can no longer be asked for.
+    presets: Vec<Option<choz_ports::PresetsHandle>>,
     /// What each slot's instrument reports when the user moves one of its knobs
     /// **inside the plugin's own window**. Same capture moment as the editor.
     touches: Vec<Option<choz_ports::TouchHandle>>,
@@ -546,6 +550,7 @@ impl AudioEngine {
             fx_touches: Vec::new(),
             states: Vec::new(),
             fx_states: Vec::new(),
+            presets: Vec::new(),
             sandboxes: Vec::new(),
             fx_sandboxes: Vec::new(),
             fx_meters: Vec::new(),
@@ -755,6 +760,7 @@ impl AudioEngine {
         self.fx_touches.clear();
         self.states.clear();
         self.fx_states.clear();
+        self.presets.clear();
         self.sandboxes.clear();
         self.fx_sandboxes.clear();
         self.fx_meters.clear();
@@ -1028,6 +1034,7 @@ impl AudioEngine {
         self.fx_touches.clear();
         self.states.clear();
         self.fx_states.clear();
+        self.presets.clear();
         self.sandboxes.clear();
         self.fx_sandboxes.clear();
         self.fx_meters.clear();
@@ -1146,6 +1153,33 @@ impl AudioEngine {
         }
     }
 
+    /// Everything slot `slot`'s instrument offers in its own preset browser.
+    /// Empty for a SoundFont (its programs are the engine's own business), for
+    /// an effect, and for any plugin whose format cannot report presets.
+    pub fn slot_presets(&self, slot: usize) -> Vec<choz_ports::PresetEntry> {
+        match self.presets.get(slot) {
+            Some(Some(h)) => h.list(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The key of the preset slot `slot`'s instrument says it is on, when its
+    /// format can be asked. `None` otherwise — most of them.
+    pub fn slot_current_preset(&self, slot: usize) -> Option<String> {
+        match self.presets.get(slot) {
+            Some(Some(h)) => h.current(),
+            _ => None,
+        }
+    }
+
+    /// Load one of them, by the key [`Self::slot_presets`] handed out. Runs on
+    /// the calling (UI) thread: every format allocates or reads files here.
+    pub fn load_slot_preset(&self, slot: usize, key: &str) {
+        if let Some(Some(h)) = self.presets.get(slot) {
+            h.load(key);
+        }
+    }
+
     /// Same for an effect in the slot's chain.
     pub fn fx_state(&self, slot: usize, fx: usize) -> Option<Vec<u8>> {
         self.fx_states.get(slot)?.get(fx)?.as_ref()?.save()
@@ -1218,6 +1252,7 @@ impl AudioEngine {
         self.editors.push(source.editor());
         self.touches.push(source.param_touch());
         self.states.push(source.state());
+        self.presets.push(source.presets());
         self.sandboxes.push(source.sandbox());
         self.fx_editors.push(Vec::new());
         self.fx_touches.push(Vec::new());
@@ -1241,6 +1276,7 @@ impl AudioEngine {
             self.fx_touches.remove(slot);
             self.states.remove(slot);
             self.fx_states.remove(slot);
+            self.presets.remove(slot);
             self.sandboxes.remove(slot);
             self.fx_sandboxes.remove(slot);
             self.fx_meters.remove(slot);
@@ -1370,6 +1406,7 @@ impl AudioEngine {
         self.editors[slot] = source.editor();
         self.touches[slot] = source.param_touch();
         self.states[slot] = source.state();
+        self.presets[slot] = source.presets();
         self.sandboxes[slot] = source.sandbox();
         self.send(EngineCommand::SetSlotSource { slot, source });
     }
@@ -1505,6 +1542,43 @@ impl AudioEngine {
             }
             _ => anyhow::bail!("{} hosting is not implemented yet", format.label()),
         }
+    }
+
+    /// Load a DSSI synth with its `configure` settings applied **before** it
+    /// reaches the audio thread.
+    ///
+    /// `configure` is how DSSI carries everything that is not a parameter — the
+    /// SoundFont FluidSynth-DSSI needs to make any sound at all, the patch file
+    /// hexter and WhySynth read. It is not RT-safe (it opens files), and once a
+    /// source is in a slot the audio thread owns it, so the only safe moment is
+    /// this one: build, configure, hand over.
+    ///
+    /// With an empty `config` this is exactly [`Self::load_plugin`], sandbox and
+    /// all. With settings to send it builds in-process, because the sandbox
+    /// bridge has no message for `configure` yet.
+    pub fn load_dssi(
+        &mut self,
+        slot: usize,
+        path: &std::path::Path,
+        id: &str,
+        config: &[(String, String)],
+    ) -> Result<()> {
+        if config.is_empty() {
+            return self.load_plugin(slot, crate::PluginFormat::Dssi, path, id);
+        }
+        refuse_if_quarantined(crate::PluginFormat::Dssi, path, id)?;
+        let mut inst =
+            choz_plugin_ladspa::DssiInstrument::build(path, id, self.sample_rate, self.buffer_size)
+                .ok_or_else(|| anyhow::anyhow!("DSSI {id} would not load"))?;
+        for (key, value) in config {
+            if let Some(complaint) = inst.configure(key, value) {
+                // The plugin refusing one key is not a reason to lose the
+                // instrument: it says so and the rest still applies.
+                eprintln!("choz: DSSI {id} rejected {key}={value}: {complaint}");
+            }
+        }
+        self.set_slot_source(slot, Box::new(inst));
+        Ok(())
     }
 
     /// Instantiate a plugin instrument off the RT thread, at this engine's
@@ -2874,6 +2948,79 @@ mod tests {
         );
     }
 
+    /// The instrument's preset browser has to survive the trip: the handle is
+    /// captured when the source is added **and** when one replaces another, and
+    /// the UI reaches the real plugin through it. Without the second capture a
+    /// tab that changed instrument would list the old one's patches.
+    #[test]
+    fn a_slots_preset_browser_follows_the_instrument_in_it() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Browser {
+            name: &'static str,
+            loaded: Mutex<Vec<String>>,
+        }
+        impl choz_ports::PluginPresets for Browser {
+            fn list(&self) -> Vec<choz_ports::PresetEntry> {
+                vec![choz_ports::PresetEntry {
+                    name: self.name.to_string(),
+                    category: "Keys".to_string(),
+                    key: format!("{}-key", self.name),
+                }]
+            }
+            fn load(&self, key: &str) {
+                self.loaded.lock().unwrap().push(key.to_string());
+            }
+        }
+
+        struct Synth(Arc<Browser>);
+        impl AudioSource for Synth {
+            fn render(&mut self, out: &mut [f32], _sr: u32) -> usize {
+                out.fill(0.0);
+                out.len() / 2
+            }
+            fn presets(&self) -> Option<choz_ports::PresetsHandle> {
+                Some(self.0.clone())
+            }
+        }
+
+        let mut engine = AudioEngine::new(48_000, 256);
+        let first = Arc::new(Browser {
+            name: "first",
+            ..Default::default()
+        });
+        let slot = engine.add_slot(Box::new(Synth(first.clone()))).unwrap();
+
+        let listed = engine.slot_presets(slot);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "first");
+        assert_eq!(listed[0].category, "Keys");
+
+        engine.load_slot_preset(slot, &listed[0].key);
+        assert_eq!(first.loaded.lock().unwrap().as_slice(), ["first-key"]);
+
+        // Another instrument in the same tab: the old browser is gone, and
+        // loading goes to the new one.
+        let second = Arc::new(Browser {
+            name: "second",
+            ..Default::default()
+        });
+        engine.set_slot_source(slot, Box::new(Synth(second.clone())));
+        let listed = engine.slot_presets(slot);
+        assert_eq!(listed[0].name, "second");
+        engine.load_slot_preset(slot, &listed[0].key);
+        assert_eq!(second.loaded.lock().unwrap().len(), 1);
+        assert_eq!(first.loaded.lock().unwrap().len(), 1, "the old one is idle");
+
+        // A source with no browser of its own says so, and so does a tab that
+        // does not exist.
+        let silent = engine.add_silent().unwrap();
+        assert!(engine.slot_presets(silent).is_empty());
+        assert!(engine.slot_presets(99).is_empty());
+        engine.load_slot_preset(99, "nowhere");
+    }
+
     /// **The whole path a live microphone takes**: capture buffers → the tab's
     /// FX chain → the mix.
     ///
@@ -3006,7 +3153,10 @@ mod tests {
         };
 
         let unity = heard(1.0);
-        assert!((unity - 0.25).abs() < 1e-5, "unity trim is the input: {unity}");
+        assert!(
+            (unity - 0.25).abs() < 1e-5,
+            "unity trim is the input: {unity}"
+        );
         for trim in [2.0f32, 6.0] {
             let loud = heard(trim);
             assert!(

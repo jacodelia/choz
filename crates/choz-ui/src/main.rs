@@ -77,6 +77,19 @@ impl InputRef {
     }
 }
 
+/// One MIDI-learn assignment: which controller, which CC, what it moves.
+///
+/// **The controller is part of the binding.** Two keyboards on stage both send
+/// CC 1; without the source, the KeyStep's mod wheel would drive whatever the
+/// Keystation's was assigned to. `None` means "any source" — what a binding
+/// learned before this existed says, and what the QWERTY piano and OSC use.
+#[derive(Clone, Debug, PartialEq)]
+struct CcBinding {
+    source: Option<InputRef>,
+    cc: u8,
+    target: LearnTarget,
+}
+
 #[derive(Clone)]
 struct RackSlot {
     /// MIDI channel this tab answers, 1..16 — **or 0, meaning any**.
@@ -122,6 +135,13 @@ struct RackSlot {
     /// them. Empty for every other source kind.
     presets: Vec<sources::Sf2Preset>,
     preset_cursor: usize,
+    /// DSSI instruments only: the `configure` key/values this tab was given.
+    /// Applied when the plugin is built — see [`choz_engine::AudioEngine::load_dssi`].
+    dssi_config: Vec<(String, String)>,
+    /// Plugin-instrument slots only: the patches the plugin publishes through
+    /// its own browser. Shares `preset_cursor` with the SoundFont list — a tab
+    /// has one instrument, so only one of the two is ever populated.
+    plugin_presets: Vec<choz_engine::PresetEntry>,
     /// Plugin-instrument slots only: what the plugin exposes, and the current
     /// knob positions (0..1, same order). Empty for every other source kind.
     instr_params: Vec<choz_engine::PluginParam>,
@@ -161,6 +181,8 @@ impl RackSlot {
             in_pair: None,
             presets: Vec::new(),
             preset_cursor: 0,
+            dssi_config: Vec::new(),
+            plugin_presets: Vec::new(),
             instr_params: Vec::new(),
             instr_values: Vec::new(),
             instr_state: Vec::new(),
@@ -511,6 +533,18 @@ pub enum LearnTarget {
     Trigger(TriggerAction),
 }
 
+/// The rack tab a target moves, or `None` for the rack-wide buttons.
+fn target_slot(t: &LearnTarget) -> Option<usize> {
+    match *t {
+        LearnTarget::Gain(s)
+        | LearnTarget::Pan(s)
+        | LearnTarget::InGain(s)
+        | LearnTarget::InGate(s) => Some(s),
+        LearnTarget::FxParam { slot, .. } | LearnTarget::InstrParam { slot, .. } => Some(slot),
+        LearnTarget::Trigger(_) => None,
+    }
+}
+
 /// The FX unit a target belongs to, or `None` for rack-wide controls. Two
 /// bindings on the same CC may coexist only when they live in different units.
 fn fx_scope(t: &LearnTarget) -> Option<(usize, usize)> {
@@ -571,36 +605,27 @@ impl TriggerAction {
     }
 }
 
-/// A directory being typed in the Plugin paths modal. `dir` is the index of the
-/// row being rewritten, or `None` when it's a brand new entry.
-#[derive(Debug, Clone)]
-struct PathEdit {
-    fmt: choz_engine::PluginFormat,
-    dir: Option<usize>,
+/// One line of text being typed in a modal: the buffer and where the caret is.
+/// Shared by the Plugin paths editor and the SAVE PROJECT name prompt.
+#[derive(Debug, Clone, Default)]
+struct TextEdit {
     buf: String,
     /// Caret position, in characters.
     cursor: usize,
 }
 
-impl PathEdit {
-    fn new(fmt: choz_engine::PluginFormat, dir: Option<usize>, buf: String) -> Self {
+impl TextEdit {
+    fn new(buf: String) -> Self {
         let cursor = buf.chars().count();
-        Self {
-            fmt,
-            dir,
-            buf,
-            cursor,
-        }
+        Self { buf, cursor }
     }
 
-    /// The line the modal shows while editing, with a caret at the cursor and
-    /// the format the path is being filed under (getting that wrong is the easy
-    /// mistake: an SF2 folder under SFZ finds nothing).
-    fn display(&self) -> String {
+    /// The buffer with a block caret drawn at the cursor.
+    fn caret(&self) -> String {
         let mut out: String = self.buf.chars().take(self.cursor).collect();
         out.push('\u{2588}');
         out.extend(self.buf.chars().skip(self.cursor));
-        format!("    \u{270E} [{}] {out}", self.fmt.label())
+        out
     }
 
     /// Apply a key to the buffer. Returns `Some(commit)` when the edit ends.
@@ -641,6 +666,86 @@ impl PathEdit {
             _ => {}
         }
         None
+    }
+}
+
+/// A directory being typed in the Plugin paths modal. `dir` is the index of the
+/// row being rewritten, or `None` when it's a brand new entry.
+#[derive(Debug, Clone)]
+struct PathEdit {
+    fmt: choz_engine::PluginFormat,
+    dir: Option<usize>,
+    text: TextEdit,
+}
+
+impl PathEdit {
+    fn new(fmt: choz_engine::PluginFormat, dir: Option<usize>, buf: String) -> Self {
+        Self {
+            fmt,
+            dir,
+            text: TextEdit::new(buf),
+        }
+    }
+
+    /// The line the modal shows while editing, with a caret at the cursor and
+    /// the format the path is being filed under (getting that wrong is the easy
+    /// mistake: an SF2 folder under SFZ finds nothing).
+    fn display(&self) -> String {
+        format!("    \u{270E} [{}] {}", self.fmt.label(), self.text.caret())
+    }
+}
+
+/// The file name being typed once SAVE PROJECT has a directory. Overwriting is
+/// a separate keypress: a project is somebody's whole set, and the browser
+/// picking a folder is not consent to replace what is already in it.
+struct SaveName {
+    dir: std::path::PathBuf,
+    text: TextEdit,
+    /// The target already exists and Enter is now the confirmation.
+    confirm: bool,
+    /// Why the last save failed, kept on screen instead of dying in stderr.
+    error: Option<String>,
+}
+
+impl SaveName {
+    /// `name` is what the prompt starts with — the project's own file name when
+    /// it has one, so Save as suggests overwriting itself rather than a name
+    /// nobody chose.
+    fn new(dir: std::path::PathBuf, name: String) -> Self {
+        Self {
+            dir,
+            text: TextEdit::new(name),
+            confirm: false,
+            error: None,
+        }
+    }
+
+    /// Where Enter would write. A bare name gets `.yml` so the browser (and
+    /// `Project::load`) still recognises it.
+    fn target(&self) -> std::path::PathBuf {
+        let mut name = self.text.buf.trim().to_string();
+        if !name.contains('.') {
+            name.push_str(".yml");
+        }
+        self.dir.join(name)
+    }
+
+    /// The modal's note line: the prompt, the overwrite question, or the error.
+    fn note(&self) -> String {
+        if let Some(e) = &self.error {
+            return format!("  \u{26A0} {e}  \u{00B7}  Enter=retry  Esc=cancel");
+        }
+        if self.confirm {
+            return format!(
+                "  \u{26A0} {} \u{00B7} \u{2191}\u{2193} then Enter  \u{00B7}  Esc=rename",
+                self.target().display()
+            );
+        }
+        format!(
+            "  name: {}  \u{00B7}  in {}  \u{00B7}  Enter=save  Esc=back",
+            self.text.caret(),
+            self.dir.display()
+        )
     }
 }
 
@@ -828,6 +933,11 @@ struct App {
     paths_format: Option<choz_engine::PluginFormat>,
     /// In-place path editor of the Plugin paths section.
     path_edit: Option<PathEdit>,
+    /// The SAVE PROJECT name prompt, once a directory has been picked.
+    save_name: Option<SaveName>,
+    /// The file this project was last saved to or loaded from — what plain
+    /// "Save project" rewrites without asking anything.
+    project_file: Option<std::path::PathBuf>,
     /// In-place numeric editor for an OSC port.
     port_edit: Option<PortEdit>,
     /// Set when the search paths changed, so closing the modal rescans.
@@ -861,7 +971,7 @@ struct App {
     /// Last known mouse position, only tracked while `learn_pick` is on.
     mouse: (u16, u16),
     /// MIDI-learn bindings: CC number -> the rack control it drives.
-    cc_bindings: Vec<(u8, LearnTarget)>,
+    cc_bindings: Vec<CcBinding>,
     /// Same, for controller buttons that send program change: program number ->
     /// the rack button it presses.
     pc_bindings: Vec<(u8, LearnTarget)>,
@@ -950,6 +1060,8 @@ impl App {
             ui: settings::UiSettings::load(),
             paths_format: None,
             path_edit: None,
+            save_name: None,
+            project_file: None,
             port_edit: None,
             paths_dirty: false,
             load_rack_only: false,
@@ -1633,19 +1745,48 @@ impl App {
         };
     }
 
-    /// SF2 bank/preset picker for the active tab (RACK's `[BANK/PRESET]`).
+    /// Bank/preset picker for the active tab (RACK's `[BANK/PRESET]`): a
+    /// SoundFont's programs, or the plugin instrument's own patches.
     fn open_preset_modal(&mut self) {
         let Some(slot) = self.slots.get(self.active_slot) else {
             return;
         };
-        if slot.presets.is_empty() {
-            eprintln!("choz: the active tab has no SoundFont");
+        if slot.presets.is_empty() && slot.plugin_presets.is_empty() {
+            eprintln!("choz: the active tab's instrument has no presets to pick");
             return;
         }
-        let mut modal = Modal::new(
-            ModalKind::Preset,
-            views::modal::ListModal::new("BANK / PRESET", Vec::new()),
-        );
+        // Where the plugin says it is, when it can be asked: opening the picker
+        // on row 0 while the plugin plays program 12 is a lie the user has to
+        // undo before it is useful.
+        let at = self
+            .audio_engine
+            .as_ref()
+            .and_then(|e| e.slot_current_preset(self.active_slot))
+            .and_then(|key| {
+                self.slots
+                    .get(self.active_slot)?
+                    .plugin_presets
+                    .iter()
+                    .position(|p| p.key == key)
+            });
+        if let (Some(at), Some(slot)) = (at, self.slots.get_mut(self.active_slot)) {
+            slot.preset_cursor = at;
+        }
+        let slot = match self.slots.get(self.active_slot) {
+            Some(s) => s,
+            None => return,
+        };
+        let banks = self.preset_banks(self.active_slot);
+        let mut list = views::modal::ListModal::new("BANK / PRESET", Vec::new());
+        if !banks.is_empty() {
+            // Tab cycles these; the first one is the whole list, so a plugin
+            // with thousands of patches still opens on something familiar.
+            let mut chips = vec![i18n::t("ALL BANKS").to_string()];
+            chips.extend(banks.iter().cloned());
+            list.filters = chips;
+            list.note = "  Tab = bank".to_string();
+        }
+        let mut modal = Modal::new(ModalKind::Preset, list);
         modal.list.cursor = slot.preset_cursor;
         self.modal = Some(modal);
         self.refresh_modal();
@@ -1816,6 +1957,54 @@ impl App {
 
     /// Re-instantiate the active tab's plugin instrument, keeping its knobs.
     /// Used when something about *how* it is hosted changed.
+    /// Whether the active tab plays a DSSI plugin.
+    fn active_is_dssi(&self) -> bool {
+        self.plugin_ref(None)
+            .is_some_and(|(format, _, _)| format == choz_engine::PluginFormat::Dssi)
+    }
+
+    /// Store one DSSI `configure` setting for the active tab and rebuild the
+    /// instrument with it. Rebuilt rather than sent live because `configure` is
+    /// not RT-safe and the audio thread owns the instance — see
+    /// [`choz_engine::AudioEngine::load_dssi`].
+    fn set_dssi_config(&mut self, key: &str, value: &str) {
+        let slot = self.active_slot;
+        if let Some(s) = self.slots.get_mut(slot) {
+            s.dssi_config.retain(|(k, _)| k != key);
+            s.dssi_config.push((key.to_string(), value.to_string()));
+        }
+        self.reload_instrument();
+        // The plugin's programs come *from* what it was just configured with:
+        // FluidSynth-DSSI has none until it has a SoundFont, and then it has
+        // that SoundFont's.
+        let presets = match self.audio_engine.as_ref() {
+            Some(engine) => engine.slot_presets(slot),
+            None => Vec::new(),
+        };
+        if let Some(s) = self.slots.get_mut(slot) {
+            s.plugin_presets = presets;
+            s.preset_cursor = 0;
+        }
+    }
+
+    /// Load a plugin instrument into `slot`, sending a DSSI synth its stored
+    /// `configure` settings on the way in — the only moment they can be sent,
+    /// and what a FluidSynth-DSSI tab needs to come back with its SoundFont.
+    fn load_plugin_into(
+        engine: &mut choz_engine::AudioEngine,
+        slot: usize,
+        format: choz_engine::PluginFormat,
+        path: &std::path::Path,
+        id: &str,
+        config: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        if format == choz_engine::PluginFormat::Dssi {
+            engine.load_dssi(slot, path, id, config)
+        } else {
+            engine.load_plugin(slot, format, path, id)
+        }
+    }
+
     fn reload_instrument(&mut self) {
         let Some((format, path, id)) = self.plugin_ref(None) else {
             return;
@@ -1826,10 +2015,15 @@ impl App {
             .get(slot)
             .map(|s| s.instr_values.clone())
             .unwrap_or_default();
+        let config = self
+            .slots
+            .get(slot)
+            .map(|s| s.dssi_config.clone())
+            .unwrap_or_default();
         let Some(ref mut engine) = self.audio_engine else {
             return;
         };
-        if let Err(e) = engine.load_plugin(slot, format, &path, &id) {
+        if let Err(e) = Self::load_plugin_into(engine, slot, format, &path, &id, &config) {
             eprintln!("choz: reloading {}: {e}", path.display());
             return;
         }
@@ -2303,7 +2497,8 @@ impl App {
         }
     }
 
-    /// Parameter editor for the active tab's plugin instrument.
+    /// Parameter editor for the active tab's instrument — a hosted plugin's own
+    /// parameters, or a SoundFont's built-in reverb / chorus switches.
     fn open_instr_modal(&mut self) {
         let Some(slot) = self.slots.get(self.active_slot) else {
             return;
@@ -2331,6 +2526,7 @@ impl App {
     fn close_modal(&mut self) {
         let kind = self.modal.take().map(|m| m.kind);
         self.path_edit = None;
+        self.save_name = None;
         if kind == Some(ModalKind::PluginPaths) && self.paths_dirty {
             self.paths_dirty = false;
             self.discover_synths(true);
@@ -3021,7 +3217,7 @@ impl App {
                     "  typing a {fmt} path \u{00B7} Enter=save  Esc=cancel  (empty = remove)"
                 );
             }
-            match edit.key(key) {
+            match edit.text.key(key) {
                 Some(true) => self.commit_path_edit(edit),
                 Some(false) => {}
                 None => {
@@ -3092,7 +3288,7 @@ impl App {
     /// Store a typed path: replaces the row it came from, or appends a new one.
     /// An empty buffer means "forget it" (and deletes the row when editing).
     fn commit_path_edit(&mut self, edit: PathEdit) {
-        let text = edit.buf.trim().to_string();
+        let text = edit.text.buf.trim().to_string();
         let dirs = self.plugin_paths.dirs_mut(edit.fmt);
         match (edit.dir, text.is_empty()) {
             (Some(i), true) => {
@@ -3167,10 +3363,10 @@ impl App {
                     .collect()
             }
             ModalKind::Preset => self
-                .slots
-                .get(self.active_slot)
-                .map(|s| s.presets.iter().map(|p| p.label()).collect())
-                .unwrap_or_default(),
+                .preset_rows()
+                .into_iter()
+                .map(|(_, label)| label)
+                .collect(),
             // The list was built when the modal opened and the parameter has
             // not moved since; rebuilding it here would only re-read the same
             // names.
@@ -3185,8 +3381,13 @@ impl App {
                         let bound = self
                             .cc_bindings
                             .iter()
-                            .find(|(_, b)| b == t)
-                            .map(|(cc, _)| format!("   [CC {cc}]"))
+                            .find(|b| b.target == *t)
+                            .map(|b| match &b.source {
+                                // Which keyboard it answers to, because with two
+                                // of them "CC 74" alone does not say.
+                                Some(src) => format!("   [CC {} \u{00B7} {}]", b.cc, src.name()),
+                                None => format!("   [CC {}]", b.cc),
+                            })
                             .or_else(|| {
                                 self.pc_bindings
                                     .iter()
@@ -3374,6 +3575,9 @@ impl App {
             if let Some(row) = edit_row {
                 m.list.cursor = row;
             }
+            // …unless the overwrite question is up, whose two rows own the
+            // cursor: taking the browser's back would put it on "overwrite".
+            let confirming = self.save_name.as_ref().is_some_and(|n| n.confirm);
             if let (
                 ModalKind::Browser
                 | ModalKind::AddPath
@@ -3383,7 +3587,30 @@ impl App {
             ) = (m.kind, m.browser.as_ref())
             {
                 m.list.note = format!("  {}", b.dir.display());
-                m.list.cursor = b.cursor;
+                if !confirming {
+                    m.list.cursor = b.cursor;
+                }
+            }
+            // The name prompt owns the note line while it is open, and an
+            // overwrite replaces the listing outright: a question with two
+            // answers, not a hint under a file browser nobody re-reads.
+            if let (ModalKind::SaveProject, Some(n)) = (m.kind, self.save_name.as_ref()) {
+                m.list.note = n.note();
+                if n.confirm {
+                    m.list.title = i18n::t("OVERWRITE PROJECT?").to_string();
+                    m.list.items = vec![
+                        format!(
+                            "  {} \u{2014} {}",
+                            i18n::t("OVERWRITE"),
+                            n.target().display()
+                        ),
+                        format!("  {}", i18n::t("RENAME INSTEAD")),
+                    ];
+                    m.list.cursor = m.list.cursor.min(1);
+                    m.list.scroll = 0;
+                    return;
+                }
+                m.list.title = "SAVE PROJECT".to_string();
             }
             m.list.items = items;
             let last = m.list.items.len().saturating_sub(1);
@@ -3471,8 +3698,13 @@ impl App {
                 None => false,
             },
             ModalKind::Preset => {
+                // The row is a position in the filtered view; what gets applied
+                // is the preset it points at.
+                let Some((index, _)) = self.preset_rows().into_iter().nth(i) else {
+                    return false;
+                };
                 if let Some(slot) = self.slots.get_mut(self.active_slot) {
-                    slot.preset_cursor = i;
+                    slot.preset_cursor = index;
                 }
                 self.apply_selected_preset();
                 true
@@ -3628,6 +3860,21 @@ impl App {
             // Nothing to select: it is a list of what happened.
             ModalKind::MaxReport => true,
             ModalKind::SaveProject => {
+                // While the name is being typed the list is only a backdrop:
+                // a stray click must not re-pick the directory under it. The
+                // overwrite question, though, *is* the list.
+                if let Some(n) = self.save_name.as_ref() {
+                    if n.confirm {
+                        if let Some(m) = self.modal.as_mut() {
+                            m.list.cursor = i;
+                        }
+                        self.save_name_key(KeyCode::Enter);
+                        // Answering either way leaves the modal where it is:
+                        // saved closes it already, renaming goes on typing.
+                        return false;
+                    }
+                    return false;
+                }
                 let picked = self.modal.as_mut().and_then(|m| {
                     let b = m.browser.as_mut()?;
                     b.cursor = i;
@@ -3641,9 +3888,18 @@ impl App {
                         self.refresh_modal();
                         false
                     }
+                    // Picking the directory only asks for the name; the save
+                    // itself is `save_name_key`'s Enter.
                     Some(file_browser::Action::PickFile(dir)) => {
-                        self.save_project_to(&dir);
-                        true
+                        let name = self
+                            .project_file
+                            .as_ref()
+                            .and_then(|f| f.file_name())
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| project::DEFAULT_NAME.to_string());
+                        self.save_name = Some(SaveName::new(dir, name));
+                        self.refresh_modal();
+                        false
                     }
                     None => true,
                 }
@@ -3791,6 +4047,7 @@ impl App {
                         preset: None,
                         params: Vec::new(),
                         state: String::new(),
+                        config: Vec::new(),
                     },
                     AudioSource::Sf2 { path, bank, preset } => project::Instrument {
                         kind: "sf2".into(),
@@ -3801,6 +4058,7 @@ impl App {
                         preset: Some(*preset),
                         params: Vec::new(),
                         state: String::new(),
+                        config: Vec::new(),
                     },
                     AudioSource::AudioFile { path, .. } => project::Instrument {
                         kind: "wav".into(),
@@ -3811,6 +4069,7 @@ impl App {
                         preset: None,
                         params: Vec::new(),
                         state: String::new(),
+                        config: Vec::new(),
                     },
                     AudioSource::Plugin { id, name, .. } => project::Instrument {
                         kind: "plugin".into(),
@@ -3835,6 +4094,7 @@ impl App {
                             })
                             .map(|b| project::encode_state(&b))
                             .unwrap_or_default(),
+                        config: slot.dssi_config.clone(),
                     },
                 };
                 let fx = slot
@@ -3875,7 +4135,7 @@ impl App {
                 let midi_learn = self
                     .cc_bindings
                     .iter()
-                    .filter(|(_, t)| match t {
+                    .filter(|b| match &b.target {
                         LearnTarget::Gain(s)
                         | LearnTarget::Pan(s)
                         | LearnTarget::InGain(s)
@@ -3884,10 +4144,16 @@ impl App {
                         | LearnTarget::InstrParam { slot, .. } => *slot == idx,
                         LearnTarget::Trigger(_) => idx == self.active_slot,
                     })
-                    .map(|(cc, t)| project::Binding {
-                        cc: *cc,
-                        target: *t,
-                        label: self.learn_label(t),
+                    .map(|b| project::Binding {
+                        cc: b.cc,
+                        target: b.target,
+                        label: self.learn_label(&b.target),
+                        // Which controller it was learned from, written the way
+                        // a tab's own input is.
+                        source: b.source.as_ref().map(|i| match i {
+                            InputRef::Midi(name) => format!("MIDI:{name}"),
+                            InputRef::Osc => "OSC".to_string(),
+                        }),
                     })
                     .collect();
                 project::Slot {
@@ -4003,14 +4269,7 @@ impl App {
 
         for (idx, slot) in p.rack.iter().enumerate() {
             let mut rack = RackSlot::new(AudioSource::Midi);
-            rack.input = slot
-                .input
-                .as_ref()
-                .and_then(|s| match s.strip_prefix("MIDI:") {
-                    Some(name) => Some(InputRef::Midi(name.to_string())),
-                    None if s == "OSC" => Some(InputRef::Osc),
-                    None => None,
-                });
+            rack.input = slot.input.as_deref().and_then(parse_input_ref);
             rack.source = self.project_source(&slot.instrument, idx);
             if let AudioSource::Sf2 { path, .. } = &rack.source {
                 rack.presets = sources::list_sf2_presets(path).unwrap_or_default();
@@ -4025,6 +4284,14 @@ impl App {
                     })
                     .unwrap_or(0);
             }
+            if matches!(rack.source, AudioSource::Sf2 { .. }) {
+                rack.instr_params = sources::sf2_params();
+                // A project saved before the sends were switchable has no
+                // values stored: on is what it sounded like.
+                rack.instr_values = slot.instrument.params.clone();
+                rack.instr_values.resize(rack.instr_params.len(), 1.0);
+            }
+            rack.dssi_config = slot.instrument.config.clone();
             if let AudioSource::Plugin { id, .. } = &rack.source {
                 if let Some(entry) = self.synths.iter().find(|s| s.id == *id) {
                     rack.instr_params =
@@ -4069,7 +4336,11 @@ impl App {
             self.slots.push(rack);
 
             for b in &slot.midi_learn {
-                self.cc_bindings.push((b.cc, b.target));
+                self.cc_bindings.push(CcBinding {
+                    source: b.source.as_deref().and_then(parse_input_ref),
+                    cc: b.cc,
+                    target: b.target,
+                });
             }
         }
 
@@ -4260,14 +4531,43 @@ impl App {
 
     fn load_project_from(&mut self, path: &std::path::Path) {
         match project::Project::load(path) {
-            Ok(p) => self.apply_project(p),
+            Ok(p) => {
+                self.apply_project(p);
+                // Where "Save project" will write from now on. A directory was
+                // a valid thing to open, so store the file it resolved to.
+                self.project_file = Some(if path.is_dir() {
+                    path.join(project::DEFAULT_NAME)
+                } else {
+                    path.to_path_buf()
+                });
+            }
             Err(e) => eprintln!("choz: {e}"),
         }
     }
 
-    /// File \u{2192} Save project: pick the directory, then write the YAML.
+    /// File \u{2192} Save project: straight back to the file this project came
+    /// from. Without one (nothing opened, nothing saved yet) there is nowhere
+    /// to write silently, so it is Save as.
+    fn save_project(&mut self) {
+        match self.project_file.clone() {
+            Some(file) => self.save_project_to(&file),
+            None => self.open_save_project(),
+        }
+    }
+
+    /// File \u{2192} Save project as: pick the directory, then the name. Starts
+    /// where the current project lives, which is the folder the next one
+    /// usually belongs in too.
     fn open_save_project(&mut self) {
-        let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let start = self
+            .project_file
+            .as_ref()
+            .and_then(|f| f.parent())
+            .filter(|d| d.is_dir())
+            .map(|d| d.to_path_buf())
+            .unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            });
         let mut modal = Modal::new(
             ModalKind::SaveProject,
             views::modal::ListModal::new("SAVE PROJECT", Vec::new()),
@@ -4280,12 +4580,112 @@ impl App {
         self.refresh_modal();
     }
 
-    fn save_project_to(&mut self, dir: &std::path::Path) {
+    /// Write the project to `path`, closing the modal when it worked and
+    /// leaving the error on screen when it did not.
+    fn save_project_to(&mut self, path: &std::path::Path) {
         let project = self.project_snapshot();
-        match project.save(dir) {
-            Ok(file) => eprintln!("choz: project saved to {}", file.display()),
-            Err(e) => eprintln!("choz: cannot save the project: {e}"),
+        match project.save(path) {
+            Ok(file) => {
+                eprintln!("choz: project saved to {}", file.display());
+                self.project_file = Some(file);
+                self.close_modal();
+            }
+            Err(e) => {
+                if let Some(n) = self.save_name.as_mut() {
+                    n.confirm = false;
+                    n.error = Some(e.to_string());
+                }
+            }
         }
+    }
+
+    /// Keys of the SAVE PROJECT name prompt: typing the file name, and the
+    /// separate Enter that agrees to overwrite. Returns true when handled.
+    fn save_name_key(&mut self, key: KeyCode) -> bool {
+        if self.modal.as_ref().map(|m| m.kind) != Some(ModalKind::SaveProject) {
+            return false;
+        }
+        let Some(mut edit) = self.save_name.take() else {
+            return false;
+        };
+
+        // An error owns the keys until it is dismissed: Enter goes back to the
+        // name (which is what needs changing when a directory is read-only or
+        // the name is not writable), Esc drops the save.
+        if edit.error.is_some() {
+            match key {
+                KeyCode::Enter => {
+                    edit.error = None;
+                    self.save_name = Some(edit);
+                }
+                KeyCode::Esc => {}
+                _ => self.save_name = Some(edit),
+            }
+            self.refresh_modal();
+            return true;
+        }
+
+        // The overwrite question is the list itself (row 0 replaces, row 1
+        // keeps): only Enter and Esc answer it, everything else — the arrows,
+        // the wheel — still moves between the two rows.
+        if edit.confirm {
+            match key {
+                KeyCode::Enter => {
+                    let overwrite = self.modal.as_ref().is_some_and(|m| m.list.cursor == 0);
+                    let target = edit.target();
+                    edit.confirm = overwrite;
+                    self.save_name = Some(edit);
+                    if overwrite {
+                        self.save_project_to(&target);
+                    } else {
+                        // Back to the name, which is the other way out of a
+                        // collision: save it as something else.
+                        if let Some(n) = self.save_name.as_mut() {
+                            n.confirm = false;
+                        }
+                    }
+                }
+                // Esc backs out of the overwrite, not out of the save.
+                KeyCode::Esc => {
+                    edit.confirm = false;
+                    self.save_name = Some(edit);
+                }
+                _ => {
+                    self.save_name = Some(edit);
+                    return false;
+                }
+            }
+            self.refresh_modal();
+            return true;
+        }
+
+        match edit.text.key(key) {
+            Some(true) => {
+                // An empty name has nothing to write: keep typing.
+                if edit.text.buf.trim().is_empty() {
+                    self.save_name = Some(edit);
+                } else {
+                    let target = edit.target();
+                    if target.exists() {
+                        edit.confirm = true;
+                        self.save_name = Some(edit);
+                        // Start on "rename": Enter twice in a row must not be
+                        // how somebody's set gets replaced.
+                        if let Some(m) = self.modal.as_mut() {
+                            m.list.cursor = 1;
+                        }
+                    } else {
+                        self.save_name = Some(edit);
+                        self.save_project_to(&target);
+                    }
+                }
+            }
+            // Esc leaves the name and returns to the directory browser.
+            Some(false) => {}
+            None => self.save_name = Some(edit),
+        }
+        self.refresh_modal();
+        true
     }
 
     // ── MIDI learn ────────────────────────────────────────────────────────
@@ -4434,9 +4834,55 @@ impl App {
         }
     }
 
+    /// The [`InputRef`] a message's source names, or `None` for the QWERTY
+    /// piano (and for a port that is no longer connected).
+    fn source_ref(&self, source: choz_engine::input::InputSource) -> Option<InputRef> {
+        use choz_engine::input::InputSource as S;
+        match source {
+            S::Midi(i) => self.midi_connected.get(i).cloned().map(InputRef::Midi),
+            S::Osc => Some(InputRef::Osc),
+            S::Keyboard => None,
+        }
+    }
+
+    /// Every tab bound to `input`, in tab order.
+    fn tabs_on_input(&self, input: &InputRef) -> Vec<usize> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.input.as_ref() == Some(input))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// A CC as if it came from the QWERTY piano — no source, so it drives every
+    /// binding. Tests that are not about routing use this.
+    #[cfg(test)]
+    fn feed_cc(&mut self, cc: u8, value: u8) {
+        self.apply_cc(choz_engine::input::InputSource::Keyboard, 0, cc, value);
+    }
+
+    /// `(cc, target)` for every binding, for the tests that predate sources.
+    #[cfg(test)]
+    fn cc_pairs(&self) -> Vec<(u8, LearnTarget)> {
+        self.cc_bindings.iter().map(|b| (b.cc, b.target)).collect()
+    }
+
     /// A control change arrived: bind it if learn is armed, otherwise drive
-    /// every rack control already bound to that CC.
-    fn apply_cc(&mut self, cc: u8, value: u8) {
+    /// every rack control bound to that CC **from that controller**.
+    ///
+    /// Two keyboards is the normal case on stage, and each one drives its own
+    /// tabs: a CC from the KeyStep never moves what the Keystation's fader was
+    /// assigned to, whichever tab happens to be on screen. The active tab only
+    /// wins where it has to — when several tabs listen to the *same* port, in
+    /// which case the port has one owner at a time, exactly as its notes do.
+    fn apply_cc(
+        &mut self,
+        source: choz_engine::input::InputSource,
+        channel: u8,
+        cc: u8,
+        value: u8,
+    ) {
         // Bank Select rides along with every program change a controller's
         // buttons send, so it is the first CC to arrive after arming learn —
         // and it would steal the binding from the fader the user is moving.
@@ -4449,13 +4895,30 @@ impl App {
             // 1:REVERB Room *and* 2:TUBE Drive, and the selected unit decides
             // which one it moves. Everything else (VOL, PAN, buttons) is one CC
             // one control, so a new binding evicts the old.
-            let coexists = |t: &LearnTarget| match (fx_scope(t), fx_scope(&target)) {
-                (Some(a), Some(b)) => a != b,
-                _ => false,
+            // Two bindings may share a CC when they cannot both be meant: one
+            // per **tab** (a shared port has one owner at a time, so the fader
+            // moves whichever tab is playing), and one per FX unit within a tab
+            // (the same fader drives 1:REVERB Room *and* 2:TUBE Drive). Anything
+            // else is one CC, one control, and the new binding evicts the old.
+            let coexists = |t: &LearnTarget| match (target_slot(t), target_slot(&target)) {
+                (Some(a), Some(b)) if a != b => true,
+                _ => match (fx_scope(t), fx_scope(&target)) {
+                    (Some(a), Some(b)) => a != b,
+                    _ => false,
+                },
             };
-            self.cc_bindings
-                .retain(|(c, t)| (*c != cc || coexists(t)) && *t != target);
-            self.cc_bindings.push((cc, target));
+            // Learned from this controller. A binding evicts an old one only
+            // when it is the same CC **from the same place**: the two keyboards
+            // both sending CC 1 are two bindings, not one being overwritten.
+            let from = self.source_ref(source);
+            self.cc_bindings.retain(|b| {
+                (b.cc != cc || b.source != from || coexists(&b.target)) && b.target != target
+            });
+            self.cc_bindings.push(CcBinding {
+                source: from,
+                cc,
+                target,
+            });
             eprintln!("choz: CC {cc} -> {}", self.learn_label(&target));
             // Assignment done: back to the normal pointer and event flow.
             self.end_learn();
@@ -4466,8 +4929,29 @@ impl App {
         // fader high doesn't retrigger every message.
         let rising = value >= 64 && self.cc_last[cc as usize] < 64;
         self.cc_last[cc as usize] = value;
-        for (_, target) in self.cc_bindings.clone().iter().filter(|(c, _)| *c == cc) {
-            self.apply_target(*target, v, rising);
+        let from = self.source_ref(source);
+        // Which tab this port is playing right now — the channel first, then the
+        // active tab. Only consulted when the port really is shared.
+        let owners = from.as_ref().map(|i| self.tabs_on_input(i));
+        let playing = self.targets_for(source, channel);
+        for binding in self.cc_bindings.clone() {
+            if binding.cc != cc {
+                continue;
+            }
+            // A binding with no source is from before they had one (or from the
+            // QWERTY piano): it answers anything, as it always did.
+            if binding.source.is_some() && binding.source != from {
+                continue;
+            }
+            if let (Some(slot), Some(owners)) = (target_slot(&binding.target), owners.as_ref()) {
+                // Shared port: only the tab that owns it right now answers.
+                // One tab on the port (or a tab elsewhere) is not a conflict —
+                // the binding already names what it moves.
+                if owners.len() > 1 && owners.contains(&slot) && !playing.contains(&slot) {
+                    continue;
+                }
+            }
+            self.apply_target(binding.target, v, rising);
         }
     }
 
@@ -4896,8 +5380,17 @@ impl App {
         let Some(slot) = self.ensure_slot() else {
             return;
         };
+        // A tab that already had DSSI settings keeps them; a new instrument
+        // starts with none, which is what every other format has anyway.
+        let config = self
+            .slots
+            .get(slot)
+            .map(|s| s.dssi_config.clone())
+            .unwrap_or_default();
         let loaded = match self.audio_engine.as_mut() {
-            Some(engine) => engine.load_plugin(slot, entry.format, &entry.path, &entry.id),
+            Some(engine) => {
+                Self::load_plugin_into(engine, slot, entry.format, &entry.path, &entry.id, &config)
+            }
             None => return,
         };
         match loaded {
@@ -4914,9 +5407,18 @@ impl App {
                     .iter()
                     .map(|p| p.normalised(p.default) as f32)
                     .collect();
+                // …and its own patch browser, for the BANK key. A plugin whose
+                // format cannot report presets simply hands back nothing.
+                let presets = self
+                    .audio_engine
+                    .as_ref()
+                    .map(|e| e.slot_presets(slot))
+                    .unwrap_or_default();
                 if let Some(s) = self.slots.get_mut(slot) {
                     s.instr_params = params;
                     s.instr_values = values;
+                    s.plugin_presets = presets;
+                    s.preset_cursor = 0;
                 }
             }
             Err(e) => eprintln!("choz: {e}"),
@@ -4952,6 +5454,7 @@ impl App {
         if let Some(slot) = self.slots.get_mut(self.active_slot) {
             slot.source = source;
             slot.presets.clear();
+            slot.plugin_presets.clear();
             slot.preset_cursor = 0;
             slot.instr_params.clear();
             slot.instr_values.clear();
@@ -5440,6 +5943,18 @@ impl App {
         let Some(slot) = self.slots.get_mut(idx) else {
             return;
         };
+        // A plugin loads its patch through its own browser; there is no bank
+        // and no program number to send, and the state blob follows from it.
+        if slot.presets.is_empty() {
+            let key = slot
+                .plugin_presets
+                .get(slot.preset_cursor)
+                .map(|p| p.key.clone());
+            if let (Some(key), Some(engine)) = (key, self.audio_engine.as_ref()) {
+                engine.load_slot_preset(idx, &key);
+            }
+            return;
+        }
         let Some(p) = slot.presets.get(slot.preset_cursor).cloned() else {
             return;
         };
@@ -5560,7 +6075,7 @@ impl App {
                 AudioSource::Plugin { id, .. } => match self.synths.iter().find(|s| s.id == *id) {
                     Some(entry) => {
                         let (fmt, path, id) = (entry.format, entry.path.clone(), entry.id.clone());
-                        engine.load_plugin(i, fmt, &path, &id)
+                        Self::load_plugin_into(engine, i, fmt, &path, &id, &slot.dssi_config)
                     }
                     None => Err(anyhow::anyhow!("plugin {id} is no longer available")),
                 },
@@ -5586,6 +6101,21 @@ impl App {
                     }
                     let engine_fx = slot.fx_chain[..ui_fx].iter().filter(|x| x.enabled).count();
                     engine.set_fx_state(i, engine_fx, &entry.state);
+                }
+            }
+        }
+        // The preset handles belong to the instances that were just built, so
+        // the lists have to come back with them — a project load lands here.
+        for i in 0..self.slots.len() {
+            let presets = match self.audio_engine.as_ref() {
+                Some(engine) => engine.slot_presets(i),
+                None => Vec::new(),
+            };
+            if let Some(slot) = self.slots.get_mut(i) {
+                slot.plugin_presets = presets;
+                let last = slot.plugin_presets.len().saturating_sub(1);
+                if !slot.plugin_presets.is_empty() {
+                    slot.preset_cursor = slot.preset_cursor.min(last);
                 }
             }
         }
@@ -5616,25 +6146,133 @@ impl App {
         )
     }
 
-    /// The active tab's current SoundFont program, as `bank:preset Name`.
-    fn active_preset_label(&self) -> Option<String> {
-        let slot = self.slots.get(self.active_slot)?;
-        slot.presets.get(slot.preset_cursor).map(|p| p.label())
+    /// What the BANK key lists for tab `slot`: a SoundFont's programs, or a
+    /// plugin's own patches. One instrument per tab, so at most one is filled.
+    fn preset_labels(&self, slot: usize) -> Vec<String> {
+        let Some(s) = self.slots.get(slot) else {
+            return Vec::new();
+        };
+        if !s.presets.is_empty() {
+            return s.presets.iter().map(|p| p.label()).collect();
+        }
+        s.plugin_presets
+            .iter()
+            .map(|p| {
+                if p.category.is_empty() {
+                    p.name.clone()
+                } else {
+                    format!("{} \u{00B7} {}", p.category, p.name)
+                }
+            })
+            .collect()
     }
 
-    /// Step the active tab's SoundFont program by `delta` and apply it. This is
-    /// what the RACK's `\u{25C0}` / `\u{25B6}` buttons (and their MIDI bindings) do.
-    fn step_preset(&mut self, delta: isize) {
-        let Some(slot) = self.slots.get(self.active_slot) else {
-            return;
+    /// The bank a preset belongs to: the first level of its category, which is
+    /// what a plugin's own browser calls a bank ("A.Liv", "Factory"). Surge XT
+    /// files its 3008 patches under 314 two-level categories, and only the top
+    /// level is few enough to be a row of chips.
+    fn preset_bank(entry: &choz_engine::PresetEntry) -> &str {
+        entry
+            .category
+            .split_once(" / ")
+            .map(|(top, _)| top)
+            .unwrap_or(&entry.category)
+    }
+
+    /// The banks of tab `slot`, in list order, without repeats. Empty when the
+    /// instrument files nothing under a bank — an SF2, or a flat plugin list.
+    fn preset_banks(&self, slot: usize) -> Vec<String> {
+        let Some(s) = self.slots.get(slot) else {
+            return Vec::new();
         };
-        if slot.presets.is_empty() {
+        let mut banks: Vec<String> = Vec::new();
+        for entry in &s.plugin_presets {
+            let bank = Self::preset_bank(entry);
+            if !bank.is_empty() && !banks.iter().any(|b| b == bank) {
+                banks.push(bank.to_string());
+            }
+        }
+        banks
+    }
+
+    /// The rows the BANK picker shows: `(index into the full list, label)`,
+    /// narrowed to the selected bank chip. The index is what selecting a row
+    /// applies, so the filter never has to be undone anywhere else.
+    fn preset_rows(&self) -> Vec<(usize, String)> {
+        let labels = self.preset_labels(self.active_slot);
+        let banks = self.preset_banks(self.active_slot);
+        // Chip 0 is "every bank"; the rest are the banks in order.
+        let chip = self.modal.as_ref().map(|m| m.list.filter).unwrap_or(0);
+        let wanted = chip.checked_sub(1).and_then(|i| banks.get(i));
+        let Some(slot) = self.slots.get(self.active_slot) else {
+            return Vec::new();
+        };
+        labels
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| match wanted {
+                Some(bank) => slot
+                    .plugin_presets
+                    .get(*i)
+                    .is_some_and(|e| Self::preset_bank(e) == bank),
+                None => true,
+            })
+            .collect()
+    }
+
+    /// The active tab's current program, as the picker writes it.
+    fn active_preset_label(&self) -> Option<String> {
+        let cursor = self.slots.get(self.active_slot)?.preset_cursor;
+        self.preset_labels(self.active_slot).into_iter().nth(cursor)
+    }
+
+    /// Step the active tab's program by `delta` and apply it. This is what the
+    /// RACK's `\u{25C0}` / `\u{25B6}` buttons (and their MIDI bindings) do.
+    fn step_preset(&mut self, delta: isize) {
+        let last = self.preset_labels(self.active_slot).len() as isize - 1;
+        if last < 0 {
             return;
         }
+        // Inside the bank, not across the whole list: stepping out of "Factory"
+        // into somebody's third-party pack is not what the next patch means,
+        // and with 3008 of them it is not even findable again.
+        let bank: Option<String> = self.slots.get(self.active_slot).and_then(|s| {
+            s.plugin_presets
+                .get(s.preset_cursor)
+                .map(|e| Self::preset_bank(e).to_string())
+        });
         if let Some(slot) = self.slots.get_mut(self.active_slot) {
-            let last = slot.presets.len() as isize - 1;
-            slot.preset_cursor =
-                (slot.preset_cursor as isize + delta).clamp(0, last.max(0)) as usize;
+            let mut at = slot.preset_cursor as isize;
+            match &bank {
+                Some(bank) if !bank.is_empty() => {
+                    let step = delta.signum();
+                    let mut left = delta.abs();
+                    while left > 0 {
+                        let next = at + step;
+                        if next < 0 || next > last {
+                            break;
+                        }
+                        at = next;
+                        if slot
+                            .plugin_presets
+                            .get(at as usize)
+                            .is_some_and(|e| Self::preset_bank(e) == bank)
+                        {
+                            left -= 1;
+                        }
+                    }
+                    // Landing outside the bank means the edge was reached: stay.
+                    if !slot
+                        .plugin_presets
+                        .get(at as usize)
+                        .is_some_and(|e| Self::preset_bank(e) == bank)
+                    {
+                        at = slot.preset_cursor as isize;
+                    }
+                }
+                _ => at = (at + delta).clamp(0, last),
+            }
+            slot.preset_cursor = at.clamp(0, last) as usize;
         }
         self.apply_selected_preset();
     }
@@ -5761,6 +6399,13 @@ impl App {
         let is_sf2 = path
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("sf2"));
+        // A SoundFont dropped on a DSSI tab is not a new instrument: it is what
+        // that instrument was missing. FluidSynth-DSSI has no sound at all
+        // until it is given one, and `load` is the key it takes.
+        if is_sf2 && self.active_is_dssi() {
+            self.set_dssi_config("load", &path.to_string_lossy());
+            return;
+        }
         let Some(slot) = self.ensure_slot() else {
             return;
         };
@@ -5782,6 +6427,10 @@ impl App {
                 });
                 if let Some(slot) = self.slots.get_mut(self.active_slot) {
                     slot.presets = presets;
+                    // A SoundFont has no plugin parameters, but it does have
+                    // oxisynth's own reverb and chorus, and those are switches.
+                    slot.instr_params = sources::sf2_params();
+                    slot.instr_values = vec![1.0; slot.instr_params.len()];
                 }
             }
             Ok(()) => self.set_active_source(AudioSource::AudioFile {
@@ -6012,7 +6661,7 @@ impl App {
         // MIDI-learn binding: the same sustain pedal can hold notes *and* be
         // assigned to a rack control.
         for c in ccs {
-            self.apply_cc(c.cc, c.value);
+            self.apply_cc(c.source, c.channel, c.cc, c.value);
         }
         for c in controls {
             self.apply_control(c);
@@ -6641,7 +7290,7 @@ fn handle_modal_key(app: &mut App, key: KeyCode) {
     let cursor = app.modal.as_ref().map(|m| m.list.cursor).unwrap_or(0);
     // Enable/disable, add and remove live in the Plugin Paths section; the
     // Engine and OSC sections have their own value editing.
-    if app.paths_modal_key(key) || app.audio_settings_key(key) {
+    if app.paths_modal_key(key) || app.audio_settings_key(key) || app.save_name_key(key) {
         return;
     }
     match key {
@@ -6989,6 +7638,16 @@ fn note_targets(
     bound
 }
 
+/// `"MIDI:<port>"` / `"OSC"` back into an [`InputRef`]. The one spelling, used
+/// by a tab's own input and by a MIDI-learn binding's source.
+fn parse_input_ref(text: &str) -> Option<InputRef> {
+    match text.strip_prefix("MIDI:") {
+        Some(name) => Some(InputRef::Midi(name.to_string())),
+        None if text == "OSC" => Some(InputRef::Osc),
+        None => None,
+    }
+}
+
 /// A tab that answers every MIDI channel of its port. The default in LIVE,
 /// where a tab is a patch rather than a part.
 const ANY_CHANNEL: u8 = 0;
@@ -7140,7 +7799,8 @@ fn handle_fx_keys(app: &mut App, key: KeyCode) {
                 }
             }
         }
-        // Parameters of the tab's own instrument (plugin instruments only).
+        // Parameters of the tab's own instrument: a plugin's list, or the
+        // SoundFont's reverb / chorus switches.
         KeyCode::Char('p') => app.open_instr_modal(),
         // Factory presets of the selected effect.
         KeyCode::Char('P') => {
@@ -7689,7 +8349,8 @@ fn apply_menu_action(app: &mut App, action: menu::MenuAction) {
         A::OpenSf2 => app.open_browser_modal(&["sf2", "sf3"]),
         A::Quit => app.quit = true,
         A::PluginPaths => app.open_paths_modal(),
-        A::SaveProject => app.open_save_project(),
+        A::SaveProject => app.save_project(),
+        A::SaveProjectAs => app.open_save_project(),
         A::LoadProject => app.open_load_project(),
         A::ImportMax => app.open_import_max(),
         A::RescanPlugins => app.start_rescan(),
@@ -9484,8 +10145,8 @@ mod tests {
         assert_eq!(app.learn, Some(LearnTarget::Gain(0)));
 
         // The next CC binds; it must not also move the fader.
-        app.apply_cc(74, 127);
-        assert_eq!(app.cc_bindings, vec![(74, LearnTarget::Gain(0))]);
+        app.feed_cc(74, 127);
+        assert_eq!(app.cc_pairs(), vec![(74, LearnTarget::Gain(0))]);
         assert_eq!(
             app.slots[0].gain, 1.0,
             "the binding message itself doesn't move it"
@@ -9493,10 +10154,10 @@ mod tests {
         assert!(app.learn.is_none(), "learn disarms after binding");
 
         // Now it drives the fader; an unbound CC does nothing.
-        app.apply_cc(74, 64);
+        app.feed_cc(74, 64);
         assert!((app.slots[0].gain - 64.0 / 127.0 * MAX_GAIN).abs() < 1e-6);
         let gain = app.slots[0].gain;
-        app.apply_cc(9, 0);
+        app.feed_cc(9, 0);
         assert_eq!(app.slots[0].gain, gain, "an unbound CC is ignored");
     }
 
@@ -9535,9 +10196,9 @@ mod tests {
         );
         assert!(app.modal.is_none(), "learning closes the editor");
 
-        app.apply_cc(74, 127);
+        app.feed_cc(74, 127);
         assert_eq!(
-            app.cc_bindings,
+            app.cc_pairs(),
             vec![(74, LearnTarget::InstrParam { slot: 0, param: 1 })]
         );
         assert_eq!(
@@ -9545,7 +10206,7 @@ mod tests {
             "the binding message doesn't move it"
         );
 
-        app.apply_cc(74, 64);
+        app.feed_cc(74, 64);
         assert!((app.slots[0].instr_values[1] - 64.0 / 127.0).abs() < 1e-6);
         assert_eq!(
             app.slots[0].instr_values[0], 0.0,
@@ -9571,14 +10232,14 @@ mod tests {
             fx: 0,
             param: 0,
         });
-        app.apply_cc(7, 0);
+        app.feed_cc(7, 0);
         app.fx_slot = 1;
         app.learn = Some(LearnTarget::FxParam {
             slot: 0,
             fx: 1,
             param: 0,
         });
-        app.apply_cc(7, 0);
+        app.feed_cc(7, 0);
         assert_eq!(
             app.cc_bindings.len(),
             2,
@@ -9588,7 +10249,7 @@ mod tests {
 
         // FX 2 is selected, so only FX 2 follows the fader.
         let untouched = app.fx_chain[0].params[0];
-        app.apply_cc(7, 127);
+        app.feed_cc(7, 127);
         assert_eq!(
             app.fx_chain[0].params[0], untouched,
             "the unselected unit moved"
@@ -9598,14 +10259,14 @@ mod tests {
         // Select FX 1 and the same fader now drives it instead.
         app.fire_trigger(TriggerAction::FxSelect(0));
         let held = app.fx_chain[1].params[0];
-        app.apply_cc(7, 64);
+        app.feed_cc(7, 64);
         assert!((app.fx_chain[0].params[0] - 64.0 / 127.0).abs() < 1e-6);
         assert_eq!(app.fx_chain[1].params[0], held, "the unselected unit moved");
 
         // A non-FX target on that CC is still one-CC-one-control.
         app.learn = Some(LearnTarget::Gain(0));
-        app.apply_cc(7, 0);
-        assert_eq!(app.cc_bindings, vec![(7, LearnTarget::Gain(0))]);
+        app.feed_cc(7, 0);
+        assert_eq!(app.cc_pairs(), vec![(7, LearnTarget::Gain(0))]);
     }
 
     /// A bound CC arriving over the real MIDI channel has to move the drawn
@@ -9615,7 +10276,11 @@ mod tests {
     fn a_bound_cc_moves_the_drawn_fader() {
         let mut app = App::new();
         app.slots.push(RackSlot::new(AudioSource::Midi));
-        app.cc_bindings.push((74, LearnTarget::Gain(0)));
+        app.cc_bindings.push(CcBinding {
+            source: None,
+            cc: 74,
+            target: LearnTarget::Gain(0),
+        });
 
         app.note_tx
             .send(midi::InputEvent::Cc(choz_engine::input::CcMsg {
@@ -9707,7 +10372,7 @@ mod tests {
             }))
             .unwrap();
         app.drain_midi();
-        assert_eq!(app.cc_bindings, vec![(74, LearnTarget::Gain(0))]);
+        assert_eq!(app.cc_pairs(), vec![(74, LearnTarget::Gain(0))]);
     }
 
     /// Two buttons, learned by the user, step the preset; every other button on
@@ -10296,8 +10961,8 @@ mod tests {
             "the pick click must not move the fader"
         );
 
-        app.apply_cc(21, 127);
-        assert_eq!(app.cc_bindings, vec![(21, LearnTarget::Gain(0))]);
+        app.feed_cc(21, 127);
+        assert_eq!(app.cc_pairs(), vec![(21, LearnTarget::Gain(0))]);
         assert!(
             !app.learn_pick && app.learn.is_none(),
             "learn ends once bound"
@@ -10377,25 +11042,25 @@ mod tests {
             app.slots[0].preset_cursor, 1,
             "picking must not press the button"
         );
-        app.apply_cc(30, 127);
+        app.feed_cc(30, 127);
         assert_eq!(
-            app.cc_bindings,
+            app.cc_pairs(),
             vec![(30, LearnTarget::Trigger(TriggerAction::PresetNext))]
         );
 
         // Buttons fire on the rising edge only.
         app.slots[0].preset_cursor = 0;
-        app.apply_cc(30, 10);
+        app.feed_cc(30, 10);
         assert_eq!(
             app.slots[0].preset_cursor, 0,
             "below half-scale does nothing"
         );
-        app.apply_cc(30, 127);
+        app.feed_cc(30, 127);
         assert_eq!(
             app.slots[0].preset_cursor, 1,
             "crossing half-scale presses it"
         );
-        app.apply_cc(30, 120);
+        app.feed_cc(30, 120);
         assert_eq!(app.slots[0].preset_cursor, 1, "held high doesn't retrigger");
     }
 
@@ -11828,12 +12493,12 @@ mod tests {
         );
 
         // The next CC binds; the ones after it drive the parameter.
-        app.apply_cc(74, 100);
+        app.feed_cc(74, 100);
         assert!(app.learn.is_none(), "armed no longer");
         assert_eq!(app.cc_bindings.len(), 1);
-        app.apply_cc(74, 127);
+        app.feed_cc(74, 127);
         assert_eq!(app.slots[0].instr_values[1], 1.0);
-        app.apply_cc(74, 0);
+        app.feed_cc(74, 0);
         assert_eq!(app.slots[0].instr_values[1], 0.0);
 
         // A touch with learn disarmed only tracks the value; it must not
@@ -12215,7 +12880,11 @@ mod tests {
         fx.params[0] = 0.75;
         fx.enabled = false;
         app.fx_chain.push(fx);
-        app.cc_bindings.push((74, LearnTarget::Gain(0)));
+        app.cc_bindings.push(CcBinding {
+            source: None,
+            cc: 74,
+            target: LearnTarget::Gain(0),
+        });
 
         let saved = app.project_snapshot();
 
@@ -12239,7 +12908,7 @@ mod tests {
         assert_eq!(chain[0].kind, source::AudioFxKind::AmberFang);
         assert_eq!(chain[0].params[0], 0.75, "knob positions survive");
         assert!(!chain[0].enabled, "so does the ON/OFF state");
-        assert_eq!(loaded.cc_bindings, vec![(74, LearnTarget::Gain(0))]);
+        assert_eq!(loaded.cc_pairs(), vec![(74, LearnTarget::Gain(0))]);
         // The working copy has to follow the first tab, or the RACK draws stale.
         assert_eq!(loaded.source, app.slots[0].source);
         assert_eq!(loaded.fx_chain.len(), 1);
@@ -12262,7 +12931,11 @@ mod tests {
         app.source = app.slots[0].source.clone();
         app.fx_chain
             .push(AudioFxEntry::new(source::AudioFxKind::AmberFang));
-        app.cc_bindings.push((74, LearnTarget::Gain(0)));
+        app.cc_bindings.push(CcBinding {
+            source: None,
+            cc: 74,
+            target: LearnTarget::Gain(0),
+        });
         app.midi_disabled.push("Midi Through".into());
 
         let dir = std::env::temp_dir().join(format!("choz_save_{}", std::process::id()));
@@ -12464,6 +13137,276 @@ mod tests {
         );
     }
 
+    /// "Save project" rewrites the file the project came from without a single
+    /// question; "Save project as" always asks, and starts from that file's
+    /// folder and name.
+    #[test]
+    fn save_rewrites_the_current_file_and_save_as_always_asks() {
+        sandbox_state_dir();
+        let dir = std::env::temp_dir().join(format!("choz_save_as_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new();
+        // Nothing saved yet: Save falls back to the picker.
+        app.save_project();
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::SaveProject),
+            "without a file, Save is Save as"
+        );
+        app.close_modal();
+
+        // With a file, it writes straight there and opens nothing.
+        let file = dir.join("set-a.yml");
+        app.project_file = Some(file.clone());
+        app.save_project();
+        assert!(app.modal.is_none(), "Save asks nothing");
+        assert!(file.exists());
+
+        // Save as starts in that file's folder, suggesting its name.
+        app.open_save_project();
+        let browser_dir = app
+            .modal
+            .as_ref()
+            .and_then(|m| m.browser.as_ref())
+            .map(|b| b.dir.clone());
+        assert_eq!(browser_dir.as_deref(), Some(dir.as_path()));
+        // The first entry of a DIR_PICK browser is "use this directory".
+        assert!(!app.modal_select(), "picking the dir only prompts");
+        assert_eq!(app.save_name.as_ref().unwrap().text.buf, "set-a.yml");
+
+        // Typing a new name leaves the old file alone and moves the project.
+        for _ in 0.."set-a.yml".chars().count() {
+            app.save_name_key(KeyCode::Backspace);
+        }
+        for c in "set-b".chars() {
+            app.save_name_key(KeyCode::Char(c));
+        }
+        app.save_name_key(KeyCode::Enter);
+        assert!(dir.join("set-b.yml").exists());
+        assert_eq!(
+            app.project_file.as_deref(),
+            Some(dir.join("set-b.yml").as_path())
+        );
+
+        // …and loading a project points Save at it too.
+        app.load_project_from(&file);
+        assert_eq!(app.project_file.as_deref(), Some(file.as_path()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A SoundFont dropped on a FluidSynth-DSSI tab is a `configure` call, not
+    /// a new instrument — and after it the tab has the SoundFont's programs.
+    ///
+    /// Skipped without the plugin (or without a SoundFont) installed. It is the
+    /// one DSSI synth here that starts empty, which is exactly what makes it
+    /// the case worth testing: it had been loading and staying silent.
+    #[test]
+    fn a_soundfont_on_a_dssi_tab_configures_it_instead_of_replacing_it() {
+        sandbox_state_dir();
+        let plugin = std::path::Path::new("/usr/lib/dssi/fluidsynth-dssi.so");
+        let sf2 = std::path::Path::new("/usr/share/sounds/sf2/FluidR3_GM.sf2");
+        if !plugin.exists() || !sf2.exists() {
+            eprintln!("no fluidsynth-dssi (or no SoundFont) here; skipping");
+            return;
+        }
+
+        let mut app = App::new();
+        app.audio_engine = Some(choz_engine::AudioEngine::new(48_000, 256));
+        app.synths.push(SynthEntry {
+            id: "FluidSynth-DSSI".into(),
+            format: choz_engine::PluginFormat::Dssi,
+            name: "FluidSynth-DSSI".into(),
+            path: plugin.to_path_buf(),
+        });
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: "FluidSynth-DSSI".into(),
+            format: "DSSI".into(),
+            name: "FluidSynth-DSSI".into(),
+        }));
+        app.source = app.slots[0].source.clone();
+        let engine = app.audio_engine.as_mut().unwrap();
+        engine.add_silent().unwrap();
+        engine
+            .load_dssi(0, plugin, "FluidSynth-DSSI", &[])
+            .expect("the plugin loads");
+        assert!(app.active_is_dssi());
+        assert!(
+            app.audio_engine
+                .as_ref()
+                .unwrap()
+                .slot_presets(0)
+                .is_empty(),
+            "no SoundFont, no programs"
+        );
+
+        // The SF2 picker lands here. The tab must still be the same plugin.
+        app.load_source(sf2.to_path_buf());
+        assert!(
+            matches!(app.slots[0].source, AudioSource::Plugin { .. }),
+            "the DSSI instrument was replaced instead of configured"
+        );
+        assert_eq!(
+            app.slots[0].dssi_config,
+            [("load".to_string(), sf2.to_string_lossy().into_owned())]
+        );
+        assert!(
+            app.slots[0].plugin_presets.len() > 100,
+            "the SoundFont's programs: {}",
+            app.slots[0].plugin_presets.len()
+        );
+
+        // …and the settings travel with the project.
+        let saved = app.project_snapshot();
+        assert_eq!(saved.rack[0].instrument.config, app.slots[0].dssi_config);
+    }
+
+    /// A plugin with thousands of patches is only usable if the picker narrows
+    /// them: the chips are its banks, a row picks the preset it points at (not
+    /// the position it sits in), and the arrows stay inside the bank.
+    #[test]
+    fn a_plugins_patches_are_picked_by_bank() {
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: "org.surge-synth-team.surge-xt".into(),
+            format: "CLAP".into(),
+            name: "Surge XT".into(),
+        }));
+        app.source = app.slots[0].source.clone();
+        // Shaped like the real scan: two levels of directory per patch.
+        let entry = |cat: &str, name: &str| choz_engine::PresetEntry {
+            name: name.to_string(),
+            category: cat.to_string(),
+            key: format!("/patches/{cat}/{name}.fxp"),
+        };
+        app.slots[0].plugin_presets = vec![
+            entry("A.Liv / Basses", "808er"),
+            entry("A.Liv / Keys", "Rhodes"),
+            entry("Factory / Basses", "Sub"),
+            entry("Factory / Leads", "Saw"),
+            entry("Factory / Leads", "Square"),
+        ];
+
+        // The banks are the first level, deduplicated and in list order.
+        assert_eq!(app.preset_banks(0), ["A.Liv", "Factory"]);
+
+        app.open_preset_modal();
+        let chips = app.modal.as_ref().unwrap().list.filters.clone();
+        assert_eq!(chips.len(), 3, "every bank, plus one chip for all of them");
+        assert_eq!(app.preset_rows().len(), 5, "chip 0 hides nothing");
+
+        // Second chip = the second bank: three of the five patches.
+        app.modal.as_mut().unwrap().list.filter = 2;
+        let rows = app.preset_rows();
+        assert_eq!(rows.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [2, 3, 4]);
+        assert!(rows[0].1.contains("Sub"), "{rows:?}");
+
+        // Selecting row 1 of that view applies preset 3, not preset 1.
+        app.modal.as_mut().unwrap().list.cursor = 1;
+        app.modal_select();
+        assert_eq!(app.slots[0].preset_cursor, 3);
+
+        // The arrows stay inside "Factory": forward lands on Square…
+        app.step_preset(1);
+        assert_eq!(app.slots[0].preset_cursor, 4);
+        // …and the end of the bank is where they stop, not "A.Liv".
+        app.step_preset(1);
+        assert_eq!(app.slots[0].preset_cursor, 4);
+        app.step_preset(-1);
+        app.step_preset(-1);
+        assert_eq!(app.slots[0].preset_cursor, 2, "the first patch of the bank");
+        app.step_preset(-1);
+        assert_eq!(app.slots[0].preset_cursor, 2, "and it does not leave it");
+    }
+
+    /// SAVE PROJECT asks for a name and refuses to overwrite on a single
+    /// keypress: picking the directory only opens the prompt, Enter writes the
+    /// typed file, and a second save onto the same name has to be confirmed.
+    #[test]
+    fn saving_a_project_asks_for_the_name_and_for_the_overwrite() {
+        sandbox_state_dir();
+        let dir = std::env::temp_dir().join(format!("choz_save_name_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new();
+        app.open_save_project();
+        // Picking the directory opens the name prompt instead of saving.
+        app.save_name = Some(SaveName::new(
+            dir.clone(),
+            project::DEFAULT_NAME.to_string(),
+        ));
+        app.refresh_modal();
+        assert!(
+            !dir.join(project::DEFAULT_NAME).exists(),
+            "nothing written yet"
+        );
+
+        // Retype the suggested name, then save.
+        let suggested = project::DEFAULT_NAME.chars().count();
+        for _ in 0..suggested {
+            app.save_name_key(KeyCode::Backspace);
+        }
+        for c in "my-set".chars() {
+            assert!(app.save_name_key(KeyCode::Char(c)));
+        }
+        assert!(app.save_name_key(KeyCode::Enter));
+        let file = dir.join("my-set.yml");
+        assert!(file.exists(), "Enter writes the typed name (with .yml)");
+        assert!(app.modal.is_none(), "a saved project closes the modal");
+
+        // Same name again: Enter asks first, and Esc backs out without writing.
+        let before = std::fs::metadata(&file).unwrap().len();
+        std::fs::write(&file, "clobbered").unwrap();
+        app.open_save_project();
+        app.save_name = Some(SaveName::new(
+            dir.clone(),
+            project::DEFAULT_NAME.to_string(),
+        ));
+        for _ in 0..project::DEFAULT_NAME.chars().count() {
+            app.save_name_key(KeyCode::Backspace);
+        }
+        for c in "my-set".chars() {
+            app.save_name_key(KeyCode::Char(c));
+        }
+        app.save_name_key(KeyCode::Enter);
+        assert!(
+            app.save_name.as_ref().unwrap().confirm,
+            "an existing file asks before it is replaced"
+        );
+        // The question is the modal itself: two rows, starting on the harmless
+        // one, naming the file that is about to go.
+        let m = app.modal.as_ref().unwrap();
+        assert_eq!(m.list.items.len(), 2, "overwrite / rename");
+        assert_eq!(m.list.cursor, 1, "Enter twice does not clobber anything");
+        assert!(m.list.items[0].contains("my-set.yml"), "{:?}", m.list.items);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "clobbered");
+
+        // The rename row backs out, and so does Esc.
+        app.save_name_key(KeyCode::Enter);
+        assert!(!app.save_name.as_ref().unwrap().confirm, "rename backs out");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "clobbered");
+        app.save_name_key(KeyCode::Enter);
+        app.save_name_key(KeyCode::Esc);
+        assert!(
+            !app.save_name.as_ref().unwrap().confirm,
+            "Esc backs out of the overwrite"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "clobbered");
+
+        // Confirming on the OVERWRITE row does replace it.
+        app.save_name_key(KeyCode::Enter);
+        app.modal.as_mut().unwrap().list.cursor = 0;
+        app.save_name_key(KeyCode::Enter);
+        assert!(std::fs::metadata(&file).unwrap().len() > before / 2);
+        assert_ne!(std::fs::read_to_string(&file).unwrap(), "clobbered");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A path can be typed in place: `e` loads the row into the editor, the
     /// keys land in the buffer, Enter stores it and Esc leaves it alone.
     #[test]
@@ -12487,7 +13430,7 @@ mod tests {
         assert!(app.paths_modal_key(KeyCode::Char('e')));
         let before = app.plugin_paths.dirs(fmt)[i].path.clone();
         assert_eq!(
-            app.path_edit.as_ref().unwrap().buf,
+            app.path_edit.as_ref().unwrap().text.buf,
             before.display().to_string()
         );
         // The row being typed is what the modal shows, caret and all.
@@ -12791,6 +13734,107 @@ mod tests {
 
     /// One port, two tabs, two channels: the split the roadmap asked for.
     ///
+    /// Two controllers, two tabs: **each keyboard drives its own tab**, whatever
+    /// is on screen. This is the stage case — a Keystation on the e-piano, a
+    /// KeyStep on Surge — and before bindings knew where a CC came from, the
+    /// KeyStep's mod wheel moved whatever the Keystation's had been assigned to.
+    #[test]
+    fn each_controller_drives_its_own_tabs_learned_controls() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let mut app = App::new();
+        for _ in 0..2 {
+            app.push_slot(AudioSource::Midi);
+        }
+        app.midi_connected = vec!["Keystation".into(), "KeyStep".into()];
+        app.slots[0].input = Some(InputRef::Midi("Keystation".into()));
+        app.slots[1].input = Some(InputRef::Midi("KeyStep".into()));
+        let keystation = choz_engine::input::InputSource::Midi(0);
+        let keystep = choz_engine::input::InputSource::Midi(1);
+
+        // CC 74 learned on each keyboard, each pointing at its own tab's VOL.
+        app.learn = Some(LearnTarget::Gain(0));
+        app.apply_cc(keystation, 0, 74, 100);
+        app.learn = Some(LearnTarget::Gain(1));
+        app.apply_cc(keystep, 0, 74, 100);
+        assert_eq!(
+            app.cc_bindings.len(),
+            2,
+            "same CC from two controllers is two bindings: {:?}",
+            app.cc_bindings
+        );
+
+        // Tab 2 is on screen. The Keystation's fader still moves tab 1 — its
+        // own tab — and leaves tab 2 alone.
+        app.active_slot = 1;
+        app.slots[0].gain = 0.0;
+        app.slots[1].gain = 0.0;
+        app.apply_cc(keystation, 0, 74, 127);
+        assert!(app.slots[0].gain > 0.0, "the Keystation moved its own tab");
+        assert_eq!(app.slots[1].gain, 0.0, "and not the tab on screen");
+
+        // …and the KeyStep's moves tab 2 while tab 1 is on screen.
+        app.active_slot = 0;
+        app.slots[0].gain = 0.0;
+        app.apply_cc(keystep, 0, 74, 127);
+        assert!(app.slots[1].gain > 0.0, "the KeyStep moved its own tab");
+        assert_eq!(app.slots[0].gain, 0.0);
+    }
+
+    /// The one case where the tab on screen decides: **both tabs on the same
+    /// port**. A port has one owner at a time — the same rule its notes follow —
+    /// so its fader moves the tab that is actually playing.
+    #[test]
+    fn a_shared_port_gives_its_ccs_to_the_tab_on_screen() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let mut app = App::new();
+        for _ in 0..2 {
+            app.push_slot(AudioSource::Midi);
+        }
+        app.midi_connected = vec!["Keystation".into()];
+        for slot in app.slots.iter_mut() {
+            slot.input = Some(InputRef::Midi("Keystation".into()));
+        }
+        let midi = choz_engine::input::InputSource::Midi(0);
+
+        // The same fader learned twice on the same port, once per tab.
+        app.active_slot = 0;
+        app.learn = Some(LearnTarget::Gain(0));
+        app.apply_cc(midi, 0, 74, 100);
+        app.active_slot = 1;
+        app.learn = Some(LearnTarget::Gain(1));
+        app.apply_cc(midi, 0, 74, 100);
+
+        // Tab 2 on screen: only tab 2 moves.
+        app.slots[0].gain = 0.0;
+        app.slots[1].gain = 0.0;
+        app.apply_cc(midi, 0, 74, 127);
+        assert_eq!(app.slots[0].gain, 0.0, "the tab off screen stays put");
+        assert!(app.slots[1].gain > 0.0);
+
+        // Switch tabs and the same fader moves the other one.
+        app.active_slot = 0;
+        app.slots[1].gain = 0.0;
+        app.apply_cc(midi, 0, 74, 127);
+        assert!(app.slots[0].gain > 0.0);
+        assert_eq!(app.slots[1].gain, 0.0);
+
+        // A channel claim still wins over the tab on screen, as it does for
+        // notes: tab 2 asks for channel 3 and gets channel 3's fader.
+        app.slots[1].channel = 3;
+        app.slots[0].gain = 0.0;
+        app.slots[1].gain = 0.0;
+        app.apply_cc(midi, 2, 74, 127);
+        assert!(
+            app.slots[1].gain > 0.0,
+            "channel 3 reaches the tab that asked"
+        );
+        assert_eq!(app.slots[0].gain, 0.0);
+    }
+
     /// It has to be opt-in, and this is why: pressing `+` gives another patch on
     /// the same controller, and if that tab claimed a channel the controller
     /// already sends, the patch on screen would go silent. So a tab answers

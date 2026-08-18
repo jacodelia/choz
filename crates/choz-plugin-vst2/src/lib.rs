@@ -369,6 +369,96 @@ impl choz_ports::PluginState for Vst2State {
     }
 }
 
+/// The plugin's own programs, reached through the same shared cell.
+///
+/// VST2 has no preset *files* to discover: a plugin carries a fixed bank of
+/// `numPrograms` slots, named through `effGetProgramNameIndexed` and selected
+/// with `effSetProgram`. So the key is just the index, as text.
+struct Vst2Presets {
+    shared: SharedEffect,
+}
+
+impl Vst2Presets {
+    /// Run `f` against the live AEffect, if there still is one.
+    fn with<T>(&self, f: impl FnOnce(*mut AEffect, DispatcherProc) -> T) -> Option<T> {
+        let guard = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let cell = guard.as_ref()?;
+        // SAFETY: the cell holds a live AEffect for as long as the guard does.
+        let dispatcher = unsafe { (*cell.effect).dispatcher }?;
+        Some(f(cell.effect, dispatcher))
+    }
+}
+
+impl choz_ports::PluginPresets for Vst2Presets {
+    fn list(&self) -> Vec<choz_ports::PresetEntry> {
+        self.with(|effect, dispatch| {
+            // SAFETY: live AEffect; the plugin writes into a buffer we own and
+            // the count is its own.
+            let count = unsafe { (*effect).num_programs }.max(0);
+            (0..count)
+                .map(|i| {
+                    let mut buf = [0 as c_char; 256];
+                    let got = unsafe {
+                        dispatch(
+                            effect,
+                            opcode::GET_PROGRAM_NAME_INDEXED,
+                            i,
+                            0,
+                            buf.as_mut_ptr() as *mut c_void,
+                            0.0,
+                        )
+                    };
+                    let name = c_str_from_buf(&buf);
+                    choz_ports::PresetEntry {
+                        // A plugin that answers 0 (or an empty name) still has
+                        // the program: numbering it is better than a blank row.
+                        name: if got == 0 || name.trim().is_empty() {
+                            format!("Program {}", i + 1)
+                        } else {
+                            name
+                        },
+                        category: String::new(),
+                        key: i.to_string(),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    /// `effGetProgram`: which slot the plugin is on. The one format here that
+    /// can be asked — and the only way to see a program change land in a plugin
+    /// that makes no sound of its own (an unlicensed demo, a sampler with no
+    /// samples loaded).
+    fn current(&self) -> Option<String> {
+        self.with(|effect, dispatch| {
+            // SAFETY: live AEffect under the cell's mutex.
+            let index =
+                unsafe { dispatch(effect, opcode::GET_PROGRAM, 0, 0, std::ptr::null_mut(), 0.0) };
+            index.to_string()
+        })
+    }
+
+    fn load(&self, key: &str) {
+        let Ok(index) = key.parse::<i32>() else {
+            return;
+        };
+        self.with(|effect, dispatch| {
+            // SAFETY: live AEffect, and the index came from our own list.
+            unsafe {
+                dispatch(
+                    effect,
+                    opcode::SET_PROGRAM,
+                    0,
+                    index as isize,
+                    std::ptr::null_mut(),
+                    0.0,
+                )
+            };
+        });
+    }
+}
+
 impl PluginEditor for Vst2Editor {
     fn open(&self, parent: u64) -> Option<(u16, u16)> {
         self.dispatch(opcode::EDIT_OPEN, 0, parent as usize as *mut c_void);
@@ -483,6 +573,17 @@ impl Instance {
         Some(Arc::new(Vst2State {
             shared: Arc::clone(&self.shared),
         }) as choz_ports::StateHandle)
+    }
+
+    /// The plugin's programs, when it has more than the one every VST2 has.
+    fn presets(&self) -> Option<choz_ports::PresetsHandle> {
+        // SAFETY: the instance owns this AEffect.
+        if unsafe { (*self.effect).num_programs } <= 1 {
+            return None;
+        }
+        Some(Arc::new(Vst2Presets {
+            shared: Arc::clone(&self.shared),
+        }) as choz_ports::PresetsHandle)
     }
 
     /// The parameters the user moves inside the plugin's own window.
@@ -785,6 +886,10 @@ impl Vst2Instrument {
 }
 
 impl AudioSource for Vst2Instrument {
+    fn presets(&self) -> Option<choz_ports::PresetsHandle> {
+        self.inst.presets()
+    }
+
     fn render(&mut self, output: &mut [f32], _sample_rate: u32) -> usize {
         let mut done = 0;
         let total = output.len() / 2;

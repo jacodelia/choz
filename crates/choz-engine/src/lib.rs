@@ -406,7 +406,7 @@ fn scan_item(format: PluginFormat, path: &std::path::Path) -> Vec<FoundPlugin> {
 }
 
 pub use choz_plugin_clap::ClapPluginInfo;
-pub use choz_ports::PluginParam;
+pub use choz_ports::{PluginParam, PresetEntry};
 
 /// Parameters exposed by a hosted plugin. Non-RT: CLAP loads the binary, LV2
 /// reads the bundle TTL. Empty for formats choz can't host.

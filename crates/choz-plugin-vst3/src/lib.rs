@@ -13,6 +13,7 @@
 
 pub mod editor;
 pub mod host;
+pub mod presets;
 
 use std::path::{Path, PathBuf};
 
@@ -241,5 +242,9 @@ impl AudioSource for Vst3Instrument {
 
     fn state(&self) -> Option<choz_ports::StateHandle> {
         self.inst.state()
+    }
+
+    fn presets(&self) -> Option<choz_ports::PresetsHandle> {
+        self.inst.presets()
     }
 }

@@ -81,6 +81,13 @@ pub trait FxProcessor: Send {
         None
     }
 
+    /// The plugin's own preset browser, when the format lets choz read it.
+    /// Captured at the same moment as [`Self::editor`]; `None` means the tab's
+    /// BANK key has nothing to show.
+    fn presets(&self) -> Option<PresetsHandle> {
+        None
+    }
+
     /// Live counters when this processor is a plugin running in its own
     /// process. Taken once, next to [`FxProcessor::editor`]. Default `None`:
     /// everything else runs in choz's own process.
@@ -245,6 +252,13 @@ pub trait AudioSource: Send {
         None
     }
 
+    /// The plugin's own preset browser, when the format lets choz read it.
+    /// Captured at the same moment as [`Self::editor`]; `None` means the tab's
+    /// BANK key has nothing to show.
+    fn presets(&self) -> Option<PresetsHandle> {
+        None
+    }
+
     /// Live counters when this source is a plugin running in its own process.
     /// Taken once, next to [`AudioSource::editor`]. Default `None`: everything
     /// else runs in choz's own process.
@@ -342,6 +356,48 @@ pub trait PluginState: Send + Sync {
 }
 
 pub type StateHandle = std::sync::Arc<dyn PluginState>;
+
+/// One preset a plugin offers: what to show, and what to say back to load it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PresetEntry {
+    /// What the user reads — the patch name the plugin gave.
+    pub name: String,
+    /// The group the plugin filed it under (CLAP collection, VST2 bank, an
+    /// SF2's bank number). Empty when the format has no grouping; the picker
+    /// turns the distinct values into filter chips.
+    pub category: String,
+    /// What [`PluginPresets::load`] needs to get this one back: a CLAP
+    /// `load_key`, a VST2 program index as text, a preset URI. Opaque to
+    /// choz — only the runtime that produced it reads it.
+    pub key: String,
+}
+
+/// The presets a plugin can list and load by itself — its own patch browser,
+/// flattened.
+///
+/// Deliberately **not** on the RT traits: no format loads a preset without
+/// allocating, reading files or talking to the plugin's main thread, so this
+/// is captured where [`PluginEditor`] and [`PluginState`] are and called from
+/// the UI thread. Parameters and state stay as they are; a preset is the
+/// coarse move that replaces both.
+pub trait PluginPresets: Send + Sync {
+    /// Everything the plugin offers, in the order it offered it. Empty when it
+    /// has no browser of its own — which is most effects, and is not an error.
+    fn list(&self) -> Vec<PresetEntry>;
+
+    /// Load the preset with this [`PresetEntry::key`]. Silent no-op when the
+    /// key is not one of ours or the instance is already gone.
+    fn load(&self, key: &str);
+
+    /// The key of the preset the plugin says it is on, when the format can be
+    /// asked. Default `None`: the picker then opens where it last was, which
+    /// is what every format that cannot answer leaves it doing anyway.
+    fn current(&self) -> Option<String> {
+        None
+    }
+}
+
+pub type PresetsHandle = std::sync::Arc<dyn PluginPresets>;
 
 // ─── Hosted plugins ─────────────────────────────────────────────────────────
 

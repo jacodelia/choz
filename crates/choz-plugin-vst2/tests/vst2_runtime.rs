@@ -174,3 +174,56 @@ fn installed_vst2_plugins_scan_host_and_expose_params() {
         break;
     }
 }
+
+/// A VST2 with more than one program must list them by name and switch between
+/// them. Verified through `effGetProgram` rather than through the audio: a
+/// plugin can be silent for reasons of its own (an unlicensed demo, a sampler
+/// with nothing loaded) and still be switching programs correctly.
+///
+/// Skipped when nothing installed declares more than one program — which is
+/// most effects, and both u-he synths (they browse their own presets instead).
+#[test]
+fn vst2_programs_are_listed_and_selected() {
+    let found = installed();
+    if found.is_empty() {
+        eprintln!("no VST2 plugins installed; skipping");
+        return;
+    }
+
+    for info in &found {
+        let Some(inst) = Vst2Instrument::build(&info.path, SR, BLOCK)
+            .map(Some)
+            .unwrap_or(None)
+        else {
+            continue;
+        };
+        let Some(browser) = inst.presets() else {
+            continue; // one program (or none): nothing to pick
+        };
+        let list = browser.list();
+        assert!(list.len() > 1, "{}: a browser with one row", info.name);
+        for p in list.iter().take(20) {
+            assert!(!p.name.is_empty(), "{}: a program with no name", info.name);
+            assert!(p.key.parse::<i32>().is_ok(), "{}: {p:?}", info.name);
+        }
+
+        // Pick one and ask the plugin where it is.
+        let target = &list[list.len() / 2];
+        browser.load(&target.key);
+        assert_eq!(
+            browser.current().as_deref(),
+            Some(target.key.as_str()),
+            "{}: selecting '{}' did not stick",
+            info.name,
+            target.name
+        );
+        browser.load(&list[0].key);
+        assert_eq!(browser.current().as_deref(), Some(list[0].key.as_str()));
+
+        // A key that is not a program index is ignored rather than fatal.
+        browser.load("not-a-number");
+        assert_eq!(browser.current().as_deref(), Some(list[0].key.as_str()));
+        return;
+    }
+    eprintln!("no installed VST2 declares more than one program; skipping");
+}

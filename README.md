@@ -20,7 +20,7 @@ Built with Rust, ratatui and cpal. Provides a TUI for managing note inputs, inst
 
 ## Status
 
-**1.1.0.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
+**1.2.0.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
 LADSPA, DSSI, VST2, VST3 and Pure Data patches are really hosted** — instruments
 and audio effects, with their own parameters and their own windows — choz's own
 45 effects are published as a CLAP plugin for other hosts, and choz installs as a
@@ -151,8 +151,8 @@ architecture (x86-64, aarch64, armv7), a `.deb`, an `.rpm` and a `PKGBUILD` for
 Arch, plus `SHA256SUMS.txt`:
 
 ```bash
-tar xzf choz-1.1.0-x86_64-unknown-linux-gnu.tar.gz
-cd choz-1.1.0-x86_64-unknown-linux-gnu
+tar xzf choz-1.2.0-x86_64-unknown-linux-gnu.tar.gz
+cd choz-1.2.0-x86_64-unknown-linux-gnu
 ./install.sh            # uses the binary shipped beside it — no cargo involved
 ```
 
@@ -235,7 +235,7 @@ headroom for plugin DSP at small buffer sizes.
 | `x` / `X` | rack | run that plugin sandboxed |
 | `l` | rack | MIDI learn (or click a knob after pressing `MIDI LEARN`) |
 | `k` | rack | move the cursor between the instrument knobs and the FX ones |
-| `p` | rack | full parameter list of the tab's plugin |
+| `p` | rack | parameters of the tab's instrument (a plugin's own list, or an SF2's reverb / chorus switches) |
 | `P` | anywhere | panic — kill every sounding note |
 | `F4` | anywhere | LIVE ↔ MULTI |
 | `F5` | anywhere | MIDI IN panel: MIDI / WAVE / ACTIVITY (the tabs are clickable) |
@@ -255,7 +255,7 @@ paints over the TUI.
 ## Architecture
 
 ```
-choz/                      11 crates, version 1.1.0
+choz/                      11 crates, version 1.2.0
 ├── crates/
 │   ├── choz-ports/         RT-safe traits every host implements: AudioSource,
 │   │                       FxProcessor, PluginEditor, PluginParam, SandboxStatus
@@ -306,7 +306,7 @@ ring so they are freed off the RT thread.
 
 | | |
 |---|---|
-| choz | **1.1.0** |
+| choz | **1.2.0** |
 | Rust edition | 2021 (`choz-plugin-lv2` is 2024) |
 | Toolchain tested | rustc 1.97.1 |
 | Platform | Linux. ALSA/JACK/PipeWire. Released for x86-64, aarch64 and armv7 |

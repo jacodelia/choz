@@ -140,7 +140,7 @@ impl HostHandlers for ChozHost {
     }
 }
 
-fn host_info() -> HostInfo {
+pub fn host_info() -> HostInfo {
     HostInfo::new("choz", "choz", "https://github.com/jacodelia/choz", "0.1.0")
         .expect("static host info has no interior nul")
 }
@@ -712,6 +712,9 @@ pub struct ClapInstrument {
     /// The plugin's parameters, in the order the UI shows them. `set_param`
     /// indexes this list.
     params: Vec<crate::PluginParam>,
+    /// Its own patches, scanned from the entry's preset-discovery factory at
+    /// load time. Empty for a plugin that publishes none.
+    presets: Vec<choz_ports::PresetEntry>,
 }
 
 impl ClapInstrument {
@@ -722,6 +725,7 @@ impl ClapInstrument {
             queue: Vec::with_capacity(64),
             notes: NoteRegistry::default(),
             params: read_params(path, plugin_id),
+            presets: crate::presets::scan(path),
         })
     }
 }
@@ -766,6 +770,16 @@ impl AudioSource for ClapInstrument {
             std::sync::Arc::new(crate::state::ClapState::new(self.proc.gui.clone()))
                 as choz_ports::StateHandle,
         )
+    }
+
+    fn presets(&self) -> Option<choz_ports::PresetsHandle> {
+        if self.presets.is_empty() {
+            return None;
+        }
+        Some(std::sync::Arc::new(crate::presets::ClapPresets::new(
+            self.proc.gui.clone(),
+            self.presets.clone(),
+        )) as choz_ports::PresetsHandle)
     }
 
     fn render(&mut self, output: &mut [f32], _sample_rate: u32) -> usize {
