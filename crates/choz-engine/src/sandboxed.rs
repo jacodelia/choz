@@ -535,6 +535,33 @@ pub fn sandbox_worker_main() -> bool {
     let (path, id, name) = (Path::new(&args[3]), args[4].as_str(), args[5].as_str());
     let frames: u32 = args[6].parse().unwrap_or(256);
 
+    // Die with the host. A choz that crashes (or is killed) never gets to set
+    // `quit`, and the child's own patience only ever says "nothing asked of us
+    // lately" — so before this, an orphan stayed alive answering nobody. One
+    // was found 35 minutes after its host was gone.
+    // SAFETY: a process-wide prctl with no pointers in it.
+    unsafe {
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+    }
+    // The host may already be gone: `prctl` only arms the signal for deaths
+    // from here on, and the race is real when the crash is at start-up.
+    if unsafe { libc::getppid() } == 1 {
+        return true;
+    }
+
+    // The child renders audio for a realtime thread that is *waiting on it*, so
+    // it has to be scheduled like one. Without this it is an ordinary thread
+    // competing with browsers and compilers, and every time it loses that race
+    // the host gets silence for a block. Best effort: no RT limits (no @audio,
+    // no rtkit) simply leaves it where it was.
+    // SAFETY: sets this process's own scheduling class, no pointers escape.
+    unsafe {
+        let p = libc::sched_param { sched_priority: 70 };
+        if libc::sched_setscheduler(0, libc::SCHED_FIFO, &p) != 0 {
+            libc::nice(-10);
+        }
+    }
+
     if let Err(e) = serve_plugin(format, path, id, name, frames) {
         eprintln!("choz: sandbox for {}: {e}", path.display());
     }
