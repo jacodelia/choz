@@ -450,6 +450,17 @@ one client, so two tabs pointed at the same synth have to be one connection. The
 tab stores the **name**, not an index: ports come and go, and an index into a
 list that changed while choz was closed points at somebody else's synth.
 
+#### HOLD, the way a Keystep does it
+
+The arpeggiator keeps two lists: `held`, the notes the pattern plays from, and
+`down`, the keys **physically** pressed. With HOLD (`latch`) on they are not the
+same list, and the difference is the whole feature: letting go of everything
+keeps the pattern running, and the next key pressed **with nothing down** clears
+`held` and starts a new chord, while a key pressed while another is still down
+joins the chord being held. Keyed off "is the pattern stopped" instead, as it
+was, nothing ever replaced anything — the pattern never stops while latched, so
+every note played piled onto the last chord until the switch was turned off.
+
 ### The clock, from outside
 
 `midi.rs` counts MIDI clock **inside the port's own callback**, which is the last
@@ -631,7 +642,7 @@ and nothing else.
 
 ```mermaid
 flowchart TB
-    MB["Menu bar: FILE · EDIT · HELP (F10)"]
+    MB["Menu bar: FILE · EDIT · HELP (F10) · ♩ MET ▾ · LIVE/MULTI"]
     subgraph Screen
         direction LR
         subgraph Left["IN drawer (F2) — 3 cols shut, 40% open"]
@@ -640,7 +651,7 @@ flowchart TB
         subgraph Mid["RACK — everything the drawers leave"]
             FXP["RACK Panel<br/>tabs · mixer strip · INSTR buttons · BANK · ARP<br/>FX chain row · knob grid · SLOT buttons"]
             TR["TRANSPORT<br/>[PLAY] [STOP] · OUT device"]
-            MM["MIDI IN monitor<br/>tabs: MIDI · KEYS · ROLL · WAVE · SPEC · ACTIVITY"]
+            MM["Bottom panel<br/>tabs: MONITOR · KEYS · WAVE · MIXER<br/>MIXER = a strip per tab: two faders + link · pan · mute · solo"]
         end
         subgraph Right["OUT drawer (F3) — 3 cols shut, 34% open"]
             OP["Output devices + one row per device channel<br/>Enter on a device reloads the rack,<br/>Enter on a channel sends the active tab there,<br/>←/→ set one side only"]
@@ -778,12 +789,21 @@ layers, each measured against what is installed on the dev machine:
    own process, exchanging one block at a time over shared memory. The exchange
    has a **deadline**: if the child does not answer, the host reads silence and
    carries on, so a hung plugin costs a click rather than the stream. A supervisor
-   thread restarts a child that dies. Applied to whatever the probe saw die on
-   teardown, to anything the user pins with the `SBX` button
-   (`<state dir>/plugin-sandbox.json`), and **to every plugin that has a window**:
-   plugin GUIs are the least trustworthy code choz runs, and the sandbox is the
-   only place where one that dies costs a process instead of the app.
-   `CHOZ_SANDBOX_GUI=0` turns that last reason off.
+   thread restarts a child that dies, and the child asks for `SCHED_FIFO` — it is
+   audio, for a realtime thread that is waiting on it. Applied to whatever the
+   probe saw die on teardown and to anything the user pins with the `SBX` button
+   (`<state dir>/plugin-sandbox.json`).
+
+   **Having a window is not a reason**, though it used to be. What that cost was
+   measured on the rig it broke: at 96 kHz and 128 frames a block is 1.33 ms, and
+   one sandboxed Surge XT takes ~0.95 ms of it — every block, because the audio
+   thread hands the work to another process and waits. In-process the same plugin
+   costs 0.13 ms. A rack with two tabs therefore ran out of time under a held
+   pedal and the sound broke up and disappeared, which is a certain failure
+   traded against a possible one. It also cost the tab its **state and preset
+   list**: `SandboxedPlugin` implements `editor()` but not `state()` or
+   `presets()`, so a sandboxed instrument had no bank button and saved no patch
+   with the project. `CHOZ_SANDBOX_GUI=1` brings the old policy back.
 
 Deny-lists remain for two cases the layers above cannot cover, both by name and
 both measured: Carla's own wrappers (they corrupt the allocator rather than
@@ -800,6 +820,14 @@ whichever host can embed into an X11 window; `AudioSource` and `FxProcessor` bot
 expose `editor()`, defaulting to `None`. `choz-ui/src/editor.rs` owns the window:
 a dedicated thread creates it with `x11rb`, hands the XID to the plugin, and
 pumps `idle()` every 30 ms. One window at a time.
+
+**It opens on the screen the user is looking at.** Two monitors are one X screen,
+so a window left at 0,0 is placed by the window manager, and with a second
+monitor attached that regularly meant "the other one" — which reads exactly like
+the editor never opened. The pointer says where the person is: the window is
+centred on the RandR monitor under it, and centred again once the plugin reports
+the size it wants (a 1141×711 editor centred as a 600×400 box hangs off the
+screen). Best effort — no pointer, no RandR, no placement, same as before.
 
 | Format | How |
 |---|---|
@@ -844,6 +872,48 @@ moves **one position** per arrow or wheel click (`ParamShape::nudge`), and every
 control — bank bars included — keeps its own rect in `RackLayout.instr_knobs`,
 which is what the mouse and MIDI learn work off.
 
+#### What is a knob, and what is not
+
+Two things are read from the plugin rather than guessed, because guessing from
+names is how a filter cutoff becomes a checkbox:
+
+* **Automatable or not.** Surge XT publishes 191 `MIDI CC 0|0`… rows — its CC
+  mapping table — without `kCanAutomate`. A knob box is an automation surface
+  (MIDI learn binds to those knobs), so a control the plugin refuses to be driven
+  on is not drawn. The filter is applied where index → id is decided
+  (`Vst3RealInstance`'s parameter table), so the knob box, `set_param` and the
+  GUI's edit feed keep agreeing about what index 12 means.
+* **Switch or fader.** VST3 says so with `stepCount`, and Surge reports `0` for
+  all 800 of its parameters, switches included. What it does answer is
+  `getParamStringByValue`: a parameter whose whole range only ever reads as two
+  words ("Off"/"On") is a switch and is drawn as one — three probes, because an
+  enumeration reads three different things and a continuous parameter reads three
+  numbers.
+
+#### Paging a synth with hundreds of parameters
+
+Surge XT reports more parameters than any panel can show, so the instrument box
+shows a window of them and pages: `◀` `▶` on its top edge
+(`RackButton::InstrPagePrev` / `Next`, `PgUp` / `PgDn`, or
+`TriggerAction::InstrPage*` from a CC — the arrows are learn targets like every
+other button).
+
+**Moving the window re-addresses the bindings, whatever moved it.**
+`App::sync_instr_window` runs after every draw: it compares the window the frame
+actually produced (`instr_knobs[0]`, read back from the panel — the panel is what
+decides how many knobs fit) against the one this tab had last frame, and shifts
+every `LearnTarget::InstrParam` of that tab by the difference. The arrows,
+`PgUp` / `PgDn`, a CC bound to either, the cursor walking off the bottom row, a
+terminal resize — all of them are "the window moved", and none of them has to
+remember to call anything. Doing it in `page_instr` alone was a controller that
+pointed at the wrong parameters from the first arrow press.
+
+Paging itself carries no scroll state: the box already scrolls to keep its
+cursor visible with the cursor on the last visible row, so paging is "put the
+cursor on the last cell of the page we want". A tab whose parameter *count*
+changed is a new instrument, not a moved window: the baseline is adopted and
+nothing shifts. Bindings clamp at the ends of the list rather than falling off.
+
 The named positions carry the value they sit at, not an index: Ardour's `a-delay`
 names ten note divisions over a range of 1..48, so a uniform grid would show the
 wrong name and step to values the plugin never offered.
@@ -887,6 +957,124 @@ opaque blob each format has for that — VST2 chunks, VST3 `IComponent::getState
 rebuild the patch is restored **first** and the knob values applied on top:
 restoring state moves every parameter, so the other order would leave a tab
 sounding like the patch and looking like the knobs.
+
+### A bank that is a folder (`preset_files.rs`)
+
+Some formats hand their patches over — a CLAP preset-discovery factory, VST3
+`IUnitInfo` program lists, DSSI programs. Plenty of plugins have none of that and
+keep their sounds on disk: Surge XT's VST3 build reports **zero** programs and
+ships 637 `.fxp` files, so a tab holding it had a bank button that did nothing
+and no way to reach any of them.
+
+What those files carry is the same blob the state call above produces, inside a
+container header — `.fxp` / `.fxb` (`FPCh` / `FBCh`, the opaque-chunk kinds; the
+`FxCk` / `FxBk` parameter-list kinds are refused, they are not a patch) and
+`.vstpreset` (the `Comp` chunk *is* `IComponent::getState`). So the bank is a
+directory, a preset is a file, and loading one is `PluginState::restore`:
+`App::set_bank_dir` walks the tree (four levels, sub-folder = category = the
+picker's bank chips) and fills the same `plugin_presets` list a plugin's own
+browser fills, which puts the whole library on the existing `◀` `▶` buttons and
+whatever CC is learned on them. The folder is saved with the project
+(`Instrument::bank_dir`) and re-read on load — cheaper than storing 637 paths,
+and it picks up patches added since.
+
+**The folder is found by name.** Asking the user to go looking for it is asking
+them to know where a package put its data, so `preset_files::guess_bank_dir`
+looks for a directory answering to the plugin's name (punctuation removed, so
+"Surge XT" matches `surge-xt`) beside the plugin, in the user's own folders, then
+in the system's — and inside it picks the child holding the **factory** patches
+rather than the one with the most files, because the category names people know
+("Leads", "Pads") are the factory ones. Surge XT's bank button therefore opens on
+637 patches with its own chips instead of on a file manager. What the guess
+cannot find is one `PICK BANK` away, and a tab that already has a folder — from a
+project, or picked by hand — keeps it.
+
+### The click (`metronome.rs`)
+
+Tempo and time signature are the transport's, so the click and a tempo-synced
+delay cannot disagree; what the module owns is whether it sounds, how loud, and
+which of three sounds. It renders in the audio callback straight into the first
+output pair **after** the tabs are mixed — through no tab's FX, because a
+metronome a reverb smears is one you cannot play to.
+
+It keeps **its own frame counter**, advanced per block. The transport only moves
+while it is rolling, and a metronome is for practising: it has to tick with the
+transport stopped, which is exactly when it is wanted. Switching it on resets
+that counter, so the first beat is the beat you switched it on for. The downbeat
+is a different pitch rather than a louder one — on a stage, "louder" is the first
+thing the room takes away.
+
+#### A window outliving its plugin is a deadlock
+
+The editor thread lives *inside* the plugin: it calls `idle()` on it every 30 ms,
+which for a JUCE-based plugin runs that plugin's own message loop. Dropping the
+instrument out from under it hangs the interface — the destructor wants locks the
+editor thread is holding — and that is what froze choz when a tab was closed with
+the window open (main thread in `futex`, editor thread in `futex`, the plugin's
+own timer thread in `futex`, read straight off `/proc` while the session sat
+there). `App::close_editor_for` now runs first everywhere an instrument is
+dropped or replaced: closing a tab, changing its instrument, reloading the rack
+after a device change. Dropping `EditorWindow` signals the thread, joins it, and
+only then is the plugin free to go — and it joins **with a deadline**: two
+seconds later the thread is left behind (it keeps its `Arc` on the editor
+handle, so nothing it can still touch has been freed) and the interface carries
+on. Order first, deadline second; freezing is not on the list.
+
+### Two faders in a strip
+
+A tab plays out of a **pair** of channels, so its level is two numbers, not one:
+`RackSlot::gain` and `gain_r`, with `link` keeping them equal — which is what a
+tab wants nearly always, and so is what it starts as. The pan law is unchanged
+and applies on top: `channel_gains` is `(gain_l · cos θ, gain_r · sin θ)`, so
+breaking the link trims one side of a lopsided instrument without faking it with
+the pan, which would move the image as well as the level.
+
+`App::nudge_gain` and `set_gain_side` are the only writers, and both consult the
+link, so nothing else in the interface has to know about it. The RACK's own
+`VOL` moves **both** sides by the same delta whatever the link says, which keeps
+the trim between them while the tab as a whole goes up or down. The project
+stores the second fader only when the link is broken (`Mixer::gain_r`,
+`Mixer::link`, both `Option`), so every project written before the strips had two
+faders opens sounding exactly as it did.
+
+### When the audio thread runs out of time
+
+The report is always the same sentence — *"the sound saturates and then
+disappears, and comes back when I stop playing"* — and from outside, a rack that
+runs out of CPU, a sandboxed plugin missing its deadline, and an output that is
+clipping look identical. `meter::Load` separates them: the callback times itself
+(two clock reads a block) and each slot separately, and `App::poll_health` turns
+that into one log line a second, **only when something went wrong** — the block
+budget, the worst block, the dearest tab *by name*, how many blocks went over out
+of how many the device asked for, how many a sandbox missed, how many clipped,
+how many plugins restarted, and the pid (two instances share one log file). Past
+5 % of blocks over budget it also says what to do about it, with the latency the
+bigger buffer costs. The status bar carries the live `DSP %`.
+
+That line is what found the bug above: `383/383 blocks over budget` with the
+device asking for 750 a second — half the audio was never rendered at all.
+
+### Drawing into a window that is too small
+
+ratatui's answer to a rect outside the buffer is a **panic**, which is the whole
+application gone because somebody dragged a window narrow — and it looked, from
+the outside, like the wallpaper disappearing. Two places computed positions from
+fixed offsets without checking the width (the RACK's button row, the TRANSPORT's
+buttons); both now clamp to the panel, draw what fits, and hand back the rect
+that is really on screen so the mouse and the picture keep agreeing. The test
+draws the whole interface at six sizes, 20×8 included, for every tab of the
+bottom panel.
+
+### Saying "loading" before going quiet
+
+Instantiating a plugin blocks the UI thread for as long as the plugin takes
+(Surge XT reads its whole factory library), and it used to happen inside the
+keypress that asked for it: the interface froze with the picker still on screen
+and nothing to explain it. Anything the user can click now *promises* the load —
+`App::pending_load` plus the name to show — the frame draws with a `Loading …`
+box over everything, and the run loop calls `App::run_pending_load` immediately
+after that draw. A project load still calls `load_synth` directly: there is no
+frame to wait for in the middle of rebuilding a rack.
 
 ### The desktop, and why it is two paths
 

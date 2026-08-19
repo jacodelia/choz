@@ -20,7 +20,7 @@ a notas), AutoTune y un arpegiador por tab; 45 efectos
 propios (**la suite está completa**), que además se publican como un `.clap`
 para usarlos en cualquier otro host; un patch de Max se importa hasta donde se
 puede, diciendo qué no; y hay guardia de acople en la entrada. **La 1.0.0 está
-publicada y sus paquetes verificados; la 1.2.1 es este árbol.** 563 tests, `clippy --workspace
+publicada y sus paquetes verificados; la 1.3.0 es este árbol.** 580 tests, `clippy --workspace
 --all-targets -D warnings` limpio.
 
 Lo cerrado se fue de aquí el 2026-08-15 y el 2026-08-16; las comprobaciones con
