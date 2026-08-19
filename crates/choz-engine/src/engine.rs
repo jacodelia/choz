@@ -28,8 +28,11 @@ type Source = Box<dyn AudioSource>;
 pub(crate) struct Slot {
     source: Source,
     fx: FxChain,
-    /// Linear output gain (0.0..=2.0).
+    /// Linear output gain (0.0..=2.0). Two of them, one per side: a desk lets
+    /// you trim one channel of a stereo instrument against the other, and a
+    /// linked strip simply keeps them equal — see `App::set_gain_side`.
     gain: f32,
+    gain_r: f32,
     /// Stereo position, -1.0 = hard left, 0.0 = center, 1.0 = hard right.
     pan: f32,
     mute: bool,
@@ -81,6 +84,7 @@ impl Slot {
             source,
             fx: Vec::new(),
             gain: 1.0,
+            gain_r: 1.0,
             pan: 0.0,
             mute: false,
             out_pair: (0, 1),
@@ -137,13 +141,14 @@ impl Slot {
         self.pending[i].take()
     }
 
-    /// Constant-power pan law → (left, right) channel gains.
+    /// Constant-power pan law → (left, right) channel gains, each side times
+    /// its own fader.
     fn channel_gains(&self) -> (f32, f32) {
         if self.mute {
             return (0.0, 0.0);
         }
         let theta = (self.pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
-        (self.gain * theta.cos(), self.gain * theta.sin())
+        (self.gain * theta.cos(), self.gain_r * theta.sin())
     }
 }
 
@@ -164,6 +169,7 @@ pub(crate) enum EngineCommand {
     SetSlotMix {
         slot: usize,
         gain: f32,
+        gain_r: f32,
         pan: f32,
         mute: bool,
     },
@@ -1146,6 +1152,13 @@ impl AudioEngine {
         self.states.get(slot)?.as_ref()?.save()
     }
 
+    /// Whether slot `slot`'s instrument can be handed a state blob at all.
+    /// Cheap — it asks the handle, not the plugin — because the UI reads it
+    /// every frame to decide whether the tab can take a folder of presets.
+    pub fn slot_has_state(&self, slot: usize) -> bool {
+        matches!(self.states.get(slot), Some(Some(_)))
+    }
+
     /// Restore a blob saved by [`Self::slot_state`] onto the same plugin.
     pub fn set_slot_state(&self, slot: usize, data: &[u8]) {
         if let Some(Some(h)) = self.states.get(slot) {
@@ -1203,6 +1216,18 @@ impl AudioEngine {
     }
 
     /// Live counters when slot `slot`'s instrument plays in its own process.
+    /// Blocks every sandboxed plugin in the rack has failed to answer in time,
+    /// and how many times one has crashed and come back. Each missed block is a
+    /// hole the user heard, so this is half of "why did the sound break up".
+    pub fn sandbox_health(&self) -> (u64, u64) {
+        let all = self
+            .sandboxes
+            .iter()
+            .flatten()
+            .chain(self.fx_sandboxes.iter().flatten().flatten());
+        all.fold((0, 0), |(m, r), s| (m + s.missed(), r + s.restarts()))
+    }
+
     pub fn slot_sandbox(&self, slot: usize) -> Option<choz_ports::SandboxStatus> {
         self.sandboxes.get(slot).cloned().flatten()
     }
@@ -1355,13 +1380,14 @@ impl AudioEngine {
 
     /// Set slot `slot`'s mixer strip: linear `gain`, `pan` (-1 left .. 1 right)
     /// and `mute`.
-    pub fn set_slot_mix(&mut self, slot: usize, gain: f32, pan: f32, mute: bool) {
+    pub fn set_slot_mix(&mut self, slot: usize, gain: f32, gain_r: f32, pan: f32, mute: bool) {
         if slot >= self.slot_count {
             return;
         }
         self.send(EngineCommand::SetSlotMix {
             slot,
             gain,
+            gain_r,
             pan,
             mute,
         });
@@ -1658,6 +1684,7 @@ impl AudioEngine {
 /// the device buffer. Every backend shares [`RtState::apply_commands`] and
 /// [`RtState::render`]; only the hand-off to the device differs.
 fn audio_callback(buf: &mut [f32], state: &mut RtState) {
+    let started = std::time::Instant::now();
     state.apply_commands();
     let frames = buf.len() / 2;
     state.drain_capture(frames);
@@ -1666,6 +1693,14 @@ fn audio_callback(buf: &mut [f32], state: &mut RtState) {
         buf[f * 2] = state.mix[0][f];
         buf[f * 2 + 1] = state.mix[1][f];
     }
+    publish_load(started, frames, state.sample_rate);
+}
+
+/// What this block cost against what it had. One clock read per block, and the
+/// only place either backend measures it — see [`crate::meter::Load`].
+pub(crate) fn publish_load(started: std::time::Instant, frames: usize, sample_rate: u32) {
+    let budget = std::time::Duration::from_secs_f64(frames as f64 / sample_rate.max(1) as f64);
+    crate::meter::load().publish(started.elapsed(), budget);
 }
 
 impl RtState {
@@ -1712,11 +1747,13 @@ impl RtState {
                 EngineCommand::SetSlotMix {
                     slot,
                     gain,
+                    gain_r,
                     pan,
                     mute,
                 } => {
                     if let Some(s) = state.slots.get_mut(slot) {
                         s.gain = gain;
+                        s.gain_r = gain_r;
                         s.pan = pan;
                         s.mute = mute;
                     }
@@ -1944,7 +1981,8 @@ impl RtState {
         // effect problem, which look the same from a panel.
         crate::meter::capture_levels().publish(capture, frames);
 
-        for slot in slots.iter_mut() {
+        for (slot_index, slot) in slots.iter_mut().enumerate() {
+            let slot_started = std::time::Instant::now();
             // Synths always render (envelope tails / live keys); generators
             // (tone, WAV) honor the transport play flag.
             if !playing && !slot.source.plays_on_transport_stop() {
@@ -2134,6 +2172,25 @@ impl RtState {
             for f in 0..(n / 2) {
                 mix[l][f] += sc[f * 2] * gl;
                 mix[r][f] += sc[f * 2 + 1] * gr;
+            }
+            // What this tab cost, source and FX chain together. Two clock
+            // reads a block per tab, and the only way the log can name which
+            // one ran the callback out of time.
+            crate::meter::load().publish_slot(slot_index, slot_started.elapsed());
+        }
+
+        // The click, on top of everything and through no tab's FX: a metronome
+        // that a reverb smears is a metronome you cannot play to. It goes to
+        // the first output pair, which is the one being listened on.
+        if mix.len() >= 2 {
+            let n = frames.min(mix[0].len()).min(mix[1].len());
+            let len = (n * 2).min(scratch.len());
+            let sc = &mut scratch[..len];
+            sc.fill(0.0);
+            crate::metronome::metronome().render(sc, n, sr);
+            for f in 0..sc.len() / 2 {
+                mix[0][f] += sc[f * 2];
+                mix[1][f] += sc[f * 2 + 1];
             }
         }
 
@@ -3572,6 +3629,7 @@ mod tests {
             .push(EngineCommand::SetSlotMix {
                 slot: 0,
                 gain: 0.5,
+                gain_r: 0.5,
                 pan: -1.0,
                 mute: false,
             })
@@ -3592,6 +3650,7 @@ mod tests {
             .push(EngineCommand::SetSlotMix {
                 slot: 0,
                 gain: 0.5,
+                gain_r: 0.5,
                 pan: -1.0,
                 mute: true,
             })

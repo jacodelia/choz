@@ -386,6 +386,117 @@ impl PitchMeter {
     }
 }
 
+/// How long the audio callback takes against how long it has.
+///
+/// The one number that separates "a plugin is broken" from "this machine cannot
+/// render this rack in time": at 96 kHz with 128-frame blocks a callback has
+/// **1.33 ms**, and everything it does — every synth voice, every effect, every
+/// round trip to a sandboxed plugin — comes out of that. Past 100 % the device
+/// gets a hole instead of a block, which is heard as the sound breaking up and
+/// then going away, and which nothing in the interface could say before this.
+///
+/// Written from the audio thread with relaxed atomics and one `Instant` pair
+/// per block, which is a clock read, not a syscall.
+pub struct Load {
+    /// Microseconds the last block took, and the worst since the last read.
+    last_us: AtomicU32,
+    peak_us: AtomicU32,
+    /// Microseconds the block *had*, from frames and sample rate.
+    budget_us: AtomicU32,
+    /// Blocks rendered, and blocks that took longer than they had.
+    blocks: AtomicU32,
+    over: AtomicU32,
+    /// The slot that cost the most in the worst block, and what it cost in
+    /// microseconds. Without this "the callback ran out of time" names no
+    /// culprit, and the tab that is actually expensive is the one thing the
+    /// person playing can change.
+    worst_slot: AtomicU32,
+    worst_slot_us: AtomicU32,
+}
+
+pub fn load() -> &'static Load {
+    static L: Load = Load {
+        last_us: AtomicU32::new(0),
+        peak_us: AtomicU32::new(0),
+        budget_us: AtomicU32::new(0),
+        blocks: AtomicU32::new(0),
+        over: AtomicU32::new(0),
+        worst_slot: AtomicU32::new(0),
+        worst_slot_us: AtomicU32::new(0),
+    };
+    &L
+}
+
+impl Load {
+    /// Called at the end of every block with what it took and what it had.
+    pub fn publish(&self, took: std::time::Duration, budget: std::time::Duration) {
+        let us = took.as_micros().min(u32::MAX as u128) as u32;
+        let budget_us = budget.as_micros().min(u32::MAX as u128) as u32;
+        self.last_us.store(us, Ordering::Relaxed);
+        self.budget_us.store(budget_us, Ordering::Relaxed);
+        self.peak_us.fetch_max(us, Ordering::Relaxed);
+        self.blocks.fetch_add(1, Ordering::Relaxed);
+        if budget_us > 0 && us > budget_us {
+            self.over.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Called per slot per block, from the audio thread: which tab this was and
+    /// how long its source took. Only the worst since the last read is kept.
+    pub fn publish_slot(&self, slot: usize, took: std::time::Duration) {
+        let us = took.as_micros().min(u32::MAX as u128) as u32;
+        if us > self.worst_slot_us.load(Ordering::Relaxed) {
+            self.worst_slot_us.store(us, Ordering::Relaxed);
+            self.worst_slot.store(slot as u32, Ordering::Relaxed);
+        }
+    }
+
+    /// `(tab, milliseconds)` of the most expensive source since the last read.
+    pub fn take_worst_slot(&self) -> (usize, f32) {
+        let us = self.worst_slot_us.swap(0, Ordering::Relaxed);
+        (
+            self.worst_slot.load(Ordering::Relaxed) as usize,
+            us as f32 / 1000.0,
+        )
+    }
+
+    /// Fraction of the budget the last block used. 1.0 is the edge of a hole.
+    pub fn last(&self) -> f32 {
+        let (us, budget) = (
+            self.last_us.load(Ordering::Relaxed) as f32,
+            self.budget_us.load(Ordering::Relaxed) as f32,
+        );
+        if budget <= 0.0 {
+            0.0
+        } else {
+            us / budget
+        }
+    }
+
+    /// `(peak fraction, blocks, blocks over budget)` since the last
+    /// [`Self::take`], which is what the health poller reports and resets.
+    pub fn take(&self) -> (f32, u32, u32) {
+        let budget = self.budget_us.load(Ordering::Relaxed) as f32;
+        let peak = self.peak_us.swap(0, Ordering::Relaxed) as f32;
+        let blocks = self.blocks.swap(0, Ordering::Relaxed);
+        let over = self.over.swap(0, Ordering::Relaxed);
+        let peak = if budget <= 0.0 { 0.0 } else { peak / budget };
+        (peak, blocks, over)
+    }
+
+    /// Microseconds a block has, for a message that wants the real numbers.
+    pub fn budget_us(&self) -> u32 {
+        self.budget_us.load(Ordering::Relaxed)
+    }
+
+    pub fn clear(&self) {
+        self.last_us.store(0, Ordering::Relaxed);
+        self.peak_us.store(0, Ordering::Relaxed);
+        self.blocks.store(0, Ordering::Relaxed);
+        self.over.store(0, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
