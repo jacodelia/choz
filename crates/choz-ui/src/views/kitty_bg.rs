@@ -164,6 +164,9 @@ pub fn sync(
         *cells = None;
         return false;
     }
+    if std::env::var_os("CHOZ_DEBUG_BG").is_some() {
+        eprintln!("choz: wallpaper placed {px_w}x{px_h}px over {}x{} cells", area.width, area.height);
+    }
     *state = Some(want);
     true
 }

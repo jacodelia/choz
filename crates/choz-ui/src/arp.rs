@@ -221,6 +221,10 @@ pub struct Arp {
     /// Held keys in the order they were pressed — `AsPlayed` needs the order,
     /// and the other modes sort a copy.
     held: Vec<(u8, u8)>,
+    /// The keys **physically** down, which with `latch` on is not the same
+    /// list: that is what tells a new chord from a note added to the one being
+    /// held. See [`Arp::note_on`].
+    down: Vec<u8>,
     step: usize,
     /// The transport sample the current note's gate closes on, when it was
     /// scheduled. `None` for the free-running clock, which has no timeline.
@@ -268,6 +272,7 @@ impl Default for Arp {
         Self {
             settings: ArpSettings::default(),
             held: Vec::new(),
+            down: Vec::new(),
             step: 0,
             scheduled_off: None,
             sounding: None,
@@ -302,9 +307,21 @@ impl Arp {
     /// A key went down. The first key of a new chord starts the pattern
     /// immediately, so the first note is heard when it is played rather than on
     /// the next step boundary.
+    ///
+    /// **With HOLD on, what starts a new chord is the first key pressed with
+    /// nothing else down** — a Keystep's hold, and the only version of it that
+    /// is playable: keys pressed together (or rolled, with one still down) join
+    /// the chord being held, and letting go of all of them and playing
+    /// something else replaces it. Keyed off `next_step` instead, as it was,
+    /// nothing ever replaced anything: the pattern never stops while latched,
+    /// so every note played landed on top of the last chord until the switch
+    /// was turned off.
     pub fn note_on(&mut self, note: u8, vel: u8, now: Instant) {
-        if self.settings.latch && self.next_step.is_none() {
+        if self.settings.latch && self.down.is_empty() {
             self.held.clear();
+        }
+        if !self.down.contains(&note) {
+            self.down.push(note);
         }
         self.held.retain(|(n, _)| *n != note);
         self.held.push((note, vel));
@@ -327,8 +344,10 @@ impl Arp {
         }
     }
 
-    /// A key came up. With `latch` on the pattern keeps its notes.
+    /// A key came up. With `latch` on the pattern keeps its notes — but the key
+    /// is no longer down, which is what lets the next one start a new chord.
     pub fn note_off(&mut self, note: u8) {
+        self.down.retain(|n| *n != note);
         if self.settings.latch {
             return;
         }
@@ -531,8 +550,15 @@ impl Arp {
     pub fn reset(&mut self, out: &mut Vec<ArpEvent>) {
         self.silence(out);
         self.held.clear();
+        self.down.clear();
         self.next_step = None;
         self.step = 0;
+    }
+
+    /// The notes the pattern is playing from, for the tests.
+    #[cfg(test)]
+    fn notes_for_test(&self) -> Vec<u8> {
+        self.held.iter().map(|(n, _)| *n).collect()
     }
 
     /// The snapshot the panel draws from.
@@ -814,7 +840,7 @@ impl ArpSettings {
             ),
             (
                 ArpParam::Latch,
-                "LATCH",
+                "HOLD",
                 self.latch as u8 as f32,
                 ParamShape::Toggle,
             ),
@@ -1010,4 +1036,32 @@ mod tests {
 
         t.set_playing(was);
     }
+    /// HOLD, the way a Keystep does it: let go of everything and the pattern
+    /// keeps playing; the next key with nothing down starts a **new** chord,
+    /// and a key pressed while another is still down joins the one being held.
+    #[test]
+    fn hold_replaces_the_chord_when_the_hands_have_left_the_keys() {
+        let mut a = Arp::new(ArpSettings {
+            on: true,
+            latch: true,
+            ..ArpSettings::default()
+        });
+        let t0 = Instant::now();
+        a.note_on(60, 100, t0);
+        a.note_on(64, 100, t0);
+        a.note_off(60);
+        a.note_off(64);
+        assert_eq!(a.notes_for_test(), vec![60, 64], "hold keeps the chord");
+
+        // Hands back on the keys: a new chord, not a sixth note added to the
+        // old one. Rolled, so the second key arrives with the first still down.
+        a.note_on(67, 100, t0);
+        a.note_on(71, 100, t0);
+        assert_eq!(
+            a.notes_for_test(),
+            vec![67, 71],
+            "the new chord replaces the held one, and both its keys are in it"
+        );
+    }
+
 }
