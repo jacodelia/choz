@@ -221,16 +221,23 @@ pub fn set_forced(format: PluginFormat, path: &Path, id: &str, on: bool) {
 }
 
 /// Whether this plugin should be hosted out of process: because the user said
-/// so, because the probe saw it die on the way out, or because it has a window.
+/// so, or because the probe saw it die on the way out.
 ///
-/// A window is a reason on its own. Plugin GUIs are the least trustworthy code
-/// choz runs — guitarix's 31 X11 UIs segfault whatever loads them, and the
-/// deny-list that hides them only exists because there was nowhere safe to open
-/// them. There is now: the plugin that owns the window also owns the process
-/// that dies with it, and the supervisor puts a new one back.
+/// **Having a window is not a reason.** It used to be — plugin GUIs are the
+/// least trustworthy code choz runs, and a crash in one costs a child process
+/// instead of the session. What that cost in exchange was measured on the rig
+/// this was reported from: at 96 kHz and 128 frames a block is **1.33 ms**, and
+/// one sandboxed Surge XT takes **~0.95 ms of it**, every block, because the
+/// realtime thread has to hand the block to another process and wait for the
+/// answer. The same plugin in-process costs **0.13 ms**. So a rack with two
+/// tabs ran out of time under a held pedal and the sound broke up and went
+/// away — which is a worse failure, and a certain one, traded against a crash
+/// that may never come.
 ///
-/// `CHOZ_SANDBOX_GUI=0` turns this half off for whoever would rather pay the
-/// crash than the extra process.
+/// What still sandboxes is what actually crashed: a probe verdict of
+/// [`Verdict::CrashesOnTeardown`], or the user asking for it with `x` on the
+/// rack. `CHOZ_SANDBOX_GUI=1` brings the old behaviour back for whoever would
+/// rather pay the process than the crash.
 pub fn wants_sandbox(format: PluginFormat, path: &Path, id: &str) -> bool {
     if forced(format, path, id) {
         return true;
@@ -241,8 +248,8 @@ pub fn wants_sandbox(format: PluginFormat, path: &Path, id: &str) -> bool {
 
 fn sandbox_guis() -> bool {
     std::env::var("CHOZ_SANDBOX_GUI")
-        .map(|v| v != "0")
-        .unwrap_or(true)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 /// Set once a spawned child turns out not to understand the probe flag, so a

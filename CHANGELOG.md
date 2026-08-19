@@ -199,6 +199,259 @@ fallos que ninguna corrida por crate mostraba y que sólo aparecían al correr
 
 ---
 
+## [1.3.0] — 2026-08-19
+
+La versión que salió de tocar con ella. Todo lo de abajo se reprodujo en el
+equipo del reporte —Keystation Pro 88 con pedal en una tab, KeyStep con Surge XT
+en la otra, JACK a 96 kHz con 128 frames— y se midió antes de tocar código.
+
+**Lo que se rompía:**
+
+- **El sonido se caía bajo el pedal.** No era el DSP: era que un plugin con
+  ventana se hosteaba fuera de proceso, y ese viaje cuesta **0.95 ms de los
+  1.33 ms** que tiene un bloque (el mismo plugin en proceso: 0.13 ms). Ahora
+  sólo se aísla lo que de verdad se cayó, o lo que el usuario pide con `x`.
+- **choz se cerraba al achicar o maximizar la ventana** — un rect fuera del
+  buffer es un panic de ratatui — y **se congelaba al cerrar una tab con la
+  ventana del plugin abierta**, en un deadlock contra el hilo del editor.
+- **La ventana del plugin abría en el otro monitor**, que se lee igual que si no
+  hubiera abierto.
+- **El banco de presets no llegaba a los patches**: no aparecía en VST2/VST3,
+  mostraba una carpeta vacía en los u-he, o listaba 128 casilleros sin nombre.
+
+**Lo que trae:**
+
+- **MIXER**: una tira por tab con un fader por canal de salida y link entre los
+  dos, paneo, mute y solo, con paginado; teclado y rueda en el mismo paso que el
+  `VOL` del rack.
+- **Metrónomo** sobre el mismo transporte que leen los plugins, que suena con el
+  transporte parado — que es cuando se lo quiere.
+- **Paginador** de los parámetros del instrumento, **con los CC aprendidos
+  siguiendo a la caja** se mueva como se mueva.
+- **Bancos de patches en archivos**, encontrados por el nombre del plugin:
+  637 de Surge XT, 669 de TyrellN6, 282 de TripleCheese.
+- **HOLD del arpegiador como el de un Keystep**, mensaje de carga antes de que
+  el hilo se quede mudo, y un log que dice cuándo el audio se queda sin tiempo,
+  de qué tab es la culpa y qué hacer al respecto.
+
+580 tests, `clippy --workspace --all-targets` limpio.
+
+---
+
+### 2026-08-19 — el sandbox se comía el bloque, y ratatui se llevaba la app
+
+#### Corregido
+- **El sonido se caía porque cada plugin con ventana se hosteaba fuera de
+  proceso.** `wants_sandbox` trataba "tiene GUI" como razón suficiente, así que
+  Surge XT corría en un hijo y **cada bloque de audio cruzaba dos procesos**.
+  Medido en el equipo del reporte (JACK a 96 kHz / 128 = **1.33 ms de
+  presupuesto**): esa sola tab costaba **~0.95 ms**, el mismo plugin en proceso
+  cuesta **0.13 ms**. Con el pedal sostenido y las dos tabs sonando, el callback
+  se pasaba del bloque y el sonido se rompía hasta desaparecer, recuperándose al
+  dejar de tocar. Ahora sólo van al sandbox los que **realmente** se cayeron
+  (veredicto `CrashesOnTeardown`) o los que el usuario manda con `x`;
+  `CHOZ_SANDBOX_GUI=1` devuelve el comportamiento anterior. De regalo, la tab
+  vuelve a tener **banco de presets y estado**: `SandboxedPlugin` no implementa
+  `state()` ni `presets()`, que es por qué el botón BANK no aparecía en VST2/3.
+  Y si igual se usa el sandbox, el hijo ahora pide `SCHED_FIFO`: es audio para
+  un hilo de tiempo real que lo está esperando.
+- **choz se cerraba al achicar o maximizar la ventana.** La fila de botones del
+  RACK y los del TRANSPORT se dibujaban en posiciones fijas sin mirar el ancho
+  del panel, y un rect fuera del buffer es un **panic** de ratatui: la
+  aplicación entera desaparecía por redimensionar una ventana — que es lo que se
+  veía como "se perdió el fondo". Ahora se dibuja lo que entra y el rect que se
+  devuelve es la parte que está realmente en pantalla, así el mouse y el dibujo
+  siguen coincidiendo. Hay test que dibuja toda la interfaz en seis tamaños
+  (20×8 incluido) por cada pestaña del panel de abajo.
+- **La ventana del plugin se abría en el otro monitor.** Se creaba en 0,0 y la
+  ubicaba el gestor de ventanas; con dos pantallas eso significaba, seguido, "la
+  otra" — que se lee igual que si el editor no hubiera abierto. Ahora se centra
+  en el monitor donde está el puntero (RandR), y se re-centra cuando el plugin
+  informa el tamaño que quiere.
+- **Los parámetros que el plugin dice que no se pueden automatizar ya no se
+  dibujan.** Surge XT publica 191 filas `MIDI CC 0|0`, `MIDI CC 0|1`… sin
+  `kCanAutomate`: casi doscientos faders que no hacen nada, entre el usuario y
+  los que sí. Se filtran donde se decide índice → id, así el knob box,
+  `set_param` y el feed de ediciones de la GUI siguen de acuerdo sobre qué es el
+  índice 12.
+- **Los interruptores se dibujan como interruptores.** Surge informa `stepCount
+  = 0` para sus 800 parámetros, switches incluidos, así que los números no
+  alcanzan; lo que sí contesta es cómo *se lee* un valor. Un parámetro cuyo
+  rango entero sólo muestra dos palabras ("Off"/"On") es un switch y se dibuja
+  como tal: 69 de ellos en Surge XT. No es adivinar por el nombre — es lo que el
+  plugin dice.
+
+- **choz se congelaba al cerrar una tab con la ventana del plugin abierta.** El
+  hilo del editor vive *dentro* del plugin — le llama `idle()` cada 30 ms, y en
+  uno hecho con JUCE (Surge XT) eso corre su propio bucle de mensajes. Soltar el
+  instrumento debajo de ese hilo es un deadlock: el destructor toma los locks
+  que el hilo del editor ya tiene. Se encontró con la sesión colgada todavía
+  abierta: hilo principal en `futex`, hilo del editor en `futex`, `JUCE Timer`
+  en `futex`. Ahora la ventana se cierra **antes** — al cerrar una tab, al
+  cambiar de instrumento, al recargar el rack — que es el orden que funciona. Y
+  como segunda línea, soltar la ventana espera a su hilo **con plazo**: si a los
+  dos segundos no cerró, se lo deja atrás (conserva su `Arc`, así que no hay nada
+  liberado que pueda tocar) y choz sigue andando, en vez de congelarse en medio
+  de un set porque una ventana no quiso cerrarse.
+- **El banco de un plugin sin programas se encuentra solo.** Había que ir a
+  buscar la carpeta con un explorador de archivos; ahora `guess_bank_dir` la
+  busca por el nombre del plugin (sin puntuación: "Surge XT" encuentra
+  `surge-xt`) en donde un paquete de Linux o el usuario las ponen, y dentro
+  elige la carpeta de fábrica antes que la que tenga más archivos — porque las
+  categorías que la gente conoce son las de fábrica. Con eso, `BANK/PRESET` de
+  Surge XT abre directamente con **637 patches** y sus chips: `Basses`, `Brass`,
+  `Chords`, `FX`, `Keys`, `Leads`… y `Leads · Butter` es dos teclas. Lo que la
+  búsqueda no encuentra sigue a un `PICK BANK` de distancia.
+- **Los patches de u-he también.** Sus plugins no usan `.fxp` ni `.vstpreset`:
+  guardan los sonidos como archivos de texto `.h2p`, y **el chunk de estado del
+  plugin es ese mismo texto** — comprobado cargando "Bell Flower" en TyrellN6 y
+  midiendo que el estado cambia y suena. Así que `.h2p` entra como formato de
+  preset (sin contenedor: el archivo *es* el patch) y la búsqueda por nombre
+  ahora mira dos niveles, porque los fabricantes archivan por fabricante
+  primero: `~/.u-he/TyrellN6/…` no responde al nombre de ningún plugin en su
+  primer nivel. Bajando por las puertas únicas del camino
+  (`Presets/TyrellN6/<categoría>`) se llega a donde están las categorías:
+  **669 patches** en TyrellN6 y **282** en TripleCheese, en VST2 y en VST3.
+- **Una lista de casilleros numerados no es un banco.** El VST3 de TyrellN6
+  publica 128 programas llamados `Program 0`, `Program 1`… — una lista sin
+  información, parada entre el músico y los 669 patches que u-he instaló en la
+  misma máquina. Un banco cuyos nombres no nombran nada (vacíos, un número, o
+  `Program 12`) deja pasar los archivos. Los que sí nombran —Pianoteq, por
+  ejemplo— siguen mandando ellos.
+
+#### Añadido
+- **El log dice cuándo el audio se queda sin tiempo, y de quién es la culpa.**
+  Un medidor de carga en el callback (`meter::Load`, dos lecturas de reloj por
+  bloque) publica cuánto tardó contra cuánto tenía, y por tab. Una vez por
+  segundo, y sólo si algo pasó, sale una línea con el presupuesto, el peor
+  bloque, **la tab más cara con su nombre**, cuántos bloques se pasaron de los
+  que el dispositivo pedía, cuántos perdió un sandbox, cuántos clipearon y
+  cuántos reinicios de plugin hubo — con el pid, porque dos instancias comparten
+  el archivo de log. Si más del 5 % de los bloques se pasa, agrega qué hacer:
+  el doble de buffer y cuánta latencia cuesta. La barra de estado muestra
+  `DSP %` en vivo. Ahí se vio el colapso: `383/383 bloques pasados` con el
+  dispositivo pidiendo 750 por segundo — la mitad del audio directamente no se
+  renderizó.
+- **El mixer ahora son tiras verticales**, como el de seqterm: una columna por
+  tab con su fader de arriba a abajo, sus flags `M`/`S` y su paneo. **Pagina**
+  cuando el rack es más ancho que el panel (`◀ ▶` con la posición de la
+  ventana), y la ventana sigue a la tab activa, sin un scroll aparte que
+  mantener en sincronía.
+- **Cada tira tiene un fader por canal de salida y un link entre los dos.** Una
+  tab sale en estéreo, así que su nivel son dos: `≡` en la columna del medio los
+  mueve juntos (lo que quiere una tab casi siempre, y por eso es como arranca),
+  `⋮` los suelta para compensar un instrumento que pega más de un lado sin
+  falsear el paneo. El `VOL` del RACK sigue siendo el nivel de la tab entera:
+  mueve los dos lados **conservando el desnivel** entre ellos. Volver a linkear
+  toma el más alto de los dos, porque el bajo era el que estaba recortado. El
+  motor recibe las dos ganancias y la ley de paneo se aplica sobre cada una; el
+  proyecto guarda el segundo fader sólo cuando el link está roto, así todo lo
+  escrito antes abre sonando igual.
+- **El nivel se mueve con la rueda y con las flechas, en el mismo paso que el
+  `VOL` del RACK** (0.05): la rueda sobre un fader, y `↑` `↓` cuando el MIXER
+  tiene el foco — `Tab` lo alcanza mientras esa pestaña está a la vista, o un
+  click en una tira. Ahí `←` `→` caminan el desk (y lo paginan), `l` ata o suelta
+  el link, `k` elige a qué lado apuntan las flechas en una tira suelta, y `m` /
+  `S` / `,` / `.` son los mismos de siempre. La parte llena del fader se dibuja
+  en octavos, así que cuatro filas de celdas siguen leyéndose como cuarenta
+  posiciones y no como cuatro.
+- **El menú del metrónomo se mueve con flechas y con la rueda**, no sólo con
+  Enter: un tempo cuatro pasos arriba estaba a cuarenta pasos de distancia si la
+  única dirección era hacia adelante. El menú queda abierto, que es lo que
+  permite escuchar el cambio.
+- Dos sondas nuevas que quedan en el árbol porque contestan preguntas que sólo
+  el hardware contesta: `sf2_voices` (cuánto cuesta un pedalazo, voz por voz —
+  96 teclas sostenidas en DSoundFontV4 son el **12 %** del bloque, así que el SF2
+  nunca fue el problema) y `param_shapes` (qué dice un plugin de sus parámetros
+  frente a qué dibuja choz).
+
+---
+
+### 2026-08-18 — el hijo del sandbox quemaba un núcleo entero
+
+#### Corregido
+- **Cada plugin en sandbox giraba al 100 % de un núcleo, siempre, tocara o no.**
+  `bridge.rs::wait_until` esperaba con `spin_loop` más `sched_yield` en bucle:
+  correcto para el **host**, que es el hilo de audio y tiene un deadline de dos
+  tercios de bloque, y desastroso para el **hijo**, que está ocioso casi todo el
+  período. Medido con `ps` sobre Surge XT en sandbox: **99.9 %**. Ahora el hijo
+  **duerme en un futex** y el host lo despierta al publicar el bloque: un
+  syscall por bloque en el hilo de audio, que es lo que paga cualquier puente de
+  audio (la sincronización de clientes de JACK incluida). Medido a 96 kHz/128
+  (1.33 ms de presupuesto): CPU del hijo **100 % → 25 %**, mediana del bloque
+  0.118 → 0.163 ms, 1 bloque perdido de 4000 con la máquina cargada. **Sin
+  `FUTEX_PRIVATE_FLAG`**: la palabra vive en memoria compartida entre dos
+  procesos, y el futex privado no encuentra al que espera — el síntoma no es un
+  cuelgue sino cada bloque llegando un deadline tarde. Hay test.
+- **Un hijo huérfano seguía vivo, girando, después de que choz muriera.** El
+  hijo sólo mira `quit`, que un crash nunca llega a escribir; se encontró uno
+  con **35 minutos** al 99.9 % cuyo host ya no existía. `PR_SET_PDEATHSIG`
+  (más un `getppid() == 1` por la carrera del arranque) lo mata con su host.
+- El escenario reportado —pedal sostenido en la tab del SF2 mientras se toca la
+  otra con Surge XT, y el sonido desapareciendo hasta volver solo al soltar— se
+  reproduce en `cargo run --release --example pedal_bench -p choz-engine`, que
+  queda en el árbol: dos slots, un callback, hilo RT de verdad y carga
+  opcional. Con eso medido: SF2 con 48 voces bajo el pedal cuesta 0.19 ms/bloque
+  a 48 kHz, Surge XT en proceso 0.02 ms — el DSP no era el cuello, el núcleo
+  quemado sí.
+
+#### Añadido
+- **Paginador de parámetros del instrumento**, con las asignaciones de MIDI
+  siguiéndolo. Un synth con cientos de parámetros (Surge XT) mostraba una
+  ventana de ellos y el resto no se alcanzaba: ahora la caja lleva `◀` `▶` en su
+  borde superior (`PgUp`/`PgDn`, o un CC — las dos flechas son destinos de MIDI
+  learn como cualquier otro botón). **Cada CC aprendido sobre esa caja se
+  re-direcciona la misma distancia que se movió la ventana, la haya movido lo
+  que la haya movido**: las flechas, las teclas, un CC, el cursor saliéndose por
+  abajo, un cambio de tamaño del terminal. Se hace después del dibujo, sobre la
+  ventana que el dibujo produjo (`App::sync_instr_window`) — hacerlo sólo dentro
+  de `page_instr` dejaba el controlador apuntando mal desde la primera flecha.
+  El fader que estaba en el primer knob de la página está en el primero de la
+  siguiente; sin eso, ocho faders se quedan con ocho de trescientos parámetros
+  para siempre. Si cambia el *número* de parámetros no es una ventana que se
+  movió sino otro instrumento: se adopta y no se corre nada.
+- **Un banco que es una carpeta**, para el plugin que no publica programas. El
+  VST3 de Surge XT informa **cero** programas y guarda sus 637 patches como
+  `.fxp`: el botón de banco no llevaba a ninguna parte. Ahora se elige la
+  carpeta una vez y todo lo que cuelga de ella entra en el mismo picker que
+  llena el browser propio de un plugin — con las subcarpetas como bancos, en los
+  mismos `◀` `▶` y en el CC que esté aprendido sobre ellos. Un preset es un
+  archivo y cargarlo es `PluginState::restore`: `.fxp`/`.fxb` (`FPCh`/`FBCh`; se
+  rechazan `FxCk`/`FxBk`, que son listas de valores y no un patch) y
+  `.vstpreset` (su chunk `Comp` *es* `IComponent::getState`). La carpeta se
+  guarda con el proyecto y se relee al abrirlo, que además recoge lo que se haya
+  agregado desde entonces.
+- **Pestaña MIXER** abajo, junto a MONITOR / KEYS / WAVE (`F5`): todas las tabs
+  a la vez, una fila cada una — nivel, paneo, mute, solo — y cada control se
+  edita donde está dibujado, sin cambiar de tab. El RACK sigue mostrando la tira
+  de la tab activa; balancear un set con eso solo era ir y volver para escuchar
+  lo que uno acababa de cambiar en otra.
+- **Metrónomo**, al lado del interruptor LIVE/MULTI (`F6`, o el botón; la flecha
+  abre su menú: tempo, compás, sonido, nivel). El tempo y el compás son los del
+  transporte, los mismos que lee cualquier plugin sincronizado, así que el click
+  y un delay sincronizado no pueden discrepar. **Lleva su propio contador de
+  frames**: el transporte sólo avanza cuando rueda, y un metrónomo es para
+  estudiar — tiene que sonar con el transporte parado, que es justo cuando se lo
+  quiere. Entra en la mezcla después de las tabs y fuera de toda cadena de FX.
+  El primer tiempo del compás es otra nota, no una más fuerte: "más fuerte" es lo
+  primero que se lleva la sala.
+- **HOLD del arpegiador como el de un Keystep.** Se separan las teclas que el
+  patrón toca de las que están **físicamente** pulsadas: se suelta todo y el
+  patrón sigue, y la siguiente tecla pulsada sin nada abajo empieza un acorde
+  **nuevo**, mientras que una tecla pulsada con otra todavía abajo se suma al que
+  está sonando. Antes se decidía por "el patrón está parado", que con latch no
+  pasa nunca: todo lo que se tocaba se apilaba sobre el acorde anterior hasta
+  apagar el interruptor. El botón ahora se llama `HOLD`.
+- **Mensaje de carga.** Instanciar un plugin bloquea el hilo de la interfaz
+  varios segundos (Surge XT lee toda su librería de fábrica) y hasta ahora eso
+  pasaba dentro de la propia tecla que lo pedía: la interfaz se congelaba con el
+  picker todavía en pantalla y nada que lo explicara. Ahora la carga se
+  **promete**, se dibuja el cuadro `Loading …` con el nombre y recién entonces el
+  bucle la ejecuta. Cargar un proyecto sigue llamando directo: en medio de
+  reconstruir un rack no hay un frame que esperar.
+
+---
+
 ### 2026-08-16 (ter) — CI decía la verdad: el paquete es `libpd-dev`
 
 #### Corregido

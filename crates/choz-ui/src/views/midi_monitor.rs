@@ -208,16 +208,26 @@ pub enum MonitorTab {
     Keys,
     /// The output's shape, stacked into a history.
     Wave,
+    /// Every tab's strip at once: level, pan, mute, solo. The RACK shows the
+    /// active tab's mixer and only that one; balancing a set means seeing them
+    /// side by side.
+    Mixer,
 }
 
 impl MonitorTab {
-    pub const ALL: [MonitorTab; 3] = [MonitorTab::Monitor, MonitorTab::Keys, MonitorTab::Wave];
+    pub const ALL: [MonitorTab; 4] = [
+        MonitorTab::Monitor,
+        MonitorTab::Keys,
+        MonitorTab::Wave,
+        MonitorTab::Mixer,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             MonitorTab::Monitor => "MONITOR",
             MonitorTab::Keys => "KEYS",
             MonitorTab::Wave => "WAVE",
+            MonitorTab::Mixer => "MIXER",
         }
     }
 
@@ -745,6 +755,11 @@ fn controller_line(state: &KeyboardState) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Where the tab strip drew each tab, for the mouse.
+pub type TabRect = (MonitorTab, Rect);
+/// Where the MIXER drew each control, same reason.
+pub type MixerRect = (MixerHit, Rect);
+
 /// Draw the monitor. `events` is oldest-first; the newest ones are shown at the
 /// bottom, so the eye follows new arrivals downward like a terminal log.
 #[allow(clippy::too_many_arguments)]
@@ -761,7 +776,10 @@ pub fn draw_midi_monitor(
     spectrum: &crate::spectrum::Spectrum,
     // Likewise a history, and for the same reason.
     wave: &WaveHistory,
-) -> Vec<(MonitorTab, Rect)> {
+    // One strip per rack tab, for the MIXER tab. Read from the tabs rather than
+    // held here: the RACK edits them, and a second copy would drift.
+    strips: &[MixerStrip],
+) -> (Vec<TabRect>, Vec<MixerRect>) {
     let block = Block::default()
         .title(" MIDI IN ")
         .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
@@ -772,7 +790,7 @@ pub fn draw_midi_monitor(
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height == 0 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     // The tab strip takes the first row; the rest is whichever tab is showing.
@@ -806,15 +824,272 @@ pub fn draw_midi_monitor(
         inner.height.saturating_sub(1),
     );
     if inner.height == 0 {
-        return rects;
+        return (rects, Vec::new());
     }
 
+    let mut hits = Vec::new();
     match tab {
         MonitorTab::Keys => draw_keys(f, inner, keyboard, key_colour_mode),
         MonitorTab::Wave => draw_wave(f, inner, wave),
         MonitorTab::Monitor => draw_monitor_columns(f, inner, events, ports, spectrum),
+        MonitorTab::Mixer => hits = draw_mixer(f, inner, strips),
     }
-    rects
+    (rects, hits)
+}
+
+/// One rack tab as the MIXER shows it.
+pub struct MixerStrip {
+    pub label: String,
+    /// Linear, over the same range the RACK's VOL knob uses. One per output
+    /// channel: a stereo tab can sit louder on one side, and `link` is what
+    /// keeps the two together for the tabs where that is nonsense.
+    pub gain: f32,
+    pub gain_r: f32,
+    pub link: bool,
+    pub pan: f32,
+    pub mute: bool,
+    pub solo: bool,
+    /// Drawn lit: the tab the RACK is on.
+    pub active: bool,
+    /// Which side the keyboard is pointed at, when the MIXER has the focus.
+    pub side: Option<MixerSide>,
+}
+
+/// A half of a strip, for the caller to say which one the arrows move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MixerSide {
+    Left,
+    Right,
+    Both,
+}
+
+/// What the mouse can hit in the MIXER, by tab index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MixerHit {
+    /// A level track, left or right. The value comes from where in the rect the
+    /// click landed, so the caller needs the rect — which it has.
+    Gain(usize),
+    GainR(usize),
+    /// Tie the two sides of a strip together, or let them go.
+    Link(usize),
+    Pan(usize),
+    Mute(usize),
+    Solo(usize),
+    /// The tab's name: make it the active one.
+    Select(usize),
+    /// Walk the window of strips when the rack is wider than the panel.
+    Page(isize),
+}
+
+/// Every tab as a channel strip, side by side, the way a desk is laid out —
+/// the model is seqterm's mixer view: a bordered column per channel with a
+/// vertical fader in it.
+///
+/// **It pages.** A rack of twelve tabs does not fit across a terminal, so the
+/// strips that fit are drawn and `◀` `▶` on the top row walk the window, which
+/// also follows the active tab so switching tabs never leaves the mixer showing
+/// somewhere else.
+fn draw_mixer(f: &mut Frame, area: Rect, strips: &[MixerStrip]) -> Vec<MixerRect> {
+    let mut hits = Vec::new();
+    if strips.is_empty() || area.height < 3 || area.width < STRIP_W {
+        return hits;
+    }
+    let per_page = ((area.width / STRIP_W) as usize).max(1);
+    let active = strips.iter().position(|s| s.active).unwrap_or(0);
+    // The window follows the active tab, like every other list in choz: no
+    // second piece of state to keep in step with the rack.
+    let page = super::drawer::list_scroll(active, strips.len(), per_page);
+    let paging = strips.len() > per_page;
+
+    for (col, (i, st)) in strips.iter().enumerate().skip(page).take(per_page).enumerate() {
+        let x = area.x + col as u16 * STRIP_W;
+        let rect = Rect::new(x, area.y, STRIP_W - 1, area.height);
+        hits.extend(draw_strip(f, rect, i, st));
+    }
+
+    // The pager sits on the right of the top row, over the last strip's border:
+    // there is no row to spare in a panel that is eight lines at its tallest.
+    if paging {
+        let label = format!(" {page}+{per_page}/{} ", strips.len());
+        let w = label.chars().count() as u16 + 2;
+        if area.width > w {
+            let x = area.x + area.width - w;
+            let style = Style::default().fg(theme::text()).bg(theme::PANEL_BG);
+            let prev = Rect::new(x, area.y, 1, 1);
+            let next = Rect::new(x + w - 1, area.y, 1, 1);
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("\u{25C0}", Style::default().fg(ACCENT)),
+                    Span::styled(label, style),
+                    Span::styled("\u{25B6}", Style::default().fg(ACCENT)),
+                ])),
+                Rect::new(x, area.y, w, 1),
+            );
+            hits.push((MixerHit::Page(-1), prev));
+            hits.push((MixerHit::Page(1), next));
+        }
+    }
+    hits
+}
+
+/// Columns one channel strip takes, its one-column gutter included.
+const STRIP_W: u16 = 9;
+
+/// One channel: name, a vertical fader, its two flags and its pan.
+fn draw_strip(f: &mut Frame, area: Rect, tab: usize, st: &MixerStrip) -> Vec<MixerRect> {
+    use crate::views::fx_chain_panel::{pan_label, truncate};
+    let mut hits = Vec::new();
+    let name_style = if st.active {
+        Style::default()
+            .fg(Color::Black)
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::text())
+    };
+    let w = area.width as usize;
+    let head = Rect::new(area.x, area.y, area.width, 1);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(
+                "{:<w$}",
+                format!("{} {}", tab + 1, truncate(&st.label, w.saturating_sub(2))),
+                w = w
+            ),
+            name_style,
+        )))
+        .style(theme::panel_style()),
+        head,
+    );
+    hits.push((MixerHit::Select(tab), head));
+
+    // Two faders side by side — the tab's two output channels — with the link
+    // between them. Everything between the name and the last two rows.
+    let bottom = 2u16.min(area.height.saturating_sub(1));
+    let fader_h = area.height.saturating_sub(1 + bottom);
+    if fader_h > 0 {
+        let y = area.y + 1;
+        let colour = if st.mute { DIM } else { OK };
+        // The lit side, when the keyboard is pointed at one of them.
+        let lit = |side: MixerSide| {
+            if st.link {
+                return colour;
+            }
+            match st.side {
+                Some(s) if s == side || s == MixerSide::Both => ACCENT,
+                _ => colour,
+            }
+        };
+        // `L` and `R` columns, one cell of gutter, then the link between them.
+        let cols = ((area.width.saturating_sub(3)) / 2).max(1);
+        let left = Rect::new(area.x, y, cols, fader_h);
+        let right = Rect::new(area.x + cols + 1, y, cols, fader_h);
+        draw_fader(f, left, st.gain, lit(MixerSide::Left));
+        draw_fader(f, right, st.gain_r, lit(MixerSide::Right));
+        hits.push((MixerHit::Gain(tab), left));
+        hits.push((MixerHit::GainR(tab), right));
+
+        // The link, drawn in the gutter down the middle: a chain when the two
+        // move together, a break when they do not.
+        let link_x = area.x + cols;
+        let mid = y + fader_h / 2;
+        for row in 0..fader_h {
+            let on_link = y + row == mid;
+            let (text, style) = if !on_link {
+                (" ", Style::default().fg(DIM))
+            } else if st.link {
+                (
+                    "\u{2261}",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ("\u{22EE}", Style::default().fg(DIM))
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(text, style))).style(theme::panel_style()),
+                Rect::new(link_x, y + row, 1, 1),
+            );
+        }
+        hits.push((MixerHit::Link(tab), Rect::new(link_x, y, 1, fader_h)));
+    }
+
+    let mut y = area.y + area.height - bottom;
+    if bottom >= 2 {
+        let flags = Rect::new(area.x, y, area.width, 1);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" M ", flag(st.mute, Color::Rgb(200, 80, 80))),
+                Span::styled(" ", theme::panel_style()),
+                Span::styled(" S ", flag(st.solo, Color::Rgb(220, 190, 70))),
+            ]))
+            .style(theme::panel_style()),
+            flags,
+        );
+        hits.push((MixerHit::Mute(tab), Rect::new(flags.x, y, 3, 1)));
+        hits.push((MixerHit::Solo(tab), Rect::new(flags.x + 4, y, 3, 1)));
+        y += 1;
+    }
+    // The level in numbers, and the pan. Two faders and one number: the number
+    // is the side that is louder, which is the one you are setting.
+    let pan = Rect::new(area.x, y, area.width, 1);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("{:<4.2}", st.gain.max(st.gain_r)),
+                Style::default().fg(DIM),
+            ),
+            Span::styled(
+                format!("{:>w$}", pan_label(st.pan), w = w.saturating_sub(4)),
+                Style::default().fg(HEADER),
+            ),
+        ]))
+        .style(theme::panel_style()),
+        pan,
+    );
+    hits.push((MixerHit::Pan(tab), pan));
+    hits
+}
+
+/// One vertical fader, filled from the bottom, with the part-filled row drawn
+/// in eighths — four rows of cells would otherwise be a four-position fader,
+/// where the knob it stands for has forty.
+fn draw_fader(f: &mut Frame, area: Rect, gain: f32, colour: Color) {
+    use crate::views::fx_chain_panel::MAX_GAIN;
+    let h = area.height;
+    let filled = (gain / MAX_GAIN).clamp(0.0, 1.0) * h as f32;
+    let lines: Vec<Line> = (0..h)
+        .map(|row| {
+            let from_bottom = h - row;
+            let cell = if filled >= from_bottom as f32 {
+                "\u{2588}"
+            } else if filled > from_bottom as f32 - 1.0 {
+                let eighths = ((filled - (from_bottom as f32 - 1.0)) * 8.0).round() as usize;
+                [
+                    "\u{2581}", "\u{2581}", "\u{2582}", "\u{2583}", "\u{2584}", "\u{2585}",
+                    "\u{2586}", "\u{2587}", "\u{2588}",
+                ][eighths.min(8)]
+            } else {
+                "\u{2591}"
+            };
+            Line::from(Span::styled(
+                cell.repeat(area.width.max(1) as usize),
+                Style::default().fg(colour),
+            ))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines).style(theme::panel_style()), area);
+}
+
+/// A mixer flag: lit when it is on, an outline when it is not.
+fn flag(on: bool, colour: Color) -> Style {
+    if on {
+        Style::default()
+            .fg(Color::Black)
+            .bg(colour)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(DIM)
+    }
 }
 
 /// The message log, the spectrum and the meters, three columns across.
@@ -1274,7 +1549,7 @@ mod tests {
         let wave = WaveHistory::default();
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| {
-            draw_midi_monitor(f, f.area(), &[], &[], tab, state, mode, &spec, &wave);
+            draw_midi_monitor(f, f.area(), &[], &[], tab, state, mode, &spec, &wave, &[]);
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
@@ -1301,6 +1576,7 @@ mod tests {
                 mode,
                 &spec,
                 &wave,
+            &[],
             );
         })
         .unwrap();
@@ -1703,6 +1979,7 @@ mod tests {
                             KeyColor::default(),
                             &spec,
                             &wave,
+                        &[],
                         );
                     })
                     .unwrap();
@@ -1731,6 +2008,7 @@ mod tests {
                 KeyColor::default(),
                 &crate::spectrum::Spectrum::new(),
                 &WaveHistory::default(),
+            &[],
             );
         })
         .unwrap();
@@ -2027,7 +2305,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
         let mut rects = Vec::new();
         term.draw(|f| {
-            rects = draw_midi_monitor(
+            (rects, _) = draw_midi_monitor(
                 f,
                 f.area(),
                 &[],
@@ -2037,6 +2315,7 @@ mod tests {
                 KeyColor::default(),
                 &crate::spectrum::Spectrum::new(),
                 &WaveHistory::default(),
+                &[],
             );
         })
         .unwrap();
@@ -2046,6 +2325,6 @@ mod tests {
         assert!(rects.iter().all(|(_, r)| r.height == 1));
 
         assert_eq!(MonitorTab::Monitor.next(), MonitorTab::Keys);
-        assert_eq!(MonitorTab::Wave.next(), MonitorTab::Monitor, "it wraps");
+        assert_eq!(MonitorTab::Mixer.next(), MonitorTab::Monitor, "it wraps");
     }
 }

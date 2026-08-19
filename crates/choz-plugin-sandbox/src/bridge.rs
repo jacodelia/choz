@@ -17,11 +17,15 @@
 //! reads silence and carries on — a sandboxed plugin that hangs costs a glitch,
 //! not the stream.
 //!
-//! ponytail: the wait is a bounded spin plus `sched_yield`, not a futex. It
-//! keeps the region to plain atomics (no `sem_t` layout games, no init order to
-//! get wrong) and the spin is short by construction — the child is answering a
-//! block it already has. Swap in a futex if the busy-wait ever shows up in a
-//! profile.
+//! The **host** waits by spinning: it is the audio thread, its deadline is a
+//! fraction of a block, and it has nothing else to do with those microseconds.
+//! The **child** does not. Between blocks it is idle for most of a period, and
+//! spinning through that (which is what it used to do, `sched_yield` in a loop)
+//! pinned a whole core per sandboxed plugin, permanently — measured at 100 %
+//! with the plugin playing nothing. On a rig running 128 frames at 96 kHz that
+//! core is the one the rest of the rack needed. So the child parks on a futex
+//! and the host wakes it: one syscall per block on the audio thread, which is
+//! what every audio bridge (JACK's own client sync included) already pays.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -35,6 +39,12 @@ pub struct Header {
     /// Bumped by the child once its output block is written. Equal to
     /// `request` means "the answer to that request is ready".
     pub done: AtomicU64,
+    /// The futex word the child sleeps on, bumped with every `request`. A
+    /// separate 32-bit field because that is what `FUTEX_WAIT` takes, and
+    /// because a counter that only ever moves forward cannot be missed: the
+    /// child compares the value it last saw, so a wake that lands before the
+    /// wait does not put it to sleep on a request already made.
+    pub wake: AtomicU32,
     /// Set by the host when it wants the child to exit for good. A child that
     /// is merely being replaced never sees this.
     pub quit: AtomicU32,
@@ -211,6 +221,10 @@ impl Host {
         let ticket = h.request.load(Ordering::Relaxed) + 1;
         // Release: the child must see the samples we just wrote, and the MIDI.
         h.request.store(ticket, Ordering::Release);
+        // Wake it if it is parked. Costs a syscall on the audio thread and buys
+        // back the core the child used to spin on.
+        h.wake.fetch_add(1, Ordering::Release);
+        futex_wake(&h.wake);
 
         let answered = wait_until(deadline, || h.done.load(Ordering::Acquire) >= ticket);
         // MIDI and parameters belong to the block just sent, answered or not.
@@ -369,7 +383,7 @@ impl Sandbox {
     pub fn serve(&mut self, patience: Duration, f: Process<'_>) -> bool {
         let h = self.region.header();
         let want = self.served + 1;
-        if !wait_until(patience, || h.request.load(Ordering::Acquire) >= want) {
+        if !park_until(h, patience, || h.request.load(Ordering::Acquire) >= want) {
             // Nothing asked of us: say we are still alive and let the caller
             // decide (it checks whether the host process is still there).
             return h.quit.load(Ordering::Acquire) == 0;
@@ -410,6 +424,71 @@ impl Sandbox {
 }
 
 /// Spin, then yield, until `ready` or the deadline passes.
+/// The child's wait: a short spin for the block that is already on its way,
+/// then asleep on the futex until the host wakes it (or `patience` runs out,
+/// which is how a host that died without saying so is noticed).
+fn park_until(h: &Header, patience: Duration, ready: impl Fn() -> bool) -> bool {
+    for _ in 0..2_000 {
+        if ready() {
+            return true;
+        }
+        std::hint::spin_loop();
+    }
+    let start = Instant::now();
+    loop {
+        // Read the futex word *before* the check: a wake that lands between the
+        // two makes the value stale, and a stale value is exactly what makes
+        // `FUTEX_WAIT` return at once instead of sleeping through the request.
+        let seen = h.wake.load(Ordering::Acquire);
+        if ready() {
+            return true;
+        }
+        let Some(left) = patience.checked_sub(start.elapsed()) else {
+            return ready();
+        };
+        futex_wait(&h.wake, seen, left);
+    }
+}
+
+/// Sleep until `word` moves off `expect`, or `timeout` passes.
+///
+/// Not `FUTEX_PRIVATE_FLAG`: the word lives in shared memory and the two ends
+/// are two processes, which is the one case a private futex cannot serve — the
+/// wake never finds the waiter and every block goes out late.
+fn futex_wait(word: &AtomicU32, expect: u32, timeout: Duration) {
+    let ts = libc::timespec {
+        tv_sec: timeout.as_secs() as libc::time_t,
+        tv_nsec: timeout.subsec_nanos() as _,
+    };
+    // SAFETY: a plain syscall on a 32-bit word we own a reference to. A failed
+    // wait (EAGAIN, EINTR, ETIMEDOUT) is a wake-up like any other — the caller
+    // re-checks the condition either way.
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            word as *const AtomicU32,
+            libc::FUTEX_WAIT,
+            expect,
+            &ts as *const libc::timespec,
+        );
+    }
+}
+
+/// Wake whoever is parked on `word`. No-op when nobody is.
+fn futex_wake(word: &AtomicU32) {
+    // SAFETY: as above.
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            word as *const AtomicU32,
+            libc::FUTEX_WAKE,
+            1i32,
+        );
+    }
+}
+
+/// The host's wait: a bounded spin, because it is the audio thread and the
+/// deadline it is holding is a fraction of one block.
 fn wait_until(deadline: Duration, ready: impl Fn() -> bool) -> bool {
     // A block the child already has takes microseconds; spinning first avoids
     // a syscall in the common case.
@@ -467,6 +546,42 @@ impl EditorLink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A parked child has to be woken by the host's next block, promptly.
+    ///
+    /// This is the one that catches the wrong futex: a `FUTEX_PRIVATE_FLAG`
+    /// wake never reaches a waiter in another process, and the symptom is not
+    /// a hang but every block arriving one deadline late — silence that looks
+    /// like a slow plugin. Two threads stand in for the two processes here;
+    /// the flag is what is being checked, not the process boundary.
+    #[test]
+    fn a_parked_child_is_woken_by_the_next_block() {
+        let (frames, channels) = (64u32, 2u32);
+        let mut buf = vec![0u8; region_bytes(frames, channels)];
+        let base = buf.as_mut_ptr() as usize;
+        // SAFETY: one buffer, both ends, as the other protocol tests do.
+        let mut host = unsafe { Host::create(buf.as_mut_ptr(), frames, channels, 48_000) };
+
+        let child = std::thread::spawn(move || {
+            let mut sandbox = unsafe { Sandbox::attach(base as *mut u8, frames, channels) };
+            // Long patience: if the wake does not arrive, the answer comes from
+            // the timeout and the host's short deadline has long since passed.
+            sandbox.serve(Duration::from_secs(10), &mut |input, output, _, _| {
+                output.copy_from_slice(input);
+            })
+        });
+        // Let it get past the spin and actually park.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let input = vec![0.5f32; (frames * channels) as usize];
+        let mut output = vec![0.0f32; input.len()];
+        assert!(
+            host.exchange(&input, &mut output, Duration::from_millis(200)),
+            "the parked child was not woken inside a block's deadline"
+        );
+        assert_eq!(output, input);
+        assert!(child.join().unwrap());
+    }
 
     /// The window handshake, in one process on a plain buffer: the host asks,
     /// the child sees exactly one request, answers with a size, and the host

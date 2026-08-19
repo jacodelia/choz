@@ -15,6 +15,9 @@ use choz_ports::EditorHandle;
 pub struct EditorWindow {
     close: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The thread reports here on its way out, so [`Drop`] can wait for it
+    /// **with a deadline** — see there for why a plain join is not enough.
+    gone: std::sync::mpsc::Receiver<()>,
     /// What the window belongs to: `(rack slot, FX index or None for the
     /// instrument)`. A second `[GUI]` click on the same plugin closes it; a
     /// different plugin opens its own.
@@ -26,10 +29,12 @@ impl EditorWindow {
     /// available (no `DISPLAY`, or a build without X11).
     pub fn open(key: (usize, Option<usize>), handle: EditorHandle, title: String) -> Option<Self> {
         let close = Arc::new(AtomicBool::new(false));
-        let thread = spawn(handle, Arc::clone(&close), title)?;
+        let (tx, gone) = std::sync::mpsc::channel();
+        let thread = spawn(handle, Arc::clone(&close), title, tx)?;
         Some(Self {
             close,
             thread: Some(thread),
+            gone,
             key,
         })
     }
@@ -41,10 +46,32 @@ impl EditorWindow {
 }
 
 impl Drop for EditorWindow {
+    /// Close the window and wait for its thread — **but not forever**.
+    ///
+    /// The thread is inside the plugin (`idle()` runs a JUCE plugin's own
+    /// message loop), so a plugin that wedges there wedges the join, and the
+    /// whole interface with it: choz frozen mid-set because a window would not
+    /// close. Everything that drops an instrument closes its window first
+    /// (`App::close_editor_for`), which is what keeps this from happening at
+    /// all; this is the second line — after two seconds the thread is left to
+    /// its own devices and choz carries on. It holds an `Arc` on the editor
+    /// handle, so nothing it can still touch has been freed.
     fn drop(&mut self) {
         self.close.store(true, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        let Some(t) = self.thread.take() else {
+            return;
+        };
+        match self.gone.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(()) => {
+                let _ = t.join();
+            }
+            Err(_) => {
+                eprintln!(
+                    "choz: this plugin's window did not close; leaving its thread behind \
+                     rather than freezing (the window may stay on screen)"
+                );
+                std::mem::forget(t);
+            }
         }
     }
 }
@@ -54,6 +81,7 @@ fn spawn(
     handle: EditorHandle,
     close: Arc<AtomicBool>,
     title: String,
+    gone: std::sync::mpsc::Sender<()>,
 ) -> Option<std::thread::JoinHandle<()>> {
     if std::env::var_os("DISPLAY").is_none() {
         eprintln!("choz: no DISPLAY — plugin editors need an X11 (or XWayland) session");
@@ -69,6 +97,9 @@ fn spawn(
             // thinks is alive.
             handle.close();
             close.store(true, Ordering::Relaxed);
+            // Only now is it safe to drop the instrument this thread was
+            // driving: `Drop` waits for this.
+            let _ = gone.send(());
         })
         .ok()
 }
@@ -78,6 +109,7 @@ fn spawn(
     _handle: EditorHandle,
     _close: Arc<AtomicBool>,
     _title: String,
+    _gone: std::sync::mpsc::Sender<()>,
 ) -> Option<std::thread::JoinHandle<()>> {
     eprintln!("choz: plugin editors are only implemented for X11");
     None
@@ -93,11 +125,48 @@ mod x11 {
         AtomEnum, ConfigureWindowAux, ConnectionExt, CreateWindowAux, EventMask, PropMode,
         WindowClass,
     };
+    use x11rb::protocol::randr::ConnectionExt as _;
     use x11rb::protocol::Event;
     use x11rb::wrapper::ConnectionExt as _;
 
     /// Default size until the plugin reports the one it wants.
     const FALLBACK: (u16, u16) = (600, 400);
+
+    /// Centre `win` on whichever monitor the pointer is on, clamped so the
+    /// whole window stays inside it.
+    ///
+    /// Best effort by design: no pointer, no RandR, or a server that answers
+    /// neither simply leaves the window where the window manager put it, which
+    /// is what happened before this existed.
+    fn place_on_pointer_monitor<C: Connection>(conn: &C, root: u32, win: u32, w: u16, h: u16) {
+        let Ok(Ok(p)) = conn.query_pointer(root).map(|c| c.reply()) else {
+            return;
+        };
+        let (px, py) = (p.root_x as i32, p.root_y as i32);
+        // The monitor under the pointer, or the whole screen when RandR has
+        // nothing to say.
+        let mon = conn
+            .randr_get_monitors(root, true)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| {
+                r.monitors
+                    .into_iter()
+                    .find(|m| {
+                        px >= m.x as i32
+                            && px < m.x as i32 + m.width as i32
+                            && py >= m.y as i32
+                            && py < m.y as i32 + m.height as i32
+                    })
+                    .map(|m| (m.x as i32, m.y as i32, m.width as i32, m.height as i32))
+            });
+        let Some((mx, my, mw, mh)) = mon else {
+            return;
+        };
+        let x = (mx + (mw - w as i32) / 2).clamp(mx, mx + (mw - w as i32).max(0));
+        let y = (my + (mh - h as i32) / 2).clamp(my, my + (mh - h as i32).max(0));
+        let _ = conn.configure_window(win, &ConfigureWindowAux::new().x(x).y(y));
+    }
 
     pub fn run(handle: &EditorHandle, close: &AtomicBool, title: &str) -> anyhow::Result<()> {
         let (conn, screen_num) = x11rb::connect(None)?;
@@ -136,6 +205,12 @@ mod x11 {
             AtomEnum::STRING,
             title.as_bytes(),
         )?;
+        // On the screen the user is looking at. Two monitors are one X screen,
+        // so a window left at 0,0 is placed by the window manager — and with a
+        // second monitor attached that regularly meant "the other one", which
+        // reads exactly like the editor never opened. The pointer is where the
+        // person is: put the window on that monitor.
+        place_on_pointer_monitor(&conn, screen.root, win, w, h);
         conn.map_window(win)?;
         conn.flush()?;
 
@@ -146,6 +221,9 @@ mod x11 {
                 win,
                 &ConfigureWindowAux::new().width(w as u32).height(h as u32),
             )?;
+            // Re-centred at the size the plugin asked for, or a big editor
+            // opens centred as a 600×400 box and hangs off the screen.
+            place_on_pointer_monitor(&conn, screen.root, win, w, h);
             conn.flush()?;
         }
 

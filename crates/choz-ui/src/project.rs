@@ -91,6 +91,13 @@ pub struct Binding {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Mixer {
     pub gain: f32,
+    /// The right channel's own level, and whether the two move together.
+    /// Added later, so a project written before the strips had two faders loads
+    /// with them linked — which is what it sounded like.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gain_r: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<bool>,
     pub pan: f32,
     pub mute: bool,
     pub solo: bool,
@@ -153,6 +160,12 @@ pub struct Instrument {
     /// Written as text so the project stays a readable YAML file.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub state: String,
+    /// The folder of preset **files** this tab uses as its bank, for a plugin
+    /// that publishes no programs of its own (Surge XT's VST3 build reports
+    /// none and keeps its patches as `.fxp`). Without it the bank has to be
+    /// pointed at again every time the project opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bank_dir: Option<PathBuf>,
     /// DSSI only: the `configure` key/values the plugin was given. Saving these
     /// is what the DSSI convention asks of a host, and without them a project
     /// with FluidSynth-DSSI in it reopens with no SoundFont and no sound.
@@ -242,10 +255,13 @@ mod tests {
                     preset: Some(4),
                     params: Vec::new(),
                     state: String::new(),
+                    bank_dir: None,
                     config: Vec::new(),
                 },
                 mixer: Mixer {
                     gain: 0.8,
+                    gain_r: None,
+                    link: None,
                     pan: -0.25,
                     mute: false,
                     solo: false,

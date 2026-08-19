@@ -102,16 +102,25 @@ fn only_the_sandbox_offers_an_editor_choz_itself_refuses() {
         "choz's own process must not be offered this UI"
     );
 
-    // …which is exactly why it must not be hosted here: the probe child looks
-    // past the deny-list (asking is not opening), sees a window, and that alone
-    // sends the plugin to a process choz can afford to lose.
+    // …which is why the sandbox is where this UI can be opened at all: the
+    // probe child looks past the deny-list (asking is not opening) and sees a
+    // window. Whether that is *reason enough* to pay for a process is the
+    // user's call now — `CHOZ_SANDBOX_GUI=1` — because the round trip costs
+    // most of an audio block and a rack that runs out of time is a certain
+    // failure, where a GUI crash is a possible one.
     let state = std::env::temp_dir().join(format!("choz_gui_sbx_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&state);
     std::fs::create_dir_all(&state).unwrap();
     unsafe { std::env::set_var("XDG_STATE_HOME", &state) };
+    unsafe { std::env::set_var("CHOZ_SANDBOX_GUI", "1") };
     assert!(
         choz_engine::quarantine::wants_sandbox(PluginFormat::Lv2, bundle, uri),
-        "a plugin with a window belongs in its own process"
+        "asked for, a plugin with a window goes to its own process"
+    );
+    unsafe { std::env::remove_var("CHOZ_SANDBOX_GUI") };
+    assert!(
+        !choz_engine::quarantine::wants_sandbox(PluginFormat::Lv2, bundle, uri),
+        "and by default it does not — the window alone is not worth the block"
     );
     let _ = std::fs::remove_dir_all(&state);
 
@@ -167,13 +176,15 @@ fn a_plugin_the_user_asked_for_runs_out_of_process() {
     };
     let build = || choz_engine::fx_chain::build_chain_from_specs(&[spec()], SR, FRAMES);
 
-    // ZamComp has a window, and a window is reason enough — so the manual half
-    // is only visible with the automatic one turned off.
+    // A window is **not** reason enough any more — the round trip costs most of
+    // an audio block, which is a certain failure traded against a possible one.
+    // It is still available for whoever wants it.
+    unsafe { std::env::set_var("CHOZ_SANDBOX_GUI", "1") };
     assert!(
         choz_engine::quarantine::wants_sandbox(PluginFormat::Vst2, path, ""),
-        "a plugin with a GUI is isolated on its own"
+        "asked for, a plugin with a GUI is isolated on its own"
     );
-    unsafe { std::env::set_var("CHOZ_SANDBOX_GUI", "0") };
+    unsafe { std::env::remove_var("CHOZ_SANDBOX_GUI") };
 
     // Nothing wrong with it, so nothing sandboxes it on its own.
     assert!(!choz_engine::quarantine::wants_sandbox(
@@ -217,7 +228,6 @@ fn a_plugin_the_user_asked_for_runs_out_of_process() {
         path,
         ""
     ));
-    unsafe { std::env::remove_var("CHOZ_SANDBOX_GUI") };
     let _ = std::fs::remove_dir_all(&state);
     println!("test a_plugin_the_user_asked_for_runs_out_of_process ... ok");
 }

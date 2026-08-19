@@ -120,7 +120,13 @@ struct RackSlot {
     fx_chain: Vec<AudioFxEntry>,
     /// Mixer strip. `solo` is a UI-only concept: it's folded into the mute flag
     /// sent to the engine (any solo → everything else is muted).
+    /// Output level, one per side. A stereo instrument that sits louder on one
+    /// channel is trimmed here rather than by cheating with the pan; `link`
+    /// keeps the two equal, which is what a tab wants nearly always and so is
+    /// what it starts as.
     gain: f32,
+    gain_r: f32,
+    link: bool,
     pan: f32,
     mute: bool,
     solo: bool,
@@ -142,10 +148,21 @@ struct RackSlot {
     /// its own browser. Shares `preset_cursor` with the SoundFont list — a tab
     /// has one instrument, so only one of the two is ever populated.
     plugin_presets: Vec<choz_engine::PresetEntry>,
+    /// The folder of preset **files** this tab is using as its bank, when the
+    /// plugin has no browser of its own to ask. Surge XT's VST3 build reports
+    /// no programs at all and keeps its 637 factory patches as `.fxp` files, so
+    /// without this the tab has no bank and no way to reach any of them.
+    preset_dir: Option<std::path::PathBuf>,
     /// Plugin-instrument slots only: what the plugin exposes, and the current
     /// knob positions (0..1, same order). Empty for every other source kind.
     instr_params: Vec<choz_engine::PluginParam>,
     instr_values: Vec<f32>,
+    /// The window of instrument knobs the last draw put on screen, as
+    /// `(first parameter, how many the plugin has)`. Compared against the next
+    /// draw to re-address the CCs learned on that box when the window moves.
+    /// `None` until this tab has been drawn once, and reset whenever the
+    /// parameter list changes — a new instrument is not a window that moved.
+    instr_window: Option<(usize, usize)>,
     /// The instrument plugin's own state (its patch), as the project stores it.
     /// Kept here so a tab survives everything that rebuilds engine slots — an
     /// output-device change, a project load — with the sound it had.
@@ -174,6 +191,8 @@ impl RackSlot {
             source,
             fx_chain: Vec::new(),
             gain: 1.0,
+            gain_r: 1.0,
+            link: true,
             pan: 0.0,
             mute: false,
             solo: false,
@@ -183,13 +202,31 @@ impl RackSlot {
             preset_cursor: 0,
             dssi_config: Vec::new(),
             plugin_presets: Vec::new(),
+            preset_dir: None,
             instr_params: Vec::new(),
             instr_values: Vec::new(),
+            instr_window: None,
             instr_state: Vec::new(),
             arp: arp::Arp::default(),
             pitch_mix: 1.0,
         }
     }
+}
+
+/// A load the interface has promised but not run yet. See [`App::pending_load`].
+#[derive(Debug, Clone)]
+enum PendingLoad {
+    Synth(usize),
+    Source(std::path::PathBuf),
+}
+
+/// Which half of a strip a level change is aimed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MixSide {
+    Left,
+    Right,
+    /// Both, whatever the link says — what the RACK's own `VOL` knob does.
+    Both,
 }
 
 /// A discovered synthesizer plugin.
@@ -209,6 +246,10 @@ enum Focus {
     Transport,
     /// The OUT drawer (audio output devices), only while it is open.
     Output,
+    /// The MIXER at the bottom, only while that tab is the one showing: the
+    /// arrows are worth more there than anywhere else, because a level is the
+    /// one thing you set while looking somewhere else entirely.
+    Mixer,
 }
 
 /// What a row of the OUT drawer points at.
@@ -346,6 +387,12 @@ enum ModalKind {
     /// Directory picker for File \u{2192} Save project.
     SaveProject,
     LoadProject,
+    /// Tempo, time signature, sound and level of the metronome.
+    Metronome,
+    /// Folder picker for a plugin's bank of preset **files** — the tab has an
+    /// instrument that reports no programs of its own, so its patches are
+    /// `.fxp` / `.vstpreset` files on disk.
+    Bank,
     /// Image picker for the desktop background (Settings \u{2192} THEME).
     Wallpaper,
     /// Factory presets of the selected built-in effect.
@@ -398,6 +445,11 @@ const SILENCE: f32 = 3.163e-5;
 
 /// Width of the tint slider's bar, in cells.
 const TINT_BAR_WIDTH: usize = 20;
+/// How much one press (or one click of the wheel) moves a level — the same
+/// step the RACK's `VOL` knob uses, so the answer does not depend on where you
+/// touched it.
+const GAIN_STEP: f32 = 0.05;
+
 /// How much one arrow press moves the tint.
 const TINT_STEP: u8 = 5;
 
@@ -560,6 +612,11 @@ fn fx_scope(t: &LearnTarget) -> Option<(usize, usize)> {
 pub enum TriggerAction {
     PresetPrev,
     PresetNext,
+    /// Page the instrument's knob box backwards / forwards. A plugin with
+    /// hundreds of parameters (Surge XT has them) shows a few rows at a time,
+    /// and the CCs already learned move with the page — see [`App::page_instr`].
+    InstrPagePrev,
+    InstrPageNext,
     FxToggle,
     FxMoveLeft,
     FxMoveRight,
@@ -588,6 +645,8 @@ impl TriggerAction {
         match self {
             TriggerAction::PresetPrev => "BANK \u{25C0}".to_string(),
             TriggerAction::PresetNext => "BANK \u{25B6}".to_string(),
+            TriggerAction::InstrPagePrev => "PARAMS \u{25C0}".to_string(),
+            TriggerAction::InstrPageNext => "PARAMS \u{25B6}".to_string(),
             TriggerAction::FxToggle => "FX ON/OFF".to_string(),
             TriggerAction::FxMoveLeft => "FX \u{25C0} MOVE".to_string(),
             TriggerAction::FxMoveRight => "FX MOVE \u{25B6}".to_string(),
@@ -597,7 +656,7 @@ impl TriggerAction {
             TriggerAction::Solo => "SOLO".to_string(),
             TriggerAction::ArpToggle => "ARP ON/OFF".to_string(),
             TriggerAction::ArpTap => "ARP TAP".to_string(),
-            TriggerAction::ArpLatch => "ARP LATCH".to_string(),
+            TriggerAction::ArpLatch => "ARP HOLD".to_string(),
             TriggerAction::ArpPlayPause | TriggerAction::ArpStop | TriggerAction::ArpRecord => {
                 "(retired)".to_string()
             }
@@ -817,12 +876,18 @@ struct UiLayout {
     loop_rect: Option<Rect>,
     /// The internal/external clock switch of the TRANSPORT panel.
     clock_rect: Option<Rect>,
+    /// The metronome's switch and the `\u{25BE}` that opens its menu, drawn on the
+    /// menu bar just left of LIVE/MULTI.
+    met_rect: Option<Rect>,
+    met_menu_rect: Option<Rect>,
     /// The LIVE/MULTI switch in the top-right corner of the menu bar.
     mode_switch_rect: Option<Rect>,
     /// About dialog close-button rect.
     about_close_rect: Option<Rect>,
     /// The MIDI monitor's tab strip: MIDI / WAVE / ACTIVITY.
     monitor_tabs: Vec<(views::midi_monitor::MonitorTab, Rect)>,
+    /// The MIXER tab's controls, while it is the one showing.
+    mixer_hits: Vec<views::midi_monitor::MixerRect>,
 }
 
 #[allow(dead_code)]
@@ -990,6 +1055,22 @@ struct App {
     playing: bool,
     /// Recorded parameter moves, played back against the transport.
     automation: automation::Automation,
+    /// When the health of the audio thread was last reported, and what the
+    /// counters said then — see [`App::poll_health`].
+    health_at: Instant,
+    health_seen: (u32, u64, u64),
+    /// A load asked for but not started yet, and the name to say while it runs.
+    ///
+    /// Instantiating a plugin is seconds of blocking work on this thread (Surge
+    /// XT reads its whole factory library), and it used to happen inside the
+    /// keypress that asked for it — so the interface froze with no explanation
+    /// and the last thing drawn was the picker. Deferring it by one frame is
+    /// what makes it possible to say "loading" *before* going quiet.
+    pending_load: Option<PendingLoad>,
+    loading: Option<String>,
+    /// Which half of a strip the MIXER's arrows move. Only means anything on a
+    /// strip whose sides are not linked.
+    mix_side: MixSide,
     /// Which of the monitor's tabs is showing.
     monitor_tab: views::midi_monitor::MonitorTab,
     /// What the KEYS/ROLL tabs draw: which keys are down, and the wheels.
@@ -1084,6 +1165,11 @@ impl App {
             audio_engine: None,
             playing: false,
             automation: automation::Automation::default(),
+            health_at: Instant::now(),
+            health_seen: (0, 0, 0),
+            pending_load: None,
+            loading: None,
+            mix_side: MixSide::Both,
             monitor_tab: views::midi_monitor::MonitorTab::default(),
             keyboard: views::midi_monitor::KeyboardState::default(),
             spectrum: spectrum::Spectrum::new(),
@@ -1752,7 +1838,13 @@ impl App {
             return;
         };
         if slot.presets.is_empty() && slot.plugin_presets.is_empty() {
-            eprintln!("choz: the active tab's instrument has no presets to pick");
+            // No programs to list. If the plugin takes a state blob its patches
+            // are files somewhere, so ask where instead of refusing.
+            if self.can_pick_bank() {
+                self.open_bank_browser();
+            } else {
+                eprintln!("choz: the active tab's instrument has no presets to pick");
+            }
             return;
         }
         // Where the plugin says it is, when it can be asked: opening the picker
@@ -1805,6 +1897,8 @@ impl App {
             LearnTarget::Trigger(TriggerAction::Solo),
             LearnTarget::Trigger(TriggerAction::PresetPrev),
             LearnTarget::Trigger(TriggerAction::PresetNext),
+            LearnTarget::Trigger(TriggerAction::InstrPagePrev),
+            LearnTarget::Trigger(TriggerAction::InstrPageNext),
             LearnTarget::Trigger(TriggerAction::FxToggle),
             LearnTarget::Trigger(TriggerAction::FxMoveLeft),
             LearnTarget::Trigger(TriggerAction::FxMoveRight),
@@ -1837,6 +1931,168 @@ impl App {
         modal.targets = targets;
         self.modal = Some(modal);
         self.refresh_modal();
+    }
+
+    /// Can this tab take a folder of preset files as its bank? Any plugin that
+    /// can be handed its own state back can: that is what a `.fxp` carries.
+    fn can_pick_bank(&self) -> bool {
+        matches!(
+            self.slots.get(self.active_slot).map(|s| &s.source),
+            Some(AudioSource::Plugin { .. })
+        ) && self
+            .audio_engine
+            .as_ref()
+            .is_some_and(|e| e.slot_has_state(self.active_slot))
+    }
+
+    /// Pick the folder a plugin's patches live in — its bank, when the plugin
+    /// has no browser of its own to ask. Starts where this tab last looked,
+    /// then where the plugin is installed.
+    fn open_bank_browser(&mut self) {
+        let start = self
+            .slots
+            .get(self.active_slot)
+            .and_then(|s| s.preset_dir.clone())
+            .or_else(|| {
+                let id = match self.slots.get(self.active_slot).map(|s| &s.source) {
+                    Some(AudioSource::Plugin { id, .. }) => id.clone(),
+                    _ => return None,
+                };
+                self.synths
+                    .iter()
+                    .find(|s| s.id == id)
+                    .and_then(|s| s.path.parent().map(|p| p.to_path_buf()))
+            })
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
+        let mut modal = Modal::new(
+            ModalKind::Bank,
+            views::modal::ListModal::new(i18n::t("BANK FOLDER"), Vec::new()),
+        );
+        // The folder itself, not a file in it: a patch library is filed by
+        // category, and those sub-folders are the picker's bank chips. The
+        // browser's first row is "[use this one]".
+        modal.browser = Some(file_browser::FileBrowser::open(
+            &start,
+            file_browser::DIR_PICK,
+        ));
+        self.modal = Some(modal);
+        self.refresh_modal();
+    }
+
+    /// Switch the click on or off. Also on `F6` and on the MET button.
+    fn toggle_metronome(&mut self) {
+        let m = choz_engine::metronome::metronome();
+        m.set_on(!m.on());
+    }
+
+    /// The metronome's menu: tempo, time signature, sound, level. Every row
+    /// steps on Enter or a click and the menu stays open, because setting a
+    /// tempo means hearing it — closing after each step would make that four
+    /// round trips instead of four presses.
+    fn open_metronome_modal(&mut self) {
+        let modal = Modal::new(
+            ModalKind::Metronome,
+            views::modal::ListModal::new(i18n::t("METRONOME"), Vec::new()),
+        );
+        self.modal = Some(modal);
+        self.refresh_modal();
+    }
+
+    /// The time signatures the menu offers, in the order it steps them.
+    const TIME_SIGS: [(u16, u16); 6] = [(4, 4), (3, 4), (2, 4), (6, 8), (5, 4), (7, 8)];
+
+    fn metronome_rows(&self) -> Vec<String> {
+        let m = choz_engine::metronome::metronome();
+        let t = choz_ports::transport();
+        let (num, den) = t.time_signature();
+        vec![
+            format!(
+                "  {:<12} {}",
+                i18n::t("CLICK"),
+                if m.on() { "ON" } else { "OFF" }
+            ),
+            format!("  {:<12} {:>5.1} BPM", i18n::t("TEMPO"), t.bpm()),
+            format!("  {:<12} {num}/{den}", i18n::t("SIGNATURE")),
+            format!("  {:<12} {}", i18n::t("SOUND"), m.style().label()),
+            format!("  {:<12} {:>4.0}%", i18n::t("LEVEL"), m.gain() * 100.0),
+        ]
+    }
+
+    /// Move row `i` of the metronome menu by `delta` steps.
+    ///
+    /// Enter (or a click) steps forward; `←` `→` and the wheel go either way,
+    /// which is what a tempo needs — 132 is four presses past 112 and forty
+    /// presses back the other way if the only direction is forward.
+    fn step_metronome_row(&mut self, i: usize, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        let m = choz_engine::metronome::metronome();
+        let t = choz_ports::transport();
+        let wrap = |at: usize, n: usize| -> usize {
+            ((at as isize + delta).rem_euclid(n as isize)) as usize
+        };
+        match i {
+            0 => m.set_on(!m.on()),
+            1 => {
+                // Five at a time, wrapping: the range is 20..300 and a menu is
+                // not where anyone sets a tempo one BPM at a time.
+                let bpm = t.bpm() + 5.0 * delta as f32;
+                let (lo, hi) = (
+                    choz_ports::Transport::MIN_BPM,
+                    choz_ports::Transport::MAX_BPM,
+                );
+                t.set_bpm(if bpm > hi {
+                    lo
+                } else if bpm < lo {
+                    hi
+                } else {
+                    bpm
+                });
+            }
+            2 => {
+                let now = t.time_signature();
+                let at = Self::TIME_SIGS.iter().position(|s| *s == now).unwrap_or(0);
+                let (n, d) = Self::TIME_SIGS[wrap(at, Self::TIME_SIGS.len())];
+                t.set_time_signature(n, d);
+            }
+            3 => {
+                let all = choz_engine::metronome::ClickStyle::ALL;
+                let at = all.iter().position(|s| *s == m.style()).unwrap_or(0);
+                m.set_style(all[wrap(at, all.len())]);
+            }
+            4 => {
+                let g = m.gain() + 0.1 * delta as f32;
+                m.set_gain(if g > 1.001 {
+                    0.1
+                } else if g < 0.05 {
+                    1.0
+                } else {
+                    g
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Take `dir` as the active tab's bank: every preset file under it becomes
+    /// a patch in the same picker a plugin's own browser fills, filed by
+    /// sub-folder. Loading one is [`App::apply_selected_preset`], which for a
+    /// file bank is a state restore.
+    fn set_bank_dir(&mut self, dir: std::path::PathBuf) {
+        let bank = choz_engine::preset_files::list_bank(&dir);
+        if bank.is_empty() {
+            eprintln!("choz: no .fxp / .fxb / .vstpreset files under {}", dir.display());
+            return;
+        }
+        if let Some(slot) = self.slots.get_mut(self.active_slot) {
+            slot.preset_cursor = 0;
+            slot.plugin_presets = bank;
+            slot.preset_dir = Some(dir);
+        }
+        // Straight into the patch list: picking the folder was a means to it.
+        self.open_preset_modal();
     }
 
     fn open_browser_modal(&mut self, exts: &'static [&'static str]) {
@@ -2020,6 +2276,7 @@ impl App {
             .get(slot)
             .map(|s| s.dssi_config.clone())
             .unwrap_or_default();
+        self.close_editor_for(Some(slot));
         let Some(ref mut engine) = self.audio_engine else {
             return;
         };
@@ -2085,6 +2342,93 @@ impl App {
         }
         let next = (self.instr_param as isize + delta).clamp(0, n as isize - 1);
         self.instr_param = next as usize;
+    }
+
+    /// Page the instrument's knob box. The learned CCs follow it, but not from
+    /// here: [`App::sync_instr_window`] moves them after the draw, so they
+    /// follow the window however it moved.
+    fn page_instr(&mut self, delta: isize) {
+        let n = self.instr_knob_count();
+        // What is actually on screen, read back from the last draw: the panel
+        // decides how many knobs fit, and pretending otherwise here is how the
+        // page and the box disagree.
+        let (start, page, cols) = {
+            let layout = self.layout.borrow();
+            let knobs = &layout.rack.instr_knobs;
+            let Some(&(first, rect)) = knobs.first() else {
+                return;
+            };
+            let cols = knobs.iter().filter(|(_, r)| r.y == rect.y).count().max(1);
+            (first, knobs.len(), cols)
+        };
+        if page == 0 || page >= n {
+            return;
+        }
+        let rows = page.div_ceil(cols);
+        // The box scrolls to keep the cursor visible, with the cursor on the
+        // *last* visible row — so putting the cursor on the last cell of the
+        // page we want is how the window is moved. No second scroll state to
+        // keep in step with the first.
+        let wanted = (start as isize + delta * page as isize).max(0) as usize;
+        let cursor = (wanted + page - 1).min(n - 1);
+        let landed = (cursor / cols).saturating_sub(rows - 1) * cols;
+        let shift = landed as isize - start as isize;
+        if shift == 0 {
+            return;
+        }
+        self.instr_param = cursor;
+    }
+
+    /// Re-address the CCs learned on the instrument's knob box to whatever the
+    /// box is showing now.
+    ///
+    /// A plugin with three hundred parameters (Surge XT has them) shows a
+    /// dozen at a time, so the box has a window into the list. Whoever moves
+    /// that window — the `◀` `▶` buttons, `PgUp` / `PgDn`, a CC bound to
+    /// either, the arrow keys walking off the edge, the wheel, a terminal
+    /// resize — moves every CC bound to this tab's instrument by the same
+    /// distance: the fader that sat on the first knob of the box still sits on
+    /// the first knob of the box. Otherwise eight faders own eight of three
+    /// hundred parameters for good.
+    ///
+    /// This runs after the draw, on the window the draw actually produced,
+    /// because that is the only place the truth lives: the panel decides how
+    /// many knobs fit. Nothing that scrolls the box has to remember to call
+    /// anything.
+    fn sync_instr_window(&mut self) {
+        let slot = self.active_slot;
+        let n = self.instr_knob_count();
+        let start = self
+            .layout
+            .borrow()
+            .rack
+            .instr_knobs
+            .first()
+            .map(|&(first, _)| first);
+        let prev = self.slots.get(slot).and_then(|s| s.instr_window);
+        if let Some(s) = self.slots.get_mut(slot) {
+            s.instr_window = start.map(|start| (start, n));
+        }
+        let (Some(start), Some((was, was_n))) = (start, prev) else {
+            return;
+        };
+        // A different parameter list is not a window that moved: a tab that
+        // just loaded a plugin adopts its window and shifts nothing.
+        if was_n != n || start == was {
+            return;
+        }
+        let shift = start as isize - was as isize;
+        for b in self.cc_bindings.iter_mut() {
+            if let LearnTarget::InstrParam { slot: s, param } = &mut b.target {
+                // ponytail: clamped, so a binding near the end of the list
+                // lands on the last parameter instead of falling off the rack.
+                // Two of them can then share one parameter, which is visible
+                // and undoable; a silently dropped binding is neither.
+                if *s == slot {
+                    *param = (*param as isize + shift).clamp(0, n as isize - 1) as usize;
+                }
+            }
+        }
     }
 
     /// Columns in the instrument's knob box, read back from what was drawn:
@@ -3362,6 +3706,7 @@ impl App {
                     .map(|(_, label)| label)
                     .collect()
             }
+            ModalKind::Metronome => self.metronome_rows(),
             ModalKind::Preset => self
                 .preset_rows()
                 .into_iter()
@@ -3399,7 +3744,7 @@ impl App {
                     })
                     .collect()
             }
-            ModalKind::Browser | ModalKind::Wallpaper => self
+            ModalKind::Browser | ModalKind::Wallpaper | ModalKind::Bank => self
                 .modal
                 .as_ref()
                 .unwrap()
@@ -3580,6 +3925,7 @@ impl App {
             let confirming = self.save_name.as_ref().is_some_and(|n| n.confirm);
             if let (
                 ModalKind::Browser
+                | ModalKind::Bank
                 | ModalKind::AddPath
                 | ModalKind::SaveProject
                 | ModalKind::LoadProject,
@@ -3676,7 +4022,7 @@ impl App {
                         true
                     }
                     Some(SourceAction::File(path)) => {
-                        self.load_source(path);
+                        self.request_load_source(path);
                         true
                     }
                     Some(SourceAction::Browse(ext)) => {
@@ -3708,6 +4054,11 @@ impl App {
                 }
                 self.apply_selected_preset();
                 true
+            }
+            ModalKind::Metronome => {
+                self.step_metronome_row(i, 1);
+                // Stays open: the point is to hear the change and step again.
+                false
             }
             ModalKind::Learn => {
                 self.learn = m.targets.get(i).copied();
@@ -3752,8 +4103,9 @@ impl App {
                 }
                 true
             }
-            ModalKind::Browser | ModalKind::Wallpaper => {
+            ModalKind::Browser | ModalKind::Wallpaper | ModalKind::Bank => {
                 let wallpaper = m.kind == ModalKind::Wallpaper;
+                let bank = m.kind == ModalKind::Bank;
                 let action = self.modal.as_mut().and_then(|m| {
                     let b = m.browser.as_mut()?;
                     b.cursor = i;
@@ -3785,8 +4137,14 @@ impl App {
                         self.refresh_modal();
                         false
                     }
+                    Some(file_browser::Action::PickFile(path)) if bank => {
+                        self.set_bank_dir(path);
+                        // `set_bank_dir` opens the patch list on top; closing
+                        // here would take that with it.
+                        false
+                    }
                     Some(file_browser::Action::PickFile(path)) => {
-                        self.load_source(path);
+                        self.request_load_source(path);
                         true
                     }
                     None => true,
@@ -4024,7 +4382,7 @@ impl App {
             .iter()
             .position(|s| s.id == id && s.path == path && s.format == format)
         {
-            self.load_synth(i);
+            self.request_load_synth(i);
         }
     }
 
@@ -4047,6 +4405,7 @@ impl App {
                         preset: None,
                         params: Vec::new(),
                         state: String::new(),
+                        bank_dir: None,
                         config: Vec::new(),
                     },
                     AudioSource::Sf2 { path, bank, preset } => project::Instrument {
@@ -4058,6 +4417,7 @@ impl App {
                         preset: Some(*preset),
                         params: Vec::new(),
                         state: String::new(),
+                        bank_dir: None,
                         config: Vec::new(),
                     },
                     AudioSource::AudioFile { path, .. } => project::Instrument {
@@ -4069,6 +4429,7 @@ impl App {
                         preset: None,
                         params: Vec::new(),
                         state: String::new(),
+                        bank_dir: None,
                         config: Vec::new(),
                     },
                     AudioSource::Plugin { id, name, .. } => project::Instrument {
@@ -4094,6 +4455,7 @@ impl App {
                             })
                             .map(|b| project::encode_state(&b))
                             .unwrap_or_default(),
+                        bank_dir: slot.preset_dir.clone(),
                         config: slot.dssi_config.clone(),
                     },
                 };
@@ -4169,6 +4531,8 @@ impl App {
                         in_gain: Some(slot.in_gain),
                         in_gate: Some(slot.in_gate),
                         gain: slot.gain,
+                        gain_r: (!slot.link).then_some(slot.gain_r),
+                        link: (!slot.link).then_some(false),
                         pan: slot.pan,
                         mute: slot.mute,
                         solo: slot.solo,
@@ -4305,6 +4669,13 @@ impl App {
             // is saved. Restored by `rebuild_rack` once an instance exists; a
             // blob that no longer decodes is dropped, not fatal.
             rack.instr_state = project::decode_state(&slot.instrument.state).unwrap_or_default();
+            // The bank is a folder on disk; re-reading it is how the patch list
+            // comes back. A folder that has since gone leaves the tab with the
+            // patch it saved and no list, which is what it would have anyway.
+            if let Some(dir) = slot.instrument.bank_dir.clone() {
+                rack.plugin_presets = choz_engine::preset_files::list_bank(&dir);
+                rack.preset_dir = Some(dir);
+            }
             rack.fx_chain = slot
                 .fx
                 .iter()
@@ -4315,6 +4686,8 @@ impl App {
                 })
                 .collect();
             rack.gain = slot.mixer.gain;
+            rack.link = slot.mixer.link.unwrap_or(true);
+            rack.gain_r = slot.mixer.gain_r.unwrap_or(slot.mixer.gain);
             rack.pan = slot.mixer.pan;
             rack.mute = slot.mixer.mute;
             rack.solo = slot.mixer.solo;
@@ -4766,6 +5139,8 @@ impl App {
                 .and_then(|&(b, _)| match b {
                     RackButton::PresetPrev => Some(TriggerAction::PresetPrev),
                     RackButton::PresetNext => Some(TriggerAction::PresetNext),
+                    RackButton::InstrPagePrev => Some(TriggerAction::InstrPagePrev),
+                    RackButton::InstrPageNext => Some(TriggerAction::InstrPageNext),
                     _ => None,
                 })
         })
@@ -4793,6 +5168,8 @@ impl App {
         match action {
             TriggerAction::PresetPrev => self.step_preset(-1),
             TriggerAction::PresetNext => self.step_preset(1),
+            TriggerAction::InstrPagePrev => self.page_instr(-1),
+            TriggerAction::InstrPageNext => self.page_instr(1),
             TriggerAction::Mute => self.with_active_mix(|s| s.mute = !s.mute),
             TriggerAction::Solo => self.with_active_mix(|s| s.solo = !s.solo),
             TriggerAction::ArpToggle => self.edit_arp(ArpEdit::Toggle),
@@ -5373,6 +5750,109 @@ impl App {
     }
 
     /// Load the plugin instrument at `i` into the active tab.
+    /// Ask for a plugin to be loaded after the next frame, with its name on
+    /// screen while it happens. Everything the user can click goes through
+    /// here; a project load calls [`App::load_synth`] directly, because there
+    /// is no frame to wait for in the middle of rebuilding a rack.
+    fn request_load_synth(&mut self, i: usize) {
+        self.loading = self.synths.get(i).map(|s| s.name.clone());
+        self.pending_load = Some(PendingLoad::Synth(i));
+    }
+
+    fn request_load_source(&mut self, path: std::path::PathBuf) {
+        self.loading = Some(
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+        );
+        self.pending_load = Some(PendingLoad::Source(path));
+    }
+
+    /// Say in the log when the audio thread could not keep up.
+    ///
+    /// The symptom the user reports is always the same sentence — "the sound
+    /// saturates and then disappears, and comes back when I stop playing" — and
+    /// from the outside a rack that runs out of CPU, a sandboxed plugin missing
+    /// its deadline and an output that is clipping look identical. They are not
+    /// the same problem and they have different fixes, so the log says which:
+    /// the block budget, the worst block in the last second, how many went over
+    /// it, how many blocks a sandboxed child failed to answer, and whether the
+    /// mix clipped. Once a second, and only when something actually went wrong.
+    fn poll_health(&mut self) {
+        if self.health_at.elapsed() < std::time::Duration::from_secs(1) {
+            return;
+        }
+        self.health_at = Instant::now();
+        let (peak, blocks, over) = choz_engine::meter::load().take();
+        if blocks == 0 {
+            return;
+        }
+        let clips = choz_engine::meter::meter().clipping();
+        let (missed, restarts) = self
+            .audio_engine
+            .as_ref()
+            .map(|e| e.sandbox_health())
+            .unwrap_or((0, 0));
+        let (seen_clips, seen_missed, seen_restarts) = self.health_seen;
+        self.health_seen = (clips, missed, restarts);
+        let new_missed = missed.saturating_sub(seen_missed);
+        let new_clips = clips.saturating_sub(seen_clips);
+        let new_restarts = restarts.saturating_sub(seen_restarts);
+        if over == 0 && new_missed == 0 && new_clips == 0 && new_restarts == 0 {
+            return;
+        }
+        let budget = choz_engine::meter::load().budget_us();
+        let (tab, tab_ms) = choz_engine::meter::load().take_worst_slot();
+        // A second where more than a handful of blocks went over is not a
+        // hiccup, it is a rack this machine cannot render at this block size —
+        // and the fix is one setting, so say it rather than leaving it to be
+        // deduced from microseconds.
+        if over > blocks / 20 {
+            let frames = self
+                .audio_engine
+                .as_ref()
+                .map(|e| e.buffer_size)
+                .unwrap_or(0);
+            if frames > 0 {
+                eprintln!(
+                    "choz[{}]: …that is heard as breaking up. A block of {} frames instead of {} \
+                     doubles the room (Settings -> AUDIO), and costs {:.1} ms more latency.",
+                    std::process::id(),
+                    frames * 2,
+                    frames,
+                    budget as f32 / 1000.0,
+                );
+            }
+        }
+        eprintln!(
+            "choz[{pid}]: audio short of time — block {:.2} ms, worst {:.2} ms ({:.0}% of it), \
+             dearest tab {} ({}) {tab_ms:.2} ms, {over}/{blocks} blocks over budget \
+             (device wants {want}/s), {new_missed} sandbox blocks missed, \
+             {new_clips} clipped, {new_restarts} plugin restarts",
+            budget as f32 / 1000.0,
+            peak * budget as f32 / 1000.0,
+            peak * 100.0,
+            tab + 1,
+            self.slots
+                .get(tab)
+                .map(|s| slot_label(&s.source))
+                .unwrap_or_else(|| "?".into()),
+            pid = std::process::id(),
+            want = 1_000_000u32.checked_div(budget).unwrap_or(0),
+        );
+    }
+
+    /// Run whatever the last frame promised. Called from the run loop right
+    /// after the draw that put "loading" on screen.
+    fn run_pending_load(&mut self) {
+        match self.pending_load.take() {
+            Some(PendingLoad::Synth(i)) => self.load_synth(i),
+            Some(PendingLoad::Source(p)) => self.load_source(p),
+            None => return,
+        }
+        self.loading = None;
+    }
+
     fn load_synth(&mut self, i: usize) {
         let Some(entry) = self.synths.get(i).cloned() else {
             return;
@@ -5387,6 +5867,9 @@ impl App {
             .get(slot)
             .map(|s| s.dssi_config.clone())
             .unwrap_or_default();
+        // The instrument in this tab is about to be replaced; its window cannot
+        // outlive it.
+        self.close_editor_for(Some(slot));
         let loaded = match self.audio_engine.as_mut() {
             Some(engine) => {
                 Self::load_plugin_into(engine, slot, entry.format, &entry.path, &entry.id, &config)
@@ -5398,7 +5881,7 @@ impl App {
                 self.set_active_source(AudioSource::Plugin {
                     id: entry.id.clone(),
                     format: entry.format.label().to_string(),
-                    name: entry.name,
+                    name: entry.name.clone(),
                 });
                 // Read the plugin's own parameters so the INSTR editor can show
                 // them; knobs start where the plugin says its defaults are.
@@ -5419,7 +5902,11 @@ impl App {
                     s.instr_values = values;
                     s.plugin_presets = presets;
                     s.preset_cursor = 0;
+                    // A new instrument, so the folder the last one used is not
+                    // this one's bank.
+                    s.preset_dir = None;
                 }
+                self.adopt_bank(slot);
             }
             Err(e) => eprintln!("choz: {e}"),
         }
@@ -5889,10 +6376,82 @@ impl App {
 
     /// Remove slot `idx` from the rack and the engine, then reload the working
     /// copy from whichever slot ends up active.
+    /// Give tab `slot` a bank of patch **files** when its plugin publishes no
+    /// programs worth showing.
+    ///
+    /// Surge XT's VST3 reports zero programs and ships 637 `.fxp` under
+    /// `/usr/share/surge-xt/patches_factory`, filed by the same categories its
+    /// own window shows. Finding them by name means the BANK button opens on
+    /// `Leads · Butter` instead of on a folder picker. A tab that already knows
+    /// its folder (a project, or a folder the user picked) keeps it, and
+    /// anything the guess cannot find is still one pick away.
+    fn adopt_bank(&mut self, slot: usize) {
+        let Some(s) = self.slots.get(slot) else {
+            return;
+        };
+        // A browser of its own wins — but only if it says anything. TyrellN6's
+        // VST3 publishes 128 slots called `Program 0`, `Program 1`… : a list
+        // with no information in it, standing between the player and the 669
+        // patches u-he actually installed. A bank that names nothing is not a
+        // bank.
+        if s.preset_dir.is_none() && s.plugin_presets.iter().any(|p| !is_placeholder(&p.name)) {
+            return;
+        }
+        let (id, name) = match &s.source {
+            AudioSource::Plugin { id, name, .. } => (id.clone(), name.clone()),
+            _ => return,
+        };
+        let dir = s
+            .preset_dir
+            .clone()
+            .filter(|d| d.is_dir())
+            .or_else(|| {
+                let path = self.synths.iter().find(|e| e.id == id).map(|e| e.path.clone())?;
+                choz_engine::preset_files::guess_bank_dir(&name, &path)
+            });
+        let Some(dir) = dir else {
+            return;
+        };
+        let files = choz_engine::preset_files::list_bank(&dir);
+        if files.is_empty() {
+            return;
+        }
+        eprintln!("choz: {} patches for {name} in {}", files.len(), dir.display());
+        if let Some(s) = self.slots.get_mut(slot) {
+            s.preset_cursor = s.preset_cursor.min(files.len() - 1);
+            s.plugin_presets = files;
+            s.preset_dir = Some(dir);
+        }
+    }
+
+    /// Shut a plugin's window **before** its plugin is dropped or replaced.
+    ///
+    /// The editor thread lives inside the plugin: it calls `idle()` on it every
+    /// 30 ms, and for a JUCE-based one (Surge XT) that runs the plugin's own
+    /// message loop. Dropping the instrument out from under that thread is a
+    /// deadlock — the destructor takes locks the editor thread is already
+    /// holding — and it is what froze choz when a tab was closed with the
+    /// window open: the interface waiting on a thread that was waiting on the
+    /// plugin. Dropping [`editor::EditorWindow`] closes the window and joins the
+    /// thread first, which is the order that works.
+    ///
+    /// `slot` of `None` means "whatever is open": removing a tab renumbers
+    /// every slot after it, so an editor keyed on the old index is pointing at
+    /// somebody else's plugin either way.
+    fn close_editor_for(&mut self, slot: Option<usize>) {
+        let open = self.editor.as_ref().map(|w| w.key.0);
+        if open.is_some_and(|s| slot.is_none_or(|want| s == want)) {
+            self.editor = None;
+        }
+    }
+
     fn remove_slot(&mut self, idx: usize) {
         if idx >= self.slots.len() {
             return;
         }
+        // Its plugin is about to be dropped, and every slot after it is about
+        // to be renumbered.
+        self.close_editor_for(None);
         // The working copy belongs to the active slot; flush it before the Vec
         // shifts, or edits made since the last tab switch are lost.
         self.persist_active();
@@ -5925,16 +6484,75 @@ impl App {
     /// any slot is soloed, every non-soloed slot is muted.
     fn push_mix(&mut self) {
         let any_solo = self.slots.iter().any(|s| s.solo);
-        let strips: Vec<(f32, f32, bool)> = self
+        let strips: Vec<(f32, f32, f32, bool)> = self
             .slots
             .iter()
-            .map(|s| (s.gain, s.pan, s.mute || (any_solo && !s.solo)))
+            .map(|s| {
+                (
+                    s.gain,
+                    if s.link { s.gain } else { s.gain_r },
+                    s.pan,
+                    s.mute || (any_solo && !s.solo),
+                )
+            })
             .collect();
         if let Some(ref mut engine) = self.audio_engine {
-            for (i, (gain, pan, mute)) in strips.into_iter().enumerate() {
-                engine.set_slot_mix(i, gain, pan, mute);
+            for (i, (gain, gain_r, pan, mute)) in strips.into_iter().enumerate() {
+                engine.set_slot_mix(i, gain, gain_r, pan, mute);
             }
         }
+    }
+
+    /// Move one side of a tab's fader, or both when the strip is linked.
+    ///
+    /// `delta` is in the same step the RACK's `VOL` knob uses, so a click of the
+    /// wheel means the same thing wherever the level is touched.
+    fn nudge_gain(&mut self, tab: usize, side: MixSide, delta: f32) {
+        let Some(s) = self.slots.get(tab) else {
+            return;
+        };
+        let (linked, l, r) = (s.link, s.gain, s.gain_r);
+        let clamp = |v: f32| v.clamp(0.0, views::fx_chain_panel::MAX_GAIN);
+        self.with_mix(tab, |s| match (linked, side) {
+            (true, _) | (_, MixSide::Both) => {
+                s.gain = clamp(l + delta);
+                s.gain_r = clamp(r + delta);
+            }
+            (false, MixSide::Left) => s.gain = clamp(l + delta),
+            (false, MixSide::Right) => s.gain_r = clamp(r + delta),
+        });
+    }
+
+    /// Put one side of a tab's fader at `value` (0..1 of the range), or both
+    /// when the strip is linked — what a click on the track means.
+    fn set_gain_side(&mut self, tab: usize, side: MixSide, value: f32) {
+        let linked = self.slots.get(tab).is_some_and(|s| s.link);
+        let v = value.clamp(0.0, 1.0) * views::fx_chain_panel::MAX_GAIN;
+        self.with_mix(tab, |s| match (linked, side) {
+            (true, _) | (_, MixSide::Both) => {
+                s.gain = v;
+                s.gain_r = v;
+            }
+            (false, MixSide::Left) => s.gain = v,
+            (false, MixSide::Right) => s.gain_r = v,
+        });
+    }
+
+    /// Tie a strip's two sides together, or let them go. Linking takes the
+    /// louder of the two, because the quiet side was the one being trimmed.
+    fn toggle_link(&mut self, tab: usize) {
+        let Some(s) = self.slots.get(tab) else {
+            return;
+        };
+        let (link, l, r) = (s.link, s.gain, s.gain_r);
+        self.with_mix(tab, |s| {
+            s.link = !link;
+            if s.link {
+                let both = l.max(r);
+                s.gain = both;
+                s.gain_r = both;
+            }
+        });
     }
 
     /// Apply the preset under the active slot's cursor (SF2 program change).
@@ -5950,6 +6568,24 @@ impl App {
                 .plugin_presets
                 .get(slot.preset_cursor)
                 .map(|p| p.key.clone());
+            // A bank of files: the key is the path, and the patch inside it is
+            // the same blob the plugin's own state call produces.
+            if slot.preset_dir.is_some() {
+                let Some(key) = key else { return };
+                match choz_engine::preset_files::read_state(std::path::Path::new(&key)) {
+                    Ok(state) => {
+                        // Kept on the tab too, so the patch survives everything
+                        // that rebuilds engine slots — and gets saved with the
+                        // project like any other.
+                        slot.instr_state = state.clone();
+                        if let Some(engine) = self.audio_engine.as_ref() {
+                            engine.set_slot_state(idx, &state);
+                        }
+                    }
+                    Err(e) => eprintln!("choz: {e:#}"),
+                }
+                return;
+            }
             if let (Some(key), Some(engine)) = (key, self.audio_engine.as_ref()) {
                 engine.load_slot_preset(idx, &key);
             }
@@ -6060,6 +6696,8 @@ impl App {
     /// is assumed empty — this runs after something dropped it (an output
     /// device change) or after a project was loaded.
     fn rebuild_rack(&mut self) {
+        // Every instrument in the rack is about to be replaced by a fresh one.
+        self.close_editor_for(None);
         let slots = self.slots.clone();
         for (i, slot) in slots.iter().enumerate() {
             let Some(ref mut engine) = self.audio_engine else {
@@ -6112,12 +6750,18 @@ impl App {
                 None => Vec::new(),
             };
             if let Some(slot) = self.slots.get_mut(i) {
-                slot.plugin_presets = presets;
+                // A bank of files is the tab's own, not the instance's: keep it
+                // rather than replacing it with the nothing this plugin
+                // publishes.
+                if slot.preset_dir.is_none() {
+                    slot.plugin_presets = presets;
+                }
                 let last = slot.plugin_presets.len().saturating_sub(1);
                 if !slot.plugin_presets.is_empty() {
                     slot.preset_cursor = slot.preset_cursor.min(last);
                 }
             }
+            self.adopt_bank(i);
         }
         self.push_mix();
         // Engine slots are new after a reload, so they start on the default
@@ -6221,9 +6865,17 @@ impl App {
     }
 
     /// The active tab's current program, as the picker writes it.
+    ///
+    /// A plugin that reports no programs but can be handed a state blob gets a
+    /// standing invitation instead of nothing: its patches are files on disk,
+    /// and the bank button is the only way to say where they are. Surge XT's
+    /// VST3 build is exactly that case — 637 factory patches, zero programs.
     fn active_preset_label(&self) -> Option<String> {
         let cursor = self.slots.get(self.active_slot)?.preset_cursor;
-        self.preset_labels(self.active_slot).into_iter().nth(cursor)
+        self.preset_labels(self.active_slot)
+            .into_iter()
+            .nth(cursor)
+            .or_else(|| self.can_pick_bank().then(|| i18n::t("PICK BANK").to_string()))
     }
 
     /// Step the active tab's program by `delta` and apply it. This is what the
@@ -6310,6 +6962,43 @@ impl App {
     }
 
     /// Mutate the active slot's mixer strip, then push it to the engine.
+    /// Every tab as the MIXER tab draws it.
+    fn mixer_strips(&self) -> Vec<views::midi_monitor::MixerStrip> {
+        self.slots
+            .iter()
+            .enumerate()
+            .map(|(i, s)| views::midi_monitor::MixerStrip {
+                label: slot_label(&s.source),
+                gain: s.gain,
+                gain_r: if s.link { s.gain } else { s.gain_r },
+                link: s.link,
+                pan: s.pan,
+                mute: s.mute,
+                solo: s.solo,
+                active: i == self.active_slot,
+                // Only the tab the keyboard is on has a lit side, and only
+                // while the MIXER is the panel with the focus.
+                side: (i == self.active_slot && self.focus == Focus::Mixer).then_some(
+                    match self.mix_side {
+                        MixSide::Left => views::midi_monitor::MixerSide::Left,
+                        MixSide::Right => views::midi_monitor::MixerSide::Right,
+                        MixSide::Both => views::midi_monitor::MixerSide::Both,
+                    },
+                ),
+            })
+            .collect()
+    }
+
+    /// Same as [`App::with_active_mix`] for a tab that is not the active one —
+    /// the MIXER edits all of them, and every strip has to reach the engine.
+    fn with_mix(&mut self, i: usize, f: impl FnOnce(&mut RackSlot)) {
+        let Some(slot) = self.slots.get_mut(i) else {
+            return;
+        };
+        f(slot);
+        self.push_mix();
+    }
+
     fn with_active_mix(&mut self, f: impl FnOnce(&mut RackSlot)) {
         let Some(slot) = self.slots.get_mut(self.active_slot) else {
             return;
@@ -6409,6 +7098,7 @@ impl App {
         let Some(slot) = self.ensure_slot() else {
             return;
         };
+        self.close_editor_for(Some(slot));
         let loaded = match self.audio_engine.as_mut() {
             Some(engine) if is_sf2 => engine.load_sf2(slot, &path, 0, 0),
             Some(engine) => engine.load_wav(slot, &path, true),
@@ -7101,6 +7791,10 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Screen>>, app: &mut App) -> 
             }
         }
 
+        // The frame above is the one that says "loading": the work below blocks
+        // this thread, so it has to come after a draw and not before one.
+        app.run_pending_load();
+
         handle_events(app)?;
         app.poll_scan();
         app.poll_midi_hotplug();
@@ -7110,6 +7804,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Screen>>, app: &mut App) -> 
         app.publish_chord();
         app.poll_editor();
         app.poll_plugin_touch();
+        app.poll_health();
         app.tick_automation();
     }
     Ok(())
@@ -7159,6 +7854,12 @@ fn handle_key(app: &mut App, key: KeyCode) {
     // with the plugin's window focused still has to be killable from the TUI.
     if key == KeyCode::Char('P') && app.modal.is_none() {
         app.panic();
+        return;
+    }
+    // The click, from anywhere and with one key: a metronome you have to open
+    // a menu to silence is one you play over.
+    if key == KeyCode::F(6) && app.modal.is_none() {
+        app.toggle_metronome();
         return;
     }
     // The monitor's tabs, from anywhere: the panel has no focus of its own.
@@ -7248,7 +7949,12 @@ fn handle_key(app: &mut App, key: KeyCode) {
     }
 
     if key == KeyCode::Tab {
-        app.focus = next_focus(app.focus, app.in_open, app.out_open);
+        app.focus = next_focus(
+            app.focus,
+            app.in_open,
+            app.out_open,
+            app.monitor_tab == views::midi_monitor::MonitorTab::Mixer,
+        );
         return;
     }
 
@@ -7257,21 +7963,57 @@ fn handle_key(app: &mut App, key: KeyCode) {
         Focus::FxChain => handle_fx_keys(app, key),
         Focus::Transport => handle_transport_keys(app, key),
         Focus::Output => handle_output_keys(app, key),
+        Focus::Mixer => handle_mixer_keys(app, key),
+    }
+}
+
+/// Keys for the MIXER: the strips of every tab, side by side.
+///
+/// `↑` `↓` move the level in the same step the RACK's `VOL` uses, `←` `→` walk
+/// the desk (which pages it), `l` ties a strip's two sides together or lets
+/// them go, and `k` picks which side the arrows move on a strip that is not
+/// linked. Mute and solo are the same letters as everywhere else.
+fn handle_mixer_keys(app: &mut App, key: KeyCode) {
+    let tab = app.active_slot;
+    match key {
+        KeyCode::Up => app.nudge_gain(tab, app.mix_side, GAIN_STEP),
+        KeyCode::Down => app.nudge_gain(tab, app.mix_side, -GAIN_STEP),
+        // A tenth at a time, for getting there rather than for settling.
+        KeyCode::PageUp => app.nudge_gain(tab, app.mix_side, GAIN_STEP * 2.0),
+        KeyCode::PageDown => app.nudge_gain(tab, app.mix_side, -GAIN_STEP * 2.0),
+        KeyCode::Left if tab > 0 => app.switch_slot(tab - 1),
+        KeyCode::Right if tab + 1 < app.slots.len() => app.switch_slot(tab + 1),
+        KeyCode::Char('l') => app.toggle_link(tab),
+        KeyCode::Char('k') => {
+            app.mix_side = match app.mix_side {
+                MixSide::Both => MixSide::Left,
+                MixSide::Left => MixSide::Right,
+                MixSide::Right => MixSide::Both,
+            }
+        }
+        KeyCode::Char(',') => app.with_active_mix(|s| s.pan = (s.pan - 0.05).clamp(-1.0, 1.0)),
+        KeyCode::Char('.') => app.with_active_mix(|s| s.pan = (s.pan + 0.05).clamp(-1.0, 1.0)),
+        KeyCode::Char('m') => app.with_active_mix(|s| s.mute = !s.mute),
+        KeyCode::Char('S') => app.with_active_mix(|s| s.solo = !s.solo),
+        _ => {}
     }
 }
 
 /// Tab order, skipping whichever drawer is shut — a closed drawer has nothing
 /// to focus, so Tab must not park on it.
-fn next_focus(focus: Focus, in_open: bool, out_open: bool) -> Focus {
+fn next_focus(focus: Focus, in_open: bool, out_open: bool, mixer: bool) -> Focus {
     let order = [
         Focus::Source,
         Focus::FxChain,
         Focus::Transport,
+        Focus::Mixer,
         Focus::Output,
     ];
     let open = |f: Focus| match f {
         Focus::Source => in_open,
         Focus::Output => out_open,
+        // Nothing to focus when the bottom panel is showing something else.
+        Focus::Mixer => mixer,
         _ => true,
     };
     let at = order.iter().position(|f| *f == focus).unwrap_or(1);
@@ -7380,6 +8122,12 @@ fn handle_modal_key(app: &mut App, key: KeyCode) {
                 app.apply_ui_settings();
                 app.refresh_modal();
             }
+        }
+        // The metronome's rows are values, not choices: the arrows move them
+        // either way, and the menu stays open so the change can be heard.
+        KeyCode::Left | KeyCode::Right if kind == ModalKind::Metronome => {
+            app.step_metronome_row(cursor, if key == KeyCode::Right { 1 } else { -1 });
+            app.refresh_modal();
         }
         // Value arrows in the instrument editor; filter chips everywhere else.
         KeyCode::Left | KeyCode::Right => {
@@ -7681,6 +8429,23 @@ fn scan_files(dir: &std::path::Path, ext: &str) -> Vec<std::path::PathBuf> {
 }
 
 /// Short label for a rack tab, e.g. "SF2:piano" or "CLAP:Surge".
+/// A preset name that names nothing: empty, a bare number, or `Program 12` —
+/// the numbered slots a format hands out when the plugin filled none of them in.
+fn is_placeholder(name: &str) -> bool {
+    let n = name.trim();
+    if n.is_empty() {
+        return true;
+    }
+    let rest = n
+        .strip_prefix("Program")
+        .or_else(|| n.strip_prefix("program"))
+        .or_else(|| n.strip_prefix("Preset"))
+        .or_else(|| n.strip_prefix("preset"))
+        .unwrap_or(n)
+        .trim();
+    rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit())
+}
+
 fn slot_label(source: &AudioSource) -> String {
     match source {
         AudioSource::Midi => "(empty)".to_string(),
@@ -7758,6 +8523,12 @@ fn handle_fx_keys(app: &mut App, key: KeyCode) {
         // `k` swaps between the instrument's knobs and the FX chain's; the
         // arrows and w/s then drive whichever box has the cursor.
         KeyCode::Char('k') => app.toggle_rack_focus(),
+        // The instrument's pager, from the keyboard: the same two arrows the
+        // panel draws, and the same remapping of whatever CCs are on the box.
+        // Page up/down rather than `<`/`>` — those are the input trim, and a
+        // guitarist reaching for the gain must not page the synth instead.
+        KeyCode::PageUp => app.page_instr(-1),
+        KeyCode::PageDown => app.page_instr(1),
         KeyCode::Left if app.rack_focus == RackFocus::Instrument => app.step_instr_cursor(-1),
         KeyCode::Right if app.rack_focus == RackFocus::Instrument => app.step_instr_cursor(1),
         KeyCode::Up if app.rack_focus == RackFocus::Instrument => {
@@ -7882,8 +8653,11 @@ const MAX_IN_GAIN: f32 = 16.0;
 /// How much AutoTune history the strip under the knobs shows.
 const AUTOTUNE_TRACE: usize = 240;
 
+/// The RACK's `VOL`: the tab's level, both sides at once whatever the link
+/// says — an unlinked strip keeps the trim between its sides while the whole
+/// tab moves.
 fn adjust_gain(app: &mut App, delta: f32) {
-    app.with_active_mix(|s| s.gain = (s.gain + delta).clamp(0.0, MAX_GAIN));
+    app.nudge_gain(app.active_slot, MixSide::Both, delta);
 }
 
 fn adjust_pan(app: &mut App, delta: f32) {
@@ -8060,6 +8834,8 @@ enum MouseAction {
     OpenSourcePicker,
     ScanInputs,
     PresetStep(isize),
+    /// Page the instrument's knob box, taking the CCs learned on it along.
+    InstrPage(isize),
     /// Step the active tab's MIDI channel (MULTI mode).
     ChannelStep(i8),
     OpenPresetPicker,
@@ -8083,6 +8859,14 @@ enum MouseAction {
     AutomationLoop(i32),
     MixMute,
     MixSolo,
+    /// A MIXER strip: set that tab's level or pan from where the click landed
+    /// on the track, or flip one of its two flags.
+    MixerSet(usize, views::midi_monitor::MixerHit, f32),
+    MixerToggle(usize, views::midi_monitor::MixerHit),
+    MixerPage(isize),
+    /// The wheel over a strip: move that side by a step.
+    MixerNudge(usize, MixSide, f32),
+    MixerPan(usize, f32),
 }
 
 fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> MouseAction {
@@ -8131,6 +8915,35 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                     return MouseAction::MonitorTab(tab);
                 }
             }
+            for &(hit, rect) in layout.mixer_hits.iter() {
+                if !rect.contains(pos) {
+                    continue;
+                }
+                use views::midi_monitor::MixerHit;
+                return match hit {
+                    // Where in the control it was clicked *is* the value: a
+                    // fader you can only nudge is a fader that takes ten clicks
+                    // to cross. The level is a **vertical** fader — top is
+                    // loud — and the pan reads across.
+                    MixerHit::Gain(i) | MixerHit::GainR(i) => {
+                        let h = rect.height.max(1) as f32;
+                        let at = (rect.y + rect.height - 1 - pos.y) as f32 / (h - 1.0).max(1.0);
+                        MouseAction::MixerSet(i, hit, at.clamp(0.0, 1.0))
+                    }
+                    MixerHit::Link(i) => MouseAction::MixerToggle(i, hit),
+                    MixerHit::Pan(i) => {
+                        let w = rect.width.max(1) as f32;
+                        let at = (pos.x - rect.x) as f32 / w;
+                        MouseAction::MixerSet(i, hit, at.clamp(0.0, 1.0))
+                    }
+                    MixerHit::Mute(i) | MixerHit::Solo(i) | MixerHit::Select(i) => {
+                        MouseAction::MixerToggle(i, hit)
+                    }
+                    // The pager walks the active tab, which is what the window
+                    // follows — there is no separate scroll to move.
+                    MixerHit::Page(d) => MouseAction::MixerPage(d),
+                };
+            }
 
             if layout.fx_chain_area.contains(pos) {
                 let rack = &layout.rack;
@@ -8147,6 +8960,8 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                             RackButton::Sandbox => MouseAction::ToggleSandbox,
                             RackButton::PresetPrev => MouseAction::PresetStep(-1),
                             RackButton::PresetNext => MouseAction::PresetStep(1),
+                            RackButton::InstrPagePrev => MouseAction::InstrPage(-1),
+                            RackButton::InstrPageNext => MouseAction::InstrPage(1),
                             RackButton::ArpOn => MouseAction::ArpEdit(ArpEdit::Toggle),
                             // The ones with names open their list instead of
                             // walking it: on a panel too short for the knob
@@ -8297,6 +9112,23 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                     return MouseAction::MonitorTab(tab);
                 }
             }
+            // The wheel over a MIXER control moves it, in the step the RACK's
+            // own VOL knob uses: a fader four rows tall cannot be *set* finely
+            // with a click, and this is what makes it playable anyway.
+            for &(hit, rect) in layout.mixer_hits.iter() {
+                if !rect.contains(pos) {
+                    continue;
+                }
+                use views::midi_monitor::MixerHit;
+                return match hit {
+                    MixerHit::Gain(i) => MouseAction::MixerNudge(i, MixSide::Left, dir * GAIN_STEP),
+                    MixerHit::GainR(i) => {
+                        MouseAction::MixerNudge(i, MixSide::Right, dir * GAIN_STEP)
+                    }
+                    MixerHit::Pan(i) => MouseAction::MixerPan(i, dir * 0.05),
+                    _ => MouseAction::None,
+                };
+            }
 
             if layout.fx_chain_area.contains(pos) {
                 let rack = &layout.rack;
@@ -8416,6 +9248,18 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         let switch = app.layout.borrow().mode_switch_rect;
         if switch.is_some_and(|r| r.contains(pos)) {
             app.toggle_rack_mode();
+            return;
+        }
+        let (met, met_menu) = {
+            let l = app.layout.borrow();
+            (l.met_rect, l.met_menu_rect)
+        };
+        if met.is_some_and(|r| r.contains(pos)) {
+            app.toggle_metronome();
+            return;
+        }
+        if met_menu.is_some_and(|r| r.contains(pos)) {
+            app.open_metronome_modal();
             return;
         }
         let title_hit = app
@@ -8594,6 +9438,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             app.rescan_capture();
         }
         MouseAction::PresetStep(d) => app.step_preset(d),
+        MouseAction::InstrPage(d) => app.page_instr(d),
         MouseAction::ArpEdit(edit) => app.edit_arp(edit),
         MouseAction::OpenPresetPicker => app.open_preset_modal(),
         MouseAction::OpenLearnPicker => app.start_learn_pick(),
@@ -8628,6 +9473,46 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         }
         MouseAction::MixMute => app.with_active_mix(|s| s.mute = !s.mute),
         MouseAction::MixSolo => app.with_active_mix(|s| s.solo = !s.solo),
+        MouseAction::MixerSet(i, hit, v) => match hit {
+            views::midi_monitor::MixerHit::Gain(_) => app.set_gain_side(i, MixSide::Left, v),
+            views::midi_monitor::MixerHit::GainR(_) => app.set_gain_side(i, MixSide::Right, v),
+            views::midi_monitor::MixerHit::Pan(_) => {
+                app.with_mix(i, |s| s.pan = (v * 2.0 - 1.0).clamp(-1.0, 1.0))
+            }
+            _ => {}
+        },
+        MouseAction::MixerNudge(i, side, d) => app.nudge_gain(i, side, d),
+        MouseAction::MixerPan(i, d) => {
+            app.with_mix(i, |s| s.pan = (s.pan + d).clamp(-1.0, 1.0));
+        }
+        MouseAction::MixerPage(d) => {
+            // A page is however many strips fit, which only the panel knows —
+            // so it is read back from what it drew, like every other window in
+            // choz. Moving the active tab moves the window with it.
+            let per_page = app
+                .layout
+                .borrow()
+                .mixer_hits
+                .iter()
+                .filter(|(h, _)| matches!(h, views::midi_monitor::MixerHit::Select(_)))
+                .count()
+                .max(1) as isize;
+            let at = app.active_slot as isize + d * per_page;
+            let last = app.slots.len().saturating_sub(1) as isize;
+            app.switch_slot(at.clamp(0, last) as usize);
+        }
+        MouseAction::MixerToggle(i, hit) => match hit {
+            views::midi_monitor::MixerHit::Mute(_) => app.with_mix(i, |s| s.mute = !s.mute),
+            views::midi_monitor::MixerHit::Solo(_) => app.with_mix(i, |s| s.solo = !s.solo),
+            views::midi_monitor::MixerHit::Link(_) => app.toggle_link(i),
+            views::midi_monitor::MixerHit::Select(_) => {
+                // Clicking a strip is how the MIXER takes the keyboard: from
+                // then on the arrows are on levels.
+                app.focus = Focus::Mixer;
+                app.switch_slot(i);
+            }
+            _ => {}
+        },
     }
 }
 
@@ -8638,6 +9523,24 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
     let rects = app.layout.borrow().modal_rects.clone();
 
     match mouse.kind {
+        // The metronome's menu has five rows and no scrolling: the wheel over
+        // one of them is worth more as the value than as a cursor.
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            if app.modal.as_ref().is_some_and(|m| m.kind == ModalKind::Metronome) =>
+        {
+            if let Some(&(row, _)) = rects.rows.iter().find(|(_, r)| r.contains(pos)) {
+                if let Some(m) = app.modal.as_mut() {
+                    m.list.cursor = row;
+                }
+                let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    1
+                } else {
+                    -1
+                };
+                app.step_metronome_row(row, delta);
+                app.refresh_modal();
+            }
+        }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             if rects.list.is_some_and(|r| r.contains(pos))
                 || rects.scrollbar.is_some_and(|r| r.contains(pos))
@@ -9017,6 +9920,8 @@ fn ui(f: &mut Frame, app: &mut App) {
         app.fx_slot_info(),
     );
     app.layout.borrow_mut().rack = rack;
+    // The knob box may have scrolled; the CCs learned on it go where it went.
+    app.sync_instr_window();
 
     draw_transport(f, app, transport_area);
 
@@ -9070,7 +9975,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             app.wave.tick();
         }
         let log: Vec<midi::InputEvent> = app.midi_log.iter().copied().collect();
-        let tabs = views::midi_monitor::draw_midi_monitor(
+        let (tabs, hits) = views::midi_monitor::draw_midi_monitor(
             f,
             monitor_area,
             &log,
@@ -9080,8 +9985,11 @@ fn ui(f: &mut Frame, app: &mut App) {
             app.ui.key_colour,
             &app.spectrum,
             &app.wave,
+            &app.mixer_strips(),
         );
-        app.layout.borrow_mut().monitor_tabs = tabs;
+        let mut layout = app.layout.borrow_mut();
+        layout.monitor_tabs = tabs;
+        layout.mixer_hits = hits;
     }
 
     if app.modal.is_some() {
@@ -9125,6 +10033,11 @@ fn ui(f: &mut Frame, app: &mut App) {
     if let Some(ref job) = app.scan {
         draw_scan_progress(f, job, area);
     }
+    // …and above that, what this frame exists for: the next thing this thread
+    // does is instantiate a plugin, which can take seconds with nothing moving.
+    if let Some(name) = app.loading.clone() {
+        draw_loading(f, &name, area);
+    }
 
     // Status bar
     let backend_label = app
@@ -9139,8 +10052,12 @@ fn ui(f: &mut Frame, app: &mut App) {
         i18n::t("STOPPED")
     };
 
+    // How much of the audio block the callback is using. The one number that
+    // says "the machine cannot render this rack in time" while it is happening,
+    // rather than after the sound has already gone.
+    let dsp = choz_engine::meter::load().last() * 100.0;
     let status_text = format!(
-        " choz v0.1 | {} backend | RACK: {} | FX: {} | {play_icon} {play_state} | F2=IN F3=OUT F10=menu q=quit",
+        " choz v0.1 | {} backend | RACK: {} | FX: {} | DSP {dsp:.0}% | {play_icon} {play_state} | F2=IN F3=OUT F10=menu q=quit",
         backend_label,
         app.active_tab_label(),
         app.fx_chain.len(),
@@ -9282,6 +10199,19 @@ fn draw_transport(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // Every button on this row sits at a fixed offset, and a narrow terminal
+    // puts those offsets past the panel — which ratatui answers with a panic,
+    // so a window dragged narrow took the whole application with it. What fits
+    // is drawn; what does not is left out, and the rect handed back is the part
+    // that is really on screen so the mouse agrees with the picture.
+    let fit = move |r: Rect| -> Option<Rect> {
+        let right = inner.x + inner.width;
+        if r.x >= right || r.y >= inner.y + inner.height {
+            return None;
+        }
+        Some(Rect::new(r.x, r.y, r.width.min(right - r.x), r.height))
+    };
+
     // Row 1: buttons centered
     let btn_row = inner.y + 1;
 
@@ -9303,7 +10233,10 @@ fn draw_transport(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )))
         .style(views::theme::panel_style()),
-        Rect::new(inner.x + 2, btn_row, play_label.len() as u16, 1),
+        match fit(Rect::new(inner.x + 2, btn_row, play_label.len() as u16, 1)) {
+            Some(r) => r,
+            None => return,
+        },
     );
 
     // Stop button
@@ -9324,7 +10257,10 @@ fn draw_transport(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )))
         .style(views::theme::panel_style()),
-        Rect::new(inner.x + 16, btn_row, stop_label.len() as u16, 1),
+        match fit(Rect::new(inner.x + 16, btn_row, stop_label.len() as u16, 1)) {
+            Some(r) => r,
+            None => return,
+        },
     );
 
     // Automation: arm it here, because it only means anything while the
@@ -9352,14 +10288,24 @@ fn draw_transport(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )))
         .style(views::theme::panel_style()),
-        Rect::new(inner.x + 28, btn_row, rec_label.chars().count() as u16, 1),
+        match fit(Rect::new(inner.x + 28, btn_row, rec_label.chars().count() as u16, 1)) {
+            Some(r) => r,
+            None => return,
+        },
     );
 
     // How long the automation loop is, in bars — the one number a lane is
     // measured against, and until now a constant nobody could reach.
     let bars = app.automation_loop_bars();
     let loop_label = format!(" [ \u{25C0} LOOP {bars:>2} \u{25B6} ]");
-    let loop_rect = Rect::new(inner.x + 40, btn_row, loop_label.chars().count() as u16, 1);
+    let Some(loop_rect) = fit(Rect::new(
+        inner.x + 40,
+        btn_row,
+        loop_label.chars().count() as u16,
+        1,
+    )) else {
+        return;
+    };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             loop_label,
@@ -9382,12 +10328,14 @@ fn draw_transport(f: &mut Frame, app: &App, area: Rect) {
     } else {
         " [ CLK INT \u{25CB} ]"
     };
-    let clk_rect = Rect::new(
+    let Some(clk_rect) = fit(Rect::new(
         loop_rect.x + loop_rect.width,
         btn_row,
         clk_label.chars().count() as u16,
         1,
-    );
+    )) else {
+        return;
+    };
     let (clk_bg, clk_fg) = if app.midi_clock() {
         (Color::Rgb(56, 200, 100), Color::Black)
     } else {
@@ -9546,8 +10494,47 @@ fn draw_menu_bar(f: &mut Frame, app: &App, area: Rect) {
             Rect::new(sx, area.y, w, 1),
         );
         app.layout.borrow_mut().mode_switch_rect = Some(Rect::new(sx, area.y, w, 1));
+
+        // The click, next to the switch that decides what the rack does with a
+        // note: both are things you reach for without looking. The arrow opens
+        // its menu — tempo, time signature, sound — underneath it.
+        let met_on = choz_engine::metronome::metronome().on();
+        let met = format!(" \u{2669} {} ", i18n::t("MET"));
+        let arrow = "\u{25BE} ";
+        let mw = (met.chars().count() + arrow.chars().count()) as u16;
+        if sx > area.x + mw {
+            let mx = sx - mw;
+            let style = if met_on {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(230, 200, 120))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::Rgb(150, 155, 165))
+                    .bg(Color::Rgb(40, 46, 56))
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(met.clone(), style),
+                    Span::styled(arrow, style),
+                ])),
+                Rect::new(mx, area.y, mw, 1),
+            );
+            let mut layout = app.layout.borrow_mut();
+            layout.met_rect = Some(Rect::new(mx, area.y, met.chars().count() as u16, 1));
+            layout.met_menu_rect = Some(Rect::new(
+                mx + met.chars().count() as u16,
+                area.y,
+                arrow.chars().count() as u16,
+                1,
+            ));
+        }
     } else {
-        app.layout.borrow_mut().mode_switch_rect = None;
+        let mut layout = app.layout.borrow_mut();
+        layout.mode_switch_rect = None;
+        layout.met_rect = None;
+        layout.met_menu_rect = None;
     }
     app.layout.borrow_mut().menu_bar_rects = rects;
 }
@@ -9614,6 +10601,38 @@ fn draw_menu_dropdown(f: &mut Frame, app: &App, state: menu::MenuState, menubar_
 
 /// The plugin rescan's progress box. Drawn from [`App::scan`], so it is up for
 /// exactly as long as the thread is running.
+/// "Loading <name>…", drawn on the frame before the load blocks the thread.
+///
+/// ponytail: a box and a name, no spinner. Nothing can animate it — the thread
+/// that would tick it is the thread doing the loading — and a frozen spinner
+/// says less than a sentence that was true when it was drawn.
+fn draw_loading(f: &mut Frame, name: &str, area: Rect) {
+    let text = format!(" {} {name}\u{2026} ", i18n::t("Loading"));
+    let w = (text.chars().count() as u16 + 4).min(area.width);
+    let h = 3u16.min(area.height);
+    let popup = Rect::new(
+        area.x + (area.width.saturating_sub(w)) / 2,
+        area.y + (area.height.saturating_sub(h)) / 2,
+        w,
+        h,
+    );
+    draw_modal_shadow(f, popup, area);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .style(views::theme::overlay_style());
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            text,
+            Style::default().fg(HEADER).add_modifier(Modifier::BOLD),
+        ))),
+        inner,
+    );
+}
+
 fn draw_scan_progress(f: &mut Frame, job: &ScanJob, area: Rect) {
     f.render_widget(Clear, area);
     f.render_widget(Block::default().style(Style::default().bg(BACKDROP)), area);
@@ -9936,6 +10955,75 @@ mod tests {
     }
 
     /// A rack tab holding a plugin instrument with two parameters.
+    /// A plugin that publishes no programs of its own (Surge XT's VST3 build
+    /// reports zero and keeps its 637 factory patches as `.fxp` files) gets its
+    /// bank from a folder: point at the folder once, and every patch under it
+    /// is in the same picker — and on the same `◀` `▶` buttons, and therefore
+    /// on whatever CC is learned on them — as a plugin's own programs.
+    #[test]
+    fn a_folder_of_patch_files_becomes_the_tabs_bank() {
+        // The round trip at the end applies the project's language and theme
+        // process-wide, like a real load does.
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        let mut app = app_with_plugin_tab();
+        assert!(
+            app.slots[0].plugin_presets.is_empty(),
+            "the plugin publishes no programs"
+        );
+
+        let dir = std::env::temp_dir().join(format!("choz_uibank_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Leads")).unwrap();
+        let patch = b"the patch".to_vec();
+        let mut fxp = vec![0u8; 60];
+        fxp[0..4].copy_from_slice(b"CcnK");
+        fxp[8..12].copy_from_slice(b"FPCh");
+        fxp[56..60].copy_from_slice(&(patch.len() as u32).to_be_bytes());
+        fxp.extend_from_slice(&patch);
+        std::fs::write(dir.join("Init.fxp"), &fxp).unwrap();
+        std::fs::write(dir.join("Leads/Tok.fxp"), &fxp).unwrap();
+
+        // The browser picks the folder itself, not a file in it.
+        app.open_bank_browser();
+        assert_eq!(app.modal.as_ref().unwrap().kind, ModalKind::Bank);
+        app.set_bank_dir(dir.clone());
+
+        assert_eq!(
+            app.preset_labels(0),
+            vec!["Init".to_string(), "Leads · Tok".to_string()],
+            "the whole tree is the bank, filed by sub-folder"
+        );
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::Preset),
+            "and the patch list opens on top of the folder picker"
+        );
+
+        // Picking one restores its patch onto the tab — with no engine here,
+        // what is checked is the blob the tab keeps (the same one the project
+        // saves, and the one a rebuilt engine slot is handed back).
+        app.slots[0].preset_cursor = 1;
+        app.apply_selected_preset();
+        assert_eq!(app.slots[0].instr_state, patch);
+        assert_eq!(app.active_preset_label().as_deref(), Some("Leads · Tok"));
+
+        // The bank survives a save/load round trip: it is a folder on disk, and
+        // re-reading it is cheaper than storing 637 paths in the project.
+        app.source = app.slots[0].source.clone();
+        let saved = app.project_snapshot();
+        let mut fresh = App::new();
+        // The rack alone: applying the whole project would set the language and
+        // the theme **process-wide**, and other tests are reading those while
+        // this one runs.
+        fresh.load_rack_only = true;
+        fresh.apply_project(saved);
+        assert_eq!(fresh.slots[0].preset_dir.as_deref(), Some(dir.as_path()));
+        assert_eq!(fresh.preset_labels(0).len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn app_with_plugin_tab() -> App {
         let mut app = App::new();
         app.slots.push(RackSlot::new(AudioSource::Plugin {
@@ -10128,6 +11216,130 @@ mod tests {
 
         handle_modal_mouse(&mut app, click(cancel.x + 1, cancel.y));
         assert!(app.modal.is_none(), "CANCEL closes the modal");
+    }
+
+    /// A plugin with more parameters than the box can show pages, and the CCs
+    /// learned on the box page with it: the fader that was on the first knob of
+    /// the page is on the first knob of the next one, driving a different
+    /// parameter. Without that, a synth like Surge XT gives a desk of faders
+    /// the first dozen of its three hundred parameters and nothing else.
+    #[test]
+    fn paging_the_instrument_box_carries_the_learned_ccs_with_it() {
+        let mut app = app_with_plugin_tab();
+        app.slots[0].instr_params = (0..60)
+            .map(|i| choz_engine::PluginParam::plain_range(i, format!("P{i}"), 0.0, 1.0, 0.0))
+            .collect();
+        app.slots[0].instr_values = vec![0.0; 60];
+        app.rack_focus = RackFocus::Instrument;
+
+        let (_, layout) = render_rack(&mut app, 120, 30);
+        let page = layout.instr_knobs.len();
+        assert!(page > 0 && page < 60, "the box has to be paging: {page}");
+        let first = layout.instr_knobs[0].0;
+
+        // A fader on the first knob of the page.
+        app.learn = Some(LearnTarget::InstrParam {
+            slot: 0,
+            param: first,
+        });
+        app.feed_cc(74, 100);
+        assert_eq!(
+            app.cc_pairs(),
+            vec![(
+                74,
+                LearnTarget::InstrParam {
+                    slot: 0,
+                    param: first
+                }
+            )]
+        );
+
+        handle_fx_keys(&mut app, KeyCode::PageDown);
+        let (_, layout) = render_rack(&mut app, 120, 30);
+        let moved = layout.instr_knobs[0].0;
+        assert!(moved > first, "the box did not page: {first} -> {moved}");
+        assert_eq!(
+            app.cc_pairs(),
+            vec![(
+                74,
+                LearnTarget::InstrParam {
+                    slot: 0,
+                    param: moved
+                }
+            )],
+            "the CC has to land on the first knob of the new page"
+        );
+
+        // And back, onto the parameter it started on.
+        handle_fx_keys(&mut app, KeyCode::PageUp);
+        render_rack(&mut app, 120, 30);
+        assert_eq!(
+            app.cc_pairs(),
+            vec![(
+                74,
+                LearnTarget::InstrParam {
+                    slot: 0,
+                    param: first
+                }
+            )]
+        );
+
+        // The CC now moves the parameter it points at, not the one it learned.
+        handle_fx_keys(&mut app, KeyCode::PageDown);
+        render_rack(&mut app, 120, 30);
+        app.feed_cc(74, 127);
+        assert_eq!(app.slots[0].instr_values[moved], 1.0);
+        assert_eq!(app.slots[0].instr_values[first], 0.0);
+    }
+
+    /// And the CCs follow the box **however** it moved. Paging is one way; the
+    /// arrows walking the cursor off the bottom of the box scrolls it just the
+    /// same, and a controller that only re-addressed on `PgUp` / `PgDn` would
+    /// be pointing at the wrong parameters from the first arrow press.
+    #[test]
+    fn the_learned_ccs_follow_the_knob_box_however_it_scrolled() {
+        let mut app = app_with_plugin_tab();
+        app.slots[0].instr_params = (0..60)
+            .map(|i| choz_engine::PluginParam::plain_range(i, format!("P{i}"), 0.0, 1.0, 0.0))
+            .collect();
+        app.slots[0].instr_values = vec![0.0; 60];
+        app.rack_focus = RackFocus::Instrument;
+
+        let (_, layout) = render_rack(&mut app, 120, 30);
+        let page = layout.instr_knobs.len();
+        assert!(page > 0 && page < 60, "the box has to be paging: {page}");
+        let first = layout.instr_knobs[0].0;
+        app.learn = Some(LearnTarget::InstrParam {
+            slot: 0,
+            param: first,
+        });
+        app.feed_cc(74, 100);
+
+        // Walk the cursor down until the box scrolls — no paging involved.
+        let moved = loop {
+            handle_fx_keys(&mut app, KeyCode::Down);
+            let (_, layout) = render_rack(&mut app, 120, 30);
+            let start = layout.instr_knobs[0].0;
+            if start != first {
+                break start;
+            }
+            assert!(app.instr_param < 59, "the box never scrolled");
+        };
+
+        assert_eq!(
+            app.cc_pairs(),
+            vec![(
+                74,
+                LearnTarget::InstrParam {
+                    slot: 0,
+                    param: first + (moved - first)
+                }
+            )],
+            "the CC has to move with the window, not only with the pager"
+        );
+        app.feed_cc(74, 127);
+        assert_eq!(app.slots[0].instr_values[moved], 1.0);
+        assert_eq!(app.slots[0].instr_values[first], 0.0);
     }
 
     /// MIDI learn: arm a target, and the next CC binds to it; after that the
@@ -10502,6 +11714,7 @@ mod tests {
         // The mouse router checks the panel area before the rack rects.
         layout.fx_chain_area = ratatui::layout::Rect::new(0, 0, w, h);
         drop(layout);
+        app.sync_instr_window();
         (screen, rack)
     }
 
@@ -14008,6 +15221,9 @@ mod tests {
     /// running device, each saying what it is to the active tab.
     #[test]
     fn out_drawer_lists_devices_then_single_channels() {
+        // Reads translated text, so it has to hold the same lock the tests
+        // that change the language hold.
+        let _g = ui_guard();
         let mut app = App::new();
         app.slots.push(RackSlot::new(AudioSource::Midi));
         app.slots.push(RackSlot::new(AudioSource::Midi));
@@ -14141,6 +15357,9 @@ mod tests {
     /// which looks exactly like a broken tracker — so the rack says which it is.
     #[test]
     fn audio_to_midi_says_when_there_is_no_instrument_to_play() {
+        // Reads translated text, so it has to hold the same lock the tests
+        // that change the language hold.
+        let _g = ui_guard();
         let mut app = App::new();
         app.slots.push(RackSlot::new(AudioSource::Midi));
         app.slots[0].in_pair = Some((4, 4));
@@ -14397,6 +15616,8 @@ mod tests {
     fn a_saved_tab_finds_its_capture_jacks_by_name() {
         let mixer = |ports: Option<(&str, &str)>| project::Mixer {
             gain: 1.0,
+            gain_r: None,
+            link: None,
             pan: 0.0,
             mute: false,
             solo: false,
@@ -15180,7 +16401,7 @@ mod tests {
         let latch = app
             .arp_knobs()
             .iter()
-            .position(|(_, n, ..)| *n == "LATCH")
+            .position(|(_, n, ..)| *n == "HOLD")
             .unwrap();
         app.arp_param = latch;
         handle_fx_keys(&mut app, KeyCode::Enter);
@@ -15631,6 +16852,393 @@ mod tests {
         );
     }
 
+    /// Loading a plugin blocks this thread for as long as the plugin takes
+    /// (Surge XT reads its whole factory library), so what is asked for is
+    /// promised, drawn, and only then run: the frame that says "loading" has to
+    /// reach the terminal before the thread goes quiet.
+    #[test]
+    fn a_load_says_so_on_screen_before_it_blocks_the_thread() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+
+        app.request_load_source("/nowhere/Grand Piano.sf2".into());
+        assert!(app.pending_load.is_some(), "the load is only promised");
+
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let screen: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            screen.contains("Grand Piano.sf2"),
+            "the name of what is loading is on screen:\n{screen}"
+        );
+
+        // Only now does the work happen — and the message goes with it.
+        app.run_pending_load();
+        assert!(app.pending_load.is_none());
+        assert!(app.loading.is_none());
+    }
+
+    /// The metronome: a switch on the menu bar beside LIVE/MULTI, and a menu
+    /// under it for tempo, time signature, sound and level. The click itself is
+    /// made in the audio callback off the transport's tempo, so it and a
+    /// tempo-synced delay cannot disagree.
+    #[test]
+    fn the_metronome_switches_and_its_menu_steps_every_setting() {
+        let _g = ui_guard();
+        let m = choz_engine::metronome::metronome();
+        m.set_on(false);
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+
+        let (met, menu) = {
+            let l = app.layout.borrow();
+            (l.met_rect.expect("MET button"), l.met_menu_rect.unwrap())
+        };
+        let switch = app.layout.borrow().mode_switch_rect.unwrap();
+        assert!(
+            met.x + met.width <= switch.x,
+            "the click sits beside LIVE/MULTI, not on top of it"
+        );
+
+        click(&mut app, met.x + 1, met.y);
+        assert!(m.on(), "the button switches the click on");
+        handle_key(&mut app, KeyCode::F(6));
+        assert!(!m.on(), "and F6 does it from anywhere");
+
+        // The menu steps each row and stays open — setting a tempo means
+        // hearing it, and a menu that closes makes that four round trips.
+        click(&mut app, menu.x, menu.y);
+        assert_eq!(app.modal.as_ref().map(|m| m.kind), Some(ModalKind::Metronome));
+        let bpm = choz_ports::transport().bpm();
+        app.modal.as_mut().unwrap().list.cursor = 1;
+        app.modal_select();
+        assert!(
+            (choz_ports::transport().bpm() - (bpm + 5.0)).abs() < 0.01,
+            "the tempo row steps the transport itself"
+        );
+        assert!(app.modal.is_some(), "the menu stays open");
+
+        let sig = choz_ports::transport().time_signature();
+        app.modal.as_mut().unwrap().list.cursor = 2;
+        app.modal_select();
+        assert_ne!(choz_ports::transport().time_signature(), sig);
+
+        // The arrows move a row either way — a tempo four presses up is forty
+        // presses back the other way if the only direction is forward.
+        app.modal.as_mut().unwrap().list.cursor = 1;
+        let bpm = choz_ports::transport().bpm();
+        handle_modal_key(&mut app, KeyCode::Left);
+        assert!(
+            (choz_ports::transport().bpm() - (bpm - 5.0)).abs() < 0.01,
+            "left takes the tempo down: {}",
+            choz_ports::transport().bpm()
+        );
+        handle_modal_key(&mut app, KeyCode::Right);
+        assert!((choz_ports::transport().bpm() - bpm).abs() < 0.01, "and right puts it back");
+        assert!(app.modal.is_some(), "still open");
+
+        // …and so does the wheel over the row it is pointing at.
+        let row = app
+            .layout
+            .borrow()
+            .modal_rects
+            .rows
+            .iter()
+            .find(|(i, _)| *i == 1)
+            .map(|(_, r)| *r);
+        if let Some(r) = row {
+            handle_modal_mouse(
+                &mut app,
+                MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    column: r.x + 1,
+                    row: r.y,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+            );
+            assert!(
+                (choz_ports::transport().bpm() - (bpm + 5.0)).abs() < 0.01,
+                "the wheel over the tempo row is the tempo, not the cursor"
+            );
+        }
+
+        let style = m.style();
+        app.modal.as_mut().unwrap().list.cursor = 3;
+        app.modal_select();
+        assert_eq!(m.style(), style.next());
+
+        m.set_on(false);
+        choz_ports::transport().set_bpm(120.0);
+        choz_ports::transport().set_time_signature(4, 4);
+    }
+
+    /// Every size the terminal can be, drawn. A panel that computes a rect from
+    /// a width it did not check writes outside the buffer, and ratatui's answer
+    /// to that is a panic — which is the whole application gone, mid-set,
+    /// because somebody resized a window.
+    #[test]
+    fn the_interface_draws_at_every_size_without_writing_off_the_buffer() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: "x".into(),
+            format: "VST3".into(),
+            name: "Tester".into(),
+        }));
+        app.slots[1].instr_params = (0..40)
+            .map(|i| choz_engine::PluginParam::plain_range(i, format!("P{i}"), 0.0, 1.0, 0.0))
+            .collect();
+        app.slots[1].instr_values = vec![0.0; 40];
+
+        // The edges, not the whole grid: a terminal one column narrower than a
+        // fixed offset is the whole bug, and each of these draws costs an FFT.
+        for (i, (w, h)) in [(20u16, 8u16), (20, 24), (40, 12), (60, 38), (80, 24), (213, 58)]
+            .into_iter()
+            .enumerate()
+        {
+            for tab in views::midi_monitor::MonitorTab::ALL {
+                app.monitor_tab = tab;
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| ui(f, &mut app))
+                    .unwrap_or_else(|e| panic!("{w}x{h} on {tab:?}: {e}"));
+            }
+            let _ = i;
+        }
+    }
+
+    /// A list of numbered slots is not a bank. TyrellN6's VST3 publishes 128
+    /// of them (`Program 0`, `Program 1`…), which stood between the player and
+    /// the 669 patches u-he had installed on the same machine.
+    #[test]
+    fn a_bank_that_names_nothing_does_not_count_as_one() {
+        assert!(is_placeholder("Program 0"));
+        assert!(is_placeholder("program 127"));
+        assert!(is_placeholder("Preset 12"));
+        assert!(is_placeholder("  "));
+        assert!(is_placeholder("7"));
+        assert!(!is_placeholder("Angry Dog Bass"));
+        assert!(!is_placeholder("Program Material"), "a name that starts with the word is a name");
+        assert!(!is_placeholder("Grand Piano"));
+    }
+
+    /// The MIXER tab: every rack tab's strip at once, and each one editable
+    /// where it is drawn. The RACK only ever shows the active tab's level and
+    /// pan, so balancing a set of them meant switching tabs to hear the change
+    /// you just made somewhere else.
+    #[test]
+    fn the_mixer_tab_edits_every_strip_where_it_is_drawn() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.monitor_tab = views::midi_monitor::MonitorTab::Mixer;
+
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+
+        let hits = app.layout.borrow().mixer_hits.clone();
+        assert!(!hits.is_empty(), "the MIXER tab draws controls");
+        let find = |want: views::midi_monitor::MixerHit| {
+            hits.iter()
+                .find(|(h, _)| *h == want)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| panic!("no rect for {want:?} in {hits:?}"))
+        };
+
+        // The second tab, muted from the mixer while the RACK is still on the
+        // first one — the whole point of the panel.
+        let m = find(views::midi_monitor::MixerHit::Mute(1));
+        click(&mut app, m.x + 1, m.y);
+        assert!(app.slots[1].mute, "the strip of tab 2 mutes tab 2");
+        assert!(!app.slots[0].mute, "and leaves tab 1 alone");
+        assert_eq!(app.active_slot, 0, "muting is not switching tabs");
+
+        // The level track takes the value from where it was clicked: a fader
+        // that only nudges is ten clicks wide.
+        let g = find(views::midi_monitor::MixerHit::Gain(1));
+        click(&mut app, g.x + g.width - 1, g.y);
+        assert!(
+            app.slots[1].gain > 1.5,
+            "clicking the right end of the track is the top of the range: {}",
+            app.slots[1].gain
+        );
+        let p = find(views::midi_monitor::MixerHit::Pan(1));
+        click(&mut app, p.x, p.y);
+        assert!(app.slots[1].pan < -0.5, "hard left: {}", app.slots[1].pan);
+
+        // And the name switches to that tab, so the mixer is also a tab strip.
+        let n = find(views::midi_monitor::MixerHit::Select(1));
+        click(&mut app, n.x + 1, n.y);
+        assert_eq!(app.active_slot, 1);
+
+        // The strips are columns: the level reads bottom-up, so clicking the
+        // top of the track is full and the bottom is off.
+        let g = find(views::midi_monitor::MixerHit::Gain(1));
+        click(&mut app, g.x + 1, g.y + g.height - 1);
+        assert!(app.slots[1].gain < 0.1, "the bottom of a fader is off: {}", app.slots[1].gain);
+    }
+
+    /// A tab plays out of two channels, so its strip has two faders and a link
+    /// between them: linked they move together (which is what a tab wants
+    /// nearly always), broken they trim one side against the other. And the
+    /// level moves in the same step wherever it is touched — the wheel over a
+    /// fader, the arrows with the MIXER focused, the RACK's own VOL.
+    #[test]
+    fn a_strip_has_a_fader_per_channel_and_a_link_between_them() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.monitor_tab = views::midi_monitor::MonitorTab::Mixer;
+
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let find = |app: &App, want: views::midi_monitor::MixerHit| {
+            app.layout
+                .borrow()
+                .mixer_hits
+                .iter()
+                .find(|(h, _)| *h == want)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| panic!("no rect for {want:?}"))
+        };
+
+        // Linked (the default): the wheel over one side moves both.
+        let l = find(&app, views::midi_monitor::MixerHit::Gain(1));
+        wheel(&mut app, l.x, l.y + 1, true);
+        assert!(app.slots[1].gain > 1.0 && app.slots[1].link);
+        assert_eq!(
+            app.slots[1].gain, app.slots[1].gain_r,
+            "linked, the two sides are one fader"
+        );
+        assert_eq!(app.slots[1].gain, 1.0 + GAIN_STEP, "one click, one step");
+
+        // Break the link and the right side moves on its own.
+        let link = find(&app, views::midi_monitor::MixerHit::Link(1));
+        click(&mut app, link.x, link.y);
+        assert!(!app.slots[1].link);
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let r = find(&app, views::midi_monitor::MixerHit::GainR(1));
+        let (before_l, before_r) = (app.slots[1].gain, app.slots[1].gain_r);
+        wheel(&mut app, r.x, r.y + 1, false);
+        assert_eq!(app.slots[1].gain, before_l, "the left side stayed put");
+        assert!(
+            (app.slots[1].gain_r - (before_r - GAIN_STEP)).abs() < 1e-6,
+            "and the right came down one step"
+        );
+
+        // The RACK's VOL still moves the whole tab, trim and all.
+        let offset = app.slots[1].gain - app.slots[1].gain_r;
+        app.active_slot = 1;
+        adjust_gain(&mut app, GAIN_STEP);
+        assert!(
+            (app.slots[1].gain - app.slots[1].gain_r - offset).abs() < 1e-6,
+            "an unlinked strip keeps its trim when the tab's own level moves"
+        );
+
+        // Focused, the arrows are levels — that is what the MIXER is for.
+        app.focus = Focus::Mixer;
+        let before = app.slots[1].gain;
+        handle_key(&mut app, KeyCode::Up);
+        assert!((app.slots[1].gain - (before + GAIN_STEP)).abs() < 1e-6);
+        handle_key(&mut app, KeyCode::Down);
+        assert!((app.slots[1].gain - before).abs() < 1e-6);
+
+        // Linking again takes the louder of the two: the quiet side was the
+        // one being trimmed.
+        let loud = app.slots[1].gain.max(app.slots[1].gain_r);
+        click(&mut app, link.x, link.y);
+        assert!(app.slots[1].link);
+        assert_eq!(app.slots[1].gain, loud);
+        assert_eq!(app.slots[1].gain_r, loud);
+    }
+
+    fn wheel(app: &mut App, x: u16, y: u16, up: bool) {
+        handle_mouse(
+            app,
+            MouseEvent {
+                kind: if up {
+                    MouseEventKind::ScrollUp
+                } else {
+                    MouseEventKind::ScrollDown
+                },
+                column: x,
+                row: y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+        );
+    }
+
+    /// More tabs than fit across the panel: the mixer pages, and the window
+    /// follows the active tab rather than keeping a scroll of its own.
+    #[test]
+    fn the_mixer_pages_when_the_rack_is_wider_than_the_panel() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.splash_done = true;
+        for _ in 0..12 {
+            app.slots.push(RackSlot::new(AudioSource::Midi));
+        }
+        app.monitor_tab = views::midi_monitor::MonitorTab::Mixer;
+
+        let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let shown = |app: &App| -> Vec<usize> {
+            app.layout
+                .borrow()
+                .mixer_hits
+                .iter()
+                .filter_map(|(h, _)| match h {
+                    views::midi_monitor::MixerHit::Select(i) => Some(*i),
+                    _ => None,
+                })
+                .collect()
+        };
+        let first = shown(&app);
+        assert!(
+            !first.is_empty() && first.len() < 12,
+            "a 80-column panel cannot show twelve strips: {first:?}"
+        );
+        assert!(first.contains(&0), "it starts on the active tab");
+
+        // The pager is drawn, and it walks the window.
+        let next = app
+            .layout
+            .borrow()
+            .mixer_hits
+            .iter()
+            .find(|(h, _)| matches!(h, views::midi_monitor::MixerHit::Page(1)))
+            .map(|(_, r)| *r)
+            .expect("the pager is on screen when the strips do not fit");
+        click(&mut app, next.x, next.y);
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let after = shown(&app);
+        assert!(
+            after.first() > first.first(),
+            "the window moved on: {first:?} -> {after:?}"
+        );
+        assert!(
+            after.contains(&app.active_slot),
+            "and the tab it made active is one of the strips being shown"
+        );
+    }
+
     /// The drawers: shut, both edges are handles and the RACK owns the body;
     /// F2/F3 open them and Tab only ever lands on an open one.
     #[test]
@@ -15685,10 +17293,10 @@ mod tests {
 
     #[test]
     fn tab_never_parks_on_a_closed_drawer() {
-        assert_eq!(next_focus(Focus::FxChain, false, false), Focus::Transport);
-        assert_eq!(next_focus(Focus::Transport, false, false), Focus::FxChain);
-        assert_eq!(next_focus(Focus::Transport, false, true), Focus::Output);
-        assert_eq!(next_focus(Focus::Transport, true, false), Focus::Source);
-        assert_eq!(next_focus(Focus::Output, true, true), Focus::Source);
+        assert_eq!(next_focus(Focus::FxChain, false, false, false), Focus::Transport);
+        assert_eq!(next_focus(Focus::Transport, false, false, false), Focus::FxChain);
+        assert_eq!(next_focus(Focus::Transport, false, true, false), Focus::Output);
+        assert_eq!(next_focus(Focus::Transport, true, false, false), Focus::Source);
+        assert_eq!(next_focus(Focus::Output, true, true, false), Focus::Source);
     }
 }

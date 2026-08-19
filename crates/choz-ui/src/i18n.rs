@@ -154,6 +154,8 @@ static TABLE: &[Row] = &[
     ("INSTRUMENT",   ["INSTRUMENTO", "INSTRUMENTO",  "INSTRUMENT",   "STRUMENTO",    "INSTRUMENT",   "\u{418}\u{41d}\u{421}\u{422}\u{420}\u{423}\u{41c}\u{415}\u{41d}\u{422}", "\u{697d}\u{5668}", "\u{4e50}\u{5668}"]),
     ("(instrument)", ["(instrumento)", "(instrumento)", "(instrument)", "(strumento)", "(Instrument)", "(\u{438}\u{43d}\u{441}\u{442}\u{440}\u{443}\u{43c}\u{435}\u{43d}\u{442})", "(\u{697d}\u{5668})", "(\u{4e50}\u{5668})"]),
     ("PRESET",       ["PRESET",      "PRESET",       "PR\u{c9}R\u{c9}GLAGE", "PRESET", "PRESET",   "\u{41f}\u{420}\u{415}\u{421}\u{415}\u{422}", "\u{30d7}\u{30ea}\u{30bb}\u{30c3}\u{30c8}", "\u{9884}\u{8bbe}"]),
+    ("PICK BANK",    ["ELEGIR BANCO", "ESCOLHER BANCO", "CHOISIR BANQUE", "SCEGLI BANCO", "BANK WÄHLEN", "ВЫБРАТЬ БАНК", "バンク選択", "选择音色库"]),
+    ("BANK FOLDER",  ["CARPETA DEL BANCO", "PASTA DO BANCO", "DOSSIER DE BANQUE", "CARTELLA BANCO", "BANK-ORDNER", "ПАПКА БАНКА", "バンクフォルダ", "音色库文件夹"]),
     ("ARP",          ["ARP",         "ARP",          "ARP",          "ARP",          "ARP",          "\u{410}\u{420}\u{41f}", "\u{30a2}\u{30eb}\u{30da}", "\u{7434}\u{97f3}"]),
     ("SENS",         ["SENS",        "SENS",         "SENS",         "SENS",         "EMPF",         "\u{427}\u{423}\u{412}", "\u{611f}\u{5ea6}", "\u{7075}\u{654f}"]),
     ("RACK ONLY",    ["SOLO RACK",   "S\u{d3} RACK",  "RACK SEUL",    "SOLO RACK",    "NUR RACK",     "\u{422}\u{41e}\u{41b}\u{42c}\u{41a}\u{41e} \u{420}\u{415}\u{419}\u{41a}", "\u{30e9}\u{30c3}\u{30af}\u{306e}\u{307f}", "\u{4ec5}\u{673a}\u{67b6}"]),

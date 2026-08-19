@@ -947,17 +947,43 @@ impl Vst3RealInstance {
         };
 
         // The parameter table, read once: index → the plugin's own id.
+        //
+        // **Only what the plugin says can be automated.** Surge XT publishes
+        // 191 rows of `MIDI CC 0|0`, `MIDI CC 0|1`… — its CC mapping table —
+        // flagged without `kCanAutomate`, and a knob box is an automation
+        // surface: MIDI learn binds to those knobs. Drawing a fader for a
+        // parameter the plugin refuses to be driven on is a control that does
+        // nothing, and there were nearly two hundred of them between the user
+        // and the parameters that do work. Hidden ones go the same way.
+        //
+        // Filtered **here**, where index → id is decided, so every other part
+        // (the knob box, `set_param`, the GUI's edit feed) keeps agreeing about
+        // what index 12 means.
         let param_ids: Vec<u32> = controller
             .as_ref()
             .map(|c| {
                 let n = unsafe { c.getParameterCount() }.max(0);
-                (0..n)
+                let infos: Vec<ParameterInfo> = (0..n)
                     .filter_map(|i| {
                         let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
                         // SAFETY: live controller, index in range.
-                        (unsafe { c.getParameterInfo(i, &mut info) } == kResultOk)
-                            .then_some(info.id)
+                        (unsafe { c.getParameterInfo(i, &mut info) } == kResultOk).then_some(info)
                     })
+                    .collect();
+                // A plugin that flags nothing means nothing by it: keep them
+                // all rather than emptying the box on a host that leaves the
+                // field at zero.
+                let uses_flags = infos
+                    .iter()
+                    .any(|i| i.flags & ParameterInfo_::ParameterFlags_::kCanAutomate != 0);
+                infos
+                    .iter()
+                    .filter(|i| {
+                        !uses_flags
+                            || (i.flags & ParameterInfo_::ParameterFlags_::kCanAutomate != 0
+                                && i.flags & ParameterInfo_::ParameterFlags_::kIsHidden == 0)
+                    })
+                    .map(|i| i.id)
                     .collect()
             })
             .unwrap_or_default();
@@ -1328,6 +1354,40 @@ impl Vst3RealInstance {
             })
             .collect();
         (count, points)
+    }
+
+    /// The plugin's own words for this parameter at `norm`, which is the only
+    /// place some plugins say what a control really is: Surge XT reports zero
+    /// steps for every one of its 800 parameters, but still renders "Off"/"On"
+    /// for its switches. See [`crate::read_params`].
+    pub fn param_display_at(&self, index: u32, norm: f64) -> String {
+        let Some(c) = &self.controller else {
+            return String::new();
+        };
+        let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
+        if unsafe { c.getParameterInfo(index as int32, &mut info) } != kResultOk {
+            return String::new();
+        }
+        let mut s: String128 = unsafe { std::mem::zeroed() };
+        if unsafe { c.getParamStringByValue(info.id, norm, &mut s) } == kResultOk {
+            w_arr_to_string(&s)
+        } else {
+            String::new()
+        }
+    }
+
+    /// The parameter's VST3 flags, for the two questions choz asks of them:
+    /// is it hidden, and can it be automated at all.
+    pub fn param_flags(&self, index: u32) -> i32 {
+        let Some(c) = &self.controller else {
+            return 0;
+        };
+        let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
+        if unsafe { c.getParameterInfo(index as int32, &mut info) } == kResultOk {
+            info.flags
+        } else {
+            0
+        }
     }
 
     /// Unit label (e.g. "dB", "Hz") from the parameter's `units`.
