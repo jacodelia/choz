@@ -95,6 +95,16 @@ pub fn read_params(path: &Path, _id: &str) -> Vec<PluginParam> {
     (0..inst.param_count())
         .map(|id| {
             let (steps, points) = inst.param_steps(id);
+            // A plugin that reports no steps has not said "continuous" — Surge
+            // XT reports zero for all 800 of its parameters, switches included.
+            // What it does answer is what a value *reads* as, so ask: a control
+            // whose whole range only ever shows two words is a switch, and gets
+            // drawn as one instead of as a fader with two positions.
+            let (steps, points) = if steps == 0 {
+                switch_from_labels(&inst, id).unwrap_or((steps, points))
+            } else {
+                (steps, points)
+            };
             let unit = inst.param_label(id);
             PluginParam {
                 id,
@@ -109,6 +119,35 @@ pub fn read_params(path: &Path, _id: &str) -> Vec<PluginParam> {
             }
         })
         .collect()
+}
+
+/// Two labels over the whole range and nothing in between: a switch, in the
+/// plugin's own words. `None` when it reads as anything else, which leaves the
+/// parameter exactly as the plugin described it.
+///
+/// Three probes, not the whole range: a switch reads Off/Off/On or Off/On/On,
+/// an enumeration reads three different things, and a continuous parameter
+/// reads three numbers. Anything that needs more probes than that to tell is
+/// not a switch.
+fn switch_from_labels(inst: &host::Vst3RealInstance, id: u32) -> Option<(u32, Vec<(f64, String)>)> {
+    let shown: Vec<String> = [0.0, 0.5, 1.0]
+        .iter()
+        .map(|v| inst.param_display_at(id, *v))
+        .collect();
+    if shown.iter().any(|s| s.is_empty()) {
+        return None;
+    }
+    let low = &shown[0];
+    let high = &shown[2];
+    if low == high {
+        return None;
+    }
+    // The middle has to be one of the two ends: a third reading is a third
+    // position, which is a list and not a switch.
+    if shown[1] != *low && shown[1] != *high {
+        return None;
+    }
+    Some((2, vec![(0.0, low.clone()), (1.0, high.clone())]))
 }
 
 /// A live VST3 audio effect in a slot's FX chain.
