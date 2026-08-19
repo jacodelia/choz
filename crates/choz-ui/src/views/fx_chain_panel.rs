@@ -61,6 +61,11 @@ pub enum RackButton {
     /// Previous / next program of the loaded SoundFont.
     PresetPrev,
     PresetNext,
+    /// Previous / next page of the instrument's own parameters. A synth like
+    /// Surge XT has hundreds; the box shows a few rows of them, and these are
+    /// how the rest are reached.
+    InstrPagePrev,
+    InstrPageNext,
     /// The tab's arpeggiator. `ArpOn` is the only one drawn while it is off —
     /// a box of settings for something switched off is six rows of nothing in a
     /// panel that is already tight.
@@ -300,7 +305,7 @@ const MAX_IN_GAIN: f32 = 16.0;
 
 /// Max linear slot gain, mirrors `MAX_GAIN` in main.rs — only used to scale the
 /// gain bar.
-const MAX_GAIN: f32 = 2.0;
+pub const MAX_GAIN: f32 = 2.0;
 
 /// The `A→M` gate as a knob position and as a reading.
 ///
@@ -421,12 +426,19 @@ impl ButtonRow {
     /// after it. Returns where it landed.
     fn draw(&mut self, f: &mut Frame, text: String, style: Style, gap: u16) -> Rect {
         let w = Span::raw(text.as_str()).width() as u16;
-        if self.x + w > self.inner.x + self.inner.width && self.x > self.inner.x + self.indent {
+        let right = self.inner.x + self.inner.width;
+        if self.x + w > right && self.x > self.inner.x + self.indent {
             self.y += 1;
             self.x = self.inner.x + self.indent;
         }
-        let rect = Rect::new(self.x, self.y, w, 1);
-        if self.y < self.inner.y + self.inner.height {
+        // Wrapping cannot save a label that is wider than the whole panel, and
+        // ratatui's answer to a rect that leaves the buffer is a panic — the
+        // application gone because somebody made the window narrow. What fits
+        // is drawn, and the rect handed back is the part that is really there,
+        // so the mouse and the drawing keep agreeing.
+        let visible = w.min(right.saturating_sub(self.x));
+        let rect = Rect::new(self.x, self.y, visible, 1);
+        if self.y < self.inner.y + self.inner.height && visible > 0 {
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(text, style))).style(self.bg),
                 rect,
@@ -1286,7 +1298,7 @@ pub fn draw_fx_chain_panel(
                 f,
                 &mut layout,
                 RackButton::ArpLatch,
-                format!(" LATCH {} ", if s.latch { "\u{25CF}" } else { "\u{25CB}" }),
+                format!(" HOLD {} ", if s.latch { "\u{25CF}" } else { "\u{25CB}" }),
                 s.latch,
             );
             button(
@@ -1389,6 +1401,28 @@ pub fn draw_fx_chain_panel(
             9,
             true,
         );
+        // More parameters than fit: page through them. The arrows sit on the
+        // box's own top edge, right-aligned, where the arpeggiator's TAP sits —
+        // and they are learn targets like any other button, because a synth
+        // whose knobs are on page 4 is no use to someone with both hands busy.
+        if rects.len() < instr_params.len() {
+            let (px, pn) = (BTN_PREV, BTN_NEXT);
+            let w = (Span::raw(px).width() + Span::raw(pn).width() + 1) as u16;
+            let right = inner.x + inner.width.saturating_sub(1);
+            if right > inner.x + w + 2 {
+                let mut x = right.saturating_sub(w + 1);
+                for (btn, text) in [
+                    (RackButton::InstrPagePrev, px),
+                    (RackButton::InstrPageNext, pn),
+                ] {
+                    let bw = Span::raw(text).width() as u16;
+                    let rect = Rect::new(x, y, bw, 1);
+                    f.render_widget(Paragraph::new(Span::styled(text, btn_style)), rect);
+                    layout.buttons.push((btn, rect));
+                    x += bw;
+                }
+            }
+        }
         layout.instr_knobs = rects;
         y = next;
     }
