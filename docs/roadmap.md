@@ -21,10 +21,12 @@ a notas), AutoTune y un arpegiador por tab; 45 efectos
 propios (**la suite está completa**), que además se publican como un `.clap`
 para usarlos en cualquier otro host; un patch de Max se importa hasta donde se
 puede, diciendo qué no; hay guardia de acople en la entrada; el mixer tiene un
-main y cuatro subgrupos; una tab guarda sus sonidos en botones y puede partir el
-teclado entre ellos; y un efecto puede abrirse con el bombo de otra tab. **La 1.0.0 está publicada y sus paquetes
-verificados; la 1.3.0 es este árbol, con trabajo sin publicar encima.**
-602 tests, `clippy --workspace --all-targets -D warnings` limpio.
+main **estéreo** y cuatro subgrupos; una tab guarda sus sonidos en botones —que
+se asignan desde el mismo modal de bank/preset— y puede partir el teclado entre
+ellos; y un efecto puede abrirse con el bombo de otra tab, con el clock, o con
+el tap del metrónomo. **La 1.0.0 está publicada y sus paquetes verificados; la
+1.3.1 es este árbol.**
+606 tests, `clippy --workspace --all-targets -D warnings` limpio.
 
 Las comprobaciones con hardware delante quedaron dichas en los gotchas, que es
 donde se van a leer.
@@ -61,6 +63,56 @@ dudar de un número: todo el DSP está verificado contra señales sintéticas, n
 contra una habitación.
 
 ## Notas / gotchas para el que retome
+
+- **El cazador de acoples estaba calibrado al revés** (2026-08-20). Reportado
+  como "el harmonizer empieza bien pero no sostiene una nota larga", y no era
+  el harmonizer: `FeedbackGuard` está en la **entrada**, antes del trim, así que
+  se lleva la voz y la armonía juntas. Medido con `examples/guard_probe`, con
+  las constantes viejas (`GROWTH` 1,5× **por chequeo de 64 ms**, 3 chequeos):
+  un swell normal de 600 ms hacia una nota larga bajaba a **0,126 (-18 dB)** y
+  se quedaba ahí, porque lo único que soltaba el duck era que la sala se
+  callara — o sea, que el cantante dejara de cantar. Y al mismo tiempo un acople
+  real de +6 dB/s **no se detectaba**: sube 0,4 dB entre dos chequeos y nunca
+  llegaba al 1,5×. Cazaba cantantes y dejaba pasar acoples.
+  Lo que se hizo: el crecimiento se mide contra la lectura **más vieja del
+  historial** (medio segundo atrás), o sea una tasa y no un salto; hacen falta
+  `GROWTH_CHECKS = 16` ventanas seguidas (~1,5 s de crecimiento continuo), que
+  es lo único que separa a un cantante de un lazo — los dos crecen, pero una
+  nota deja de crecer cuando llega; y el duck se suelta cuando **deja de
+  crecer** (`CALM_CHECKS`), no sólo con silencio. Medido después: los tres casos
+  cantados quedan en 1,00, el acople de +6 dB/s se caza y se sostiene.
+  Lo que **no** resuelve: un crescendo largo de verdad (2 s subiendo) sigue
+  siendo indistinguible de un lazo lento mientras sube — dispara, pero ahora se
+  suelta solo en cuanto para. El interruptor sigue en Settings → AUDIO.
+
+- **"Se satura al pisar el sustain" son huecos, no clipping** (2026-08-20). El
+  log del usuario lo dice entero: el grafo corre a **96 kHz con 128 frames**, o
+  sea **1,33 ms por bloque**, y el tab de SoundFont solo ya cuesta 0,66–1,04 ms
+  de eso (532 de 716 avisos lo nombran a él; Surge XT es el segundo con 91). El
+  peor bloque **no crece** durante la sesión: arranca en 1,4 ms y se queda ahí,
+  o sea el rack vive al borde desde el primer minuto. Pisar el sustain no baja
+  ninguna voz, así que el pool de oxisynth se llena y se queda lleno: medido con
+  `examples/sustain_probe`, un bloque pasaba de 233 µs al minuto a 330 µs una
+  vez lleno (+40 % en un solo tab). Un bloque que se pasa del presupuesto es un
+  hueco en la salida, y un hueco suena a distorsión, no a nivel — de ahí
+  "satura". Lo que se hizo: **polifonía 64** en `Sf2Synth` (el default de
+  oxisynth es 256), que deja el coste plano en ~124 µs con el pedal abajo, 2,7×
+  más barato, sin tocar el pico de nivel (0,115 medido antes y después. Y sí,
+  parte del problema es el sistema: hay líneas de "el grafo sólo corrió 380 de
+  750 ciclos" que son otro cliente xruneando. Las dos cosas son ciertas.
+- **El DSP % del menú era un solo bloque** (2026-08-20). `Load::last()` leía
+  `last_us`, uno de los ~190 bloques por segundo, y `elapsed()` es reloj de
+  pared: un bloque que se comió una expropiación se lee como un rack que cuesta
+  el 40 % cuando el tiempo de CPU del hilo dice 4 %. Eso es lo que parecía "el
+  número sube cuanto más tiempo lleva choz abierto" — medido con
+  `/proc/PID/task/*/stat`, ni la CPU del `data-loop` ni el RSS crecen en 3
+  minutos. Ahora publica una media exponencial (1/16, ~100 ms); el pico sigue
+  aparte, porque un deadline se pierde por picos y no por medias. Descartado por
+  medición: denormales (probé los 14 FX con cola larga contra 30 s de silencio,
+  ninguno pasa de 1,14×).
+- **`take_worst_slot` no se vaciaba en un segundo sano**: sólo se leía camino a
+  un aviso, así que la primera línea tras una hora nombraba el tab que alguna
+  vez fue caro, no el que está pasándose ahora. Se lee siempre.
 
 - **FluidSynth-DSSI no se puede instanciar dos veces en un proceso.** Arrastra
   libinstpatch, cuyo registro de tipos de GLib no sobrevive a que se destruya la

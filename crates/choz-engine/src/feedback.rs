@@ -48,14 +48,39 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// happens to be swelling — a bowed note, a fade-in — must not be ducked.
 const FLOOR: f32 = 0.05;
 
-/// How much louder than it was a fifth of a second ago the signal has to be
-/// for that stretch to count as growth.
-const GROWTH: f32 = 1.5;
+/// How much louder than it was **half a second ago** the signal has to be for
+/// that stretch to count as growth.
+///
+/// Measured against the oldest reading in the history rather than against the
+/// previous check, which is what makes this a rate and not a jump: a loop
+/// climbing 6 dB a second gains only 0.4 dB between two 64 ms checks and the
+/// per-check version never saw it at all, while the attack of a sung note
+/// gains far more than that and tripped it every time. +3 dB over half a
+/// second is ~4.5 dB/s, which is about as slow as a runaway gets before it
+/// stops being one.
+const GROWTH: f32 = 1.3;
 
-/// Consecutive growing stretches before the guard acts. Three of them is about
-/// 200 ms of a signal that keeps climbing from an already loud start, which no
-/// struck or held note does.
-const GROWTH_CHECKS: u32 = 3;
+/// Consecutive growing windows before the guard acts.
+///
+/// **This is the number that separates a singer from a loop, and it can only
+/// be time.** Both grow; a note stops growing once it has arrived and a loop
+/// does not. Sixteen checks is a second of *continuous* growth on top of the
+/// half second the window itself covers — about 1.5 s in all, which no sung
+/// entrance, bowed swell or crescendo reaches and which a howl passes without
+/// noticing. The old value was three checks (~200 ms) measured per check, and
+/// it pulled an ordinary 600 ms swell into a long note down by 18 dB and then
+/// held it there for as long as the singer kept singing.
+const GROWTH_CHECKS: u32 = 16;
+
+/// Checks with no growth before a duck is let go again.
+///
+/// The other half of the same bug: the duck used to lift only when the room
+/// went **quiet**, so a guard that fired on a singer stayed on until the singer
+/// stopped — which is precisely the note it was ruining. A loop pulled 18 dB
+/// down is a loop that is no longer running away, so "it stopped growing" is
+/// the honest signal to open again. A real one climbs again and is caught
+/// again, and that pumping is the guard telling the room something is wrong.
+const CALM_CHECKS: u32 = 6;
 
 /// How far the input is pulled down once a loop is recognised: -18 dB, which
 /// takes any realistic loop gain back under one.
@@ -101,8 +126,12 @@ pub struct FeedbackGuard {
     /// Samples until the next check.
     countdown: usize,
     check_every: usize,
-    /// Consecutive checks that grew.
+    /// Consecutive checks that grew, and consecutive checks that did not.
     growing: u32,
+    calm: u32,
+    /// How many readings the history holds, so the oldest one is only compared
+    /// against once it is a real reading rather than the zero it started as.
+    filled: usize,
     /// Gain applied to the input right now, and where it is heading.
     gain: f32,
     target: f32,
@@ -122,6 +151,8 @@ impl FeedbackGuard {
             countdown: (CHECK_S * sr) as usize,
             check_every: (CHECK_S * sr).max(1.0) as usize,
             growing: 0,
+            calm: 0,
+            filled: 0,
             gain: 1.0,
             target: 1.0,
             attack: coefficient(DUCK_ATTACK_S, sr),
@@ -160,6 +191,8 @@ impl FeedbackGuard {
         self.slot = 0;
         self.countdown = self.check_every;
         self.growing = 0;
+        self.calm = 0;
+        self.filled = 0;
         self.gain = 1.0;
         self.target = 1.0;
     }
@@ -214,24 +247,30 @@ impl FeedbackGuard {
 
     /// One look at the history, once every [`CHECK_S`].
     fn check(&mut self) {
+        // The oldest reading in the ring is half a second back, and that is
+        // what growth is measured against — see [`GROWTH`].
         let then = self.history[self.slot];
         self.history[self.slot] = self.env;
         self.slot = (self.slot + 1) % HISTORY;
+        self.filled = (self.filled + 1).min(HISTORY);
 
         let loud = self.env > FLOOR;
-        let grew = loud && then > 0.0 && self.env > then * GROWTH;
+        let grew = loud && self.filled >= HISTORY && then > 0.0 && self.env > then * GROWTH;
         if grew {
             self.growing = self.growing.saturating_add(1);
+            self.calm = 0;
         } else {
             self.growing = 0;
+            self.calm = self.calm.saturating_add(1);
         }
 
         if self.growing >= GROWTH_CHECKS {
             self.target = DUCK;
-        } else if self.target < 1.0 && self.env < FLOOR * 0.7 {
-            // The room has gone quiet: let it back up. Slowly, which is what
-            // `release` is for — a guard that opens the instant a howl stops
-            // simply starts it again.
+            self.calm = 0;
+        } else if self.target < 1.0 && (self.calm >= CALM_CHECKS || self.env < FLOOR * 0.7) {
+            // It stopped climbing, or the room went quiet: let it back up.
+            // Slowly, which is what `release` is for — a guard that opens the
+            // instant a howl stops simply starts it again.
             self.target = 1.0;
             self.growing = 0;
         }
@@ -271,16 +310,16 @@ mod tests {
     fn a_growing_howl_is_pulled_down() {
         let _lock = armed_lock();
         let mut g = FeedbackGuard::new(SR);
-        let mut level = 0.1f32;
         let mut last = 1.0;
-        // Half a second of a 1 kHz tone doubling every 200 ms, which is what a
-        // room does when the loop gain passes one.
-        for i in 0..seconds(0.8) {
+        // A 1 kHz tone climbing 6 dB a second — about as slow as a runaway
+        // gets — from something already audible. Two seconds of it, because
+        // **length is what tells this from a singer**: a note stops growing
+        // when it arrives, and this does not.
+        for i in 0..seconds(2.5) {
+            let t = i as f32 / SR;
             let phase = std::f32::consts::TAU * 1_000.0 * i as f32 / SR;
+            let level = (0.06 * 2.0f32.powf(t)).min(1.0);
             last = g.step(level * phase.sin());
-            if i % seconds(0.2) == 0 {
-                level = (level * 2.0).min(1.0);
-            }
         }
         assert!(last < 0.5, "the guard let a howl through: gain {last}");
         assert!(g.ducking());
@@ -316,7 +355,10 @@ mod tests {
             last = g.step(amp * phase.sin());
             amp *= 0.99995;
         }
-        assert!((last - 1.0).abs() < 1e-3, "a decaying note was ducked: {last}");
+        assert!(
+            (last - 1.0).abs() < 1e-3,
+            "a decaying note was ducked: {last}"
+        );
     }
 
     /// Quiet material that swells is not a loop: a bowed note, a fade-in. Under
@@ -332,7 +374,67 @@ mod tests {
             let amp = 0.03 * (i as f32 / seconds(1.5) as f32);
             last = g.step(amp * phase.sin());
         }
-        assert!((last - 1.0).abs() < 1e-3, "a quiet swell was ducked: {last}");
+        assert!(
+            (last - 1.0).abs() < 1e-3,
+            "a quiet swell was ducked: {last}"
+        );
+    }
+
+    /// **The one this was reported for.** A singer swelling into a long note is
+    /// not a loop, and the note must survive being held: the guard used to duck
+    /// an ordinary 600 ms entrance by 18 dB and then hold it there for as long
+    /// as the singer kept singing, because the only thing that lifted the duck
+    /// was silence.
+    #[test]
+    fn a_sung_note_swells_in_and_is_left_alone() {
+        let _lock = armed_lock();
+        for swell in [0.15f32, 0.6, 1.0] {
+            let mut g = FeedbackGuard::new(SR);
+            let mut worst = 1.0f32;
+            for i in 0..seconds(4.0) {
+                let t = i as f32 / SR;
+                let phase = std::f32::consts::TAU * 220.0 * i as f32 / SR;
+                // In over `swell` seconds, then held — with vibrato on it,
+                // because a held human note is not a flat line.
+                let amp = (t / swell).min(1.0)
+                    * 0.35
+                    * (1.0 + 0.25 * (t * 5.0 * std::f32::consts::TAU).sin());
+                worst = worst.min(g.step(amp * phase.sin()));
+            }
+            assert!(
+                worst > 0.999,
+                "a {swell}s swell into a held note was ducked to {worst}"
+            );
+        }
+    }
+
+    /// And when it does fire on something that was not a loop — a long
+    /// crescendo is genuinely indistinguishable from a slow one while it is
+    /// still climbing — it lets go as soon as the climbing stops, without
+    /// waiting for the room to fall silent.
+    #[test]
+    fn a_duck_lifts_when_the_growing_stops() {
+        let _lock = armed_lock();
+        let mut g = FeedbackGuard::new(SR);
+        // Two seconds of continuous growth: long enough to be taken for a loop.
+        for i in 0..seconds(2.5) {
+            let t = i as f32 / SR;
+            let phase = std::f32::consts::TAU * 440.0 * i as f32 / SR;
+            g.step((0.06 + 0.3 * (t / 2.0).min(1.0)) * phase.sin());
+        }
+        assert!(g.ducking(), "it should be holding by now");
+
+        // Now it stays loud but stops growing — which a runaway never does.
+        // No silence anywhere, and it opens anyway.
+        let mut last = 0.0;
+        for i in 0..seconds(4.0) {
+            let phase = std::f32::consts::TAU * 440.0 * i as f32 / SR;
+            last = g.step(0.36 * phase.sin());
+        }
+        assert!(
+            last > 0.8,
+            "it held a signal that had stopped growing: gain {last}"
+        );
     }
 
     /// Once the room goes quiet the guard lets go — slowly, because opening the
@@ -341,13 +443,11 @@ mod tests {
     fn it_lets_go_once_the_room_is_quiet() {
         let _lock = armed_lock();
         let mut g = FeedbackGuard::new(SR);
-        let mut level = 0.1f32;
-        for i in 0..seconds(0.8) {
+        for i in 0..seconds(2.5) {
+            let t = i as f32 / SR;
             let phase = std::f32::consts::TAU * 1_000.0 * i as f32 / SR;
+            let level = (0.06 * 2.0f32.powf(t)).min(1.0);
             g.step(level * phase.sin());
-            if i % seconds(0.2) == 0 {
-                level = (level * 2.0).min(1.0);
-            }
         }
         assert!(g.ducking(), "it should be holding by now");
 
@@ -369,13 +469,11 @@ mod tests {
     fn disarmed_it_does_nothing_at_all() {
         let _lock = armed_lock();
         let mut g = FeedbackGuard::new(SR);
-        let mut level = 0.1f32;
-        for i in 0..seconds(0.8) {
+        for i in 0..seconds(2.5) {
+            let t = i as f32 / SR;
             let phase = std::f32::consts::TAU * 1_000.0 * i as f32 / SR;
+            let level = (0.06 * 2.0f32.powf(t)).min(1.0);
             g.step(level * phase.sin());
-            if i % seconds(0.2) == 0 {
-                level = (level * 2.0).min(1.0);
-            }
         }
         assert!(g.ducking());
         arm(false);

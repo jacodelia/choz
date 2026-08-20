@@ -211,9 +211,11 @@ pub(crate) enum EngineCommand {
         left: usize,
         right: usize,
     },
-    /// The main fader, on the first output pair.
+    /// The main fader, on the first output pair. One level per channel: the
+    /// main is a stereo output like every other strip, and a single number
+    /// could not ride a rig whose two sides are not level.
     SetMain {
-        gain: f32,
+        gain: [f32; 2],
         mute: bool,
     },
     /// Trim on the slot's audio input, and how loud that input has to be before
@@ -507,7 +509,7 @@ pub(crate) struct RtState {
     /// The main strip: the last thing the **first** output pair passes through,
     /// which is the pair everything calls "the output" and the one the meter
     /// reads. The other pairs are separate outputs, not part of a main.
-    pub(crate) main_gain: f32,
+    pub(crate) main_gain: [f32; 2],
     pub(crate) main_mute: bool,
     /// One pre-allocated buffer per device *input* channel, filled by the
     /// backend before `render` so a slot can process live audio.
@@ -910,7 +912,7 @@ impl AudioEngine {
             mix: vec![vec![0.0; frames]; outs.max(2)],
             bus_mix: vec![vec![0.0; frames]; BUSES * 2],
             buses: [Bus::default(); BUSES],
-            main_gain: 1.0,
+            main_gain: [1.0, 1.0],
             main_mute: false,
             capture: vec![vec![0.0; frames]; ins],
             capture_rx,
@@ -1558,9 +1560,12 @@ impl AudioEngine {
         });
     }
 
-    /// The main strip: one fader over the first output pair.
-    pub fn set_main(&mut self, gain: f32, mute: bool) {
-        self.send(EngineCommand::SetMain { gain, mute });
+    /// The main strip: a fader per channel over the first output pair.
+    pub fn set_main(&mut self, gain: f32, gain_r: f32, mute: bool) {
+        self.send(EngineCommand::SetMain {
+            gain: [gain, gain_r],
+            mute,
+        });
     }
 
     /// Set slot `slot`'s mixer strip: linear `gain`, `pan` (-1 left .. 1 right)
@@ -1963,7 +1968,7 @@ impl RtState {
                     }
                 }
                 EngineCommand::SetMain { gain, mute } => {
-                    state.main_gain = gain.clamp(0.0, 2.0);
+                    state.main_gain = [gain[0].clamp(0.0, 2.0), gain[1].clamp(0.0, 2.0)];
                     state.main_mute = mute;
                 }
                 EngineCommand::SetSlotOut { slot, left, right } => {
@@ -2464,14 +2469,14 @@ impl RtState {
         // a main that also trimmed channels 7 and 8 would be a master fader
         // that silences a monitor send.
         let main = match *main_mute {
-            true => 0.0,
+            true => [0.0, 0.0],
             false => *main_gain,
         };
-        if (main - 1.0).abs() > f32::EPSILON && mix.len() >= 2 {
+        if main.iter().any(|g| (g - 1.0).abs() > f32::EPSILON) && mix.len() >= 2 {
             let n = frames.min(mix[0].len()).min(mix[1].len());
-            for ch in mix.iter_mut().take(2) {
+            for (ch, g) in mix.iter_mut().take(2).zip(main) {
                 for s in ch[..n].iter_mut() {
-                    *s *= main;
+                    *s *= g;
                 }
             }
         }
@@ -3079,7 +3084,7 @@ mod tests {
             mix: vec![vec![0.0; 32]; outs],
             bus_mix: vec![vec![0.0; 32]; BUSES * 2],
             buses: [Bus::default(); BUSES],
-            main_gain: 1.0,
+            main_gain: [1.0, 1.0],
             main_mute: false,
             capture: vec![vec![0.0; 32]; ins],
             capture_rx: None,
@@ -4234,7 +4239,7 @@ mod tests {
         }
         cmd_tx
             .push(EngineCommand::SetMain {
-                gain: 0.5,
+                gain: [0.5, 0.5],
                 mute: false,
             })
             .unwrap();
@@ -4261,7 +4266,7 @@ mod tests {
             .unwrap();
         cmd_tx
             .push(EngineCommand::SetMain {
-                gain: 0.0,
+                gain: [0.0, 0.0],
                 mute: false,
             })
             .unwrap();
@@ -4271,6 +4276,31 @@ mod tests {
             (state.mix[2][0] - 0.5 * unity).abs() < 1e-5,
             "channels 3/4 are their own output: {}",
             state.mix[2][0]
+        );
+
+        // The main is a **stereo** strip: its two faders move apart, which is
+        // what a rig whose sides are not level needs and what one number could
+        // not say.
+        cmd_tx
+            .push(EngineCommand::SetSlotOut {
+                slot: 0,
+                left: 0,
+                right: 1,
+            })
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetMain {
+                gain: [1.0, 0.25],
+                mute: false,
+            })
+            .unwrap();
+        state.apply_commands();
+        state.render(8);
+        let (l, r) = (state.mix[0][0], state.mix[1][0]);
+        assert!(l.abs() > 1e-4, "the left side still sounds: {l}");
+        assert!(
+            (r / l - 0.25).abs() < 1e-4,
+            "the right fader is a quarter of the left one: {l} vs {r}"
         );
     }
 

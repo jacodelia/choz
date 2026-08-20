@@ -544,6 +544,15 @@ impl PitchMeter {
 pub struct Load {
     /// Microseconds the last block took, and the worst since the last read.
     last_us: AtomicU32,
+    /// The same, smoothed: a decaying average of the last few hundred blocks.
+    ///
+    /// **The readout reads this, not `last_us`.** One block out of the ~190 a
+    /// second is a sample of nothing: `elapsed()` is wall-clock, so a block
+    /// that happened to be preempted reads as a rack that costs 40 % when the
+    /// thread's own CPU time says 4 %. Which is exactly what "the number keeps
+    /// climbing the longer choz is open" looked like. The peak is still kept
+    /// separately, because a deadline is missed by peaks and not by averages.
+    avg_us: AtomicU32,
     peak_us: AtomicU32,
     /// Microseconds the block *had*, from frames and sample rate.
     budget_us: AtomicU32,
@@ -561,6 +570,7 @@ pub struct Load {
 pub fn load() -> &'static Load {
     static L: Load = Load {
         last_us: AtomicU32::new(0),
+        avg_us: AtomicU32::new(0),
         peak_us: AtomicU32::new(0),
         budget_us: AtomicU32::new(0),
         blocks: AtomicU32::new(0),
@@ -577,6 +587,13 @@ impl Load {
         let us = took.as_micros().min(u32::MAX as u128) as u32;
         let budget_us = budget.as_micros().min(u32::MAX as u128) as u32;
         self.last_us.store(us, Ordering::Relaxed);
+        // A 1/16 exponential average: ~a tenth of a second at any block size
+        // anyone plays at, which is slow enough to stop flickering and fast
+        // enough that turning a rack on is seen immediately. Integer maths, on
+        // the audio thread.
+        let prev = self.avg_us.load(Ordering::Relaxed);
+        self.avg_us
+            .store(prev - prev / 16 + us / 16, Ordering::Relaxed);
         self.budget_us.store(budget_us, Ordering::Relaxed);
         self.peak_us.fetch_max(us, Ordering::Relaxed);
         self.blocks.fetch_add(1, Ordering::Relaxed);
@@ -604,10 +621,17 @@ impl Load {
         )
     }
 
-    /// Fraction of the budget the last block used. 1.0 is the edge of a hole.
+    /// Microseconds the last block took. The raw sample; the readout wants
+    /// [`Self::last`], which is the average.
+    pub fn last_block_us(&self) -> u32 {
+        self.last_us.load(Ordering::Relaxed)
+    }
+
+    /// Fraction of the budget a block is using, averaged. 1.0 is the edge of a
+    /// hole.
     pub fn last(&self) -> f32 {
         let (us, budget) = (
-            self.last_us.load(Ordering::Relaxed) as f32,
+            self.avg_us.load(Ordering::Relaxed) as f32,
             self.budget_us.load(Ordering::Relaxed) as f32,
         );
         if budget <= 0.0 {
@@ -635,6 +659,8 @@ impl Load {
 
     pub fn clear(&self) {
         self.last_us.store(0, Ordering::Relaxed);
+        self.avg_us.store(0, Ordering::Relaxed);
+        self.worst_slot_us.store(0, Ordering::Relaxed);
         self.peak_us.store(0, Ordering::Relaxed);
         self.blocks.store(0, Ordering::Relaxed);
         self.over.store(0, Ordering::Relaxed);

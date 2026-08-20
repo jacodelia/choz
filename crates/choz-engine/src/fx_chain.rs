@@ -28,10 +28,48 @@ pub struct FxSpec {
 /// source tab that renders *after* this one is therefore one block late; at
 /// choz's block sizes that is under three milliseconds and nobody has ever
 /// heard it, but it is the reason the order of tabs is not entirely arbitrary.
+/// What drives a gate.
+///
+/// A tab is the sidechain everybody knows. The other two are the clock: an
+/// effect that has to open **on the beat** rather than on a hit — a tremolo
+/// that chops in time, a delay that only speaks between bars — has nothing to
+/// listen to when nothing is playing it, and asking the player to keep a tab of
+/// clicks running just to drive it is a workaround, not a feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateSource {
+    /// Another tab's level, by rack index.
+    Tab(usize),
+    /// The transport's beat, wherever the transport is getting it — choz's own
+    /// clock or an external one. Silent metronome included: this is the count,
+    /// not the click.
+    Clock,
+    /// The internal metronome's tap, as it actually sounds: off when the
+    /// metronome is off, and accented on the downbeat the way the click is.
+    Metronome,
+}
+
+impl Default for GateSource {
+    fn default() -> Self {
+        GateSource::Tab(0)
+    }
+}
+
+impl GateSource {
+    /// The level this source is offering right now, on the same 0..1 scale a
+    /// tab's is read on.
+    pub fn level(self) -> f32 {
+        match self {
+            GateSource::Tab(i) => crate::meter::slot_levels().live(i),
+            GateSource::Metronome => crate::metronome::metronome().tap_level(),
+            GateSource::Clock => crate::metronome::beat_pulse(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GateSpec {
-    /// The tab whose level drives this, by rack index.
-    pub source: usize,
+    /// What drives this: another tab, the clock, or the metronome's tap.
+    pub source: GateSource,
     pub mode: GateMode,
     /// How much of the effect the gate is allowed to move, 0..1. At 0 it does
     /// nothing; at 1 the effect is entirely the gate's.
@@ -67,7 +105,7 @@ impl GateMode {
 impl Default for GateSpec {
     fn default() -> Self {
         Self {
-            source: 0,
+            source: GateSource::Tab(0),
             mode: GateMode::default(),
             depth: 1.0,
             threshold: 0.5,
@@ -519,7 +557,7 @@ struct Gated {
 impl fx::FxProcessor for Gated {
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
         let frames = (buf.len() / 2).max(1) as f32;
-        let level = crate::meter::slot_levels().live(self.gate.source);
+        let level = self.gate.source.level();
         let open = (level / self.gate.threshold.max(1e-4)).clamp(0.0, 1.0);
         // Instant attack, exponential release, stepped once per block: a kick
         // is over in less time than a fader move, and the block is the grid the
@@ -723,6 +761,46 @@ mod tests {
         }
     }
 
+    /// The two clock gate sources: the metronome's tap says nothing while the
+    /// metronome is off, and the transport's beat pulses whether it does or
+    /// not — which is the point of having both.
+    #[test]
+    fn the_clock_can_drive_a_gate_with_no_tab_playing() {
+        let m = crate::metronome::metronome();
+        let t = choz_ports::transport();
+        t.set_sample_rate(48_000);
+        t.set_bpm(120.0);
+
+        m.set_on(false);
+        m.render(&mut [0.0f32; 128], 64, 48_000);
+        assert_eq!(
+            GateSource::Metronome.level(),
+            0.0,
+            "a metronome that is off taps nothing"
+        );
+
+        m.set_on(true);
+        m.set_gain(1.0);
+        // Switching it on rewinds its count, so the first block is the downbeat.
+        m.render(&mut [0.0f32; 128], 64, 48_000);
+        assert!(
+            GateSource::Metronome.level() > 0.05,
+            "and the click itself is the tap: {}",
+            GateSource::Metronome.level()
+        );
+        m.set_on(false);
+
+        // The beat pulse is the transport's, not the click's: full on the
+        // boundary, well down a third of a beat later.
+        t.rewind();
+        let on_beat = GateSource::Clock.level();
+        t.advance(8_000); // a third of a beat at 120 bpm
+        let after = GateSource::Clock.level();
+        assert!(on_beat > 0.9, "the boundary is the hit: {on_beat}");
+        assert!(after < 0.3, "and it has decayed by the next third: {after}");
+        t.rewind();
+    }
+
     /// A gate is another tab's level riding this effect's dry/wet. The case it
     /// was built for: a kick on one tab opening a filter on another.
     #[test]
@@ -752,7 +830,7 @@ mod tests {
         let mut gated = Gated {
             inner: Box::new(Silencer { wet: 1.0 }),
             gate: GateSpec {
-                source: drums,
+                source: GateSource::Tab(drums),
                 mode: GateMode::Open,
                 depth: 1.0,
                 threshold: 0.5,

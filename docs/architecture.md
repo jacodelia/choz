@@ -549,8 +549,13 @@ The **KEYS** and **ROLL** tabs answer the first question with a picture instead
 of a log. `KeyboardState` (in `midi_monitor.rs`) is a 128-slot map of what is
 held plus a fixed ring of recent notes for the falling view, fed from
 `drain_midi` **after** routing is resolved, so a key can be coloured by the tab
-that is playing it (`KeyColor::{Channel, Instrument, Velocity}`, saved in
-`ui.json`). It is deliberately not `App.sounding`: that one indexes slots and
+that is playing it (`KeyColor::{Channel, Source, Instrument, Velocity}`, saved
+in `ui.json`, with a legend under the keyboard naming each colour in its own
+colour — six hues mean nothing until something names them). `Source` and
+`Instrument` are two modes and not one because they answer different halves of
+a rig: two controllers can play one tab and one controller can be split across
+two, so "where did this note come in" and "what is it playing" are separate
+questions. Their hue wheels are offset so port 1 and tab 1 never look alike. It is deliberately not `App.sounding`: that one indexes slots and
 exists so a note-off reaches the tab its note-on went to, and merging the two is
 how notes get stuck. There is no stuck-note timeout either — a held pad is a
 held note; `PANIC` is what clears both the rack and the picture.
@@ -1050,6 +1055,14 @@ of how many the device asked for, how many a sandbox missed, how many clipped,
 how many plugins restarted, and the pid (two instances share one log file). Past
 5 % of blocks over budget it also says what to do about it, with the latency the
 bigger buffer costs. The status bar carries the live `DSP %`.
+
+**That readout is an average, and it has to be.** `elapsed()` is wall-clock, so
+a single block that was preempted reads as a rack costing 40 % while the
+thread's own CPU time says 4 % — which is what "the number climbs the longer
+choz is open" turned out to be, with neither the audio thread's CPU nor the RSS
+moving over three minutes of measurement. `Load` publishes a 1/16 exponential
+average (~100 ms) for the panel and keeps the **peak** separately for the log,
+because a deadline is missed by peaks and not by averages.
 
 That line is what found the bug above: `383/383 blocks over budget` with the
 device asking for 750 a second — half the audio was never rendered at all.

@@ -250,23 +250,43 @@ impl MonitorTab {
 
 /// What decides the colour of a lit key.
 ///
-/// Three questions a player actually asks, one mode each: *which channel is
-/// this* (MULTI, where a channel is a tab), *which instrument is sounding*
-/// (two ports on one channel), and *how hard am I playing*.
+/// Four questions a player actually asks, one mode each: *which channel is
+/// this* (MULTI, where a channel is a tab), *which keyboard did it come from*,
+/// *which tab is sounding it*, and *how hard am I playing*.
+///
+/// **The last two are not the same question**, which is why they are two modes.
+/// Two controllers can both play the same tab and one controller can be split
+/// across two, so "where did this note come in" and "what is it playing" answer
+/// different halves of a rig — and reading a rig means being able to ask each
+/// of them on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum KeyColor {
-    #[default]
     Channel,
+    /// One colour per **MIDI input**: which keyboard, pad or sequencer the note
+    /// arrived on. Notes choz made itself — the QWERTY piano, `A→M` — have no
+    /// port and are drawn dim.
+    Source,
+    /// The default: one colour per rack tab. "Which tab is this note playing"
+    /// is the question a rack of tabs raises, and the legend under the
+    /// keyboard names the colours — which is what made the other modes
+    /// unreadable before there was one.
+    #[default]
     Instrument,
     Velocity,
 }
 
 impl KeyColor {
-    pub const ALL: [KeyColor; 3] = [KeyColor::Channel, KeyColor::Instrument, KeyColor::Velocity];
+    pub const ALL: [KeyColor; 4] = [
+        KeyColor::Channel,
+        KeyColor::Source,
+        KeyColor::Instrument,
+        KeyColor::Velocity,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             KeyColor::Channel => "CHANNEL",
+            KeyColor::Source => "INPUT",
             KeyColor::Instrument => "INSTRUMENT",
             KeyColor::Velocity => "VELOCITY",
         }
@@ -536,6 +556,16 @@ fn key_colour(mode: KeyColor, key: &KeyLit) -> Color {
             // Not routed anywhere: it arrived, but nothing is playing it.
             None => DIM,
         },
+        // Offset past the tabs' wheel so a port and a tab of the same number
+        // are not the same colour — the two modes are read one after the other,
+        // and a colour that means two things is worse than no colour.
+        KeyColor::Source => match key.source {
+            Some(InputSource::Midi(i)) => hue_of(i as u32 + 9),
+            Some(InputSource::Osc) => hue_of(8),
+            // choz's own: the QWERTY piano and what `A→M` heard. They came from
+            // no port, and saying so is the point of this mode.
+            Some(InputSource::Keyboard) | None => DIM,
+        },
         KeyColor::Velocity => {
             let (r, g, b) = theme::rgb_of(theme::text());
             let k = 0.25 + 0.75 * (key.vel as f32 / 127.0);
@@ -661,7 +691,14 @@ fn keyboard_lines(state: &KeyboardState, mode: KeyColor, width: usize) -> Vec<Li
 }
 
 /// The piano keyboard, lit by what is arriving.
-fn draw_keys(f: &mut Frame, area: Rect, state: &KeyboardState, mode: KeyColor) {
+fn draw_keys(
+    f: &mut Frame,
+    area: Rect,
+    state: &KeyboardState,
+    mode: KeyColor,
+    strips: &[MixerStrip],
+    ports: &[String],
+) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -684,16 +721,108 @@ fn draw_keys(f: &mut Frame, area: Rect, state: &KeyboardState, mode: KeyColor) {
     if height > lines.len() {
         lines.push(controller_line(state));
     }
+    // The key to the colours, in the colours: a keyboard lit in six hues says
+    // nothing until something names them. What the legend lists is what the
+    // mode colours by — one entry per tab, per channel, or the velocity ramp.
     if height > lines.len() {
-        lines.push(Line::from(Span::styled(
-            format!("  colour: {}  [C]", mode.label()),
-            Style::default().fg(DIM),
-        )));
+        lines.push(colour_legend(mode, state, strips, ports));
     }
     f.render_widget(
         Paragraph::new(lines).style(super::theme::panel_style()),
         area,
     );
+}
+
+/// The colour key under the keyboard: which colour is which tab, channel or
+/// velocity, spelled in the colour it stands for, and the `[C]` that cycles it.
+fn colour_legend(
+    mode: KeyColor,
+    state: &KeyboardState,
+    strips: &[MixerStrip],
+    ports: &[String],
+) -> Line<'static> {
+    use crate::views::fx_chain_panel::truncate;
+    let mut spans = vec![Span::styled(
+        format!("  {} ", mode.label()),
+        Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+    )];
+    match mode {
+        // One entry per rack tab, in the hue that tab's notes are drawn in —
+        // `key_colour` offsets the slot by three, so the legend has to as well
+        // or it would name the wrong colour with total confidence.
+        KeyColor::Instrument => {
+            for (i, st) in strips
+                .iter()
+                .filter(|s| s.kind == StripKind::Tab)
+                .enumerate()
+            {
+                spans.push(Span::styled(
+                    format!("{}:{} ", i + 1, truncate(&st.label, 8)),
+                    Style::default().fg(hue_of(i as u32 + 3)),
+                ));
+            }
+        }
+        // Every input that is connected, whether or not it is playing right
+        // now: this legend is also the answer to "is that keyboard even
+        // plugged in", and a port that vanishes from the key when nothing is
+        // held cannot answer it. `InputSource::Midi(i)` indexes this list.
+        KeyColor::Source => {
+            for (i, name) in ports.iter().enumerate() {
+                spans.push(Span::styled(
+                    format!("{} ", truncate(name, 12)),
+                    Style::default().fg(hue_of(i as u32 + 9)),
+                ));
+            }
+            // The notes with no port at all, named so the dim keys are not
+            // read as a fault.
+            spans.push(Span::styled(
+                format!("{} ", crate::i18n::t("QWERTY")),
+                Style::default().fg(DIM),
+            ));
+        }
+        // Sixteen channels would be a legend nobody can read across a panel,
+        // so it lists the ones actually arriving. Nothing held is not an empty
+        // legend: it is the reminder that this colours by channel.
+        KeyColor::Channel => {
+            let mut seen: Vec<u8> = state
+                .keys
+                .iter()
+                .filter_map(|k| k.as_ref().map(|l| l.channel))
+                .collect();
+            seen.sort_unstable();
+            seen.dedup();
+            if seen.is_empty() {
+                spans.push(Span::styled(
+                    "\u{2014} ".to_string(),
+                    Style::default().fg(DIM),
+                ));
+            }
+            for ch in seen {
+                spans.push(Span::styled(
+                    format!("CH{} ", ch + 1),
+                    Style::default().fg(hue_of(ch as u32)),
+                ));
+            }
+        }
+        // A ramp rather than a list: velocity is continuous, and the thing to
+        // read off it is which end is hard.
+        KeyColor::Velocity => {
+            for v in [1u8, 32, 64, 96, 127] {
+                let lit = KeyLit {
+                    channel: 0,
+                    vel: v,
+                    slot: None,
+                    source: None,
+                };
+                spans.push(Span::styled(
+                    format!("{v} "),
+                    Style::default().fg(key_colour(KeyColor::Velocity, &lit)),
+                ));
+            }
+        }
+    }
+    spans.push(Span::styled(" [C]", Style::default().fg(DIM)));
+    Line::from(spans)
 }
 
 /// The chord under the hand: its name, then the notes that spell it.
@@ -792,6 +921,8 @@ pub fn draw_midi_monitor(
     f: &mut Frame,
     area: Rect,
     events: &[InputEvent],
+    // The **connected** MIDI inputs, in the order `InputSource::Midi(i)`
+    // indexes them. Only ever used to turn that index back into a name.
     ports: &[String],
     tab: MonitorTab,
     keyboard: &KeyboardState,
@@ -854,7 +985,7 @@ pub fn draw_midi_monitor(
 
     let mut hits = Vec::new();
     match tab {
-        MonitorTab::Keys => draw_keys(f, inner, keyboard, key_colour_mode),
+        MonitorTab::Keys => draw_keys(f, inner, keyboard, key_colour_mode, strips, ports),
         MonitorTab::Wave => draw_wave(f, inner, wave),
         MonitorTab::Monitor => draw_monitor_columns(f, inner, events, ports, spectrum),
         MonitorTab::Mixer => hits = draw_mixer(f, inner, strips),
@@ -944,7 +1075,13 @@ fn draw_mixer(f: &mut Frame, area: Rect, strips: &[MixerStrip]) -> Vec<MixerRect
     let page = super::drawer::list_scroll(active, strips.len(), per_page);
     let paging = strips.len() > per_page;
 
-    for (col, (i, st)) in strips.iter().enumerate().skip(page).take(per_page).enumerate() {
+    for (col, (i, st)) in strips
+        .iter()
+        .enumerate()
+        .skip(page)
+        .take(per_page)
+        .enumerate()
+    {
         let x = area.x + col as u16 * STRIP_W;
         let rect = Rect::new(x, area.y, STRIP_W - 1, area.height);
         hits.extend(draw_strip(f, rect, i, st));
@@ -1030,9 +1167,10 @@ fn draw_strip(f: &mut Frame, area: Rect, tab: usize, st: &MixerStrip) -> Vec<Mix
                 _ => colour,
             }
         };
-        // A group and the main are already a sum: one fader, the full width,
-        // and none of the link machinery below.
-        if st.kind != StripKind::Tab {
+        // A group is already a sum: one fader, the full width, and none of the
+        // link machinery below. The **main** is not — it is a stereo output,
+        // and it gets the same two faders a tab does.
+        if st.kind == StripKind::Bus {
             let bar = Rect::new(area.x, y, area.width, fader_h);
             draw_fader(f, bar, st.gain, if st.mute { DIM } else { HEADER });
             hits.push((MixerHit::Gain(tab), bar));
@@ -1643,6 +1781,100 @@ mod tests {
         );
     }
 
+    /// The colour key: it names what the mode colours by, in that colour, so a
+    /// keyboard lit in six hues means something.
+    #[test]
+    fn the_keys_legend_names_the_colours() {
+        let strips = |n: usize| -> Vec<MixerStrip> {
+            (0..n)
+                .map(|i| MixerStrip {
+                    kind: StripKind::Tab,
+                    label: format!("Synth{i}"),
+                    gain: 1.0,
+                    gain_r: 1.0,
+                    link: true,
+                    pan: 0.0,
+                    mute: false,
+                    solo: false,
+                    active: false,
+                    side: None,
+                    dest: None,
+                })
+                .collect()
+        };
+        let mut k = KeyboardState::default();
+        k.feed(
+            &InputEvent::Note(NoteMsg {
+                source: InputSource::Midi(0),
+                channel: 2,
+                on: true,
+                note: 60,
+                vel: 100,
+            }),
+            Some(1),
+        );
+
+        // One entry per tab, in that tab's own hue — the same offset
+        // `key_colour` uses, or the legend would name the wrong colour.
+        let line = colour_legend(KeyColor::Instrument, &k, &strips(2), &[]);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("1:Synth0") && text.contains("2:Synth1"),
+            "{text}"
+        );
+        assert_eq!(
+            line.spans[1].style.fg,
+            Some(hue_of(3)),
+            "tab 1 is drawn in the colour its keys are"
+        );
+
+        // By channel it lists the ones actually arriving, not sixteen.
+        let text: String = colour_legend(KeyColor::Channel, &k, &strips(2), &[])
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("CH3") && !text.contains("CH1"), "{text}");
+
+        // By input it lists every keyboard that is connected, playing or not —
+        // the legend is also the answer to "is that thing plugged in".
+        let ports = vec!["Keystation".to_string(), "Groovebox".to_string()];
+        let line = colour_legend(KeyColor::Source, &k, &strips(2), &ports);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("Keystation") && text.contains("Groovebox"),
+            "{text}"
+        );
+        assert_eq!(
+            line.spans[1].style.fg,
+            Some(hue_of(9)),
+            "the first port is drawn in the colour its notes are"
+        );
+
+        // The two modes must not answer with the same colour for the same
+        // number, or reading one after the other means nothing.
+        let lit = KeyLit {
+            channel: 0,
+            vel: 100,
+            slot: Some(0),
+            source: Some(InputSource::Midi(0)),
+        };
+        assert_ne!(
+            key_colour(KeyColor::Source, &lit),
+            key_colour(KeyColor::Instrument, &lit),
+            "tab 1 and port 1 must not look alike"
+        );
+
+        // A note choz made itself came from no port, and says so.
+        let own = KeyLit {
+            channel: 0,
+            vel: 100,
+            slot: Some(0),
+            source: None,
+        };
+        assert_eq!(key_colour(KeyColor::Source, &own), DIM);
+    }
+
     /// An unknown port index must not panic the draw path.
     #[test]
     fn missing_port_names_degrade_to_an_index() {
@@ -1694,7 +1926,7 @@ mod tests {
                 mode,
                 &spec,
                 &wave,
-            &[],
+                &[],
             );
         })
         .unwrap();
@@ -2097,7 +2329,7 @@ mod tests {
                             KeyColor::default(),
                             &spec,
                             &wave,
-                        &[],
+                            &[],
                         );
                     })
                     .unwrap();
@@ -2126,7 +2358,7 @@ mod tests {
                 KeyColor::default(),
                 &crate::spectrum::Spectrum::new(),
                 &WaveHistory::default(),
-            &[],
+                &[],
             );
         })
         .unwrap();

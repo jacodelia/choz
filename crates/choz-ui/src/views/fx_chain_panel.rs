@@ -88,6 +88,12 @@ pub enum RackButton {
     /// One key plays the memorised chord.
     ArpChord,
     ArpTap,
+    /// What opens or ducks the selected effect: another tab, the external
+    /// clock, or the internal metronome's tap.
+    FxGate,
+    /// Which keyboard the selected effect takes its chord from. Only the
+    /// harmoniser has one, so only the harmoniser draws it.
+    FxChord,
 }
 
 /// Every clickable area of the panel, filled in as it draws.
@@ -477,6 +483,18 @@ pub fn truncate(s: &str, max: usize) -> String {
             .take(max.saturating_sub(1))
             .chain(['\u{2026}'])
             .collect()
+    }
+}
+
+/// A gate source in the width a chain button can spare: the tab's number, or
+/// the two clock sources by name. The full label is in the gate's own picker,
+/// which is where there is room for one.
+fn gate_source_mark(source: choz_engine::fx_chain::GateSource) -> String {
+    use choz_engine::fx_chain::GateSource;
+    match source {
+        GateSource::Tab(i) => (i + 1).to_string(),
+        GateSource::Clock => "CLK".into(),
+        GateSource::Metronome => "TAP".into(),
     }
 }
 
@@ -1248,11 +1266,8 @@ pub fn draw_fx_chain_panel(
         // never a knob: tapping a tempo is a gesture, not a position.
         let mut row = ButtonRow::new(inner, bg, y, 2);
         if !boxed {
-            row.label(
-                f,
-                format!("{}   ", t("ARP")),
-                Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
-            );
+            // One `ARP`, not two: the switch says the word, so a label saying
+            // it again beside the button read as `ARP ARP \u{25CB}`.
             button(
                 &mut row,
                 f,
@@ -1520,7 +1535,7 @@ pub fn draw_fx_chain_panel(
         // in any of its knobs, so an effect that goes quiet between kicks would
         // otherwise look like an effect that is broken.
         let mark = match entry.gate {
-            Some(g) => format!("\u{2301}{} ", g.source + 1),
+            Some(g) => format!("\u{2301}{} ", gate_source_mark(g.source)),
             None => String::new(),
         };
         let rect = row.button(f, format!(" {}:{} {mark}", i + 1, entry.label()), st);
@@ -1552,6 +1567,42 @@ pub fn draw_fx_chain_panel(
         }
         return layout;
     };
+
+    // The two wirings an effect can have that are not knobs: what opens it,
+    // and — for the harmoniser — which keyboard it takes its chord from.
+    // Buttons rather than only the `c` / `C` keys: a wiring nothing on the
+    // panel mentions is a wiring nobody finds.
+    {
+        let on = |lit: bool| match lit {
+            true => Style::default()
+                .fg(Color::Black)
+                .bg(ON_COLOUR)
+                .add_modifier(Modifier::BOLD),
+            false => btn_style,
+        };
+        let mut row = ButtonRow::new(inner, bg, y, 2);
+        let rect = row.button(
+            f,
+            match entry.gate {
+                Some(g) => format!(" {} {} ", t("GATE"), gate_source_mark(g.source)),
+                None => format!(" {} \u{25CB} ", t("GATE")),
+            },
+            on(entry.gate.is_some()),
+        );
+        layout.buttons.push((RackButton::FxGate, rect));
+        if entry.kind == crate::source::AudioFxKind::Harmonizer {
+            let rect = row.button(
+                f,
+                match &entry.chord_port {
+                    Some(p) => format!(" {} {} ", t("CHORD"), truncate(p, 10)),
+                    None => format!(" {} {} ", t("CHORD"), t("ANY")),
+                },
+                on(entry.chord_port.is_some()),
+            );
+            layout.buttons.push((RackButton::FxChord, rect));
+        }
+        y = row.finish();
+    }
 
     // ── Selected FX: the same knob box, from the same helper ──────────────
     let descs = entry.param_descs();

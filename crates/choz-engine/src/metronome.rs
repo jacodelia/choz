@@ -128,6 +128,9 @@ pub struct Metronome {
     /// **not** go where the music goes: the player wants it in their wedge and
     /// the room does not want it at all.
     dest: AtomicU32,
+    /// The peak of the click in the last block, for whatever wants to be
+    /// driven by the tap — see [`Metronome::tap_level`].
+    tap: AtomicU32,
 }
 
 impl Metronome {
@@ -139,7 +142,17 @@ impl Metronome {
             pos: AtomicU64::new(0),
             groups: AtomicU64::new(0),
             dest: AtomicU32::new(0),
+            tap: AtomicU32::new(0),
         }
+    }
+
+    /// How loud the click was in the last block, 0..1.
+    ///
+    /// What an FX gate set to the metronome reads: the tap **as it sounds**,
+    /// accents and all, so an effect wired to it breathes with the count and
+    /// goes still when the metronome is switched off.
+    pub fn tap_level(&self) -> f32 {
+        f32::from_bits(self.tap.load(Ordering::Relaxed))
     }
 
     pub fn dest(&self) -> crate::engine::Dest {
@@ -234,6 +247,9 @@ impl Metronome {
     /// the metronome is off.
     pub fn render(&self, out: &mut [f32], frames: usize, sample_rate: u32) {
         if !self.on() || sample_rate == 0 {
+            // Off is a tap of nothing: an effect gated on the click must go
+            // still with it, not hold whatever the last block happened to be.
+            self.tap.store(0f32.to_bits(), Ordering::Relaxed);
             return;
         }
         let bpm = choz_ports::transport().bpm().clamp(20.0, 300.0);
@@ -248,6 +264,7 @@ impl Metronome {
         let gain = self.gain();
         let style = self.style();
         let start = self.pos.fetch_add(frames as u64, Ordering::Relaxed);
+        let mut peak = 0.0f32;
 
         for f in 0..frames.min(out.len() / 2) {
             let pos = (start + f as u64) as f64;
@@ -259,10 +276,32 @@ impl Metronome {
             // told apart from seven of the same tap.
             let stress = self.stress_at(beat_index % beats_per_bar, beats_per_bar);
             let s = click(style, t as f32, stress) * gain;
+            peak = peak.max(s.abs());
             out[f * 2] += s;
             out[f * 2 + 1] += s;
         }
+        self.tap.store(peak.to_bits(), Ordering::Relaxed);
     }
+}
+
+/// A pulse on every beat of the transport, whatever is driving it — 1.0 at the
+/// boundary, decaying over the next eighth of a second.
+///
+/// The metronome's tap says nothing when the metronome is off, and an effect
+/// that has to open on the beat should not need the click switched on to do it.
+/// Derived from the transport's position, so following an external clock is not
+/// a special case: the transport **is** the external clock.
+pub fn beat_pulse() -> f32 {
+    let t = choz_ports::transport();
+    let (sr, bpm) = (
+        t.sample_rate().max(1) as f64,
+        t.bpm().clamp(20.0, 300.0) as f64,
+    );
+    let per_beat = sr * 60.0 / bpm;
+    let into = (t.samples() as f64 % per_beat) / sr;
+    // Same shape as the click's own envelope, and short enough that a gate on
+    // it reads as a hit rather than as a square wave.
+    (-(into / 0.125) as f32).exp()
 }
 
 /// One click, `t` seconds after its beat. Silent once the envelope has run out,

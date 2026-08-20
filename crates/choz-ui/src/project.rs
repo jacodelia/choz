@@ -37,6 +37,13 @@ pub struct Project {
 pub struct Buses {
     pub group: Vec<Bus>,
     pub main_gain: f32,
+    /// The main's right channel and whether the two sides move together. Added
+    /// when the main became a stereo strip; absent is "linked at `main_gain`",
+    /// which is what every project written before it sounded like.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_gain_r: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_link: Option<bool>,
     pub main_mute: bool,
 }
 
@@ -63,6 +70,8 @@ impl Default for Buses {
         Self {
             group: vec![Bus::default(); choz_engine::BUSES],
             main_gain: 1.0,
+            main_gain_r: None,
+            main_link: None,
             main_mute: false,
         }
     }
@@ -270,10 +279,21 @@ pub struct Sound {
 
 /// An effect driven by another tab's level. See
 /// [`choz_engine::fx_chain::GateSpec`], which this mirrors on disk.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// What drives a gate on disk. Mirrors
+/// [`choz_engine::fx_chain::GateSource`]; untagged so a project written when
+/// the only source was a tab — a bare number — still loads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GateSource {
+    Tab(usize),
+    /// `"clock"` or `"tap"`.
+    Named(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Gate {
-    /// Rack index of the tab that drives it.
-    pub source: usize,
+    /// What drives it: a tab's index, or one of the clock sources by name.
+    pub source: GateSource,
     /// `true` ducks instead of opening.
     pub duck: bool,
     pub depth: f32,
@@ -466,5 +486,28 @@ mod state_tests {
         assert_eq!(decode_state(&text).unwrap(), blob);
         assert_eq!(decode_state(""), None);
         assert_eq!(decode_state("not base64 !!"), None);
+    }
+}
+
+impl GateSource {
+    pub fn to_engine(&self) -> choz_engine::fx_chain::GateSource {
+        use choz_engine::fx_chain::GateSource as E;
+        match self {
+            GateSource::Tab(i) => E::Tab(*i),
+            GateSource::Named(n) if n == "clock" => E::Clock,
+            GateSource::Named(n) if n == "tap" => E::Metronome,
+            // A name from a newer choz means nothing here; the first tab is the
+            // reading that at least does something.
+            GateSource::Named(_) => E::Tab(0),
+        }
+    }
+
+    pub fn from_engine(s: choz_engine::fx_chain::GateSource) -> Self {
+        use choz_engine::fx_chain::GateSource as E;
+        match s {
+            E::Tab(i) => GateSource::Tab(i),
+            E::Clock => GateSource::Named("clock".into()),
+            E::Metronome => GateSource::Named("tap".into()),
+        }
     }
 }

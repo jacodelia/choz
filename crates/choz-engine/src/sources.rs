@@ -199,9 +199,22 @@ impl Sf2Synth {
         // as a chord is held — measured at 1.0 a four-note chord already hit
         // 1.15 and a two-handed one 2.7. Loudness belongs to the slot's VOL,
         // which has a fader; clipping inside the synth has no way back.
+        // **Polyphony is a CPU budget, not a musical limit.** oxisynth's
+        // default is 256 voices, and a SoundFont preset commonly layers two or
+        // three per key — so a hand on the keyboard with the sustain pedal down
+        // walks the voice pool up until it is full and *keeps it there*, since
+        // nothing is released. Measured with the pedal down and a chord a
+        // second: a block cost 233 µs a minute in and 330 µs once the pool had
+        // filled, a 40 % rise on one tab alone, which is where "it saturates
+        // when I press the sustain" comes from — those are dropouts, not
+        // clipping. Sixty-four still covers both hands sustained on a layered
+        // preset (three layers × twenty-one held notes) and bounds what the
+        // pedal can cost.
+        const POLYPHONY: u16 = 64;
         let desc = SynthDescriptor {
             sample_rate: sample_rate as f32,
             gain: 0.2,
+            polyphony: POLYPHONY,
             ..Default::default()
         };
         let mut synth =
