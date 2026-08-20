@@ -11,6 +11,69 @@ pub struct FxSpec {
     /// Set for hosted plugin effects: which plugin to load in this slot
     /// instead of a built-in FX. `kind` is then ignored.
     pub plugin: Option<PluginFxRef>,
+    /// Driven by another tab's level, when the user asked for it.
+    pub gate: Option<GateSpec>,
+}
+
+/// An effect opened (or closed) by what **another tab** is playing.
+///
+/// The case it exists for: a drum kit on tab 1 and a keyboard on tab 2, and the
+/// kick opening an auto-wah on the keyboard. Every host calls this a sidechain;
+/// what makes it a *gate* here is that it moves the effect's dry/wet rather
+/// than a compressor's gain, which is why it works with all forty-five of
+/// choz's effects and with hosted plugins, without one line of per-effect code.
+///
+/// The source is read from [`crate::meter::SlotLevels::live`] — the tab's own
+/// level in the last block, which the audio callback already publishes. A
+/// source tab that renders *after* this one is therefore one block late; at
+/// choz's block sizes that is under three milliseconds and nobody has ever
+/// heard it, but it is the reason the order of tabs is not entirely arbitrary.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GateSpec {
+    /// The tab whose level drives this, by rack index.
+    pub source: usize,
+    pub mode: GateMode,
+    /// How much of the effect the gate is allowed to move, 0..1. At 0 it does
+    /// nothing; at 1 the effect is entirely the gate's.
+    pub depth: f32,
+    /// The source level that counts as fully open, linear. A kick peaks around
+    /// 0.5, which is why that is the default rather than full scale.
+    pub threshold: f32,
+    /// How long the gate takes to fall back, in milliseconds. Rising is
+    /// immediate: a gate that is late to open is a gate that missed the hit.
+    pub release_ms: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GateMode {
+    /// The source opens the effect: silence on the source means no effect.
+    #[default]
+    Open,
+    /// The source closes it — the sidechain duck every mix engineer knows.
+    Duck,
+}
+
+impl GateMode {
+    pub const ALL: [GateMode; 2] = [GateMode::Open, GateMode::Duck];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GateMode::Open => "OPEN",
+            GateMode::Duck => "DUCK",
+        }
+    }
+}
+
+impl Default for GateSpec {
+    fn default() -> Self {
+        Self {
+            source: 0,
+            mode: GateMode::default(),
+            depth: 1.0,
+            threshold: 0.5,
+            release_ms: 120.0,
+        }
+    }
 }
 
 /// Which plugin an FX slot hosts: the file (or LV2 bundle directory) and the
@@ -435,6 +498,108 @@ fn build_clap_fx(
 ///
 /// Everything else is forwarded. A wrapper that swallowed `editor()` would take
 /// a plugin's window away, which is the trap with this shape.
+/// An effect whose dry/wet is ridden by another tab's level.
+///
+/// One wrapper for every effect, rather than a sidechain input on each: the
+/// only thing it needs from the processor below it is `set_mix`, which the
+/// trait has required all along.
+struct Gated {
+    inner: Box<dyn fx::FxProcessor>,
+    gate: GateSpec,
+    /// The mix the user set, which is what the gate moves *from*.
+    base_wet: f32,
+    /// The follower's state, 0..1. Rises to the source at once and falls by
+    /// the release time — the shape of a gate, not of a filter.
+    env: f32,
+    /// What was last handed to the inner processor, so a block that does not
+    /// move the gate does not set the same number again.
+    sent: f32,
+}
+
+impl fx::FxProcessor for Gated {
+    fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
+        let frames = (buf.len() / 2).max(1) as f32;
+        let level = crate::meter::slot_levels().live(self.gate.source);
+        let open = (level / self.gate.threshold.max(1e-4)).clamp(0.0, 1.0);
+        // Instant attack, exponential release, stepped once per block: a kick
+        // is over in less time than a fader move, and the block is the grid the
+        // dry/wet can be changed on anyway.
+        if open >= self.env {
+            self.env = open;
+        } else {
+            let secs = frames / sample_rate.max(1) as f32;
+            let coeff = (-secs / (self.gate.release_ms.max(1.0) / 1000.0)).exp();
+            self.env = open + (self.env - open) * coeff;
+        }
+        let g = match self.gate.mode {
+            GateMode::Open => self.env,
+            GateMode::Duck => 1.0 - self.env,
+        };
+        // Depth is how much of the effect the gate owns: the rest stays where
+        // the user put it, so a gate at half depth is an effect that breathes
+        // rather than one that switches.
+        let d = self.gate.depth.clamp(0.0, 1.0);
+        let wet = self.base_wet * (1.0 - d + d * g);
+        if (wet - self.sent).abs() > 1e-4 {
+            self.inner.set_mix(wet);
+            self.sent = wet;
+        }
+        self.inner.process_block(buf, sample_rate);
+    }
+
+    fn reset(&mut self) {
+        self.env = 0.0;
+        self.sent = -1.0;
+        self.inner.reset();
+    }
+
+    /// The user moving the dry/wet moves what the gate works from, not the
+    /// gate's own output — otherwise the next block would overwrite the move.
+    fn set_mix(&mut self, wet: f32) {
+        self.base_wet = wet.clamp(0.0, 1.0);
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn params(&self) -> Vec<choz_ports::FxParam> {
+        self.inner.params()
+    }
+
+    fn set_param(&mut self, index: usize, value: f32) {
+        self.inner.set_param(index, value);
+    }
+
+    fn editor(&self) -> Option<choz_ports::EditorHandle> {
+        self.inner.editor()
+    }
+
+    fn param_touch(&self) -> Option<choz_ports::TouchHandle> {
+        self.inner.param_touch()
+    }
+
+    fn state(&self) -> Option<choz_ports::StateHandle> {
+        self.inner.state()
+    }
+
+    fn presets(&self) -> Option<choz_ports::PresetsHandle> {
+        self.inner.presets()
+    }
+
+    fn sandbox(&self) -> Option<choz_ports::SandboxStatus> {
+        self.inner.sandbox()
+    }
+
+    fn meter(&self) -> Option<choz_ports::FxMeter> {
+        self.inner.meter()
+    }
+
+    fn latency_samples(&self) -> u32 {
+        self.inner.latency_samples()
+    }
+}
+
 struct Metered {
     inner: Box<dyn fx::FxProcessor>,
     meter: choz_ports::FxMeter,
@@ -515,6 +680,19 @@ pub fn build_chain_from_specs(
                 None => build_processor(&s.kind, &s.params, sample_rate)?,
             };
             proc.set_mix(s.wet);
+            // The gate wraps the processor and the meter wraps the gate, so
+            // what the interface's meter shows is what actually came out —
+            // gate and all.
+            let proc: Box<dyn fx::FxProcessor> = match s.gate {
+                Some(gate) => Box::new(Gated {
+                    inner: proc,
+                    gate,
+                    base_wet: s.wet,
+                    env: 0.0,
+                    sent: -1.0,
+                }),
+                None => proc,
+            };
             Some(Box::new(Metered {
                 inner: proc,
                 meter: choz_ports::FxMeter::default(),
@@ -536,12 +714,109 @@ mod tests {
 
     fn spec(kind: &str, plugin: Option<PluginFxRef>) -> FxSpec {
         FxSpec {
+            gate: None,
             kind: kind.into(),
             enabled: true,
             wet: 1.0,
             params: vec![0.5; 8],
             plugin,
         }
+    }
+
+    /// A gate is another tab's level riding this effect's dry/wet. The case it
+    /// was built for: a kick on one tab opening a filter on another.
+    #[test]
+    fn a_gate_opens_an_effect_from_another_tab() {
+        use crate::fx::FxProcessor;
+        let levels = crate::meter::slot_levels();
+        let drums = 7usize;
+
+        // An effect that is trivially audible: full wet is silence, dry is the
+        // signal. Anything measurable would do — the gate moves `set_mix`, and
+        // that is the same call for all forty-five.
+        struct Silencer {
+            wet: f32,
+        }
+        impl FxProcessor for Silencer {
+            fn process_block(&mut self, buf: &mut [f32], _sr: u32) {
+                for s in buf.iter_mut() {
+                    *s *= 1.0 - self.wet;
+                }
+            }
+            fn reset(&mut self) {}
+            fn set_mix(&mut self, wet: f32) {
+                self.wet = wet.clamp(0.0, 1.0);
+            }
+        }
+
+        let mut gated = Gated {
+            inner: Box::new(Silencer { wet: 1.0 }),
+            gate: GateSpec {
+                source: drums,
+                mode: GateMode::Open,
+                depth: 1.0,
+                threshold: 0.5,
+                release_ms: 20.0,
+            },
+            base_wet: 1.0,
+            env: 0.0,
+            sent: -1.0,
+        };
+
+        // The drum tab is silent: the gate is shut, so the effect is not
+        // applied and the signal comes through untouched.
+        levels.reset(drums);
+        let mut buf = vec![1.0f32; 64];
+        gated.process_block(&mut buf, 48_000);
+        assert!(
+            (buf[0] - 1.0).abs() < 1e-6,
+            "a shut gate is no effect: {}",
+            buf[0]
+        );
+
+        // A kick lands. The gate opens and the effect is fully in.
+        levels.publish(drums, &vec![0.9f32; 64]);
+        let mut buf = vec![1.0f32; 64];
+        gated.process_block(&mut buf, 48_000);
+        assert!(buf[0].abs() < 1e-6, "the kick opened it: {}", buf[0]);
+
+        // Silence again: it falls back over the release rather than snapping,
+        // which is what makes it sound like a gate and not like a switch.
+        levels.publish(drums, &vec![0.0f32; 64]);
+        let mut buf = vec![1.0f32; 64];
+        gated.process_block(&mut buf, 48_000);
+        assert!(
+            buf[0] > 0.0 && buf[0] < 1.0,
+            "one block into a 20 ms release: {}",
+            buf[0]
+        );
+
+        // DUCK is the other way round: the same kick takes the effect *out*,
+        // so the signal comes through where OPEN would have removed it.
+        gated.gate.mode = GateMode::Duck;
+        gated.env = 0.0;
+        levels.publish(drums, &vec![0.9f32; 64]);
+        let mut buf = vec![1.0f32; 64];
+        gated.process_block(&mut buf, 48_000);
+        assert!(
+            (buf[0] - 1.0).abs() < 1e-6,
+            "the kick ducked the effect out: {}",
+            buf[0]
+        );
+
+        // Depth is how much of the effect the gate owns. At zero it owns none
+        // of it, whatever the source is doing.
+        gated.gate.mode = GateMode::Open;
+        gated.gate.depth = 0.0;
+        levels.reset(drums);
+        let mut buf = vec![1.0f32; 64];
+        gated.process_block(&mut buf, 48_000);
+        assert!(
+            buf[0].abs() < 1e-6,
+            "depth 0 leaves the effect where the user put it: {}",
+            buf[0]
+        );
+        levels.reset(drums);
     }
 
     /// A CLAP effect that can't be loaded (missing file) is dropped from the

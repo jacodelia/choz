@@ -602,12 +602,21 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
     // AUTO-TUNE. Named steps where the value is a name — a key is C or it is
     // not, and drawing "0.36" for D would be a knob that means nothing.
     static AUTOTUNE: &[FxParamDesc] = &[
+        // **Hard Auto-Tune**, the third of the presets, and the sound anybody
+        // reaching for an auto-tune came for. It was "Natural Vocal" — 120 ms
+        // of retune with a quarter of humanise on top, which is a correction
+        // you have to A/B against the dry to hear at all, and which is what
+        // "it does nothing to the sound" meant.
         FxParamDesc {
             name: Cow::Borrowed("Preset"),
-            default: 0.0,
+            default: 0.5,
             shape: ParamShape::Continuous,
         },
-        pd!("Retune", 0.08),
+        // These three are the preset's own values, written out. The knobs are
+        // applied in index order when a chain is built, so a Retune that
+        // disagreed with the Preset above it simply overwrote it — the preset
+        // knob only ever survived until the next rebuild.
+        pd!("Retune", 0.001),
         pd!("Correct", 1.00),
         FxParamDesc {
             name: Cow::Borrowed("Key"),
@@ -621,7 +630,8 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         },
         FxParamDesc {
             name: Cow::Borrowed("Mode"),
-            default: 0.0,
+            // HardTune, to agree with the preset above.
+            default: 1.0,
             shape: ParamShape::Continuous,
         },
         pd!("Human", 0.00),
@@ -714,7 +724,9 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
     /// Voices, shape, key and scale are lists of names; the rest are knobs.
     static HARMONIZER: &[FxParamDesc] = &[
         pd!("Voices", 0.334),
-        pd!("Shape", 0.00),
+        // MAJ7, which is last in the list of shapes: a harmoniser reached for
+        // in a hurry should already be making the chord people expect.
+        pd!("Shape", 1.00),
         pd!("Key", 0.00),
         pd!("Scale", 0.20),
         pd!("Detune", 0.32),
@@ -731,6 +743,20 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
             shape: ParamShape::Toggle,
         },
         pd!("Ch", 0.00),
+        // The vocoder, folded in. Appended rather than interleaved: every knob
+        // above is where it was, so a project written when these were two
+        // effects opens with the harmoniser's controls untouched.
+        FxParamDesc {
+            name: Cow::Borrowed("Mode"),
+            default: 0.0,
+            shape: ParamShape::Toggle,
+        },
+        pd!("Bands", 0.50),
+        pd!("Carrier", 1.00),
+        pd!("Pitch", 0.35),
+        pd!("Res", 0.36),
+        pd!("Speed", 0.20),
+        pd!("Shift", 0.50),
     ];
     /// Bands and carrier are lists of names; the rest are knobs.
     static VOCODER: &[FxParamDesc] = &[
@@ -922,6 +948,14 @@ pub struct AudioFxEntry {
     /// The plugin's own state (its patch), as the project stores it. Empty for
     /// built-ins, which have nothing beyond their parameters.
     pub state: Vec<u8>,
+    /// Driven by another tab, when the user wired one — the kick of a drum tab
+    /// opening this effect. `None` is an effect that answers only to its own
+    /// knobs, which is every effect until somebody says otherwise.
+    pub gate: Option<choz_engine::fx_chain::GateSpec>,
+    /// Which keyboard the chord comes from, for the effects that follow one.
+    /// `None` is any of them, which is what a rig with one controller wants and
+    /// what every project written before this said.
+    pub chord_port: Option<String>,
 }
 
 impl AudioFxEntry {
@@ -942,6 +976,8 @@ impl AudioFxEntry {
             params,
             plugin: None,
             state: Vec::new(),
+            gate: None,
+            chord_port: None,
         }
     }
 
@@ -965,6 +1001,8 @@ impl AudioFxEntry {
             params,
             plugin: Some(plugin),
             state: Vec::new(),
+            gate: None,
+            chord_port: None,
         }
     }
 
@@ -1346,6 +1384,7 @@ impl AudioFxEntry {
 
     pub fn to_spec(&self) -> choz_engine::fx_chain::FxSpec {
         choz_engine::fx_chain::FxSpec {
+            gate: self.gate,
             kind: self.kind.id().to_string(),
             enabled: self.enabled,
             wet: self.wet,
@@ -1378,6 +1417,197 @@ impl AudioFxEntry {
             params,
             plugin: None,
             state: Vec::new(),
+            gate: None,
+            chord_port: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod autotune_defaults {
+    use super::*;
+
+    /// A freshly added AUTO-TUNE has to *be* the preset it says it is.
+    ///
+    /// The knobs are applied in index order when a chain is built, so any knob
+    /// below the preset silently replaces what the preset set. They agree now,
+    /// and this is the test that keeps them agreeing.
+    #[test]
+    fn the_default_autotune_is_the_preset_it_names() {
+        use choz_engine::fx::autotune;
+        let entry = AudioFxEntry::new(AudioFxKind::AutoTune);
+        let p = &entry.params;
+        let pick = autotune::preset_index(p[0]);
+        let (name, retune, correction, humanize, mode) = autotune::PRESETS[pick];
+        assert_eq!(name, "Hard Auto-Tune", "the sound people add it for");
+        assert!(
+            (p[1] * 1000.0 - retune).abs() < 0.5,
+            "Retune knob {} ms, preset {retune} ms",
+            p[1] * 1000.0
+        );
+        assert!((p[2] - correction).abs() < 1e-6, "Correct");
+        assert!((p[6] - humanize).abs() < 1e-6, "Human");
+        assert_eq!(
+            p[5] >= 0.5,
+            mode == autotune::AutoTuneMode::HardTune,
+            "Mode"
+        );
+    }
+}
+
+/// Which section each parameter belongs to, and the name with that section
+/// taken off the front.
+///
+/// # Why this is not just `p.name`
+///
+/// A thirteen-column cell holds eleven characters. Surge XT's parameters are
+/// called "Filter 1 Cutoff", "Filter 1 Resonance", "Osc 1 Pitch" — so the cells
+/// read `Filter 1 C…`, `Filter 1 R…`, `Osc 1 Pitch`, which is three knobs that
+/// look the same and none you can name. The part that repeats is exactly the
+/// part worth showing **once**, as a heading; what is left ("Cutoff",
+/// "Resonance", "Pitch") is short enough to read and is the only part that
+/// differs.
+///
+/// The section comes from the plugin when the plugin gives one — CLAP's
+/// `module`. When it does not (VST2, VST3, LV2, LADSPA all name parameters and
+/// nothing else), it is **read off the names**: a run of consecutive parameters
+/// that begin with the same words is a section, because that is how every
+/// plugin that has sections writes them. Nothing is invented for a lone
+/// parameter: it keeps its whole name and has no heading.
+pub fn param_sections(params: &[choz_engine::PluginParam]) -> Vec<(Option<String>, String)> {
+    // The plugin's own answer, when it has one.
+    if params.iter().any(|p| p.group.is_some()) {
+        return params
+            .iter()
+            .map(|p| {
+                let group = p.group.clone();
+                let short = match &group {
+                    Some(g) => strip_prefix_words(&p.name, g),
+                    None => p.name.clone(),
+                };
+                (group, short)
+            })
+            .collect();
+    }
+
+    // Otherwise: runs of names that start the same way.
+    let words: Vec<Vec<&str>> = params
+        .iter()
+        .map(|p| p.name.split_whitespace().collect())
+        .collect();
+    let mut out: Vec<(Option<String>, String)> =
+        params.iter().map(|p| (None, p.name.clone())).collect();
+    let mut i = 0;
+    while i < params.len() {
+        // How far this run goes, and how many words it shares.
+        let mut end = i + 1;
+        let mut shared = usize::MAX;
+        while end < params.len() {
+            let common = common_words(&words[i], &words[end]);
+            // A run needs a prefix that is not the whole name: two parameters
+            // called the same thing are not a section, they are a plugin that
+            // repeats itself.
+            if common == 0 || common >= words[i].len() || common >= words[end].len() {
+                break;
+            }
+            shared = shared.min(common);
+            end += 1;
+        }
+        // Two is a section; one is a parameter with a long name.
+        if end - i >= 2 && shared != usize::MAX && shared > 0 {
+            let heading = words[i][..shared].join(" ");
+            for (k, slot) in out.iter_mut().enumerate().take(end).skip(i) {
+                *slot = (
+                    Some(heading.clone()),
+                    words[k][shared..].join(" ").trim().to_string(),
+                );
+            }
+        }
+        i = end.max(i + 1);
+    }
+    // A section whose parameter left nothing behind keeps its own name: better
+    // a repeat than a blank cell.
+    for (p, slot) in params.iter().zip(out.iter_mut()) {
+        if slot.1.is_empty() {
+            slot.1 = p.name.clone();
+        }
+    }
+    out
+}
+
+/// How many leading words two names share, compared without case.
+fn common_words(a: &[&str], b: &[&str]) -> usize {
+    a.iter()
+        .zip(b.iter())
+        .take_while(|(x, y)| x.eq_ignore_ascii_case(y))
+        .count()
+}
+
+/// `name` with the words of `prefix` taken off the front, when they are there.
+fn strip_prefix_words(name: &str, prefix: &str) -> String {
+    let (n, p): (Vec<&str>, Vec<&str>) = (
+        name.split_whitespace().collect(),
+        prefix.split_whitespace().collect(),
+    );
+    let shared = common_words(&n, &p);
+    match shared == p.len() && shared < n.len() {
+        true => n[shared..].join(" "),
+        false => name.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod param_sections_tests {
+    use super::*;
+    use choz_engine::PluginParam;
+
+    fn p(name: &str) -> PluginParam {
+        PluginParam::plain_range(0, name.to_string(), 0.0, 1.0, 0.0)
+    }
+
+    /// A synth's parameters group themselves by the words they share, and what
+    /// is left is the part that fits in a cell.
+    #[test]
+    fn a_run_of_names_that_start_the_same_is_a_section() {
+        let params = [
+            p("Osc 1 Pitch"),
+            p("Osc 1 Shape"),
+            p("Filter 1 Cutoff"),
+            p("Filter 1 Resonance"),
+            p("Filter 1 Type"),
+            p("Volume"),
+        ];
+        let out = param_sections(&params);
+        assert_eq!(out[0], (Some("Osc 1".into()), "Pitch".into()));
+        assert_eq!(out[1], (Some("Osc 1".into()), "Shape".into()));
+        assert_eq!(out[2], (Some("Filter 1".into()), "Cutoff".into()));
+        assert_eq!(out[4], (Some("Filter 1".into()), "Type".into()));
+        // A parameter on its own is not a section of one.
+        assert_eq!(out[5], (None, "Volume".into()));
+    }
+
+    /// When the plugin says which section a parameter is in, that is the
+    /// answer — no guessing from names.
+    #[test]
+    fn the_plugins_own_sections_win() {
+        let mut a = p("Cutoff");
+        a.group = Some("Filter 1".into());
+        let mut b = p("Filter 1 Resonance");
+        b.group = Some("Filter 1".into());
+        let out = param_sections(&[a, b]);
+        assert_eq!(out[0], (Some("Filter 1".into()), "Cutoff".into()));
+        // The prefix comes off when the name repeats the section, and stays
+        // when it does not.
+        assert_eq!(out[1], (Some("Filter 1".into()), "Resonance".into()));
+    }
+
+    /// Nothing shared, nothing invented.
+    #[test]
+    fn unrelated_names_are_left_alone() {
+        let params = [p("Drive"), p("Tone"), p("Level")];
+        for (group, name) in param_sections(&params) {
+            assert_eq!(group, None);
+            assert!(!name.is_empty());
+        }
     }
 }

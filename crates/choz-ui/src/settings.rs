@@ -454,8 +454,17 @@ pub struct UiSettings {
     /// Follow an outside MIDI clock instead of choz's own transport. Off by
     /// default: a port that sends clock all day would otherwise take the tempo
     /// over the moment it is plugged in.
+    ///
+    /// **Superseded by [`UiSettings::clock_source`]**, which names *which*
+    /// port. Kept so a settings file written before that reads back as what it
+    /// meant — "follow any port" — instead of silently going internal.
     #[serde(default)]
     pub midi_clock: bool,
+    /// Where the transport's tempo comes from. One setting for the whole rack:
+    /// there is one transport, and a per-tab clock is a rack playing against
+    /// itself.
+    #[serde(default)]
+    pub clock_source: ClockSource,
     /// How strongly the theme's panel colour is washed over a background image,
     /// 0..100 %. A photo behind the UI is beautiful and unreadable; this is the
     /// knob that trades one for the other.
@@ -501,7 +510,39 @@ impl Default for UiSettings {
             rack_mode: RackMode::default(),
             key_colour: crate::views::midi_monitor::KeyColor::default(),
             midi_clock: false,
+            clock_source: ClockSource::default(),
         }
+    }
+}
+
+/// What the transport follows.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum ClockSource {
+    /// choz's own clock — the tempo in the metronome's menu.
+    #[default]
+    Internal,
+    /// Whichever port sends clock. What the old on/off switch meant, and still
+    /// the right answer for a rig with exactly one device that sends any.
+    Any,
+    /// One named port, and only that one. The name rather than an index:
+    /// ports come and go, and an index into a list that changed while choz was
+    /// closed points at somebody else's drum machine.
+    Port(String),
+}
+
+impl ClockSource {
+    /// What the button says. The port's name is trimmed by the caller, which
+    /// is the side that knows how much room there is.
+    pub fn label(&self) -> &str {
+        match self {
+            ClockSource::Internal => "INT",
+            ClockSource::Any => "ANY",
+            ClockSource::Port(name) => name,
+        }
+    }
+
+    pub fn is_external(&self) -> bool {
+        !matches!(self, ClockSource::Internal)
     }
 }
 
@@ -608,7 +649,14 @@ impl UiSettings {
             .ok()
             .and_then(|s| serde_json::from_str::<Self>(&s).ok())
         {
-            Some(saved) => saved,
+            Some(mut saved) => {
+                // A file written before the clock had a source: `true` meant
+                // "follow any port", and that is what it still means.
+                if saved.midi_clock && saved.clock_source == ClockSource::Internal {
+                    saved.clock_source = ClockSource::Any;
+                }
+                saved
+            }
             // **First run.** A fresh install opens with the wallpaper it was
             // installed with, rather than on a bare terminal — the images ship
             // with the package for exactly that. Anything the user picks

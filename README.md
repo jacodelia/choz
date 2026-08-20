@@ -271,13 +271,163 @@ headroom for plugin DSP at small buffer sizes.
 | `P` | anywhere | panic — kill every sounding note |
 | `F4` | anywhere | LIVE ↔ MULTI |
 | `F5` | anywhere | bottom panel: MONITOR / KEYS / WAVE / MIXER (the tabs are clickable) |
-| `F6` | anywhere | metronome on/off (the `▾` beside it opens tempo / signature / sound — arrows and the wheel move each row) |
+| `F6` | anywhere | metronome on/off (the `▾` beside it opens tempo / signature / grouping / sound — arrows, Enter and the wheel move each row) |
 | `<` `>` / `;` `:` | rack | input trim / `A→M` sensitivity of a tab fed by audio |
-| `←` `→` | TRANSPORT | length of the automation loop, in bars |
+| `F7` / `F8` / `F9` | anywhere | roll-stop the rack / arm automation recording / panic (all-notes-off) — the same three buttons that sit on the menu bar |
 | `m` / `S` | rack | mute / solo the tab |
 | `↑` `↓` / wheel | MIXER | that tab's level, one step (`Tab` focuses the MIXER while it is showing, or click a strip) |
 | `l` / `k` | MIXER | link the strip's two channels / pick which side the arrows move |
+| `C` | rack (FX) | which keyboard the selected effect takes its chord from |
+| `v` | rack | split the keyboard: which saved sound each octave plays |
+| `c` | rack (FX) | gate the selected effect from another tab — the kick that opens it |
+| `n` / `N` | rack, MIXER | level the tab / the whole rack again, from what it has played since it was loaded |
 | `c` / `r` | IN drawer | connect-disconnect a port / rescan inputs |
+
+### A plugin's knobs, readable
+
+Surge XT calls its parameters `Filter 1 Cutoff`, `Filter 1 Resonance`,
+`Filter 1 Type`. A cell in the rack is thirteen columns — eleven characters —
+so those read `Filter 1 C…`, `Filter 1 R…`, `Filter 1 T…`: three knobs that
+look the same and none you can name.
+
+The part that repeats is now drawn **once**, as the box's heading
+(`INSTRUMENT · Surge XT · Filter 1`), and each cell shows only what differs:
+`Cutoff`, `Resonance`, `Type`. The section comes from the plugin when it gives
+one — CLAP's `module` — and is read off the names when it does not, which is
+every other format: a run of consecutive parameters that begin with the same
+words *is* a section, because that is how plugins with sections write them.
+Nothing is invented for a lone parameter; it keeps its whole name.
+
+The long parameter list groups them the same way, without extra rows: the
+cursor is the parameter index, so a heading row of its own would put every row
+one out of step. The first row of a section names it and the rest sit indented
+under it.
+
+### The harmoniser and the vocoder are one effect
+
+They answer the same question — what should the voice be sung *on* — and both
+read the same held chord, so they are one effect with a `Mode`: **HARMONY**
+pitch-shifts voices onto the chord, **VOCODER** puts the voice's shape on it.
+The vocoder gained a carrier for exactly this: `CHORD`, a bank of saws at the
+notes being held, so the keyboard decides what the machine says. Nothing held
+is silence — a vocoder with no carrier says nothing.
+
+The merge **appended**: every knob the harmoniser had is at the index it was, so
+a project written when these were two effects opens with its controls
+untouched. The old `vocoder` effect still loads and still works; it is only off
+the ADD FX menu, because two entries for one sound is two places to look.
+
+`C` (shift) picks **which keyboard** the chord comes from: any, or one by name.
+The channel was always a knob; the port could not be, for the same reason the
+clock's could not — a number into a list of ports means a different device the
+moment one is unplugged.
+
+### Four sounds on buttons, and the keyboard split between them
+
+A tab with an instrument gets a `SOUNDS` row: four buttons and a `+` (up to
+eight). **Left-click recalls, right-click saves** — what the tab is playing
+*right now*, taken from the live plugin rather than from what choz last stored,
+so a patch changed inside the plugin's own window is the one that gets kept.
+The knobs and the program go with it.
+
+They are MIDI-actionable: every button is in the learn picker, so a footswitch,
+a pad or the program change a pedalboard sends when its patch changes can fire
+one. This is not the BANK line above it — that lists what the *plugin* ships;
+these are the sound as the player left it.
+
+`v` opens the **split**: a row per MIDI octave, drawn as that octave's twelve
+keys in the colour of the sound it plays, stepped with Enter, the arrows or the
+wheel. A sound can be used in as many octaves as you like. A note arriving in
+an octave brings its sound with it, and one arriving in an octave that has none
+leaves the tab alone.
+
+**It swaps the patch, it does not layer two.** One tab is one instrument: for a
+SoundFont the swap is a program change and instant; for a plugin it is a state
+restore, which costs what pressing the button costs. Two sounds at once is two
+tabs, which is what MULTI is for.
+
+### One tab's kick, another tab's filter
+
+Any effect can be **gated from another tab**. Select it in the chain, press
+`c`, and the dialogue asks the only four things a gate is: which tab drives it,
+whether that tab **opens** the effect or **ducks** it, how much of the effect
+the gate owns (depth), and what counts as a hit (threshold, plus a release).
+
+The example it was built for: a drum kit on tab 1 and a keyboard on tab 2, with
+the kick opening an auto-filter on the keyboard. The gated effect shows `⌁1` on
+its button in the chain, because what an effect is wired to is in none of its
+knobs — and an effect that goes quiet between kicks otherwise looks broken.
+
+It works with **all forty-five effects and with hosted plugins**, without a
+line of per-effect code: a gate rides the effect's dry/wet, and `set_mix` is
+something the processor trait has required all along. The source is the tab's
+own level in the last block, which the audio callback already publishes for the
+meters — so a tab that renders after the gated one is one block late, which at
+choz's block sizes is under three milliseconds.
+
+### One clock, and you say whose
+
+`CLK` on the menu bar opens a picker: **INTERNAL** (choz's own tempo), **ANY
+PORT**, or one of the connected devices by name. Clock messages now travel
+tagged with the port they arrived on, so a rig with a groovebox *and* a DAW on
+the same hub can name which of them is the master — the other one is ignored
+outright instead of fighting for the tempo.
+
+It is one setting for the whole rack, deliberately: there is one transport,
+every synced plugin reads it, and a clock per tab is a rack playing against
+itself.
+
+### A desk, not a pile of tabs
+
+Under the tab strips the MIXER now carries the desk's own: **four subgroups**
+(`A`–`D`) and a **MAIN**. A subgroup is a destination that is not a device —
+tabs sum into it, its fader rides all of them together, its mute takes the
+group out, and its output pair decides where the group lands. Every tab strip
+shows where it sums (`▸OUT`, `▸A`…) and clicking that cell walks
+`OUT → A → B → C → D`.
+
+The MAIN is the last thing the **first** output pair passes through, which is
+the pair everything calls "the output" and the one the meter reads. The other
+pairs are separate outputs, left alone on purpose: a master fader that also
+trimmed channels 7 and 8 is a master fader that silences a monitor send.
+
+The metronome has its own destination (its menu's `OUTPUT` row): the click can
+go to a group — a wedge — and nowhere else. It borrows that group's routing but
+not its fader, because a reference that moves when somebody rides the group is
+not a reference.
+
+### One bar instead of a panel
+
+Everything true of the whole rack lives on the top-right of the menu bar rather
+than in a panel of its own: the metronome, the LIVE/MULTI switch, the transport
+(`▶ ON` / `■ OFF`), the automation's `● REC` chip, the loop length `◀ 4 ▶`,
+the `CLK INT/EXT` switch, `PANIC`, and what the audio callback is spending
+(`DSP 12%`, ambered past 70% and red past 90%).
+
+Every one is clickable; the loop's two arrows are the two halves of its button,
+and the **right** button on `REC` throws the recorded lanes away. The keyboard
+reaches the three that matter through `F7`, `F8` and `F9` — function keys
+because every letter is already worth something to whichever section has the
+focus, which is exactly why those controls used to be unreachable unless the
+TRANSPORT panel was focused.
+
+The panel itself is gone. It spent seven rows on five buttons and a device
+name; the rows went to the RACK, and the device name — with `NOT CONNECTED`
+and `CLIP` beside it — to the status bar, where clicking it still opens the
+OUT drawer.
+
+### Tabs that arrive level
+
+A new instrument is measured before it reaches the audio thread: choz plays it
+a middle C, listens to half a second of it, and sets the tab's fader so its
+loudest passage sits at -18 dBFS RMS — never above full scale, whatever that
+costs in loudness. A SoundFont, a Surge patch and a sampled piano therefore
+land at roughly the same level instead of metres apart.
+
+It happens **once, at load**. After that the strip is the player's: nothing
+moves a fader again unless `n` or `N` is pressed, and a project reopens with
+the levels it was saved with. A plugin that answers the probe with silence
+(some need warming up) keeps the fader it had and says so in the log.
 
 A controller plugged in while choz is running is picked up on its own — the port
 list is polled every couple of seconds.

@@ -410,6 +410,14 @@ pub fn read_params(path: &Path, plugin_id: &str) -> Vec<crate::PluginParam> {
             // CLAP has no unit field: the unit is baked into `value_to_text`.
             unit: None,
             points,
+            // CLAP's own sectioning: a path like `/Scene A/Osc 1`. The last
+            // segment is the section a player would name — the full path is
+            // the plugin's tree, and a tree does not fit in a cell.
+            group: String::from_utf8_lossy(info.module)
+                .trim_end_matches('\0')
+                .rsplit('/')
+                .find(|s| !s.trim().is_empty())
+                .map(|s| s.trim().to_string()),
         });
     }
     out

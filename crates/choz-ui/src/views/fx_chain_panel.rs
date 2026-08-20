@@ -61,6 +61,11 @@ pub enum RackButton {
     /// Previous / next program of the loaded SoundFont.
     PresetPrev,
     PresetNext,
+    /// One of the tab's saved sounds. Left recalls it, right saves what the
+    /// tab is playing into it.
+    Sound(usize),
+    /// One more sound button.
+    SoundAdd,
     /// Previous / next page of the instrument's own parameters. A synth like
     /// Surge XT has hundreds; the box shows a few rows of them, and these are
     /// how the rest are reached.
@@ -704,6 +709,16 @@ fn draw_knob_box(
     (rects, box_rect.y + box_rect.height)
 }
 
+/// The tab's saved sounds, as the RACK draws them.
+pub struct SoundsView<'a> {
+    /// One entry per button: the name it holds, or `None` for an empty one.
+    pub names: &'a [Option<String>],
+    /// The button last recalled, drawn lit.
+    pub active: Option<usize>,
+    /// Whether there is room for another button.
+    pub can_add: bool,
+}
+
 /// Draw the RACK panel and return its click rects.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_fx_chain_panel(
@@ -738,6 +753,9 @@ pub fn draw_fx_chain_panel(
     // Carla's "generic UI": every plugin gets knobs whether or not it has a
     // window, so a CC can be learned without opening one.
     instr_params: &[(String, f32, ParamShape)],
+    // Which section of the plugin the cursor is in, when it has sections. The
+    // cells show the short name; this is the heading that gives it back.
+    instr_section: Option<String>,
     instr_cursor: usize,
     // Which of the two knob boxes the arrows and the highlight belong to.
     instr_focused: bool,
@@ -759,6 +777,8 @@ pub fn draw_fx_chain_panel(
     // Meter, latency and presets of the selected FX — everything the SLOT box
     // knows that is not a button.
     fx_info: FxSlotInfo,
+    // The tab's sound buttons: a footswitch's worth of patches.
+    sounds: SoundsView<'_>,
 ) -> RackLayout {
     let has_presets = preset.is_some();
     let mut layout = RackLayout::default();
@@ -1104,6 +1124,46 @@ pub fn draw_fx_chain_panel(
         y += 1;
     }
 
+    // ── Saved sounds ───────────────────────────────────────────────────────
+    //
+    // A row of buttons holding the tab's own patches — not the plugin's preset
+    // list, which is the BANK line above: these are the sound *as the player
+    // left it*, and the reason they are on the panel rather than in a menu is
+    // that they are reached mid-song.
+    if !sounds.names.is_empty() {
+        let mut row = ButtonRow::new(inner, bg, y, 2);
+        row.label(
+            f,
+            format!("{}  ", t("SOUNDS")),
+            Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
+        );
+        for (i, name) in sounds.names.iter().enumerate() {
+            let filled = name.is_some();
+            let style = match (Some(i) == sounds.active && filled, filled) {
+                (true, _) => Style::default()
+                    .fg(Color::Black)
+                    .bg(ON_COLOUR)
+                    .add_modifier(Modifier::BOLD),
+                (false, true) => Style::default().fg(ui_text()).bg(Color::Rgb(40, 46, 56)),
+                // An empty button is drawn all the same: it is where a sound
+                // goes, and a row that grows as you save is a row you cannot
+                // aim at.
+                (false, false) => Style::default().fg(Color::Rgb(90, 95, 105)),
+            };
+            let label = match name {
+                Some(n) => format!(" {}:{} ", i + 1, truncate(n, 8)),
+                None => format!(" {} ", i + 1),
+            };
+            let rect = row.button(f, label, style);
+            layout.buttons.push((RackButton::Sound(i), rect));
+        }
+        if sounds.can_add {
+            let rect = row.button(f, " + ".to_string(), btn_style);
+            layout.buttons.push((RackButton::SoundAdd, rect));
+        }
+        y = row.finish();
+    }
+
     // ── Arpeggiator ────────────────────────────────────────────────────────
     //
     // Off, it is a single switch: a bordered box for something most tabs never
@@ -1382,9 +1442,15 @@ pub fn draw_fx_chain_panel(
             // The title carries the key that hands it the arrows: two knob
             // boxes on one panel need to say which one is live.
             &format!(
-                "{} \u{00B7} {}{}",
+                "{} \u{00B7} {}{}{}",
                 t("INSTRUMENT"),
                 truncate(instrument, 18),
+                // The section the cursor is in: the cells dropped the words
+                // every knob around them repeats, and this is where they went.
+                match &instr_section {
+                    Some(g) => format!(" \u{00B7} {}", truncate(g, 18)),
+                    None => String::new(),
+                },
                 if focused && instr_focused {
                     ""
                 } else {
@@ -1450,7 +1516,14 @@ pub fn draw_fx_chain_panel(
                 .bg(Color::Rgb(30, 34, 40))
                 .add_modifier(Modifier::CROSSED_OUT)
         };
-        let rect = row.button(f, format!(" {}:{} ", i + 1, entry.label()), st);
+        // A gated effect says so on its own button: what it is wired to is not
+        // in any of its knobs, so an effect that goes quiet between kicks would
+        // otherwise look like an effect that is broken.
+        let mark = match entry.gate {
+            Some(g) => format!("\u{2301}{} ", g.source + 1),
+            None => String::new(),
+        };
+        let rect = row.button(f, format!(" {}:{} {mark}", i + 1, entry.label()), st);
         layout.fx_slots.push((i, rect));
     }
     if chain.len() < MAX_FX {
@@ -1482,7 +1555,22 @@ pub fn draw_fx_chain_panel(
 
     // ── Selected FX: the same knob box, from the same helper ──────────────
     let descs = entry.param_descs();
-    let names: Vec<String> = descs.iter().map(|d| d.name.to_string()).collect();
+    // A hosted effect's parameters are the plugin's own names, and a plugin
+    // with sections repeats them in every one — the same thing that made an
+    // instrument's cells unreadable. Built-ins name their knobs in one word
+    // and come back unchanged.
+    let sections = match &entry.plugin {
+        Some(p) => crate::source::param_sections(&p.params),
+        None => Vec::new(),
+    };
+    let names: Vec<String> = descs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| match sections.get(i) {
+            Some((_, short)) => short.clone(),
+            None => d.name.to_string(),
+        })
+        .collect();
     let shapes: Vec<ParamShape> = descs.iter().map(|d| d.shape.clone()).collect();
 
     // A graphic EQ is ten sliders, and ten arcs cannot be read as a curve. It
@@ -1561,7 +1649,18 @@ pub fn draw_fx_chain_panel(
             f,
             inner,
             y,
-            &format!("{}:{}", fx_slot + 1, entry.label()),
+            &format!(
+                "{}:{}{}",
+                fx_slot + 1,
+                entry.label(),
+                // Same as the instrument's box: the cells dropped the words
+                // every knob around them repeats, and the heading is where
+                // they went.
+                match sections.get(fx_param).and_then(|(g, _)| g.as_ref()) {
+                    Some(g) => format!(" \u{00B7} {}", truncate(g, 18)),
+                    None => String::new(),
+                }
+            ),
             &entry.params,
             &names,
             &shapes,

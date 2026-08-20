@@ -424,6 +424,15 @@ pub struct PluginParam {
     /// Named positions — `(value, label)` — for a parameter whose steps have
     /// names: waveform, filter type, mode. Empty when there are none.
     pub points: Vec<(f64, String)>,
+    /// Which section of the plugin this belongs to, **when the plugin says so**
+    /// — CLAP's `module`, and nothing invented here.
+    ///
+    /// A synth with three hundred parameters is unreadable as one list: Surge
+    /// XT's are called things like "Filter 1 Cutoff", and in a thirteen-column
+    /// cell that is "Filter 1 C…", which names neither the section nor the
+    /// control. With the section known, the cell can drop the part that repeats
+    /// and show `Cutoff` under a heading that says `Filter 1`.
+    pub group: Option<String>,
 }
 
 impl PluginParam {

@@ -192,6 +192,7 @@ pub fn read_maxpat(path: &Path) -> anyhow::Result<MaxImport> {
         }
         match EQUIVALENTS.iter().find(|(max, _)| *max == b.name) {
             Some((_, kind)) => out.chain.push(FxSpec {
+                gate: None,
                 kind: (*kind).to_string(),
                 enabled: true,
                 wet: 1.0,

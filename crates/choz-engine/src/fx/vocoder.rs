@@ -63,10 +63,20 @@ pub enum Carrier {
     /// The right channel. A talkbox is a vocoder carried by a real
     /// instrument, so this is that, and it needs no separate effect.
     Right,
+    /// **The chord being held.** The same notes the harmoniser follows, played
+    /// as a bank of saws — so the keyboard decides what the voice says *on*,
+    /// which is the whole reason the two effects are one.
+    Chord,
 }
 
 impl Carrier {
-    pub const ALL: [Carrier; 4] = [Carrier::Saw, Carrier::Pulse, Carrier::Noise, Carrier::Right];
+    pub const ALL: [Carrier; 5] = [
+        Carrier::Saw,
+        Carrier::Pulse,
+        Carrier::Noise,
+        Carrier::Right,
+        Carrier::Chord,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -74,6 +84,7 @@ impl Carrier {
             Carrier::Pulse => "PULSE",
             Carrier::Noise => "NOISE",
             Carrier::Right => "INPUT R",
+            Carrier::Chord => "CHORD",
         }
     }
 
@@ -108,6 +119,13 @@ pub struct Vocoder {
     /// formant control: the same words out of a bigger or smaller head.
     shift: f32,
     phase: f32,
+    /// One phase per note of the held chord, for [`Carrier::Chord`].
+    chord_phase: [f32; crate::chord::MAX_NOTES],
+    /// The chord as frequencies, refreshed when the hand on the keyboard moves
+    /// rather than per sample: eight atomic loads a block, not a block's worth.
+    chord_hz: [f32; crate::chord::MAX_NOTES],
+    chord_n: usize,
+    chord_seen: u32,
     rng: u32,
     mix: f32,
     sample_rate: f32,
@@ -126,6 +144,10 @@ impl Vocoder {
             speed_ms: 12.0,
             shift: 0.0,
             phase: 0.0,
+            chord_phase: [0.0; crate::chord::MAX_NOTES],
+            chord_hz: [0.0; crate::chord::MAX_NOTES],
+            chord_n: 0,
+            chord_seen: 0,
             rng: 0x5EED_1234,
             mix: 1.0,
             sample_rate: sr,
@@ -205,6 +227,29 @@ impl Vocoder {
     fn carrier_sample(&mut self, right: f32) -> f32 {
         match self.carrier {
             Carrier::Right => right,
+            Carrier::Chord => {
+                if self.chord_n == 0 {
+                    // Nothing held: silence rather than a drone. A vocoder with
+                    // no carrier says nothing, which is what a hand off the
+                    // keyboard means.
+                    return 0.0;
+                }
+                let mut sum = 0.0;
+                let sr = self.sample_rate;
+                for (phase, hz) in self
+                    .chord_phase
+                    .iter_mut()
+                    .zip(self.chord_hz.iter())
+                    .take(self.chord_n)
+                {
+                    *phase += hz / sr;
+                    *phase -= phase.floor();
+                    sum += *phase * 2.0 - 1.0;
+                }
+                // Uncorrelated saws: their powers add, so the sum is divided by
+                // the root rather than by the count.
+                sum / (self.chord_n as f32).sqrt()
+            }
             Carrier::Noise => {
                 self.rng ^= self.rng << 13;
                 self.rng ^= self.rng >> 17;
@@ -241,6 +286,19 @@ impl super::FxProcessor for Vocoder {
         }
         if self.dirty {
             self.rebuild();
+        }
+        // The chord, once a block and only when it moved.
+        if self.carrier == Carrier::Chord {
+            let chord = crate::chord::chord();
+            let generation = chord.generation();
+            if generation != self.chord_seen {
+                let mut held = [0u8; crate::chord::MAX_NOTES];
+                self.chord_n = chord.read(&mut held);
+                for (hz, note) in self.chord_hz.iter_mut().zip(held.iter()).take(self.chord_n) {
+                    *hz = 440.0 * 2f32.powf((*note as f32 - 69.0) / 12.0);
+                }
+                self.chord_seen = generation;
+            }
         }
         let count = self.count;
         let mix = self.mix;

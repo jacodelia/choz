@@ -168,6 +168,150 @@ impl Meter {
     }
 }
 
+/// How loud each tab is **before its fader**, since the last reset.
+///
+/// The master meter says the mix clipped; it cannot say which tab pushed it
+/// there, and on a rack of eight that is the whole question. This is the same
+/// two numbers per slot, taken where the tab's audio is finished and the strip
+/// has not touched it yet — so the reading answers "how loud is this plugin",
+/// not "how loud did I leave the fader".
+///
+/// Both are **sticky maxima**: the audio thread only ever raises them, so a
+/// UI reading twenty times a second cannot miss the one block that clipped.
+/// Whoever wants a fresh window calls [`SlotLevels::reset`].
+pub struct SlotLevels {
+    peaks: [AtomicU32; MAX_SLOTS],
+    rms: [AtomicU32; MAX_SLOTS],
+    /// The **last** block's peak, not the loudest one. What a sidechain reads:
+    /// a gate opened by a kick drum needs to know what the drum is doing right
+    /// now, and the sticky maxima above answer a different question.
+    live: [AtomicU32; MAX_SLOTS],
+}
+
+/// As many tabs as the engine will build. Kept here because the meter is the
+/// one place both sides agree on how many there can be.
+pub const MAX_SLOTS: usize = 32;
+
+pub fn slot_levels() -> &'static SlotLevels {
+    static L: SlotLevels = SlotLevels::new();
+    &L
+}
+
+impl SlotLevels {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: AtomicU32 = AtomicU32::new(0);
+
+    const fn new() -> Self {
+        Self {
+            peaks: [Self::ZERO; MAX_SLOTS],
+            rms: [Self::ZERO; MAX_SLOTS],
+            live: [Self::ZERO; MAX_SLOTS],
+        }
+    }
+
+    /// Publish one block of one tab, interleaved stereo, pre-fader. Called from
+    /// the audio callback: one pass over the buffer and two relaxed max-stores.
+    pub fn publish(&self, slot: usize, buf: &[f32]) {
+        if slot >= MAX_SLOTS || buf.is_empty() {
+            return;
+        }
+        let mut peak = 0.0f32;
+        let mut sum = 0.0f64;
+        for frame in buf.chunks_exact(2) {
+            let mono = (frame[0] + frame[1]) * 0.5;
+            peak = peak.max(mono.abs());
+            sum += (mono as f64) * (mono as f64);
+        }
+        let rms = (sum / (buf.len() / 2).max(1) as f64).sqrt() as f32;
+        // A plugin that has gone to NaN would otherwise store a bit pattern
+        // that no later block can beat, and the tab reads "infinitely loud"
+        // for the rest of the session.
+        if !peak.is_finite() || !rms.is_finite() {
+            return;
+        }
+        // `fetch_max` on the bits works because both are non-negative and
+        // finite: for those, f32 bit order is value order.
+        self.peaks[slot].fetch_max(peak.to_bits(), Ordering::Relaxed);
+        self.rms[slot].fetch_max(rms.to_bits(), Ordering::Relaxed);
+        self.live[slot].store(peak.to_bits(), Ordering::Relaxed);
+    }
+
+    /// The loudest block this tab has played since the last reset, as
+    /// `(peak, RMS)`, linear. Reading does not clear it — two readers (the
+    /// health log and auto-trim) want the same window.
+    pub fn read(&self, slot: usize) -> (f32, f32) {
+        match slot < MAX_SLOTS {
+            true => (
+                f32::from_bits(self.peaks[slot].load(Ordering::Relaxed)),
+                f32::from_bits(self.rms[slot].load(Ordering::Relaxed)),
+            ),
+            false => (0.0, 0.0),
+        }
+    }
+
+    /// What this tab did in the **last block**, linear. The sidechain reading:
+    /// see [`SlotLevels::live`].
+    pub fn live(&self, slot: usize) -> f32 {
+        match slot < MAX_SLOTS {
+            true => f32::from_bits(self.live[slot].load(Ordering::Relaxed)),
+            false => 0.0,
+        }
+    }
+
+    /// Start this tab's window again — a new instrument is not the old one's
+    /// levels.
+    pub fn reset(&self, slot: usize) {
+        if slot < MAX_SLOTS {
+            self.peaks[slot].store(0, Ordering::Relaxed);
+            self.rms[slot].store(0, Ordering::Relaxed);
+            self.live[slot].store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub fn reset_all(&self) {
+        for i in 0..MAX_SLOTS {
+            self.reset(i);
+        }
+    }
+}
+
+#[cfg(test)]
+mod slot_level_tests {
+    use super::*;
+
+    /// It keeps the loudest block, not the last one — a fader solved from
+    /// whatever happened to be playing when the UI looked is a fader that
+    /// changes every time you press the key.
+    #[test]
+    fn a_slot_keeps_its_loudest_block_until_reset() {
+        let l = slot_levels();
+        l.reset(3);
+        assert_eq!(l.read(3), (0.0, 0.0));
+
+        // Full-scale square, both channels: peak and RMS are both 1.
+        l.publish(3, &[1.0, 1.0, -1.0, -1.0]);
+        assert_eq!(l.read(3), (1.0, 1.0));
+
+        // A quiet block after it changes nothing.
+        l.publish(3, &[0.1, 0.1, -0.1, -0.1]);
+        assert_eq!(l.read(3), (1.0, 1.0), "the loud block still stands");
+
+        // A plugin gone to NaN must not stick a reading nothing can beat.
+        l.publish(3, &[f32::NAN, f32::NAN]);
+        assert_eq!(l.read(3), (1.0, 1.0));
+
+        l.reset(3);
+        assert_eq!(l.read(3), (0.0, 0.0));
+        // Slots do not read each other, and past the cap is silence, not a panic.
+        l.publish(3, &[0.5, 0.5]);
+        assert_eq!(l.read(4), (0.0, 0.0));
+        l.publish(MAX_SLOTS, &[1.0, 1.0]);
+        assert_eq!(l.read(MAX_SLOTS), (0.0, 0.0));
+        l.reset_all();
+        assert_eq!(l.read(3), (0.0, 0.0));
+    }
+}
+
 /// How loud each capture channel is, right now.
 ///
 /// The one reading that separates the three ways live audio goes missing:

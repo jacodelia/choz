@@ -107,6 +107,7 @@ pub fn read_params(path: &Path, _id: &str) -> Vec<PluginParam> {
             };
             let unit = inst.param_label(id);
             PluginParam {
+            group: None,
                 id,
                 name: inst.param_name(id),
                 // VST3 parameters are normalised by definition.

@@ -22,7 +22,7 @@ pub mod sandboxed;
 pub mod sfz;
 pub mod sources;
 
-pub use engine::{AudioBackend, AudioEngine};
+pub use engine::{AudioBackend, AudioEngine, Dest, BUSES};
 
 /// Parameter index that means "choz's own dry/wet" in
 /// [`AudioEngine::set_fx_param`], rather than one of the processor's params.

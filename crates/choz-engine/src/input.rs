@@ -87,9 +87,13 @@ pub enum ControlMsg {
 pub enum InputEvent {
     Note(NoteMsg),
     /// The MIDI clock of whatever is upstream: a drum machine, a DAW, a
-    /// KeyStep. Not tagged with a source — there is one clock, and two ports
-    /// sending it is a setup problem rather than something to average.
-    Clock(ClockMsg),
+    /// KeyStep.
+    ///
+    /// **Tagged with the port it came from.** There is one transport, but a
+    /// rig has more than one device sending clock — a groovebox and a DAW on
+    /// the same hub — and choz has to be told which of them is the master
+    /// rather than following whichever spoke last.
+    Clock(InputSource, ClockMsg),
     Cc(CcMsg),
     Program(ProgramMsg),
     Bend(BendMsg),

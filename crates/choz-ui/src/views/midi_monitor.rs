@@ -136,7 +136,7 @@ fn line(event: &InputEvent, ports: &[String]) -> Line<'static> {
         InputEvent::Note(m) => (m.source, "NOTE OFF".to_string(), note_name(m.note), DIM),
         // The clock has no port of its own in this log: it is the wire itself
         // talking, and there is one of it.
-        InputEvent::Clock(c) => (
+        InputEvent::Clock(_, c) => (
             InputSource::Osc,
             "CLOCK".to_string(),
             match c {
@@ -285,6 +285,11 @@ pub struct KeyLit {
     pub vel: u8,
     /// Which rack tab it was routed to, when it was routed anywhere.
     pub slot: Option<usize>,
+    /// Which input it arrived on. `None` for a note choz made itself — the
+    /// QWERTY piano, `A→M`. Kept because a chord the harmoniser follows has to
+    /// be able to come from **one** keyboard: with two of them on a hub, the
+    /// channel alone cannot tell them apart.
+    pub source: Option<InputSource>,
 }
 
 /// How many controllers are shown under the keyboard.
@@ -373,6 +378,7 @@ impl KeyboardState {
                 channel: 0,
                 vel: 100,
                 slot,
+                source: None,
             });
         }
     }
@@ -386,7 +392,18 @@ impl KeyboardState {
     ///
     /// **`channel` is 1..16**, the way a musician and the panel say it; on the
     /// wire and in [`KeyLit`] it is 0-based.
-    pub fn held_on_channel(&self, channel: u8, slot: Option<usize>) -> Vec<u8> {
+    /// The same, narrowed to one input as well.
+    ///
+    /// `source` is which port the notes must have come from; `None` takes them
+    /// from any. That is the difference between "the chord on channel 1" and
+    /// "the chord on **this** keyboard" — with two controllers both sending
+    /// channel 1, only the second question has an answer.
+    pub fn held_from(
+        &self,
+        channel: u8,
+        slot: Option<usize>,
+        source: Option<InputSource>,
+    ) -> Vec<u8> {
         let wire = channel.saturating_sub(1);
         self.keys
             .iter()
@@ -394,7 +411,14 @@ impl KeyboardState {
             .filter_map(|(note, lit)| {
                 let lit = lit.as_ref()?;
                 let same_tab = slot.is_none() || lit.slot.is_none() || lit.slot == slot;
-                (lit.channel == wire && same_tab).then_some(note as u8)
+                let same_port = match source {
+                    None => true,
+                    // A note choz made itself has no port and belongs to
+                    // whoever asks: `A→M` feeding the harmony is the point of
+                    // `A→M`.
+                    Some(want) => lit.source.is_none_or(|s| s == want),
+                };
+                (lit.channel == wire && same_tab && same_port).then_some(note as u8)
             })
             .collect()
     }
@@ -438,6 +462,7 @@ impl KeyboardState {
                     channel: m.channel,
                     vel: m.vel,
                     slot,
+                    source: Some(m.source),
                 });
             }
             InputEvent::Note(m) => {
@@ -454,7 +479,7 @@ impl KeyboardState {
                 self.ccs.truncate(CC_SHOWN);
             }
             InputEvent::Bend(m) => self.bend = m.value,
-            InputEvent::Program(_) | InputEvent::Control(_) | InputEvent::Clock(_) => {}
+            InputEvent::Program(_) | InputEvent::Control(_) | InputEvent::Clock(..) => {}
         }
     }
 
@@ -781,7 +806,7 @@ pub fn draw_midi_monitor(
     strips: &[MixerStrip],
 ) -> (Vec<TabRect>, Vec<MixerRect>) {
     let block = Block::default()
-        .title(" MIDI IN ")
+        .title(" MONITOR ")
         .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::border()))
@@ -837,8 +862,21 @@ pub fn draw_midi_monitor(
     (rects, hits)
 }
 
-/// One rack tab as the MIXER shows it.
+/// What a strip stands for. The MIXER draws tabs, then the four subgroups,
+/// then the main, in one run of strips — the way a desk is laid out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StripKind {
+    Tab,
+    /// A subgroup. Has a fader, a mute and an output pair, and none of the
+    /// things that only mean something for a tab: no pan, no solo, no split
+    /// sides — a group is already a sum.
+    Bus,
+    Main,
+}
+
+/// One strip of the MIXER: a rack tab, a subgroup, or the main.
 pub struct MixerStrip {
+    pub kind: StripKind,
     pub label: String,
     /// Linear, over the same range the RACK's VOL knob uses. One per output
     /// channel: a stereo tab can sit louder on one side, and `link` is what
@@ -853,6 +891,9 @@ pub struct MixerStrip {
     pub active: bool,
     /// Which side the keyboard is pointed at, when the MIXER has the focus.
     pub side: Option<MixerSide>,
+    /// Where a tab sums — `OUT`, or the letter of a group. `None` on the
+    /// group and main strips, which are where things sum *to*.
+    pub dest: Option<&'static str>,
 }
 
 /// A half of a strip, for the caller to say which one the arrows move.
@@ -877,6 +918,8 @@ pub enum MixerHit {
     Solo(usize),
     /// The tab's name: make it the active one.
     Select(usize),
+    /// The destination cell: step it to the next group, or back to the device.
+    Dest(usize),
     /// Walk the window of strips when the rack is wider than the panel.
     Page(isize),
 }
@@ -937,7 +980,7 @@ const STRIP_W: u16 = 9;
 
 /// One channel: name, a vertical fader, its two flags and its pan.
 fn draw_strip(f: &mut Frame, area: Rect, tab: usize, st: &MixerStrip) -> Vec<MixerRect> {
-    use crate::views::fx_chain_panel::{pan_label, truncate};
+    use crate::views::fx_chain_panel::truncate;
     let mut hits = Vec::new();
     let name_style = if st.active {
         Style::default()
@@ -949,23 +992,30 @@ fn draw_strip(f: &mut Frame, area: Rect, tab: usize, st: &MixerStrip) -> Vec<Mix
     };
     let w = area.width as usize;
     let head = Rect::new(area.x, area.y, area.width, 1);
+    // A tab is numbered because that is how it is addressed everywhere else; a
+    // group and the main are named, because there is only one of each.
+    let title = match st.kind {
+        StripKind::Tab => format!("{} {}", tab + 1, truncate(&st.label, w.saturating_sub(2))),
+        _ => truncate(&st.label, w),
+    };
+    let name_style = match st.kind {
+        StripKind::Main => Style::default()
+            .fg(Color::Black)
+            .bg(HEADER)
+            .add_modifier(Modifier::BOLD),
+        StripKind::Bus => Style::default().fg(HEADER).add_modifier(Modifier::BOLD),
+        StripKind::Tab => name_style,
+    };
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!(
-                "{:<w$}",
-                format!("{} {}", tab + 1, truncate(&st.label, w.saturating_sub(2))),
-                w = w
-            ),
-            name_style,
-        )))
-        .style(theme::panel_style()),
+        Paragraph::new(Line::from(Span::styled(format!("{title:<w$}"), name_style)))
+            .style(theme::panel_style()),
         head,
     );
     hits.push((MixerHit::Select(tab), head));
 
     // Two faders side by side — the tab's two output channels — with the link
-    // between them. Everything between the name and the last two rows.
-    let bottom = 2u16.min(area.height.saturating_sub(1));
+    // between them. Everything between the name and the rows at the foot.
+    let bottom = strip_bottom(area, st.kind);
     let fader_h = area.height.saturating_sub(1 + bottom);
     if fader_h > 0 {
         let y = area.y + 1;
@@ -980,6 +1030,15 @@ fn draw_strip(f: &mut Frame, area: Rect, tab: usize, st: &MixerStrip) -> Vec<Mix
                 _ => colour,
             }
         };
+        // A group and the main are already a sum: one fader, the full width,
+        // and none of the link machinery below.
+        if st.kind != StripKind::Tab {
+            let bar = Rect::new(area.x, y, area.width, fader_h);
+            draw_fader(f, bar, st.gain, if st.mute { DIM } else { HEADER });
+            hits.push((MixerHit::Gain(tab), bar));
+            return finish_strip(f, area, tab, st, hits);
+        }
+
         // `L` and `R` columns, one cell of gutter, then the link between them.
         let cols = ((area.width.saturating_sub(3)) / 2).max(1);
         let left = Rect::new(area.x, y, cols, fader_h);
@@ -1013,25 +1072,49 @@ fn draw_strip(f: &mut Frame, area: Rect, tab: usize, st: &MixerStrip) -> Vec<Mix
         hits.push((MixerHit::Link(tab), Rect::new(link_x, y, 1, fader_h)));
     }
 
+    finish_strip(f, area, tab, st, hits)
+}
+
+/// The bottom of a strip: the flags row and the numbers row. Its own function
+/// because a group leaves the fader early — one fader, no link — and still has
+/// to have a mute and a level under it.
+fn finish_strip(
+    f: &mut Frame,
+    area: Rect,
+    tab: usize,
+    st: &MixerStrip,
+    mut hits: Vec<MixerRect>,
+) -> Vec<MixerRect> {
+    use crate::views::fx_chain_panel::pan_label;
+    let w = area.width as usize;
+    let bottom = strip_bottom(area, st.kind);
     let mut y = area.y + area.height - bottom;
     if bottom >= 2 {
         let flags = Rect::new(area.x, y, area.width, 1);
+        // A group has no solo — soloing a sum is soloing the tabs in it, which
+        // is what their own strips already do.
+        let second = match st.kind {
+            StripKind::Tab => Span::styled(" S ", flag(st.solo, Color::Rgb(220, 190, 70))),
+            _ => Span::styled("   ", theme::panel_style()),
+        };
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(" M ", flag(st.mute, Color::Rgb(200, 80, 80))),
                 Span::styled(" ", theme::panel_style()),
-                Span::styled(" S ", flag(st.solo, Color::Rgb(220, 190, 70))),
+                second,
             ]))
             .style(theme::panel_style()),
             flags,
         );
         hits.push((MixerHit::Mute(tab), Rect::new(flags.x, y, 3, 1)));
-        hits.push((MixerHit::Solo(tab), Rect::new(flags.x + 4, y, 3, 1)));
+        if st.kind == StripKind::Tab {
+            hits.push((MixerHit::Solo(tab), Rect::new(flags.x + 4, y, 3, 1)));
+        }
         y += 1;
     }
     // The level in numbers, and the pan. Two faders and one number: the number
     // is the side that is louder, which is the one you are setting.
-    let pan = Rect::new(area.x, y, area.width, 1);
+    let row = Rect::new(area.x, y, area.width, 1);
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -1044,10 +1127,45 @@ fn draw_strip(f: &mut Frame, area: Rect, tab: usize, st: &MixerStrip) -> Vec<Mix
             ),
         ]))
         .style(theme::panel_style()),
-        pan,
+        row,
     );
-    hits.push((MixerHit::Pan(tab), pan));
+    if st.kind == StripKind::Tab {
+        hits.push((MixerHit::Pan(tab), row));
+    }
+    y += 1;
+
+    // Where the tab sums, when the panel is tall enough to say it. On a desk
+    // with groups this is the setting that explains a tab nobody can hear —
+    // and clicking it walks `OUT → A → B → C → D`.
+    if bottom >= 3 {
+        if let Some(d) = st.dest {
+            let cell = Rect::new(area.x, y, area.width, 1);
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!("{:^w$}", format!("\u{25B8}{d}")),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                )))
+                .style(theme::panel_style()),
+                cell,
+            );
+            hits.push((MixerHit::Dest(tab), cell));
+        }
+    }
     hits
+}
+
+/// Rows at the foot of a strip: the flags and the numbers, plus the
+/// destination when the panel is tall enough to show it and the strip is a tab
+/// (a group is where things go; it has no destination of its own yet).
+fn strip_bottom(area: Rect, kind: StripKind) -> u16 {
+    let want = match kind == StripKind::Tab && area.height >= 7 {
+        true => 3,
+        false => 2,
+    };
+    want.min(area.height.saturating_sub(1))
 }
 
 /// One vertical fader, filled from the bottom, with the part-filled row drawn
@@ -2038,7 +2156,7 @@ mod tests {
             .collect();
 
         let screen = render(&events, &ports, 50, 8);
-        assert!(screen.contains("MIDI IN"), "panel is titled:\n{screen}");
+        assert!(screen.contains("MONITOR"), "panel is titled:\n{screen}");
         assert!(
             screen.contains(&note_name(59)),
             "newest message is shown:\n{screen}"

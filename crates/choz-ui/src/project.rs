@@ -25,6 +25,47 @@ pub struct Project {
     /// written before automation existed simply has none.
     #[serde(default)]
     pub automation: crate::automation::Automation,
+    /// The subgroups and the main fader. Absent in projects written before
+    /// there were buses, which is four untouched groups and a main at unity —
+    /// exactly what those projects sounded like.
+    #[serde(default)]
+    pub buses: Buses,
+}
+
+/// The desk's own strips: four subgroups and the main.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Buses {
+    pub group: Vec<Bus>,
+    pub main_gain: f32,
+    pub main_mute: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Bus {
+    pub gain: f32,
+    pub mute: bool,
+    /// Device output channels this group lands on, 0-based.
+    pub out_pair: (usize, usize),
+}
+
+impl Default for Bus {
+    fn default() -> Self {
+        Self {
+            gain: 1.0,
+            mute: false,
+            out_pair: (0, 1),
+        }
+    }
+}
+
+impl Default for Buses {
+    fn default() -> Self {
+        Self {
+            group: vec![Bus::default(); choz_engine::BUSES],
+            main_gain: 1.0,
+            main_mute: false,
+        }
+    }
 }
 
 /// Engine-side settings that aren't per-slot.
@@ -58,6 +99,15 @@ pub struct Slot {
     pub instrument: Instrument,
     pub mixer: Mixer,
     pub fx: Vec<Fx>,
+    /// The tab's sound buttons, in button order. Absent in projects written
+    /// before they existed, which is four empty ones.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sounds: Vec<Sound>,
+    /// Which saved sound each MIDI octave plays, as `(octave, button)` pairs.
+    /// Only the octaves that were given one — a split is a handful of them, and
+    /// eleven nulls is not worth writing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub split: Vec<(usize, usize)>,
     /// MIDI-learn bindings that target this tab.
     pub midi_learn: Vec<Binding>,
     /// The tab's arpeggiator. Added later, so `default` (off) keeps every
@@ -105,6 +155,12 @@ pub struct Mixer {
     /// projects saved before per-slot routing existed, which is the first pair.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub out_pair: Option<(usize, usize)>,
+    /// Where the tab sums: `0` is straight to `out_pair`, `1..=4` are the
+    /// subgroups. A number rather than an enum because that is what it is on
+    /// the wire, and a project written before buses has none — which reads as
+    /// direct, the only thing those projects could do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dest: Option<usize>,
     /// Device *input* channels feeding this tab, when it runs on live audio
     /// instead of its instrument.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -188,6 +244,41 @@ pub struct Fx {
     /// The plugin's own state, base64 — see [`Instrument::state`].
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub state: String,
+    /// The tab that opens or ducks this effect, when one does. Absent — which
+    /// is every project written before gates existed — is an effect that
+    /// answers only to its own knobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<Gate>,
+    /// The keyboard whose chord this effect follows, by port name. Absent is
+    /// any of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chord_port: Option<String>,
+}
+
+/// One of a tab's saved sounds: the patch as the player left it.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Sound {
+    pub name: String,
+    /// The plugin's own state, base64 — see [`Instrument::state`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<f32>,
+    #[serde(default)]
+    pub preset: usize,
+}
+
+/// An effect driven by another tab's level. See
+/// [`choz_engine::fx_chain::GateSpec`], which this mirrors on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Gate {
+    /// Rack index of the tab that drives it.
+    pub source: usize,
+    /// `true` ducks instead of opening.
+    pub duck: bool,
+    pub depth: f32,
+    pub threshold: f32,
+    pub release_ms: f32,
 }
 
 impl Project {
@@ -228,6 +319,7 @@ mod tests {
 
     fn sample() -> Project {
         Project {
+            buses: Buses::default(),
             automation: crate::automation::Automation::default(),
             version: 1,
             audio: Audio {
@@ -244,6 +336,8 @@ mod tests {
             },
             plugin_paths: choz_engine::PluginPaths::default(),
             rack: vec![Slot {
+                sounds: Vec::new(),
+                split: Vec::new(),
                 input: Some("MIDI:Keystation".into()),
                 channel: 3,
                 instrument: Instrument {
@@ -259,6 +353,7 @@ mod tests {
                     config: Vec::new(),
                 },
                 mixer: Mixer {
+                    dest: None,
                     gain: 0.8,
                     gain_r: None,
                     link: None,
@@ -274,6 +369,8 @@ mod tests {
                     in_gate: None,
                 },
                 fx: vec![Fx {
+                    gate: None,
+                    chord_port: None,
                     kind: "amberfang".into(),
                     enabled: true,
                     wet: 1.0,
