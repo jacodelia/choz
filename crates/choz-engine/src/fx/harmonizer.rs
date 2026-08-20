@@ -38,6 +38,43 @@
 use super::shift::VoiceShifter;
 use super::smooth::Smoothed;
 use crate::fx::autotune::{Scale, ScaleType, NOTE_NAMES};
+use crate::fx::vocoder::Vocoder;
+use crate::fx::FxProcessor as _;
+
+/// What the effect does with the chord it is given.
+///
+/// **The vocoder lives here too.** It was a separate effect and it should not
+/// have been: both answer the same question — "what should the voice be sung
+/// *on*" — and both read the same held chord. As two effects they needed two
+/// MIDI inputs, two dry/wets and two places to look; as one, `MODE` is the only
+/// thing that differs, and `Carrier::Chord` is the setting that makes the
+/// vocoder a harmoniser with a different voice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// Pitch-shifted voices: the harmony sings the notes.
+    #[default]
+    Harmony,
+    /// A band vocoder: the voice's shape on the chord's sound.
+    Vocoder,
+}
+
+impl Mode {
+    pub const ALL: [Mode; 2] = [Mode::Harmony, Mode::Vocoder];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Harmony => "HARMONY",
+            Mode::Vocoder => "VOCODER",
+        }
+    }
+
+    pub fn from_norm(v: f32) -> Self {
+        match v >= 0.5 {
+            true => Mode::Vocoder,
+            false => Mode::Harmony,
+        }
+    }
+}
 
 /// The most voices, and the width of everything sized per voice.
 pub const MAX_VOICES: usize = 8;
@@ -52,7 +89,6 @@ pub const MAX_VOICES: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Shape {
     /// A third and a fifth above, then their octaves: the standard stack.
-    #[default]
     Thirds,
     /// Fifths and octaves — open, and the safest against a wrong key.
     Fifths,
@@ -64,16 +100,22 @@ pub enum Shape {
     Below,
     /// Tight, for the chorus-of-one sound rather than a chord.
     Cluster,
+    /// Third, fifth and seventh: a major seventh over the note being sung, and
+    /// the shape a harmoniser is reached for. The default, because two voices
+    /// of thirds is the safe answer and this is the one people want to hear.
+    #[default]
+    Maj7,
 }
 
 impl Shape {
-    pub const ALL: [Shape; 6] = [
+    pub const ALL: [Shape; 7] = [
         Shape::Thirds,
         Shape::Fifths,
         Shape::Octaves,
         Shape::Above,
         Shape::Below,
         Shape::Cluster,
+        Shape::Maj7,
     ];
 
     pub fn label(self) -> &'static str {
@@ -84,6 +126,7 @@ impl Shape {
             Shape::Above => "ABOVE",
             Shape::Below => "BELOW",
             Shape::Cluster => "CLUSTER",
+            Shape::Maj7 => "MAJ7",
         }
     }
 
@@ -100,6 +143,9 @@ impl Shape {
             Shape::Above => [2, 4, 6, 8, 10, 12, 14, 16],
             Shape::Below => [-2, -4, -6, -7, -9, -11, -14, -16],
             Shape::Cluster => [1, -1, 2, -2, 3, -3, 4, -4],
+            // Scale steps, so in a major key these are the major third, the
+            // fifth and the major seventh, then the same chord an octave up.
+            Shape::Maj7 => [2, 4, 6, 9, 11, 13, -3, -5],
         }
     }
 
@@ -219,6 +265,15 @@ pub struct Harmonizer {
     /// somebody sang. A follower has to follow the singer, not the meter.
     peak: f32,
     width: f32,
+    /// Which of the two things this effect is right now, and the vocoder it
+    /// keeps for when it is the other one. Built either way: switching mode
+    /// mid-song must not stop to build a filter bank.
+    mode: Mode,
+    voc: Vocoder,
+    /// What the panned voices have to be multiplied by for full wet to come out
+    /// as loud as the dry. Computed in [`Harmonizer::rebuild`] from the pans it
+    /// just assigned — see there for why it is not a constant.
+    makeup: f32,
     mix: f32,
     sample_rate: f32,
     dirty: bool,
@@ -230,7 +285,7 @@ impl Harmonizer {
         let mut h = Self {
             voices: (0..MAX_VOICES).map(|_| Voice::new()).collect(),
             count: 2,
-            shape: Shape::Thirds,
+            shape: Shape::default(),
             scale: Scale::new(0, ScaleType::Major),
             key: 0,
             kind: ScaleType::Major,
@@ -244,6 +299,9 @@ impl Harmonizer {
             env: Smoothed::new(0.0, 40.0, sr),
             peak: 0.0,
             width: 1.0,
+            mode: Mode::default(),
+            voc: Vocoder::new(sample_rate),
+            makeup: 1.0,
             mix: 0.5,
             sample_rate: sr,
             dirty: true,
@@ -271,8 +329,19 @@ impl Harmonizer {
         h.mix = get(8, 0.5).clamp(0.0, 1.0);
         h.midi = get(9, 0.0) >= 0.5;
         h.set_midi_channel(get(10, 0.0));
+        // 11 onwards is the vocoder half: the mode, then its own knobs.
+        // **Appended, not interleaved** — every index above is where it was
+        // before the two effects became one, so a project written against the
+        // old harmoniser opens with its knobs still on their own controls.
+        h.mode = Mode::from_norm(get(11, 0.0));
+        h.voc = Vocoder::with_params(sample_rate, &p[VOC_PARAM0.min(p.len())..]);
+        h.voc.set_mix(1.0);
         h.rebuild();
         h
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
     }
 
     /// 1..16, from a knob position.
@@ -420,6 +489,25 @@ impl Harmonizer {
             };
             voice.delay_frames = (delay_ms * share * 0.001 * sr).clamp(0.0, (MAX_DELAY - 2) as f32);
         }
+        // **What the pans cost, given back.** Two voices at full width sit hard
+        // left and hard right, so each channel carries exactly one of them at
+        // `1/sqrt(2)` — the wet arrives 3 dB under the dry before the shifter
+        // has taken its own cut, and a harmony 5 dB down is one that disappears
+        // into the track. Rather than a constant fudge, the loss is read off
+        // the pans that were just assigned: each channel is normalised to the
+        // power it would have had unpanned, so width and voice count can move
+        // without changing how loud the effect is.
+        let power = |ch: usize| -> f32 {
+            self.voices
+                .iter()
+                .take(count)
+                .map(|v| (v.level * v.gain[ch]).powi(2))
+                .sum::<f32>()
+        };
+        let loudest = power(0).max(power(1)).max(1e-6);
+        // Capped: a single hard-panned voice would otherwise ask for infinite
+        // makeup on the silent side.
+        self.makeup = (1.0 / loudest.sqrt()).clamp(1.0, 4.0);
         self.dirty = false;
         self.chord_seen = crate::chord::chord().generation();
         // The voice count follows the chord while it is driving.
@@ -429,8 +517,21 @@ impl Harmonizer {
     }
 }
 
+/// Where the vocoder's own knobs start in the merged parameter list, and how
+/// many of them there are — its dry/wet is not one of them: the merged effect
+/// has one, and it is `Wet` above.
+pub const VOC_PARAM0: usize = 12;
+pub const VOC_PARAMS: usize = 6;
+
 impl super::FxProcessor for Harmonizer {
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
+        if self.mode == Mode::Vocoder {
+            // The vocoder owns the whole block in this mode, dry/wet and all:
+            // two mixes in series would be a mix nobody can predict.
+            self.voc.set_mix(self.mix);
+            self.voc.process_block(buf, sample_rate);
+            return;
+        }
         let sr = sample_rate.max(8000) as f32;
         if (sr - self.sample_rate).abs() > 0.5 {
             self.sample_rate = sr;
@@ -447,6 +548,7 @@ impl super::FxProcessor for Harmonizer {
         }
         let count = self.count;
         let mix = self.mix;
+        let makeup = self.makeup;
         let env_amount = self.env_amount;
         // Two seconds to fall by 1/e, as a per-sample coefficient.
         let peak_decay = (-1.0 / (2.0 * sr)).exp();
@@ -488,12 +590,14 @@ impl super::FxProcessor for Harmonizer {
                 wet[1] += g * voice.gain[1];
             }
 
-            frame[0] = dry_l + mix * (wet[0] - dry_l);
-            frame[1] = dry_r + mix * (wet[1] - dry_r);
+            let (wet_l, wet_r) = (wet[0] * makeup, wet[1] * makeup);
+            frame[0] = dry_l + mix * (wet_l - dry_l);
+            frame[1] = dry_r + mix * (wet_r - dry_r);
         }
     }
 
     fn reset(&mut self) {
+        self.voc.reset();
         for v in self.voices.iter_mut() {
             v.shifter.reset();
             v.delay.fill(0.0);
@@ -543,7 +647,19 @@ impl super::FxProcessor for Harmonizer {
                 16.0,
                 "",
             ),
+            // The vocoder half, appended so nothing above it moved: the mode,
+            // then the vocoder's own knobs in its own order.
+            FxParam::new(
+                "Mode",
+                (self.mode == Mode::Vocoder) as u8 as f32,
+                0.0,
+                1.0,
+                "",
+            ),
         ]
+        .into_iter()
+        .chain(self.voc.params().into_iter().take(VOC_PARAMS))
+        .collect()
     }
 
     fn set_param(&mut self, index: usize, value: f32) {
@@ -578,6 +694,8 @@ impl super::FxProcessor for Harmonizer {
                 self.set_midi_channel(v);
                 self.dirty = true;
             }
+            11 => self.mode = Mode::from_norm(v),
+            i if i >= VOC_PARAM0 => self.voc.set_param(i - VOC_PARAM0, v),
             _ => {}
         }
     }
@@ -591,6 +709,92 @@ pub fn key_names() -> &'static [&'static str; 12] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The vocoder is this effect's other mode, and it is carried by the same
+    /// held chord the harmony follows.
+    #[test]
+    fn the_vocoder_is_a_mode_of_the_harmoniser_and_the_chord_carries_it() {
+        use crate::fx::FxProcessor;
+        let sr = 48_000u32;
+        let mut h = Harmonizer::new(sr);
+
+        // The knobs the harmoniser always had are where they were: the merge
+        // appended, so a project written before it opens unchanged.
+        let params = h.params();
+        assert_eq!(params[8].name, "Wet");
+        assert_eq!(params[9].name, "MIDI");
+        assert_eq!(params[11].name, "Mode");
+        assert_eq!(params.len(), VOC_PARAM0 + VOC_PARAMS);
+        assert_eq!(params[VOC_PARAM0].name, "Bands");
+
+        // Harmony by default; the mode knob swaps what the block does.
+        assert_eq!(h.mode(), Mode::Harmony);
+        h.set_param(11, 1.0);
+        assert_eq!(h.mode(), Mode::Vocoder);
+
+        // Vocoder mode, carried by the chord: nothing held is silence — a
+        // vocoder with no carrier says nothing — and a chord makes it speak.
+        h.set_param(VOC_PARAM0 + 1, crate::fx::vocoder::Carrier::Chord.to_norm());
+        h.set_mix(1.0);
+        crate::chord::chord().clear();
+        let mut buf: Vec<f32> = (0..2048).map(|i| ((i as f32) * 0.05).sin() * 0.5).collect();
+        h.process_block(&mut buf, sr);
+        let silent = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(silent < 1e-3, "no chord, no carrier: {silent}");
+
+        crate::chord::chord().set(&[48, 52, 55]);
+        let mut buf: Vec<f32> = (0..8192).map(|i| ((i as f32) * 0.05).sin() * 0.5).collect();
+        h.process_block(&mut buf, sr);
+        let sounding = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(sounding > 1e-3, "the chord carries the voice: {sounding}");
+        crate::chord::chord().clear();
+    }
+
+    /// Full wet has to arrive at the level of what went in.
+    ///
+    /// It did not: two voices at full width pan hard left and hard right, each
+    /// channel carried one of them at `1/sqrt(2)`, and with the pitch shifter's
+    /// own cut on top the harmony came out **4.9 dB under the dry** — present
+    /// on a meter, gone in a mix. The makeup in `rebuild` gives the pan's share
+    /// of that back; what is left is the shifter, which is material-dependent
+    /// and not a number to fake.
+    #[test]
+    fn the_wet_harmony_arrives_at_the_level_of_the_dry() {
+        use crate::fx::FxProcessor;
+        let sr = 48_000u32;
+        let mut h = Harmonizer::new(sr);
+        h.set_mix(1.0);
+        let (mut sum_in, mut sum_out, mut n) = (0.0f64, 0.0f64, 0u64);
+        let mut phase = 0.0f32;
+        for block in 0..200 {
+            let mut buf = vec![0.0f32; 512];
+            for f in buf.chunks_exact_mut(2) {
+                let s = (phase * std::f32::consts::TAU).sin() * 0.3;
+                phase = (phase + 220.0 / sr as f32).fract();
+                f[0] = s;
+                f[1] = s;
+            }
+            let dry = buf.clone();
+            h.process_block(&mut buf, sr);
+            // The first blocks are the shifter and the envelope filling up.
+            if block > 100 {
+                for (a, b) in dry.iter().zip(buf.iter()) {
+                    sum_in += (*a as f64) * (*a as f64);
+                    sum_out += (*b as f64) * (*b as f64);
+                    n += 1;
+                }
+            }
+        }
+        let loss = 20.0 * ((sum_out / n as f64).sqrt() / (sum_in / n as f64).sqrt()).log10();
+        assert!(
+            loss > -3.0,
+            "full wet is {loss:.1} dB under the dry — the harmony is being lost"
+        );
+        assert!(
+            loss < 3.0,
+            "and it must not be louder than what went in either"
+        );
+    }
     use crate::fx::FxProcessor;
 
     fn tone(hz: f32, sr: f32, frames: usize) -> Vec<f32> {
@@ -872,5 +1076,4 @@ mod tests {
         assert_eq!(h.midi_input(), None);
         crate::chord::chord().clear();
     }
-
 }

@@ -1,18 +1,8 @@
 # CHOZ
 
-![A terminal-based audio plugin host for the terminal.](docs/choz.png)
-
 A terminal-based audio plugin host for the terminal.
 
-"Choz" can mean a few different things depending on the context:
-
-* Tagalog Slang (Philippines): It is an informal spelling or variation of chos (from echos), meaning "just kidding," "joking," or used to brush off a statement as a joke.
-* Urban/Regional Slang: In some British regional dialects, it has historically been used to mean something "good" or "brilliant".
-* Spanish (Colloquial/Archaic): According to the Diccionario de la lengua española (RAE), choz can mean a sudden surprise, blow, or a state of amazement.
-* Zoning (Urban Planning): It can stand for an acronym like Central Heber Overlay Zone (a specific municipal planning term).
-* Toys/Media: It is frequently used as shorthand for "Cho-Z" (Super Z) series parts or spinning tops in franchises like Beyblade Burst.
-
-Choose the meaning that suits you best!
+![A terminal-based audio plugin host for the terminal.](docs/choz.png)
 
 Built with Rust, ratatui and cpal. Provides a TUI for managing note inputs, instruments and real-time FX chains.
 
@@ -20,7 +10,7 @@ Built with Rust, ratatui and cpal. Provides a TUI for managing note inputs, inst
 
 ## Status
 
-**1.3.0.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
+**1.3.1.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
 LADSPA, DSSI, VST2, VST3 and Pure Data patches are really hosted** — instruments
 and audio effects, with their own parameters and their own windows — choz's own
 45 effects are published as a CLAP plugin for other hosts, and choz installs as a
@@ -182,8 +172,8 @@ architecture (x86-64, aarch64, armv7), a `.deb`, an `.rpm` and a `PKGBUILD` for
 Arch, plus `SHA256SUMS.txt`:
 
 ```bash
-tar xzf choz-1.3.0-x86_64-unknown-linux-gnu.tar.gz
-cd choz-1.3.0-x86_64-unknown-linux-gnu
+tar xzf choz-1.3.1-x86_64-unknown-linux-gnu.tar.gz
+cd choz-1.3.1-x86_64-unknown-linux-gnu
 ./install.sh            # uses the binary shipped beside it — no cargo involved
 ```
 
@@ -271,26 +261,24 @@ headroom for plugin DSP at small buffer sizes.
 | `P` | anywhere | panic — kill every sounding note |
 | `F4` | anywhere | LIVE ↔ MULTI |
 | `F5` | anywhere | bottom panel: MONITOR / KEYS / WAVE / MIXER (the tabs are clickable) |
-| `F6` | anywhere | metronome on/off (the `▾` beside it opens tempo / signature / sound — arrows and the wheel move each row) |
+| `F6` | anywhere | metronome on/off (the `▾` beside it opens tempo / signature / grouping / sound — arrows, Enter and the wheel move each row) |
 | `<` `>` / `;` `:` | rack | input trim / `A→M` sensitivity of a tab fed by audio |
-| `←` `→` | TRANSPORT | length of the automation loop, in bars |
+| `F7` / `F8` / `F9` | anywhere | roll-stop the rack / arm automation recording / panic (all-notes-off) — the same three buttons that sit on the menu bar |
 | `m` / `S` | rack | mute / solo the tab |
 | `↑` `↓` / wheel | MIXER | that tab's level, one step (`Tab` focuses the MIXER while it is showing, or click a strip) |
 | `l` / `k` | MIXER | link the strip's two channels / pick which side the arrows move |
+| `C` | rack (FX) | which keyboard the selected effect takes its chord from |
+| `v` | rack | split the keyboard: which saved sound each octave plays |
+| `c` | rack (FX) | gate the selected effect from another tab — the kick that opens it |
+| `n` / `N` | rack, MIXER | level the tab / the whole rack again, from what it has played since it was loaded |
 | `c` / `r` | IN drawer | connect-disconnect a port / rescan inputs |
-
-A controller plugged in while choz is running is picked up on its own — the port
-list is polled every couple of seconds.
-
-Log: `~/.local/state/choz/choz.log` — plugin stdout lands there too, so it never
-paints over the TUI.
 
 ---
 
 ## Architecture
 
 ```
-choz/                      11 crates, version 1.3.0
+choz/                      11 crates, version 1.3.1
 ├── crates/
 │   ├── choz-ports/         RT-safe traits every host implements: AudioSource,
 │   │                       FxProcessor, PluginEditor, PluginParam, SandboxStatus
@@ -341,7 +329,7 @@ ring so they are freed off the RT thread.
 
 | | |
 |---|---|
-| choz | **1.3.0** |
+| choz | **1.3.1** |
 | Rust edition | 2021 (`choz-plugin-lv2` is 2024) |
 | Toolchain tested | rustc 1.97.1 |
 | Platform | Linux. ALSA/JACK/PipeWire. Released for x86-64, aarch64 and armv7 |

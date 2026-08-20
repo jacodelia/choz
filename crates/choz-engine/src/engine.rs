@@ -28,6 +28,8 @@ type Source = Box<dyn AudioSource>;
 pub(crate) struct Slot {
     source: Source,
     fx: FxChain,
+    /// Where this slot sums: a device pair, or a subgroup.
+    dest: Dest,
     /// Linear output gain (0.0..=2.0). Two of them, one per side: a desk lets
     /// you trim one channel of a stereo instrument against the other, and a
     /// linked strip simply keeps them equal — see `App::set_gain_side`.
@@ -83,6 +85,7 @@ impl Slot {
         Slot {
             source,
             fx: Vec::new(),
+            dest: Dest::default(),
             gain: 1.0,
             gain_r: 1.0,
             pan: 0.0,
@@ -195,6 +198,26 @@ pub(crate) enum EngineCommand {
         slot: usize,
         mix: f32,
     },
+    /// Where a slot sums: a device pair, or one of the subgroups.
+    SetSlotDest {
+        slot: usize,
+        dest: Dest,
+    },
+    /// One subgroup's strip.
+    SetBus {
+        bus: usize,
+        gain: f32,
+        mute: bool,
+        left: usize,
+        right: usize,
+    },
+    /// The main fader, on the first output pair. One level per channel: the
+    /// main is a stereo output like every other strip, and a single number
+    /// could not ride a rig whose two sides are not level.
+    SetMain {
+        gain: [f32; 2],
+        mute: bool,
+    },
     /// Trim on the slot's audio input, and how loud that input has to be before
     /// the pitch tracker calls it a note.
     SetSlotInTrim {
@@ -270,8 +293,9 @@ pub(crate) enum Retired {
 
 /// Max rack slots before the slot Vec would reallocate on the RT thread.
 /// ponytail: fixed cap keeps `AddSlot` alloc-free; raise it if anyone needs
-/// more than this many simultaneous sources.
-const MAX_SLOTS: usize = 32;
+/// more than this many simultaneous sources. The number lives in the meter,
+/// which has to size a per-slot array to the same cap.
+use crate::meter::MAX_SLOTS;
 
 /// Capacity of the UI → RT command ring, and of the retired ring that comes
 /// back. Sized for a burst: a chord plus a fader sweep between two audio
@@ -393,6 +417,76 @@ struct RtEndpoints {
     retired_tx: rtrb::Producer<Retired>,
 }
 
+/// Subgroups. Four, because a rack is grouped by what it is — keys, drums,
+/// guitars, the click — and a fifth name is one nobody uses.
+///
+/// A bus is a **destination that is not a device**: tabs sum into it, it has
+/// its own fader and mute, and what comes out of it lands on a device pair like
+/// a tab would. That is the whole of it — no sends, no inserts, no nesting.
+/// ponytail: flat and fixed-size, because both are what makes it allocation-free
+/// on the audio thread; a bus that feeds another bus is a different feature.
+pub const BUSES: usize = 4;
+
+/// Where a tab's (or the click's) audio goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Dest {
+    /// Straight to a pair of device channels, which is what everything did
+    /// before there were buses.
+    #[default]
+    Direct,
+    /// Into subgroup `0..BUSES`.
+    Bus(usize),
+}
+
+impl Dest {
+    /// `0` is direct, `1..=BUSES` are the subgroups — the encoding projects and
+    /// the command ring carry, so a number is enough to name a destination.
+    pub fn from_index(i: usize) -> Self {
+        match i {
+            0 => Dest::Direct,
+            n if n <= BUSES => Dest::Bus(n - 1),
+            _ => Dest::Direct,
+        }
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            Dest::Direct => 0,
+            Dest::Bus(b) => b + 1,
+        }
+    }
+
+    /// `OUT`, `A`, `B`, `C`, `D` — what the strip shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            Dest::Direct => "OUT",
+            Dest::Bus(0) => "A",
+            Dest::Bus(1) => "B",
+            Dest::Bus(2) => "C",
+            Dest::Bus(3) => "D",
+            Dest::Bus(_) => "?",
+        }
+    }
+}
+
+/// One subgroup's strip, as the audio thread holds it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Bus {
+    gain: f32,
+    mute: bool,
+    out_pair: (usize, usize),
+}
+
+impl Default for Bus {
+    fn default() -> Self {
+        Self {
+            gain: 1.0,
+            mute: false,
+            out_pair: (0, 1),
+        }
+    }
+}
+
 /// State owned by the real-time audio callback. No locks, no allocation.
 pub(crate) struct RtState {
     pub(crate) playing: Arc<AtomicBool>,
@@ -407,6 +501,16 @@ pub(crate) struct RtState {
     /// One pre-allocated buffer per device output channel. Slots sum into the
     /// pair they are routed to; the backend copies these to its ports.
     pub(crate) mix: Vec<Vec<f32>>,
+    /// Two pre-allocated buffers per subgroup, laid out `[bus * 2 + channel]`.
+    /// A tab routed to a bus sums here instead of into `mix`, and the bus is
+    /// folded into `mix` once its own fader has been applied.
+    pub(crate) bus_mix: Vec<Vec<f32>>,
+    pub(crate) buses: [Bus; BUSES],
+    /// The main strip: the last thing the **first** output pair passes through,
+    /// which is the pair everything calls "the output" and the one the meter
+    /// reads. The other pairs are separate outputs, not part of a main.
+    pub(crate) main_gain: [f32; 2],
+    pub(crate) main_mute: bool,
     /// One pre-allocated buffer per device *input* channel, filled by the
     /// backend before `render` so a slot can process live audio.
     pub(crate) capture: Vec<Vec<f32>>,
@@ -806,6 +910,10 @@ impl AudioEngine {
             scratch: vec![0.0; frames * 2],
             dry: vec![0.0; frames * 2],
             mix: vec![vec![0.0; frames]; outs.max(2)],
+            bus_mix: vec![vec![0.0; frames]; BUSES * 2],
+            buses: [Bus::default(); BUSES],
+            main_gain: [1.0, 1.0],
+            main_mute: false,
             capture: vec![vec![0.0; frames]; ins],
             capture_rx,
             sample_rate: self.sample_rate,
@@ -1267,13 +1375,59 @@ impl AudioEngine {
         let _ = self.cmd_tx.push(cmd);
     }
 
+    /// Play a note into a freshly-built instrument and measure how loud it is,
+    /// **before** it reaches the audio thread.
+    ///
+    /// This is the reading the interface trims the tab's fader from, and taking it
+    /// here is what makes the trim happen at load rather than after the player has
+    /// already been deafened by the first chord. The source is not in a slot yet,
+    /// so this thread owns it outright: rendering it costs nobody a deadline, and
+    /// it runs as fast as the CPU allows rather than in real time.
+    ///
+    /// Only instruments are probed — [`AudioSource::plays_on_transport_stop`] is
+    /// what separates them from a WAV or a tone, and rendering one of those would
+    /// eat the first half-second of the file before the play button was ever
+    /// pressed. A plugin that answers with silence (it wants warming up, or the
+    /// note lands where it has no sample) publishes nothing, and the fader is left
+    /// where it was rather than moved on a reading of nothing.
+    fn probe_levels(source: &mut Source, slot: usize, sample_rate: u32) {
+        /// Long enough for an attack and the start of a decay, short enough that a
+        /// load does not visibly wait on it.
+        const SECONDS: f32 = 0.6;
+        /// Middle C at a normal velocity: what a player checking a new patch hits.
+        const NOTE: u8 = 60;
+        const VELOCITY: u8 = 100;
+        const BLOCK: usize = 256;
+
+        let levels = crate::meter::slot_levels();
+        levels.reset(slot);
+        if sample_rate == 0 || !source.plays_on_transport_stop() {
+            return;
+        }
+        let mut buf = vec![0.0f32; BLOCK * 2];
+        source.note_on(NOTE, VELOCITY);
+        let blocks = ((sample_rate as f32 * SECONDS) as usize).div_ceil(BLOCK);
+        for _ in 0..blocks {
+            buf.fill(0.0);
+            // A source is not required to overwrite what it is handed, so the
+            // buffer is cleared each time and everything past what it wrote is
+            // silence by construction.
+            let written = source.render(&mut buf, sample_rate);
+            levels.publish(slot, &buf[..(written * 2).min(buf.len())]);
+        }
+        // Hand it over silent. The note was ours, not the player's.
+        source.note_off(NOTE);
+        source.all_notes_off();
+    }
+
     /// Append a source as a new rack slot. Returns its index. No-op past
     /// [`MAX_SLOTS`].
-    fn add_slot(&mut self, source: Source) -> Option<usize> {
+    fn add_slot(&mut self, mut source: Source) -> Option<usize> {
         if self.slot_count >= MAX_SLOTS {
             return None;
         }
         let idx = self.slot_count;
+        Self::probe_levels(&mut source, idx, self.sample_rate);
         self.editors.push(source.editor());
         self.touches.push(source.param_touch());
         self.states.push(source.state());
@@ -1294,6 +1448,10 @@ impl AudioEngine {
     pub fn remove_slot(&mut self, slot: usize) {
         if slot < self.slot_count {
             self.send(EngineCommand::RemoveSlot(slot));
+            // Later tabs shift down a place, so every stored level now belongs
+            // to a different tab. Start them all again rather than keep a set
+            // of readings that are off by one.
+            crate::meter::slot_levels().reset_all();
             self.slot_count -= 1;
             self.editors.remove(slot);
             self.fx_editors.remove(slot);
@@ -1378,6 +1536,38 @@ impl AudioEngine {
         self.send(EngineCommand::SetSlotInTrim { slot, gain, gate });
     }
 
+    /// Point slot `slot` at a device pair or a subgroup. The pair itself is
+    /// still [`Self::set_slot_out`]'s — a tab keeps where it would land if it
+    /// were taken off the bus again.
+    pub fn set_slot_dest(&mut self, slot: usize, dest: Dest) {
+        if slot >= self.slot_count {
+            return;
+        }
+        self.send(EngineCommand::SetSlotDest { slot, dest });
+    }
+
+    /// One subgroup's fader, mute and output pair.
+    pub fn set_bus(&mut self, bus: usize, gain: f32, mute: bool, pair: (usize, usize)) {
+        if bus >= BUSES {
+            return;
+        }
+        self.send(EngineCommand::SetBus {
+            bus,
+            gain,
+            mute,
+            left: pair.0,
+            right: pair.1,
+        });
+    }
+
+    /// The main strip: a fader per channel over the first output pair.
+    pub fn set_main(&mut self, gain: f32, gain_r: f32, mute: bool) {
+        self.send(EngineCommand::SetMain {
+            gain: [gain, gain_r],
+            mute,
+        });
+    }
+
     /// Set slot `slot`'s mixer strip: linear `gain`, `pan` (-1 left .. 1 right)
     /// and `mute`.
     pub fn set_slot_mix(&mut self, slot: usize, gain: f32, gain_r: f32, pan: f32, mute: bool) {
@@ -1425,10 +1615,11 @@ impl AudioEngine {
     }
 
     /// Replace slot `slot`'s source. The old one is dropped off the RT thread.
-    fn set_slot_source(&mut self, slot: usize, source: Source) {
+    fn set_slot_source(&mut self, slot: usize, mut source: Source) {
         if slot >= self.slot_count {
             return;
         }
+        Self::probe_levels(&mut source, slot, self.sample_rate);
         self.editors[slot] = source.editor();
         self.touches[slot] = source.param_touch();
         self.states[slot] = source.state();
@@ -1758,6 +1949,28 @@ impl RtState {
                         s.mute = mute;
                     }
                 }
+                EngineCommand::SetSlotDest { slot, dest } => {
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        s.dest = dest;
+                    }
+                }
+                EngineCommand::SetBus {
+                    bus,
+                    gain,
+                    mute,
+                    left,
+                    right,
+                } => {
+                    if let Some(b) = state.buses.get_mut(bus) {
+                        b.gain = gain.clamp(0.0, 2.0);
+                        b.mute = mute;
+                        b.out_pair = (left, right);
+                    }
+                }
+                EngineCommand::SetMain { gain, mute } => {
+                    state.main_gain = [gain[0].clamp(0.0, 2.0), gain[1].clamp(0.0, 2.0)];
+                    state.main_mute = mute;
+                }
                 EngineCommand::SetSlotOut { slot, left, right } => {
                     if let Some(s) = state.slots.get_mut(slot) {
                         s.out_pair = (left, right);
@@ -1947,13 +2160,17 @@ impl RtState {
             scratch,
             dry,
             mix,
+            bus_mix,
+            buses,
+            main_gain,
+            main_mute,
             capture,
             playing,
             sample_rate,
             ..
         } = self;
         let last = mix.len().saturating_sub(1);
-        for ch in mix.iter_mut() {
+        for ch in mix.iter_mut().chain(bus_mix.iter_mut()) {
             let n = frames.min(ch.len());
             ch[..n].fill(0.0);
         }
@@ -2164,14 +2381,30 @@ impl RtState {
             for fx in slot.fx.iter_mut() {
                 fx.process_block(sc, sr);
             }
+            // How loud this tab is on its own, **before** the strip: the
+            // number auto-trim solves against, and the only way the health log
+            // can name which tab clipped the mix.
+            crate::meter::slot_levels().publish(slot_index, sc);
             // Muted slots still render (so envelopes/playheads keep moving) but
             // sum in at zero gain. A pair pointing past the device's channels
             // folds onto the last one rather than going silent.
             let (gl, gr) = slot.channel_gains();
-            let (l, r) = (slot.out_pair.0.min(last), slot.out_pair.1.min(last));
-            for f in 0..(n / 2) {
-                mix[l][f] += sc[f * 2] * gl;
-                mix[r][f] += sc[f * 2 + 1] * gr;
+            // A tab routed to a subgroup never touches a device pair: the bus
+            // owns where it lands, which is the point of having one.
+            match slot.dest {
+                Dest::Bus(b) if b < BUSES => {
+                    for f in 0..(n / 2) {
+                        bus_mix[b * 2][f] += sc[f * 2] * gl;
+                        bus_mix[b * 2 + 1][f] += sc[f * 2 + 1] * gr;
+                    }
+                }
+                _ => {
+                    let (l, r) = (slot.out_pair.0.min(last), slot.out_pair.1.min(last));
+                    for f in 0..(n / 2) {
+                        mix[l][f] += sc[f * 2] * gl;
+                        mix[r][f] += sc[f * 2 + 1] * gr;
+                    }
+                }
             }
             // What this tab cost, source and FX chain together. Two clock
             // reads a block per tab, and the only way the log can name which
@@ -2179,18 +2412,72 @@ impl RtState {
             crate::meter::load().publish_slot(slot_index, slot_started.elapsed());
         }
 
+        // Each subgroup, through its own fader, onto the pair it points at. A
+        // muted bus still had its tabs rendered — envelopes and playheads keep
+        // moving — it simply does not arrive.
+        for (b, bus) in buses.iter().enumerate() {
+            let g = match bus.mute {
+                true => 0.0,
+                false => bus.gain,
+            };
+            let (l, r) = (bus.out_pair.0.min(last), bus.out_pair.1.min(last));
+            let n = frames
+                .min(bus_mix[b * 2].len())
+                .min(bus_mix[b * 2 + 1].len());
+            for f in 0..n {
+                let (a, c) = (bus_mix[b * 2][f] * g, bus_mix[b * 2 + 1][f] * g);
+                mix[l][f] += a;
+                mix[r][f] += c;
+            }
+        }
+
         // The click, on top of everything and through no tab's FX: a metronome
-        // that a reverb smears is a metronome you cannot play to. It goes to
-        // the first output pair, which is the one being listened on.
+        // that a reverb smears is a metronome you cannot play to. Where it
+        // lands is the metronome's own setting — the point of a subgroup is
+        // being able to send the click to the player's wedge and nowhere else.
         if mix.len() >= 2 {
             let n = frames.min(mix[0].len()).min(mix[1].len());
             let len = (n * 2).min(scratch.len());
             let sc = &mut scratch[..len];
             sc.fill(0.0);
-            crate::metronome::metronome().render(sc, n, sr);
-            for f in 0..sc.len() / 2 {
-                mix[0][f] += sc[f * 2];
-                mix[1][f] += sc[f * 2 + 1];
+            let click = crate::metronome::metronome();
+            click.render(sc, n, sr);
+            match click.dest() {
+                Dest::Bus(b) if b < BUSES => {
+                    // Straight past the bus fader: the click is a reference, and
+                    // a reference that moves when somebody rides the group
+                    // fader is not one. It borrows the bus's *routing*, not its
+                    // level.
+                    let bus = buses[b];
+                    let (l, r) = (bus.out_pair.0.min(last), bus.out_pair.1.min(last));
+                    for f in 0..sc.len() / 2 {
+                        mix[l][f] += sc[f * 2];
+                        mix[r][f] += sc[f * 2 + 1];
+                    }
+                }
+                _ => {
+                    for f in 0..sc.len() / 2 {
+                        mix[0][f] += sc[f * 2];
+                        mix[1][f] += sc[f * 2 + 1];
+                    }
+                }
+            }
+        }
+
+        // The main strip, last: one fader on the pair everything calls the
+        // output. The other pairs are separate outputs and are left alone —
+        // a main that also trimmed channels 7 and 8 would be a master fader
+        // that silences a monitor send.
+        let main = match *main_mute {
+            true => [0.0, 0.0],
+            false => *main_gain,
+        };
+        if main.iter().any(|g| (g - 1.0).abs() > f32::EPSILON) && mix.len() >= 2 {
+            let n = frames.min(mix[0].len()).min(mix[1].len());
+            for (ch, g) in mix.iter_mut().take(2).zip(main) {
+                for s in ch[..n].iter_mut() {
+                    *s *= g;
+                }
             }
         }
 
@@ -2795,6 +3082,10 @@ mod tests {
             scratch: vec![0.0; 64],
             dry: vec![0.0; 64],
             mix: vec![vec![0.0; 32]; outs],
+            bus_mix: vec![vec![0.0; 32]; BUSES * 2],
+            buses: [Bus::default(); BUSES],
+            main_gain: [1.0, 1.0],
+            main_mute: false,
             capture: vec![vec![0.0; 32]; ins],
             capture_rx: None,
             sample_rate: 48_000,
@@ -3112,6 +3403,7 @@ mod tests {
             .unwrap();
         // A harmoniser, exactly as the rack builds one: from a spec.
         let spec = crate::fx_chain::FxSpec {
+            gate: None,
             kind: "harmonizer".into(),
             enabled: true,
             wet: 1.0,
@@ -3804,6 +4096,246 @@ mod tests {
             matches!(retired_rx.pop(), Ok(Retired::Source(_))),
             "old source dropped off-RT"
         );
+    }
+
+    /// A source that is gated by the play button — a WAV, a tone — must not be
+    /// probed: rendering it would spend the start of the file before anyone
+    /// pressed play.
+    struct Gated;
+    impl AudioSource for Gated {
+        fn render(&mut self, out: &mut [f32], _sr: u32) -> usize {
+            out.fill(1.0);
+            out.len() / 2
+        }
+    }
+
+    /// A fresh instrument is measured on the way in, so the fader can be set
+    /// before the first note is heard rather than after.
+    #[test]
+    fn a_new_instrument_is_measured_before_it_reaches_the_audio_thread() {
+        let levels = crate::meter::slot_levels();
+        // Two tabs nothing else in this file touches.
+        let (probed, skipped) = (20usize, 21usize);
+
+        let mut synth: Source = Box::new(DcSource(0.4));
+        AudioEngine::probe_levels(&mut synth, probed, 48_000);
+        let (peak, rms) = levels.read(probed);
+        assert!((peak - 0.4).abs() < 1e-6, "peak {peak}");
+        assert!((rms - 0.4).abs() < 1e-6, "rms {rms}");
+
+        // The probe leaves a reading, not a running note.
+        let mut src: Source = Box::new(Gated);
+        AudioEngine::probe_levels(&mut src, skipped, 48_000);
+        assert_eq!(
+            levels.read(skipped),
+            (0.0, 0.0),
+            "a gated source is left alone"
+        );
+
+        // And a probe of a new instrument replaces the old one's reading rather
+        // than being hidden behind it.
+        let mut quiet: Source = Box::new(DcSource(0.05));
+        AudioEngine::probe_levels(&mut quiet, probed, 48_000);
+        let (peak, _) = levels.read(probed);
+        assert!((peak - 0.05).abs() < 1e-6, "the loud one is gone: {peak}");
+
+        levels.reset(probed);
+        levels.reset(skipped);
+    }
+
+    /// A subgroup is a destination that is not a device: tabs sum into it, its
+    /// own fader rides them together, and its output pair decides where the
+    /// group lands. The main fader is the last thing the first pair sees.
+    #[test]
+    fn a_subgroup_carries_its_tabs_and_the_main_rides_everything() {
+        let _clock = crate::test_locks::transport();
+        // Four outputs: the group can be sent somewhere the main is not.
+        let (mut cmd_tx, _retired, mut state) = mk_state_ch(4, 0);
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(DcSource(0.5))))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(DcSource(0.25))))
+            .unwrap();
+        // Both tabs onto bus A, and the bus out of channels 3/4.
+        for slot in 0..2 {
+            cmd_tx
+                .push(EngineCommand::SetSlotDest {
+                    slot,
+                    dest: Dest::Bus(0),
+                })
+                .unwrap();
+        }
+        cmd_tx
+            .push(EngineCommand::SetBus {
+                bus: 0,
+                gain: 1.0,
+                mute: false,
+                left: 2,
+                right: 3,
+            })
+            .unwrap();
+        state.apply_commands();
+        state.render(8);
+
+        // Constant-power pan sits a centred tab at 1/sqrt(2) on each side.
+        let unity = std::f32::consts::FRAC_1_SQRT_2;
+        let both = (0.5 + 0.25) * unity;
+        assert!(
+            (state.mix[2][0] - both).abs() < 1e-5,
+            "the group carries both tabs: {}",
+            state.mix[2][0]
+        );
+        assert!(
+            state.mix[0][0].abs() < 1e-6,
+            "and nothing reached the pair they are not routed to: {}",
+            state.mix[0][0]
+        );
+
+        // The group's own fader rides the tabs together.
+        cmd_tx
+            .push(EngineCommand::SetBus {
+                bus: 0,
+                gain: 0.5,
+                mute: false,
+                left: 2,
+                right: 3,
+            })
+            .unwrap();
+        state.apply_commands();
+        state.render(8);
+        assert!(
+            (state.mix[2][0] - both * 0.5).abs() < 1e-5,
+            "half the group: {}",
+            state.mix[2][0]
+        );
+
+        // Muted, it is gone — but its tabs still rendered, which is what keeps
+        // envelopes and playheads moving under a muted group.
+        cmd_tx
+            .push(EngineCommand::SetBus {
+                bus: 0,
+                gain: 0.5,
+                mute: true,
+                left: 2,
+                right: 3,
+            })
+            .unwrap();
+        state.apply_commands();
+        state.render(8);
+        assert!(
+            state.mix[2][0].abs() < 1e-6,
+            "a muted group does not arrive"
+        );
+
+        // Back to the main pair, where the main fader is the last word.
+        for slot in 0..2 {
+            cmd_tx
+                .push(EngineCommand::SetSlotDest {
+                    slot,
+                    dest: Dest::Direct,
+                })
+                .unwrap();
+        }
+        cmd_tx
+            .push(EngineCommand::SetMain {
+                gain: [0.5, 0.5],
+                mute: false,
+            })
+            .unwrap();
+        state.apply_commands();
+        state.render(8);
+        assert!(
+            (state.mix[0][0] - both * 0.5).abs() < 1e-5,
+            "the main halves the first pair: {}",
+            state.mix[0][0]
+        );
+        assert!(
+            state.mix[2][0].abs() < 1e-6,
+            "and the group's pair is empty again"
+        );
+
+        // The main is the first pair only: another pair is a separate output,
+        // not something a master fader may silence.
+        cmd_tx
+            .push(EngineCommand::SetSlotOut {
+                slot: 0,
+                left: 2,
+                right: 3,
+            })
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetMain {
+                gain: [0.0, 0.0],
+                mute: false,
+            })
+            .unwrap();
+        state.apply_commands();
+        state.render(8);
+        assert!(
+            (state.mix[2][0] - 0.5 * unity).abs() < 1e-5,
+            "channels 3/4 are their own output: {}",
+            state.mix[2][0]
+        );
+
+        // The main is a **stereo** strip: its two faders move apart, which is
+        // what a rig whose sides are not level needs and what one number could
+        // not say.
+        cmd_tx
+            .push(EngineCommand::SetSlotOut {
+                slot: 0,
+                left: 0,
+                right: 1,
+            })
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetMain {
+                gain: [1.0, 0.25],
+                mute: false,
+            })
+            .unwrap();
+        state.apply_commands();
+        state.render(8);
+        let (l, r) = (state.mix[0][0], state.mix[1][0]);
+        assert!(l.abs() > 1e-4, "the left side still sounds: {l}");
+        assert!(
+            (r / l - 0.25).abs() < 1e-4,
+            "the right fader is a quarter of the left one: {l} vs {r}"
+        );
+    }
+
+    /// The click can be sent to a subgroup — a wedge, say — and it borrows that
+    /// group's routing without passing through its fader: a reference that
+    /// moves when somebody rides the group is not a reference.
+    #[test]
+    fn the_click_goes_where_the_metronome_says() {
+        let _clock = crate::test_locks::transport();
+        let (mut cmd_tx, _retired, mut state) = mk_state_ch(4, 0);
+        let m = crate::metronome::metronome();
+        m.set_on(true);
+        m.set_gain(1.0);
+        choz_ports::transport().set_bpm(120.0);
+        cmd_tx
+            .push(EngineCommand::SetBus {
+                bus: 1,
+                gain: 0.0,
+                mute: true,
+                left: 2,
+                right: 3,
+            })
+            .unwrap();
+        m.set_dest(Dest::Bus(1));
+        state.apply_commands();
+        state.render(8);
+        let click = (0..8).fold(0.0f32, |acc, f| acc.max(state.mix[2][f].abs()));
+        assert!(click > 0.01, "the click reached the group's pair: {click}");
+        assert!(
+            (0..8).all(|f| state.mix[0][f].abs() < 1e-6),
+            "and not the main pair"
+        );
+
+        m.set_dest(Dest::Direct);
+        m.set_on(false);
     }
 
     #[test]

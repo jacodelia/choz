@@ -7,6 +7,7 @@ fn main() {
     // A typical rack: the FX a MIDI-learned knob would be driving.
     for kind in ["delay", "reverb", "grandelay", "compressor"] {
         let mk = || FxSpec {
+            gate: None,
             kind: kind.to_string(),
             enabled: true,
             wet: 0.5,

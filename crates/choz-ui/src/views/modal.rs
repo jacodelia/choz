@@ -25,6 +25,10 @@ pub struct ListModal {
     pub filters: Vec<String>,
     pub filter: usize,
     pub items: Vec<String>,
+    /// A colour per row, when the list is about things that have one — the
+    /// keyboard split's sounds. Empty (the usual) draws every row in the
+    /// panel's own text colour.
+    pub colours: Vec<Option<Color>>,
     pub cursor: usize,
     pub scroll: usize,
     /// Extra line above the buttons (e.g. the current directory).
@@ -275,7 +279,10 @@ pub fn draw_list_modal(
         let (bg, fg) = if sel {
             (ACCENT, Color::Black)
         } else {
-            (PANEL_BG, text())
+            (
+                PANEL_BG,
+                m.colours.get(i).copied().flatten().unwrap_or_else(text),
+            )
         };
         let text = format!("{}{}", if sel { "\u{25B6} " } else { "  " }, label);
         f.render_widget(

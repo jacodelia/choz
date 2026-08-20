@@ -83,7 +83,7 @@ pub fn connect_inputs(
             "choz-in-conn",
             move |_ts, data, _| {
                 if let Some(msg) = clock.feed(data, _ts) {
-                    let _ = txc.send(InputEvent::Clock(msg));
+                    let _ = txc.send(InputEvent::Clock(source, msg));
                     return;
                 }
                 match parse(data) {

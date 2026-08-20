@@ -983,6 +983,7 @@ fn params_of(info: &Lv2PluginInfo) -> Vec<PluginParam> {
     ports
         .iter()
         .map(|p| PluginParam {
+            group: None,
             id: p.index,
             name: if p.name.is_empty() {
                 p.symbol.clone()
