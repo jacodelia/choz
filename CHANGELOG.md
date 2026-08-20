@@ -12,14 +12,219 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **602 tests** con harness + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **606 tests** con harness + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio.
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
 - `cargo test --workspace` necesita `--no-fail-fast`: uno de los binarios con
   `harness = false` no reconoce los argumentos que cargo le pasa y aborta la
   corrida. Por crate (`-p choz-engine -p choz-ui`) va entero.
 
-## [Sin publicar] — 2026-08-19 (bis)
+## [1.3.1] — 2026-08-20
+
+Ocho puntos pedidos en una sesión, y tres bugs que aparecieron al medirlos. Lo
+que tienen en común: **casi ninguno era donde el síntoma decía**. El armonizador
+que "no armonizaba" no era el DSP, la saturación al pisar el sustain no era el
+nivel, y el DSP % que subía no subía.
+
+### El armonizador no seguía el acorde
+
+Dos bugs, los dos en la interfaz, ninguno en el DSP:
+
+- `publish_chord` estrechaba las notas al `active_slot` **también** cuando había
+  un puerto elegido. El caso real es micrófono en esta tab y el acorde tocado en
+  un teclado ruteado a **otra** — el flujo entero de la petición — y ese filtro
+  tiraba justo esas notas: el armonizador cantaba su *shape* contra un acorde
+  vacío. Ahora, con puerto elegido no se estrecha por tab; el puerto **es** la
+  identidad. Sin puerto no hay otra forma de saber de qué teclado hablamos, así
+  que ahí el tab activo sigue siendo el filtro.
+- Elegir el teclado no encendía el interruptor `MIDI` del efecto (índice 9). El
+  puerto y el interruptor son dos mitades de una respuesta; elegir uno enciende
+  el otro.
+
+Y el botón: `CHORD` ahora está **dentro de la ventana del efecto**, no sólo en
+la tecla `C`. Un ruteo que el panel no menciona es un ruteo que nadie encuentra.
+
+### El cazador de acoples estaba calibrado al revés
+
+Reportado como "el armonizador empieza bien pero no sostiene una nota larga", y
+no era el armonizador: `FeedbackGuard` está en la **entrada**, antes del trim,
+así que se lleva la voz y la armonía juntas.
+
+Medido con `examples/guard_probe`, con las constantes viejas (`GROWTH` 1,5×
+**por chequeo de 64 ms**, tres chequeos):
+
+```
+sung note              worst 1.000   ← ataque de 150 ms, pasa
+sung swell 600 ms      worst 0.126   ← -18 dB, y se queda ahí
+sung + vibrato         worst 0.126
+howl +6 dB/s           worst 1.000   ← un acople real, NO se detecta
+howl +18 dB/s          worst 0.126
+```
+
+Cazaba cantantes y dejaba pasar acoples. Dos errores:
+
+1. 1,5× por chequeo de 64 ms exige **+55 dB/s**. El ataque de una nota cantada
+   lo pasa; un lazo de +6 dB/s sube 0,4 dB entre chequeos y nunca llegaba.
+2. Lo único que soltaba el duck era `env < FLOOR*0.7` — que la sala se callara,
+   o sea que el cantante dejara de cantar. Eso es literalmente el síntoma.
+
+Lo que se hizo: el crecimiento se mide contra la lectura **más vieja del
+historial** (medio segundo atrás), que lo vuelve una tasa y no un salto; hacen
+falta `GROWTH_CHECKS = 16` ventanas seguidas (~1,5 s de crecimiento
+**continuo**), que es lo único que separa a un cantante de un lazo —los dos
+crecen, pero una nota deja de crecer cuando llega—; y el duck se suelta cuando
+**deja de crecer** (`CALM_CHECKS`), no sólo con silencio.
+
+```
+sung note              worst 1.000
+sung swell 600 ms      worst 1.000
+sung + vibrato         worst 1.000
+crescendo 2 s          worst 0.126 → recupera a 0.90 sin silencio
+howl +6 dB/s           worst 0.126  y lo sostiene
+howl +18 dB/s          worst 0.126
+```
+
+Falta: un crescendo largo de verdad (2 s subiendo) sigue siendo indistinguible
+de un lazo lento **mientras sube**. Dispara, pero ahora se suelta solo en cuanto
+para. El interruptor sigue en Settings → AUDIO.
+
+### "Se satura al pisar el sustain" son huecos, no clipping
+
+Auditoría pedida porque el problema volvía después de haberse dado por
+solucionado. El log del usuario lo dice entero: el grafo corre a **96 kHz con
+128 frames**, o sea **1,33 ms por bloque**, y la tab de SoundFont sola ya cuesta
+0,66–1,04 ms de eso —532 de 716 avisos la nombran a ella; Surge XT es la segunda
+con 91—. El peor bloque **no crece** durante la sesión: arranca en 1,4 ms y se
+queda ahí. El rack vive al borde desde el primer minuto.
+
+Pisar el sustain no baja ninguna voz, así que el pool de oxisynth se llena y se
+queda lleno. Medido con `examples/sustain_probe`: un bloque pasaba de 233 µs al
+minuto a 330 µs una vez lleno, **+40 % en una sola tab**. Un bloque que se pasa
+del presupuesto es un hueco en la salida, y un hueco suena a distorsión, no a
+nivel — de ahí "satura".
+
+Lo que se hizo: **polifonía 64** en `Sf2Synth` (el default de oxisynth es 256).
+Coste plano en ~124 µs con el pedal abajo, 2,7× más barato, sin tocar el pico de
+nivel (0,115 medido antes y después). Sesenta y cuatro voces siguen cubriendo
+las dos manos sostenidas sobre un preset de tres capas.
+
+Y sí, parte del problema **es** el sistema: hay líneas de "el grafo sólo corrió
+380 de 750 ciclos" que son otro cliente xruneando en el mismo grafo. Las dos
+cosas son ciertas; el diagnóstico anterior no estaba mal, estaba incompleto.
+
+### El DSP % que subía no subía
+
+`Load::last()` leía `last_us`, **uno** de los ~190 bloques por segundo, y
+`elapsed()` es reloj de pared: un bloque que se comió una expropiación se lee
+como un rack que cuesta el 40 % cuando el tiempo de CPU del hilo dice 4 %. Eso
+es lo que parecía "el número sube cuanto más tiempo lleva choz abierto".
+
+Medido con `/proc/PID/task/*/stat` sobre tres minutos: ni la CPU del `data-loop`
+ni el RSS crecen. Descartado también por medición: **denormales** —los 14 FX con
+cola larga contra 30 s de silencio, ninguno pasa de 1,14×— y acumulación
+ilimitada de voces.
+
+Ahora `Load` publica una media exponencial (1/16, ~100 ms). El pico sigue
+aparte, porque un deadline se pierde por picos y no por medias.
+
+De paso: `take_worst_slot` sólo se leía **camino a un aviso**, así que no se
+vaciaba nunca en un segundo sano y la primera línea después de una hora nombraba
+la tab que alguna vez fue cara, no la que se está pasando ahora. Se lee siempre.
+
+### MIXER: el main es un canal estéreo
+
+`main_gain` pasa de `f32` a `[f32; 2]`, y la strip `MAIN` dibuja dos faders y su
+link como cualquier tab. El main es una salida como las demás, y un equipo cuyos
+dos lados no están parejos —un wedge más lejos de la pared, un ampli con más
+encima— se corrige acá o en ningún lado.
+
+El proyecto guarda `main_gain_r` y `main_link`; ausentes significan "enlazados
+en `main_gain`", que es como sonaban los proyectos escritos antes.
+
+### FX CHAIN: el gate escucha una tab, el clock, o el tap del metrónomo
+
+`GateSpec.source` deja de ser un `usize` y pasa a
+`GateSource::{Tab(i), Clock, Metronome}`, con botón `GATE` dentro de la ventana
+del efecto. El picker camina `OFF → cada tab → CLOCK → TAP → OFF`.
+
+Las dos fuentes nuevas son para el efecto que tiene que abrir **en el pulso** y
+no en un golpe: un tremolo que corta a tiempo, un delay que sólo habla entre
+compases. No tienen nada que escuchar cuando no hay nadie tocando, y pedirle al
+músico que mantenga una tab de clicks sonando sólo para manejarlo es un rodeo,
+no una función.
+
+- `Metronome` lee el tap **como suena de verdad**: cero con el metrónomo
+  apagado, y con los acentos del compás.
+- `Clock` es un pulso en cada beat del transporte, siga el reloj interno o uno
+  externo. Derivado de la posición, así que seguir un clock externo no es un
+  caso especial: el transporte **es** el clock externo.
+
+En disco va `serde(untagged)`: un número es una tab, un string es `"clock"` o
+`"tap"`. Los proyectos viejos cargan igual.
+
+### rack/sounds: los botones se asignan desde el mismo modal de bank/preset
+
+`ModalKind::SoundAssign(i)`: la misma lista que abre `BANK`, con una fila
+adelante —*lo que está sonando ahora*—. Un botón que sólo puede recibir lo que
+justo estaba sonando cuando se guardó por primera vez es un botón con el que no
+se planea un set.
+
+Click izquierdo en un botón **vacío** abre el modal; en uno lleno sigue siendo
+recall, que es el gesto que tiene que sobrevivir a un escenario. Click derecho
+abre el modal en cualquiera, así que todos son reasignables. Todos ya eran
+alcanzables por MIDI learn (`TriggerAction::SoundRecall(i)`), vacíos incluidos.
+
+Falta: asignar un preset a un botón lee el estado del plugin **inmediatamente**
+después de aplicarlo, así que un plugin que carga su patch en diferido puede
+guardar el anterior.
+
+### monitor/keys: un color por tab, otro por entrada MIDI, y la leyenda
+
+`[C]` cicla `CHANNEL → INPUT → INSTRUMENT → VELOCITY`, y debajo del teclado hay
+una **leyenda que nombra cada color en su color**. Un teclado encendido en seis
+tonos no dice nada hasta que algo los nombra.
+
+- **INSTRUMENT** (el default ahora): un color por tab del rack.
+- **INPUT**: un color por puerto MIDI de entrada. Las notas que hace choz mismo
+  —el piano QWERTY, `A→M`— no vienen de ningún puerto y van en gris,
+  etiquetadas, para que no se lean como una falla.
+
+Las dos ruedas están desfasadas a propósito: el puerto 1 y la tab 1 **no** son
+el mismo color. Son dos preguntas distintas —dos controladores pueden tocar la
+misma tab, y uno solo puede estar partido entre dos— así que leer un modo
+después del otro tiene que dar respuestas distintas. Hay un assert que lo fija.
+
+La leyenda de `INPUT` lista **todos los puertos conectados**, toquen o no: un
+puerto que desaparece cuando no hay nada apretado no puede contestar "¿está
+enchufado ese teclado?". La de `CHANNEL` lista sólo los canales que están
+llegando, porque dieciséis no entran.
+
+### El ARP decía ARP dos veces
+
+Un `row.label("ARP")` al lado del botón `ARP ⭘`. Fuera el label; queda el botón,
+que ya era el toggle.
+
+### Dos bugs más que aparecieron midiendo
+
+- **El log de mensajes le atribuía las notas al teclado equivocado.**
+  `draw_midi_monitor` recibía `midi_ports` ("todo lo que se vio alguna vez"),
+  pero `InputSource::Midi(i)` indexa `midi_connected`. Esa lista sólo se usa
+  para convertir el índice en nombre, así que **un puerto deshabilitado corría
+  todos los nombres siguientes**. Es el gotcha que ya estaba anotado en el
+  roadmap, mordiendo de verdad.
+- **`take_worst_slot` no se vaciaba** — contado arriba, con el DSP %.
+
+### Sondas que quedan
+
+- `examples/sustain_probe` — qué le hace el pedal al nivel y a la CPU, por
+  minuto. Es la medición que cita el comentario de la polifonía.
+- `examples/guard_probe` — el cazador de acoples contra notas cantadas y contra
+  acoples de verdad, lado a lado. Es la que fija la calibración.
+
+Se descartó la sonda de denormales: resultado negativo, ninguno de los 14 FX
+medidos crece con la cola en silencio.
+
+## [1.3.1] — 2026-08-19 (bis)
 
 Los cinco puntos pedidos ese día, en el orden en que se hicieron, más los bugs
 que aparecieron en el camino. Cada uno dice qué **no** quedó hecho.
