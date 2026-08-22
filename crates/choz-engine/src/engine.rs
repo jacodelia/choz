@@ -2411,9 +2411,7 @@ impl RtState {
                         // back is the player's decision, not the plugin's.
                         sc.fill(0.0);
                         let written = slot.source.render(sc, sr);
-                        for s in sc[written * 2..].iter_mut() {
-                            *s = 0.0;
-                        }
+                        sc[written * 2..].fill(0.0);
                         if keep_dry {
                             for (out, d) in sc.iter_mut().zip(dry[..n].iter()) {
                                 *out = *out * wet + *d * (1.0 - wet);
@@ -2478,9 +2476,7 @@ impl RtState {
                             .clamp(at + 1, frames);
                         let seg = &mut sc[at * 2..end * 2];
                         let written = slot.source.render(seg, sr);
-                        for s in seg[written * 2..].iter_mut() {
-                            *s = 0.0;
-                        }
+                        seg[written * 2..].fill(0.0);
                         at = end;
                     }
                 }

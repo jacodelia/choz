@@ -153,9 +153,7 @@ impl AudioSource for WavPlayer {
                     self.pos %= total as f64;
                 } else {
                     // Zero-fill the rest of the block and stop.
-                    for s in &mut out[i * 2..] {
-                        *s = 0.0;
-                    }
+                    out[i * 2..].fill(0.0);
                     self.finished = true;
                     return i;
                 }

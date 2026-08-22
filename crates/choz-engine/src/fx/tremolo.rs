@@ -98,7 +98,7 @@ impl super::FxProcessor for Tremolo {
         let spread = self.spread;
         let mix = self.mix;
 
-        for frame in buf.chunks_exact_mut(2) {
+        for frame in buf.as_chunks_mut::<2>().0 {
             let m = self.lfo.tick(wave, rate, sr, spread);
             let depth = self.depth.tick();
             let (dry_l, dry_r) = (frame[0], frame[1]);

@@ -75,7 +75,7 @@ impl Meter {
         }
         let mut peak = 0.0f32;
         let mut sum = 0.0f64;
-        for frame in buf.chunks_exact(2) {
+        for frame in buf.as_chunks::<2>().0 {
             let mono = (frame[0] + frame[1]) * 0.5;
             peak = peak.max(mono.abs());
             sum += (mono as f64) * (mono as f64);
@@ -105,7 +105,7 @@ impl Meter {
         // Every frame, in order: one relaxed store per frame, which is what a
         // block of 256 costs and what an FFT needs to exist at all.
         let mut sw = self.spectrum_write.load(Ordering::Relaxed);
-        for frame in buf.chunks_exact(2) {
+        for frame in buf.as_chunks::<2>().0 {
             let mono = (frame[0] + frame[1]) * 0.5;
             self.spectrum[sw % SPECTRUM_POINTS].store(mono.to_bits(), Ordering::Relaxed);
             sw = sw.wrapping_add(1);
@@ -217,7 +217,7 @@ impl SlotLevels {
         }
         let mut peak = 0.0f32;
         let mut sum = 0.0f64;
-        for frame in buf.chunks_exact(2) {
+        for frame in buf.as_chunks::<2>().0 {
             let mono = (frame[0] + frame[1]) * 0.5;
             peak = peak.max(mono.abs());
             sum += (mono as f64) * (mono as f64);

@@ -1155,9 +1155,7 @@ impl Vst3RealInstance {
     pub fn render_with_input(&mut self, input: &[f32], output: &mut [f32]) -> usize {
         let frames = (output.len() / 2).min(self.block);
         for b in &mut self.out_bufs {
-            for s in b.iter_mut() {
-                *s = 0.0;
-            }
+            b.fill(0.0);
         }
 
         self.out_ptrs.clear();

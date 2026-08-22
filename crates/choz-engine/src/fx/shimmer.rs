@@ -157,7 +157,7 @@ impl FxProcessor for ShimmerReverb {
             .clamp(0.0, 0.999);
         let cap = self.predelay.len() / 2;
 
-        for frame in buf.chunks_exact_mut(2) {
+        for frame in buf.as_chunks_mut::<2>().0 {
             let dry = [frame[0], frame[1]];
             // Pre-delay, plus whatever is coming back round.
             let read = (self.pre_write + cap - self.pre_frames) % cap;

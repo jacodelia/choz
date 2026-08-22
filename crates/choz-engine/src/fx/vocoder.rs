@@ -303,7 +303,7 @@ impl super::FxProcessor for Vocoder {
         let count = self.count;
         let mix = self.mix;
 
-        for frame in buf.chunks_exact_mut(2) {
+        for frame in buf.as_chunks_mut::<2>().0 {
             let (dry_l, dry_r) = (frame[0], frame[1]);
             // The left channel is the voice. One signal is being analysed and
             // one is being shaped; which is which has to be decided somewhere,

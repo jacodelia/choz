@@ -226,7 +226,7 @@ impl FxProcessor for Envelope {
             self.sample_rate = sr;
         }
         let (depth, mix) = (self.depth, self.mix);
-        for frame in buf.chunks_exact_mut(2) {
+        for frame in buf.as_chunks_mut::<2>().0 {
             let (dry_l, dry_r) = (frame[0], frame[1]);
             let env = self.tick(dry_l.abs().max(dry_r.abs()));
             // `depth` fades between the input's own level and the contour's, so

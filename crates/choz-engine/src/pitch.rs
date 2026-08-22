@@ -273,7 +273,7 @@ impl PitchTracker {
         // different microphones — summing those is phase cancellation and two
         // pitches at once, neither of which is a note. So: the left side, which
         // is the channel the user assigned first.
-        for frame in buf.chunks_exact(2) {
+        for frame in buf.as_chunks::<2>().0 {
             // Band-limit first, average second. The other way round is what a
             // box filter is, and a box filter is why a voice folded.
             let mut x = frame[0];

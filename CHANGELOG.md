@@ -237,6 +237,26 @@ líneas no hablaban del caso. Lo que sí apareció, en orden de sospecha:
 Instrumentados los tres: OSC escribe `OSC <evento> from <ip:puerto>`, la sonda
 dice a qué tab tocó, y el reconnect imprime la lista antes y después.
 
+### CI: dos lints que sólo existen río arriba
+
+`clippy 1.98` en CI y `1.97` en la máquina de desarrollo, y la diferencia son dos
+lints nuevos que aquí no se veían: `chunks_exact_to_as_chunks` (17 sitios) y
+`manual_slice_fill` (8). El arreglo es mecánico y además dice más: un
+`chunks_exact(2)` sobre estéreo entrelazado es una tirada de *frames* de ancho
+conocido, y `as_chunks::<2>()` lo pone en el tipo — `&[f32; 2]` en vez de
+`&[f32]`, sin comprobación de longitud por iteración.
+
+Dos avisos para el que retome:
+
+- La sugerencia de `manual_slice_fill` **no compila**: propone
+  `&mut self.buf.fill(0.0)`, y `fill` devuelve `()`. El relleno a secas es el
+  arreglo.
+- No se pudo verificar con la versión de CI: el toolchain `beta` local no trae
+  su binario de clippy. Lo que sí se hizo es enumerar cada sitio del workspace
+  que los dos lints pueden tocar — tamaño de chunk constante, y relleno de un
+  slice **entero** — y quedan cero. Los `chunks_exact(channels)` y los bucles
+  con `.skip()`/`.take()` no entran en ninguno de los dos.
+
 ### VST3: las posiciones de un parámetro que no declara ninguna
 
 Iba en el árbol sin commitear y sale en esta versión. Surge XT reporta **cero
