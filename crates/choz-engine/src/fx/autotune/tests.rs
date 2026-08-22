@@ -63,7 +63,9 @@ fn detect(hz: f32, sr: f32, harmonics: bool) -> PitchEstimate {
             t.block(hz, sr, 256, 0.5)
         };
         let mono: Vec<f32> = stereo
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|f| (f[0] + f[1]) * 0.5)
             .collect();
         last = d.process(&mono);
@@ -564,7 +566,7 @@ fn run_sine(at: &mut AutoTune, hz: f32, sr: f32, blocks: usize) -> Vec<f32> {
         let mut buf = t.block(hz, sr, 512, 0.5);
         at.process_block(&mut buf, sr as u32);
         if i >= blocks / 2 {
-            tail.extend(buf.chunks_exact(2).map(|f| (f[0] + f[1]) * 0.5));
+            tail.extend(buf.as_chunks::<2>().0.iter().map(|f| (f[0] + f[1]) * 0.5));
         }
     }
     tail
@@ -785,7 +787,7 @@ fn changing_the_note_does_not_click() {
         for _ in 0..10 {
             let mut buf = t.voice(hz, sr, 512, 0.2);
             at.process_block(&mut buf, sr as u32);
-            for f in buf.chunks_exact(2) {
+            for f in buf.as_chunks::<2>().0 {
                 worst = worst.max((f[0] - prev).abs());
                 prev = f[0];
             }
@@ -957,8 +959,10 @@ fn a_rumble_under_the_voice_is_not_the_note() {
         let note = voice.voice(220.0, sr, 256, 0.15);
         let low = rumble.block(41.0, sr, 256, 0.45);
         let mono: Vec<f32> = note
-            .chunks_exact(2)
-            .zip(low.chunks_exact(2))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(low.as_chunks::<2>().0)
             .map(|(n, l)| (n[0] + l[0]) * 0.5)
             .collect();
         last = d.process(&mono);
@@ -989,8 +993,10 @@ fn hiss_above_the_notes_does_not_fold_onto_them() {
         // folds onto the notes when the only filter is an average.
         let above = hiss.block(9_500.0, sr, 256, 0.4);
         let mono: Vec<f32> = note
-            .chunks_exact(2)
-            .zip(above.chunks_exact(2))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(above.as_chunks::<2>().0)
             .map(|(n, h)| (n[0] + h[0]) * 0.5)
             .collect();
         last = d.process(&mono);
@@ -1016,7 +1022,7 @@ fn a_single_bad_window_does_not_become_the_note() {
     let mut t = Tone::new();
     for _ in 0..80 {
         let stereo = t.voice(220.0, sr, 256, 0.2);
-        let mono: Vec<f32> = stereo.chunks_exact(2).map(|f| f[0]).collect();
+        let mono: Vec<f32> = stereo.as_chunks::<2>().0.iter().map(|f| f[0]).collect();
         d.process(&mono);
     }
     let settled = d.estimate();
@@ -1026,7 +1032,7 @@ fn a_single_bad_window_does_not_become_the_note() {
     let mut other = Tone::new();
     for _ in 0..2 {
         let stereo = other.voice(330.0, sr, 256, 0.2);
-        let mono: Vec<f32> = stereo.chunks_exact(2).map(|f| f[0]).collect();
+        let mono: Vec<f32> = stereo.as_chunks::<2>().0.iter().map(|f| f[0]).collect();
         d.process(&mono);
     }
     let after = d.estimate();
@@ -1062,7 +1068,7 @@ fn the_shift_is_walked_across_the_block_and_not_stepped() {
     let (mut a, mut b) = (vec![0.0; BLOCK], vec![0.0; BLOCK]);
     // Past the latency with no shift at all, so the block under test is the one
     // where the ratio moves.
-    for chunk in signal.chunks_exact(BLOCK).take(20) {
+    for chunk in signal.as_chunks::<BLOCK>().0.iter().take(20) {
         ramped.process(chunk, &mut a, 1.0, 1.0, period);
         stepped.process(chunk, &mut b, 1.0, 1.0, period);
     }

@@ -553,7 +553,7 @@ impl super::FxProcessor for Harmonizer {
         // Two seconds to fall by 1/e, as a per-sample coefficient.
         let peak_decay = (-1.0 / (2.0 * sr)).exp();
 
-        for frame in buf.chunks_exact_mut(2) {
+        for frame in buf.as_chunks_mut::<2>().0 {
             let (dry_l, dry_r) = (frame[0], frame[1]);
             // One voice in, one signal to harmonise: a harmoniser fed a stereo
             // pair would be transposing two different signals into one chord.
@@ -768,7 +768,7 @@ mod tests {
         let mut phase = 0.0f32;
         for block in 0..200 {
             let mut buf = vec![0.0f32; 512];
-            for f in buf.chunks_exact_mut(2) {
+            for f in buf.as_chunks_mut::<2>().0 {
                 let s = (phase * std::f32::consts::TAU).sin() * 0.3;
                 phase = (phase + 220.0 / sr as f32).fract();
                 f[0] = s;

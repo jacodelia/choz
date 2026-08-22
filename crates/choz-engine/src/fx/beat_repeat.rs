@@ -184,7 +184,7 @@ impl super::FxProcessor for BeatRepeat {
         let fade = self.fade();
         let mix = self.mix;
 
-        for (i, frame) in buf.chunks_exact_mut(2).enumerate() {
+        for (i, frame) in buf.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             let dry = [frame[0], frame[1]];
             let q = q0 + i as f64 * q_per_frame;
             let step = (q / self.interval_q.max(1e-3) as f64).floor() as i64;
@@ -438,7 +438,7 @@ mod tests {
             br.decay = 0.5;
             br.set_mix(1.0);
             let mut buf = vec![0.0f32; 48000 * 2];
-            for (i, f) in buf.chunks_exact_mut(2).enumerate() {
+            for (i, f) in buf.as_chunks_mut::<2>().0.iter_mut().enumerate() {
                 let s = (2.0 * std::f32::consts::PI * 200.0 * i as f32 / 48000.0).sin();
                 f[0] = s;
                 f[1] = s;

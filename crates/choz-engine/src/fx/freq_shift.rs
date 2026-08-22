@@ -196,7 +196,7 @@ impl super::FxProcessor for FreqShift {
         let mix = self.mix;
         let spread = self.spread;
 
-        for frame in buf.chunks_exact_mut(2) {
+        for frame in buf.as_chunks_mut::<2>().0 {
             let hz = self.freq.tick();
             self.phase += hz / sr;
             // Wrapped, not left to grow: a phase counted in millions of cycles

@@ -125,9 +125,7 @@ impl Compressor {
         let want = (self.lookahead_ms * 0.001 * sr).round() as usize;
         self.look_frames = want.min(cap);
         self.look_pos = 0;
-        for s in &mut self.look_buf {
-            *s = 0.0;
-        }
+        self.look_buf.fill(0.0);
     }
 
     fn gain_reduction_db(&self, level_db: f32) -> f32 {
@@ -265,9 +263,7 @@ impl super::FxProcessor for Compressor {
         self.gain_smooth = [1.0; 2];
         self.hpf_z = [0.0; 2];
         self.look_pos = 0;
-        for s in &mut self.look_buf {
-            *s = 0.0;
-        }
+        self.look_buf.fill(0.0);
     }
 
     fn set_mix(&mut self, wet: f32) {

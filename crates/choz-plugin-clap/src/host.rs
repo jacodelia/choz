@@ -590,9 +590,7 @@ impl ClapProc {
 
         for port in out_buf.iter_mut() {
             for ch in port.iter_mut() {
-                for v in ch[..frames].iter_mut() {
-                    *v = 0.0;
-                }
+                ch[..frames].fill(0.0);
             }
         }
 
@@ -792,9 +790,7 @@ impl AudioSource for ClapInstrument {
 
     fn render(&mut self, output: &mut [f32], _sample_rate: u32) -> usize {
         let frames = (output.len() / 2).min(self.proc.max_frames as usize);
-        for s in output.iter_mut() {
-            *s = 0.0;
-        }
+        output.fill(0.0);
         if frames == 0 {
             return output.len() / 2;
         }
@@ -802,9 +798,7 @@ impl AudioSource for ClapInstrument {
         // An instrument takes no audio input; feed every port silence.
         for port in self.proc.in_buf.iter_mut() {
             for ch in port.iter_mut() {
-                for v in ch[..frames].iter_mut() {
-                    *v = 0.0;
-                }
+                ch[..frames].fill(0.0);
             }
         }
         self.proc.process_block(frames, &self.queue);
