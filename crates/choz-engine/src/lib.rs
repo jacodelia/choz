@@ -19,6 +19,7 @@ pub mod pitch;
 pub mod preset_files;
 pub mod quarantine;
 pub mod sandboxed;
+pub mod sf2_patch;
 pub mod sfz;
 pub mod sources;
 

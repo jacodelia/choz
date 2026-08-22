@@ -12,12 +12,284 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **606 tests** con harness + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **642 tests** con harness + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio.
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
 - `cargo test --workspace` necesita `--no-fail-fast`: uno de los binarios con
   `harness = false` no reconoce los argumentos que cargo le pasa y aborta la
   corrida. Por crate (`-p choz-engine -p choz-ui`) va entero.
+
+## [1.3.2] — 2026-08-22
+
+Una sesión larga de pedidos sobre el rack, y un patrón que se repitió hasta
+volverse la moraleja: **casi nada estaba donde el síntoma señalaba**. La splash
+"congelada" no era la splash, el editor SF2 que "no se oía" sí se oía pero con
+un recorrido demasiado corto para notarse, el MIDI learn de los bancos sí
+existía pero no por donde se usa, y el piano que sonaba sordo y una octava más
+grave no tenía nada roto dentro.
+
+### La splash congelada era el fondo de pantalla
+
+Reportado como "la splash se queda congelada y después del resize no funcionan
+ni las tabs ni los botones". No era la splash ni el manejo de eventos:
+`kitty_bg::sync` vuelve a colocar el papel tapiz cuando cambia el tamaño, y
+colocarlo es un reescalado Lanczos al tamaño en píxeles de la ventana más una
+transferencia base64 de la imagen entera — megabytes por frame en una ventana
+4K. Arrastrar un borde cambia el tamaño en cada frame, así que se pagaba en
+todos: la terminal se atasca y choz deja de responder al teclado y al ratón.
+
+Ahora nada se coloca hasta que el tamaño lleva 150 ms quieto; los frames
+intermedios sólo dibujan texto.
+
+### El editor SF2, dentro del box INSTRUMENT
+
+Un SoundFont llegaba como un nombre en una lista y nada más: la envolvente, el
+filtro, la afinación y los rangos están en el archivo y ninguno se veía. Ahora
+la pestaña ofrece **once generadores editables** además de los dos envíos que ya
+tenía — Attack, Hold, Decay, Sustain, Release, Cutoff, Reso, Coarse, Fine, Pan,
+Volume — con las cinco etapas dibujadas como **banco de faders verticales**,
+porque cinco números en fila no tienen forma y la forma es el control.
+
+Son parámetros de slot corrientes, y eso es deliberado: heredan gratis el ratón,
+las teclas, `LearnTarget::InstrParam`, la paginación y el guardado en el
+proyecto. Cero maquinaria nueva. Y no tocan el archivo: cada uno es un *offset*
+`set_gen` sobre el canal, que es la vía RT-safe que oxisynth ofrece; el medio de
+cada mando es el SoundFont como está escrito.
+
+**Dos bugs al medirlos, los dos por no medir antes:**
+
+- Los recorridos eran ±2400 timecents y ±480 centibelios. Un piano muestreado
+  dice 8 ms de ataque: multiplicarlo por cuatro lo deja en 32 ms. Los mandos se
+  movían y no se oía nada, que es la peor forma de fallar que tiene un control.
+  Ahora van al rango completo que oxisynth admite (±8000 tc, 0–1440 cB), que sí
+  alcanza un ataque de dos segundos desde un piano.
+- `Sustain` y `Volume` estaban **al revés**: los generadores SF2 detrás de ambos
+  son *atenuaciones*, así que subir el mando bajaba el sonido.
+
+Medido sobre FluidR3, C4 a velocidad 100:
+
+```
+                 primeros 50 ms   sostenido a 4 s   3 s tras soltar
+archivo tal cual     0.0460           0.0006           0.0000
+Attack  = 1.0        0.0024   ← cuatro segundos de entrada
+Sustain = 1.0                         0.0023   ← 4× más
+Release = 1.0                                          0.0005
+Volume  = 1.0        0.2278
+Volume  = 0.0        0.0029
+```
+
+Hay un techo físico que ningún mando pasa: la muestra de un piano es una
+grabación que se apaga y se acaba. La envolvente da forma a lo que hay; no
+devuelve lo que nunca se grabó.
+
+Y un **RESET** en el borde del box, sólo para SoundFonts: sus mandos son offsets
+cuyo centro es el archivo intacto, así que hay una respuesta exacta a la que
+volver. Los defaults de un plugin son del plugin, y un botón que borra sin
+avisar un patch que costó una hora no va junto a las flechas de página.
+
+### El split ahora superpone en vez de elegir
+
+Pedido: "que al dividir el piano en bancos puedan sonar dos o más notas con
+sonidos distintos; en estos momentos choz discrimina y elige uno". Era exacto:
+la pestaña **cambiaba de programa** al cruzar la junta, así que una nota grave
+sostenida y un pad encima peleaban por el único patch y sólo sobrevivía la
+última — la ya pulsada además cambiaba de timbre bajo el dedo.
+
+Ahora **una zona = un canal MIDI de oxisynth, un solo archivo**. `AudioSource`
+gana `layers_zones` / `set_zone_program` / `set_split`, con implementaciones por
+defecto que no tocan a ningún otro source; sólo `Sf2Synth` las implementa. El
+canal 0 sigue siendo el programa de la pestaña, para toda octava sin zona.
+Pedales y rueda llegan a todos los canales — el sostenido sostiene el teclado
+entero, no la mitad donde cayó la última nota — y los mandos del editor también.
+
+**No hizo falta limitar a cuatro bancos ni quitar el `+`**, que era el plan B
+por si se disparaba la RAM: el SoundFont se carga **una vez** y los dieciséis
+canales lo comparten. Una zona cuesta un canal y cero memoria. Un plugin
+alojado tiene un solo patch, así que ahí el rack sigue conmutando; la decisión
+la toma el instrumento, no la extensión del archivo.
+
+### El SPLIT es el teclado
+
+Deja de ser una lista con una fila por octava. Ahora es el **mismo piano de la
+pestaña KEYS** — mismo helper, misma geometría, misma resolución de clicks — con
+un cuadrado de color por botón de sonido encima y un `+` para crear otro hasta
+ocho. El botón izquierdo pinta la octava bajo el puntero, el derecho la borra,
+arrastrar pinta varias. Un split es una afirmación sobre *este* teclado; un
+segundo dibujo de él pondría las zonas donde el músico no las ve.
+
+### El teclado, tecla por tecla
+
+- **Las negras no se veían.** La junta entre blancas ocupaba una celda entera,
+  el mismo ancho que una negra, así que no había forma de distinguirlas. Ahora
+  la junta es un pelo (`▏` en primer plano sobre marfil) y sólo las negras
+  ocupan una celda oscura entera: la banda queda continua y las barras negras se
+  leen solas. El ancho de tecla se elige del ancho del panel — se quitó el
+  control `◀ KEY n ▶`, que era una cosa más que trastear en un panel cuyo
+  trabajo es enseñar lo que llega.
+- **Una negra encendida se salía de su contorno.** La celda de junta tomaba su
+  fondo de `w + 1`, y donde hay negra `w + 1` **es** la negra: tocar C#4 pintaba
+  los cuerpos blancos de C4 y D4 de su color, por todo el teclado. Ahora la
+  junta busca la siguiente *blanca*.
+- **El borde sobrevive al color.** Cedía a un medio bloque partido entre los dos
+  colores en cuanto una tecla se encendía, que es invisible cuando ambas llevan
+  el mismo — o sea, una octava pintada por el SPLIT. La regla se dibuja siempre.
+- **Se toca con el ratón**, y la tecla pulsada **se enciende**: iba al
+  instrumento y a nada más, así que el panel quedaba oscuro justo bajo el
+  puntero. Entra por el mismo embudo que el piano del teclado del ordenador, así
+  que arpegia, respeta el split y se suelta sola.
+
+### El mixer, uniforme
+
+`strip_bottom` dependía del tipo de tira, así que un grupo tenía el fader dos
+filas más largo que las pestañas de al lado. Ahora todas reservan las mismas
+filas de pie —las que una tira no usa quedan vacías— y el ancho del panel se
+reparte por igual en vez de dejar un resto irregular a la derecha.
+
+### ENVELOPE: un contorno escrito sobre lo que entra
+
+Efecto nuevo, y el primero de la cadena que **escribe** la envolvente en vez de
+seguirla: el nivel de entrada sólo decide *cuándo* empieza la nota, la forma es
+de los cinco mandos. Convierte un pad en algo pulsado, un piano en un swell, o
+un loop en algo que respira con la forma que dibujaste. Al estar en
+`BUILT_IN_KINDS` sale publicado como CLAP con los demás: `org.choz.fx.envelope`,
+y el bundle pasa de 45 a **46 efectos**.
+
+Tres bugs encontrados midiendo, con el efecto ya escrito:
+
+- **Se comía su propia release.** La compuerta se cierra mientras la nota
+  todavía suena —eso es lo que hace `Length`— pero el rearme miraba sólo el
+  nivel, así que en la muestra siguiente la entrada seguía por encima del suelo
+  y disparaba otro ataque. Salía una sierra, y **ninguna posición de Release se
+  oía nunca porque nada llegaba a terminar de soltar**. Ahora rearma sólo cuando
+  la entrada sube 6 dB por encima de donde se ha asentado.
+- **El umbral en dB absolutos era inservible**: −40 dB no cierra sobre nada real,
+  así que la etapa Release sólo se alcanzaba con el sonido ya ido. Sustituido por
+  `Length`, que dice cuánto tiene que caer la nota **respecto a su propio pico**
+  — mismo significado a cualquier ganancia de entrada.
+- **La primera nota no disparaba**: el suelo arrancaba en fondo de escala y la
+  primera muestra lo bajaba a su propio nivel antes de que se viera la subida.
+
+### La audición en los selectores de patch
+
+Elegir un sonido leyendo su nombre es elegirlo a ciegas. El MIDI ya llegaba al
+rack con un modal abierto; lo que faltaba es que la fila resaltada no estaba en
+el instrumento hasta pulsar SELECT. Ahora **BANK/PRESET** y el selector que abre
+un botón SOUNDS cargan lo que está bajo el cursor, se toca con el teclado, y
+**CANCEL devuelve el que sonaba antes de abrir**: recorrer una lista no puede ser
+una forma de cambiar el sonido sin querer.
+
+Va por *polling* una vez por frame en lugar de engancharse a cada tecla y click
+—el cursor se mueve con flechas, ratón, rueda y barra de scroll, y un solo sitio
+que note que se movió no puede ser el que se olvide— y espera 120 ms de cursor
+quieto antes de cargar, porque el patch de un plugin puede ser una lectura de
+disco y mantener una flecha pulsada por trescientos no debe ser trescientas
+lecturas.
+
+Y mientras hay un selector abierto, **manda el selector**: con un split puesto,
+la propia tecla que pulsabas para escuchar el patch disparaba `apply_octave_sound`
+y devolvía la audición a donde estaba.
+
+### MIDI learn en los botones de sonido
+
+Reportado como "no funciona", y era cierto por donde se usa. Los cuatro botones
+estaban en la *lista* del selector de MIDI LEARN, pero no en el mapa de lo que el
+**puntero** puede vincular: armar el learn, apuntar y hacer click —el gesto con
+el que se aprende cualquier otro control del panel— resolvía a `None`, y un click
+en cualquier otro sitio cancela. Añadidos `Sound(i)`, `ArpOn`, `ArpTap` y
+`ArpLatch`, que estaban igual de mudos.
+
+### El piano sonaba sordo y una octava más grave
+
+El síntoma más alarmante de la sesión, y el diagnóstico empezó descartando:
+renderizado el mismo C4 del mismo archivo por tres vías —fluidsynth, el
+`Sf2Synth` de choz y oxisynth pelado— las tres dan **f0 = 263.0 Hz y el mismo
+brillo**. El instrumento carga bien, y en una carga limpia la interfaz no empuja
+ni un solo parámetro al motor.
+
+Lo que sonaba mal era **estado viejo de la pestaña**. Un botón SOUNDS guarda un
+*número de programa* dentro de la lista de ese archivo, más un blob de estado
+que sólo ese plugin entiende — y sobrevivían al cambio de instrumento, con el
+split todavía apuntando a ellos. Cada octava cubierta tocaba el programa que por
+casualidad ocupara ese índice en el archivo **nuevo**. También explicaba el mismo
+efecto en Surge XT: un plugin no puede superponer zonas, así que el rack le
+cambia el patch al cruzar la junta.
+
+Salió ahora porque el split antes estaba a medias: al hacerlo funcionar, un
+split olvidado pasó de casi inaudible a mandar sobre el teclado entero. Cargar
+un instrumento lo trae ahora como está en disco — sin botones, sin split, sin el
+blob del anterior.
+
+### La nota fantasma
+
+Reportada como "cada ciertos minutos se escucha una nota corta sin tocar nada".
+Los logs no podían decirlo: **choz no registraba ninguna nota**, así que 35 687
+líneas no hablaban del caso. Lo que sí apareció, en orden de sospecha:
+
+- **OSC escucha en `0.0.0.0:9000`, sin filtro de origen**, y un `/note` de quien
+  sea suena. El propio log lo delata: `cannot bind OSC port 9000` en varios
+  arranques, o sea que otro proceso de la máquina lo usa.
+- `probe_levels` toca **do central a velocidad 100 durante 600 ms** al cargar un
+  instrumento. Se renderiza a un buffer fuera del hilo de audio, pero es la única
+  nota que choz toca por su cuenta.
+- `poll_midi_hotplug` reconecta cada 2 s si cambia la lista de puertos, y reabrir
+  reparte lo que el controlador tuviera en cola.
+
+Instrumentados los tres: OSC escribe `OSC <evento> from <ip:puerto>`, la sonda
+dice a qué tab tocó, y el reconnect imprime la lista antes y después.
+
+### VST3: las posiciones de un parámetro que no declara ninguna
+
+Iba en el árbol sin commitear y sale en esta versión. Surge XT reporta **cero
+pasos** para sus ochocientos parámetros, `A Play Mode` incluido, y aun así
+dibuja "Poly"/"Mono"/"Mono ST"/"Latch". El único sitio donde existen esos
+nombres es `getParamStringByValue`, así que el rango se barre: las etiquetas que
+se sostienen a lo largo de una tirada de sondeos y luego cambian son posiciones,
+y cada una se coloca en el **medio** de su meseta — el punto más seguro para
+devolver, porque los bordes son justo donde una diferencia de redondeo cae en el
+vecino. Lo que se lee como número ("0.50", "-6.0 dB") se rechaza y se queda como
+mando: una rampa continua no es una lista.
+
+### Auditoría de rendimiento
+
+Pedida porque choz "se escucha saturado" compartiendo máquina con un navegador.
+El presupuesto real es 128 frames a 96 kHz = **1333 µs**, 750 bloques por
+segundo. Medido en release:
+
+```
+SF2 en silencio               5.7 µs/bloque   0.4% del presupuesto
+SF2, 8 voces                 19.0 µs          1.4%
+SF2, 20 voces                37.1 µs          2.8%
+reverb + delay, cola          5.6 µs          0.4%
+```
+
+El log decía `dearest tab 1.12 ms` para ese mismo trabajo. **El medidor usaba
+reloj de pared**, así que lo que llamaba "coste de la pestaña" incluía el rato en
+que el hilo no estaba corriendo. Dos hipótesis más, descartadas con números:
+denormales (5.6 µs con y sin flush-to-zero: los built-ins ya se protegen) y
+`lto = "fat"` + `codegen-units = 1` (19.0 vs 19.2 µs, ruido).
+
+De ahí salieron tres cambios:
+
+- **El redibujado ya no va atado al poll de eventos.** El reloj sigue rápido; el
+  dibujo tiene techo de 30 fps. Con el poll de 5 ms que crea el arpegiador, el
+  hilo de interfaz pasa de **16,33% a 4,00%** de un núcleo — cuatro veces menos,
+  justo en el momento en que se toca.
+- **El medidor distingue "fui lento" de "no me dejaron correr".** El hilo de
+  audio lee `CLOCK_THREAD_CPUTIME_ID` junto al reloj de pared, y cuando el peor
+  bloque se pasó de presupuesto sin gastar CPU la línea de salud lo dice con
+  todas las letras en vez de dejarlo deducir de microsegundos.
+- **La sonda ya no mide lo que no puede sonar.** `add_silent()` crea el slot
+  vacío como `Silence`, que responde `true` a `plays_on_transport_stop` a
+  propósito, así que cada pestaña creada antes de tener instrumento pagaba 600 ms
+  renderizando ceros en el hilo que dibuja — un rack de doce, siete segundos.
+  Ahora abandona a los 200 ms si no ha salido ni una muestra distinta de cero.
+
+Lo que la auditoría dejó dicho y **no** se tocó: el grafo corre a 96 kHz con
+periodo 128 por decisión del usuario (menor latencia posible), y choz registra 12
+puertos de salida y 20 de entrada porque la interfaz los tiene — PipeWire mueve
+los 34 en cada bloque, los use alguien o no. Registrar sólo los enganchados,
+manteniendo la lista completa en los cajones IN/OUT, queda pendiente en el
+roadmap.
 
 ## [1.3.1] — 2026-08-20
 

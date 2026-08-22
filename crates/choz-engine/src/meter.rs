@@ -565,6 +565,32 @@ pub struct Load {
     /// person playing can change.
     worst_slot: AtomicU32,
     worst_slot_us: AtomicU32,
+    /// The worst block's own **CPU** time, against the wall time in
+    /// `peak_us`. See [`cpu_micros`].
+    peak_cpu_us: AtomicU32,
+}
+
+/// This thread's own CPU time, in microseconds.
+///
+/// `CLOCK_THREAD_CPUTIME_ID`: it advances only while the thread is on a CPU, so
+/// subtracting two readings gives the work done and not the time passed. One
+/// `clock_gettime` per block on the audio thread — the same vDSO call
+/// `Instant::now` already makes there, so it costs a second one and no more.
+/// Zero where the platform has no such clock, which reads as "we cannot tell"
+/// rather than as "it was free".
+pub fn cpu_micros() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // Safe: `ts` is a valid, owned `timespec` and the call only writes it.
+        if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } == 0 {
+            return ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1_000;
+        }
+    }
+    0
 }
 
 pub fn load() -> &'static Load {
@@ -577,14 +603,35 @@ pub fn load() -> &'static Load {
         over: AtomicU32::new(0),
         worst_slot: AtomicU32::new(0),
         worst_slot_us: AtomicU32::new(0),
+        peak_cpu_us: AtomicU32::new(0),
     };
     &L
 }
 
 impl Load {
-    /// Called at the end of every block with what it took and what it had.
-    pub fn publish(&self, took: std::time::Duration, budget: std::time::Duration) {
+    /// Called at the end of every block with what it took on the wall clock,
+    /// what it took of this thread's own CPU, and what it had.
+    ///
+    /// **The two are not the same number and the difference is the diagnosis.**
+    /// Wall time says the block was late; CPU time says whether choz was busy
+    /// or simply not running. A rack costing 20 µs of CPU inside a 1400 µs wall
+    /// block was preempted — by a browser, by an IRQ, by anything — and no
+    /// amount of making choz faster would have helped. The old line reported
+    /// the wall figure as "the tab costs 1.12 ms", which sent people optimising
+    /// a rack that was already thirty times inside its budget.
+    pub fn publish(
+        &self,
+        took: std::time::Duration,
+        cpu: std::time::Duration,
+        budget: std::time::Duration,
+    ) {
         let us = took.as_micros().min(u32::MAX as u128) as u32;
+        let cpu_us = cpu.as_micros().min(u32::MAX as u128) as u32;
+        // The pair is kept together: the CPU figure only means anything beside
+        // the wall figure it belongs to.
+        if us >= self.peak_us.load(Ordering::Relaxed) {
+            self.peak_cpu_us.store(cpu_us, Ordering::Relaxed);
+        }
         let budget_us = budget.as_micros().min(u32::MAX as u128) as u32;
         self.last_us.store(us, Ordering::Relaxed);
         // A 1/16 exponential average: ~a tenth of a second at any block size
@@ -652,6 +699,19 @@ impl Load {
         (peak, blocks, over)
     }
 
+    /// What the worst block actually spent on a CPU, as a share of its budget.
+    ///
+    /// Read after [`Self::take`], which is what resets the pair. Well under the
+    /// wall figure means the thread was off the CPU, not slow.
+    pub fn peak_cpu(&self) -> f32 {
+        let budget = self.budget_us.load(Ordering::Relaxed) as f32;
+        let cpu = self.peak_cpu_us.swap(0, Ordering::Relaxed) as f32;
+        match budget <= 0.0 {
+            true => 0.0,
+            false => cpu / budget,
+        }
+    }
+
     /// Microseconds a block has, for a message that wants the real numbers.
     pub fn budget_us(&self) -> u32 {
         self.budget_us.load(Ordering::Relaxed)
@@ -662,6 +722,7 @@ impl Load {
         self.avg_us.store(0, Ordering::Relaxed);
         self.worst_slot_us.store(0, Ordering::Relaxed);
         self.peak_us.store(0, Ordering::Relaxed);
+        self.peak_cpu_us.store(0, Ordering::Relaxed);
         self.blocks.store(0, Ordering::Relaxed);
         self.over.store(0, Ordering::Relaxed);
     }
@@ -670,6 +731,78 @@ impl Load {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Wall time and CPU time are two different answers and the load meter
+    /// has to keep both.**
+    ///
+    /// A block that ran long on the wall clock while spending almost no CPU was
+    /// not slow — the thread was off the CPU when the deadline went past. The
+    /// meter reported only the wall figure, so a rack costing 20 µs inside a
+    /// 1400 µs block was written down as "this tab costs 1.4 ms" and the fix
+    /// people went looking for was in the wrong process.
+    #[test]
+    fn the_load_meter_separates_being_slow_from_not_being_scheduled() {
+        use std::time::Duration;
+        // A local one: the readings are process-wide, and a test that reset
+        // them would fight every other test in this file.
+        let load = Load {
+            last_us: AtomicU32::new(0),
+            avg_us: AtomicU32::new(0),
+            peak_us: AtomicU32::new(0),
+            budget_us: AtomicU32::new(0),
+            blocks: AtomicU32::new(0),
+            over: AtomicU32::new(0),
+            worst_slot: AtomicU32::new(0),
+            worst_slot_us: AtomicU32::new(0),
+            peak_cpu_us: AtomicU32::new(0),
+        };
+        let budget = Duration::from_micros(1333);
+
+        // A healthy block, then one that overran the deadline without doing any
+        // more work: preempted, not slow.
+        load.publish(Duration::from_micros(20), Duration::from_micros(19), budget);
+        load.publish(
+            Duration::from_micros(1400),
+            Duration::from_micros(21),
+            budget,
+        );
+        let (peak, blocks, over) = load.take();
+        let cpu = load.peak_cpu();
+        assert_eq!((blocks, over), (2, 1));
+        assert!(peak > 1.0, "the wall clock says it was late: {peak}");
+        assert!(cpu < 0.05, "and the CPU says it was not busy: {cpu}");
+
+        // The other way round: a block that really did the work is not excused.
+        load.publish(
+            Duration::from_micros(1400),
+            Duration::from_micros(1390),
+            budget,
+        );
+        let (peak, ..) = load.take();
+        assert!(
+            peak > 1.0 && load.peak_cpu() > 1.0,
+            "that one was this rack"
+        );
+
+        // The pair belongs together: the CPU figure kept is the worst *wall*
+        // block's, not the worst CPU block's, or the two would describe
+        // different blocks and the comparison would mean nothing.
+        load.publish(
+            Duration::from_micros(2000),
+            Duration::from_micros(30),
+            budget,
+        );
+        load.publish(
+            Duration::from_micros(100),
+            Duration::from_micros(95),
+            budget,
+        );
+        load.take();
+        assert!(
+            load.peak_cpu() < 0.05,
+            "the CPU reading follows the worst wall block"
+        );
+    }
 
     #[test]
     fn a_block_becomes_a_level_and_a_shape() {

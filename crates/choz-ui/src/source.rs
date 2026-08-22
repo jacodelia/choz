@@ -66,6 +66,9 @@ pub enum AudioFxKind {
     AutoPan,
     /// A filter with an LFO and an envelope follower on its cutoff.
     AutoFilter,
+    /// An ADHSR contour written onto whatever comes in — the one effect here
+    /// that replaces the source's envelope instead of following it.
+    Envelope,
     /// A slice of the bar, caught and looped on choz's own transport.
     BeatRepeat,
     /// Up to eight transposed voices, in the key.
@@ -204,6 +207,7 @@ impl AudioFxKind {
             BitCrusher | Vinyl | Cassette | SoftClip | Saturator | WaveShaper | TubeSat
             | AmberFang | VelvetFuzz => FxCategory::Distortion,
             Widener | Pan => FxCategory::Spatial,
+            Envelope => FxCategory::Dynamics,
             Protocosmos | Z5Texture | Looper | BeatRepeat => FxCategory::Texture,
             AutoTune | Harmonizer | Vocoder => FxCategory::Pitch,
             Gain | PhaseInvert | MonoMaker => FxCategory::Utility,
@@ -265,6 +269,7 @@ pub const ALL_FX_KINDS: &[AudioFxKind] = &[
     AudioFxKind::AmberFang,
     AudioFxKind::VelvetFuzz,
     AudioFxKind::AutoTune,
+    AudioFxKind::Envelope,
 ];
 
 impl AudioFxKind {
@@ -315,6 +320,7 @@ impl AudioFxKind {
             Self::AmberFang => "AMBER FANG",
             Self::VelvetFuzz => "VELVET FUZZ",
             Self::AutoTune => "AUTO-TUNE",
+            Self::Envelope => "ENVELOPE",
         }
     }
 
@@ -365,6 +371,7 @@ impl AudioFxKind {
             Self::AmberFang => "amberfang",
             Self::VelvetFuzz => "velvetfuzz",
             Self::AutoTune => "autotune",
+            Self::Envelope => "envelope",
         }
     }
 
@@ -508,6 +515,23 @@ impl ParamShape {
     }
 }
 
+/// Same, for a knob that reads as a distance rather than a setting. Three or
+/// more in a row sharing one unit are drawn as a bank of vertical faders — see
+/// `views::fx_chain_panel::fader_groups` — which is how an ADSR gets to look
+/// like one.
+macro_rules! pdf {
+    ($n:literal, $d:literal) => {
+        FxParamDesc {
+            // No unit: `ParamShape::Fader` carries one so that a *plugin*'s
+            // parameters can be grouped by it, and a built-in's list is written
+            // here — a run of these is a run because it was written as one.
+            name: Cow::Borrowed($n),
+            default: $d,
+            shape: ParamShape::Fader(String::new()),
+        }
+    };
+}
+
 macro_rules! pd {
     ($n:literal, $d:literal) => {
         FxParamDesc {
@@ -567,6 +591,19 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         pd!("Release", 0.25),
         pd!("Look", 0.20),
         pd!("Link", 1.00),
+        pd!("Wet", 1.00),
+    ];
+    // The five stages first and consecutive, so they draw as one bank of
+    // vertical faders: the shape of the envelope is what is being set, and five
+    // numbers in a row do not have a shape.
+    static ENVELOPE: &[FxParamDesc] = &[
+        pdf!("Attack", 0.005),
+        pdf!("Hold", 0.00),
+        pdf!("Decay", 0.10),
+        pdf!("Sustain", 0.70),
+        pdf!("Release", 0.075),
+        pd!("Length", 0.60),
+        pd!("Depth", 1.00),
         pd!("Wet", 1.00),
     ];
     static GATE: &[FxParamDesc] = &[
@@ -829,6 +866,7 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         Compressor => COMP,
         Limiter => LIMIT,
         Gate => GATE,
+        Envelope => ENVELOPE,
         AutoTune => AUTOTUNE,
         ParamEq => PARAMEQ,
         GraphicEq => GRAPHICEQ,
@@ -1051,6 +1089,7 @@ impl AudioFxEntry {
                 | AmberFang
                 | VelvetFuzz
                 | AutoTune
+                | Envelope
         )
     }
 

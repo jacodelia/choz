@@ -66,11 +66,19 @@ pub enum RackButton {
     Sound(usize),
     /// One more sound button.
     SoundAdd,
+    /// Which saved sound each octave of the keyboard plays.
+    Split,
     /// Previous / next page of the instrument's own parameters. A synth like
     /// Surge XT has hundreds; the box shows a few rows of them, and these are
     /// how the rest are reached.
     InstrPagePrev,
     InstrPageNext,
+    /// Put the instrument's own knobs back where the file opened them. Drawn
+    /// only for a SoundFont, whose knobs are choz's own generator offsets and
+    /// whose "default" therefore means something exact — the SF2 as written.
+    /// A hosted plugin's defaults are the plugin's, and wiping a patch someone
+    /// spent an hour on is not a button choz should offer by accident.
+    InstrReset,
     /// The tab's arpeggiator. `ArpOn` is the only one drawn while it is off —
     /// a box of settings for something switched off is six rows of nothing in a
     /// panel that is already tight.
@@ -398,6 +406,7 @@ fn line_width(spans: &[Span]) -> u16 {
     spans.iter().map(|s| s.width() as u16).sum()
 }
 
+pub const BTN_RESET: &str = " RESET ";
 pub const BTN_PREV: &str = " \u{25C0} ";
 pub const BTN_NEXT: &str = " \u{25B6} ";
 
@@ -735,6 +744,8 @@ pub struct SoundsView<'a> {
     pub active: Option<usize>,
     /// Whether there is room for another button.
     pub can_add: bool,
+    /// Whether any octave of the keyboard is set to one of these sounds.
+    pub split: bool,
 }
 
 /// Draw the RACK panel and return its click rects.
@@ -777,6 +788,9 @@ pub fn draw_fx_chain_panel(
     instr_cursor: usize,
     // Which of the two knob boxes the arrows and the highlight belong to.
     instr_focused: bool,
+    // Whether to offer RESET on the instrument box — see
+    // [`RackButton::InstrReset`].
+    instr_reset: bool,
     // `(trim, gate)` of the tab's audio input, or `None` when it plays its own
     // instrument and there is nothing coming in to trim.
     in_trim: Option<(f32, f32)>,
@@ -1179,6 +1193,26 @@ pub fn draw_fx_chain_panel(
             let rect = row.button(f, " + ".to_string(), btn_style);
             layout.buttons.push((RackButton::SoundAdd, rect));
         }
+        // The split lives on this row because it is about these buttons: it is
+        // which of them each octave of the keyboard plays. Lit while the tab
+        // has one set, because a split is the setting that explains a keyboard
+        // that changes sound halfway up.
+        let rect = row.button(
+            f,
+            format!(
+                " {} {} ",
+                t("SPLIT"),
+                if sounds.split { "\u{25CF}" } else { "\u{25CB}" }
+            ),
+            match sounds.split {
+                true => Style::default()
+                    .fg(Color::Black)
+                    .bg(ON_COLOUR)
+                    .add_modifier(Modifier::BOLD),
+                false => btn_style,
+            },
+        );
+        layout.buttons.push((RackButton::Split, rect));
         y = row.finish();
     }
 
@@ -1416,25 +1450,58 @@ pub fn draw_fx_chain_panel(
                 matches!(shape, ArpShape::Boxed),
             );
             layout.arp_knobs = rects;
-            // On the box's own top edge, right-aligned: the same place the
-            // SLOT box carries its meter, and the reason this is not a knob is
-            // that tapping a tempo is a gesture, not a position.
+            // The switch and TAP ride the box's top edge, right-aligned, in
+            // that order. The switch is there at all because with the box open
+            // the only way to stop the arpeggiator was to walk the cursor onto
+            // its first knob and press Enter — a switch you can turn on with
+            // one click and not off with one is not a switch. The edge rather
+            // than a row of its own, because rows are what this panel never
+            // has, and not the left edge because that is where the box says
+            // which key hands it the arrows.
             if matches!(shape, ArpShape::Boxed) {
-                let label = format!(" TAP {:>3.0} ", s.tempo());
-                let w = label.chars().count() as u16;
+                let labels = [
+                    (
+                        RackButton::ArpOn,
+                        format!(
+                            " {} {} ",
+                            t("ARP"),
+                            if s.on { "\u{25CF}" } else { "\u{25CB}" }
+                        ),
+                        true,
+                    ),
+                    (
+                        RackButton::ArpTap,
+                        format!(" TAP {:>3.0} ", s.tempo()),
+                        false,
+                    ),
+                ];
+                let total: u16 = labels
+                    .iter()
+                    .map(|(_, l, _)| l.chars().count() as u16)
+                    .sum();
                 let right = inner.x + inner.width.saturating_sub(1);
-                if right > inner.x + w + 2 {
-                    let rect = Rect::new(right.saturating_sub(w + 1), box_top, w, 1);
-                    let style = if cursor_btns.contains(&RackButton::ArpTap) {
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(SEL)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        btn_style
-                    };
-                    f.render_widget(Paragraph::new(Span::styled(label, style)), rect);
-                    layout.buttons.push((RackButton::ArpTap, rect));
+                if right > inner.x + total + 2 {
+                    let mut x = right.saturating_sub(total + 1);
+                    for (btn, label, lit) in labels {
+                        let w = label.chars().count() as u16;
+                        let style = if cursor_btns.contains(&btn) {
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(SEL)
+                                .add_modifier(Modifier::BOLD)
+                        } else if lit {
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(ON_COLOUR)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            btn_style
+                        };
+                        let rect = Rect::new(x, box_top, w, 1);
+                        f.render_widget(Paragraph::new(Span::styled(label, style)), rect);
+                        layout.buttons.push((btn, rect));
+                        x += w;
+                    }
                 }
             }
             y = next;
@@ -1475,27 +1542,41 @@ pub fn draw_fx_chain_panel(
             &values,
             &names,
             &shapes,
-            instr_cursor,
+            // Clamped here, where the box is drawn: the cursor belongs to the
+            // rack and this list to the tab, and a cursor past the end scrolls
+            // the window off the list — an empty box for a tab whose knobs are
+            // right there. The arpeggiator's box has always done this.
+            instr_cursor.min(instr_params.len().saturating_sub(1)),
             focused && instr_focused,
             INSTR_KNOB_ROWS,
             // Leave the FX chain its rule, its buttons and a knob row.
             9,
             true,
         );
-        // More parameters than fit: page through them. The arrows sit on the
-        // box's own top edge, right-aligned, where the arpeggiator's TAP sits —
-        // and they are learn targets like any other button, because a synth
-        // whose knobs are on page 4 is no use to someone with both hands busy.
+        // The box's own top edge, right-aligned, where the arpeggiator's TAP
+        // sits: RESET, then the page arrows when there is more than one page.
+        // They are learn targets like any other button — a synth whose knobs
+        // are on page 4 is no use to someone with both hands busy, and neither
+        // is an undo you have to find with a mouse.
+        let mut edge: Vec<(RackButton, &str)> = Vec::new();
+        if instr_reset {
+            edge.push((RackButton::InstrReset, BTN_RESET));
+        }
         if rects.len() < instr_params.len() {
-            let (px, pn) = (BTN_PREV, BTN_NEXT);
-            let w = (Span::raw(px).width() + Span::raw(pn).width() + 1) as u16;
+            edge.push((RackButton::InstrPagePrev, BTN_PREV));
+            edge.push((RackButton::InstrPageNext, BTN_NEXT));
+        }
+        if !edge.is_empty() {
+            let w = edge
+                .iter()
+                .map(|(_, t)| Span::raw(*t).width() as u16)
+                .sum::<u16>()
+                + edge.len() as u16
+                - 1;
             let right = inner.x + inner.width.saturating_sub(1);
             if right > inner.x + w + 2 {
                 let mut x = right.saturating_sub(w + 1);
-                for (btn, text) in [
-                    (RackButton::InstrPagePrev, px),
-                    (RackButton::InstrPageNext, pn),
-                ] {
+                for (btn, text) in edge {
                     let bw = Span::raw(text).width() as u16;
                     let rect = Rect::new(x, y, bw, 1);
                     f.render_widget(Paragraph::new(Span::styled(text, btn_style)), rect);

@@ -29,6 +29,7 @@ pub struct JackRt {
 impl jack::ProcessHandler for JackRt {
     fn process(&mut self, _: &Client, ps: &ProcessScope) -> Control {
         let started = std::time::Instant::now();
+        let cpu_started = crate::meter::cpu_micros();
         let frames = ps.n_frames() as usize;
         self.state.apply_commands();
 
@@ -48,7 +49,7 @@ impl jack::ProcessHandler for JackRt {
                 None => buf[..n].fill(0.0),
             }
         }
-        crate::engine::publish_load(started, frames, self.state.sample_rate);
+        crate::engine::publish_load(started, cpu_started, frames, self.state.sample_rate);
         Control::Continue
     }
 }
@@ -279,4 +280,3 @@ fn connect(client: &Client, our_outs: &[String], sink: &str) -> Result<(String, 
     }
     Ok((name, wired))
 }
-

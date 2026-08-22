@@ -230,6 +230,18 @@ pub(crate) enum EngineCommand {
         bank: u8,
         preset: u8,
     },
+    /// Point one keyboard zone of a slot at a program of the loaded file.
+    SetZoneProgram {
+        slot: usize,
+        zone: u8,
+        bank: u8,
+        preset: u8,
+    },
+    /// Which zone each octave of a slot's keyboard plays.
+    SetSplit {
+        slot: usize,
+        split: [Option<u8>; choz_ports::SPLIT_OCTAVES],
+    },
     /// Live parameter tweak for a slot's *instrument* (hosted plugin).
     SetSlotParam {
         slot: usize,
@@ -332,6 +344,10 @@ pub struct AudioEngine {
     /// each source before it moves to the RT thread — that is the only moment
     /// the UI can still reach it.
     editors: Vec<Option<choz_ports::EditorHandle>>,
+    /// Whether each slot's instrument can sound several keyboard zones at once
+    /// — read once, on the UI thread, when the source is built. Asking the
+    /// source itself would mean reaching across to the audio thread.
+    layers: Vec<bool>,
     /// Same, for each slot's FX chain: `fx_editors[slot][fx]`.
     fx_editors: Vec<Vec<Option<choz_ports::EditorHandle>>>,
     /// Each slot's plugin state handle: its patch, not just its parameters.
@@ -655,6 +671,7 @@ impl AudioEngine {
             playing: Arc::new(AtomicBool::new(false)),
             slot_count: 0,
             editors: Vec::new(),
+            layers: Vec::new(),
             fx_editors: Vec::new(),
             touches: Vec::new(),
             fx_touches: Vec::new(),
@@ -865,6 +882,7 @@ impl AudioEngine {
         self.retired_rx = retired_rx;
         self.slot_count = 0;
         self.editors.clear();
+        self.layers.clear();
         self.fx_editors.clear();
         self.touches.clear();
         self.fx_touches.clear();
@@ -1143,6 +1161,7 @@ impl AudioEngine {
         self.retired_rx = retired_rx;
         self.slot_count = 0;
         self.editors.clear();
+        self.layers.clear();
         self.fx_editors.clear();
         self.touches.clear();
         self.fx_touches.clear();
@@ -1404,20 +1423,52 @@ impl AudioEngine {
         if sample_rate == 0 || !source.plays_on_transport_stop() {
             return;
         }
+        /// How long to keep going on a source that has produced nothing at all.
+        ///
+        /// **A silent source is not a quiet one.** An empty tab is `Silence`,
+        /// which answers `true` to `plays_on_transport_stop` on purpose — a
+        /// slot waiting for an instrument still has to be rendered — so every
+        /// tab created before its instrument arrived paid 600 ms of rendering
+        /// zeros, and a rack of twelve paid seven seconds of it on the thread
+        /// the interface draws from. A patch with a slow attack still puts out
+        /// *tiny* samples from the first one (the envelope multiplies a real
+        /// sample); bit-for-bit zero for a fifth of a second is nothing there.
+        const SILENT_MS: f32 = 200.0;
+
         let mut buf = vec![0.0f32; BLOCK * 2];
         source.note_on(NOTE, VELOCITY);
         let blocks = ((sample_rate as f32 * SECONDS) as usize).div_ceil(BLOCK);
-        for _ in 0..blocks {
+        let give_up = ((sample_rate as f32 * SILENT_MS / 1000.0) as usize).div_ceil(BLOCK);
+        let mut heard = false;
+        for i in 0..blocks {
             buf.fill(0.0);
             // A source is not required to overwrite what it is handed, so the
             // buffer is cleared each time and everything past what it wrote is
             // silence by construction.
             let written = source.render(&mut buf, sample_rate);
-            levels.publish(slot, &buf[..(written * 2).min(buf.len())]);
+            let n = (written * 2).min(buf.len());
+            levels.publish(slot, &buf[..n]);
+            heard |= buf[..n].iter().any(|s| *s != 0.0);
+            if !heard && i >= give_up {
+                break;
+            }
         }
         // Hand it over silent. The note was ours, not the player's.
         source.note_off(NOTE);
         source.all_notes_off();
+        // Logged because it is a note choz played by itself. It is rendered
+        // into a scratch buffer off the audio thread and cannot be heard — but
+        // when someone reports "a short note nobody pressed", the first thing
+        // to rule out is the one note choz is known to play on its own. Only
+        // when something came back: a slot that answered with silence played
+        // no note worth reporting.
+        if heard {
+            eprintln!(
+                "choz: probed tab {} with middle C — {:.1} ms of it, not routed anywhere",
+                slot + 1,
+                SECONDS * 1000.0
+            );
+        }
     }
 
     /// Append a source as a new rack slot. Returns its index. No-op past
@@ -1429,6 +1480,7 @@ impl AudioEngine {
         let idx = self.slot_count;
         Self::probe_levels(&mut source, idx, self.sample_rate);
         self.editors.push(source.editor());
+        self.layers.push(source.layers_zones());
         self.touches.push(source.param_touch());
         self.states.push(source.state());
         self.presets.push(source.presets());
@@ -1614,6 +1666,37 @@ impl AudioEngine {
         self.send(EngineCommand::SetSlotProgram { slot, bank, preset });
     }
 
+    /// Point keyboard zone `zone` of `slot` at a program of the loaded file.
+    ///
+    /// This is what makes a split *layer* rather than switch: each zone keeps
+    /// its own program on its own channel, so two hands in two zones sound
+    /// together. Ignored by an instrument that cannot do it — see
+    /// [`choz_ports::AudioSource::layers_zones`].
+    pub fn set_zone_program(&mut self, slot: usize, zone: u8, bank: u8, preset: u8) {
+        if slot >= self.slot_count {
+            return;
+        }
+        self.send(EngineCommand::SetZoneProgram {
+            slot,
+            zone,
+            bank,
+            preset,
+        });
+    }
+
+    /// Which zone each octave of `slot`'s keyboard plays.
+    pub fn set_split(&mut self, slot: usize, split: [Option<u8>; choz_ports::SPLIT_OCTAVES]) {
+        if slot >= self.slot_count {
+            return;
+        }
+        self.send(EngineCommand::SetSplit { slot, split });
+    }
+
+    /// Whether `slot`'s instrument can sound several zones at once.
+    pub fn slot_layers_zones(&self, slot: usize) -> bool {
+        self.layers.get(slot).copied().unwrap_or(false)
+    }
+
     /// Replace slot `slot`'s source. The old one is dropped off the RT thread.
     fn set_slot_source(&mut self, slot: usize, mut source: Source) {
         if slot >= self.slot_count {
@@ -1621,6 +1704,7 @@ impl AudioEngine {
         }
         Self::probe_levels(&mut source, slot, self.sample_rate);
         self.editors[slot] = source.editor();
+        self.layers[slot] = source.layers_zones();
         self.touches[slot] = source.param_touch();
         self.states[slot] = source.state();
         self.presets[slot] = source.presets();
@@ -1876,6 +1960,7 @@ impl AudioEngine {
 /// [`RtState::render`]; only the hand-off to the device differs.
 fn audio_callback(buf: &mut [f32], state: &mut RtState) {
     let started = std::time::Instant::now();
+    let cpu_started = crate::meter::cpu_micros();
     state.apply_commands();
     let frames = buf.len() / 2;
     state.drain_capture(frames);
@@ -1884,14 +1969,21 @@ fn audio_callback(buf: &mut [f32], state: &mut RtState) {
         buf[f * 2] = state.mix[0][f];
         buf[f * 2 + 1] = state.mix[1][f];
     }
-    publish_load(started, frames, state.sample_rate);
+    publish_load(started, cpu_started, frames, state.sample_rate);
 }
 
-/// What this block cost against what it had. One clock read per block, and the
-/// only place either backend measures it — see [`crate::meter::Load`].
-pub(crate) fn publish_load(started: std::time::Instant, frames: usize, sample_rate: u32) {
+/// What this block cost against what it had — on the wall clock and on a CPU.
+/// The only place either backend measures it; see [`crate::meter::Load`].
+pub(crate) fn publish_load(
+    started: std::time::Instant,
+    cpu_started: u64,
+    frames: usize,
+    sample_rate: u32,
+) {
     let budget = std::time::Duration::from_secs_f64(frames as f64 / sample_rate.max(1) as f64);
-    crate::meter::load().publish(started.elapsed(), budget);
+    let cpu =
+        std::time::Duration::from_micros(crate::meter::cpu_micros().saturating_sub(cpu_started));
+    crate::meter::load().publish(started.elapsed(), cpu, budget);
 }
 
 impl RtState {
@@ -2033,6 +2125,21 @@ impl RtState {
                 EngineCommand::SetSlotProgram { slot, bank, preset } => {
                     if let Some(s) = state.slots.get_mut(slot) {
                         s.source.program_change(bank, preset);
+                    }
+                }
+                EngineCommand::SetZoneProgram {
+                    slot,
+                    zone,
+                    bank,
+                    preset,
+                } => {
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        s.source.set_zone_program(zone, bank, preset);
+                    }
+                }
+                EngineCommand::SetSplit { slot, split } => {
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        s.source.set_split(split);
                     }
                 }
                 // Notes are addressed to one slot; the UI already decided which.
@@ -4130,6 +4237,23 @@ mod tests {
             levels.read(skipped),
             (0.0, 0.0),
             "a gated source is left alone"
+        );
+
+        // **A source that answers with silence is dropped in a fifth of a
+        // second, not in six tenths.** An empty tab is `Silence`, and it says
+        // it plays while the transport is stopped — so every tab created before
+        // its instrument arrived used to render 600 ms of zeros on the thread
+        // the interface draws from.
+        let mut nothing: Source = Box::new(crate::sources::Silence);
+        let t = std::time::Instant::now();
+        AudioEngine::probe_levels(&mut nothing, skipped, 48_000);
+        let spent = t.elapsed();
+        assert_eq!(levels.read(skipped), (0.0, 0.0), "and it reads as silent");
+        // A guard on the work, not on the clock: 200 ms of 48 kHz is 9600
+        // frames, and the full probe would be three times that.
+        assert!(
+            spent < std::time::Duration::from_millis(100),
+            "it gave up early, took {spent:?}"
         );
 
         // And a probe of a new instrument replaces the old one's reading rather

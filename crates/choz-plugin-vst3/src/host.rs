@@ -838,7 +838,7 @@ unsafe impl Send for Vst3RealInstance {}
 /// Most steps worth asking a plugin to name, one `getParamStringByValue` call
 /// each. Beyond this a stepped parameter is a range to slide through, not a
 /// list of choices to pick from.
-const MAX_NAMED_STEPS: u32 = 32;
+pub(crate) const MAX_NAMED_STEPS: u32 = 32;
 
 impl Vst3RealInstance {
     pub fn load(path: &Path, sample_rate: u32, block: u32) -> Result<Self> {

@@ -593,6 +593,14 @@ pub trait FxProcessor: Send {
 Instruments implement `AudioSource`, whose `set_param` (no-op by default) is what
 lets a CLAP instrument be tweaked live, RT-safely.
 
+An instrument may also say it can play several **keyboard zones at once**
+(`layers_zones`), take a program per zone (`set_zone_program`) and be told which
+octave plays which (`set_split`). All three default to nothing, so only a source
+that can do it implements them: `Sf2Synth` gives each zone its own MIDI channel
+of the one loaded font, which is what makes a split *layer* — a bass held under
+a pad — instead of switching the tab's patch as the hand crosses the join. A
+hosted plugin has one patch, so the rack falls back to switching it.
+
 Processing is zero-allocation in the audio callback — all buffers are
 pre-allocated and updated in place.
 
@@ -735,6 +743,9 @@ classDiagram
         note_off(note)
         program_change(bank, program)
         set_param(index, value)
+        layers_zones() bool
+        set_zone_program(zone, bank, program)
+        set_split(octaves)
     }
     class FxProcessor {
         <<trait>>
