@@ -45,6 +45,11 @@ pub struct Buses {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub main_link: Option<bool>,
     pub main_mute: bool,
+    /// The main's balance, `-1` left .. `1` right. Added with the desk's pan
+    /// sliders; absent is centred, which is what every project written before
+    /// it sounded like.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_pan: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -73,6 +78,7 @@ impl Default for Buses {
             main_gain_r: None,
             main_link: None,
             main_mute: false,
+            main_pan: None,
         }
     }
 }

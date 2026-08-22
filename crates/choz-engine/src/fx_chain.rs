@@ -145,6 +145,7 @@ pub const BUILT_IN_KINDS: &[(&str, &str)] = &[
     ("tremolo", "Tremolo"),
     ("autopan", "Auto Pan"),
     ("autofilter", "Auto Filter"),
+    ("envelope", "Envelope"),
     ("freqshifter", "Frequency Shifter"),
     ("ringmod", "Ring Modulator"),
     ("shimmer", "Shimmer"),
@@ -296,6 +297,8 @@ pub fn build_processor(
             params,
         )),
         "autofilter" => Box::new(fx::AutoFilter::with_params(sample_rate, params)),
+        // The contour is written, not followed: see `fx::envelope`.
+        "envelope" => Box::new(fx::Envelope::with_params(sample_rate, params)),
         // One carrier, two uses: one sideband or both.
         "freqshifter" => Box::new(fx::FreqShift::with_params(
             fx::Carrier::Shift,

@@ -181,6 +181,13 @@ pub struct Sf2Synth {
     synth: oxisynth::Synth,
     /// Font handle, kept so program changes can re-select on the same font.
     font_id: oxisynth::SoundFontId,
+    /// Which sound zone each octave of the keyboard plays, `None` for the
+    /// tab's own program. See [`AudioSource::set_split`].
+    split: [Option<u8>; choz_ports::SPLIT_OCTAVES],
+    /// Zones that have been given a program of their own. A zone nobody has
+    /// pointed anywhere plays the tab's program, so it must not be routed to an
+    /// empty channel and go silent.
+    zone_set: [bool; ZONES],
     /// Pre-allocated de-interleaved render scratch (oxisynth writes L/R planar).
     buf_l: Vec<f32>,
     buf_r: Vec<f32>,
@@ -188,6 +195,37 @@ pub struct Sf2Synth {
 
 /// Max render block, in frames. cpal blocks are far smaller (256).
 const SF2_MAX_FRAMES: usize = 4096;
+
+/// How many keyboard zones can sound at once.
+///
+/// **One MIDI channel each, one font.** A split used to be a program change as
+/// the hand crossed the join, so two hands in two zones fought over the one
+/// patch and only the last note's sound survived — you could not hold a bass
+/// note and play a pad over it. oxisynth has sixteen channels and the
+/// SoundFont is loaded once for all of them, so a zone costs a channel and no
+/// memory at all. Channel 0 stays the tab's own program, for every octave with
+/// no zone on it.
+const ZONES: usize = 8;
+
+/// The MIDI channel zone `z` plays on. Zone 0 is channel 1: channel 0 belongs
+/// to the tab itself.
+fn zone_channel(zone: u8) -> u8 {
+    (zone as usize % ZONES) as u8 + 1
+}
+
+impl Sf2Synth {
+    /// The channel a note plays on: its octave's zone when that zone has been
+    /// given a program, and the tab's own channel otherwise.
+    fn channel_for(&self, note: u8) -> u8 {
+        self.split
+            .get(note as usize / 12)
+            .copied()
+            .flatten()
+            .filter(|z| self.zone_set.get(*z as usize % ZONES) == Some(&true))
+            .map(zone_channel)
+            .unwrap_or(0)
+    }
+}
 
 impl Sf2Synth {
     /// Load an SF2 file and select `bank`/`preset` on channel 0. Non-RT (file I/O).
@@ -243,6 +281,8 @@ impl Sf2Synth {
         Ok(Self {
             synth,
             font_id,
+            split: [None; choz_ports::SPLIT_OCTAVES],
+            zone_set: [false; ZONES],
             buf_l: vec![0.0; SF2_MAX_FRAMES],
             buf_r: vec![0.0; SF2_MAX_FRAMES],
         })
@@ -251,25 +291,68 @@ impl Sf2Synth {
 
 /// The parameters an SF2 slot shows in the instrument editor.
 ///
-/// A SoundFont has no plugin parameters, but oxisynth runs a reverb **and** a
-/// chorus of its own, on by default, fed by each preset's send amounts. Stacked
-/// under choz's FX chain that is two reverbs and a chorus nobody asked for — so
-/// the two sends are switchable. Presets that send nothing (plenty of them) are
-/// unaffected either way.
+/// Two switches and eleven knobs. The switches came first: oxisynth runs a
+/// reverb **and** a chorus of its own, on by default, fed by each preset's send
+/// amounts, and stacked under choz's FX chain that is two reverbs and a chorus
+/// nobody asked for.
+///
+/// The rest is the SoundFont editor — the envelope, the filter, the tuning and
+/// the output, from [`crate::sf2_patch::EDITS`]. They are ordinary slot
+/// parameters on purpose: that is what makes them movable by mouse, by arrow
+/// key and by a learned CC, and what puts them in the project file, without a
+/// second copy of any of that machinery.
 pub fn sf2_params() -> Vec<choz_ports::PluginParam> {
-    ["SF2 Reverb", "SF2 Chorus"]
+    use crate::sf2_patch::{EDITS, NEUTRAL};
+    let sends = ["SF2 Reverb", "SF2 Chorus"]
         .iter()
-        .enumerate()
-        .map(|(i, name)| choz_ports::PluginParam {
-            id: i as u32,
+        .map(|name| choz_ports::PluginParam {
             name: (*name).to_string(),
             min: 0.0,
             max: 1.0,
             default: 1.0,
             steps: 2,
+            group: Some("SENDS".to_string()),
             ..Default::default()
-        })
+        });
+    let edits = EDITS.iter().map(|e| choz_ports::PluginParam {
+        name: e.name.to_string(),
+        min: 0.0,
+        max: 1.0,
+        // The middle is the SoundFont as written; a knob has to start there or
+        // loading a font would change how it sounds.
+        default: NEUTRAL as f64,
+        unit: e.unit.map(str::to_string),
+        group: Some(e.group.to_string()),
+        ..Default::default()
+    });
+    sends
+        .chain(edits)
+        .enumerate()
+        .map(|(i, p)| choz_ports::PluginParam { id: i as u32, ..p })
         .collect()
+}
+
+/// An SF2 generator number as oxisynth names it.
+///
+/// Only the ones [`crate::sf2_patch::EDITS`] uses: the numbering is the
+/// specification's and shared, but oxisynth's enum is not `repr`-convertible
+/// from a `u16`, and a wrong transmute here would move the wrong generator.
+fn sf2_generator(gen: u16) -> Option<oxisynth::GeneratorType> {
+    use oxisynth::GeneratorType as G;
+    Some(match gen {
+        8 => G::FilterFc,
+        9 => G::FilterQ,
+        17 => G::Pan,
+        34 => G::VolEnvAttack,
+        35 => G::VolEnvHold,
+        36 => G::VolEnvDecay,
+        37 => G::VolEnvSustain,
+        38 => G::VolEnvRelease,
+        48 => G::Attenuation,
+        51 => G::CoarseTune,
+        52 => G::FineTune,
+        _ => return None,
+    })
 }
 
 /// One selectable program in a SoundFont.
@@ -327,17 +410,54 @@ impl AudioSource for Sf2Synth {
 
     fn note_on(&mut self, note: u8, velocity: u8) {
         let _ = self.synth.send_event(oxisynth::MidiEvent::NoteOn {
-            channel: 0,
+            channel: self.channel_for(note),
             key: note,
             vel: velocity,
         });
     }
 
     fn note_off(&mut self, note: u8) {
-        let _ = self.synth.send_event(oxisynth::MidiEvent::NoteOff {
-            channel: 0,
-            key: note,
+        // **The same channel the note went to.** The split can be re-drawn
+        // while a key is held, so this is the one place it must not be
+        // consulted again — but a note-off on the wrong channel is a hung note,
+        // and sending it to every channel costs nothing and cannot miss.
+        for channel in 0..=ZONES as u8 {
+            let _ = self
+                .synth
+                .send_event(oxisynth::MidiEvent::NoteOff { channel, key: note });
+        }
+    }
+
+    fn layers_zones(&self) -> bool {
+        true
+    }
+
+    fn set_zone_program(&mut self, zone: u8, bank: u8, preset: u8) {
+        let Some(seen) = self.zone_set.get_mut(zone as usize % ZONES) else {
+            return;
+        };
+        *seen = true;
+        let channel = zone_channel(zone);
+        // RT-safe: this looks the preset up in the already-loaded font and
+        // Arc-clones it into the channel.
+        if self
+            .synth
+            .select_program(channel, self.font_id, bank as u32, preset)
+            .is_err()
+        {
+            let _ = self.synth.select_program(channel, self.font_id, 0, 0);
+        }
+        // GM channel volume, as channel 0 gets on the way in — without it the
+        // zone plays at whatever the channel happened to be left at.
+        let _ = self.synth.send_event(oxisynth::MidiEvent::ControlChange {
+            channel,
+            ctrl: 7,
+            value: 100,
         });
+    }
+
+    fn set_split(&mut self, split: [Option<u8>; choz_ports::SPLIT_OCTAVES]) {
+        self.split = split;
     }
 
     /// The SoundFont engine can cut its own voices, which is more than the two
@@ -351,7 +471,16 @@ impl AudioSource for Sf2Synth {
         }
     }
 
+    /// Pedals and wheels reach every zone: the sustain pedal holds the whole
+    /// keyboard, not the half of it the last note happened to be in.
     fn control_change(&mut self, cc: u8, value: u8) {
+        for channel in 1..=ZONES as u8 {
+            let _ = self.synth.send_event(oxisynth::MidiEvent::ControlChange {
+                channel,
+                ctrl: cc,
+                value,
+            });
+        }
         let _ = self.synth.send_event(oxisynth::MidiEvent::ControlChange {
             channel: 0,
             ctrl: cc,
@@ -360,19 +489,31 @@ impl AudioSource for Sf2Synth {
     }
 
     fn pitch_bend(&mut self, value: u16) {
-        let _ = self.synth.send_event(oxisynth::MidiEvent::PitchBend {
-            channel: 0,
-            value: value.min(16383),
-        });
+        for channel in 0..=ZONES as u8 {
+            let _ = self.synth.send_event(oxisynth::MidiEvent::PitchBend {
+                channel,
+                value: value.min(16383),
+            });
+        }
     }
 
     /// `0` = the SoundFont's own reverb send, `1` = its chorus send, both as
-    /// on/off. See [`sf2_params`] for why they are here at all.
+    /// on/off; everything after them is one of [`crate::sf2_patch::EDITS`].
     ///
     /// RT-safe: `set_gen` writes a channel generator offset and re-derives the
-    /// live voices' sends. **Not** `set_chorus_params`, which rebuilds the
+    /// live voices from it. **Not** `set_chorus_params`, which rebuilds the
     /// chorus modulation table — 4.3 ms measured, an xrun every toggle.
     fn set_param(&mut self, index: usize, value: f32) {
+        if let Some((gen, offset)) = crate::sf2_patch::offset_of(index, value) {
+            if let Some(g) = sf2_generator(gen) {
+                // Every zone: the editor shapes the instrument, not whichever
+                // half of the keyboard is being played at the time.
+                for channel in 0..=ZONES {
+                    let _ = self.synth.set_gen(channel, g, offset);
+                }
+            }
+            return;
+        }
         let gen = match index {
             0 => oxisynth::GeneratorType::ReverbSend,
             1 => oxisynth::GeneratorType::ChorusSend,
@@ -382,7 +523,9 @@ impl AudioSource for Sf2Synth {
         // send is clamped at 0: -1000 (=-100%) zeroes any preset, whatever it
         // set. Anything else leaves the SoundFont's own amount alone.
         let offset = if value >= 0.5 { 0.0 } else { -1000.0 };
-        let _ = self.synth.set_gen(0, gen, offset);
+        for channel in 0..=ZONES {
+            let _ = self.synth.set_gen(channel, gen, offset);
+        }
     }
 
     fn program_change(&mut self, bank: u8, preset: u8) {
@@ -407,6 +550,184 @@ mod tests {
         let mut buf = vec![0.0f32; frames * 2];
         s.render(&mut buf, 48_000);
         buf.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+    }
+
+    /// **A split has to layer, not choose.**
+    ///
+    /// The rack used to answer a note in a split zone by changing the tab's
+    /// program, so holding a bass note and playing a pad over it left one
+    /// sound: whichever note landed last won, and the one already down changed
+    /// timbre under the finger. A SoundFont has no reason to work that way —
+    /// the file is loaded once and the engine has sixteen channels to point at
+    /// different programs in it, so a zone costs a channel and no memory.
+    #[test]
+    fn two_split_zones_sound_together_with_different_programs() {
+        let path = std::path::Path::new("/usr/share/sounds/sf2/FluidR3_GM.sf2");
+        if !path.exists() {
+            return;
+        }
+        const SR: u32 = 48_000;
+        let mut s = Sf2Synth::load(path, 0, 0, SR).expect("load SF2");
+        assert!(s.layers_zones(), "a SoundFont layers its zones");
+
+        // Zone 0 is a bass in the bottom two octaves, zone 1 a pad up top.
+        // Programs picked by number rather than by name: any two different GM
+        // programs prove the point.
+        s.set_zone_program(0, 0, 33); // Electric Bass
+        s.set_zone_program(1, 0, 89); // Warm Pad
+        let mut split = [None; choz_ports::SPLIT_OCTAVES];
+        split[2] = Some(0);
+        split[5] = Some(1);
+        s.set_split(split);
+
+        // The two zones really are two channels.
+        assert_eq!(s.channel_for(2 * 12 + 4), zone_channel(0));
+        assert_eq!(s.channel_for(5 * 12 + 4), zone_channel(1));
+        // …and an octave with no zone on it still plays the tab's own program.
+        assert_eq!(s.channel_for(7 * 12), 0);
+
+        /// Peak of `secs` of rendering.
+        fn run(s: &mut Sf2Synth, secs: f32) -> f32 {
+            let mut buf = vec![0.0f32; (SR as f32 * secs) as usize * 2];
+            let mut at = 0;
+            while at < buf.len() {
+                let end = (at + 1024).min(buf.len());
+                s.render(&mut buf[at..end], SR);
+                at = end;
+            }
+            buf.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+        }
+
+        // Both hands down at once, and neither goes quiet. Measured against a
+        // second synth playing only the bass over the *same* window — a note's
+        // own decay makes any comparison across two windows meaningless.
+        let (low, high) = (2 * 12 + 4, 5 * 12 + 4);
+        let mut alone = Sf2Synth::load(path, 0, 0, SR).expect("load SF2");
+        alone.set_zone_program(0, 0, 33);
+        alone.set_zone_program(1, 0, 89);
+        alone.set_split(split);
+
+        for synth in [&mut s, &mut alone] {
+            synth.note_on(low, 100);
+        }
+        run(&mut s, 0.3);
+        run(&mut alone, 0.3);
+        s.note_on(high, 100);
+        let both = run(&mut s, 0.5);
+        let one = run(&mut alone, 0.5);
+        assert!(one > 0.001, "the bass zone sounds: {one}");
+        assert!(
+            both > one * 1.5,
+            "the pad joins it rather than replacing it: {both} vs {one}"
+        );
+
+        // Letting one go leaves the other ringing.
+        s.note_off(high);
+        assert!(run(&mut s, 0.3) > 0.001, "the held note survived");
+        s.note_off(low);
+
+        // A zone nobody has given a program to falls back to the tab's own
+        // rather than playing an empty channel and going silent.
+        let mut s = Sf2Synth::load(path, 0, 0, SR).expect("load SF2");
+        let mut split = [None; choz_ports::SPLIT_OCTAVES];
+        split[5] = Some(3);
+        s.set_split(split);
+        assert_eq!(s.channel_for(5 * 12), 0, "an unset zone is not a hole");
+        s.note_on(5 * 12, 100);
+        assert!(run(&mut s, 0.3) > 0.001, "and it still sounds");
+    }
+
+    /// **Every envelope knob has to reach the sound, and the right way round.**
+    ///
+    /// The first version could not. The offsets went ±2400 timecents and ±480
+    /// centibels, which is polite next to a sampled piano's own 8 ms attack and
+    /// 1000 cB sustain — the knobs moved and nothing was audible, which is the
+    /// worst way for a control to fail. And two of them were backwards: the SF2
+    /// generators behind `Sustain` and `Volume` are *attenuations*, so turning
+    /// them up made the note quieter.
+    ///
+    /// Measured on a real SoundFont because that is the only place the question
+    /// exists: an offset is only big enough relative to what the file says.
+    #[test]
+    fn every_envelope_knob_changes_the_sound_in_the_direction_it_reads() {
+        use crate::sf2_patch::{NEUTRAL, SENDS};
+        let path = std::path::Path::new("/usr/share/sounds/sf2/FluidR3_GM.sf2");
+        if !path.exists() {
+            return;
+        }
+        const SR: u32 = 48_000;
+        /// Loudest sample in the last 200 ms of what was rendered — the level a
+        /// long stage *arrives* at. Peak over the whole window would be the
+        /// note's own attack, which no release setting can change.
+        fn tail(s: &mut Sf2Synth, secs: f32) -> f32 {
+            let frames = (SR as f32 * secs) as usize;
+            let mut buf = vec![0.0f32; frames * 2];
+            let mut at = 0;
+            while at < buf.len() {
+                let end = (at + 1024).min(buf.len());
+                s.render(&mut buf[at..end], SR);
+                at = end;
+            }
+            let last = SR as usize / 5 * 2;
+            buf[buf.len().saturating_sub(last)..]
+                .iter()
+                .fold(0.0f32, |m, v| m.max(v.abs()))
+        }
+        /// `(level in the first 50 ms, held for 4 s, 3 s after the note-off)`
+        /// with one parameter moved off centre.
+        fn probe(path: &std::path::Path, param: usize, value: f32) -> (f32, f32, f32) {
+            let mut s = Sf2Synth::load(path, 0, 0, SR).expect("load SF2");
+            if param != usize::MAX {
+                s.set_param(param, value);
+            }
+            s.note_on(60, 100);
+            let head = tail(&mut s, 0.05);
+            let held = tail(&mut s, 4.0);
+            s.note_off(60);
+            (head, held, tail(&mut s, 3.0))
+        }
+
+        let (head, held, after) = probe(path, usize::MAX, NEUTRAL);
+        assert!(head > 0.01, "the SoundFont makes a sound at all");
+
+        // Attack up: the note fades in, so the first 50 ms are far quieter.
+        let (slow_head, ..) = probe(path, SENDS, 1.0);
+        assert!(
+            slow_head < head / 4.0,
+            "a full attack must be audible: {slow_head} vs {head}"
+        );
+        // …and down, it is at least as immediate as the file itself.
+        let (fast_head, ..) = probe(path, SENDS, 0.0);
+        assert!(fast_head >= head * 0.9, "{fast_head} vs {head}");
+
+        // Sustain up holds the note higher four seconds in. It cannot hold it
+        // for ever — a piano *sample* runs out, and no envelope puts back what
+        // was never recorded — but it must be plainly louder than the file's.
+        let (_, loud_hold, _) = probe(path, SENDS + 3, 1.0);
+        assert!(
+            loud_hold > held * 2.0,
+            "sustain up must sustain: {loud_hold} vs {held}"
+        );
+
+        // Release up leaves something ringing three seconds after the key.
+        let (.., long_tail) = probe(path, SENDS + 4, 1.0);
+        assert!(
+            long_tail > after,
+            "release up must ring on: {long_tail} vs {after}"
+        );
+
+        // Volume: up is louder and down is quieter. The generator is an
+        // attenuation, so this is the pair that catches the sign.
+        let (up, ..) = probe(path, SENDS + 10, 1.0);
+        let (down, ..) = probe(path, SENDS + 10, 0.0);
+        assert!(
+            up > head && down < head,
+            "up {up}, file {head}, down {down}"
+        );
+
+        // Cutoff down takes the top off it.
+        let (dark, ..) = probe(path, SENDS + 5, 0.0);
+        assert!(dark < head, "cutoff down must be heard: {dark} vs {head}");
     }
 
     /// The sustain pedal has to actually sustain: without it a note-off kills

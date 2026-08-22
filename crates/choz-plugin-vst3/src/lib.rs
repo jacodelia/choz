@@ -96,18 +96,18 @@ pub fn read_params(path: &Path, _id: &str) -> Vec<PluginParam> {
         .map(|id| {
             let (steps, points) = inst.param_steps(id);
             // A plugin that reports no steps has not said "continuous" — Surge
-            // XT reports zero for all 800 of its parameters, switches included.
-            // What it does answer is what a value *reads* as, so ask: a control
-            // whose whole range only ever shows two words is a switch, and gets
-            // drawn as one instead of as a fader with two positions.
+            // XT reports zero for all 800 of its parameters, switches and mode
+            // lists included. What it does answer is what a value *reads* as,
+            // so ask: a control whose range reads as a handful of words is a
+            // switch or a list of positions, and gets drawn as one.
             let (steps, points) = if steps == 0 {
-                switch_from_labels(&inst, id).unwrap_or((steps, points))
+                steps_from_labels(&inst, id).unwrap_or((steps, points))
             } else {
                 (steps, points)
             };
             let unit = inst.param_label(id);
             PluginParam {
-            group: None,
+                group: None,
                 id,
                 name: inst.param_name(id),
                 // VST3 parameters are normalised by definition.
@@ -122,33 +122,94 @@ pub fn read_params(path: &Path, _id: &str) -> Vec<PluginParam> {
         .collect()
 }
 
-/// Two labels over the whole range and nothing in between: a switch, in the
-/// plugin's own words. `None` when it reads as anything else, which leaves the
-/// parameter exactly as the plugin described it.
+/// The positions of a parameter that reports none, read off the plugin's own
+/// words. `None` when it reads as anything but a list of names, which leaves
+/// the parameter exactly as the plugin described it.
 ///
-/// Three probes, not the whole range: a switch reads Off/Off/On or Off/On/On,
-/// an enumeration reads three different things, and a continuous parameter
-/// reads three numbers. Anything that needs more probes than that to tell is
-/// not a switch.
-fn switch_from_labels(inst: &host::Vst3RealInstance, id: u32) -> Option<(u32, Vec<(f64, String)>)> {
-    let shown: Vec<String> = [0.0, 0.5, 1.0]
-        .iter()
-        .map(|v| inst.param_display_at(id, *v))
+/// Surge XT reports zero steps for all 800 of its parameters, `A Play Mode`
+/// included, and still renders "Poly"/"Mono"/"Mono ST"/"Latch" for it. The
+/// only place those names exist is `getParamStringByValue`, so the range is
+/// swept: labels that hold over a run of probes and then change are positions,
+/// and each one is placed at the middle of its run — the safest point to send
+/// back, since the edges of a plateau are exactly where a rounding difference
+/// lands on the neighbour.
+///
+/// Rejected, and left a knob: anything that reads as a number ("0.50",
+/// "-12.0 dB"), a label that comes back in two separate runs (which is a
+/// waveform table being sampled too coarsely, not a list), and more positions
+/// than are worth stepping through one by one.
+fn steps_from_labels(inst: &host::Vst3RealInstance, id: u32) -> Option<Positions> {
+    // Enough to separate the handful of positions a mode switch has without
+    // asking a plugin for 800 × N strings on load. When every probe reads
+    // differently the sweep was too coarse to have found the plateaus — Surge
+    // XT's filter type has more entries than that — so that one parameter is
+    // swept again finely, and only that one pays for it.
+    steps_from_labels_at(inst, id, 17).and_then(|(sweep, out)| {
+        if sweep {
+            steps_from_labels_at(inst, id, 65).map(|(_, out)| out)
+        } else {
+            Some(out)
+        }
+    })
+}
+
+/// The positions of a parameter and where they sit, `0..=1`.
+type Positions = (u32, Vec<(f64, String)>);
+
+/// One sweep of `probes` points.
+fn steps_from_labels_at(
+    inst: &host::Vst3RealInstance,
+    id: u32,
+    probes: usize,
+) -> Option<(bool, Positions)> {
+    let probes = probes.max(3);
+    let shown: Vec<String> = (0..probes)
+        .map(|k| inst.param_display_at(id, k as f64 / (probes - 1) as f64))
         .collect();
-    if shown.iter().any(|s| s.is_empty()) {
+    positions_from_labels(&shown)
+}
+
+/// What a sweep of labels, evenly spaced over `0..=1`, says the parameter is.
+/// The flag says every probe read differently, which is the caller's cue to
+/// sweep again more finely.
+fn positions_from_labels(shown: &[String]) -> Option<(bool, Positions)> {
+    let probes = shown.len();
+    if probes < 3 || shown.iter().any(|s| s.is_empty()) {
         return None;
     }
-    let low = &shown[0];
-    let high = &shown[2];
-    if low == high {
+    // A value, however it is dressed: "0.50", "440 Hz", "-12.0 dB".
+    if shown.iter().any(|s| {
+        s.split_whitespace()
+            .next()
+            .is_some_and(|w| w.parse::<f64>().is_ok())
+    }) {
         return None;
     }
-    // The middle has to be one of the two ends: a third reading is a third
-    // position, which is a list and not a switch.
-    if shown[1] != *low && shown[1] != *high {
+    // Runs of one label, in order: (label, first index, last index).
+    let mut runs: Vec<(&str, usize, usize)> = Vec::new();
+    for (k, s) in shown.iter().enumerate() {
+        match runs.last_mut() {
+            Some(r) if r.0 == s.as_str() => r.2 = k,
+            _ => runs.push((s.as_str(), k, k)),
+        }
+    }
+    if runs.len() < 2 || runs.len() as u32 > host::MAX_NAMED_STEPS {
         return None;
     }
-    Some((2, vec![(0.0, low.clone()), (1.0, high.clone())]))
+    // The same name twice with something else between it is not a position:
+    // that is a table being read too coarsely to see what it really does.
+    let mut seen = std::collections::HashSet::new();
+    if !runs.iter().all(|(l, _, _)| seen.insert(*l)) {
+        return None;
+    }
+    let points = runs
+        .iter()
+        .map(|(label, lo, hi)| {
+            let mid = (lo + hi) as f64 / 2.0;
+            (mid / (probes - 1) as f64, label.to_string())
+        })
+        .collect();
+    Some((runs.len() == probes, (runs.len() as u32, points)))
 }
 
 /// A live VST3 audio effect in a slot's FX chain.
@@ -286,5 +347,61 @@ impl AudioSource for Vst3Instrument {
 
     fn presets(&self) -> Option<choz_ports::PresetsHandle> {
         self.inst.presets()
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::positions_from_labels;
+
+    fn sweep(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_mode_list_reads_as_its_positions() {
+        // Surge XT's play mode, as it renders over the range.
+        let s = sweep(&[
+            "Poly", "Poly", "Mono", "Mono", "Mono ST", "Mono ST", "Latch", "Latch",
+        ]);
+        let (undersampled, (steps, points)) = positions_from_labels(&s).expect("a list");
+        assert!(!undersampled);
+        assert_eq!(steps, 4);
+        assert_eq!(points.len(), 4);
+        assert_eq!(points[0].1, "Poly");
+        // Each point sits inside its own run, not on the edge where the next
+        // position starts.
+        assert!((points[0].0 - 1.0 / 14.0).abs() < 1e-9);
+        assert!(points.iter().all(|(v, _)| (0.0..=1.0).contains(v)));
+    }
+
+    #[test]
+    fn a_switch_is_two_positions() {
+        let s = sweep(&["Off", "Off", "Off", "On"]);
+        let (_, (steps, _)) = positions_from_labels(&s).expect("a switch");
+        assert_eq!(steps, 2);
+    }
+
+    #[test]
+    fn numbers_stay_a_knob() {
+        assert!(positions_from_labels(&sweep(&["0.00", "0.50", "1.00"])).is_none());
+        assert!(positions_from_labels(&sweep(&["-12.0 dB", "-6.0 dB", "0.0 dB"])).is_none());
+    }
+
+    #[test]
+    fn a_name_that_comes_back_is_not_a_list() {
+        assert!(positions_from_labels(&sweep(&["Saw", "Sine", "Saw", "Sine"])).is_none());
+    }
+
+    #[test]
+    fn every_probe_different_asks_for_a_finer_sweep() {
+        let s = sweep(&["Off", "LP 24", "HP 12", "BP 12"]);
+        let (undersampled, _) = positions_from_labels(&s).expect("a list");
+        assert!(undersampled);
+    }
+
+    #[test]
+    fn a_blank_reading_says_nothing() {
+        assert!(positions_from_labels(&sweep(&["Off", "", "On"])).is_none());
     }
 }

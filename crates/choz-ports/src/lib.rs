@@ -180,6 +180,10 @@ impl FxMeter {
 
 /// A source of interleaved stereo `f32` audio. `render` is called from the
 /// audio callback — must be realtime-safe (no alloc, no locks, no I/O).
+/// Octaves a keyboard split is expressed in — MIDI note 127 is in octave 10,
+/// so eleven covers the whole range.
+pub const SPLIT_OCTAVES: usize = 11;
+
 pub trait AudioSource: Send {
     /// Fill `out` (interleaved stereo) with the next block. Returns frames
     /// written; a short/zero return means the source has finished.
@@ -220,6 +224,32 @@ pub trait AudioSource: Send {
     /// sources (SF2) react. Called on the RT thread, so implementations must not
     /// allocate or block.
     fn program_change(&mut self, _bank: u8, _preset: u8) {}
+
+    /// Whether this source can play several *different* sounds at once, one per
+    /// keyboard zone.
+    ///
+    /// A SoundFont can: the file is loaded once and the engine has sixteen MIDI
+    /// channels to point at different programs in it, so a split costs nothing
+    /// but channels. A hosted plugin cannot — it has one patch — so the rack
+    /// falls back to switching that patch as the hand moves, which is one sound
+    /// at a time.
+    fn layers_zones(&self) -> bool {
+        false
+    }
+
+    /// Point keyboard zone `zone` at a program of the loaded file.
+    ///
+    /// Zones are the rack's sound buttons, numbered from 0. Ignored by a source
+    /// that answers `false` to [`AudioSource::layers_zones`].
+    fn set_zone_program(&mut self, _zone: u8, _bank: u8, _preset: u8) {}
+
+    /// Which zone each octave of the keyboard plays, `None` for the source's
+    /// own current program.
+    ///
+    /// A fixed array rather than a slice because this crosses to the audio
+    /// thread inside a command, and a command that allocates is a command that
+    /// can stall a block.
+    fn set_split(&mut self, _split: [Option<u8>; SPLIT_OCTAVES]) {}
 
     /// Set a plugin parameter by index to a normalised 0.0–1.0 value. Default
     /// no-op: only hosted plugins expose parameters. Called on the RT thread,

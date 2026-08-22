@@ -6,7 +6,7 @@ día por día, con los porqués y lo último arriba; cómo encajan las piezas, e
 cierra, para que lo que quede sea sólo lo que queda — el 2026-08-19 se podó
 entero: lo que decía "hecho" o "cerrado" se fue al changelog.
 
-Última actualización: 2026-08-19.
+Última actualización: 2026-08-22.
 
 ## Estado en una línea
 
@@ -17,7 +17,7 @@ jack del grafo) y por ALSA/PulseAudio/PipeWire (un dispositivo de captura
 elegible en Settings), así que también es un multiefecto; hay tres capas contra
 el código ajeno que revienta —escaneo fuera de proceso, cuarentena y sandbox—;
 hay transporte propio con compás, automatización contra ese reloj, `A→M` (audio
-a notas), AutoTune y un arpegiador por tab; 45 efectos
+a notas), AutoTune y un arpegiador por tab; 46 efectos
 propios (**la suite está completa**), que además se publican como un `.clap`
 para usarlos en cualquier otro host; un patch de Max se importa hasta donde se
 puede, diciendo qué no; hay guardia de acople en la entrada; el mixer tiene un
@@ -25,8 +25,8 @@ main **estéreo** y cuatro subgrupos; una tab guarda sus sonidos en botones —q
 se asignan desde el mismo modal de bank/preset— y puede partir el teclado entre
 ellos; y un efecto puede abrirse con el bombo de otra tab, con el clock, o con
 el tap del metrónomo. **La 1.0.0 está publicada y sus paquetes verificados; la
-1.3.1 es este árbol.**
-606 tests, `clippy --workspace --all-targets -D warnings` limpio.
+1.3.2 es este árbol.**
+642 tests, `clippy --workspace --all-targets -D warnings` limpio.
 
 Las comprobaciones con hardware delante quedaron dichas en los gotchas, que es
 donde se van a leer.
@@ -35,9 +35,9 @@ donde se van a leer.
 
 ## Pendiente
 
-Nada de lo pedido el 2026-08-19 queda abierto como punto: los cinco están
-cerrados y contados en el changelog. Lo que sigue son los bordes que cada uno
-dejó dichos, y la pieza que se decidió no hacer.
+Nada de lo pedido queda abierto como punto: lo del 2026-08-19 y lo del
+2026-08-22 está cerrado y contado en el changelog. Lo que sigue son los bordes
+que cada uno dejó dichos, y la pieza que se decidió no hacer.
 
 ### Fuera de la lista, por decisión del 2026-08-19
 
@@ -53,8 +53,10 @@ tiempo, y se replantea aparte.
 | 2 | **Strips de grupo desde el teclado** | MIXER | Se manejan con el mouse; el teclado del MIXER sigue siendo el de las tabs. |
 | 3 | **Gates disparados por nota** | FX | Hoy la fuente es el **nivel de audio** de la otra tab. Para un bombo de SF2 da igual; para un pad silencioso que igual manda notas, no. |
 | 4 | **Un bloque de retraso en el gate** | FX | Una tab que se renderiza después de la gateada llega un bloque tarde (< 3 ms). Se arregla ordenando los slots por dependencia, que es más máquina de la que el problema pide. |
-| 5 | **El split cambia el patch, no superpone dos** | SOUNDS | Una tab es un instrumento. Instantáneo en SF2 (program change), con el costo de un `set_slot_state` en plugins. Dos sonidos a la vez son dos tabs, que es lo que MULTI hace. |
+| 5 | **El split superpone en SF2, no en plugins** | SOUNDS | Cerrado para SoundFonts: una zona por canal MIDI de oxisynth, el archivo compartido, coste cero de memoria. Un plugin alojado tiene **un** patch, así que ahí el rack sigue conmutando al cruzar la junta. Dos plugins a la vez son dos tabs, que es lo que MULTI hace. |
 | 6 | **Secciones de parámetros en VST3** | RACK | VST3 tiene `unitId` + `IUnitInfo`, que es la respuesta del plugin. Hoy VST3 cae en la heurística por nombre, que para Surge XT acierta — pero es una heurística. |
+| 7 | **Registrar sólo los puertos que se usan** | JACK | choz registra un puerto por canal del dispositivo: en una UMC1820 son 12 de salida y 20 de entrada, y PipeWire mueve los 34 en cada bloque, 750 veces por segundo, los use alguien o no. Medido: con el proceso parado, el hilo del grafo come 5,5% de un núcleo mientras el DSP de choz cuesta 0,4%. Lo que se **muestra** en los cajones IN/OUT sale de consultar el grafo y no cambiaría; lo que baja es lo que se registra. |
+| 8 | **Los mandos del editor SF2 no son por zona** | SOUNDS | El editor escribe sus offsets en todos los canales, así que da forma al instrumento entero. Una envolvente distinta por zona del split querría un juego de mandos por zona, y eso es un panel nuevo. |
 
 ### Y lo de siempre
 
@@ -168,7 +170,7 @@ contra una habitación.
   propósito y se alarga con un patch real delante; un `.pd` necesita `adc~`
   **y** `dac~`; el dispositivo de audio no cambia solo **nunca**; JSFX no
   existe en choz.
-- **Lo que se instala con choz**: sus 45 efectos como `.clap` (`~/.clap` desde
+- **Lo que se instala con choz**: sus 46 efectos como `.clap` (`~/.clap` desde
   el instalador, `/usr/lib/clap` desde los paquetes), los wallpapers en
   `share/choz/wallpapers` —una instalación nueva abre con el que trae— y
   `choz-pd-host` cuando hay libpd. `--no-clap` para quien no quiera el plugin.

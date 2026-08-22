@@ -10,10 +10,10 @@ Built with Rust, ratatui and cpal. Provides a TUI for managing note inputs, inst
 
 ## Status
 
-**1.3.1.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
+**1.3.2.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
 LADSPA, DSSI, VST2, VST3 and Pure Data patches are really hosted** — instruments
 and audio effects, with their own parameters and their own windows — choz's own
-45 effects are published as a CLAP plugin for other hosts, and choz installs as a
+46 effects are published as a CLAP plugin for other hosts, and choz installs as a
 `.deb`, an `.rpm` or a script, with an entry in the desktop menu.
 
 ### Plugin formats
@@ -30,7 +30,7 @@ and audio effects, with their own parameters and their own windows — choz's ow
 | **SFZ**    | ✅ | ✅ | — | — |
 | **SF2**    | ✅ | ✅ (oxisynth) | — | — |
 
-Plus **35 built-in DSP effects** — including a real-time pitch corrector — and WAV playback as a rack source.
+Plus **46 built-in DSP effects** — including a real-time pitch corrector — and WAV playback as a rack source.
 
 Plugin windows embed into a real X11 window on choz's editor thread — no suil,
 no Steinberg SDK. Verified by counting the parent window's actual X11 children,
@@ -172,8 +172,8 @@ architecture (x86-64, aarch64, armv7), a `.deb`, an `.rpm` and a `PKGBUILD` for
 Arch, plus `SHA256SUMS.txt`:
 
 ```bash
-tar xzf choz-1.3.1-x86_64-unknown-linux-gnu.tar.gz
-cd choz-1.3.1-x86_64-unknown-linux-gnu
+tar xzf choz-1.3.2-x86_64-unknown-linux-gnu.tar.gz
+cd choz-1.3.2-x86_64-unknown-linux-gnu
 ./install.sh            # uses the binary shipped beside it — no cargo involved
 ```
 
@@ -186,7 +186,7 @@ native binaries**: a Raspberry Pi loads plugins built for ARM, not the x86 ones.
 
 | What | Where | Why |
 |---|---|---|
-| `choz.clap` | `~/.clap` (script) or `/usr/lib/clap` (packages) | choz's own 45 effects, usable from Bitwig, Reaper, Carla or any CLAP host. `--no-clap` skips it. |
+| `choz.clap` | `~/.clap` (script) or `/usr/lib/clap` (packages) | choz's own 46 effects, usable from Bitwig, Reaper, Carla or any CLAP host. `--no-clap` skips it. |
 | Wallpapers | `<prefix>/share/choz/wallpapers` | A fresh install opens on the image choz ships with, and the picker starts there. |
 | `choz-pd-host` | next to `choz` | The only binary that links libpd — installed when libpd is present. |
 
@@ -278,7 +278,7 @@ headroom for plugin DSP at small buffer sizes.
 ## Architecture
 
 ```
-choz/                      11 crates, version 1.3.1
+choz/                      11 crates, version 1.3.2
 ├── crates/
 │   ├── choz-ports/         RT-safe traits every host implements: AudioSource,
 │   │                       FxProcessor, PluginEditor, PluginParam, SandboxStatus
@@ -286,7 +286,7 @@ choz/                      11 crates, version 1.3.1
 │   │                       plugin scan cache, quarantine, sandbox policy
 │   │   ├── engine.rs       RT callback, slots, EngineCommand ring
 │   │   ├── jack_backend.rs Native JACK client — one port per device channel
-│   │   ├── fx/             45 built-in DSP effects
+│   │   ├── fx/             46 built-in DSP effects
 │   │   ├── chord.rs        The chord being held, for the harmoniser's MIDI in
 │   │   ├── feedback.rs     Catches a microphone that starts to howl
 │   │   ├── maxpat.rs       Reads a Max/MSP patch and says what can be kept
@@ -302,7 +302,7 @@ choz/                      11 crates, version 1.3.1
 │   ├── choz-plugin-vst3/   VST3 host — pure-Rust COM bindings, no Steinberg SDK
 │   ├── choz-plugin-pd/     Pure Data patches as effects; `choz-pd-host` is the
 │   │                       only binary that links libpd (feature `pd`)
-│   ├── choz-plugin-clap-export/ choz's own 45 effects, published as one `.clap`
+│   ├── choz-plugin-clap-export/ choz's own 46 effects, published as one `.clap`
 │   ├── choz-plugin-sandbox/ Shared-memory transport for out-of-process hosting
 │   │                       (audio blocks and the plugin's window)
 │   └── choz-ui/            The `choz` binary: TUI, rack, modals, drawers,
@@ -329,7 +329,7 @@ ring so they are freed off the RT thread.
 
 | | |
 |---|---|
-| choz | **1.3.1** |
+| choz | **1.3.2** |
 | Rust edition | 2021 (`choz-plugin-lv2` is 2024) |
 | Toolchain tested | rustc 1.97.1 |
 | Platform | Linux. ALSA/JACK/PipeWire. Released for x86-64, aarch64 and armv7 |

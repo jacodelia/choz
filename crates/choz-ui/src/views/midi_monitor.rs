@@ -623,71 +623,237 @@ fn visible_whites(state: &KeyboardState, width: usize) -> Vec<u8> {
     all[start..start + width].to_vec()
 }
 
-/// The keyboard: black keys on the top row, white key bodies below, octave
-/// numbers under those.
+/// How wide one white key is drawn, for `width` cells of panel.
 ///
-/// One column per white key, and the black keys are drawn with half-blocks
-/// straddling the boundary they really sit on — the right half of the white
-/// below them and the left half of the white above. A white key with a black
-/// on each side (D, G, A) ends up fully covered, and *that* is what turns the
-/// top row into the piano's 2-and-3 grouping instead of an even dotted line:
+/// The whole 88 keys whenever they fit, at the widest that still fits — a
+/// keyboard is read by where the black groups fall, and that reads better on a
+/// wide key than on a scrolled window of narrow ones. Chosen rather than set:
+/// a control for it was one more thing to fiddle with on a panel whose job is
+/// to show what is arriving.
+fn auto_key_w(width: usize) -> usize {
+    const WHITES: usize = 52;
+    // A white key is its body plus the join to its right, which is where the
+    // black key lives.
+    (1..=KEY_W_MAX)
+        .rev()
+        .find(|kw| WHITES * (kw + 1) <= width)
+        .unwrap_or(1)
+}
+
+/// The widest a white key is ever drawn. Past this the labels stop growing and
+/// the keyboard is just a coarse picture of a piano.
+const KEY_W_MAX: usize = 4;
+
+/// Unlit hairline down the join between two white keys.
+const KEY_EDGE: Color = Color::Rgb(120, 126, 138);
+
+/// The keyboard: black keys over the top of the white bodies, a hairline down
+/// every join, and octave labels underneath.
+///
+/// Each white key is a body of solid cells plus **one join cell** to its right.
+/// The black key sits on that join, because that is where it really sits — on
+/// the seam between two whites. Where there is no black key (E–F, B–C) the join
+/// is drawn as ivory carrying a one-eighth rule, so the band stays a continuous
+/// keyboard with a hairline between keys and the dark bars are unmistakably the
+/// black keys:
 ///
 /// ```text
-///  ▐█▌ ▐███▌ ▐█▌ ▐███▌
-///  ███████████████████
-///  1     2
+///  ██▊██▊██▏██▊██▊██▊██▏      ▊ = a black key, ▏ = the seam
+///  ██▏██▏██▏██▏██▏██▏██▏
+///  C4   D4   E4   F4
 /// ```
-fn keyboard_lines(state: &KeyboardState, mode: KeyColor, width: usize) -> Vec<Line<'static>> {
-    let whites = visible_whites(state, width);
-    let colour_of = |note: u8, unlit: Color| match state.lit(note) {
-        Some(k) => key_colour(mode, &k),
-        None => unlit,
+fn keyboard_lines(
+    state: &KeyboardState,
+    mode: KeyColor,
+    width: usize,
+    rows: usize,
+) -> (Vec<Line<'static>>, KeyMap) {
+    let key_w = auto_key_w(width);
+    // One key plus its join. The window is measured in those, not in cells.
+    let whites = visible_whites(state, width / (key_w + 1));
+    piano_lines(&whites, key_w, rows, &|n| {
+        state.lit(n).map(|k| key_colour(mode, &k))
+    })
+}
+
+/// The whole 88-key piano at the widest key that fits `width`, for a panel that
+/// wants a keyboard rather than a window onto one. The SPLIT dialogue is the
+/// caller: its zones are octaves, so it has to show every octave at once.
+pub fn full_piano(
+    width: usize,
+    rows: usize,
+    paint: &dyn Fn(u8) -> Option<Color>,
+) -> (Vec<Line<'static>>, KeyMap) {
+    let all = piano_whites();
+    let key_w = (1..=KEY_W_MAX)
+        .rev()
+        .find(|kw| all.len() * (kw + 1) <= width)
+        .unwrap_or(1);
+    let fits = (width / (key_w + 1)).min(all.len());
+    piano_lines(&all[..fits], key_w, rows, paint)
+}
+
+/// The piano itself: white keys `key_w` cells wide over `rows`, painted by
+/// whatever rule the caller has. `paint` answers `None` for a key that is not
+/// lit, which is the ivory-and-ebony a keyboard sitting still.
+///
+/// Shared by the KEYS tab (lit by what is arriving) and by the SPLIT dialogue
+/// (painted by which sound each octave plays), because a second piano would be
+/// a second answer to where middle C is drawn — and the mouse resolves clicks
+/// through the [`KeyMap`] this returns, so the two cannot disagree.
+fn piano_lines(
+    whites: &[u8],
+    key_w: usize,
+    rows: usize,
+    paint: &dyn Fn(u8) -> Option<Color>,
+) -> (Vec<Line<'static>>, KeyMap) {
+    let colour_of = |note: u8, unlit: Color| paint(note).unwrap_or(unlit);
+    // The black keys take the top half and the white bodies the rest — a
+    // keyboard whose blacks are a single row on a panel ten rows tall is a
+    // diagram, not an instrument. The octave labels are a nicety and go first
+    // when there is no room: two rows still read as a keyboard, one does not.
+    let rows = rows.max(2);
+    let labelled = rows >= 3;
+    let keys = rows - labelled as usize;
+    let band = (keys / 2).max(1);
+    let body = keys.saturating_sub(band).max(1);
+
+    // The join to the right of white key `w`: the black key that sits on it in
+    // the top band, or the seam between two whites that touch.
+    //
+    // The seam is drawn *on ivory* — a rule in the foreground over a white
+    // background — so it costs a hairline rather than a whole cell of gap. A
+    // full dark column there was the same width as a black key, which is why
+    // the blacks could not be picked out of the row at all.
+    let join = |w: u8, in_band: bool| -> Span<'static> {
+        let black = Some(w + 1).filter(|n| *n <= PIANO_HI && is_black(*n));
+        if let (Some(n), true) = (black, in_band) {
+            // The black key itself, and nothing else: one cell in its colour.
+            return Span::styled(
+                "\u{2588}".to_string(),
+                Style::default().fg(colour_of(n, BLACK_KEY)),
+            );
+        }
+        // The seam between two white keys.
+        //
+        // **The next white key, never `w + 1`.** Where a black key sits on this
+        // join, `w + 1` *is* that black key — and reading its colour here is
+        // what painted the white bodies underneath a black key in the black
+        // key's colour. A lit note has to stay inside its own outline.
+        let right = ((w + 1)..=PIANO_HI).find(|n| !is_black(*n)).unwrap_or(w);
+        // **The rule is drawn whatever the keys are wearing.** It used to give
+        // way to a half-block split between the two colours as soon as either
+        // key lit, which is invisible when they are the same colour — and a
+        // whole octave painted one colour by the SPLIT dialogue is exactly
+        // that, so its keys merged into a single bar with no keyboard left in
+        // it. In the foreground over the right key's colour it costs a hairline
+        // rather than a cell of gap, and the cell still belongs to that key.
+        Span::styled(
+            "\u{258F}".to_string(),
+            Style::default()
+                .fg(KEY_EDGE)
+                .bg(colour_of(right, WHITE_KEY)),
+        )
+    };
+    let key_row = |in_band: bool| -> Line<'static> {
+        let mut spans = Vec::with_capacity(whites.len() * 2);
+        for &w in whites {
+            spans.push(Span::styled(
+                "\u{2588}".repeat(key_w),
+                Style::default().fg(colour_of(w, WHITE_KEY)),
+            ));
+            spans.push(join(w, in_band));
+        }
+        Line::from(spans)
     };
 
-    let mut blacks: Vec<Span> = Vec::with_capacity(whites.len());
-    let mut bodies: Vec<Span> = Vec::with_capacity(whites.len());
-    let mut labels: Vec<Span> = Vec::with_capacity(whites.len());
-    for &w in &whites {
-        let white = colour_of(w, WHITE_KEY);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows);
+    for _ in 0..band {
+        lines.push(key_row(true));
+    }
+    for _ in 0..body {
+        lines.push(key_row(false));
+    }
 
-        // The black keys touching this white key, if they are on the piano.
-        let left = w.checked_sub(1).filter(|n| *n >= PIANO_LO && is_black(*n));
-        let right = Some(w + 1).filter(|n| *n <= PIANO_HI && is_black(*n));
-        let glyph = match (left.is_some(), right.is_some()) {
-            (true, true) => '\u{2588}',
-            (true, false) => '\u{258C}',
-            (false, true) => '\u{2590}',
-            (false, false) => ' ',
-        };
-        // One cell cannot colour its two halves apart, so a lit black key wins
-        // the cell it shares: a key being played is the thing being looked for.
-        let black = [left, right]
-            .into_iter()
-            .flatten()
-            .find(|n| state.lit(*n).is_some())
-            .map(|n| colour_of(n, BLACK_KEY))
-            .unwrap_or(BLACK_KEY);
-        blacks.push(Span::styled(
-            glyph.to_string(),
-            Style::default().fg(black).bg(white),
-        ));
-        bodies.push(Span::styled(
-            "\u{2588}".to_string(),
-            Style::default().fg(white),
-        ));
-
-        // Octave numbers under each C, one cell wide so they cannot collide
-        // with the key next door. C4 is middle C, as everywhere else.
-        let label = match w % 12 == 0 {
-            true => char::from_digit((w as u32 / 12).saturating_sub(1), 10).unwrap_or(' '),
-            false => ' ',
+    let map = KeyMap {
+        area: Rect::default(),
+        whites: whites.to_vec(),
+        key_w,
+        band,
+    };
+    if !labelled {
+        return (lines, map);
+    }
+    // Octave numbers under each C — the note name when the key is wide enough
+    // to carry it, and the bare octave digit when it is not. C4 is middle C, as
+    // everywhere else.
+    let mut labels = Vec::with_capacity(whites.len() * 2);
+    for &w in whites {
+        let text = match w % 12 == 0 {
+            false => " ".repeat(key_w),
+            true => {
+                let oct = (w as i32 / 12) - 1;
+                let full = format!("C{oct}");
+                match full.chars().count() <= key_w {
+                    true => format!("{full:<key_w$}"),
+                    false => format!("{:<key_w$}", oct.rem_euclid(10)),
+                }
+            }
         };
         labels.push(Span::styled(
-            label.to_string(),
-            Style::default().fg(if label == ' ' { DIM } else { HEADER }),
+            text,
+            Style::default().fg(if w % 12 == 0 { HEADER } else { DIM }),
         ));
+        labels.push(Span::styled(" ".to_string(), Style::default().fg(DIM)));
     }
-    vec![Line::from(blacks), Line::from(bodies), Line::from(labels)]
+    lines.push(Line::from(labels));
+    (lines, map)
+}
+
+/// Where the keys the last frame drew ended up, so the mouse can play them.
+///
+/// Built by the drawing rather than worked out again beside it: a hit test that
+/// re-derives the layout is a second answer to where middle C is, and the two
+/// drift the moment either changes.
+#[derive(Debug, Clone, Default)]
+pub struct KeyMap {
+    /// The rows the keys were drawn in — the labels and the read-outs under
+    /// them are not part of it.
+    pub area: Rect,
+    /// The white keys on screen, left to right.
+    pub whites: Vec<u8>,
+    /// Cells of white key body, before its join cell.
+    pub key_w: usize,
+    /// How many rows at the top carry the black keys.
+    pub band: usize,
+}
+
+impl KeyMap {
+    /// The note under `(col, row)`, or `None` for a click off the keys.
+    ///
+    /// The black keys live on the join between two whites and only in the top
+    /// band, which is exactly where they are drawn — so the top of a key that
+    /// has a black key beside it plays the black key, and the body below it
+    /// plays the white one. That is what a piano does under a finger.
+    pub fn note_at(&self, col: u16, row: u16) -> Option<u8> {
+        if self.whites.is_empty()
+            || !self
+                .area
+                .contains(ratatui::layout::Position { x: col, y: row })
+        {
+            return None;
+        }
+        let stride = self.key_w + 1;
+        let x = (col - self.area.x) as usize;
+        let white = *self.whites.get(x / stride)?;
+        let on_join = x % stride == self.key_w;
+        let in_band = ((row - self.area.y) as usize) < self.band;
+        let black = Some(white + 1).filter(|n| *n <= PIANO_HI && is_black(*n));
+        match (on_join, in_band, black) {
+            (true, true, Some(n)) => Some(n),
+            _ => Some(white),
+        }
+    }
 }
 
 /// The piano keyboard, lit by what is arriving.
@@ -698,39 +864,37 @@ fn draw_keys(
     mode: KeyColor,
     strips: &[MixerStrip],
     ports: &[String],
-) {
+) -> KeyMap {
     if area.height == 0 || area.width == 0 {
-        return;
+        return KeyMap::default();
     }
     let height = area.height as usize;
-    let mut lines = keyboard_lines(state, mode, area.width as usize);
-    // The octave labels are the first thing to go when the panel is short: a
-    // C2/C3/C4 ruler is a nicety, where the chord and the wheels below it are
-    // readings. Without this, a seven-row panel spent its last row on the
-    // ruler and pushed the pedals off the bottom.
-    if height < lines.len() + 2 {
-        lines.pop();
-    }
-    // The chord goes directly under the keys, before the controllers: it is
-    // the thing being read while both hands are busy.
-    if height > lines.len() {
-        lines.push(chord_line(state));
-    }
-    // Below that: the wheels and the last few controllers. They are what
-    // a player checks after "did the note arrive" — and CCs never light a key.
-    if height > lines.len() {
-        lines.push(controller_line(state));
-    }
-    // The key to the colours, in the colours: a keyboard lit in six hues says
-    // nothing until something names them. What the legend lists is what the
-    // mode colours by — one entry per tab, per channel, or the velocity ramp.
-    if height > lines.len() {
-        lines.push(colour_legend(mode, state, strips, ports));
-    }
+    // What goes under the keyboard, in the order it is given up when the panel
+    // is short: the chord is read while both hands are busy, the controllers
+    // after it, the colour key last. Whatever they do not take, the keys do —
+    // a keyboard three rows tall in a panel of twelve is a diagram of a piano
+    // rather than one whose keys can be seen.
+    let extras = [
+        chord_line(state),
+        controller_line(state),
+        colour_legend(mode, state, strips, ports),
+    ];
+    /// The least that still reads as a keyboard: one row of blacks over one of
+    /// white bodies. The octave labels go before the readouts do.
+    const KEYS_MIN: usize = 2;
+    let take = extras.len().min(height.saturating_sub(KEYS_MIN));
+    let (mut lines, mut map) = keyboard_lines(state, mode, area.width as usize, height - take);
+    // The rows the keys themselves were drawn in: the octave labels are the
+    // last line of `lines` when there is room for them, and clicking a label is
+    // not clicking a key.
+    let key_rows = lines.len().saturating_sub(usize::from(height - take >= 3));
+    map.area = Rect::new(area.x, area.y, area.width, key_rows as u16);
+    lines.extend(extras.into_iter().take(take));
     f.render_widget(
         Paragraph::new(lines).style(super::theme::panel_style()),
         area,
     );
+    map
 }
 
 /// The colour key under the keyboard: which colour is which tab, channel or
@@ -935,7 +1099,7 @@ pub fn draw_midi_monitor(
     // One strip per rack tab, for the MIXER tab. Read from the tabs rather than
     // held here: the RACK edits them, and a second copy would drift.
     strips: &[MixerStrip],
-) -> (Vec<TabRect>, Vec<MixerRect>) {
+) -> (Vec<TabRect>, Vec<MixerRect>, KeyMap) {
     let block = Block::default()
         .title(" MONITOR ")
         .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
@@ -946,7 +1110,7 @@ pub fn draw_midi_monitor(
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height == 0 {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), KeyMap::default());
     }
 
     // The tab strip takes the first row; the rest is whichever tab is showing.
@@ -973,6 +1137,7 @@ pub fn draw_midi_monitor(
         Paragraph::new(Line::from(spans)).style(super::theme::panel_style()),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
+    let mut hits: Vec<MixerRect> = Vec::new();
     let inner = Rect::new(
         inner.x,
         inner.y + 1,
@@ -980,17 +1145,17 @@ pub fn draw_midi_monitor(
         inner.height.saturating_sub(1),
     );
     if inner.height == 0 {
-        return (rects, Vec::new());
+        return (rects, hits, KeyMap::default());
     }
 
-    let mut hits = Vec::new();
+    let mut keys = KeyMap::default();
     match tab {
-        MonitorTab::Keys => draw_keys(f, inner, keyboard, key_colour_mode, strips, ports),
+        MonitorTab::Keys => keys = draw_keys(f, inner, keyboard, key_colour_mode, strips, ports),
         MonitorTab::Wave => draw_wave(f, inner, wave),
         MonitorTab::Monitor => draw_monitor_columns(f, inner, events, ports, spectrum),
-        MonitorTab::Mixer => hits = draw_mixer(f, inner, strips),
+        MonitorTab::Mixer => hits.extend(draw_mixer(f, inner, strips)),
     }
-    (rects, hits)
+    (rects, hits, keys)
 }
 
 /// What a strip stands for. The MIXER draws tabs, then the four subgroups,
@@ -1022,6 +1187,11 @@ pub struct MixerStrip {
     pub active: bool,
     /// Which side the keyboard is pointed at, when the MIXER has the focus.
     pub side: Option<MixerSide>,
+    /// Peak of the channel's last block, **linear and pre-fader**: what is
+    /// coming in, not what the fader is letting out. Drawn inside the fader
+    /// itself in its own colour, so a strip says whether it is making any
+    /// sound at all without a second column of meters beside it.
+    pub level: f32,
     /// Where a tab sums — `OUT`, or the letter of a group. `None` on the
     /// group and main strips, which are where things sum *to*.
     pub dest: Option<&'static str>,
@@ -1069,6 +1239,10 @@ fn draw_mixer(f: &mut Frame, area: Rect, strips: &[MixerStrip]) -> Vec<MixerRect
         return hits;
     }
     let per_page = ((area.width / STRIP_W) as usize).max(1);
+    // The panel's width, shared out equally. `STRIP_W` is the *minimum* a strip
+    // reads at; leaving the remainder unused put a ragged gap on the right and
+    // made two desks of the same rack look like different instruments.
+    let cell = (area.width / per_page as u16).max(STRIP_W);
     let active = strips.iter().position(|s| s.active).unwrap_or(0);
     // The window follows the active tab, like every other list in choz: no
     // second piece of state to keep in step with the rack.
@@ -1082,8 +1256,8 @@ fn draw_mixer(f: &mut Frame, area: Rect, strips: &[MixerStrip]) -> Vec<MixerRect
         .take(per_page)
         .enumerate()
     {
-        let x = area.x + col as u16 * STRIP_W;
-        let rect = Rect::new(x, area.y, STRIP_W - 1, area.height);
+        let x = area.x + col as u16 * cell;
+        let rect = Rect::new(x, area.y, cell - 1, area.height);
         hits.extend(draw_strip(f, rect, i, st));
     }
 
@@ -1152,7 +1326,7 @@ fn draw_strip(f: &mut Frame, area: Rect, tab: usize, st: &MixerStrip) -> Vec<Mix
 
     // Two faders side by side — the tab's two output channels — with the link
     // between them. Everything between the name and the rows at the foot.
-    let bottom = strip_bottom(area, st.kind);
+    let bottom = strip_bottom(area);
     let fader_h = area.height.saturating_sub(1 + bottom);
     if fader_h > 0 {
         let y = area.y + 1;
@@ -1171,18 +1345,34 @@ fn draw_strip(f: &mut Frame, area: Rect, tab: usize, st: &MixerStrip) -> Vec<Mix
         // link machinery below. The **main** is not — it is a stereo output,
         // and it gets the same two faders a tab does.
         if st.kind == StripKind::Bus {
-            let bar = Rect::new(area.x, y, area.width, fader_h);
-            draw_fader(f, bar, st.gain, if st.mute { DIM } else { HEADER });
-            hits.push((MixerHit::Gain(tab), bar));
+            // The same fader a tab's side gets, centred in the strip. Filling
+            // the whole width made the groups read as a different, heavier kind
+            // of control than the faders either side of them, which is exactly
+            // what they are not: one is a sum of the others.
+            let cols = fader_cols(area.width);
+            let bar = Rect::new(area.x + (area.width - cols) / 2, y, cols, fader_h);
+            draw_fader(
+                f,
+                bar,
+                st.gain,
+                if st.mute { DIM } else { HEADER },
+                st.level,
+            );
+            // The click target stays the full width: the fader is thin now, and
+            // a three-column target on a desk is a target you miss.
+            hits.push((
+                MixerHit::Gain(tab),
+                Rect::new(area.x, y, area.width, fader_h),
+            ));
             return finish_strip(f, area, tab, st, hits);
         }
 
         // `L` and `R` columns, one cell of gutter, then the link between them.
-        let cols = ((area.width.saturating_sub(3)) / 2).max(1);
+        let cols = fader_cols(area.width);
         let left = Rect::new(area.x, y, cols, fader_h);
         let right = Rect::new(area.x + cols + 1, y, cols, fader_h);
-        draw_fader(f, left, st.gain, lit(MixerSide::Left));
-        draw_fader(f, right, st.gain_r, lit(MixerSide::Right));
+        draw_fader(f, left, st.gain, lit(MixerSide::Left), st.level);
+        draw_fader(f, right, st.gain_r, lit(MixerSide::Right), st.level);
         hits.push((MixerHit::Gain(tab), left));
         hits.push((MixerHit::GainR(tab), right));
 
@@ -1225,7 +1415,7 @@ fn finish_strip(
 ) -> Vec<MixerRect> {
     use crate::views::fx_chain_panel::pan_label;
     let w = area.width as usize;
-    let bottom = strip_bottom(area, st.kind);
+    let bottom = strip_bottom(area);
     let mut y = area.y + area.height - bottom;
     if bottom >= 2 {
         let flags = Rect::new(area.x, y, area.width, 1);
@@ -1259,23 +1449,49 @@ fn finish_strip(
                 format!("{:<4.2}", st.gain.max(st.gain_r)),
                 Style::default().fg(DIM),
             ),
+            // A group is a mono sum: it has no pan, and printing `C` under one
+            // said it had a centred one.
             Span::styled(
-                format!("{:>w$}", pan_label(st.pan), w = w.saturating_sub(4)),
+                format!(
+                    "{:>w$}",
+                    match is_stereo(st.kind) {
+                        true => pan_label(st.pan),
+                        false => String::new(),
+                    },
+                    w = w.saturating_sub(4)
+                ),
                 Style::default().fg(HEADER),
             ),
         ]))
         .style(theme::panel_style()),
         row,
     );
-    if st.kind == StripKind::Tab {
+    y += 1;
+    // Rows still to come under the numbers.
+    let mut left = bottom.saturating_sub(2);
+
+    // The pan, as something to grab rather than a word to read: the two faders
+    // above are levels, and the one control that reads across is drawn across.
+    // The word stays on the numbers row — a slider says where it is, not what
+    // it is called.
+    if left > 0 {
+        if is_stereo(st.kind) {
+            let bar = Rect::new(area.x, y, area.width, 1);
+            draw_pan_slider(f, bar, st.pan, if st.mute { DIM } else { ACCENT });
+            hits.push((MixerHit::Pan(tab), bar));
+        }
+        y += 1;
+        left -= 1;
+    } else if is_stereo(st.kind) {
+        // No row for it: the numbers row carries the pan, the way it always
+        // did on a panel with nothing to spare.
         hits.push((MixerHit::Pan(tab), row));
     }
-    y += 1;
 
     // Where the tab sums, when the panel is tall enough to say it. On a desk
     // with groups this is the setting that explains a tab nobody can hear —
     // and clicking it walks `OUT → A → B → C → D`.
-    if bottom >= 3 {
+    if left > 0 {
         if let Some(d) = st.dest {
             let cell = Rect::new(area.x, y, area.width, 1);
             f.render_widget(
@@ -1295,27 +1511,58 @@ fn finish_strip(
     hits
 }
 
-/// Rows at the foot of a strip: the flags and the numbers, plus the
-/// destination when the panel is tall enough to show it and the strip is a tab
-/// (a group is where things go; it has no destination of its own yet).
-fn strip_bottom(area: Rect, kind: StripKind) -> u16 {
-    let want = match kind == StripKind::Tab && area.height >= 7 {
-        true => 3,
-        false => 2,
-    };
+/// Rows at the foot of a strip: the flags and the numbers, then the pan slider,
+/// then the destination when the panel is tall enough to show it.
+///
+/// **The same for every kind of strip.** A group has no pan and no destination
+/// and the main has no destination, but their rows are still reserved — the
+/// foot is what decides how tall the fader above it is, and a desk whose group
+/// faders were two rows longer than the tabs either side of them read as a
+/// mistake. The rows a strip has nothing to put in are simply left empty.
+///
+/// The order is the order they are given up in: on a short panel the fader is
+/// what has to survive, so the destination goes first and the pan after it.
+fn strip_bottom(area: Rect) -> u16 {
+    let mut want = 2;
+    if area.height >= 6 {
+        want += 1;
+    }
+    if area.height >= 8 {
+        want += 1;
+    }
     want.min(area.height.saturating_sub(1))
+}
+
+/// Has this strip two sides, and so somewhere to pan between? A group is a
+/// mono sum with one fader; a tab and the main are stereo.
+fn is_stereo(kind: StripKind) -> bool {
+    matches!(kind, StripKind::Tab | StripKind::Main)
+}
+
+/// How wide one vertical fader is: half the strip, less the gutter and the
+/// link column down the middle. A group has one fader and a tab has two, and
+/// they are drawn the same width so a row of strips reads as one desk.
+fn fader_cols(width: u16) -> u16 {
+    (width.saturating_sub(3) / 2).max(1)
 }
 
 /// One vertical fader, filled from the bottom, with the part-filled row drawn
 /// in eighths — four rows of cells would otherwise be a four-position fader,
 /// where the knob it stands for has forty.
-fn draw_fader(f: &mut Frame, area: Rect, gain: f32, colour: Color) {
+fn draw_fader(f: &mut Frame, area: Rect, gain: f32, colour: Color, level: f32) {
     use crate::views::fx_chain_panel::MAX_GAIN;
     let h = area.height;
     let filled = (gain / MAX_GAIN).clamp(0.0, 1.0) * h as f32;
+    // The meter rides the same cells, in its own colour: the fader keeps its
+    // shape (where the level is set) and the colour says what is arriving.
+    let lit = meter_norm(level) * h as f32;
     let lines: Vec<Line> = (0..h)
         .map(|row| {
             let from_bottom = h - row;
+            let colour = match from_bottom as f32 <= lit {
+                true => meter_colour(level),
+                false => colour,
+            };
             let cell = if filled >= from_bottom as f32 {
                 "\u{2588}"
             } else if filled > from_bottom as f32 - 1.0 {
@@ -1334,6 +1581,57 @@ fn draw_fader(f: &mut Frame, area: Rect, gain: f32, colour: Color) {
         })
         .collect();
     f.render_widget(Paragraph::new(lines).style(theme::panel_style()), area);
+}
+
+/// Where a signal sits on the meter, `0..1` — **decibels**, not amplitude. A
+/// linear meter spends nine tenths of its travel on the top 20 dB and reads as
+/// nothing at all for a quiet part that is perfectly audible. The floor is
+/// -60 dB, which is where a channel stops being worth drawing.
+fn meter_norm(level: f32) -> f32 {
+    const FLOOR_DB: f32 = -60.0;
+    if !level.is_finite() || level <= 0.0 {
+        return 0.0;
+    }
+    let db = 20.0 * level.log10();
+    ((db - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0)
+}
+
+/// The meter's colour: its own, so it cannot be read as the fader, and red
+/// where the channel is at or past full scale — clipping is the one thing a
+/// meter exists to catch.
+fn meter_colour(level: f32) -> Color {
+    match level >= 1.0 {
+        true => Color::Rgb(230, 90, 80),
+        false => Color::Rgb(240, 190, 80),
+    }
+}
+
+/// The pan of a strip, drawn across: a track with a detent at the middle and
+/// the position on it. One row, the width of the strip.
+fn draw_pan_slider(f: &mut Frame, area: Rect, pan: f32, colour: Color) {
+    let w = area.width.max(1) as usize;
+    let mid = (w - 1) / 2;
+    // Centred lands on the detent whatever the width is: rounding a pan of 0
+    // onto an even track would otherwise sit it one cell off centre and read
+    // as panned when it is not.
+    let k = match pan.abs() < f32::EPSILON {
+        true => mid,
+        false => (((pan.clamp(-1.0, 1.0) + 1.0) / 2.0) * (w - 1) as f32).round() as usize,
+    };
+    let spans: Vec<Span> = (0..w)
+        .map(|i| match i {
+            _ if i == k => Span::styled(
+                "\u{2588}",
+                Style::default().fg(colour).add_modifier(Modifier::BOLD),
+            ),
+            _ if i == mid => Span::styled("\u{253C}", Style::default().fg(DIM)),
+            _ => Span::styled("\u{2500}", Style::default().fg(DIM)),
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(theme::panel_style()),
+        area,
+    );
 }
 
 /// A mixer flag: lit when it is on, an outline when it is not.
@@ -1781,6 +2079,149 @@ mod tests {
         );
     }
 
+    /// Each strip says what is arriving on it, inside its own fader and in its
+    /// own colour: a channel that makes no sound and a channel whose fader is
+    /// down look the same until something meters the signal.
+    #[test]
+    fn a_strip_meters_its_signal_inside_the_fader() {
+        use ratatui::{backend::TestBackend, Terminal};
+        // Decibels, not amplitude: half scale is -6 dB and sits near the top,
+        // where a linear meter would put it in the middle.
+        assert_eq!(meter_norm(0.0), 0.0);
+        assert_eq!(meter_norm(1.0), 1.0);
+        assert_eq!(meter_norm(0.001), 0.0, "-60 dB is the floor");
+        assert!(
+            meter_norm(0.5) > 0.85,
+            "-6 dB is nearly the top: {}",
+            meter_norm(0.5)
+        );
+        assert!(meter_norm(f32::NAN) == 0.0, "a NaN reads as silence");
+
+        let strip = |level| MixerStrip {
+            kind: StripKind::Tab,
+            label: "X".to_string(),
+            gain: 0.0,
+            gain_r: 0.0,
+            link: true,
+            pan: 0.0,
+            mute: false,
+            solo: false,
+            level,
+            active: false,
+            side: None,
+            dest: None,
+        };
+        let colours = |level: f32| -> Vec<ratatui::style::Color> {
+            let mut term = Terminal::new(TestBackend::new(STRIP_W, 9)).unwrap();
+            term.draw(|f| {
+                draw_mixer(f, f.area(), &[strip(level)]);
+            })
+            .unwrap();
+            let buf = term.backend().buffer().clone();
+            buf.content().iter().filter_map(|c| c.style().fg).collect()
+        };
+
+        // The fader is all the way down in both: only the meter differs.
+        assert!(
+            !colours(0.0).contains(&meter_colour(0.5)),
+            "silence draws no meter"
+        );
+        assert!(
+            colours(0.5).contains(&meter_colour(0.5)),
+            "a signal lights the fader's cells in the meter's colour"
+        );
+        assert!(
+            colours(1.2).contains(&meter_colour(1.2)),
+            "and full scale is drawn in the colour that says so"
+        );
+        assert_ne!(
+            meter_colour(1.0),
+            meter_colour(0.5),
+            "clipping has to look different or the meter is decoration"
+        );
+    }
+
+    /// The desk reads as one row of channels: a group's single fader is the
+    /// width of a tab's, not the width of the whole strip — drawn full-width it
+    /// looked like a heavier kind of control than the tabs it sums.
+    ///
+    /// And a strip with two sides gets its pan as a slider under the levels,
+    /// with a detent at the centre.
+    #[test]
+    fn a_group_fader_is_a_faders_width_and_a_stereo_strip_has_a_pan_slider() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let strip = |kind, pan| MixerStrip {
+            kind,
+            label: "X".to_string(),
+            gain: 1.0,
+            gain_r: 1.0,
+            link: true,
+            pan,
+            mute: false,
+            solo: false,
+            level: 0.0,
+            active: false,
+            side: None,
+            dest: None,
+        };
+        let render = |strips: &[MixerStrip]| -> Vec<String> {
+            let mut term = Terminal::new(TestBackend::new(STRIP_W, 9)).unwrap();
+            term.draw(|f| {
+                draw_mixer(f, f.area(), strips);
+            })
+            .unwrap();
+            // `TestBackend` prints each row quoted; the quotes are not cells.
+            term.backend()
+                .to_string()
+                .lines()
+                .map(|r| r.trim_matches('"').to_string())
+                .collect()
+        };
+        let fill = |row: &str| {
+            row.chars()
+                .filter(|c| "\u{2588}\u{2591}".contains(*c))
+                .count()
+        };
+
+        // The fader row of each: a tab's two sides, and the group's one.
+        let tab = render(&[strip(StripKind::Tab, 0.0)]);
+        let bus = render(&[strip(StripKind::Bus, 0.0)]);
+        let widest = |rows: &[String]| rows.iter().map(|r| fill(r)).max().unwrap_or(0);
+        assert_eq!(
+            widest(&bus),
+            widest(&tab) / 2,
+            "one fader, a fader wide:\n{}\n{}",
+            bus.join("\n"),
+            tab.join("\n")
+        );
+
+        // The pan slider: a detent in the middle, the position on the track,
+        // and hard left really is the left end.
+        let left = render(&[strip(StripKind::Tab, -1.0)]);
+        let pan_row = left
+            .iter()
+            .find(|r| r.contains('\u{253C}') || r.starts_with('\u{2588}'))
+            .unwrap_or_else(|| panic!("no pan row in\n{}", left.join("\n")));
+        assert!(
+            pan_row.starts_with('\u{2588}'),
+            "hard left sits at the left end: {pan_row:?}"
+        );
+        let centred = render(&[strip(StripKind::Main, 0.0)]);
+        assert!(
+            centred
+                .iter()
+                .any(|r| r.contains('\u{253C}') || r.contains('\u{2588}')),
+            "the main gets one too:\n{}",
+            centred.join("\n")
+        );
+        // A group has no pan to draw, so no track under it.
+        assert!(
+            !bus.iter().any(|r| r.contains('\u{253C}')),
+            "a mono sum draws no pan:\n{}",
+            bus.join("\n")
+        );
+    }
+
     /// The colour key: it names what the mode colours by, in that colour, so a
     /// keyboard lit in six hues means something.
     #[test]
@@ -1796,6 +2237,7 @@ mod tests {
                     pan: 0.0,
                     mute: false,
                     solo: false,
+                    level: 0.0,
                     active: false,
                     side: None,
                     dest: None,
@@ -2070,59 +2512,168 @@ mod tests {
     }
 
     /// The black keys must land in the piano's 2-and-3 groups, or the row is a
-    /// dotted line and not a keyboard. Checked on the glyphs, which is where
-    /// the grouping actually comes from.
+    /// dotted line and not a keyboard. They live on the border between two
+    /// white keys — which is where they really sit — so the grouping is read
+    /// off the borders: black, black, plain, black, black, black, plain.
     #[test]
     fn the_black_keys_fall_into_two_and_three_groups() {
         let k = KeyboardState::default();
-        let lines = keyboard_lines(&k, KeyColor::Channel, 200);
-        let blacks: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-
-        // One octave of the pattern, starting at C: C▐ D█ E▌ F▐ G█ A█ B▌.
+        let lines = keyboard_lines(&k, KeyColor::Channel, 400, 6).0;
+        // Spans go body, border, body, border… so the borders are the odd ones.
+        let borders: String = lines[0]
+            .spans
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .map(|s| s.content.as_ref())
+            .collect();
         assert!(
-            blacks.contains("\u{2590}\u{2588}\u{258C}\u{2590}\u{2588}\u{2588}\u{258C}"),
-            "the 2-group then the 3-group: {blacks}"
+            borders.contains("\u{2588}\u{2588}\u{258F}\u{2588}\u{2588}\u{2588}\u{258F}"),
+            "the 2-group then the 3-group: {borders}"
         );
-        // A white key with a black on each side is fully covered; one with a
-        // black on neither side (E→F, B→C) leaves the gap that separates the
-        // groups.
         assert_eq!(
-            blacks.chars().filter(|c| *c == '\u{2588}').count(),
-            21,
-            "D, G and A of each full octave: {blacks}"
+            borders.chars().filter(|c| *c == '\u{2588}').count(),
+            (PIANO_LO..=PIANO_HI).filter(|n| is_black(*n)).count(),
+            "one border key per black key of the piano: {borders}"
+        );
+        // Every key has an edge, in both bands: that is what makes the width
+        // worth spending.
+        let below: String = lines[2]
+            .spans
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            below.chars().all(|c| c == '\u{258F}'),
+            "under the blacks, every key is still bordered: {below}"
         );
     }
 
+    /// The keys grow with the panel: a taller panel is a taller keyboard, and
+    /// a wider one is a wider key — chosen for the width, never set by hand.
+    #[test]
+    fn the_keyboard_fills_the_room_it_is_given() {
+        let k = KeyboardState::default();
+        let short = keyboard_lines(&k, KeyColor::Channel, 400, 4).0;
+        let tall = keyboard_lines(&k, KeyColor::Channel, 400, 12).0;
+        assert_eq!(short.len(), 4);
+        assert_eq!(tall.len(), 12, "the keyboard takes the rows it is given");
+
+        // Whatever the width, the row drawn fits inside it.
+        let cells = |w: usize| {
+            keyboard_lines(&k, KeyColor::Channel, w, 6).0[0]
+                .spans
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>()
+        };
+        for w in [20, 60, 104, 156, 260, 400] {
+            assert!(
+                cells(w) <= w,
+                "the keyboard fits {w} cells, got {}",
+                cells(w)
+            );
+        }
+
+        // A white key is as wide as the panel affords, never wider than the
+        // labels can use.
+        assert_eq!(auto_key_w(20), 1, "a narrow panel windows the piano");
+        assert_eq!(auto_key_w(104), 1, "52 keys and their seams, exactly");
+        assert_eq!(auto_key_w(156), 2);
+        assert_eq!(auto_key_w(4000), KEY_W_MAX, "and it stops growing");
+    }
+
     /// Lit keys change colour — the whole point of the panel. Both colours of
-    /// key, because a black key shares its cell with the white beneath it and
-    /// that is exactly where a lit one could get lost.
+    /// key, because a black key sits on the border between two whites and that
+    /// is exactly where a lit one could get lost.
     #[test]
     fn playing_a_key_changes_its_colour() {
         let idle = KeyboardState::default();
-        let quiet = keyboard_lines(&idle, KeyColor::Channel, 200);
+        let quiet = keyboard_lines(&idle, KeyColor::Channel, 400, 6).0;
 
-        // A white key: middle C.
+        // A white key: middle C. Two spans per key, the body first.
         let mut k = KeyboardState::default();
         k.feed(&note_on(60, 0, 100), Some(0));
-        let lit = keyboard_lines(&k, KeyColor::Channel, 200);
-        let col = piano_whites().iter().position(|w| *w == 60).unwrap();
+        let lit = keyboard_lines(&k, KeyColor::Channel, 400, 6).0;
+        let col = piano_whites().iter().position(|w| *w == 60).unwrap() * 2;
         assert_ne!(
-            lit[1].spans[col].style.fg, quiet[1].spans[col].style.fg,
+            lit[2].spans[col].style.fg, quiet[2].spans[col].style.fg,
             "the white key body changed colour"
         );
         assert_ne!(
-            lit[0].spans[col].style.bg, quiet[0].spans[col].style.bg,
-            "and so did the part of it showing between the black keys"
+            lit[0].spans[col].style.fg, quiet[0].spans[col].style.fg,
+            "and so did the part of it up between the black keys"
         );
 
-        // A black key: C#4. It shares its cells with C4 and D4, and must win
-        // the foreground of at least one of them.
+        // A black key: C#4, on the border to the right of C4.
         let mut k = KeyboardState::default();
         k.feed(&note_on(61, 0, 100), Some(0));
-        let lit = keyboard_lines(&k, KeyColor::Channel, 200);
-        assert!(
-            (col..=col + 1).any(|c| lit[0].spans[c].style.fg != quiet[0].spans[c].style.fg),
-            "the lit black key took the cell it shares"
+        let lit = keyboard_lines(&k, KeyColor::Channel, 400, 6).0;
+        assert_ne!(
+            lit[0].spans[col + 1].style.fg,
+            quiet[0].spans[col + 1].style.fg,
+            "the lit black key took the border it sits on"
+        );
+    }
+
+    /// A lit key colours its own key and nothing else.
+    ///
+    /// The seam cell to the right of a white key is shared, and it used to take
+    /// its background from `w + 1` — which, wherever a black key sits on that
+    /// join, *is the black key*. So playing C#4 painted the white bodies of C4
+    /// and D4 underneath it in C#4's colour, all the way down the keyboard.
+    #[test]
+    fn a_lit_black_key_stays_inside_its_own_outline() {
+        let mut k = KeyboardState::default();
+        k.feed(&note_on(61, 0, 100), Some(0)); // C#4
+        let lines = keyboard_lines(&k, KeyColor::Channel, 400, 6).0;
+        let col = piano_whites().iter().position(|w| *w == 60).unwrap() * 2;
+
+        // The band row: the black key's own cell carries the colour.
+        let lit = lines[0].spans[col + 1].style.fg;
+        assert_ne!(lit, Some(BLACK_KEY), "the black key is lit");
+
+        // Every row below the band is white keys only, and none of them — body
+        // or seam — may be wearing the black key's colour.
+        for line in &lines[2..lines.len() - 1] {
+            for span in &line.spans {
+                assert_ne!(span.style.fg, lit, "the colour escaped onto a white key");
+                assert_ne!(span.style.bg, lit, "…or onto the seam behind one");
+            }
+        }
+        // And with nothing playing, the seams are still there to see.
+        let quiet = keyboard_lines(&KeyboardState::default(), KeyColor::Channel, 400, 6).0;
+        assert_eq!(quiet[2].spans[col + 1].content.as_ref(), "\u{258F}");
+    }
+
+    /// A painted octave is still a keyboard: the rule between its keys survives
+    /// the colour.
+    ///
+    /// The seam used to give way to a half-block split between the two keys'
+    /// colours as soon as either lit. Inside a zone the SPLIT dialogue has
+    /// painted, both keys wear the *same* colour — so the split was invisible
+    /// and the octave read as one solid bar with no keys in it.
+    #[test]
+    fn keys_keep_their_edge_when_a_whole_octave_is_painted() {
+        let paint = |n: u8| (n / 12 == 5).then_some(Color::Rgb(200, 60, 60));
+        let (lines, map) = full_piano(400, 6, &paint);
+        let first = map
+            .whites
+            .iter()
+            .position(|n| *n / 12 == 5)
+            .expect("the octave is on the piano");
+
+        // Two keys inside the painted zone, and the join between them.
+        let body = &lines[lines.len() - 2].spans;
+        assert_eq!(body[first * 2].style.fg, paint(60), "the key is painted");
+        let seam = &body[first * 2 + 1];
+        assert_eq!(seam.content.as_ref(), "\u{258F}", "the rule is still drawn");
+        assert_eq!(seam.style.fg, Some(KEY_EDGE), "and it is the edge colour");
+        assert_ne!(
+            seam.style.fg, seam.style.bg,
+            "an edge the same colour as the key it sits on is no edge"
         );
     }
 
@@ -2655,7 +3206,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
         let mut rects = Vec::new();
         term.draw(|f| {
-            (rects, _) = draw_midi_monitor(
+            (rects, _, _) = draw_midi_monitor(
                 f,
                 f.area(),
                 &[],

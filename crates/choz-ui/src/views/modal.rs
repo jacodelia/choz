@@ -23,6 +23,10 @@ pub struct ListModal {
     pub title: String,
     /// Filter chips shown above the list. Empty = no filter bar.
     pub filters: Vec<String>,
+    /// A colour per chip, when the chips stand for things that have one — the
+    /// split's sound banks, which are the same colours the octaves are drawn
+    /// in. Empty (the usual) draws them all in the panel's own colours.
+    pub filter_colours: Vec<Option<Color>>,
     pub filter: usize,
     pub items: Vec<String>,
     /// A colour per row, when the list is about things that have one — the
@@ -128,6 +132,148 @@ fn trunc(s: &str, max: usize) -> String {
     }
 }
 
+/// What the SPLIT dialogue is looking at.
+///
+/// The keyboard is set by pointing at it: the left button paints the chosen
+/// sound onto the octave under the pointer, the right button takes it off. It
+/// is the KEYS tab's own piano — same helper, same geometry — because a split
+/// is a statement about *this* keyboard, and a second drawing of it would put
+/// the zones somewhere the player cannot see them.
+pub struct SplitView<'a> {
+    /// Which sound each octave plays, indexed as `RackSlot::octave_sound` is:
+    /// entry `i` is the octave whose C is `C(i - 1)`.
+    pub octaves: &'a [Option<usize>],
+    /// One entry per sound button: its label and the colour it paints with.
+    pub sounds: &'a [(String, Color)],
+    /// The button the pointer paints with.
+    pub chosen: usize,
+    /// Whether `+` can still add one.
+    pub can_add: bool,
+}
+
+/// Where the SPLIT dialogue put things, for the mouse.
+#[derive(Default, Clone)]
+pub struct SplitRects {
+    pub area: Option<Rect>,
+    /// `(sound index, rect)` for the coloured squares.
+    pub chips: Vec<(usize, Rect)>,
+    pub add: Option<Rect>,
+    /// The piano. A click resolves to a note, and the note to its octave.
+    pub keys: crate::views::midi_monitor::KeyMap,
+}
+
+/// The octave index a note belongs to — the same indexing `octaves` uses.
+pub fn octave_of(note: u8) -> usize {
+    note as usize / 12
+}
+
+pub fn draw_split_modal(f: &mut Frame, area: Rect, v: SplitView) -> SplitRects {
+    f.render_widget(Clear, area);
+    f.render_widget(Block::default().style(Style::default().bg(BACKDROP)), area);
+
+    // Wide and short. The height is what the content needs and not a share of
+    // the screen: a percentage gave a piano nine rows of black keys over two of
+    // white, which is a wall, not a keyboard.
+    const PIANO_ROWS: u16 = 6;
+    let h = (3 + PIANO_ROWS + 1 + 2).min(area.height);
+    let w = (area.width * 92 / 100).max(24).min(area.width);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(format!(" {} ", t("SPLIT")))
+        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border()))
+        .style(super::theme::overlay_style());
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut rects = SplitRects {
+        area: Some(popup),
+        ..Default::default()
+    };
+    let content = inner.inner(Margin {
+        vertical: 0,
+        horizontal: 1,
+    });
+    if content.height < 4 || content.width < 20 {
+        return rects;
+    }
+
+    // ─── The sound buttons, as the squares they paint with ─────────────
+    let mut x = content.x;
+    let y = content.y;
+    for (i, (name, colour)) in v.sounds.iter().enumerate() {
+        let label = format!(" \u{25A0} {} {name} ", i + 1);
+        let w = label.chars().count() as u16;
+        if x + w + 4 > content.x + content.width {
+            break;
+        }
+        let rect = Rect::new(x, y, w, 1);
+        // The chosen one is the colour; the rest wear it on the square alone,
+        // so the row says which sound the pointer is holding.
+        let st = match i == v.chosen {
+            true => Style::default()
+                .fg(Color::Black)
+                .bg(*colour)
+                .add_modifier(Modifier::BOLD),
+            false => Style::default().fg(*colour).bg(PANEL_BG),
+        };
+        f.render_widget(Paragraph::new(Span::styled(label, st)), rect);
+        rects.chips.push((i, rect));
+        x += w + 1;
+    }
+    if v.can_add && x + 3 <= content.x + content.width {
+        let rect = Rect::new(x, y, 3, 1);
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                " + ",
+                Style::default().fg(OK).add_modifier(Modifier::BOLD),
+            )),
+            rect,
+        );
+        rects.add = Some(rect);
+    }
+
+    // ─── The piano, painted by which sound each octave plays ───────────
+    let note = t("  click an octave to give it the chosen sound, right-click to clear it");
+    let rows = content.height.saturating_sub(3).clamp(2, PIANO_ROWS);
+    let paint = |n: u8| -> Option<Color> {
+        v.octaves
+            .get(octave_of(n))
+            .copied()
+            .flatten()
+            .and_then(|i| v.sounds.get(i))
+            .map(|(_, c)| *c)
+    };
+    let (lines, mut keys) =
+        crate::views::midi_monitor::full_piano(content.width as usize, rows as usize, &paint);
+    // Centred on the box: the keys are a whole number of cells wide, so what is
+    // left over is a margin, and a keyboard pushed against the left border with
+    // a gap on the right reads as a drawing that ran out of room.
+    let drawn = (keys.whites.len() * (keys.key_w + 1)) as u16;
+    let x0 = content.x + content.width.saturating_sub(drawn) / 2;
+    let key_rows = lines.len().saturating_sub(usize::from(rows >= 3)) as u16;
+    let top = y + 2;
+    keys.area = Rect::new(x0, top, drawn, key_rows);
+    f.render_widget(
+        Paragraph::new(lines).style(super::theme::overlay_style()),
+        Rect::new(x0, top, drawn, rows),
+    );
+    rects.keys = keys;
+
+    f.render_widget(
+        Paragraph::new(Span::styled(note, Style::default().fg(HINT))),
+        Rect::new(content.x, content.y + content.height - 1, content.width, 1),
+    );
+    rects
+}
+
 fn centered(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
     let w = area.width * pct_x / 100;
     let h = area.height * pct_y / 100;
@@ -186,13 +332,14 @@ pub fn draw_list_modal(
             }
             let rect = Rect::new(x, y, w, 1);
             rects.filters.push((i, rect));
+            let own = m.filter_colours.get(i).copied().flatten();
             let st = if i == m.filter {
                 Style::default()
                     .fg(Color::Black)
-                    .bg(ACCENT)
+                    .bg(own.unwrap_or(ACCENT))
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(HINT).bg(PANEL_BG)
+                Style::default().fg(own.unwrap_or(HINT)).bg(PANEL_BG)
             };
             f.render_widget(Paragraph::new(Span::styled(label, st)), rect);
             x += w + 1;

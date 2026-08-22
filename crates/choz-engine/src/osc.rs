@@ -69,13 +69,18 @@ pub fn listen(port: u16, tx: flume::Sender<InputEvent>) -> Result<OscHandle> {
         // rosc's max packet size; anything larger is a malformed bundle anyway.
         let mut buf = [0u8; rosc::decoder::MTU];
         while !thread_stop.load(Ordering::Relaxed) {
-            let Ok((n, _from)) = socket.recv_from(&mut buf) else {
+            let Ok((n, from)) = socket.recv_from(&mut buf) else {
                 continue;
             };
             let Ok((_rest, packet)) = rosc::decoder::decode_udp(&buf[..n]) else {
                 continue;
             };
             for msg in flatten(packet) {
+                // **Who sent it, in the log.** The socket is bound to
+                // `0.0.0.0`, so anything on the network that reaches this port
+                // plays notes here — and a note nobody pressed is otherwise
+                // indistinguishable from a bug in choz. One line names it.
+                eprintln!("choz: OSC {msg:?} from {from}");
                 let _ = tx.send(msg);
             }
         }
