@@ -431,6 +431,11 @@ pub enum ParamShape {
 /// and `ms` are the two most common units in the 261 bundles installed here.
 const FADER_UNITS: &[&str] = &[
     "s", "ms", "sec", "seconds", "%", "pc", "percent", "cent", "cents",
+    // Not measurements: tags a plugin's own list uses to say "these belong
+    // together and their shape is the point" — a set of harmonics, and the
+    // phase of each. Drawn as a bank of bars, which is the only way 32 of them
+    // read as a spectrum rather than as 32 numbers.
+    "harmonic", "phase",
 ];
 
 impl ParamShape {

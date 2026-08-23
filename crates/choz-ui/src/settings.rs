@@ -644,6 +644,18 @@ impl UiSettings {
         choz_engine::cache::state_dir().join("ui.json")
     }
 
+    /// What an older file means in today's terms.
+    ///
+    /// Its own step so it can be tested without a state directory: the tests
+    /// share one environment variable for that, and a migration is about the
+    /// contents of a file rather than about where it lives.
+    fn migrate(mut self) -> Self {
+        // Written while the keys could be coloured by MIDI channel: they are
+        // coloured by rack tab now, which is the question the panel answers.
+        self.key_colour = self.key_colour.effective();
+        self
+    }
+
     pub fn load() -> Self {
         match std::fs::read_to_string(Self::path())
             .ok()
@@ -655,7 +667,7 @@ impl UiSettings {
                 if saved.midi_clock && saved.clock_source == ClockSource::Internal {
                     saved.clock_source = ClockSource::Any;
                 }
-                saved
+                saved.migrate()
             }
             // **First run.** A fresh install opens with the wallpaper it was
             // installed with, rather than on a bare terminal — the images ship
@@ -702,6 +714,35 @@ impl UiSettings {
 
 #[cfg(test)]
 mod tests {
+    /// A settings file written while the keys could be coloured by MIDI channel
+    /// still parses — **all of it** — and comes back colouring by rack tab.
+    ///
+    /// The whole file is one `serde_json::from_str`, so a value that no longer
+    /// parsed would not lose one setting: it would lose the theme, the paths
+    /// and the wallpaper with it.
+    #[test]
+    fn a_retired_key_colour_still_parses_and_reads_as_the_tab_one() {
+        let saved = UiSettings {
+            key_colour: crate::views::midi_monitor::KeyColor::Channel,
+            text_color: (11, 22, 33),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&saved).unwrap();
+        assert!(json.contains("Channel"), "the old name is what is written");
+
+        let back: UiSettings = serde_json::from_str(&json).expect("an old file still loads");
+        assert_eq!(
+            back.text_color,
+            (11, 22, 33),
+            "the rest of the file survived"
+        );
+        assert_eq!(
+            back.migrate().key_colour,
+            crate::views::midi_monitor::KeyColor::Instrument,
+            "the keys are coloured by tab now"
+        );
+    }
+
     use super::*;
 
     /// A file written before the audio/OSC sections existed still loads.

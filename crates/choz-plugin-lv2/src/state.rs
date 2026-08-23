@@ -281,10 +281,36 @@ impl choz_ports::PluginState for Lv2State {
 
     fn restore(&self, data: &[u8]) {
         let Some(props) = decode(data) else { return };
+        restore_props(&self.shared, props);
+    }
+}
+
+/// A preset's `state:state`, as the Turtle spells it: `(key URI, type URI,
+/// bytes)`. The flags are the host's business, and `POD` is what a value read
+/// out of a file is.
+pub(crate) fn restore_state(shared: &SharedState, props: &[(String, String, Vec<u8>)]) {
+    restore_props(
+        shared,
+        props
+            .iter()
+            .map(|(key, type_uri, value)| Property {
+                key: key.clone(),
+                type_uri: type_uri.clone(),
+                // `state:Pod` (1) | `state:Portable` (2): a value out of a file is both.
+                flags: 3,
+                value: value.clone(),
+            })
+            .collect(),
+    );
+}
+
+/// Hand a set of properties to the instance's `restore`.
+fn restore_props(shared: &SharedState, props: Vec<Property>) {
+    {
         if props.is_empty() {
             return;
         }
-        let guard = self.shared.lock();
+        let guard = shared.lock();
         let Some(cell) = guard.as_ref() else { return };
         // SAFETY: live instance under the mutex.
         let Some(iface) = (unsafe { interface(cell.descriptor) }) else {

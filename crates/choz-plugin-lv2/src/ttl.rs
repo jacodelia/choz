@@ -40,6 +40,10 @@ pub const LV2_REQUIRED_FEATURE: &str = "http://lv2plug.in/ns/lv2core#requiredFea
 pub const UI_X11UI: &str = "http://lv2plug.in/ns/extensions/ui#X11UI";
 pub const UI_BINARY: &str = "http://lv2plug.in/ns/extensions/ui#binary";
 pub const UI_UI: &str = "http://lv2plug.in/ns/extensions/ui#ui";
+/// `ui:showInterface`, as the bundle declares it: under `lv2:extensionData` of
+/// the UI, not as a type.
+pub const UI_SHOW_INTERFACE: &str = "http://lv2plug.in/ns/extensions/ui#showInterface";
+pub const LV2_EXTENSION_DATA: &str = "http://lv2plug.in/ns/lv2core#extensionData";
 pub const LV2_APPLIES_TO: &str = "http://lv2plug.in/ns/lv2core#appliesTo";
 
 // What kind of control a port is, which is what decides whether the UI draws a

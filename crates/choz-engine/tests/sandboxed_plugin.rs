@@ -98,7 +98,7 @@ fn only_the_sandbox_offers_an_editor_choz_itself_refuses() {
         .find(|p| p.uri == uri)
         .expect("gxts9 is in its bundle");
     assert!(
-        info.x11_ui.is_none(),
+        info.ui.is_none(),
         "choz's own process must not be offered this UI"
     );
 

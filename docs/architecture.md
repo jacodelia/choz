@@ -52,7 +52,10 @@ choz is a Cargo **workspace** of nine crates (modelled on seqterm's
   path config and the scan cache. Depends on `choz-ports` + cpal/oxisynth/hound/midir/rosc/rtrb.
 - **`choz-plugin-clap`** — CLAP hosting via `clack-host`.
 - **`choz-plugin-lv2`** — LV2 hosting: the LV2 C ABI plus a pure-Rust TTL parser
-  (`rio_turtle`), no lilv and no LV2 SDK.
+  (`rio_turtle`), no lilv and no LV2 SDK. Also the two doors a plugin can keep
+  its own things behind: the kx programs interface (banks a bundle describes
+  nowhere), and the OSC server ZynAddSubFX opens for its controls and its
+  window.
 - **`choz-plugin-ladspa`** — LADSPA and DSSI hosting (one crate: they share the
   LADSPA descriptor). DSSI synths are driven with ALSA sequencer events.
 - **`choz-plugin-vst2`** — VST2 hosting through the published binary interface.
@@ -100,9 +103,15 @@ choz/
 │   ├── choz-plugin-lv2/
 │   │   └── src/
 │   │       ├── lib.rs           # Instance, Lv2Instrument, Lv2Effect, features
-│   │       ├── discovery.rs     # Bundle TTL → Lv2PluginInfo + ports
+│   │       ├── discovery.rs     # Bundle TTL → Lv2PluginInfo + ports + its UI
 │   │       ├── ttl.rs           # Turtle/RDF graph
-│   │       ├── editor.rs        # ui:X11UI window, without suil
+│   │       ├── presets.rs       # pset:Preset, sibling bundles, state:state
+│   │       ├── programs.rs      # kx programs#Interface (Yoshimi's 4466 banks)
+│   │       ├── state.rs         # state:interface save/restore
+│   │       ├── osc.rs           # Finding a plugin's own OSC server, and asking it
+│   │       ├── osc_params.rs    # Controls a plugin keeps behind that server
+│   │       ├── external_gui.rs  # An editor that is a separate program
+│   │       ├── editor.rs        # ui:X11UI and ui:showInterface windows, no suil
 │   │       └── lv2_abi.rs       # LV2 C structs (core, urid, atom, midi, options, ui)
 │   ├── choz-plugin-ladspa/
 │   │   └── src/
@@ -136,12 +145,15 @@ choz/
 │           ├── log.rs           # ~/.local/state/choz/choz.log
 │           └── views/
 │               ├── mod.rs             # Shared view constants
-│               ├── modal.rs           # THE modal widget (list, sidebar, chips, buttons)
+│               ├── modal.rs           # THE modal widget (list, sidebar, chips,
+│               │                      # buttons, image preview)
 │               ├── drawer.rs          # IN/OUT drawers: handles + output routing
 │               ├── source_panel.rs    # INPUTS panel (inside the IN drawer)
 │               ├── fx_chain_panel.rs  # RACK panel; returns its own RackLayout
 │               ├── splash.rs          # Startup splash
 │               ├── midi_monitor.rs    # Tabs: MIDI / KEYS / ROLL / WAVE / ACTIVITY
+│               ├── harmonics.rs       # An oscillator's harmonics, as its own editor
+│               │                      # draws them: magnitudes over phases
 │               ├── background.rs      # Desktop: flat colour or image, in cells
 │               ├── kitty_bg.rs        # The same image at real pixel resolution,
 │               │                      # under the cell backgrounds (kitty et al)
@@ -702,6 +714,7 @@ classDiagram
         cursor
         chips / chip_cursor
         sidebar / sidebar_cursor / sidebar_focused
+        preview
         actions
         scrollbar
     }

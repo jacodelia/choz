@@ -5,6 +5,12 @@
 //! plugin's idle callback until the window is closed. Every X11 call — and
 //! every editor call — happens on the one thread this module spawns, which is
 //! what the plugin APIs require; the audio thread keeps rendering meanwhile.
+//!
+//! Some editors are not a child of anything: an LV2 UI with `ui:showInterface`
+//! (Yoshimi, ZynAddSubFX) opens **its own** window and the host only pumps it
+//! and asks whether it is still there. Those get [`run_owned`] — the same
+//! thread, no window of ours, and the close comes from the plugin instead of
+//! from the window manager.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -90,7 +96,11 @@ fn spawn(
     std::thread::Builder::new()
         .name("choz-plugin-editor".into())
         .spawn(move || {
-            if let Err(e) = x11::run(&handle, &close, &title) {
+            let run = match handle.owns_window() {
+                true => run_owned(&handle, &close),
+                false => x11::run(&handle, &close, &title),
+            };
+            if let Err(e) = run {
                 eprintln!("choz: plugin editor: {e}");
             }
             // Whatever happened, the plugin must not be left with a window it
@@ -102,6 +112,25 @@ fn spawn(
             let _ = gone.send(());
         })
         .ok()
+}
+
+/// Drive an editor that owns its window: open it, pump it, and stop when either
+/// side says so — the user closing choz's `[GUI]` button, or the plugin
+/// reporting that its own window has gone.
+#[cfg(target_os = "linux")]
+fn run_owned(handle: &EditorHandle, close: &Arc<AtomicBool>) -> anyhow::Result<()> {
+    // There is no window id to hand over; the UI makes its own.
+    handle.open(0);
+    while !close.load(Ordering::Relaxed) {
+        handle.idle();
+        if !handle.is_open() {
+            close.store(true, Ordering::Relaxed);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    handle.close();
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -121,11 +150,11 @@ mod x11 {
     use std::time::Duration;
 
     use x11rb::connection::Connection;
+    use x11rb::protocol::randr::ConnectionExt as _;
     use x11rb::protocol::xproto::{
         AtomEnum, ConfigureWindowAux, ConnectionExt, CreateWindowAux, EventMask, PropMode,
         WindowClass,
     };
-    use x11rb::protocol::randr::ConnectionExt as _;
     use x11rb::protocol::Event;
     use x11rb::wrapper::ConnectionExt as _;
 

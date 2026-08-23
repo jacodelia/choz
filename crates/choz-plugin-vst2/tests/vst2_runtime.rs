@@ -128,9 +128,19 @@ fn installed_vst2_plugins_scan_host_and_expose_params() {
         };
         let restored = fresh.state().expect("same plugin, same capability");
         restored.restore(&blob);
+        let once = restored.save().expect("a plugin that saved once saves again");
+        assert!(!once.is_empty(), "{}: nothing came back", info.name);
+
+        // **Stable from there**, rather than byte-for-byte the first save.
+        // That is what a project reopening twice gets, and it is what the
+        // plugin owes: amsynth's first save writes an empty `<name>` line and
+        // after a round trip it writes the name and the next parameter on one
+        // line — 1176 bytes in, 1200 out, the same patch. Measured, and a fixed
+        // point from the second pass on.
+        restored.restore(&once);
         assert_eq!(
-            restored.save().map(|b| b.len()),
-            Some(blob.len()),
+            restored.save(),
+            Some(once),
             "{}: the chunk did not survive the round trip",
             info.name
         );

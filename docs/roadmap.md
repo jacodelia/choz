@@ -6,7 +6,7 @@ día por día, con los porqués y lo último arriba; cómo encajan las piezas, e
 cierra, para que lo que quede sea sólo lo que queda — el 2026-08-19 se podó
 entero: lo que decía "hecho" o "cerrado" se fue al changelog.
 
-Última actualización: 2026-08-22.
+Última actualización: 2026-08-23.
 
 ## Estado en una línea
 
@@ -24,9 +24,12 @@ puede, diciendo qué no; hay guardia de acople en la entrada; el mixer tiene un
 main **estéreo** y cuatro subgrupos; una tab guarda sus sonidos en botones —que
 se asignan desde el mismo modal de bank/preset— y puede partir el teclado entre
 ellos; y un efecto puede abrirse con el bombo de otra tab, con el clock, o con
-el tap del metrónomo. **La 1.0.0 está publicada y sus paquetes verificados; la
-1.3.2 es este árbol.**
-642 tests, `clippy --workspace --all-targets -D warnings` limpio.
+el tap del metrónomo. Un plugin que guarda sus controles fuera de sus puertos
+—ZynAddSubFX— se maneja por su propio servidor OSC: mandos con nombre, los
+armónicos del oscilador, su ventana real, y los mandos leyendo lo que el plugin
+tiene. **La 1.0.0 está publicada y sus paquetes verificados; la
+1.3.3 es este árbol.**
+670 tests, `clippy --workspace --all-targets -D warnings` limpio.
 
 Las comprobaciones con hardware delante quedaron dichas en los gotchas, que es
 donde se van a leer.
@@ -35,9 +38,10 @@ donde se van a leer.
 
 ## Pendiente
 
-Nada de lo pedido queda abierto como punto: lo del 2026-08-19 y lo del
-2026-08-22 está cerrado y contado en el changelog. Lo que sigue son los bordes
-que cada uno dejó dichos, y la pieza que se decidió no hacer.
+Nada de lo pedido queda abierto como punto: lo del 2026-08-19, lo del
+2026-08-22 y lo del 2026-08-23 está cerrado y contado en el changelog. Lo que
+sigue son los bordes que cada uno dejó dichos, y la pieza que se decidió no
+hacer.
 
 ### Fuera de la lista, por decisión del 2026-08-19
 
@@ -57,6 +61,9 @@ tiempo, y se replantea aparte.
 | 6 | **Secciones de parámetros en VST3** | RACK | VST3 tiene `unitId` + `IUnitInfo`, que es la respuesta del plugin. Hoy VST3 cae en la heurística por nombre, que para Surge XT acierta — pero es una heurística. |
 | 7 | **Registrar sólo los puertos que se usan** | JACK | choz registra un puerto por canal del dispositivo: en una UMC1820 son 12 de salida y 20 de entrada, y PipeWire mueve los 34 en cada bloque, 750 veces por segundo, los use alguien o no. Medido: con el proceso parado, el hilo del grafo come 5,5% de un núcleo mientras el DSP de choz cuesta 0,4%. Lo que se **muestra** en los cajones IN/OUT sale de consultar el grafo y no cambiaría; lo que baja es lo que se registra. |
 | 8 | **Los mandos del editor SF2 no son por zona** | SOUNDS | El editor escribe sus offsets en todos los canales, así que da forma al instrumento entero. Una envolvente distinta por zona del split querría un juego de mandos por zona, y eso es un panel nuevo. |
+| 9 | **La ventana de ZynAddSubFX es un proceso aparte** | LV2 | Se abre y se cierra con la pestaña, pero es su propio programa hablando OSC con la instancia. Meterla dentro de choz querría el plumbing de atom ports UI↔DSP (`__dpf_ui_data__`), que es lo que DPF usa para pasarle la dirección. |
+| 10 | **VST2 y LADSPA/DSSI no listan los nombres de los pasos** | RACK | Un parámetro con nombres abre su lista en LV2 enumerado, CLAP y VST3. En VST2 se podrían sondear con `effGetParamDisplay` posición por posición, pero hay que adivinar cuántas son: sería inventarlas, no leerlas. |
+| 11 | **El readback OSC es sólo de la pestaña activa** | RACK | Los mandos de la pestaña en pantalla siguen al plugin; los de las otras se ponen al día cuando se las mira. Preguntarlo todo para todas las pestañas es tráfico por algo que nadie está viendo. |
 
 ### Y lo de siempre
 

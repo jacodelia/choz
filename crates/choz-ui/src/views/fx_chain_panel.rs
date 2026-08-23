@@ -56,6 +56,9 @@ pub enum RackButton {
     PitchMix,
     /// Open (or close) the plugin's own window.
     Gui,
+    /// Open the harmonics of the instrument's oscillator — for a synth that
+    /// keeps them out of its parameter list.
+    Harmonics,
     /// Ask for (or stop asking for) this plugin to run in its own process.
     Sandbox,
     /// Previous / next program of the loaded SoundFont.
@@ -92,7 +95,6 @@ pub enum RackButton {
     ArpLatch,
     ArpSwing,
     /// Follow choz's transport instead of the arpeggiator's own tempo.
-    ArpSync,
     /// One key plays the memorised chord.
     ArpChord,
     ArpTap,
@@ -129,6 +131,14 @@ pub struct RackLayout {
     /// Same, for the instrument's own parameters — the generic panel every
     /// plugin gets whether or not it has a window.
     pub instr_knobs: Vec<(usize, Rect)>,
+    /// What part of the instrument's list its box is drawing: `(first, one
+    /// past the last, whether it is a bank)`.
+    ///
+    /// The list is not one flat run of knobs — a bank of sliders is drawn whole
+    /// and on its own — so the box shows **one segment at a time** and the page
+    /// keys walk between them. Without that the grid drew the bank's members
+    /// too, on a page the arrows could never land on.
+    pub instr_segment: Option<(usize, usize, bool)>,
     pub on_off: Option<Rect>,
     pub move_left: Option<Rect>,
     pub move_right: Option<Rect>,
@@ -274,6 +284,51 @@ pub fn fader_groups(shapes: &[ParamShape]) -> Vec<bool> {
     grouped
 }
 
+/// The run of bank-drawn sliders `cursor` is inside, as `(from, to)`.
+///
+/// Long enough to be worth the whole box: below that the grid says more, since
+/// a handful of faders still fit as cells with their names and numbers under
+/// them. Thirty-two harmonics are a spectrum and eight cells are a page.
+const BANK_MIN: usize = 8;
+
+/// The part of the list the box should draw for a cursor at `cursor`:
+/// `(first, one past the last, whether it is a bank)`.
+///
+/// A bank run is a segment of its own; everything between two of them is
+/// another. That is what keeps a slider out of the knob grid: it is drawn in
+/// the bank it belongs to, and nowhere else.
+pub fn instr_segment(shapes: &[ParamShape], cursor: usize) -> (usize, usize, bool) {
+    if let Some((from, to)) = bank_run(shapes, cursor) {
+        return (from, to, true);
+    }
+    let banked = |i: usize| bank_run(shapes, i).is_some();
+    let mut from = cursor;
+    while from > 0 && !banked(from - 1) {
+        from -= 1;
+    }
+    let mut to = (cursor + 1).min(shapes.len());
+    while to < shapes.len() && !banked(to) {
+        to += 1;
+    }
+    (from, to, false)
+}
+
+pub fn bank_run(shapes: &[ParamShape], cursor: usize) -> Option<(usize, usize)> {
+    let ParamShape::Fader(unit) = shapes.get(cursor)? else {
+        return None;
+    };
+    let same = |i: usize| matches!(&shapes[i], ParamShape::Fader(u) if u == unit);
+    let mut from = cursor;
+    while from > 0 && same(from - 1) {
+        from -= 1;
+    }
+    let mut to = cursor + 1;
+    while to < shapes.len() && same(to) {
+        to += 1;
+    }
+    (to - from >= BANK_MIN).then_some((from, to))
+}
+
 /// One column of a vertical fader bank, two rows tall: `(top, bottom)`.
 ///
 /// Two cells of eighth-blocks are sixteen levels, and the point is not the
@@ -400,6 +455,7 @@ fn note_name(note: u8) -> String {
     format!("{}{}", NAMES[note as usize % 12], note as i32 / 12 - 1)
 }
 pub const BTN_GUI: &str = " GUI ";
+pub const BTN_HARMONICS: &str = " HARM ";
 /// How many cells a run of spans takes on screen — the only honest way to know
 /// where the next button lands once any of the text before it is translated.
 fn line_width(spans: &[Span]) -> u16 {
@@ -503,7 +559,7 @@ fn gate_source_mark(source: choz_engine::fx_chain::GateSource) -> String {
     match source {
         GateSource::Tab(i) => (i + 1).to_string(),
         GateSource::Clock => "CLK".into(),
-        GateSource::Metronome => "TAP".into(),
+        GateSource::Metronome => "MET".into(),
     }
 }
 
@@ -628,8 +684,16 @@ fn draw_knob_box(
         inner.width.saturating_sub(2),
         box_h.min(inner.height),
     );
+    // **The rows on screen, not the last of them.** It read `2/3` while rows
+    // one and two were both up, so the first row looked like a page nobody
+    // could reach — it was the one being looked at.
     let more = if rows_needed > rows_shown {
-        format!(" ({}/{} rows) ", first_row + rows_shown, rows_needed)
+        format!(
+            " ({}\u{2013}{}/{} rows) ",
+            first_row + 1,
+            first_row + rows_shown,
+            rows_needed
+        )
     } else {
         String::new()
     };
@@ -765,6 +829,8 @@ pub fn draw_fx_chain_panel(
     preset: Option<&str>,
     // Whether the tab's instrument has a native window to open.
     has_gui: bool,
+    // Whether it has a set of harmonics choz can draw.
+    has_harmonics: bool,
     // Same for the selected FX in the chain.
     fx_has_gui: bool,
     // Out-of-process state of the instrument and of the selected FX.
@@ -1098,6 +1164,11 @@ pub fn draw_fx_chain_panel(
         ),
         // Only plugins with a native editor get the button.
         (RackButton::Gui, has_gui.then(|| BTN_GUI.to_string())),
+        // …and only a synth whose harmonics can be reached gets that one.
+        (
+            RackButton::Harmonics,
+            has_harmonics.then(|| BTN_HARMONICS.to_string()),
+        ),
         // Only a hosted plugin can be moved into a process of its own.
         (
             RackButton::Sandbox,
@@ -1237,7 +1308,6 @@ pub fn draw_fx_chain_panel(
         let cursor_btns: &[RackButton] = if arp.focused && focused {
             match knobs.get(arp.cursor).map(|(p, ..)| *p) {
                 Some(crate::arp::ArpParam::On) => &[RackButton::ArpOn],
-                Some(crate::arp::ArpParam::Sync) => &[RackButton::ArpSync],
                 Some(crate::arp::ArpParam::Mode) => &[RackButton::ArpMode],
                 Some(crate::arp::ArpParam::Div) => &[RackButton::ArpDiv],
                 // The tempo is two buttons, and both are the same control.
@@ -1369,14 +1439,6 @@ pub fn draw_fx_chain_panel(
                 RackButton::ArpRateUp,
                 BTN_NEXT.into(),
                 false,
-            );
-            button(
-                &mut row,
-                f,
-                &mut layout,
-                RackButton::ArpSync,
-                format!(" SYNC {} ", if s.sync { "\u{25CF}" } else { "\u{25CB}" }),
-                s.sync,
             );
             button(
                 &mut row,
@@ -1517,42 +1579,88 @@ pub fn draw_fx_chain_panel(
         let values: Vec<f32> = instr_params.iter().map(|(_, v, _)| *v).collect();
         let names: Vec<String> = instr_params.iter().map(|(n, _, _)| n.clone()).collect();
         let shapes: Vec<ParamShape> = instr_params.iter().map(|(_, _, s)| s.clone()).collect();
-        let (rects, next) = draw_knob_box(
-            f,
-            inner,
-            y,
-            // The title carries the key that hands it the arrows: two knob
-            // boxes on one panel need to say which one is live.
-            &format!(
-                "{} \u{00B7} {}{}{}",
-                t("INSTRUMENT"),
-                truncate(instrument, 18),
-                // The section the cursor is in: the cells dropped the words
-                // every knob around them repeats, and this is where they went.
-                match &instr_section {
-                    Some(g) => format!(" \u{00B7} {}", truncate(g, 18)),
-                    None => String::new(),
-                },
-                if focused && instr_focused {
-                    ""
-                } else {
-                    "  [k]"
-                }
-            ),
-            &values,
-            &names,
-            &shapes,
-            // Clamped here, where the box is drawn: the cursor belongs to the
-            // rack and this list to the tab, and a cursor past the end scrolls
-            // the window off the list — an empty box for a tab whose knobs are
-            // right there. The arpeggiator's box has always done this.
-            instr_cursor.min(instr_params.len().saturating_sub(1)),
-            focused && instr_focused,
-            INSTR_KNOB_ROWS,
-            // Leave the FX chain its rule, its buttons and a knob row.
-            9,
-            true,
+        let cursor = instr_cursor.min(shapes.len().saturating_sub(1));
+        let title = format!(
+            "{} \u{00B7} {}{}{}",
+            t("INSTRUMENT"),
+            truncate(instrument, 18),
+            match &instr_section {
+                Some(g) => format!(" \u{00B7} {}", truncate(g, 18)),
+                None => String::new(),
+            },
+            // `[k]` is the key that hands it the arrows, so it is shown to
+            // whoever does not have them.
+            if focused && instr_focused {
+                ""
+            } else {
+                "  [k]"
+            }
         );
+        // The box draws **one segment** of the list: a long run of sliders is a
+        // shape — a spectrum, a curve — and it is drawn whole, as the same bank
+        // the graphic EQ uses; everything between two such runs is a segment of
+        // knobs. That is what keeps a slider out of the grid, where it was
+        // being drawn a second time on a page the arrows could never reach.
+        let (from, to, is_bank) = instr_segment(&shapes, cursor);
+        let banked = is_bank
+            .then(|| {
+                let labels: Vec<&str> = names[from..to].iter().map(|s| s.as_str()).collect();
+                let (band_rects, after) = draw_eq_bank(
+                    f,
+                    inner,
+                    y,
+                    &values[from..to],
+                    &labels,
+                    cursor - from,
+                    focused && instr_focused,
+                    &title,
+                    bg,
+                );
+                // Too narrow or too short for a bank: the grid draws it
+                // instead, and it is a segment of knobs like any other.
+                (!band_rects.is_empty()).then(|| {
+                    let rects: Vec<(usize, Rect)> =
+                        band_rects.into_iter().map(|(i, r)| (i + from, r)).collect();
+                    (rects, after)
+                })
+            })
+            .flatten();
+        let drew_bank = banked.is_some();
+        let (rects, next) = match banked {
+            Some(pair) => pair,
+            None => {
+                let (rects, next) = draw_knob_box(
+                    f,
+                    inner,
+                    y,
+                    // The title carries the key that hands it the arrows: two
+                    // knob boxes on one panel need to say which one is live.
+                    // Built above, because the bank draws under the same one.
+                    &title,
+                    &values[from..to],
+                    &names[from..to],
+                    &shapes[from..to],
+                    // Clamped here, where the box is drawn: the cursor belongs
+                    // to the rack and this list to the tab, and a cursor past
+                    // the end scrolls the window off the list — an empty box
+                    // for a tab whose knobs are right there. The arpeggiator's
+                    // box has always done this.
+                    cursor.saturating_sub(from).min(to - from - 1),
+                    focused && instr_focused,
+                    INSTR_KNOB_ROWS,
+                    // Leave the FX chain its rule, its buttons and a knob row.
+                    9,
+                    true,
+                );
+                // The box numbers its cells from the start of the segment; the
+                // tab does not.
+                (
+                    rects.into_iter().map(|(i, r)| (i + from, r)).collect(),
+                    next,
+                )
+            }
+        };
+        layout.instr_segment = Some((from, to, drew_bank));
         // The box's own top edge, right-aligned, where the arpeggiator's TAP
         // sits: RESET, then the page arrows when there is more than one page.
         // They are learn targets like any other button — a synth whose knobs
@@ -2201,7 +2309,11 @@ pub fn draw_eq_bank(
     // Six rows of track plus the labels and the frame: under that there is no
     // curve to see and the knob grid is the better drawing.
     let height = 10u16.min(inner.height.saturating_sub(y - inner.y));
-    if bands == 0 || height < 7 || inner.width < bands as u16 * 4 {
+    // Two columns a band is the floor: one for the track, one to tell it from
+    // the next. Ten EQ bands were never near it; thirty-two harmonics are
+    // exactly what it is for — packed side by side is the whole point of a
+    // bank, and four columns each would fit eight of them.
+    if bands == 0 || height < 7 || inner.width < bands as u16 * 2 {
         return (rects, y);
     }
     let rect = Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), height);

@@ -237,6 +237,58 @@ pub fn render(
     }
 }
 
+// ─── Thumbnails ─────────────────────────────────────────────────────────────
+
+/// One cell of a half-block thumbnail: the colour of its top half and of its
+/// bottom half, drawn as `▀` in the first over the second.
+pub type HalfCell = ((u8, u8, u8), (u8, u8, u8));
+
+/// The last thumbnail made, so walking a folder of images with the arrow keys
+/// decodes each file once rather than once a frame.
+///
+/// **Its own cache, not [`decode_cached`]'s.** That one holds the wallpaper
+/// that is on screen; previewing a folder through it would evict the picture
+/// the whole interface is drawn over, and re-decode it on the next frame.
+#[allow(clippy::type_complexity)]
+static THUMB: std::sync::Mutex<Option<(std::path::PathBuf, u16, u16, Vec<HalfCell>)>> =
+    std::sync::Mutex::new(None);
+
+/// `cols × rows` cells of `path`, two pixel rows to a cell.
+///
+/// `None` for anything that is not a readable image — a preview pane that
+/// cannot show the file simply stays empty, which is the honest answer.
+pub fn thumbnail(path: &std::path::Path, cols: u16, rows: u16) -> Option<Vec<HalfCell>> {
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+    let mut cache = THUMB.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((p, c, r, cells)) = cache.as_ref() {
+        if p == path && *c == cols && *r == rows {
+            return Some(cells.clone());
+        }
+    }
+    let img = image::open(path).ok()?;
+    // Two pixel rows per cell is what a half-block buys: a preview twice as
+    // tall as the cells it is drawn in.
+    let small = img
+        .resize_exact(
+            cols as u32,
+            rows as u32 * 2,
+            image::imageops::FilterType::Triangle,
+        )
+        .to_rgba8();
+    let at = |x: u32, y: u32| -> (u8, u8, u8) {
+        let p = small.get_pixel(x, y).0;
+        (p[0], p[1], p[2])
+    };
+    let cells: Vec<HalfCell> = (0..rows as u32)
+        .flat_map(|r| (0..cols as u32).map(move |c| (c, r)))
+        .map(|(c, r)| (at(c, r * 2), at(c, r * 2 + 1)))
+        .collect();
+    *cache = Some((path.to_path_buf(), cols, rows, cells.clone()));
+    Some(cells)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

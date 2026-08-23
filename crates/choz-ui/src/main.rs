@@ -476,6 +476,9 @@ enum ModalKind {
     FxGate,
     /// Which saved sound each octave of the keyboard plays.
     Split,
+    /// The harmonics of the instrument's oscillator, drawn as bars — the view
+    /// its own window has, for a synth that keeps them out of its parameters.
+    Harmonics,
     /// What one of the tab's SOUNDS buttons holds: the same bank/preset list
     /// the BANK button opens, plus the patch as it is playing right now. Every
     /// button is assignable and reassignable this way, which is what makes a
@@ -494,6 +497,10 @@ enum ModalKind {
     /// The positions of one **named** arpeggiator knob: the mode, the division,
     /// which sequence, how long it plays.
     ArpChoice,
+    /// The same for a **named instrument parameter** — a filter type, a
+    /// waveform, an oscillator's mode. Any plugin whose format reports the
+    /// names of a parameter's steps gets one.
+    InstrChoice,
     /// Pick a Max/MSP patch to import into the active tab's chain.
     ImportMax,
     /// What that import kept, and — the half that matters — what it could not.
@@ -621,6 +628,20 @@ const TIME_SIGS: &[(u16, u16)] = &[
     (11, 8),
     (12, 8),
 ];
+
+/// The note the beat is counted in — the bottom number of the signature.
+const UNITS: &[u16] = &[1, 2, 4, 8, 16];
+
+/// A level as a small bar, for a menu row that is a volume: "\u{2588}\u{2588}\u{2588}\u{2591}\u{2591}".
+fn level_bar(v: f32) -> String {
+    const W: usize = 10;
+    let filled = (v.clamp(0.0, 1.0) * W as f32).round() as usize;
+    format!(
+        "{}{}",
+        "\u{2588}".repeat(filled),
+        "\u{2591}".repeat(W - filled)
+    )
+}
 
 /// How the bar is counted, for the metronome menu: "2+2+3", or the bar itself
 /// when it is not grouped.
@@ -1069,6 +1090,8 @@ struct UiLayout {
     keys: views::midi_monitor::KeyMap,
     /// Where the SPLIT dialogue put its chips and its keyboard.
     split_rects: views::modal::SplitRects,
+    /// Where the HARMONICS view drew its bars, for the mouse.
+    harmonics_rects: views::harmonics::HarmonicsRects,
 }
 
 #[allow(dead_code)]
@@ -1138,6 +1161,143 @@ enum StripRef {
     Main,
 }
 
+/// What the HARMONICS view is looking at: the plugin's own control surface, the
+/// paths of its harmonics, and what it has answered so far.
+///
+/// The values are **asked for, not fetched**: the plugin replies when it
+/// replies, so the view draws what it knows and fills in as answers arrive.
+struct HarmonicsState {
+    paths: choz_ports::PathsHandle,
+    set: choz_ports::HarmonicSet,
+    values: Vec<Option<f32>>,
+    /// The phase of each harmonic, when the plugin has one. Empty otherwise.
+    phases: Vec<Option<f32>>,
+    /// Which row the cursor is in: 0 the magnitudes, 1 the phases.
+    row: usize,
+    cursor: usize,
+    scroll: usize,
+    /// When the unanswered paths were last asked about again.
+    asked: Instant,
+    /// The harmonic just moved by hand, and when. The plugin answers a few
+    /// milliseconds later; until then its old value must not be allowed to drag
+    /// the bar back under the hand that is moving it.
+    just_set: Option<(usize, Instant)>,
+}
+
+impl HarmonicsState {
+    /// Read whatever has come back since the last look.
+    /// The paths of the row the cursor is in.
+    fn row_paths(&self) -> &[String] {
+        match self.row {
+            0 => &self.set.magnitude,
+            _ => &self.set.phase,
+        }
+    }
+
+    fn row_values(&mut self) -> &mut Vec<Option<f32>> {
+        match self.row {
+            0 => &mut self.values,
+            _ => &mut self.phases,
+        }
+    }
+
+    fn poll(&mut self) {
+        let held = self
+            .just_set
+            .filter(|(_, at)| at.elapsed() < Duration::from_millis(400))
+            .map(|(i, _)| i);
+        for (i, path) in self.set.magnitude.iter().enumerate() {
+            if self.row == 0 && Some(i) == held {
+                continue;
+            }
+            if let Some(v) = self.paths.value(path) {
+                self.values[i] = Some(v);
+            }
+        }
+        for (i, path) in self.set.phase.iter().enumerate() {
+            if self.row == 1 && Some(i) == held {
+                continue;
+            }
+            if let Some(v) = self.paths.value(path) {
+                self.phases[i] = Some(v);
+            }
+        }
+        // A plugin that was still starting up answers nothing; ask again for
+        // the ones still blank rather than showing an empty row for ever.
+        if self.asked.elapsed() > Duration::from_millis(400) {
+            self.asked = Instant::now();
+            for (i, path) in self.set.magnitude.iter().enumerate() {
+                if self.values[i].is_none() {
+                    self.paths.ask(path);
+                }
+            }
+            for (i, path) in self.set.phase.iter().enumerate() {
+                if self.phases[i].is_none() {
+                    self.paths.ask(path);
+                }
+            }
+        }
+    }
+
+    /// Move the bar under the cursor by `delta`, and tell the plugin.
+    fn nudge(&mut self, delta: f32) {
+        let Some(path) = self.row_paths().get(self.cursor).cloned() else {
+            return;
+        };
+        let zero = self.set.zero;
+        let cursor = self.cursor;
+        // The two rows are as long as their path lists, but reading a bar
+        // that is not there must be a no-op and not a panic: a plugin decides
+        // how many it has.
+        let now = self
+            .row_values()
+            .get(cursor)
+            .copied()
+            .flatten()
+            .unwrap_or(zero);
+        self.set_value(now + delta, path);
+    }
+
+    /// Put it at exactly `value`.
+    fn put(&mut self, value: f32) {
+        let Some(path) = self.row_paths().get(self.cursor).cloned() else {
+            return;
+        };
+        self.set_value(value, path);
+    }
+
+    fn set_value(&mut self, value: f32, path: String) {
+        let v = value.clamp(self.set.min, self.set.max).round();
+        let cursor = self.cursor;
+        // Kept here as well as sent: the bar has to move under the hand, and
+        // the plugin's own answer confirms it a few milliseconds later.
+        let Some(cell) = self.row_values().get_mut(cursor) else {
+            return;
+        };
+        *cell = Some(v);
+        self.just_set = Some((cursor, Instant::now()));
+        self.paths.set(&path, v);
+    }
+
+    /// Move between the magnitudes and the phases. Nothing to move to when the
+    /// plugin has no phases.
+    fn step_row(&mut self, delta: isize) {
+        if self.set.phase.is_empty() {
+            return;
+        }
+        self.row = (self.row as isize + delta).rem_euclid(2) as usize;
+    }
+
+    /// Keep the cursor on screen for a field `width` columns wide.
+    fn follow(&mut self, width: usize) {
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
+        } else if width > 0 && self.cursor >= self.scroll + width {
+            self.scroll = self.cursor + 1 - width;
+        }
+    }
+}
+
 struct App {
     source: AudioSource,
     /// Every MIDI input port seen at the last scan (connected or not).
@@ -1190,6 +1350,18 @@ struct App {
     focus: Focus,
     /// The one open modal, if any (see [`ModalKind`]).
     modal: Option<Modal>,
+    /// What the HARMONICS view is editing, while it is open.
+    harmonics: Option<HarmonicsState>,
+    /// When the instrument's knobs last asked the plugin what it holds, and the
+    /// knob the hand is on — a value on its way out must not be dragged back by
+    /// an answer to the question before it.
+    instr_asked: Option<Instant>,
+    instr_moved: Option<(usize, Instant)>,
+    /// What the open patch picker was built from: how many patches the tab had
+    /// and which one was first. A plugin that answers late — its own scan, a
+    /// folder adopted after the window went up — changes that, and the picker
+    /// has to be rebuilt or it shows a list (and a sidebar) from before.
+    preset_list_mark: Option<(usize, String)>,
     /// Open top-bar menu (None = closed).
     menu: Option<menu::MenuState>,
     /// About dialog visibility.
@@ -1370,6 +1542,10 @@ impl App {
             fx_param: 0,
             focus: Focus::FxChain,
             modal: None,
+            harmonics: None,
+            instr_asked: None,
+            instr_moved: None,
+            preset_list_mark: None,
             menu: None,
             about_open: false,
             preset_audition: None,
@@ -1555,6 +1731,13 @@ impl App {
             })
             .collect();
         self.synth_cursor = 0;
+        // A tab whose plugin publishes nothing but numbered slots finds its
+        // folder of patches **by the plugin's name and path** — both of which
+        // come from this list. Loaded before the scan finished, it found
+        // neither and kept the numbers; this is the moment it can look again.
+        for i in 0..self.slots.len() {
+            self.adopt_bank(i);
+        }
     }
 
     /// Effects offered by ADD FX after the built-ins: hosted ones first, then
@@ -1719,6 +1902,59 @@ impl App {
         let title = format!("{} \u{00B7} {}", entry.label(), desc.name);
         let mut modal = Modal::new(
             ModalKind::FxChoice,
+            views::modal::ListModal::new(title, items),
+        );
+        modal.list.cursor = here.map(|(k, _)| k).unwrap_or(0);
+        modal.fx_param = param;
+        self.modal = Some(modal);
+        true
+    }
+
+    /// Press instrument parameter `param`: a switch **flips**, and anything
+    /// else stays as it is.
+    ///
+    /// Flip rather than nudge, for the reason the arpeggiator's switch has it:
+    /// a switch nudged up while it is already on stays on, so it could be
+    /// turned on from the box and never off again.
+    fn press_instr_knob(&mut self, param: usize) {
+        let knobs = self.instr_knobs();
+        let Some((_, value, source::ParamShape::Toggle)) = knobs.get(param) else {
+            return;
+        };
+        let flipped = if *value >= 0.5 { 0.0 } else { 1.0 };
+        self.set_instr_param(param, flipped);
+    }
+
+    /// Open the list of positions for instrument parameter `param`, when it has
+    /// names rather than a range — a filter type, a waveform.
+    ///
+    /// The same rule the FX and arpeggiator knobs have followed all along, and
+    /// the instrument's box was the one that did not: its named parameters
+    /// could only be walked with the wheel, which for ZynAddSubFX's seventeen
+    /// base waveforms is seventeen scrolls to see what the choices even are.
+    /// Nothing here is plugin-specific — a parameter is a list when the plugin
+    /// says every one of its steps has a name.
+    fn open_instr_choice(&mut self, param: usize) -> bool {
+        let knobs = self.instr_knobs();
+        let Some((name, value, shape)) = knobs.get(param) else {
+            return false;
+        };
+        let source::ParamShape::Named(points) = shape else {
+            return false;
+        };
+        if points.len() < 2 {
+            return false;
+        }
+        let items: Vec<String> = points.iter().map(|(_, n)| n.clone()).collect();
+        let here = shape.step_at(*value);
+        // The section the parameter belongs to, when the plugin files it under
+        // one: "FILTER \u{00b7} TYPE" says more than "TYPE" on its own.
+        let title = match self.instr_section() {
+            Some(section) => format!("{section} \u{00b7} {name}"),
+            None => format!("{} \u{00b7} {name}", self.instrument_label()),
+        };
+        let mut modal = Modal::new(
+            ModalKind::InstrChoice,
             views::modal::ListModal::new(title, items),
         );
         modal.list.cursor = here.map(|(k, _)| k).unwrap_or(0);
@@ -2126,20 +2362,11 @@ impl App {
             Some(s) => s,
             None => return,
         };
-        let banks = self.preset_banks(self.active_slot);
         let mut list = views::modal::ListModal::new("BANK / PRESET", Vec::new());
-        if !banks.is_empty() {
-            // Tab cycles these; the first one is the whole list, so a plugin
-            // with thousands of patches still opens on something familiar.
-            let mut chips = vec![i18n::t("ALL BANKS").to_string()];
-            chips.extend(banks.iter().cloned());
-            list.filters = chips;
-            list.note = "  Tab = bank".to_string();
-        }
+        self.dress_patch_list(&mut list);
         let mut modal = Modal::new(ModalKind::Preset, list);
         modal.list.cursor = slot.preset_cursor;
         let was = slot.preset_cursor;
-        modal.list.note = audition_note(&modal.list.note);
         self.preset_audition = Some(PresetAudition {
             was,
             row: modal.list.cursor,
@@ -2166,21 +2393,16 @@ impl App {
         {
             return;
         }
-        let banks = self.preset_banks(self.active_slot);
         let mut list =
             views::modal::ListModal::new(format!("{} {}", i18n::t("SOUND"), i + 1), Vec::new());
-        if !banks.is_empty() {
-            let mut chips = vec![i18n::t("ALL BANKS").to_string()];
-            chips.extend(banks.iter().cloned());
-            list.filters = chips;
-            list.note = "  Tab = bank".to_string();
-        }
+        // The same picker the BANK button opens, with one row in front of it:
+        // two lists of the same patches must not be two different dialogues.
+        self.dress_patch_list(&mut list);
         let was = self
             .slots
             .get(self.active_slot)
             .map(|s| s.preset_cursor)
             .unwrap_or(0);
-        list.note = audition_note(&list.note);
         self.preset_audition = Some(PresetAudition {
             was,
             row: 0,
@@ -2436,7 +2658,10 @@ impl App {
                     .unwrap_or_else(|| "?".into())
             ),
             GateSource::Clock => i18n::t("CLOCK").to_string(),
-            GateSource::Metronome => i18n::t("TAP").to_string(),
+            // Named for what it is. "TAP" was the click's level and read as the
+            // arpeggiator's tap tempo, so the one source somebody looks for by
+            // name was the one they could not find.
+            GateSource::Metronome => i18n::t("METRONOME").to_string(),
         }
     }
 
@@ -2508,7 +2733,11 @@ impl App {
                 if m.on() { "ON" } else { "OFF" }
             ),
             format!("  {:<12} {:>5.1} BPM", i18n::t("TEMPO"), t.bpm()),
-            format!("  {:<12} {num}/{den}", i18n::t("SIGNATURE")),
+            // Two rows, not one list of signatures: 5/8 and 7/4 exist, and a
+            // player who wants one should not have to find it in a menu of the
+            // dozen somebody thought of.
+            format!("  {:<12} {num:>5}", i18n::t("BEATS")),
+            format!("  {:<12} {den:>5}", i18n::t("UNIT")),
             format!("  {:<12} {}", i18n::t("GROUPING"), grouping_label(num)),
             format!("  {:<12} {}", i18n::t("SOUND"), m.style().label()),
             format!(
@@ -2519,7 +2748,12 @@ impl App {
                     d => format!("BUS {}", d.label()),
                 }
             ),
-            format!("  {:<12} {:>4.0}%", i18n::t("LEVEL"), m.gain() * 100.0),
+            format!(
+                "  {:<12} {} {:>4.0}%",
+                i18n::t("LEVEL"),
+                level_bar(m.gain()),
+                m.gain() * 100.0
+            ),
         ]
     }
 
@@ -2555,10 +2789,16 @@ impl App {
                     bpm
                 });
             }
-            2 => {
-                let now = t.time_signature();
-                let at = TIME_SIGS.iter().position(|s| *s == now).unwrap_or(0);
-                let (n, d) = TIME_SIGS[wrap(at, TIME_SIGS.len())];
+            2 | 3 => {
+                let (num, den) = t.time_signature();
+                let (n, d) = if i == 2 {
+                    // 1..=32 beats to a bar, wrapping: every signature anyone
+                    // counts is in there, and the two numbers move apart.
+                    ((num as isize - 1 + delta).rem_euclid(32) as u16 + 1, den)
+                } else {
+                    let at = UNITS.iter().position(|u| *u == den).unwrap_or(2);
+                    (num, UNITS[wrap(at, UNITS.len())])
+                };
                 t.set_time_signature(n, d);
                 // The old grouping counted a different bar. Keeping it would
                 // accent beats that are no longer there.
@@ -2566,7 +2806,7 @@ impl App {
                 self.ui.audio.time_sig = (n, d);
                 self.ui.save();
             }
-            3 => {
+            4 => {
                 // Step through the ways this bar can be counted. The list is
                 // built from the signature, so it can never hold a grouping
                 // that does not fit it.
@@ -2582,12 +2822,12 @@ impl App {
                     _ => next.as_slice(),
                 });
             }
-            4 => {
+            5 => {
                 let all = choz_engine::metronome::ClickStyle::ALL;
                 let at = all.iter().position(|s| *s == m.style()).unwrap_or(0);
                 m.set_style(all[wrap(at, all.len())]);
             }
-            5 => {
+            6 => {
                 // Round the groups and back to the main. The click is the one
                 // thing in a rack that often must not go where the music goes:
                 // the player wants it in their wedge, the room does not want it
@@ -2596,7 +2836,7 @@ impl App {
                     (m.dest().index() as isize + delta).rem_euclid(choz_engine::BUSES as isize + 1);
                 m.set_dest(choz_engine::Dest::from_index(next as usize));
             }
-            6 => {
+            7 => {
                 let g = m.gain() + 0.1 * delta as f32;
                 m.set_gain(if g > 1.001 {
                     0.1
@@ -2767,6 +3007,51 @@ impl App {
         ));
     }
 
+    /// Whether the tab's instrument keeps a set of harmonics somewhere choz can
+    /// reach — which is what the HARM button is drawn for.
+    fn has_harmonics(&self) -> bool {
+        self.audio_engine
+            .as_ref()
+            .and_then(|e| e.slot_paths(self.active_slot))
+            .and_then(|p| p.harmonics())
+            .is_some()
+    }
+
+    /// The harmonics of the tab's instrument, as bars.
+    ///
+    /// A synth like ZynAddSubFX keeps them out of its parameters entirely — its
+    /// ports are sixteen numbered slots — so this is the only way to shape the
+    /// sound the way its own window does.
+    fn open_harmonics_modal(&mut self) {
+        let Some(paths) = self
+            .audio_engine
+            .as_ref()
+            .and_then(|e| e.slot_paths(self.active_slot))
+        else {
+            return;
+        };
+        let Some(set) = paths.harmonics() else { return };
+        // Ask for the lot at once: the answers arrive while the view draws.
+        for path in set.magnitude.iter().chain(set.phase.iter()) {
+            paths.ask(path);
+        }
+        self.harmonics = Some(HarmonicsState {
+            values: vec![None; set.magnitude.len()],
+            phases: vec![None; set.phase.len()],
+            row: 0,
+            paths,
+            set,
+            cursor: 0,
+            scroll: 0,
+            asked: Instant::now(),
+            just_set: None,
+        });
+        self.modal = Some(Modal::new(
+            ModalKind::Harmonics,
+            views::modal::ListModal::new(i18n::t("HARMONICS"), Vec::new()),
+        ));
+    }
+
     /// The sound buttons as the SPLIT dialogue paints with them: a label and
     /// the colour that button owns. One place, so the squares in the dialogue,
     /// the octaves under them and the SOUNDS row on the RACK cannot disagree
@@ -2909,7 +3194,7 @@ impl App {
         let bank = choz_engine::preset_files::list_bank(&dir);
         if bank.is_empty() {
             eprintln!(
-                "choz: no .fxp / .fxb / .vstpreset files under {}",
+                "choz: no .fxp / .fxb / .vstpreset / .bank files under {}",
                 dir.display()
             );
             return;
@@ -3180,16 +3465,34 @@ impl App {
         // What is actually on screen, read back from the last draw: the panel
         // decides how many knobs fit, and pretending otherwise here is how the
         // page and the box disagree.
-        let (start, page, cols) = {
+        let (seg_from, seg_to, is_bank, start, page, cols) = {
             let layout = self.layout.borrow();
             let knobs = &layout.rack.instr_knobs;
             let Some(&(first, rect)) = knobs.first() else {
                 return;
             };
+            let (from, to, bank) = layout.rack.instr_segment.unwrap_or((0, n, false));
             let cols = knobs.iter().filter(|(_, r)| r.y == rect.y).count().max(1);
-            (first, knobs.len(), cols)
+            (from, to, bank, first, knobs.len(), cols)
         };
-        if page == 0 || page >= n {
+        // Out of the segment and onto the next: the last knob before it going
+        // back, its first going on. That is the whole of paging for a bank —
+        // every slider of it is already on screen — and it is also what the
+        // grid does once it has run out of rows.
+        let leave = |app: &mut Self, delta: isize| {
+            let next = match delta < 0 {
+                true => seg_from.checked_sub(1),
+                false => (seg_to < n).then_some(seg_to),
+            };
+            if let Some(i) = next {
+                app.instr_param = i;
+            }
+        };
+        if is_bank {
+            leave(self, delta);
+            return;
+        }
+        if page == 0 || seg_to <= seg_from {
             return;
         }
         let rows = page.div_ceil(cols);
@@ -3197,11 +3500,20 @@ impl App {
         // *last* visible row — so putting the cursor on the last cell of the
         // page we want is how the window is moved. No second scroll state to
         // keep in step with the first.
-        let wanted = (start as isize + delta * page as isize).max(0) as usize;
-        let cursor = (wanted + page - 1).min(n - 1);
-        let landed = (cursor / cols).saturating_sub(rows - 1) * cols;
-        let shift = landed as isize - start as isize;
-        if shift == 0 {
+        //
+        // **Clamped to the segment, not refused at its edge.** A last window
+        // that is shorter than a whole page — which is what the box shows after
+        // coming back from a bank — asks for a page *before* the segment
+        // starts; treating that as "leave" left the arrows doing nothing, and
+        // the first page could not be got back to.
+        let wanted = (start as isize + delta * page as isize)
+            .clamp(seg_from as isize, seg_to as isize - 1) as usize;
+        let cursor = (wanted + page - 1).min(seg_to - 1);
+        let landed = ((cursor - seg_from) / cols).saturating_sub(rows - 1) * cols + seg_from;
+        if landed == start {
+            // The window did not move: this end of the segment is already up,
+            // so the arrows go on to the next one instead of doing nothing.
+            leave(self, delta);
             return;
         }
         self.instr_param = cursor;
@@ -3735,7 +4047,10 @@ impl App {
     /// was closed (Esc, the CANCEL button, or a click outside).
     fn close_modal(&mut self) {
         let kind = self.modal.take().map(|m| m.kind);
+        self.preset_list_mark = None;
         self.path_edit = None;
+        // The bars are already on the instrument; what goes away is the view.
+        self.harmonics = None;
         self.save_name = None;
         // Left the picker without choosing: whatever was auditioned goes back
         // to the patch the tab was playing before it opened. Browsing a list
@@ -4592,17 +4907,23 @@ impl App {
                 .into_iter()
                 .map(|(_, l)| l)
                 .collect(),
-            // The SPLIT dialogue draws itself from the tab; it has no rows.
-            ModalKind::Split => Vec::new(),
-            ModalKind::Preset => self
-                .preset_rows()
-                .into_iter()
-                .map(|(_, label)| label)
-                .collect(),
+            // These two draw themselves — the keyboard, and the bars — so
+            // there are no rows to build.
+            ModalKind::Split | ModalKind::Harmonics => Vec::new(),
+            ModalKind::Preset => {
+                // The counts move with the instrument, so the sidebar is rebuilt
+                // with the rows rather than only at open time.
+                self.refresh_patch_sidebar();
+                self.preset_rows()
+                    .into_iter()
+                    .map(|(_, label)| label)
+                    .collect()
+            }
             // The preset list with one row in front of it: a button is most
             // often assigned the sound already under the hands, and asking for
             // that through a preset name would be the long way round.
             ModalKind::SoundAssign(_) => {
+                self.refresh_patch_sidebar();
                 std::iter::once(format!("  \u{25CF} {}", i18n::t("WHAT IS PLAYING NOW")))
                     .chain(self.preset_rows().into_iter().map(|(_, label)| label))
                     .collect()
@@ -4610,7 +4931,10 @@ impl App {
             // The list was built when the modal opened and the parameter has
             // not moved since; rebuilding it here would only re-read the same
             // names.
-            ModalKind::FxChoice | ModalKind::FxPreset | ModalKind::ArpChoice => return,
+            ModalKind::FxChoice
+            | ModalKind::FxPreset
+            | ModalKind::ArpChoice
+            | ModalKind::InstrChoice => return,
             // Built when the import ran; there is nothing to re-read.
             ModalKind::MaxReport => return,
             ModalKind::Learn => {
@@ -4853,6 +5177,15 @@ impl App {
             // The name prompt owns the note line while it is open, and an
             // overwrite replaces the listing outright: a question with two
             // answers, not a hint under a file browser nobody re-reads.
+            // The picture under the cursor, for the picker that chooses one.
+            // Only a file: a directory row has nothing to show, and the pane
+            // goes away rather than holding the last image over a folder.
+            if m.kind == ModalKind::Wallpaper {
+                m.list.preview = m.browser.as_ref().and_then(|b| {
+                    let e = b.entries.get(b.cursor)?;
+                    (!e.is_dir).then(|| e.path.clone())
+                });
+            }
             if let (ModalKind::SaveProject, Some(n)) = (m.kind, self.save_name.as_ref()) {
                 m.list.note = n.note();
                 if n.confirm {
@@ -5035,6 +5368,9 @@ impl App {
             }
             // Painted with the pointer, so Enter has nothing to select.
             ModalKind::Split => false,
+            // Every bar is already on the instrument as it moves; Enter is how
+            // the view is left.
+            ModalKind::Harmonics => true,
             ModalKind::FxGate => {
                 self.step_fx_gate_row(i, 1);
                 // Stays open, like the metronome's: wiring a gate is done by
@@ -5064,6 +5400,22 @@ impl App {
                     });
                 if let Some(v) = value {
                     self.set_arp_knob(index, v);
+                }
+                true
+            }
+            ModalKind::InstrChoice => {
+                let param = m.fx_param;
+                // The chosen position's own value, not `i / len`: a plugin's
+                // steps are wherever it put them.
+                let value = self
+                    .instr_knobs()
+                    .get(param)
+                    .and_then(|(_, _, shape)| match shape {
+                        source::ParamShape::Named(points) => points.get(i).map(|(v, _)| *v),
+                        _ => None,
+                    });
+                if let Some(v) = value {
+                    self.set_instr_param(param, v);
                 }
                 true
             }
@@ -7219,6 +7571,9 @@ impl App {
     /// only the one on screen.
     fn set_slot_instr_param(&mut self, slot: usize, index: usize, value: f32) {
         let value = value.clamp(0.0, 1.0);
+        if slot == self.active_slot {
+            self.instr_moved = Some((index, Instant::now()));
+        }
         match self
             .slots
             .get_mut(slot)
@@ -7565,19 +7920,21 @@ impl App {
                 // Wraps rather than sticking at the ends: one button, both
                 // directions, and the range is small enough to walk.
                 ArpEdit::Bpm(d) => {
-                    let bpm = s.bpm + d;
-                    s.bpm = if bpm > 300.0 {
-                        20.0
-                    } else if bpm < 20.0 {
-                        300.0
+                    // One clock: this moves the transport, which is what the
+                    // metronome and every other tab are counting.
+                    let t = choz_ports::transport();
+                    let bpm = t.bpm() + d;
+                    t.set_bpm(if bpm > arp::MAX_BPM {
+                        arp::MIN_BPM
+                    } else if bpm < arp::MIN_BPM {
+                        arp::MAX_BPM
                     } else {
                         bpm
-                    };
+                    });
                 }
                 ArpEdit::Gate => {
                     s.gate = if s.gate >= 0.95 { 0.1 } else { s.gate + 0.1 };
                 }
-                ArpEdit::Sync => s.sync = !s.sync,
                 ArpEdit::Swing => {
                     // Past 75 % the off-beat swallows the on-beat, so it wraps
                     // back to straight instead of going further.
@@ -8036,7 +8393,7 @@ impl App {
             // the same blob the plugin's own state call produces.
             if slot.preset_dir.is_some() {
                 let Some(key) = key else { return };
-                match choz_engine::preset_files::read_state(std::path::Path::new(&key)) {
+                match choz_engine::preset_files::read_state_key(&key) {
                     Ok(state) => {
                         // Kept on the tab too, so the patch survives everything
                         // that rebuilds engine slots — and gets saved with the
@@ -8308,15 +8665,71 @@ impl App {
         banks
     }
 
+    /// Dress a list of the tab's patches: the banks down the left, and the note
+    /// that says what the arrows do.
+    ///
+    /// Shared by the two dialogues that show them — `BANK / PRESET`, and the
+    /// one a SOUNDS button opens to be told what to hold. They list the same
+    /// patches out of the same tab, so they are the same picker; the SOUNDS one
+    /// only puts the live patch in front of the list.
+    fn dress_patch_list(&self, list: &mut views::modal::ListModal) {
+        // The banks go down the left, not into a row of chips: a plugin with
+        // fifty of them has more banks than a line can hold, and which one is
+        // being looked at should be readable without cycling through the rest.
+        list.sidebar = self.preset_sidebar(self.active_slot);
+        if !list.sidebar.is_empty() {
+            list.note = format!("  \u{2190}\u{2192} = {}", i18n::t("BANK"));
+        }
+        list.note = audition_note(&list.note);
+    }
+
+    /// Rebuild that sidebar on the open picker, whichever of the two it is.
+    fn refresh_patch_sidebar(&mut self) {
+        let sidebar = self.preset_sidebar(self.active_slot);
+        if let Some(m) = self.modal.as_mut() {
+            let last = sidebar.len().saturating_sub(1);
+            m.list.sidebar_cursor = m.list.sidebar_cursor.min(last);
+            m.list.sidebar = sidebar;
+        }
+    }
+
+    /// The sidebar of the BANK picker: `("ALL BANKS", n)` and then one row per
+    /// bank with how many patches are in it. Empty when the instrument files
+    /// nothing under a bank — an SF2, or a flat plugin list — and then the list
+    /// takes the whole width.
+    fn preset_sidebar(&self, slot: usize) -> Vec<(String, usize)> {
+        let banks = self.preset_banks(slot);
+        if banks.is_empty() {
+            return Vec::new();
+        }
+        let Some(s) = self.slots.get(slot) else {
+            return Vec::new();
+        };
+        let mut out = vec![(i18n::t("ALL BANKS").to_string(), s.plugin_presets.len())];
+        for bank in banks {
+            let n = s
+                .plugin_presets
+                .iter()
+                .filter(|e| Self::preset_bank(e) == bank)
+                .count();
+            out.push((bank, n));
+        }
+        out
+    }
+
     /// The rows the BANK picker shows: `(index into the full list, label)`,
-    /// narrowed to the selected bank chip. The index is what selecting a row
-    /// applies, so the filter never has to be undone anywhere else.
+    /// narrowed to the bank picked in the sidebar. The index is what selecting
+    /// a row applies, so the filter never has to be undone anywhere else.
     fn preset_rows(&self) -> Vec<(usize, String)> {
         let labels = self.preset_labels(self.active_slot);
         let banks = self.preset_banks(self.active_slot);
-        // Chip 0 is "every bank"; the rest are the banks in order.
-        let chip = self.modal.as_ref().map(|m| m.list.filter).unwrap_or(0);
-        let wanted = chip.checked_sub(1).and_then(|i| banks.get(i));
+        // Sidebar row 0 is "every bank"; the rest are the banks in order.
+        let section = self
+            .modal
+            .as_ref()
+            .map(|m| m.list.sidebar_cursor)
+            .unwrap_or(0);
+        let wanted = section.checked_sub(1).and_then(|i| banks.get(i));
         let Some(slot) = self.slots.get(self.active_slot) else {
             return Vec::new();
         };
@@ -8748,7 +9161,7 @@ impl App {
         // computer keyboard went to the instrument and to nothing else, so the
         // KEYS panel stayed dark under the pointer — the one input whose whole
         // point is that you can see where you are pressing.
-        self.light_key(note, true, targets.first().copied());
+        self.light_key_tabs(note, true, &targets);
         // A tab with its arpeggiator on gets the key the same way it gets a
         // MIDI one: through the arpeggiator. Without this the computer keyboard
         // was the one input that could neither arpeggiate nor type a step, and
@@ -8779,6 +9192,21 @@ impl App {
     /// The same event the MIDI drain feeds, so the colour rules (by tab, by
     /// channel, by velocity) apply to it unchanged rather than growing a second
     /// path that has to be kept in step.
+    /// The same, for a note that reaches several tabs at once.
+    fn light_key_tabs(&mut self, note: u8, on: bool, tabs: &[usize]) {
+        let event = midi::InputEvent::Note(choz_engine::input::NoteMsg {
+            source: choz_engine::input::InputSource::Keyboard,
+            channel: 0,
+            on,
+            note,
+            vel: if on { 100 } else { 0 },
+        });
+        self.keyboard.feed_tabs(
+            &event,
+            views::midi_monitor::KeyLit::mask_of(tabs.iter().copied()),
+        );
+    }
+
     fn light_key(&mut self, note: u8, on: bool, slot: Option<usize>) {
         let event = midi::InputEvent::Note(choz_engine::input::NoteMsg {
             source: choz_engine::input::InputSource::Keyboard,
@@ -8802,6 +9230,86 @@ impl App {
     /// Polled rather than hooked onto each key and click: the cursor moves from
     /// the arrows, the mouse, the wheel and the scrollbar, and one place that
     /// notices it moved cannot be the one that forgets.
+    /// Bring the instrument's knobs up to what the plugin is **actually**
+    /// holding, for a plugin whose controls are addressed by path.
+    ///
+    /// ZynAddSubFX is the one: its patches move every control it has, and none
+    /// of that comes back through a parameter list — so a tab that loaded a
+    /// preset showed the knobs choz last sent, which after the first patch is
+    /// a panel describing a sound nobody is playing.
+    ///
+    /// Asked for and collected: the answers to *this* round land in the
+    /// client's table and are read on the next one, so nothing ever waits on a
+    /// socket while the interface draws.
+    fn poll_instr_readback(&mut self) {
+        let slot = self.active_slot;
+        let Some(paths) = self.audio_engine.as_ref().and_then(|e| e.slot_paths(slot)) else {
+            return;
+        };
+        let param_paths = paths.param_paths();
+        if param_paths.is_empty() {
+            return;
+        }
+        // A knob under the hand keeps its position: the plugin's answer to the
+        // question before the move would put it back where it was.
+        let held = self
+            .instr_moved
+            .filter(|(_, at)| at.elapsed() < Duration::from_millis(400))
+            .map(|(i, _)| i);
+        if let Some(s) = self.slots.get_mut(slot) {
+            let answered = |i: usize| param_paths.get(i).and_then(|p| paths.value(p));
+            read_back(&s.instr_params, &mut s.instr_values, &answered, held);
+        }
+        // …and ask again, slowly. Eighty-four questions twice a second is
+        // nothing on a socket, and a knob that follows a patch within half a
+        // second follows it as far as anyone can tell.
+        let due = self
+            .instr_asked
+            .is_none_or(|at| at.elapsed() > Duration::from_millis(500));
+        if due {
+            self.instr_asked = Some(Instant::now());
+            for path in &param_paths {
+                paths.ask(path);
+            }
+        }
+    }
+
+    /// Rebuild the open patch picker when the tab's list has changed under it.
+    ///
+    /// The list is not always there when the picker opens: a plugin scans its
+    /// own patches, a folder is adopted for one that publishes none, and either
+    /// can land a moment after the window does. Without this the picker keeps
+    /// whatever it was built from — which is how it came up with no banks down
+    /// the side and grew them only when it was closed and opened again.
+    fn poll_preset_list(&mut self) {
+        if !matches!(
+            self.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::Preset) | Some(ModalKind::SoundAssign(_))
+        ) {
+            return;
+        }
+        // Cheap on purpose: this runs every tick, and the lists it watches run
+        // to thousands of entries.
+        let now = self
+            .slots
+            .get(self.active_slot)
+            .map(|s| {
+                (
+                    s.plugin_presets.len(),
+                    s.plugin_presets
+                        .first()
+                        .map(|p| p.key.clone())
+                        .unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default();
+        if self.preset_list_mark.as_ref() == Some(&now) {
+            return;
+        }
+        self.preset_list_mark = Some(now);
+        self.refresh_modal();
+    }
+
     fn poll_preset_audition(&mut self) {
         // Both pickers that list patches: BANK/PRESET, and the one a SOUNDS
         // button opens to be told what to hold. Choosing what a bank button
@@ -8956,8 +9464,14 @@ impl App {
                         self.end_note(msg.source, msg.channel, msg.note)
                     };
                     // The visualizer is fed *after* routing, so a key can be
-                    // coloured by the tab that is actually playing it.
-                    self.keyboard.feed(&event, targets.first().copied());
+                    // coloured by the tabs that are actually playing it —
+                    // **all** of them: two tabs on one MIDI channel are two
+                    // instruments sounding, and colouring the key by the first
+                    // of them drew a rack of keyboards in one colour.
+                    self.keyboard.feed_tabs(
+                        &event,
+                        views::midi_monitor::KeyLit::mask_of(targets.iter().copied()),
+                    );
                     routed.push((targets, msg));
                 }
                 midi::InputEvent::Cc(c) => {
@@ -9592,6 +10106,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Screen>>, app: &mut App) -> 
         app.tick_notes();
         app.publish_chord();
         app.poll_editor();
+        app.poll_preset_list();
+        app.poll_instr_readback();
         app.poll_preset_audition();
         app.poll_plugin_touch();
         app.poll_health();
@@ -9833,6 +10349,40 @@ fn next_focus(focus: Focus, in_open: bool, out_open: bool, mixer: bool) -> Focus
 
 /// Keys for whichever modal is open. Navigation is the same everywhere;
 /// only Enter (and the value arrows of the instrument editor) differ per kind.
+/// The HARMONICS view: left and right walk the harmonics, up and down move the
+/// one under the cursor, and Home/End are the two ends everybody wants — full
+/// and silent.
+fn harmonics_key(app: &mut App, key: KeyCode) {
+    let Some(h) = app.harmonics.as_mut() else {
+        app.close_modal();
+        return;
+    };
+    let last = h.values.len().saturating_sub(1);
+    match key {
+        KeyCode::Esc | KeyCode::Enter => app.close_modal(),
+        KeyCode::Left => h.cursor = h.cursor.saturating_sub(1),
+        KeyCode::Right => h.cursor = (h.cursor + 1).min(last),
+        // The two rows of the editor: the magnitudes, and the phases under
+        // them. Tab is what moves between them — the arrows are the value.
+        KeyCode::Tab | KeyCode::BackTab => h.step_row(1),
+        KeyCode::Up => h.nudge(1.0),
+        KeyCode::Down => h.nudge(-1.0),
+        KeyCode::PageUp => h.nudge(8.0),
+        KeyCode::PageDown => h.nudge(-8.0),
+        // The ends of the range, which is what a bar is usually being dragged
+        // to: all of it, or none of it.
+        KeyCode::Home => {
+            let max = h.set.max;
+            h.put(max);
+        }
+        KeyCode::End => {
+            let zero = h.set.zero;
+            h.put(zero);
+        }
+        _ => {}
+    }
+}
+
 fn handle_modal_key(app: &mut App, key: KeyCode) {
     let Some(kind) = app.modal.as_ref().map(|m| m.kind) else {
         return;
@@ -9841,6 +10391,12 @@ fn handle_modal_key(app: &mut App, key: KeyCode) {
     // Enable/disable, add and remove live in the Plugin Paths section; the
     // Engine and OSC sections have their own value editing.
     if app.paths_modal_key(key) || app.audio_settings_key(key) || app.save_name_key(key) {
+        return;
+    }
+    // The harmonics are a field of bars, not a list: every arrow means
+    // something else there, so it takes the keys before the list handling.
+    if kind == ModalKind::Harmonics {
+        harmonics_key(app, key);
         return;
     }
     match key {
@@ -10146,6 +10702,35 @@ fn multi_targets(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Move the knobs to what the plugin answered, leaving the one under the hand
+/// alone.
+///
+/// Split out from the poll because this is the whole of the rule and the poll
+/// is the socket around it: a value is taken when the plugin has one for that
+/// parameter, it is read in the parameter's own range, and a knob that has not
+/// really moved is not written at all — the project is marked dirty by changes,
+/// and a knob answering the same number twice a second is not one.
+fn read_back(
+    params: &[choz_engine::PluginParam],
+    values: &mut [f32],
+    answered: &dyn Fn(usize) -> Option<f32>,
+    held: Option<usize>,
+) {
+    for (i, p) in params.iter().enumerate() {
+        if Some(i) == held {
+            continue;
+        }
+        let (Some(v), Some(plain)) = (values.get(i), answered(i)) else {
+            continue;
+        };
+        let norm = p.normalised(plain as f64) as f32;
+        if (norm - *v).abs() > 1e-4 {
+            values[i] = norm;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn note_targets(
     bindings: &[Option<&InputRef>],
     // Each tab's MIDI channel, 1-based, as MULTI uses it.
@@ -10412,11 +10997,20 @@ fn handle_fx_keys(app: &mut App, key: KeyCode) {
                 app.press_arp_knob(app.arp_param);
             }
         }
-        KeyCode::Enter if app.rack_focus != RackFocus::Instrument => {
+        // The instrument's box answers Enter the same way: a named parameter
+        // is a list, a switch flips, and a knob has nothing to open.
+        KeyCode::Enter if app.rack_focus == RackFocus::Instrument => {
+            if !app.open_instr_choice(app.instr_param) {
+                app.press_instr_knob(app.instr_param);
+            }
+        }
+        KeyCode::Enter => {
             app.open_fx_choice(app.fx_param);
         }
         // The plugin's own window, for plugins that have one.
         KeyCode::Char('4') | KeyCode::Char('g') => app.toggle_editor(None),
+        // …and the harmonics of its oscillator, for a synth that has a set.
+        KeyCode::Char('h') if app.has_harmonics() => app.open_harmonics_modal(),
         KeyCode::Char('G') => app.toggle_editor(Some(app.fx_slot)),
         KeyCode::Char('x') => app.toggle_sandbox(None),
         KeyCode::Char('X') => app.toggle_sandbox(Some(app.fx_slot)),
@@ -10602,8 +11196,6 @@ enum ArpEdit {
     Gate,
     Swing,
     Latch,
-    /// Follow the transport instead of the arpeggiator's own tempo.
-    Sync,
     /// Set the tempo by tapping it.
     Tap,
     /// One key plays the memorised chord.
@@ -10664,6 +11256,8 @@ enum MouseAction {
     OpenFxGate,
     OpenChordInput,
     ToggleEditor,
+    /// Open the harmonics of the tab's instrument.
+    OpenHarmonics,
     ToggleFxEditor,
     OpenFxPresets,
     /// Move a drawer's cursor, which is also what scrolls its list.
@@ -10792,6 +11386,7 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                             RackButton::PitchToMidi => MouseAction::TogglePitchToMidi,
                             RackButton::PitchMix => MouseAction::PitchMixCycle,
                             RackButton::Gui => MouseAction::ToggleEditor,
+                            RackButton::Harmonics => MouseAction::OpenHarmonics,
                             RackButton::Sandbox => MouseAction::ToggleSandbox,
                             RackButton::Sound(i) => MouseAction::SoundRecall(i),
                             RackButton::SoundAdd => MouseAction::SoundAdd,
@@ -10818,7 +11413,6 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                             RackButton::ArpOctaves => MouseAction::ArpPick(arp::ArpParam::Octaves),
                             RackButton::ArpLatch => MouseAction::ArpEdit(ArpEdit::Latch),
                             RackButton::ArpSwing => MouseAction::ArpEdit(ArpEdit::Swing),
-                            RackButton::ArpSync => MouseAction::ArpEdit(ArpEdit::Sync),
                             RackButton::ArpChord => MouseAction::ArpEdit(ArpEdit::Chord),
                             RackButton::ArpTap => MouseAction::ArpEdit(ArpEdit::Tap),
                         };
@@ -11216,6 +11810,15 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         }
         MouseAction::InstrParamSel(pi) => {
             app.focus = Focus::FxChain;
+            // A second click on the parameter already under the cursor opens
+            // its list, or flips it when there is no list — the same gesture
+            // the FX and arpeggiator knobs answer to.
+            if app.rack_focus == RackFocus::Instrument
+                && app.instr_param == pi
+                && !app.open_instr_choice(pi)
+            {
+                app.press_instr_knob(pi);
+            }
             app.rack_focus = RackFocus::Instrument;
             app.instr_param = pi;
         }
@@ -11319,6 +11922,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         MouseAction::OpenPresetPicker => app.open_preset_modal(),
         MouseAction::OpenLearnPicker => app.start_learn_pick(),
         MouseAction::ToggleEditor => app.toggle_editor(None),
+        MouseAction::OpenHarmonics => app.open_harmonics_modal(),
         MouseAction::ToggleFxEditor => app.toggle_editor(Some(app.fx_slot)),
         MouseAction::OpenFxPresets => {
             app.open_fx_presets();
@@ -11450,6 +12054,62 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
 fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
     let pos: ratatui::layout::Position = (mouse.column, mouse.row).into();
     let rects = app.layout.borrow().modal_rects.clone();
+
+    // The harmonics are drawn, so they are drawn on: a click (or a drag) puts
+    // the bar where the pointer is, and the wheel nudges the one under it.
+    if app
+        .modal
+        .as_ref()
+        .is_some_and(|m| m.kind == ModalKind::Harmonics)
+    {
+        let bars = app.layout.borrow().harmonics_rects.clone();
+        // Outside the panel is how every other dialogue is dismissed.
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && bars.area.is_some_and(|a| !a.contains(pos))
+        {
+            app.close_modal();
+            return;
+        }
+        let Some(h) = app.harmonics.as_mut() else {
+            return;
+        };
+        // Which of the two rows was hit, and where in it.
+        let hit = bars
+            .bars
+            .iter()
+            .map(|b| (0usize, *b))
+            .chain(bars.phase_bars.iter().map(|b| (1usize, *b)))
+            .find(|(_, (_, r))| r.contains(pos));
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
+                let Some((row, (i, rect))) = hit else { return };
+                h.row = row;
+                h.cursor = i;
+                // The row the pointer is on *is* the value: the middle is
+                // silence, the top is full, and below the middle is the same
+                // magnitude the other way up.
+                let half = (rect.height / 2).max(1) as f32;
+                let mid = rect.y as f32 + half;
+                let cells = (mid - mouse.row as f32).clamp(-half, half);
+                let span = h.set.max - h.set.zero;
+                let value = h.set.zero + cells / half * span;
+                h.put(value);
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                if let Some((row, (i, _))) = hit {
+                    h.row = row;
+                    h.cursor = i;
+                }
+                let step = match mouse.kind {
+                    MouseEventKind::ScrollUp => 1.0,
+                    _ => -1.0,
+                };
+                h.nudge(step);
+            }
+            _ => {}
+        }
+        return;
+    }
 
     // The split is painted rather than picked: the left button gives an octave
     // the sound whose square is chosen, the right button takes it away. A sound
@@ -11903,6 +12563,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         &app.instrument_label(),
         app.active_preset_label().as_deref(),
         app.has_editor(),
+        app.has_harmonics(),
         app.has_fx_editor(),
         app.sbx_state(None),
         app.sbx_state(Some(app.fx_slot)),
@@ -12018,12 +12679,41 @@ fn ui(f: &mut Frame, app: &mut App) {
         layout.keys = keys;
     }
 
-    // The SPLIT dialogue is not a list: it is the keyboard itself, painted.
+    // Nor are the harmonics: they are the sound, drawn as bars.
     if app
+        .modal
+        .as_ref()
+        .is_some_and(|m| m.kind == ModalKind::Harmonics)
+    {
+        let title = app.instrument_label();
+        if let Some(h) = app.harmonics.as_mut() {
+            h.poll();
+            // The field is one column per harmonic, so what fits is what the
+            // popup is wide — worked out the same way the view does it.
+            let width = views::harmonics::visible((area.width * 90 / 100).saturating_sub(4));
+            h.follow(width);
+            let view = views::harmonics::HarmonicsView {
+                values: &h.values,
+                phases: &h.phases,
+                row: h.row,
+                cursor: h.cursor,
+                scroll: h.scroll,
+                min: h.set.min,
+                max: h.set.max,
+                zero: h.set.zero,
+                title,
+            };
+            let rects = views::harmonics::draw(f, area, view);
+            let mut layout = app.layout.borrow_mut();
+            layout.modal_rects = views::modal::ModalRects::default();
+            layout.harmonics_rects = rects;
+        }
+    } else if app
         .modal
         .as_ref()
         .is_some_and(|m| m.kind == ModalKind::Split)
     {
+        // The SPLIT dialogue is not a list: it is the keyboard itself, painted.
         let sounds = app.split_chips();
         let octaves = app
             .slots
@@ -12056,6 +12746,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         let mut layout = app.layout.borrow_mut();
         layout.modal_rects = views::modal::ModalRects::default();
         layout.split_rects = views::modal::SplitRects::default();
+        layout.harmonics_rects = views::harmonics::HarmonicsRects::default();
     }
 
     // The MIDI-learn pointer rides above every panel.
@@ -12807,6 +13498,7 @@ mod tests {
                 mix,
                 &app.instrument_label(),
                 None,
+                false,
                 false,
                 false,
                 Default::default(),
@@ -13599,6 +14291,593 @@ mod tests {
     }
 
     /// Draw the RACK panel over a test backend and return (screen, rects).
+    /// A plugin's controls as choz reaches them: paths in, values back. Stands
+    /// in for ZynAddSubFX's OSC server, which is not something a test starts.
+    #[derive(Default)]
+    struct FakePaths {
+        values: std::sync::Mutex<std::collections::HashMap<String, f32>>,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl choz_ports::PluginPaths for FakePaths {
+        fn set(&self, path: &str, value: f32) {
+            self.values.lock().unwrap().insert(path.to_string(), value);
+        }
+        fn ask(&self, path: &str) {
+            self.asked.lock().unwrap().push(path.to_string());
+        }
+        fn value(&self, path: &str) -> Option<f32> {
+            self.values.lock().unwrap().get(path).copied()
+        }
+        fn harmonics(&self) -> Option<choz_ports::HarmonicSet> {
+            Some(choz_ports::HarmonicSet {
+                magnitude: (0..128).map(|i| format!("/h{i}")).collect(),
+                phase: (0..128).map(|i| format!("/p{i}")).collect(),
+                min: 0.0,
+                max: 127.0,
+                zero: 64.0,
+            })
+        }
+    }
+
+    fn open_harmonics(app: &mut App) -> std::sync::Arc<FakePaths> {
+        let fake = std::sync::Arc::new(FakePaths::default());
+        // What the plugin already holds: a fundamental and nothing else, which
+        // is a sine — the shape Zyn opens on.
+        fake.values.lock().unwrap().insert("/h0".into(), 127.0);
+        for i in 1..128 {
+            fake.values.lock().unwrap().insert(format!("/h{i}"), 64.0);
+        }
+        for i in 0..128 {
+            fake.values.lock().unwrap().insert(format!("/p{i}"), 64.0);
+        }
+        let paths = std::sync::Arc::clone(&fake) as choz_ports::PathsHandle;
+        let set = choz_ports::PluginPaths::harmonics(&*paths).unwrap();
+        app.harmonics = Some(HarmonicsState {
+            values: vec![None; set.magnitude.len()],
+            phases: vec![None; set.phase.len()],
+            row: 0,
+            paths,
+            set,
+            cursor: 0,
+            scroll: 0,
+            asked: Instant::now(),
+            just_set: None,
+        });
+        app.modal = Some(Modal::new(
+            ModalKind::Harmonics,
+            views::modal::ListModal::new("HARMONICS", Vec::new()),
+        ));
+        fake
+    }
+
+    /// Choosing a wallpaper by its file name is choosing it blind: the picker
+    /// shows the picture under the cursor, in the terminal, and drops the pane
+    /// again on a row that is a folder.
+    #[test]
+    fn the_wallpaper_picker_shows_the_picture_under_the_cursor() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let dir = std::env::temp_dir().join(format!("choz_wall_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("more")).unwrap();
+        // Two colours, so a preview that draws is visibly not an empty pane.
+        let mut img = image::RgbaImage::new(8, 8);
+        for (x, _y, p) in img.enumerate_pixels_mut() {
+            *p = match x < 4 {
+                true => image::Rgba([220, 30, 30, 255]),
+                false => image::Rgba([30, 60, 220, 255]),
+            };
+        }
+        let file = dir.join("wall.png");
+        img.save(&file).unwrap();
+
+        let mut app = App::new();
+        app.splash_done = true;
+        app.open_wallpaper_browser();
+        // Point it at the folder just made, the way descending into one does.
+        if let Some(b) = app.modal.as_mut().and_then(|m| m.browser.as_mut()) {
+            b.set_dir(dir.clone());
+        }
+        app.refresh_modal();
+
+        // The cursor starts on `../`, which is a folder: no pane.
+        assert!(
+            app.modal.as_ref().unwrap().list.preview.is_none(),
+            "a folder has no picture to show"
+        );
+
+        // Walk to the file itself.
+        let at = app
+            .modal
+            .as_ref()
+            .unwrap()
+            .browser
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .position(|e| e.path == file)
+            .expect("the image is listed");
+        if let Some(b) = app.modal.as_mut().and_then(|m| m.browser.as_mut()) {
+            b.cursor = at;
+        }
+        app.refresh_modal();
+        assert_eq!(
+            app.modal.as_ref().unwrap().list.preview.as_deref(),
+            Some(file.as_path()),
+            "the picture under the cursor is what the pane shows"
+        );
+
+        // And it is really drawn: half-blocks in the image's own colours.
+        let mut term = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let painted = buf
+            .content
+            .iter()
+            .filter(|c| c.symbol() == "\u{2580}")
+            .count();
+        assert!(painted > 40, "the preview drew {painted} cells");
+        assert!(
+            buf.content.iter().any(|c| matches!(
+                c.style().fg,
+                Some(ratatui::style::Color::Rgb(r, _, b)) if r > 150 && b < 100
+            )),
+            "the picture's red half is not on screen"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The knobs follow what the plugin is holding, not only what choz sent:
+    /// a patch loaded inside ZynAddSubFX moves controls the host never touched,
+    /// and the panel has to say so. The knob under the hand is the exception —
+    /// an answer to the question before the move must not drag it back.
+    #[test]
+    fn the_knobs_read_back_what_the_plugin_answers() {
+        let params = vec![
+            choz_engine::PluginParam::plain_range(0, "CUTOFF".into(), 0.0, 127.0, 64.0),
+            choz_engine::PluginParam::plain_range(1, "RES".into(), 0.0, 127.0, 40.0),
+            choz_engine::PluginParam::plain_range(2, "DETUNE".into(), 0.0, 16383.0, 8192.0),
+        ];
+        let mut values = vec![0.5, 0.5, 0.5];
+
+        // What the plugin says it holds, in its own numbers.
+        let answers = |i: usize| match i {
+            0 => Some(32.0),
+            1 => Some(127.0),
+            // Nothing back for this one yet: it keeps what it had.
+            _ => None,
+        };
+        read_back(&params, &mut values, &answers, None);
+        assert!((values[0] - 32.0 / 127.0).abs() < 1e-4, "{}", values[0]);
+        assert!((values[1] - 1.0).abs() < 1e-4, "{}", values[1]);
+        assert_eq!(values[2], 0.5, "an unanswered knob is left alone");
+
+        // The knob being turned right now keeps the hand's position.
+        let mut values = vec![0.9, 0.5, 0.5];
+        read_back(&params, &mut values, &answers, Some(0));
+        assert_eq!(values[0], 0.9, "the hand wins while it is on the knob");
+        assert!((values[1] - 1.0).abs() < 1e-4);
+
+        // A value that has not really changed is not written back: the project
+        // is marked dirty by changes, and this runs twice a second.
+        let mut values = vec![32.0 / 127.0, 0.5, 0.5];
+        let before = values.clone();
+        read_back(&params, &mut values, &|i| (i == 0).then_some(32.0), None);
+        assert_eq!(values, before);
+    }
+
+    /// The two dialogues that list a tab's patches are **one picker**: the BANK
+    /// button's, and the one a SOUNDS button opens to be told what to hold. The
+    /// second was left behind on the old row of chips when the first grew a
+    /// sidebar, so the same patches came up looking like two different things.
+    #[test]
+    fn the_sounds_picker_is_the_bank_picker_with_a_row_in_front() {
+        let _g = ui_guard();
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: "zyn".into(),
+            format: "LV2".into(),
+            name: "ZynAddSubFX".into(),
+        }));
+        app.source = app.slots[0].source.clone();
+        let entry = |cat: &str, name: &str| choz_engine::PresetEntry {
+            name: name.to_string(),
+            category: cat.to_string(),
+            key: format!("{cat}/{name}"),
+        };
+        app.slots[0].plugin_presets = vec![
+            entry("Arpeggios", "Arpeggio1"),
+            entry("Bass", "Sub"),
+            entry("Bass", "Twang"),
+        ];
+        if app.slots[0].sounds.is_empty() {
+            app.add_sound_slot(0);
+        }
+
+        app.open_preset_modal();
+        let bank = app.modal.as_ref().unwrap().list.clone();
+        app.close_modal();
+
+        app.open_sound_assign_modal(0);
+        let sounds = app.modal.as_ref().unwrap().list.clone();
+
+        assert_eq!(sounds.sidebar, bank.sidebar, "the same banks down the side");
+        assert_eq!(sounds.note, bank.note, "and the same line under them");
+        assert!(
+            sounds.filters.is_empty(),
+            "no leftover chips beside the sidebar: {:?}",
+            sounds.filters
+        );
+        assert_eq!(
+            sounds.items.len(),
+            bank.items.len() + 1,
+            "the live patch, then the same list"
+        );
+        assert!(sounds.items[0].contains(&i18n::t("WHAT IS PLAYING NOW").to_string()));
+        assert_eq!(sounds.items[1..], bank.items[..]);
+
+        // And choosing a bank narrows it the same way — the rows are the
+        // sidebar's, with row 0 still in front of them.
+        app.modal.as_mut().unwrap().list.sidebar_cursor = 2;
+        app.refresh_modal();
+        let m = app.modal.as_ref().unwrap();
+        assert_eq!(m.list.items.len(), 3, "the live patch and the two of Bass");
+        assert!(m.list.items[1].contains("Sub"), "{:?}", m.list.items);
+
+        // Picking one applies the preset it points at, not the row it sits on.
+        app.modal.as_mut().unwrap().list.cursor = 2;
+        app.modal_select();
+        assert_eq!(app.slots[0].preset_cursor, 2, "Bass \u{00b7} Twang");
+    }
+
+    /// The instrument's box draws **one segment** of the list: the knobs up to
+    /// a run of sliders, then that run as a bank of its own. A slider is never
+    /// in both, and the page keys walk between them — including back to the
+    /// first page, which is what stopped working when the grid still held the
+    /// run's members on a page the arrows could not land on.
+    #[test]
+    fn the_instrument_box_pages_by_segment() {
+        // **At two heights.** How many rows the box gets decides how big a page
+        // is, and the way back from a bank broke only when the last window was
+        // shorter than a whole page — which is what a taller box gives.
+        for height in [34u16, 44] {
+            pages_by_segment(height);
+        }
+    }
+
+    fn pages_by_segment(height: u16) {
+        let _g = ui_guard();
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: "zyn".into(),
+            format: "LV2".into(),
+            name: "ZynAddSubFX".into(),
+        }));
+        app.source = app.slots[0].source.clone();
+        // Shaped like ZynAddSubFX's: a score of knobs, then the harmonics.
+        const KNOBS: usize = 20;
+        const HARMONICS: usize = 24;
+        let mut params: Vec<choz_engine::PluginParam> = (0..KNOBS as u32)
+            .map(|i| choz_engine::PluginParam::plain_range(i, format!("K{i}"), 0.0, 127.0, 64.0))
+            .collect();
+        for i in 0..HARMONICS as u32 {
+            let mut p = choz_engine::PluginParam::plain_range(
+                100 + i,
+                format!("H{}", i + 1),
+                0.0,
+                127.0,
+                64.0,
+            );
+            p.unit = Some("harmonic".into());
+            p.group = Some("HARMONICS".into());
+            params.push(p);
+        }
+        // Something past the run, so paging forward has somewhere to land.
+        params.push(choz_engine::PluginParam::plain_range(
+            200,
+            "TAIL".into(),
+            0.0,
+            1.0,
+            0.5,
+        ));
+        app.slots[0].instr_values = vec![0.5; params.len()];
+        app.slots[0].instr_params = params;
+        app.rack_focus = RackFocus::Instrument;
+        app.instr_param = 0;
+
+        let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+        let screen = |app: &mut App, term: &mut Terminal<TestBackend>| -> String {
+            term.draw(|f| ui(f, app)).unwrap();
+            term.backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        // The cursor is on the first row of the knobs, so the box says which
+        // rows of *that segment* are up — and names the first, not only the
+        // last.
+        let s = screen(&mut app, &mut term);
+        assert!(s.contains("(1\u{2013}"), "the first row is up:\n{s}");
+        assert!(
+            !s.contains("H1 "),
+            "a slider has no business in the grid:\n{s}"
+        );
+        assert_eq!(
+            app.layout.borrow().rack.instr_segment,
+            Some((0, KNOBS, false))
+        );
+
+        // Every knob the arrows show on the way, so the ones they skip are
+        // named when they are skipped.
+        let mut seen: std::collections::BTreeSet<usize> = app
+            .layout
+            .borrow()
+            .rack
+            .instr_knobs
+            .iter()
+            .map(|(i, _)| *i)
+            .collect();
+
+        // Paging on inside the knobs stays inside them.
+        app.page_instr(1);
+        let s = screen(&mut app, &mut term);
+        assert_eq!(
+            app.layout.borrow().rack.instr_segment,
+            Some((0, KNOBS, false)),
+            "still the knobs"
+        );
+        assert!(!s.contains("(1\u{2013}"), "and the window moved:\n{s}");
+
+        // Paging on reaches **every** knob before the bank does — the last of
+        // them (a plugin's WAVE and H.SCALE) were on a page the arrows jumped
+        // clean over.
+        seen.extend(app.layout.borrow().rack.instr_knobs.iter().map(|(i, _)| *i));
+        for _ in 0..10 {
+            if app
+                .layout
+                .borrow()
+                .rack
+                .instr_segment
+                .is_some_and(|(_, _, bank)| bank)
+            {
+                break;
+            }
+            app.page_instr(1);
+            screen(&mut app, &mut term);
+            seen.extend(app.layout.borrow().rack.instr_knobs.iter().map(|(i, _)| *i));
+        }
+        assert!(
+            (0..KNOBS).all(|i| seen.contains(&i)),
+            "knobs the arrows never showed: {:?}",
+            (0..KNOBS).filter(|i| !seen.contains(i)).collect::<Vec<_>>()
+        );
+        assert!(
+            seen.iter().all(|i| *i < KNOBS + HARMONICS),
+            "the grid drew past its segment"
+        );
+
+        // The bank, whole and on its own.
+        let s = screen(&mut app, &mut term);
+        assert_eq!(app.instr_param, KNOBS, "on the first slider");
+        assert_eq!(
+            app.layout.borrow().rack.instr_segment,
+            Some((KNOBS, KNOBS + HARMONICS, true))
+        );
+        assert!(s.contains('\u{2502}'), "no slider tracks:\n{s}");
+        assert!(s.contains('\u{2588}'), "no slider knobs:\n{s}");
+        assert!(s.contains("H24"), "the far end is on screen too");
+        assert!(!s.contains("K0 "), "and the knobs are not:\n{s}");
+        let rects = app.layout.borrow().rack.instr_knobs.clone();
+        assert_eq!(rects.len(), HARMONICS, "a column per harmonic, all at once");
+        let ys: std::collections::BTreeSet<u16> = rects.iter().map(|(_, r)| r.y).collect();
+        assert_eq!(ys.len(), 1, "side by side, not wrapped onto rows");
+        assert!(
+            rects[1].1.x > rects[0].1.x && rects[1].1.x - rects[0].1.x <= 5,
+            "packed together: {:?}",
+            &rects[..2]
+        );
+        assert!(rects[0].1.height >= 6, "a slider, not a cell");
+        assert_eq!(rects[0].0, KNOBS);
+
+        // **And back out again**, which is the half that was broken: the bank
+        // is one page, so back is the knob before it — from where the ordinary
+        // paging reaches the first page.
+        app.page_instr(-1);
+        assert_eq!(app.instr_param, KNOBS - 1, "onto the knob before the run");
+        let s = screen(&mut app, &mut term);
+        assert!(s.contains("K19"), "the last of the knobs is up:\n{s}");
+        // …and on back to the first page, which is the half that was broken.
+        let mut back = 0;
+        while app
+            .layout
+            .borrow()
+            .rack
+            .instr_knobs
+            .first()
+            .is_some_and(|(i, _)| *i > 0)
+        {
+            app.page_instr(-1);
+            screen(&mut app, &mut term);
+            back += 1;
+            assert!(
+                back < 10,
+                "the arrows never reached the first page ({height} rows)"
+            );
+        }
+        let s = screen(&mut app, &mut term);
+        assert!(s.contains("K0"), "and back to the first page:\n{s}");
+        assert!(s.contains("(1\u{2013}"), "which says so:\n{s}");
+
+        // Forward out of the bank lands on what follows it.
+        app.instr_param = KNOBS + 2;
+        screen(&mut app, &mut term);
+        app.page_instr(1);
+        assert_eq!(app.instr_param, KNOBS + HARMONICS, "the knob past the run");
+    }
+
+    /// A named instrument parameter is a list, not a wheel: Enter (and a second
+    /// click) opens its positions by name. Every format that reports the names
+    /// of a parameter's steps gets this — it is `ParamShape::Named` that
+    /// decides, not the plugin.
+    #[test]
+    fn a_named_instrument_parameter_opens_its_list() {
+        let _g = ui_guard();
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: "zyn".into(),
+            format: "LV2".into(),
+            name: "ZynAddSubFX".into(),
+        }));
+        app.source = app.slots[0].source.clone();
+        let named = |name: &str, steps: &[&str]| choz_engine::PluginParam {
+            id: 0,
+            name: name.to_string(),
+            min: 0.0,
+            max: (steps.len() - 1) as f64,
+            default: 0.0,
+            steps: steps.len() as u32,
+            unit: None,
+            points: steps
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (i as f64, s.to_string()))
+                .collect(),
+            group: Some("FILTER".into()),
+        };
+        app.slots[0].instr_params = vec![
+            named("TYPE", &["LPF1", "HPF1", "LPF2", "BPF2"]),
+            choz_engine::PluginParam::plain_range(1, "CUTOFF".into(), 0.0, 127.0, 64.0),
+        ];
+        app.slots[0].instr_values = vec![0.0, 0.5];
+        app.rack_focus = RackFocus::Instrument;
+
+        // A knob is a knob: Enter on the cutoff opens nothing.
+        app.instr_param = 1;
+        handle_fx_keys(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none(), "a range has no list to open");
+
+        // A parameter whose steps have names is a list.
+        app.instr_param = 0;
+        handle_fx_keys(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::InstrChoice)
+        );
+        let m = app.modal.as_ref().unwrap();
+        assert_eq!(m.list.items, ["LPF1", "HPF1", "LPF2", "BPF2"]);
+        assert!(m.list.title.contains("FILTER"), "{}", m.list.title);
+        assert_eq!(m.list.cursor, 0, "it opens on the position it is at");
+
+        // Picking one puts the parameter exactly there — the position's own
+        // value, not a share of the list's length.
+        app.modal.as_mut().unwrap().list.cursor = 2;
+        handle_modal_key(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none(), "chosen, so it closes");
+        let v = app.slots[0].instr_values[0];
+        assert!(
+            (v - 2.0 / 3.0).abs() < 1e-6,
+            "the third of four positions: {v}"
+        );
+
+        // …and the list opens on it the next time.
+        handle_fx_keys(&mut app, KeyCode::Enter);
+        assert_eq!(app.modal.as_ref().unwrap().list.cursor, 2);
+    }
+
+    /// The harmonics of a sound, edited the way its own window does it: the
+    /// bars are the magnitudes, the arrows move them, and every move is on the
+    /// instrument the moment it is made — there is no "apply".
+    #[test]
+    fn the_harmonics_view_draws_the_sound_and_edits_it() {
+        use choz_ports::PluginPaths as _;
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        let fake = open_harmonics(&mut app);
+
+        // Drawing it reads what the plugin has answered, so the fundamental is
+        // full and the rest sit on the line.
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let h = app.harmonics.as_ref().unwrap();
+        assert_eq!(h.values[0], Some(127.0), "the fundamental");
+        assert_eq!(h.values[5], Some(64.0), "and a silent one");
+        let screen: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("HARMONIC"), "the view is up:\n{screen}");
+
+        // Up moves the harmonic under the cursor, and the plugin is told at
+        // once — a bar that is only in the picture is a bar that does nothing.
+        handle_modal_key(&mut app, KeyCode::Right);
+        handle_modal_key(&mut app, KeyCode::PageUp);
+        assert_eq!(app.harmonics.as_ref().unwrap().cursor, 1);
+        assert_eq!(fake.value("/h1"), Some(72.0), "64 + 8");
+        handle_modal_key(&mut app, KeyCode::Down);
+        assert_eq!(fake.value("/h1"), Some(71.0));
+
+        // Home is all of it, End is none — the two ends a bar is dragged to.
+        handle_modal_key(&mut app, KeyCode::Home);
+        assert_eq!(fake.value("/h1"), Some(127.0));
+        handle_modal_key(&mut app, KeyCode::End);
+        assert_eq!(fake.value("/h1"), Some(64.0), "silent, not zero");
+
+        // The cursor cannot walk off either end of the harmonics.
+        handle_modal_key(&mut app, KeyCode::Left);
+        handle_modal_key(&mut app, KeyCode::Left);
+        assert_eq!(app.harmonics.as_ref().unwrap().cursor, 0);
+        for _ in 0..200 {
+            handle_modal_key(&mut app, KeyCode::Right);
+        }
+        assert_eq!(app.harmonics.as_ref().unwrap().cursor, 127);
+        // …and the field scrolled to keep it in sight.
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let h = app.harmonics.as_ref().unwrap();
+        assert!(h.scroll > 0, "the view did not follow the cursor");
+
+        // Tab moves to the phases, which are the other half of the editor: the
+        // same bars, a different set of paths.
+        handle_modal_key(&mut app, KeyCode::Home);
+        for _ in 0..127 {
+            handle_modal_key(&mut app, KeyCode::Left);
+        }
+        handle_modal_key(&mut app, KeyCode::Right);
+        assert_eq!(app.harmonics.as_ref().unwrap().cursor, 1);
+        handle_modal_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.harmonics.as_ref().unwrap().row, 1, "on the phases now");
+        handle_modal_key(&mut app, KeyCode::PageUp);
+        assert_eq!(fake.value("/p1"), Some(72.0), "the phase moved");
+        assert_eq!(
+            fake.value("/h1"),
+            Some(64.0),
+            "and the magnitude was left where it was"
+        );
+        term.draw(|f| ui(f, &mut app)).unwrap();
+
+        // Esc leaves, and leaves the sound as it was made.
+        handle_modal_key(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_none() && app.harmonics.is_none());
+        assert_eq!(fake.value("/h1"), Some(64.0));
+    }
+
     fn render_rack(app: &mut App, w: u16, h: u16) -> (String, RackLayout) {
         let _g = ui_guard();
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -13635,6 +14914,7 @@ mod tests {
                 &app.instrument_label(),
                 preset.as_deref(),
                 app.has_editor(),
+                app.has_harmonics(),
                 app.has_fx_editor(),
                 app.sbx_state(None),
                 app.sbx_state(Some(app.fx_slot)),
@@ -14334,6 +15614,9 @@ mod tests {
     /// the switch is drawn while it is off.
     #[test]
     fn the_arp_line_shows_its_settings_only_when_it_is_on() {
+        // The rate on the line is the transport's, which every other test
+        // shares: hold the UI lock so nobody moves it mid-frame.
+        let _g = views::theme::ui_guard();
         let mut app = App::new();
         app.slots.push(RackSlot::new(AudioSource::Midi));
         app.active_slot = 0;
@@ -14364,6 +15647,9 @@ mod tests {
         assert_eq!(arp_buttons(&rack), 1, "off, it is one switch");
 
         app.edit_arp(ArpEdit::Toggle);
+        // The rate it shows is the transport's — the arpeggiator has no clock
+        // of its own — so say what the transport is at.
+        choz_ports::transport().set_bpm(120.0);
         // Short on rows, so the controls are buttons: on a panel with room they
         // are knobs instead, which is what
         // `the_arp_controls_take_the_shape_the_screen_can_afford` covers.
@@ -16465,6 +17751,113 @@ mod tests {
     /// The black keys sit on the join between two whites and only in the top
     /// band, so the top of that join is the black key and the body below it is
     /// the white one — the same split the drawing makes, from the same map.
+    /// KEYS colours a note by the tab that is playing it, and the colours move
+    /// with the rack: two keyboards into two tabs are two colours on the one
+    /// piano, and the legend under it says which is which.
+    #[test]
+    fn the_keyboard_colours_each_tab_of_incoming_midi_differently() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: "zyn".into(),
+            format: "LV2".into(),
+            name: "ZynAddSubFX".into(),
+        }));
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: "surge".into(),
+            format: "CLAP".into(),
+            name: "Surge XT".into(),
+        }));
+        app.monitor_tab = views::midi_monitor::MonitorTab::Keys;
+        app.ui.key_colour = views::midi_monitor::KeyColor::Instrument;
+
+        // One note into each tab, as the drain feeds them: routed first, then
+        // handed to the visualiser with the tab that is playing it.
+        app.light_key(60, true, Some(0));
+        app.light_key(67, true, Some(1));
+
+        let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let map = app.layout.borrow().keys.clone();
+        assert!(!map.whites.is_empty(), "the keyboard was drawn");
+
+        let buf = term.backend().buffer().clone();
+        let colour_of = |note: u8| -> ratatui::style::Color {
+            let at = map
+                .whites
+                .iter()
+                .position(|w| *w == note)
+                .unwrap_or_else(|| panic!("{note} is on screen"));
+            let x = map.area.x + map.cells[at].0;
+            buf[(x, map.area.y)].style().fg.expect("a painted key")
+        };
+        let (zyn, surge) = (colour_of(60), colour_of(67));
+        assert_ne!(zyn, surge, "both tabs' notes came out the same colour");
+
+        // …and neither is the ivory of a key nobody is playing.
+        let idle = map
+            .whites
+            .iter()
+            .copied()
+            .find(|n| *n != 60 && *n != 67)
+            .expect("a key at rest");
+        let rest = colour_of(idle);
+        assert_ne!(zyn, rest, "the lit key is not drawn as ivory");
+        assert_ne!(surge, rest);
+
+        // The legend names both tabs, each in its own colour.
+        let screen: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(
+            screen.contains("INSTRUMENT"),
+            "the legend says what it colours by"
+        );
+        assert!(
+            screen.contains("ZynAddSub") || screen.contains("Zyn"),
+            "{screen}"
+        );
+
+        // **A note into two tabs wears both colours.** Two tabs on one MIDI
+        // channel in MULTI, or a layered SoundFont, are two instruments
+        // sounding one key — and drawing it in the first tab's colour is what
+        // made a rack of keyboards come out all one colour.
+        app.light_key_tabs(72, true, &[0, 1]);
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let at = map
+            .whites
+            .iter()
+            .position(|w| *w == 72)
+            .expect("C5 is on screen");
+        let x = map.area.x + map.cells[at].0;
+        let top = buf[(x, map.area.y)].style().fg.expect("painted");
+        let bottom = buf[(x, map.area.y + map.area.height - 1)]
+            .style()
+            .fg
+            .expect("painted");
+        assert_ne!(top, bottom, "the shared key was drawn in one colour");
+        assert!(
+            [top, bottom].contains(&zyn) && [top, bottom].contains(&surge),
+            "and the two halves are the two tabs"
+        );
+        app.light_key_tabs(72, false, &[]);
+
+        // Moving the note to the other tab moves its colour with it: the rack
+        // is what the colours follow, not the note.
+        app.light_key(60, false, Some(0));
+        app.light_key(60, true, Some(1));
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let at = map.whites.iter().position(|w| *w == 60).unwrap();
+        let x = map.area.x + map.cells[at].0;
+        assert_eq!(
+            buf[(x, map.area.y)].style().fg,
+            Some(surge),
+            "the note is on the second tab now, so it wears its colour"
+        );
+    }
+
     #[test]
     fn clicking_the_drawn_piano_plays_the_key_under_the_pointer() {
         let _g = ui_guard();
@@ -16486,16 +17879,18 @@ mod tests {
             .iter()
             .position(|w| *w == 60)
             .expect("C4 is on screen");
-        let stride = (map.key_w + 1) as u16;
-        let x = map.area.x + at as u16 * stride;
+        let x = map.area.x + map.cells[at].0;
+        // The join is the last cell of the key, whatever this key's width is:
+        // they differ by a cell where the panel does not divide evenly.
+        let join = map.area.x + map.cells[at].0 + map.cells[at].1 - 1;
         assert_eq!(map.note_at(x, map.area.y), Some(60), "the white key body");
         assert_eq!(
-            map.note_at(x + map.key_w as u16, map.area.y),
+            map.note_at(join, map.area.y),
             Some(61),
             "the black key on the join, in the band"
         );
         assert_eq!(
-            map.note_at(x + map.key_w as u16, map.area.y + map.band as u16),
+            map.note_at(join, map.area.y + map.band as u16),
             Some(60),
             "…and the white key again below it"
         );
@@ -16574,7 +17969,7 @@ mod tests {
         term.draw(|f| ui(f, &mut app)).unwrap();
         let map = app.layout.borrow().keys.clone();
         let at = map.whites.iter().position(|w| *w == 60).expect("C4");
-        let x = map.area.x + at as u16 * (map.key_w + 1) as u16;
+        let x = map.area.x + map.cells[at].0;
 
         assert!(
             !app.keyboard.drawn_keys().contains(&60),
@@ -17140,8 +18535,151 @@ mod tests {
         assert_eq!(saved.rack[0].instrument.config, app.slots[0].dssi_config);
     }
 
+    /// Opening the picker twice must look the same both times — the sidebar is
+    /// built from the tab, not from whatever the last modal left behind.
+    #[test]
+    fn the_bank_sidebar_is_there_the_first_time_it_opens() {
+        let _g = ui_guard();
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: "zyn".into(),
+            format: "LV2".into(),
+            name: "ZynAddSubFX".into(),
+        }));
+        app.source = app.slots[0].source.clone();
+        let entry = |cat: &str, name: &str| choz_engine::PresetEntry {
+            name: name.to_string(),
+            category: cat.to_string(),
+            key: format!("{cat}/{name}"),
+        };
+        app.slots[0].plugin_presets = vec![
+            entry("Arpeggios", "Arpeggio1"),
+            entry("Bass", "Sub"),
+            entry("Bass", "Twang"),
+        ];
+
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let drawn = |app: &mut App, term: &mut Terminal<TestBackend>| -> usize {
+            term.draw(|f| ui(f, app)).unwrap();
+            app.layout.borrow().modal_rects.sidebar.len()
+        };
+
+        app.open_preset_modal();
+        let first_state = app.modal.as_ref().unwrap().list.sidebar.len();
+        let first_drawn = drawn(&mut app, &mut term);
+        app.close_modal();
+
+        app.open_preset_modal();
+        let second_state = app.modal.as_ref().unwrap().list.sidebar.len();
+        let second_drawn = drawn(&mut app, &mut term);
+
+        assert_eq!(
+            (first_state, first_drawn),
+            (second_state, second_drawn),
+            "the first opening drew a different picker from the second"
+        );
+        assert_eq!(first_drawn, 3, "ALL BANKS, Arpeggios, Bass");
+    }
+
+    /// The list is not always there when the picker opens: a plugin that
+    /// publishes numbered slots has its folder of patches adopted a moment
+    /// later, and the picker has to grow the banks it did not have — not wait
+    /// for somebody to close it and open it again.
+    #[test]
+    fn a_list_that_arrives_late_reaches_the_open_picker() {
+        let _g = ui_guard();
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: "amsynth".into(),
+            format: "VST2".into(),
+            name: "amsynth".into(),
+        }));
+        app.source = app.slots[0].source.clone();
+        // What the plugin itself answers: numbered slots, filed under nothing.
+        app.slots[0].plugin_presets = (0..4)
+            .map(|i| choz_engine::PresetEntry {
+                name: format!("Program {}", i + 1),
+                category: String::new(),
+                key: i.to_string(),
+            })
+            .collect();
+
+        app.open_preset_modal();
+        app.poll_preset_list();
+        assert!(
+            app.modal.as_ref().unwrap().list.sidebar.is_empty(),
+            "nothing is filed under a bank yet, so there is no sidebar"
+        );
+
+        // …and then the folder is adopted, with its banks.
+        app.slots[0].plugin_presets = vec![
+            choz_engine::PresetEntry {
+                name: "Airy".into(),
+                category: "BriansBank01".into(),
+                key: "/banks/b1.bank#0".into(),
+            },
+            choz_engine::PresetEntry {
+                name: "Sub".into(),
+                category: "BriansBank02".into(),
+                key: "/banks/b2.bank#0".into(),
+            },
+        ];
+        app.poll_preset_list();
+        let bar = &app.modal.as_ref().unwrap().list.sidebar;
+        assert_eq!(bar.len(), 3, "ALL BANKS and the two of them: {bar:?}");
+        assert_eq!(
+            app.modal.as_ref().unwrap().list.items.len(),
+            2,
+            "and its rows"
+        );
+    }
+
+    /// And the commonest reason it arrives late: the folder is found by the
+    /// plugin's name and path, which are only known once the scan has finished.
+    /// A tab loaded before that keeps its numbered slots until this runs.
+    #[test]
+    fn a_finished_scan_gives_a_numbered_tab_its_bank() {
+        let _g = ui_guard();
+        sandbox_state_dir();
+        let dir = std::env::temp_dir().join(format!("choz_adopt_{}", std::process::id()));
+        let bank = dir.join("MyBank.amSynth.bank");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &bank,
+            "amSynth\n<preset> <name> Airy\n<parameter> amp_attack 0.5\n",
+        )
+        .unwrap();
+
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: "amsynth".into(),
+            format: "VST2".into(),
+            name: "amsynth".into(),
+        }));
+        app.slots[0].plugin_presets = vec![choz_engine::PresetEntry {
+            name: "Program 1".into(),
+            category: String::new(),
+            key: "0".into(),
+        }];
+        // The tab already knows where to look; what it did not have is the
+        // plugin list that says so.
+        app.slots[0].preset_dir = Some(dir.clone());
+
+        app.apply_plugins(Vec::new());
+        let got = &app.slots[0].plugin_presets;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "Airy", "the numbered slot is gone: {got:?}");
+        assert_eq!(got[0].category, "MyBank", "and it has its bank");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A plugin with thousands of patches is only usable if the picker narrows
-    /// them: the chips are its banks, a row picks the preset it points at (not
+    /// them: the sidebar is its banks, a row picks the preset it points at (not
     /// the position it sits in), and the arrows stay inside the bank.
     #[test]
     fn a_plugins_patches_are_picked_by_bank() {
@@ -17171,12 +18709,24 @@ mod tests {
         assert_eq!(app.preset_banks(0), ["A.Liv", "Factory"]);
 
         app.open_preset_modal();
-        let chips = app.modal.as_ref().unwrap().list.filters.clone();
-        assert_eq!(chips.len(), 3, "every bank, plus one chip for all of them");
-        assert_eq!(app.preset_rows().len(), 5, "chip 0 hides nothing");
+        let bar = app.modal.as_ref().unwrap().list.sidebar.clone();
+        assert_eq!(
+            bar,
+            [
+                (i18n::t("ALL BANKS").to_string(), 5),
+                ("A.Liv".to_string(), 2),
+                ("Factory".to_string(), 3)
+            ],
+            "every bank down the side, with what is in it, under a row for all of them"
+        );
+        assert_eq!(
+            app.preset_rows().len(),
+            5,
+            "row 0 of the sidebar hides nothing"
+        );
 
-        // Second chip = the second bank: three of the five patches.
-        app.modal.as_mut().unwrap().list.filter = 2;
+        // Second bank of the sidebar: three of the five patches.
+        app.modal.as_mut().unwrap().list.sidebar_cursor = 2;
         let rows = app.preset_rows();
         assert_eq!(rows.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [2, 3, 4]);
         assert!(rows[0].1.contains("Sub"), "{rows:?}");
@@ -18846,7 +20396,6 @@ mod tests {
 
         let mut a = arp::Arp::new(ArpSettings {
             on: true,
-            sync: true,
             div: TimeDiv::Quarter,
             ..Default::default()
         });
@@ -19041,8 +20590,9 @@ mod tests {
                 },
             );
         }
-        let bpm = app.slots[0].arp.settings.bpm;
+        let bpm = choz_ports::transport().bpm();
         assert!(bpm > 120.0, "tapping did not move the tempo: {bpm}");
+        choz_ports::transport().set_bpm(120.0);
     }
 
     /// Every arpeggiator control is reachable and changeable **without a
@@ -19226,7 +20776,7 @@ mod tests {
 
         // The wheel over BPM moves the tempo and nothing else.
         let bpm = rect(&rack, i_bpm);
-        let before = app.slots[0].arp.settings.bpm;
+        let before = choz_ports::transport().bpm();
         handle_mouse(
             &mut app,
             MouseEvent {
@@ -19236,7 +20786,7 @@ mod tests {
                 modifiers: crossterm::event::KeyModifiers::NONE,
             },
         );
-        assert!(app.slots[0].arp.settings.bpm > before);
+        assert!(choz_ports::transport().bpm() > before);
 
         // Clicking a knob takes the arrows; clicking it again steps it — which
         // for PLAY means the sequencer, the same as the button did.
@@ -19309,7 +20859,6 @@ mod tests {
                         | B::ArpDiv
                         | B::ArpRateDown
                         | B::ArpRateUp
-                        | B::ArpSync
                         | B::ArpGate
                         | B::ArpSwing
                         | B::ArpOctaves
@@ -19318,9 +20867,10 @@ mod tests {
                 )
             })
             .collect();
-        // Eleven: the arpeggiator's own controls. Its on/off is not among them
-        // any more — that switch is the button on the ALGO row above.
-        assert_eq!(arp.len(), 11, "every switch is drawn: {arp:?}");
+        // Ten: the arpeggiator's own controls. Its on/off is not among them
+        // any more — that switch is the button on the ALGO row above — and
+        // neither is SYNC, which it no longer has: one clock, always.
+        assert_eq!(arp.len(), 10, "every switch is drawn: {arp:?}");
         for (b, r) in &arp {
             assert!(r.x + r.width <= 80, "{b:?} runs past the panel: {r:?}");
         }
@@ -19665,6 +21215,11 @@ mod tests {
         app.modal.as_mut().unwrap().list.cursor = 2;
         app.modal_select();
         assert_ne!(choz_ports::transport().time_signature(), sig);
+        assert_eq!(
+            choz_ports::transport().time_signature().1,
+            sig.1,
+            "the beats row leaves the note the beat is counted in alone"
+        );
 
         // The arrows move a row either way — a tempo four presses up is forty
         // presses back the other way if the only direction is forward.
@@ -19709,7 +21264,7 @@ mod tests {
         }
 
         let style = m.style();
-        app.modal.as_mut().unwrap().list.cursor = 4;
+        app.modal.as_mut().unwrap().list.cursor = 5;
         app.modal_select();
         assert_eq!(m.style(), style.next());
 
@@ -19718,18 +21273,39 @@ mod tests {
         // rather than accenting beats that no longer exist.
         choz_ports::transport().set_time_signature(7, 8);
         m.set_groups(&[]);
-        app.modal.as_mut().unwrap().list.cursor = 3;
+        app.modal.as_mut().unwrap().list.cursor = 4;
         app.modal_select();
         assert_eq!(m.groups(), vec![2, 2, 3], "7/8 counted 2+2+3");
         app.refresh_modal();
         assert!(
-            app.metronome_rows()[3].contains("2+2+3"),
+            app.metronome_rows()[4].contains("2+2+3"),
             "the menu says how the bar is counted: {}",
-            app.metronome_rows()[3]
+            app.metronome_rows()[4]
         );
+        // The two halves of the signature move on their own: the top row counts
+        // beats, the bottom row picks the note they are counted in.
         app.modal.as_mut().unwrap().list.cursor = 2;
         app.modal_select();
+        assert_eq!(
+            choz_ports::transport().time_signature(),
+            (8, 8),
+            "the beats row counts one more beat, in the same note"
+        );
         assert!(m.groups().is_empty(), "a new signature is a new bar");
+        app.modal.as_mut().unwrap().list.cursor = 3;
+        app.modal_select();
+        assert_eq!(
+            choz_ports::transport().time_signature(),
+            (8, 16),
+            "and the unit row moves only the bottom number"
+        );
+        // The level row draws what it is: a bar, not just a number.
+        app.refresh_modal();
+        assert!(
+            app.metronome_rows()[7].contains('\u{2588}') || m.gain() == 0.0,
+            "the level row is a slider: {}",
+            app.metronome_rows()[7]
+        );
 
         m.set_on(false);
         choz_ports::transport().set_bpm(120.0);
@@ -20009,6 +21585,11 @@ mod tests {
             app.fx_chain[0].gate.map(|g| g.source),
             Some(GateSource::Metronome)
         );
+        assert!(
+            app.fx_gate_rows()[0].contains("METRONOME"),
+            "the click says which source it is: {}",
+            app.fx_gate_rows()[0]
+        );
         app.step_fx_gate_row(0, 1);
         assert!(app.fx_chain[0].gate.is_none(), "and back off again");
 
@@ -20099,14 +21680,13 @@ mod tests {
         assert_eq!(app.modal.as_ref().map(|m| m.list.filter), Some(1));
 
         let key_at = |r: &views::modal::SplitRects, oct: usize| -> (u16, u16) {
-            let stride = (r.keys.key_w + 1) as u16;
             let i = r
                 .keys
                 .whites
                 .iter()
                 .position(|n| views::modal::octave_of(*n) == oct)
                 .unwrap_or_else(|| panic!("octave {oct} is on the piano"));
-            (r.keys.area.x + i as u16 * stride, r.keys.area.y)
+            (r.keys.area.x + r.keys.cells[i].0, r.keys.area.y)
         };
         for oct in [4, 5] {
             let (x, y) = key_at(&r, oct);

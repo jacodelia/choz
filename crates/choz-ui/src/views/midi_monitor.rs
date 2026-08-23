@@ -261,6 +261,12 @@ impl MonitorTab {
 /// of them on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum KeyColor {
+    /// **Retired.** Colouring by MIDI channel answered a question nobody was
+    /// asking: on a rig where every keyboard sends channel 1 — which is most of
+    /// them — it painted the whole rack one colour, and the panel exists to
+    /// show what is going *where*. It still parses, so a settings file that
+    /// names it still loads; [`KeyColor::effective`] reads it as
+    /// [`KeyColor::Instrument`] and the cycle never offers it again.
     Channel,
     /// One colour per **MIDI input**: which keyboard, pad or sequencer the note
     /// arrived on. Notes choz made itself — the QWERTY piano, `A→M` — have no
@@ -276,12 +282,18 @@ pub enum KeyColor {
 }
 
 impl KeyColor {
-    pub const ALL: [KeyColor; 4] = [
-        KeyColor::Channel,
-        KeyColor::Source,
-        KeyColor::Instrument,
-        KeyColor::Velocity,
-    ];
+    /// The modes the `[C]` key walks. **By tab first**: which instrument a note
+    /// is playing is the question a rack raises, and the other two answer
+    /// "which keyboard" and "how hard".
+    pub const ALL: [KeyColor; 3] = [KeyColor::Instrument, KeyColor::Source, KeyColor::Velocity];
+
+    /// The mode this one really means. Only the retired one is not itself.
+    pub fn effective(self) -> Self {
+        match self {
+            KeyColor::Channel => KeyColor::Instrument,
+            other => other,
+        }
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -303,13 +315,39 @@ impl KeyColor {
 pub struct KeyLit {
     pub channel: u8,
     pub vel: u8,
-    /// Which rack tab it was routed to, when it was routed anywhere.
-    pub slot: Option<usize>,
+    /// **Every** rack tab the note was routed to, one bit each — a note played
+    /// into two tabs is playing two instruments, and drawing it as if only the
+    /// first were sounding is what made two keyboards on one rack come out the
+    /// same colour. `0` for a note that reached nothing.
+    pub tabs: u32,
     /// Which input it arrived on. `None` for a note choz made itself — the
     /// QWERTY piano, `A→M`. Kept because a chord the harmoniser follows has to
     /// be able to come from **one** keyboard: with two of them on a hub, the
     /// channel alone cannot tell them apart.
     pub source: Option<InputSource>,
+}
+
+impl KeyLit {
+    /// The bit for one tab, or none at all.
+    pub fn mask(slot: Option<usize>) -> u32 {
+        Self::mask_of(slot.into_iter())
+    }
+
+    /// The bits for a set of tabs. Tabs past the thirty-second are not drawn
+    /// apart — a rack that deep has other problems.
+    pub fn mask_of(slots: impl Iterator<Item = usize>) -> u32 {
+        slots.filter(|s| *s < 32).fold(0, |m, s| m | (1 << s))
+    }
+
+    /// The tabs this note is playing, low to high.
+    pub fn tab_list(&self) -> Vec<usize> {
+        (0..32).filter(|i| self.plays(*i)).collect()
+    }
+
+    /// Whether tab `slot` is one of them.
+    pub fn plays(&self, slot: usize) -> bool {
+        slot < 32 && self.tabs & (1 << slot) != 0
+    }
 }
 
 /// How many controllers are shown under the keyboard.
@@ -397,7 +435,7 @@ impl KeyboardState {
             self.keys[n as usize] = Some(KeyLit {
                 channel: 0,
                 vel: 100,
-                slot,
+                tabs: KeyLit::mask(slot),
                 source: None,
             });
         }
@@ -430,7 +468,7 @@ impl KeyboardState {
             .enumerate()
             .filter_map(|(note, lit)| {
                 let lit = lit.as_ref()?;
-                let same_tab = slot.is_none() || lit.slot.is_none() || lit.slot == slot;
+                let same_tab = slot.is_none() || lit.tabs == 0 || lit.plays(slot.unwrap());
                 let same_port = match source {
                     None => true,
                     // A note choz made itself has no port and belongs to
@@ -468,7 +506,21 @@ impl KeyboardState {
         }
     }
 
+    /// Feed one event, told **which tabs** are playing it.
+    ///
+    /// Not "which tab": a note can reach several — two tabs on one MIDI channel
+    /// in MULTI, a layered SoundFont — and the keyboard says so by splitting
+    /// the key between their colours.
+    pub fn feed_tabs(&mut self, event: &InputEvent, slots: u32) {
+        self.feed_inner(event, slots)
+    }
+
+    /// The same, for the one caller that has a single tab in hand.
     pub fn feed(&mut self, event: &InputEvent, slot: Option<usize>) {
+        self.feed_inner(event, KeyLit::mask(slot))
+    }
+
+    fn feed_inner(&mut self, event: &InputEvent, slots: u32) {
         match event {
             // **A note-on with velocity 0 is a note-off.** Plenty of hardware
             // says it that way, and taking it literally leaves keys lit
@@ -481,7 +533,7 @@ impl KeyboardState {
                 self.keys[note] = Some(KeyLit {
                     channel: m.channel,
                     vel: m.vel,
-                    slot,
+                    tabs: slots,
                     source: Some(m.source),
                 });
             }
@@ -548,11 +600,30 @@ fn is_black(note: u8) -> bool {
 /// Channels and slots are hues off one wheel, so sixteen of them stay apart
 /// without a hand-written palette; velocity is the theme's own text colour
 /// scaled, so it reads as "the same colour, harder".
+/// The colour of one note `depth` of the way down its key (0 at the top).
+///
+/// Only the instrument mode has more than one answer: a note played into two
+/// tabs wears both colours, split down the key, which is the whole of "which
+/// tabs is this note playing".
+fn key_colour_at(mode: KeyColor, key: &KeyLit, depth: f32) -> Color {
+    let mode = mode.effective();
+    if mode != KeyColor::Instrument {
+        return key_colour(mode, key);
+    }
+    let tabs = key.tab_list();
+    if tabs.is_empty() {
+        return DIM;
+    }
+    let i = ((depth.clamp(0.0, 0.999) * tabs.len() as f32) as usize).min(tabs.len() - 1);
+    tab_hue(tabs[i] as u32)
+}
+
 fn key_colour(mode: KeyColor, key: &KeyLit) -> Color {
-    match mode {
+    match mode.effective() {
         KeyColor::Channel => hue_of(key.channel as u32),
-        KeyColor::Instrument => match key.slot {
-            Some(s) => hue_of(s as u32 + 3),
+        // The first of them; [`key_colour_at`] is what draws all of them.
+        KeyColor::Instrument => match key.tab_list().first() {
+            Some(s) => tab_hue(*s as u32),
             // Not routed anywhere: it arrived, but nothing is playing it.
             None => DIM,
         },
@@ -578,10 +649,52 @@ fn key_colour(mode: KeyColor, key: &KeyLit) -> Color {
     }
 }
 
+/// Sixteen hues that **neighbours can be told apart in**.
+///
+/// Walking the wheel in even steps does not do that: two tabs side by side came
+/// out 22.5 degrees apart — a yellow-green and a green — and a rack of two read
+/// as one colour, which is the whole thing these are for. So the wheel is
+/// walked in jumps instead, every neighbouring pair at least ninety degrees
+/// away from the last.
+///
+/// Pure red is not among them: it means clipping, an error, a refusal
+/// everywhere else in this interface, and a tab is none of those.
+const HUES: [f32; 16] = [
+    30.0, 200.0, 90.0, 300.0, 150.0, 250.0, 60.0, 330.0, 180.0, 270.0, 105.0, 225.0, 45.0, 315.0,
+    165.0, 285.0,
+];
+
 fn hue_of(n: u32) -> Color {
-    // 16 steps around the wheel, offset so channel 1 is not pure red (which
-    // reads as an error everywhere else in the UI).
-    let (r, g, b) = crate::logo::hsv_to_rgb((n % 16) as f32 * 22.5 + 30.0, 0.75, 0.95);
+    let (r, g, b) = crate::logo::hsv_to_rgb(HUES[(n % 16) as usize], 0.75, 0.95);
+    Color::Rgb(r, g, b)
+}
+
+/// The hues the **tabs** get, primaries first.
+///
+/// A rack is read at a glance while both hands are busy, and the colours that
+/// survive that are the ones with names everybody already has: red, blue,
+/// yellow, then green. The rest of the wheel follows for a rack deep enough to
+/// need it, every pair far enough apart to be told from every other.
+///
+/// Red is the one exception to the rule the rest of this interface follows —
+/// it means a fault everywhere else. On a lit key it is not a fault, it is the
+/// first tab, and asked for by name.
+const TAB_HUES: [f32; 10] = [
+    0.0,   // red
+    225.0, // blue
+    55.0,  // yellow
+    120.0, // green
+    300.0, // magenta
+    185.0, // cyan
+    32.0,  // orange
+    265.0, // violet
+    90.0,  // chartreuse
+    335.0, // rose
+];
+
+/// The colour of rack tab `slot`, wherever a tab is drawn in its own colour.
+pub fn tab_hue(slot: u32) -> Color {
+    let (r, g, b) = crate::logo::hsv_to_rgb(TAB_HUES[(slot as usize) % TAB_HUES.len()], 0.75, 0.95);
     Color::Rgb(r, g, b)
 }
 
@@ -671,8 +784,8 @@ fn keyboard_lines(
     let key_w = auto_key_w(width);
     // One key plus its join. The window is measured in those, not in cells.
     let whites = visible_whites(state, width / (key_w + 1));
-    piano_lines(&whites, key_w, rows, &|n| {
-        state.lit(n).map(|k| key_colour(mode, &k))
+    piano_lines(&whites, key_w, rows, width, &|n, depth| {
+        state.lit(n).map(|k| key_colour_at(mode, &k, depth))
     })
 }
 
@@ -684,13 +797,16 @@ pub fn full_piano(
     rows: usize,
     paint: &dyn Fn(u8) -> Option<Color>,
 ) -> (Vec<Line<'static>>, KeyMap) {
+    // The split dialogue paints a whole key one colour; only KEYS has anything
+    // to say about *where* on the key.
+    let paint = |note: u8, _depth: f32| paint(note);
     let all = piano_whites();
     let key_w = (1..=KEY_W_MAX)
         .rev()
         .find(|kw| all.len() * (kw + 1) <= width)
         .unwrap_or(1);
     let fits = (width / (key_w + 1)).min(all.len());
-    piano_lines(&all[..fits], key_w, rows, paint)
+    piano_lines(&all[..fits], key_w, rows, width, &paint)
 }
 
 /// The piano itself: white keys `key_w` cells wide over `rows`, painted by
@@ -705,9 +821,13 @@ fn piano_lines(
     whites: &[u8],
     key_w: usize,
     rows: usize,
-    paint: &dyn Fn(u8) -> Option<Color>,
+    // The cells the keyboard may use. Whatever a whole number of smallest keys
+    // does not take is handed out one cell at a time, widest keys first, so the
+    // keyboard fills its panel instead of leaving a strip of it blank.
+    room: usize,
+    paint: &dyn Fn(u8, f32) -> Option<Color>,
 ) -> (Vec<Line<'static>>, KeyMap) {
-    let colour_of = |note: u8, unlit: Color| paint(note).unwrap_or(unlit);
+    let colour_of = |note: u8, depth: f32, unlit: Color| paint(note, depth).unwrap_or(unlit);
     // The black keys take the top half and the white bodies the rest — a
     // keyboard whose blacks are a single row on a panel ten rows tall is a
     // diagram, not an instrument. The octave labels are a nicety and go first
@@ -725,13 +845,13 @@ fn piano_lines(
     // background — so it costs a hairline rather than a whole cell of gap. A
     // full dark column there was the same width as a black key, which is why
     // the blacks could not be picked out of the row at all.
-    let join = |w: u8, in_band: bool| -> Span<'static> {
+    let join = |w: u8, in_band: bool, depth: f32| -> Span<'static> {
         let black = Some(w + 1).filter(|n| *n <= PIANO_HI && is_black(*n));
         if let (Some(n), true) = (black, in_band) {
             // The black key itself, and nothing else: one cell in its colour.
             return Span::styled(
                 "\u{2588}".to_string(),
-                Style::default().fg(colour_of(n, BLACK_KEY)),
+                Style::default().fg(colour_of(n, depth, BLACK_KEY)),
             );
         }
         // The seam between two white keys.
@@ -752,34 +872,55 @@ fn piano_lines(
             "\u{258F}".to_string(),
             Style::default()
                 .fg(KEY_EDGE)
-                .bg(colour_of(right, WHITE_KEY)),
+                .bg(colour_of(right, depth, WHITE_KEY)),
         )
     };
-    let key_row = |in_band: bool| -> Line<'static> {
+    // How wide each key is drawn, joins included. Every key is at least
+    // `key_w + 1`; the cells left over go to the first ones, which is what
+    // makes the row end where the panel does.
+    let n = whites.len().max(1);
+    let cap = n * (KEY_W_MAX + 1);
+    let total = room.min(cap).max(n * (key_w + 1));
+    let (base, extra) = (total / n, total % n);
+    let widths: Vec<usize> = (0..n).map(|i| base + usize::from(i < extra)).collect();
+    let mut cells: Vec<(u16, u16)> = Vec::with_capacity(n);
+    let mut at = 0u16;
+    for w in &widths {
+        cells.push((at, *w as u16));
+        at += *w as u16;
+    }
+
+    let key_row = |in_band: bool, depth: f32| -> Line<'static> {
         let mut spans = Vec::with_capacity(whites.len() * 2);
-        for &w in whites {
+        for (i, &w) in whites.iter().enumerate() {
+            // The body is the cell without its join.
+            let body = widths[i].saturating_sub(1).max(1);
             spans.push(Span::styled(
-                "\u{2588}".repeat(key_w),
-                Style::default().fg(colour_of(w, WHITE_KEY)),
+                "\u{2588}".repeat(body),
+                Style::default().fg(colour_of(w, depth, WHITE_KEY)),
             ));
-            spans.push(join(w, in_band));
+            spans.push(join(w, in_band, depth));
         }
         Line::from(spans)
     };
 
+    // How far down the key each row sits, so a key shared by two tabs can be
+    // painted half in each. The black keys' band is the top of the same key.
+    let drawn = (band + body).max(1);
+    let depth_at = |row: usize| (row as f32 + 0.5) / drawn as f32;
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows);
-    for _ in 0..band {
-        lines.push(key_row(true));
+    for row in 0..band {
+        lines.push(key_row(true, depth_at(row)));
     }
-    for _ in 0..body {
-        lines.push(key_row(false));
+    for row in 0..body {
+        lines.push(key_row(false, depth_at(band + row)));
     }
 
     let map = KeyMap {
         area: Rect::default(),
         whites: whites.to_vec(),
-        key_w,
         band,
+        cells,
     };
     if !labelled {
         return (lines, map);
@@ -822,13 +963,23 @@ pub struct KeyMap {
     pub area: Rect,
     /// The white keys on screen, left to right.
     pub whites: Vec<u8>,
-    /// Cells of white key body, before its join cell.
-    pub key_w: usize,
     /// How many rows at the top carry the black keys.
     pub band: usize,
+    /// `(offset from `area.x`, width including the join)` for each white key.
+    ///
+    /// Not a stride: fifty-two keys rarely divide a panel evenly, and rounding
+    /// every key down left up to fifty cells of empty panel beside a keyboard
+    /// drawn at the smallest size that fit. The remainder is handed out a cell
+    /// at a time instead, so the keyboard is as wide as the room it is in.
+    pub cells: Vec<(u16, u16)>,
 }
 
 impl KeyMap {
+    /// How wide the keyboard came out, joins included.
+    pub fn drawn(&self) -> u16 {
+        self.cells.last().map(|(x, w)| x + w).unwrap_or(0)
+    }
+
     /// The note under `(col, row)`, or `None` for a click off the keys.
     ///
     /// The black keys live on the join between two whites and only in the top
@@ -843,10 +994,16 @@ impl KeyMap {
         {
             return None;
         }
-        let stride = self.key_w + 1;
-        let x = (col - self.area.x) as usize;
-        let white = *self.whites.get(x / stride)?;
-        let on_join = x % stride == self.key_w;
+        let x = col - self.area.x;
+        let i = self
+            .cells
+            .iter()
+            .position(|(off, w)| x >= *off && x < off + w)?;
+        let white = *self.whites.get(i)?;
+        let (off, w) = self.cells[i];
+        // The join is the last cell of the key, which is where a black key
+        // sits — on the seam between two whites.
+        let on_join = x == off + w - 1;
         let in_band = ((row - self.area.y) as usize) < self.band;
         let black = Some(white + 1).filter(|n| *n <= PIANO_HI && is_black(*n));
         match (on_join, in_band, black) {
@@ -888,11 +1045,16 @@ fn draw_keys(
     // last line of `lines` when there is room for them, and clicking a label is
     // not clicking a key.
     let key_rows = lines.len().saturating_sub(usize::from(height - take >= 3));
-    map.area = Rect::new(area.x, area.y, area.width, key_rows as u16);
+    // Centred on whatever it could not fill: the keys stop growing at the
+    // widest they are ever drawn, and a keyboard against the left edge with a
+    // strip of panel beside it reads as a drawing that ran out of room.
+    let drawn = map.drawn();
+    let x0 = area.x + area.width.saturating_sub(drawn) / 2;
+    map.area = Rect::new(x0, area.y, drawn, key_rows as u16);
     lines.extend(extras.into_iter().take(take));
     f.render_widget(
         Paragraph::new(lines).style(super::theme::panel_style()),
-        area,
+        Rect::new(x0, area.y, drawn.max(1), area.height),
     );
     map
 }
@@ -906,14 +1068,27 @@ fn colour_legend(
     ports: &[String],
 ) -> Line<'static> {
     use crate::views::fx_chain_panel::truncate;
-    let mut spans = vec![Span::styled(
-        format!("  {} ", mode.label()),
-        Style::default().fg(DIM).add_modifier(Modifier::BOLD),
-    )];
+    // **What it is colouring by, and the key that changes it, together and
+    // first.** Both were there before — the mode dim at the start, `[C]` dim
+    // past a list of unknown length — and "why are two tabs the same colour"
+    // was answered off the end of a line nobody was reading. It is CHANNEL
+    // that does that, on a rig whose keyboards all send channel 1.
+    let mode = mode.effective();
+    let mut spans = vec![
+        Span::styled(
+            format!("  {} ", crate::i18n::t("COLOUR")),
+            Style::default().fg(DIM),
+        ),
+        Span::styled(
+            mode.label().to_string(),
+            Style::default().fg(HEADER).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" [C]  ", Style::default().fg(DIM)),
+    ];
     match mode {
         // One entry per rack tab, in the hue that tab's notes are drawn in —
-        // `key_colour` offsets the slot by three, so the legend has to as well
-        // or it would name the wrong colour with total confidence.
+        // through the same function, or the legend would name the wrong colour
+        // with total confidence.
         KeyColor::Instrument => {
             for (i, st) in strips
                 .iter()
@@ -922,7 +1097,7 @@ fn colour_legend(
             {
                 spans.push(Span::styled(
                     format!("{}:{} ", i + 1, truncate(&st.label, 8)),
-                    Style::default().fg(hue_of(i as u32 + 3)),
+                    Style::default().fg(tab_hue(i as u32)),
                 ));
             }
         }
@@ -975,7 +1150,7 @@ fn colour_legend(
                 let lit = KeyLit {
                     channel: 0,
                     vel: v,
-                    slot: None,
+                    tabs: 0,
                     source: None,
                 };
                 spans.push(Span::styled(
@@ -985,7 +1160,6 @@ fn colour_legend(
             }
         }
     }
-    spans.push(Span::styled(" [C]", Style::default().fg(DIM)));
     Line::from(spans)
 }
 
@@ -2264,19 +2438,29 @@ mod tests {
             text.contains("1:Synth0") && text.contains("2:Synth1"),
             "{text}"
         );
+        // The legend opens with what it is colouring by and the key that
+        // changes it; the entries follow.
+        assert!(
+            text.contains("INSTRUMENT") && text.contains("[C]"),
+            "{text}"
+        );
         assert_eq!(
-            line.spans[1].style.fg,
-            Some(hue_of(3)),
+            line.spans[3].style.fg,
+            Some(tab_hue(0)),
             "tab 1 is drawn in the colour its keys are"
         );
 
-        // By channel it lists the ones actually arriving, not sixteen.
+        // A settings file that still names the retired channel mode reads as
+        // the tab one — the same legend, not a list of channels.
         let text: String = colour_legend(KeyColor::Channel, &k, &strips(2), &[])
             .spans
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(text.contains("CH3") && !text.contains("CH1"), "{text}");
+        assert!(
+            text.contains("INSTRUMENT") && !text.contains("CH"),
+            "{text}"
+        );
 
         // By input it lists every keyboard that is connected, playing or not —
         // the legend is also the answer to "is that thing plugged in".
@@ -2288,7 +2472,7 @@ mod tests {
             "{text}"
         );
         assert_eq!(
-            line.spans[1].style.fg,
+            line.spans[3].style.fg,
             Some(hue_of(9)),
             "the first port is drawn in the colour its notes are"
         );
@@ -2298,7 +2482,7 @@ mod tests {
         let lit = KeyLit {
             channel: 0,
             vel: 100,
-            slot: Some(0),
+            tabs: KeyLit::mask(Some(0)),
             source: Some(InputSource::Midi(0)),
         };
         assert_ne!(
@@ -2311,13 +2495,85 @@ mod tests {
         let own = KeyLit {
             channel: 0,
             vel: 100,
-            slot: Some(0),
+            tabs: KeyLit::mask(Some(0)),
             source: None,
         };
         assert_eq!(key_colour(KeyColor::Source, &own), DIM);
     }
 
-    /// An unknown port index must not panic the draw path.
+    /// The colours these panels hand out have one job: telling two things
+    /// apart. Two tabs side by side used to come out a yellow-green and a green
+    /// — the same colour, to anyone looking at a rack rather than a colour
+    /// wheel — because the wheel was walked in even 22.5-degree steps.
+    #[test]
+    fn neighbouring_hues_are_told_apart_at_a_glance() {
+        let gap = |a: f32, b: f32| {
+            let d = (a - b).abs() % 360.0;
+            d.min(360.0 - d)
+        };
+        for (i, h) in HUES.iter().enumerate() {
+            let next = HUES[(i + 1) % HUES.len()];
+            assert!(
+                gap(*h, next) >= 60.0,
+                "hue {i} ({h}) and its neighbour ({next}) are {} apart",
+                gap(*h, next)
+            );
+            // Red is the colour of a fault everywhere else in this interface.
+            assert!(gap(*h, 0.0) >= 20.0, "hue {i} is alarm red");
+        }
+
+        // And what that is for: the first two tabs are not the same colour.
+        let tab = tab_hue;
+        let (Color::Rgb(r0, g0, b0), Color::Rgb(r1, g1, b1)) = (tab(0), tab(1)) else {
+            panic!("hues are rgb");
+        };
+        let far = (r0 as i32 - r1 as i32).abs()
+            + (g0 as i32 - g1 as i32).abs()
+            + (b0 as i32 - b1 as i32).abs();
+        assert!(far > 200, "tab 1 and tab 2 look alike: {far}");
+    }
+
+    /// The tabs get the colours anyone can name without a legend: red, blue,
+    /// yellow, then green — and every pair of them far enough apart to be told
+    /// from every other one on the panel.
+    #[test]
+    fn the_first_tabs_wear_the_primaries() {
+        let gap = |a: f32, b: f32| {
+            let d = (a - b).abs() % 360.0;
+            d.min(360.0 - d)
+        };
+        // Red, blue, yellow: the primaries, in that order.
+        assert!(gap(TAB_HUES[0], 0.0) < 10.0, "tab 1 is red");
+        assert!(gap(TAB_HUES[1], 225.0) < 20.0, "tab 2 is blue");
+        assert!(gap(TAB_HUES[2], 55.0) < 20.0, "tab 3 is yellow");
+        assert!(gap(TAB_HUES[3], 120.0) < 20.0, "tab 4 is green");
+
+        // No two of them look alike, whichever two are on screen together.
+        for (i, a) in TAB_HUES.iter().enumerate() {
+            for (j, b) in TAB_HUES.iter().enumerate().skip(i + 1) {
+                assert!(
+                    gap(*a, *b) >= 20.0,
+                    "tabs {i} and {j} are {} apart",
+                    gap(*a, *b)
+                );
+            }
+        }
+
+        // A rack deeper than the list wraps rather than running out.
+        assert_eq!(tab_hue(0), tab_hue(TAB_HUES.len() as u32));
+
+        // And the keys are drawn in exactly these: what the legend names is
+        // what a key wears.
+        let mut k = KeyboardState::default();
+        k.feed(&note_on(60, 0, 100), Some(1));
+        assert_eq!(
+            key_colour(KeyColor::Instrument, &k.lit(60).unwrap()),
+            tab_hue(1),
+            "tab 2's key is tab 2's colour"
+        );
+    }
+
+    /// An unknown port index must not panic the draw path.    /// An unknown port index must not panic the draw path.    /// An unknown port index must not panic the draw path.
     #[test]
     fn missing_port_names_degrade_to_an_index() {
         let label = source_label(InputSource::Midi(7), &[]);
@@ -2442,18 +2698,43 @@ mod tests {
         );
     }
 
-    /// Two channels have to be told apart at a glance — that is what the mode
-    /// is for. Velocity mode instead separates two strengths on one channel.
+    /// Each mode has to separate what it claims to: which tab is playing a
+    /// note, and how hard it was played.
     #[test]
     fn the_colour_modes_separate_what_they_claim_to() {
         let (mut a, mut b) = (KeyboardState::default(), KeyboardState::default());
         a.feed(&note_on(60, 0, 100), Some(0));
         b.feed(&note_on(60, 5, 100), Some(1));
-        let (ca, cb) = (
+        // **Two tabs on one channel are still two colours.** Both keyboards on
+        // a rig send channel 1, so colouring by channel painted the rack one
+        // colour; the retired mode reads as the tab one for exactly that.
+        assert_ne!(
             key_colour(KeyColor::Channel, &a.lit(60).unwrap()),
             key_colour(KeyColor::Channel, &b.lit(60).unwrap()),
+            "the retired mode reads as the tab one"
         );
-        assert_ne!(ca, cb, "two channels, two colours");
+        let same_channel = {
+            let (mut x, mut y) = (KeyboardState::default(), KeyboardState::default());
+            x.feed(&note_on(60, 0, 100), Some(0));
+            y.feed(&note_on(60, 0, 100), Some(1));
+            (
+                key_colour(KeyColor::Instrument, &x.lit(60).unwrap()),
+                key_colour(KeyColor::Instrument, &y.lit(60).unwrap()),
+            )
+        };
+        assert_ne!(same_channel.0, same_channel.1, "one channel, two tabs");
+
+        // And the cycle never lands on the retired mode again.
+        let mut mode = KeyColor::default();
+        for _ in 0..8 {
+            assert_ne!(mode, KeyColor::Channel, "the cycle offers it again");
+            mode = mode.next();
+        }
+        assert_eq!(
+            KeyColor::default(),
+            KeyColor::Instrument,
+            "and it starts by tab"
+        );
 
         let (mut soft, mut hard) = (KeyboardState::default(), KeyboardState::default());
         soft.feed(&note_on(60, 0, 20), Some(0));
@@ -2476,16 +2757,16 @@ mod tests {
     #[test]
     fn the_drawn_keyboard_changes_when_a_key_goes_down() {
         let mut k = KeyboardState::default();
-        let before = cells_coloured(&k, KeyColor::Channel, 60, 5);
+        let before = cells_coloured(&k, KeyColor::Instrument, 60, 5);
         k.feed(&note_on(60, 0, 100), Some(0));
-        let after = cells_coloured(&k, KeyColor::Channel, 60, 5);
+        let after = cells_coloured(&k, KeyColor::Instrument, 60, 5);
         assert_ne!(before, after, "middle C lights up");
 
         // And a black key lights the row above the white bodies.
         let mut sharp = KeyboardState::default();
         sharp.feed(&note_on(61, 0, 100), Some(0));
         assert_ne!(
-            cells_coloured(&sharp, KeyColor::Channel, 60, 5),
+            cells_coloured(&sharp, KeyColor::Instrument, 60, 5),
             before,
             "C# lights too"
         );
@@ -2511,7 +2792,67 @@ mod tests {
         }
     }
 
-    /// The black keys must land in the piano's 2-and-3 groups, or the row is a
+    /// The keyboard is drawn to the panel it is given, at every size: the keys
+    /// as wide as the room allows, the window as many keys as fit, and never a
+    /// row that runs past the edge or a strip of panel left blank beside it.
+    #[test]
+    fn the_piano_fills_whatever_panel_it_is_given() {
+        let mut k = KeyboardState::default();
+        k.feed(&note_on(60, 0, 100), Some(0));
+        for w in (16usize..=200).step_by(7) {
+            for rows in 2usize..=10 {
+                let (lines, map) = keyboard_lines(&k, KeyColor::Instrument, w, rows);
+                assert!(!lines.is_empty(), "nothing drawn at {w}x{rows}");
+                let drawn: usize = lines[0]
+                    .spans
+                    .iter()
+                    .map(|s| s.content.chars().count())
+                    .sum();
+                assert!(
+                    drawn <= w,
+                    "the keys run past the panel at {w}x{rows}: {drawn}"
+                );
+                // A key is its body plus its join, so at most one key's worth
+                // can be left over — anything more is panel going to waste.
+                // Filled, not merely fitted: the cells a whole number of
+                // smallest keys leaves over are handed out one at a time, so
+                // the row ends where the panel does — unless the keys have hit
+                // the widest they are ever drawn.
+                let widest = map.whites.len() * (KEY_W_MAX + 1);
+                assert!(
+                    drawn == w.min(widest),
+                    "{drawn} of {w} cells used at {w}x{rows}"
+                );
+                // The whole piano once it fits, a window onto it before that.
+                let fits = 52 * 2 <= w;
+                assert_eq!(
+                    map.whites.len() == 52,
+                    fits,
+                    "at {w} wide the window should {}",
+                    if fits {
+                        "be the whole piano"
+                    } else {
+                        "be a window"
+                    }
+                );
+                // The window follows what is sounding: middle C is held.
+                assert!(map.whites.contains(&60), "C4 fell off the window at {w}");
+                // Every row the caller asked for, and the same width in each.
+                assert!(lines.len() <= rows.max(2));
+                assert!(
+                    lines.iter().all(|l| l
+                        .spans
+                        .iter()
+                        .map(|s| s.content.chars().count())
+                        .sum::<usize>()
+                        <= w),
+                    "a row overflows at {w}x{rows}"
+                );
+            }
+        }
+    }
+
+    /// The black keys must land in the piano's 2-and-3 groups    /// The black keys must land in the piano's 2-and-3 groups, or the row is a
     /// dotted line and not a keyboard. They live on the border between two
     /// white keys — which is where they really sit — so the grouping is read
     /// off the borders: black, black, plain, black, black, black, plain.
