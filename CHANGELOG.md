@@ -12,12 +12,211 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **642 tests** con harness + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **670 tests** con harness + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio.
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
 - `cargo test --workspace` necesita `--no-fail-fast`: uno de los binarios con
   `harness = false` no reconoce los argumentos que cargo le pasa y aborta la
   corrida. Por crate (`-p choz-engine -p choz-ui`) va entero.
+
+## [1.3.3] — 2026-08-23
+
+Una sesión de pedidos sobre plugins ajenos, y una moraleja distinta a la de la
+1.3.2: **casi todo lo que "no funcionaba" era cierto, y el motivo estaba en un
+archivo que nadie había abierto**. Los presets de ZynAddSubFX estaban en otro
+bundle, su ventana la lanza otro programa, los bancos de Yoshimi salen por una
+extensión que choz no implementaba, y el color de las teclas lo decidía una
+línea de `ui.json` escrita hace semanas.
+
+### LV2: los presets que estaban en otro bundle
+
+`presets::scan` leía sólo el `manifest.ttl` del bundle del plugin. ZynAddSubFX
+publica sus 2000 instrumentos en **otro bundle al lado** —
+`ZynAddSubFX.lv2presets`, con sus `pset:Bank` — y por eso su lista salía vacía.
+Ahora se leen también los bundles hermanos cuyo nombre empieza igual.
+
+Dos cosas más que hacían falta para que sirvieran:
+
+- Sus presets son `state:state`, no valores de puerto. Se aplican por la
+  extensión de estado (`state::restore_state`), que es lo que ya usaba el
+  guardado de proyecto.
+- Los documentos con el contenido son **35 MB de Turtle** repartidos en 40
+  archivos. Se parsean al aplicar un preset, no al cargar el plugin, con caché
+  de una entrada — que es lo que hace falta para caminar un banco con las
+  flechas.
+
+### Yoshimi: 4466 instrumentos por la puerta de al lado
+
+Su bundle declara **un** puerto de control (`Freewheel`) y ningún preset: no hay
+nada que listar en Turtle. Lo que sí declara es
+`kxstudio programs#Interface`, que es por donde todo host muestra sus bancos.
+Implementado (`programs.rs`): 4466 programas en **39 bancos con nombre** — el
+plugin devuelve `"Arpeggios -> Arpeggio1"` y el banco se parte del nombre para
+que uno sea la barra lateral y el otro la fila.
+
+### Las dos ventanas que Carla mostraba y choz no
+
+`discovery` buscaba únicamente `ui:X11UI`. Ninguno de los dos lo tiene:
+
+- **Yoshimi** trae un widget externo de kxstudio con `ui:showInterface` y exige
+  `instance-access`. Ahora se acepta esa clase de UI (abre **su propia**
+  ventana: el host sólo llama `show()` y bombea `idle()`), y `instance-access`
+  se le pasa **sólo** a las UIs con ventana propia — para una UI empotrada la
+  regla anterior sigue en pie. Verificado: la ventana aparece y se cierra
+  limpio.
+- **ZynAddSubFX** trae una UI DPF que no dibuja nada: hace
+  `execvp("zynaddsubfx-ext-gui")` y le pasa la dirección del servidor OSC que el
+  DSP abre. DPF le entrega esa dirección a la UI por un puerto atom que choz no
+  implementa, así que nunca arrancaba nada. La dirección **no** está en el blob
+  de estado (comprobado: 20489 bytes, sin `osc.udp` ni `OSC_URL`) ni en ninguna
+  interfaz LV2 — se elige al instanciar y se imprime por stdout. Se encuentra
+  desde este lado: diferencia de los sockets UDP del propio proceso
+  (`/proc/self/fd` cruzado con `/proc/net/udp`) antes y después de cargar, y se
+  confirma preguntándole algo que sólo un servidor rtosc contesta. Con eso,
+  `zynaddsubfx-ext-gui osc.udp://localhost:PUERTO/` abre la ventana real
+  conectada a esa instancia.
+
+### Los mandos de ZynAddSubFX, que eran "Slot 1..16"
+
+Sus dieciséis puertos de control se llaman así de verdad; todo lo que da forma
+al sonido vive detrás del servidor OSC, direccionado por path. Verificado en
+vivo: leer es mandar el path sin argumentos, escribir es mandarlo con el valor,
+y `/path-search` devuelve la metadata — `:shortname :min :max :scale :default
+:enumerated :map N =Nombre`, que es exactamente la forma que ya tienen los
+mandos de choz.
+
+Ahora la pestaña muestra **una lista corta y elegida** — PART, ADSYNTH, AMP ENV,
+FILTER, OSC — con nombres, rangos y enumerados por nombre (WAVE da
+sine/triangle/pulse/saw…). Son parámetros de choz corrientes, así que heredan
+MIDI learn, automatización y el guardado del proyecto. El camino de escritura
+respeta el hilo de audio: `set_param` corre en el callback y sólo empuja a un
+ring `rtrb`; el socket es asunto de un hilo aparte.
+
+Y **los armónicos del oscilador**, que en su editor son dos filas de sliders:
+
+- Vista propia (`[HARM]` o `h`): las 128 magnitudes y las 128 fases como barras
+  verticales desde el centro — 64 es silencio, hacia abajo es fase invertida,
+  igual que su ventana.
+- Y los 32 primeros de cada fila **dentro de la caja INSTRUMENT**, dibujados con
+  el mismo banco de barras que el ecualizador gráfico.
+
+Un detalle que costó encontrar y que estaba en la metadata: los paths buenos son
+`magnitude<n>` y `phase<n>`. El nombre interno `Phmag<n>` acepta escrituras y
+**no contesta lecturas** — una vista construida sobre ése habría dibujado una
+fila vacía para siempre.
+
+### amsynth: 3482 patches en 28 bancos
+
+Su VST2 responde 3712 programas y `effGetProgramNameIndexed` no escribe ningún
+nombre, así que la lista era "Program 1..3712". Sus sonidos están en
+`/usr/share/amsynth/banks/*.amSynth.bank`: texto plano, 128 presets por archivo.
+Y su chunk de estado **es** ese mismo texto con otra primera línea, así que
+cargar uno es cortar el bloque y ponerle el encabezado. `guess_bank_dir` ya
+encontraba la carpeta sola.
+
+### El metrónomo no estaba sincronizado con nada
+
+Contaba con un contador privado que nunca se reseteaba: el tempo seguía al
+transport pero la **fase** no, así que el downbeat caía en cualquier lado
+respecto de la música — y con reloj MIDI externo, cuyo `Start` hace `rewind()`,
+quedaba directamente desfasado. Ahora, con el transport rodando, cuenta su
+posición; parado vuelve a su propio contador, porque un metrónomo tiene que
+sonar sin transporte.
+
+El arpegiador perdió su reloj propio (`sync` y `bpm` fuera): cuenta el transport
+siempre, así que no puede irse del metrónomo. Su knob de BPM y su tap mueven el
+transport, que es el único reloj.
+
+### La caja INSTRUMENT
+
+- **Un parámetro con nombres es una lista.** El modal de posiciones existía para
+  los FX y para el arpegiador; la caja del instrumento estaba excluida a
+  propósito, así que el TYPE de un filtro sólo se podía pasear con la rueda.
+  Ahora abre con Enter o con el segundo clic, en cualquier formato que reporte
+  los nombres de los pasos (LV2 enumerado, CLAP, VST3, y la tabla OSC).
+  VST2 y LADSPA/DSSI no los exponen en su API: ahí no hay lista que abrir sin
+  inventarla.
+- **Paginación por segmentos.** La caja dibuja un segmento a la vez: una corrida
+  de ocho o más sliders es un banco propio, y lo que hay entre dos corridas es
+  otro. Antes la grilla dibujaba también los armónicos —aparecían como celdas
+  además de estar en el banco— y las flechas saltaban por encima de la página
+  que tenía los últimos mandos.
+- **El contador de filas mentía**: decía `(2/3 rows)` con las filas 1 y 2 en
+  pantalla, porque contaba sólo la última. Ahora dice el rango, `(1–2/3 rows)`.
+- **Readback**: los mandos muestran lo que el plugin tiene, no lo que choz
+  mandó. Un preset cargado dentro de ZynAddSubFX mueve controles que el host
+  nunca tocó; se preguntan cada 500 ms y se leen del caché. El mando que la mano
+  está moviendo se respeta 400 ms, o la respuesta a la pregunta anterior lo
+  arrastraba hacia atrás.
+
+### KEYS: el color era por canal
+
+Reportado tres veces como "las dos pestañas salen amarillas", y las tres causas
+eran distintas:
+
+1. Una nota que llega a **varias** pestañas se pintaba con el color de la
+   primera (`targets.first()`). Ahora `KeyLit` guarda todas en una máscara y la
+   tecla se parte entre sus colores.
+2. Los tonos vecinos estaban a 22,5° — la pestaña 1 salía verde amarillento
+   (129,242,61) y la 2 verde (61,242,61): dos colores distintos en el papel y el
+   mismo en pantalla.
+3. Y la de verdad, que apareció al abrir `~/.local/state/choz/ui.json`:
+   `key_colour = "Channel"`. Coloreaba por canal MIDI y los dos teclados mandan
+   canal 1.
+
+El modo por canal quedó **retirado**: contestaba una pregunta que nadie hace y
+pintaba el rack de un color. Sigue parseando —el archivo entero es un solo
+`from_str`, y un valor que no parsea no pierde una preferencia sino el tema, las
+rutas y el fondo con ella— pero se lee como el modo por pestaña y el ciclo de
+`C` ya no lo ofrece. Las pestañas usan ahora los colores que cualquiera nombra
+sin leer la leyenda: **rojo, azul, amarillo, verde**, y después el resto de la
+rueda. Y la leyenda abre diciendo por qué colorea y qué tecla lo cambia, que es
+lo que hubiera contestado esto sin tres vueltas.
+
+### El piano de KEYS no llenaba su panel
+
+Las 52 teclas se dibujaban todas del mismo ancho, así que a 155 columnas el
+piano ocupaba 104 y dejaba **51 columnas vacías** al lado. Ahora el sobrante se
+reparte de a una celda —unas teclas quedan un carácter más anchas— y la fila
+termina donde termina el panel; cuando ni así llena, porque las teclas topan en
+su ancho máximo, se centra. El clic sigue cayendo donde debe: `KeyMap` guarda
+`(offset, ancho)` por tecla en vez de un paso uniforme.
+
+### El picker de bancos
+
+- La barra lateral no aparecía la primera vez que se abría. El modal se
+  construía una vez y no se enteraba si la lista del tab cambiaba después —y
+  llega después: la carpeta de patches se busca por nombre y ruta del plugin,
+  que salen del escaneo en segundo plano. Ahora el picker se reconstruye cuando
+  la lista cambia, y `apply_plugins` vuelve a intentar la adopción para todas
+  las pestañas.
+- Y el que abren los botones SOUNDS se había quedado con los chips viejos
+  mientras el otro ya tenía barra lateral. Son el mismo picker: uno tiene una
+  fila más adelante.
+
+### Previsualización de imágenes en Settings → Theme
+
+Elegir un fondo por el nombre del archivo es elegirlo a ciegas. El picker
+muestra la imagen bajo el cursor con medias celdas (`▀` con dos filas de píxeles
+por celda), con su **propio** caché: el del papel tapiz guarda una sola imagen
+—la que está en pantalla— y previsualizar una carpeta a través de él la habría
+desalojado en cada frame.
+
+### Medido y no reproducido
+
+Dos síntomas de amsynth se midieron contra el plugin real y no aparecieron: una
+nota sostenida da pico 0,569 sin una sola muestra por encima de 1,0 (no clipea),
+y ni restaurar un patch ni cambiar de programa produce sonido alguno (pico
+0,0000). Si vuelven, la cadena del rack y el MIDI que entra son dónde mirar.
+
+### Un test que estaba rojo desde antes
+
+`installed_vst2_plugins_scan_host_and_expose_params` fallaba en HEAD, sin
+relación con esta sesión: exigía que el chunk de un plugin volviera con el mismo
+tamaño, y amsynth escribe un `<name>` vacío que tras un viaje de ida y vuelta
+queda en la misma línea que el parámetro siguiente — 1176 bytes entran, 1200
+salen, el mismo patch. Lo que un proyecto necesita es que sea estable desde ahí,
+y eso es lo que ahora comprueba: es punto fijo desde la segunda pasada.
 
 ## [1.3.2] — 2026-08-22
 
