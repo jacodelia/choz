@@ -88,6 +88,17 @@ pub trait FxProcessor: Send {
         None
     }
 
+    /// Controls the plugin keeps **outside** its parameters, addressed by name.
+    ///
+    /// ZynAddSubFX is the reason this exists: its ports are sixteen numbered
+    /// slots, and everything that shapes the sound — including the 128
+    /// harmonics of an oscillator — lives behind an OSC server addressed by
+    /// path. A view that edits those needs to reach them one by one, which no
+    /// flat parameter list can express.
+    fn paths(&self) -> Option<PathsHandle> {
+        None
+    }
+
     /// Live counters when this processor is a plugin running in its own
     /// process. Taken once, next to [`FxProcessor::editor`]. Default `None`:
     /// everything else runs in choz's own process.
@@ -289,6 +300,17 @@ pub trait AudioSource: Send {
         None
     }
 
+    /// Controls the plugin keeps **outside** its parameters, addressed by name.
+    ///
+    /// ZynAddSubFX is the reason this exists: its ports are sixteen numbered
+    /// slots, and everything that shapes the sound — including the 128
+    /// harmonics of an oscillator — lives behind an OSC server addressed by
+    /// path. A view that edits those needs to reach them one by one, which no
+    /// flat parameter list can express.
+    fn paths(&self) -> Option<PathsHandle> {
+        None
+    }
+
     /// Live counters when this source is a plugin running in its own process.
     /// Taken once, next to [`AudioSource::editor`]. Default `None`: everything
     /// else runs in choz's own process.
@@ -337,6 +359,21 @@ pub trait PluginEditor: Send + Sync {
     /// Pump the plugin's idle callback (~30 ms while the window is open).
     /// VST2 GUIs freeze without it.
     fn idle(&self) {}
+
+    /// Whether the plugin puts up a **window of its own** rather than embedding
+    /// into the one the host offers (LV2's `ui:showInterface`: Yoshimi,
+    /// ZynAddSubFX). The host must then create no window at all — one it made
+    /// would sit there empty beside the plugin's.
+    fn owns_window(&self) -> bool {
+        false
+    }
+
+    /// False once such a window has been closed. Only meaningful for an editor
+    /// that owns its window: there is no host window for the window manager to
+    /// report the close on, so the plugin is the one that says so.
+    fn is_open(&self) -> bool {
+        true
+    }
 
     /// Tear the editor down. Safe to call more than once.
     fn close(&self);
@@ -428,6 +465,57 @@ pub trait PluginPresets: Send + Sync {
 }
 
 pub type PresetsHandle = std::sync::Arc<dyn PluginPresets>;
+
+/// A plugin's own controls, addressed by path rather than by index.
+///
+/// Reads are **asked for and collected later**: the plugin answers when it
+/// answers, and a UI that blocked on each of 128 harmonics would stutter for a
+/// second every time it drew. [`Self::ask`] sends the question, [`Self::value`]
+/// returns the last answer there was, and a fresh view simply has none yet.
+/// The harmonics of a plugin's oscillator, as a set of paths.
+///
+/// A synth that draws its sound as a row of bars — ZynAddSubFX is the one here
+/// — keeps one control per harmonic. Which paths those are is the plugin's
+/// business; what the view needs is how many there are and what a bar means.
+pub struct HarmonicSet {
+    /// One path per harmonic, in order: the first is the fundamental.
+    pub magnitude: Vec<String>,
+    /// The phase of each, when the plugin has one per harmonic. Empty when it
+    /// does not, and then the view shows magnitudes alone.
+    pub phase: Vec<String>,
+    pub min: f32,
+    pub max: f32,
+    /// The value that means *silent*. Zyn's bars sit at 64 of 0..127 and grow
+    /// either way from there, which is why this is not simply `min`.
+    pub zero: f32,
+}
+
+pub trait PluginPaths: Send + Sync {
+    /// Move the control at `path`.
+    fn set(&self, path: &str, value: f32);
+    /// Ask what it holds. The answer turns up in [`Self::value`].
+    fn ask(&self, path: &str);
+    /// The last value the plugin reported, if it has reported one.
+    fn value(&self, path: &str) -> Option<f32>;
+
+    /// The harmonics of the sound, when the plugin has a set of them to draw.
+    fn harmonics(&self) -> Option<HarmonicSet> {
+        None
+    }
+
+    /// The path behind each of the plugin's **parameters**, in the order they
+    /// are reported. Empty for a plugin whose parameters are not paths.
+    ///
+    /// This is what lets the knobs show what the plugin is actually holding: a
+    /// patch loaded inside it moves controls the host never touched, and a
+    /// panel that only ever shows what *it* last sent is a panel that lies
+    /// after the first preset.
+    fn param_paths(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+pub type PathsHandle = std::sync::Arc<dyn PluginPaths>;
 
 // ─── Hosted plugins ─────────────────────────────────────────────────────────
 

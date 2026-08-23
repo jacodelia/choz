@@ -231,6 +231,15 @@ pub const LV2_UI_X11UI_URI: &str = "http://lv2plug.in/ns/extensions/ui#X11UI";
 pub const LV2_UI_PARENT_URI: &str = "http://lv2plug.in/ns/extensions/ui#parent";
 pub const LV2_UI_IDLE_INTERFACE_URI: &str = "http://lv2plug.in/ns/extensions/ui#idleInterface";
 
+/// `ui:showInterface`: the UI opens and closes a window **of its own**, so the
+/// host neither creates one nor embeds anything. Carla is what plays Yoshimi's
+/// and ZynAddSubFX's editors this way, and it is why they have windows there and
+/// had none here.
+pub const LV2_UI_SHOW_INTERFACE_URI: &str = "http://lv2plug.in/ns/extensions/ui#showInterface";
+/// `instance-access`: the live plugin handle, which a UI that *is* the plugin's
+/// own window (Yoshimi's FLTK one) requires to show anything at all.
+pub const LV2_INSTANCE_ACCESS_URI: &str = "http://lv2plug.in/ns/ext/instance-access";
+
 /// The symbol every UI binary exports: `const LV2UI_Descriptor* lv2ui_descriptor(uint32_t)`.
 pub const LV2UI_DESCRIPTOR_SYM: &[u8] = b"lv2ui_descriptor";
 
@@ -285,6 +294,14 @@ pub type Lv2UiDescriptorFn = unsafe extern "C" fn(index: u32) -> *const LV2UI_De
 #[repr(C)]
 pub struct LV2UI_Idle_Interface {
     pub idle: Option<unsafe extern "C" fn(ui: LV2UI_Handle) -> i32>,
+}
+
+/// What `extension_data(ui:showInterface)` returns. Both return non-zero on
+/// failure; `show` is what puts the plugin's own window on the screen.
+#[repr(C)]
+pub struct LV2UI_Show_Interface {
+    pub show: Option<unsafe extern "C" fn(ui: LV2UI_Handle) -> i32>,
+    pub hide: Option<unsafe extern "C" fn(ui: LV2UI_Handle) -> i32>,
 }
 
 // ─── State (ext/state) ──────────────────────────────────────────────────────

@@ -17,8 +17,12 @@
 
 pub mod discovery;
 pub mod editor;
+pub mod external_gui;
 pub mod lv2_abi;
+pub mod osc;
+pub mod osc_params;
 pub mod presets;
+pub mod programs;
 pub mod state;
 pub mod ttl;
 
@@ -442,6 +446,9 @@ struct Lv2Instance {
     /// The instance, for saving and restoring its own state. Emptied in `Drop`
     /// alongside the controls.
     state: state::SharedState,
+    /// The port of the OSC server this plugin opened, when it is one whose
+    /// editor is a separate program that connects to it.
+    osc_port: Option<u16>,
 }
 
 // SAFETY: raw pointers into the loaded library are only touched while the
@@ -830,6 +837,7 @@ fn build_instance(
 
     let lib_for_state = Arc::clone(&lib);
     let mut inst = Lv2Instance {
+        osc_port: None,
         handle,
         descriptor,
         _lib: lib,
@@ -968,6 +976,12 @@ fn info_for(bundle_dir: &Path, uri: &str) -> Result<Lv2PluginInfo> {
 /// Automatable parameters = the plugin's control input ports, in port order.
 /// Read straight from the TTL, so this never loads the binary.
 pub fn read_params(bundle_dir: &Path, uri: &str) -> Vec<PluginParam> {
+    // The same list a live instance shows: a plugin whose controls are behind
+    // its OSC server has nothing worth drawing among its ports, and the panel
+    // must not change shape the moment the plugin loads.
+    if let Some(table) = osc_params::table_for(uri) {
+        return osc_params::params(table);
+    }
     info_for(bundle_dir, uri)
         .map(|i| params_of(&i))
         .unwrap_or_default()
@@ -1031,7 +1045,19 @@ fn build(bundle_dir: &Path, uri: &str, sample_rate: u32, max_block: u32) -> Resu
     // One URID map per instance keeps each source self-contained, so it can be
     // moved onto the audio thread on its own.
     let urids = Arc::new(Mutex::new(UridStore::new()));
-    build_instance(info, lib, urids, sample_rate, max_block)
+    // Only for the one family whose editor needs it: the OSC server it opens
+    // while instantiating is found by comparing this process's UDP sockets
+    // before and after. Nothing else pays for the two `/proc` reads.
+    let wants_osc = external_gui::program_for(uri).is_some();
+    let before = wants_osc.then(osc::udp_ports).unwrap_or_default();
+    let mut inst = build_instance(info, lib, urids, sample_rate, max_block)?;
+    if wants_osc {
+        inst.osc_port = osc::server_since(&before);
+        if inst.osc_port.is_none() {
+            eprintln!("choz: LV2 {uri} opened no OSC server; its editor cannot be shown");
+        }
+    }
+    Ok(inst)
 }
 
 impl Lv2Instance {
@@ -1124,12 +1150,12 @@ impl choz_ports::ParamTouch for Lv2Touch {
 }
 
 fn touch_of(
-    editor: &Option<Arc<editor::Lv2Editor>>,
+    touched: &Option<TouchCell>,
     params: &[PluginParam],
 ) -> Option<choz_ports::TouchHandle> {
-    let ed = editor.as_ref()?;
+    let raw = touched.as_ref()?;
     Some(Arc::new(Lv2Touch {
-        raw: ed.touched(),
+        raw: Arc::clone(raw),
         params: params.to_vec(),
     }) as choz_ports::TouchHandle)
 }
@@ -1139,13 +1165,40 @@ pub struct Lv2Instrument {
     params: Vec<PluginParam>,
     /// The bundle's `pset:Preset`s, resolved to port indices at load time.
     presets: Vec<presets::Lv2Preset>,
+    /// What the plugin's own program list says, when it has one. Read once at
+    /// load: walking Yoshimi's 4466 of them is not a per-frame question.
+    programs: Vec<choz_ports::PresetEntry>,
     /// Built once at load: `editor()` is called from the UI thread and must not
     /// dlopen anything, and building it here is also what makes the GUI button
     /// appear only for plugins that really have a window.
-    editor: Option<Arc<editor::Lv2Editor>>,
+    editor: Option<choz_ports::EditorHandle>,
+    /// The cell the plugin's own window writes the control it moved into.
+    touched: Option<TouchCell>,
+    /// Set for a plugin whose real controls are behind its OSC server: knob
+    /// moves go out through here instead of into a control port.
+    osc_moves: Option<rtrb::Producer<osc_params::Move>>,
+    /// The same server, for the views that address it by path.
+    osc_client: Option<Arc<osc::OscClient>>,
+    /// Stops the thread on the other end of that ring when the tab goes away.
+    osc_alive: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl Drop for Lv2Instrument {
+    fn drop(&mut self) {
+        if let Some(alive) = self.osc_alive.take() {
+            alive.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 impl Lv2Instrument {
+    /// The OSC server this plugin opened, when it has one. That is the address
+    /// its own editor connects to, and the one door to the parameters a plugin
+    /// like ZynAddSubFX keeps out of its ports.
+    pub fn osc_port(&self) -> Option<u16> {
+        self.inst.osc_port
+    }
+
     /// Load an LV2 instrument (a plugin with a MIDI input). `None` on any
     /// failure — a broken plugin must never take the app down.
     pub fn build(bundle_dir: &Path, uri: &str, sample_rate: u32, max_block: u32) -> Option<Self> {
@@ -1160,38 +1213,93 @@ impl Lv2Instrument {
             eprintln!("choz: LV2 {uri} has no MIDI input; not an instrument");
             return None;
         }
-        let params = params_of(&inst.info);
+        let mut params = params_of(&inst.info);
         inst.apply_defaults(&params);
-        let editor = build_editor(&inst, sample_rate);
+        let (editor, touched) = build_editor(&inst, sample_rate);
+        // A plugin that keeps its controls behind an OSC server has none worth
+        // drawing among its ports: ZynAddSubFX's sixteen are called "Slot 1" to
+        // "Slot 16" and do nothing a player wants. The chosen list replaces
+        // them, so the panel names what it moves.
+        let (osc_moves, osc_alive, osc_client) = match (osc_params::table_for(uri), inst.osc_port) {
+            (Some(table), Some(port)) => match osc::OscClient::connect(port).map(Arc::new) {
+                Some(client) => {
+                    params = osc_params::params(table);
+                    let (tx, rx) = rtrb::RingBuffer::new(osc_params::RING);
+                    let alive = osc_params::spawn_sender(Arc::clone(&client), table, rx);
+                    (Some(tx), Some(alive), Some(client))
+                }
+                None => (None, None, None),
+            },
+            _ => (None, None, None),
+        };
         let presets = presets::scan(bundle_dir, uri, &inst.info.ports);
+        // Only worth asking when the bundle described nothing: a plugin that
+        // publishes both would otherwise list every patch twice.
+        let programs = match presets.is_empty() {
+            true => programs::scan(&inst.state),
+            false => Vec::new(),
+        };
         Some(Self {
             inst,
             params,
             presets,
+            programs,
             editor,
+            touched,
+            osc_moves,
+            osc_alive,
+            osc_client,
         })
     }
 }
 
-/// Load the bundle's X11 editor, if it has one that works.
-fn build_editor(inst: &Lv2Instance, sample_rate: u32) -> Option<Arc<editor::Lv2Editor>> {
-    let ui = inst.info.x11_ui.as_ref()?;
-    editor::Lv2Editor::load(
+/// Load the bundle's editor, if it has one that works.
+///
+/// The plugin's own program comes first where there is one: ZynAddSubFX's
+/// `ui:showInterface` UI instantiates happily and then shows nothing, so
+/// preferring it would be preferring a window that never appears.
+/// Where the plugin's own window reports the control the user just moved.
+type TouchCell = Arc<parking_lot::Mutex<Option<(u32, f32)>>>;
+
+type BuiltEditor = (
+    Option<choz_ports::EditorHandle>,
+    // Where the plugin's own UI reports the control it just moved. A window
+    // that is a separate program reports nothing: it talks to the plugin over
+    // OSC, not through this host.
+    Option<TouchCell>,
+);
+
+fn build_editor(inst: &Lv2Instance, sample_rate: u32) -> BuiltEditor {
+    if let (Some((program, url)), Some(port)) =
+        (external_gui::program_for(&inst.info.uri), inst.osc_port)
+    {
+        let ed = Arc::new(external_gui::ExternalGuiEditor::new(program, url, port));
+        return (Some(ed as choz_ports::EditorHandle), None);
+    }
+    let Some(ui) = inst.info.ui.as_ref() else {
+        return (None, None);
+    };
+    let Some(ed) = editor::Lv2Editor::load(
         ui,
         &inst.info.uri,
         &inst.info.bundle_dir,
         Arc::clone(&inst.controls),
         sample_rate,
-    )
+        inst.handle,
+    ) else {
+        return (None, None);
+    };
+    let touched = ed.touched();
+    (Some(ed as choz_ports::EditorHandle), Some(touched))
 }
 
 impl AudioSource for Lv2Instrument {
     fn editor(&self) -> Option<choz_ports::EditorHandle> {
-        self.editor.clone().map(|e| e as choz_ports::EditorHandle)
+        self.editor.clone()
     }
 
     fn param_touch(&self) -> Option<choz_ports::TouchHandle> {
-        touch_of(&self.editor, &self.params)
+        touch_of(&self.touched, &self.params)
     }
 
     fn state(&self) -> Option<choz_ports::StateHandle> {
@@ -1200,13 +1308,31 @@ impl AudioSource for Lv2Instrument {
         }) as choz_ports::StateHandle)
     }
 
+    fn paths(&self) -> Option<choz_ports::PathsHandle> {
+        let client = self.osc_client.clone()?;
+        let table = osc_params::table_for(&self.inst.info.uri)?;
+        Some(Arc::new(osc_params::OscPaths {
+            client,
+            harmonics: true,
+            table,
+        }) as choz_ports::PathsHandle)
+    }
+
     fn presets(&self) -> Option<choz_ports::PresetsHandle> {
         if self.presets.is_empty() {
-            return None;
+            if self.programs.is_empty() {
+                return None;
+            }
+            return Some(Arc::new(programs::Lv2Programs {
+                shared: Arc::clone(&self.inst.state),
+                list: self.programs.clone(),
+            }) as choz_ports::PresetsHandle);
         }
         Some(Arc::new(presets::Lv2Presets::new(
             Arc::clone(&self.inst.controls),
+            Arc::clone(&self.inst.state),
             self.presets.clone(),
+            &self.inst.info.ports,
         )) as choz_ports::PresetsHandle)
     }
 
@@ -1247,6 +1373,13 @@ impl AudioSource for Lv2Instrument {
     }
 
     fn set_param(&mut self, index: usize, value: f32) {
+        // RT thread. The ring is the only thing touched here; the socket is the
+        // sender thread's business. A full ring drops the move rather than
+        // waiting — the next one carries the knob's real position anyway.
+        if let Some(moves) = self.osc_moves.as_mut() {
+            let _ = moves.push((index as u16, value));
+            return;
+        }
         let params = std::mem::take(&mut self.params);
         self.inst.set_param_norm(&params, index, value);
         self.params = params;
@@ -1263,7 +1396,8 @@ pub struct Lv2Effect {
     params: Vec<PluginParam>,
     wet: f32,
     /// Built once at load, same as the instrument's.
-    editor: Option<Arc<editor::Lv2Editor>>,
+    editor: Option<choz_ports::EditorHandle>,
+    touched: Option<TouchCell>,
 }
 
 impl Lv2Effect {
@@ -1283,23 +1417,24 @@ impl Lv2Effect {
         }
         let params = params_of(&inst.info);
         inst.apply_defaults(&params);
-        let editor = build_editor(&inst, sample_rate);
+        let (editor, touched) = build_editor(&inst, sample_rate);
         Some(Self {
             inst,
             params,
             wet: 1.0,
             editor,
+            touched,
         })
     }
 }
 
 impl FxProcessor for Lv2Effect {
     fn editor(&self) -> Option<choz_ports::EditorHandle> {
-        self.editor.clone().map(|e| e as choz_ports::EditorHandle)
+        self.editor.clone()
     }
 
     fn param_touch(&self) -> Option<choz_ports::TouchHandle> {
-        touch_of(&self.editor, &self.params)
+        touch_of(&self.touched, &self.params)
     }
 
     fn state(&self) -> Option<choz_ports::StateHandle> {

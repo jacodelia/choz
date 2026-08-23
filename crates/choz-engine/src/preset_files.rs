@@ -31,7 +31,17 @@ use choz_ports::PresetEntry;
 /// files and their state chunk **is** that text, so the file goes to the plugin
 /// exactly as it is on disk (checked against TyrellN6: 2775 bytes in, the state
 /// changes, and the patch sounds).
-pub const PRESET_EXTS: &[&str] = &["fxp", "fxb", "vstpreset", "h2p"];
+pub const PRESET_EXTS: &[&str] = &["fxp", "fxb", "vstpreset", "h2p", "bank"];
+
+/// amsynth's `.amSynth.bank` files, which are **many** presets in one file:
+/// `amSynth` and then 128 blocks of `<preset> <name> …`. Its VST2 hands its
+/// patch over as that same text under a different first line, so one block is a
+/// state blob once the header is swapped — which is the whole of loading one.
+const AMSYNTH_BANK_HEAD: &str = "amSynth";
+/// What amsynth's own `getChunk` puts in front of the block it returns.
+const AMSYNTH_STATE_HEAD: &str = "amSynth1.0preset\n";
+/// Where one preset starts inside a bank file.
+const AMSYNTH_PRESET: &str = "<preset> <name> ";
 
 /// How deep under the bank folder to look. Patch libraries are filed by
 /// category, sometimes twice (`Factory / Basses`); past that it is somebody's
@@ -39,8 +49,11 @@ pub const PRESET_EXTS: &[&str] = &["fxp", "fxb", "vstpreset", "h2p"];
 const MAX_DEPTH: usize = 4;
 
 /// Every preset file under `dir`, as bank entries: the sub-folder is the
-/// category (which the picker turns into its chips), the file stem the name,
+/// category (which the picker turns into its sidebar), the file stem the name,
 /// and the full path the key.
+///
+/// A file that holds a whole bank (amsynth's) becomes one entry per preset
+/// inside it, keyed `path#index`, with the bank's name as the category.
 pub fn list_bank(dir: &Path) -> Vec<PresetEntry> {
     let mut out = Vec::new();
     walk(dir, dir, 0, &mut out);
@@ -66,6 +79,10 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<PresetEntry>) {
             .unwrap_or_default()
             .to_ascii_lowercase();
         if !PRESET_EXTS.contains(&ext.as_str()) {
+            continue;
+        }
+        if ext == "bank" {
+            out.extend(amsynth_bank(&path));
             continue;
         }
         let category = path
@@ -220,11 +237,79 @@ fn best_bank_dir(dir: &Path, depth: usize) -> Option<std::path::PathBuf> {
     }
 }
 
+/// The presets inside one amsynth bank file. Empty for anything that is not
+/// one, so a `.bank` belonging to some other plugin is simply not listed.
+fn amsynth_bank(path: &Path) -> Vec<PresetEntry> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    if !text.starts_with(AMSYNTH_BANK_HEAD) {
+        return Vec::new();
+    }
+    // "BriansBank01.amSynth.bank" is the bank "BriansBank01".
+    let bank = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .map(|n| {
+            n.trim_end_matches(".bank")
+                .trim_end_matches(".amSynth")
+                .to_string()
+        })
+        .unwrap_or_default();
+    blocks(&text)
+        .enumerate()
+        .map(|(i, block)| {
+            let name = block.lines().next().unwrap_or_default().trim();
+            PresetEntry {
+                // An empty slot is numbered rather than left blank: a row with
+                // nothing on it cannot be told from a row that failed to read.
+                name: if name.is_empty() {
+                    format!("{} \u{2014}", i + 1)
+                } else {
+                    name.to_string()
+                },
+                category: bank.clone(),
+                key: format!("{}#{i}", path.display()),
+            }
+        })
+        .collect()
+}
+
+/// The `<preset>` blocks of a bank file, without the leading marker.
+fn blocks(text: &str) -> impl Iterator<Item = &str> {
+    text.split(AMSYNTH_PRESET).skip(1)
+}
+
 fn is_preset(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| PRESET_EXTS.contains(&e.to_ascii_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+/// The state blob a picker row stands for, ready for `PluginState::restore`.
+///
+/// The key is a path, or `path#index` for one preset out of a file that holds a
+/// whole bank.
+pub fn read_state_key(key: &str) -> Result<Vec<u8>> {
+    match key
+        .rsplit_once('#')
+        .and_then(|(p, i)| Some((p, i.parse::<usize>().ok()?)))
+    {
+        Some((path, index)) => amsynth_preset(Path::new(path), index),
+        None => read_state(Path::new(key)),
+    }
+}
+
+/// Preset `index` of an amsynth bank file, as the chunk amsynth's own `getChunk`
+/// would have produced: its state header, then the block.
+fn amsynth_preset(file: &Path, index: usize) -> Result<Vec<u8>> {
+    let text =
+        std::fs::read_to_string(file).with_context(|| format!("cannot read {}", file.display()))?;
+    let Some(block) = blocks(&text).nth(index) else {
+        bail!("{}: no preset {index} in this bank", file.display());
+    };
+    Ok(format!("{AMSYNTH_STATE_HEAD}{AMSYNTH_PRESET}{block}").into_bytes())
 }
 
 /// The state blob inside a preset file, ready for `PluginState::restore`.
@@ -261,7 +346,10 @@ fn fx_chunk(data: &[u8]) -> Result<Vec<u8>> {
             "this preset is a list of parameter values, not a patch — \
              choz can only load the chunk kinds (FPCh / FBCh)"
         ),
-        other => bail!("unknown VST2 preset kind {:?}", String::from_utf8_lossy(other)),
+        other => bail!(
+            "unknown VST2 preset kind {:?}",
+            String::from_utf8_lossy(other)
+        ),
     };
     // The declared chunk size is checked rather than trusted: a truncated file
     // handed to a plugin's `setState` is a crash in somebody else's code.
@@ -345,6 +433,45 @@ mod tests {
         assert_eq!(vstpreset_component(&vp).unwrap(), patch);
     }
 
+    /// amsynth keeps a whole bank in one file, and its VST2 hands its patch over
+    /// as that same text: one file is many rows, and picking one is the block
+    /// under amsynth's own state header.
+    #[test]
+    fn an_amsynth_bank_file_is_one_row_per_preset_in_it() {
+        let dir = std::env::temp_dir().join(format!("choz_amsynth_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("MyBank.amSynth.bank");
+        std::fs::write(
+            &file,
+            "amSynth\n\
+             <preset> <name> Airy\n<parameter> amp_attack 0.5\n\
+             <preset> <name> Sub\n<parameter> amp_attack 0.1\n",
+        )
+        .unwrap();
+
+        let bank = list_bank(&dir);
+        assert_eq!(bank.len(), 2, "two presets in the one file: {bank:?}");
+        assert_eq!(bank[0].name, "Airy");
+        assert_eq!(bank[0].category, "MyBank", "the file is the bank");
+        assert_eq!(bank[1].name, "Sub");
+
+        // The blob is what amsynth's own `getChunk` produces: its header, then
+        // that block and no other.
+        let blob = String::from_utf8(read_state_key(&bank[1].key).unwrap()).unwrap();
+        assert!(
+            blob.starts_with("amSynth1.0preset\n<preset> <name> Sub"),
+            "{blob:?}"
+        );
+        assert!(
+            !blob.contains("Airy"),
+            "it carried the whole bank: {blob:?}"
+        );
+        // A row that points nowhere is an error, not a patch of someone else's.
+        assert!(read_state_key(&format!("{}#9", file.display())).is_err());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The patches of a plugin that publishes no programs are found by name,
     /// and what comes back is the folder its own browser would show — the one
     /// with the categories in it, not the data directory above it.
@@ -371,7 +498,10 @@ mod tests {
         );
         let bank = list_bank(&found);
         assert_eq!(bank.len(), 2);
-        assert_eq!(bank[0].category, "Basses", "and the category is what the plugin calls it");
+        assert_eq!(
+            bank[0].category, "Basses",
+            "and the category is what the plugin calls it"
+        );
 
         // Nothing that answers to the name: no guess, and the folder picker is
         // still there.

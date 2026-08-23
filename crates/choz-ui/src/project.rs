@@ -416,8 +416,6 @@ mod tests {
                     on: true,
                     mode: crate::arp::ArpMode::UpDown,
                     div: crate::arp::TimeDiv::EighthTriplet,
-                    bpm: 96.0,
-                    sync: true,
                     gate: 0.4,
                     swing: 0.1,
                     octaves: 2,

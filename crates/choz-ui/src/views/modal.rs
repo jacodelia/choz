@@ -41,6 +41,10 @@ pub struct ListModal {
     /// Clicking one is the same as pressing that key, so mouse and keyboard
     /// share a single handler.
     pub actions: Vec<(String, char)>,
+    /// An image to show beside the list — the file under the cursor, for a
+    /// picker whose rows are pictures. A name is not what anyone is choosing a
+    /// wallpaper by.
+    pub preview: Option<std::path::PathBuf>,
     /// Left sidebar sections: `(label, how many entries are in it)`. Empty =
     /// no sidebar, and the list takes the full width.
     pub sidebar: Vec<(String, usize)>,
@@ -99,6 +103,47 @@ impl ListModal {
         self.filter = (((self.filter as isize + delta) % n + n) % n) as usize;
         self.cursor = 0;
         self.scroll = 0;
+    }
+}
+
+/// Draw an image into `area`, two pixel rows to a cell.
+///
+/// Half-blocks rather than a graphics protocol: this has to look the same on
+/// the terminal the rest of choz is drawn in, and a picker is not the place to
+/// find out whether the terminal has kitty's protocol.
+fn draw_preview(f: &mut Frame, area: Rect, path: &std::path::Path) {
+    let Some(cells) = super::background::thumbnail(path, area.width, area.height) else {
+        // Not an image, or not readable: say so rather than leaving a hole the
+        // user reads as a broken panel.
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                format!(" {} ", t("NO PREVIEW")),
+                Style::default().fg(HINT),
+            )),
+            Rect::new(area.x, area.y + area.height / 2, area.width, 1),
+        );
+        return;
+    };
+    for row in 0..area.height {
+        let spans: Vec<Span> = (0..area.width)
+            .map(|col| {
+                let i = row as usize * area.width as usize + col as usize;
+                // The thumbnail is built to this size, so this is belt and
+                // braces — but it is drawn from a file, and a panic here is a
+                // dead interface.
+                let (top, bottom) = cells.get(i).copied().unwrap_or_default();
+                Span::styled(
+                    "\u{2580}".to_string(),
+                    Style::default()
+                        .fg(Color::Rgb(top.0, top.1, top.2))
+                        .bg(Color::Rgb(bottom.0, bottom.1, bottom.2)),
+                )
+            })
+            .collect();
+        f.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(area.x, area.y + row, area.width, 1),
+        );
     }
 }
 
@@ -256,7 +301,7 @@ pub fn draw_split_modal(f: &mut Frame, area: Rect, v: SplitView) -> SplitRects {
     // Centred on the box: the keys are a whole number of cells wide, so what is
     // left over is a margin, and a keyboard pushed against the left border with
     // a gap on the right reads as a drawing that ran out of room.
-    let drawn = (keys.whites.len() * (keys.key_w + 1)) as u16;
+    let drawn = keys.drawn();
     let x0 = content.x + content.width.saturating_sub(drawn) / 2;
     let key_rows = lines.len().saturating_sub(usize::from(rows >= 3)) as u16;
     let top = y + 2;
@@ -408,6 +453,19 @@ pub fn draw_list_modal(
         }
         list_x += sw + 1;
         list_w = list_w.saturating_sub(sw + 1);
+    }
+
+    // A picture beside the list, for a picker whose rows are pictures. It takes
+    // the right-hand third and the list keeps the rest; on a panel too narrow
+    // for both, the list wins — a preview that leaves no room to read the names
+    // is a preview of the wrong thing.
+    if let Some(path) = m.preview.clone() {
+        let pw = (list_w / 2).min(34);
+        if pw >= 12 && rows >= 4 {
+            let area = Rect::new(list_x + list_w - pw, y, pw, rows as u16);
+            draw_preview(f, area, &path);
+            list_w = list_w.saturating_sub(pw + 1);
+        }
     }
 
     let list_area = Rect::new(list_x, y, list_w.saturating_sub(1), rows as u16);

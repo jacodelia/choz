@@ -106,6 +106,12 @@ fn scan(dir: &Path, exts: &[&str]) -> Vec<Entry> {
                 continue; // skip hidden
             }
             if path.is_dir() {
+                if is_bundle(&path) {
+                    // A plugin bundle is a binary in a directory suit. Asked
+                    // where a synth's patches are, `/usr/lib/lv2` answered with
+                    // 260 `.lv2` folders and none of them was one.
+                    continue;
+                }
                 dirs.push(Entry {
                     label: format!("{name}/"),
                     path,
@@ -130,6 +136,13 @@ fn scan(dir: &Path, exts: &[&str]) -> Vec<Entry> {
     dirs
 }
 
+/// Directory extensions that are a plugin, not a folder of patches.
+const BUNDLE_EXTS: &[&str] = &["lv2", "vst3", "clap", "vst", "component"];
+
+fn is_bundle(path: &Path) -> bool {
+    BUNDLE_EXTS.iter().any(|e| has_ext(path, e))
+}
+
 fn has_ext(path: &Path, ext: &str) -> bool {
     path.extension()
         .is_some_and(|e| e.eq_ignore_ascii_case(ext))
@@ -147,6 +160,9 @@ mod tests {
         std::fs::write(base.join("b.wav"), b"x").unwrap();
         std::fs::write(base.join("a.wav"), b"x").unwrap();
         std::fs::write(base.join("note.txt"), b"x").unwrap(); // ignored
+
+        // A plugin bundle is not a folder anyone is browsing for.
+        std::fs::create_dir_all(base.join("Synth.lv2")).unwrap();
 
         let labels: Vec<_> = scan(&base, &["wav"]).into_iter().map(|e| e.label).collect();
         assert_eq!(labels, vec!["../", "sub/", "a.wav", "b.wav"]);

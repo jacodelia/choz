@@ -68,7 +68,7 @@ fn main() {
             {
                 continue;
             }
-            if info.x11_ui.is_none() {
+            if info.ui.is_none() {
                 no_ui += 1;
                 continue;
             }

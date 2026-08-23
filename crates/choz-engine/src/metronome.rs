@@ -5,10 +5,18 @@
 //! What lives here is only whether it sounds, how loud, and what it sounds
 //! like.
 //!
-//! **It keeps its own clock.** The transport advances only while it is rolling,
-//! and a metronome is for practising: it has to tick with the transport
-//! stopped, which is exactly when it is most wanted. That clock is one counter
-//! advanced per block from the audio thread and read nowhere else.
+//! **It keeps its own clock — but only while the transport is stopped.** The
+//! transport advances only while it is rolling, and a metronome is for
+//! practising: it has to tick with the transport stopped, which is exactly when
+//! it is most wanted. That clock is one counter advanced per block from the
+//! audio thread and read nowhere else.
+//!
+//! While something *is* rolling the click counts the **transport's** position
+//! instead. That is what makes it a click for the music rather than beside it:
+//! the transport is the one clock, wherever it is getting its time — choz's
+//! own, or a MIDI clock from outside, whose `Start` rewinds it — so beat one of
+//! the bar is beat one of the click, and neither drifts away from the other
+//! over a set.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -263,7 +271,12 @@ impl Metronome {
         let beats_per_bar = num.max(1) as u64;
         let gain = self.gain();
         let style = self.style();
-        let start = self.pos.fetch_add(frames as u64, Ordering::Relaxed);
+        // The private counter is advanced either way, so stopping the
+        // transport carries on from where the click already was instead of
+        // jumping back to whatever it last counted on its own.
+        let own = self.pos.fetch_add(frames as u64, Ordering::Relaxed);
+        let t = choz_ports::transport();
+        let start = if t.playing() { t.samples() } else { own };
         let mut peak = 0.0f32;
 
         for f in 0..frames.min(out.len() / 2) {
@@ -411,8 +424,10 @@ mod tests {
     /// them — and the first beat of the bar is not the same sound as the rest.
     #[test]
     fn it_clicks_on_the_beat_and_only_there() {
+        let _clock = crate::test_locks::transport();
         let m = metronome();
         let sr = 48_000u32;
+        choz_ports::transport().set_playing(false);
         choz_ports::transport().set_bpm(120.0); // half a second a beat
         choz_ports::transport().set_time_signature(4, 4);
 
@@ -447,5 +462,59 @@ mod tests {
             "the downbeat has to be distinguishable from the others"
         );
         m.set_on(false);
+    }
+
+    /// While something is rolling the click counts the **transport's**
+    /// position, not its own — that is what keeps it on the same beat as a MIDI
+    /// clock coming from outside, whose `Start` rewinds that transport.
+    #[test]
+    fn a_rolling_transport_is_what_the_click_counts() {
+        let _clock = crate::test_locks::transport();
+        let t = choz_ports::transport();
+        let m = metronome();
+        let sr = 48_000u32;
+        t.set_sample_rate(sr);
+        t.set_bpm(120.0); // half a second a beat
+        t.set_time_signature(4, 4);
+        m.set_on(true);
+
+        // The click's own clock is put somewhere silent, so anything heard here
+        // can only have come from the transport.
+        let quiet = (sr / 4) as u64;
+        let mut buf = vec![0.0f32; 64];
+
+        t.set_playing(true);
+        t.rewind();
+        m.set_pos_for_test(quiet);
+        m.render(&mut buf, 32, sr);
+        assert!(
+            buf.iter().cloned().fold(0.0f32, |a, b| a.max(b.abs())) > 0.1,
+            "the transport is at beat one, so the click is"
+        );
+
+        // …and between the transport's beats there is nothing, whatever the
+        // click's own counter says.
+        let mut buf2 = vec![0.0f32; 64];
+        t.set_position_beats(0.5);
+        m.set_pos_for_test(0);
+        m.render(&mut buf2, 32, sr);
+        assert!(
+            buf2.iter().all(|s| s.abs() < 1e-6),
+            "it clicked off the transport's beat"
+        );
+
+        // Stopped, it is back on its own clock — a metronome has to tick with
+        // nothing rolling.
+        t.set_playing(false);
+        let mut buf3 = vec![0.0f32; 64];
+        m.set_pos_for_test(0);
+        m.render(&mut buf3, 32, sr);
+        assert!(
+            buf3.iter().cloned().fold(0.0f32, |a, b| a.max(b.abs())) > 0.1,
+            "stopped, the click keeps counting on its own"
+        );
+
+        m.set_on(false);
+        t.rewind();
     }
 }

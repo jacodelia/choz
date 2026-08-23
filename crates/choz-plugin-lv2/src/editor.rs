@@ -6,8 +6,12 @@
 //! while the instance lives on the audio thread — the editor only ever writes
 //! into the control-value array, one `f32` per port, which the RT side reads.
 //!
-//! Only `ui:X11UI` is supported. A Gtk or Qt UI needs its toolkit's main loop
-//! running in the host, which is exactly the job suil does and choz does not.
+//! Two kinds are driven: `ui:X11UI`, which embeds into the window choz creates,
+//! and `ui:showInterface`, where the UI puts up a window of its own and the host
+//! only calls `show()` and `idle()` — that is how Yoshimi's and ZynAddSubFX's
+//! editors appear (in Carla too; they have no X11UI at all). A Gtk or Qt UI with
+//! neither needs its toolkit's main loop running in the host, which is exactly
+//! the job suil does and choz does not.
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
@@ -45,6 +49,8 @@ struct UiInstance {
     descriptor: *const LV2UI_Descriptor,
     handle: LV2UI_Handle,
     idle: Option<*const LV2UI_Idle_Interface>,
+    /// `show`/`hide`, for a UI that owns its window.
+    show: Option<*const LV2UI_Show_Interface>,
     /// Boxed so the pointer handed to the UI as `ui:parent` stays put.
     _features: Box<UiFeatures>,
 }
@@ -75,6 +81,13 @@ pub struct Lv2Editor {
     /// its knobs in step with the plugin's window.
     touched: Arc<Mutex<Option<(u32, f32)>>>,
     sample_rate: u32,
+    /// The live plugin instance, for `instance-access` — passed straight back to
+    /// a UI that requires it and never dereferenced here.
+    instance: usize,
+    /// Cleared when a UI that owns its window says it has been closed, which is
+    /// the only way the host can find that out: there is no window of ours for
+    /// the window manager to tell about it.
+    open: std::sync::atomic::AtomicBool,
     /// `None` while closed. The mutex serialises open/idle/close, all of which
     /// arrive on the editor thread, and makes a double `close()` harmless.
     ui: Mutex<Option<UiInstance>>,
@@ -105,6 +118,7 @@ impl Lv2Editor {
         bundle_dir: &std::path::Path,
         controls: SharedControls,
         sample_rate: u32,
+        instance: LV2_Handle,
     ) -> Option<Arc<Self>> {
         let lib = Arc::new(unsafe { Library::new(&info.binary_path) }.ok()?);
         crate::keep_loaded(&lib);
@@ -123,6 +137,8 @@ impl Lv2Editor {
             controls,
             touched: Arc::default(),
             sample_rate,
+            instance: instance as usize,
+            open: std::sync::atomic::AtomicBool::new(false),
             ui: Mutex::new(None),
             _lib: lib,
         }))
@@ -186,12 +202,14 @@ unsafe extern "C" fn write_control(
 }
 
 impl UiFeatures {
-    fn new(parent: u64, map: &LV2_URID_Map, sample_rate: u32) -> Box<Self> {
+    fn new(parent: u64, map: &LV2_URID_Map, sample_rate: u32, instance: usize) -> Box<Self> {
         let uris: Vec<CString> = [
             LV2_UI_PARENT_URI,
             LV2_URID_MAP_URI,
             LV2_UI_IDLE_INTERFACE_URI,
             LV2_OPTIONS_URI,
+            LV2_UI_SHOW_INTERFACE_URI,
+            LV2_INSTANCE_ACCESS_URI,
         ]
         .iter()
         .map(|u| CString::new(*u).expect("static URI"))
@@ -260,6 +278,17 @@ impl UiFeatures {
                 uri: me._uris[3].as_ptr(),
                 data: me._options.as_ptr() as *mut c_void,
             },
+            // Presence again; a UI that shows its own window lists this one.
+            LV2_Feature {
+                uri: me._uris[4].as_ptr(),
+                data: std::ptr::null_mut(),
+            },
+            // `instance-access`'s data *is* the instance handle, like the
+            // parent's is the window id.
+            LV2_Feature {
+                uri: me._uris[5].as_ptr(),
+                data: instance as *mut c_void,
+            },
         ];
         me.ptrs = me._feats.iter().map(|f| f as *const LV2_Feature).collect();
         me.ptrs.push(std::ptr::null());
@@ -277,7 +306,10 @@ impl PluginEditor for Lv2Editor {
         let instantiate = unsafe { (*descriptor).instantiate }?;
 
         let map = crate::shared_urid_map();
-        let features = UiFeatures::new(parent, &map, self.sample_rate);
+        // A UI that owns its window has nothing to embed into; handing it a
+        // parent is how one ends up drawing into a window nobody mapped.
+        let parent = if self.info.owns_window { 0 } else { parent };
+        let features = UiFeatures::new(parent, &map, self.sample_rate, self.instance);
         let mut widget: LV2UI_Widget = std::ptr::null_mut();
 
         // SAFETY: every pointer is owned by `features`/`self` and outlives the
@@ -303,11 +335,35 @@ impl PluginEditor for Lv2Editor {
             let p = unsafe { ext(uri.as_ptr()) } as *const LV2UI_Idle_Interface;
             (!p.is_null()).then_some(p)
         });
+        let show = unsafe { (*descriptor).extension_data }.and_then(|ext| {
+            let uri = CString::new(LV2_UI_SHOW_INTERFACE_URI).ok()?;
+            let p = unsafe { ext(uri.as_ptr()) } as *const LV2UI_Show_Interface;
+            (!p.is_null()).then_some(p)
+        });
+
+        // Nothing is on screen until it is asked for: this is the whole of the
+        // show interface, and without it Yoshimi and ZynAddSubFX instantiate
+        // their editor and never draw it.
+        if self.info.owns_window {
+            let shown = show
+                .and_then(|s| unsafe { (*s).show })
+                .map(|f| unsafe { f(handle) } == 0)
+                .unwrap_or(false);
+            if !shown {
+                eprintln!("choz: LV2 UI {} would not show its window", self.info.uri);
+                if let Some(cleanup) = unsafe { (*descriptor).cleanup } {
+                    unsafe { cleanup(handle) };
+                }
+                return None;
+            }
+        }
+        self.open.store(true, std::sync::atomic::Ordering::Relaxed);
 
         *guard = Some(UiInstance {
             descriptor,
             handle,
             idle,
+            show,
             _features: features,
         });
         // An X11UI parents itself into the window we gave it and reports no size
@@ -321,16 +377,36 @@ impl PluginEditor for Lv2Editor {
         let Some(ui) = guard.as_ref() else { return };
         let Some(idle) = ui.idle else { return };
         // SAFETY: the interface belongs to the descriptor, alive with the UI.
-        unsafe {
-            if let Some(f) = (*idle).idle {
-                f(ui.handle);
+        let asked_to_close = unsafe {
+            match (*idle).idle {
+                Some(f) => f(ui.handle) != 0,
+                None => false,
             }
+        };
+        // Non-zero means the UI wants to be closed — a window of its own has no
+        // other way of saying the user shut it.
+        if asked_to_close {
+            self.open.store(false, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    fn owns_window(&self) -> bool {
+        self.info.owns_window
+    }
+
+    fn is_open(&self) -> bool {
+        self.open.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn close(&self) {
         let mut guard = self.ui.lock();
+        self.open.store(false, std::sync::atomic::Ordering::Relaxed);
         let Some(ui) = guard.take() else { return };
+        // Down before it is torn down: a UI that put up its own window has to be
+        // told to take it away, or the window outlives the plugin behind it.
+        if let Some(hide) = ui.show.and_then(|s| unsafe { (*s).hide }) {
+            unsafe { hide(ui.handle) };
+        }
         // SAFETY: the handle came from this descriptor's `instantiate` and is
         // dropped exactly once — `take` above makes a second close a no-op.
         unsafe {

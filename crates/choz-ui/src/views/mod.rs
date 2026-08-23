@@ -1,6 +1,7 @@
 pub mod background;
 pub mod drawer;
 pub mod fx_chain_panel;
+pub mod harmonics;
 pub mod kitty_bg;
 pub mod midi_monitor;
 pub mod modal;

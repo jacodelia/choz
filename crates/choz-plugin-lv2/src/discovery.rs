@@ -60,16 +60,28 @@ pub struct Port {
     pub unit: Option<String>,
 }
 
-/// An X11 editor shipped in the same bundle as the plugin.
+/// An editor shipped in the same bundle as the plugin.
 ///
-/// Only `ui:X11UI` is looked for: it is the one that embeds into a plain X11
-/// window, which is what choz's editor thread hands the plugin. Gtk/Qt UIs need
-/// a toolkit host loop (that is what suil is for) and are ignored.
+/// Two kinds are used, and no others:
+///
+/// * **`ui:X11UI`** — embeds into the plain X11 window choz's editor thread
+///   creates for it.
+/// * **`ui:showInterface`** — the UI puts up a window of *its own*, so there is
+///   nothing to embed and no toolkit loop for the host to run. This is how
+///   Yoshimi (a kx external widget) and ZynAddSubFX (DPF) ship their editors,
+///   which is why they have windows in Carla; choz looked for X11UI only and
+///   found neither.
+///
+/// A Gtk or Qt UI that offers neither still needs its toolkit's main loop in the
+/// host — suil's job, not choz's — and is ignored.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Lv2UiInfo {
     pub uri: String,
-    /// The UI's own shared object — a *different* binary from the plugin's.
+    /// The UI's own shared object — usually a *different* binary from the
+    /// plugin's (Yoshimi's is the same one).
     pub binary_path: PathBuf,
+    /// The UI opens its own window: `show()` instead of a parent to embed into.
+    pub owns_window: bool,
 }
 
 /// Host features choz passes to a UI. A UI that requires anything else is not
@@ -82,10 +94,22 @@ pub struct Lv2UiInfo {
 pub const SUPPORTED_UI_FEATURES: &[&str] = &[
     "http://lv2plug.in/ns/extensions/ui#parent",
     "http://lv2plug.in/ns/extensions/ui#idleInterface",
+    "http://lv2plug.in/ns/extensions/ui#showInterface",
     "http://lv2plug.in/ns/extensions/ui#noUserResize",
     "http://lv2plug.in/ns/ext/urid#map",
     "http://lv2plug.in/ns/ext/options#options",
 ];
+
+/// The same, for a UI that opens its own window — plus `instance-access`.
+///
+/// That one is the live instance pointer, and it is offered here **only**: a UI
+/// of this kind is the plugin's own application on both ends (Yoshimi's editor
+/// *is* Yoshimi, in the same binary), so the synchronisation is its own
+/// business, it shows nothing at all without the pointer, and every host that
+/// displays those editors — Carla included — passes it. choz never dereferences
+/// it. An *embedded* UI stays as strict as it was: a Qt editor asking for the
+/// instance is a different bargain, and one nobody has measured here.
+pub const SUPPORTED_OWN_WINDOW_UI_FEATURES: &[&str] = &["http://lv2plug.in/ns/ext/instance-access"];
 
 /// Plugin families whose X11 UI segfaults the host on `instantiate`.
 ///
@@ -140,8 +164,8 @@ pub struct Lv2PluginInfo {
     pub ports: Vec<Port>,
     /// Required-feature URIs declared by the plugin (we support only urid:map/unmap).
     pub required_features: Vec<String>,
-    /// The bundle's X11 editor, when it ships one.
-    pub x11_ui: Option<Lv2UiInfo>,
+    /// The bundle's editor, when it ships one choz can drive.
+    pub ui: Option<Lv2UiInfo>,
 }
 
 /// Parse every plugin in `bundle_dir` (a `*.lv2` directory). Returns an empty
@@ -227,7 +251,7 @@ fn parse_plugin(
         .map(|n| n.as_str().to_string())
         .collect();
 
-    let x11_ui = find_x11_ui(graph, uri);
+    let ui = find_ui(graph, uri);
 
     Lv2PluginInfo {
         uri: uri.to_string(),
@@ -238,34 +262,66 @@ fn parse_plugin(
         is_effect,
         ports,
         required_features,
-        x11_ui,
+        ui,
     }
 }
 
-/// Find the X11 editor belonging to `plugin_uri`.
+/// Find the editor belonging to `plugin_uri`.
 ///
-/// Bundles link the two in either direction and plenty do neither, so all three
-/// are tried in turn: `plugin ui:ui <ui>`, `ui lv2:appliesTo <plugin>`, and
-/// finally — only when the bundle describes a single X11 UI — that one. The
-/// fallback is what covers DPF bundles (Zam, Dragonfly), where the UI is named
-/// `<plugin>#DPF_UI` and nothing states the relation at all.
-fn find_x11_ui(graph: &ttl::Graph, plugin_uri: &str) -> Option<Lv2UiInfo> {
+/// The embedding kind is preferred — a window inside choz's own is the better
+/// citizen — and a UI that opens its own window is taken when there is no X11
+/// one, which is the only editor Yoshimi and ZynAddSubFX have.
+fn find_ui(graph: &ttl::Graph, plugin_uri: &str) -> Option<Lv2UiInfo> {
     if ui_denied(plugin_uri) {
         return None;
     }
-    let x11: Vec<String> = graph.subjects_of_type(ttl::UI_X11UI);
-    if x11.is_empty() {
+    let x11 = graph.subjects_of_type(ttl::UI_X11UI);
+    if let Some(ui) = resolve_ui(graph, plugin_uri, &x11, false) {
+        return Some(ui);
+    }
+    // Anything else the bundle describes as a UI. What makes it usable is not
+    // its *type* — Yoshimi's is a kx external widget, ZynAddSubFX's is a plain
+    // `ui:UI` — but whether it offers `ui:showInterface`, so that is what is
+    // checked, in the UI's own document as well as here.
+    let others: Vec<String> = graph
+        .triples
+        .iter()
+        .filter(|t| t.p == ttl::UI_BINARY)
+        .map(|t| t.s.as_str().to_string())
+        .filter(|u| !x11.contains(u))
+        .collect();
+    let shows: Vec<String> = others
+        .into_iter()
+        .filter(|u| ui_declares(graph, u, ttl::LV2_EXTENSION_DATA, ttl::UI_SHOW_INTERFACE))
+        .collect();
+    resolve_ui(graph, plugin_uri, &shows, true)
+}
+
+/// Which of `candidates` is `plugin_uri`'s, and where its binary is.
+///
+/// Bundles link the two in either direction and plenty do neither, so all three
+/// are tried in turn: `plugin ui:ui <ui>`, `ui lv2:appliesTo <plugin>`, and
+/// finally — only when the bundle describes a single one — that one. The
+/// fallback is what covers DPF bundles (Zam, Dragonfly, ZynAddSubFX), where the
+/// UI is named `<plugin>#DPF_UI` and nothing states the relation at all.
+fn resolve_ui(
+    graph: &ttl::Graph,
+    plugin_uri: &str,
+    candidates: &[String],
+    owns_window: bool,
+) -> Option<Lv2UiInfo> {
+    if candidates.is_empty() {
         return None;
     }
-
     let declared = graph
         .objects(plugin_uri, ttl::UI_UI)
         .iter()
         .map(|n| n.as_str().to_string())
-        .find(|u| x11.contains(u));
+        .find(|u| candidates.contains(u));
 
     let applies = || {
-        x11.iter()
+        candidates
+            .iter()
             .find(|ui| {
                 graph
                     .objects(ui, ttl::LV2_APPLIES_TO)
@@ -277,7 +333,7 @@ fn find_x11_ui(graph: &ttl::Graph, plugin_uri: &str) -> Option<Lv2UiInfo> {
 
     // Only unambiguous when the bundle has exactly one: a multi-plugin bundle
     // would otherwise hand every plugin the same editor.
-    let only_one = || (x11.len() == 1).then(|| x11[0].clone());
+    let only_one = || (candidates.len() == 1).then(|| candidates[0].clone());
 
     let ui_uri = declared.or_else(applies).or_else(only_one)?;
     let binary_path = graph
@@ -289,29 +345,10 @@ fn find_x11_ui(graph: &ttl::Graph, plugin_uri: &str) -> Option<Lv2UiInfo> {
         return None;
     }
 
-    // The UI's own description usually lives in a separate document, reachable
-    // through its `rdfs:seeAlso`; that is where `requiredFeature` sits. Only
-    // that document is parsed — merging it into a copy of the bundle graph made
-    // discovery quadratic and hung the scan on big bundles (guitarix, Calf).
-    let mut required: Vec<String> = graph
-        .objects(&ui_uri, ttl::LV2_REQUIRED_FEATURE)
-        .iter()
-        .map(|n| n.as_str().to_string())
-        .collect();
-    for see in graph.objects(&ui_uri, ttl::RDFS_SEE_ALSO) {
-        let Some(p) = node_to_path(see) else { continue };
-        let Ok(g) = ttl::Graph::parse_file(&p) else {
-            continue;
-        };
-        required.extend(
-            g.objects(&ui_uri, ttl::LV2_REQUIRED_FEATURE)
-                .iter()
-                .map(|n| n.as_str().to_string()),
-        );
-    }
-
-    for uri in &required {
-        if !SUPPORTED_UI_FEATURES.contains(&uri.as_str()) {
+    for uri in required_features_of(graph, &ui_uri) {
+        let ok = SUPPORTED_UI_FEATURES.contains(&uri.as_str())
+            || (owns_window && SUPPORTED_OWN_WINDOW_UI_FEATURES.contains(&uri.as_str()));
+        if !ok {
             debug!("LV2: UI {ui_uri} needs unsupported feature {uri}; no editor");
             return None;
         }
@@ -320,7 +357,56 @@ fn find_x11_ui(graph: &ttl::Graph, plugin_uri: &str) -> Option<Lv2UiInfo> {
     Some(Lv2UiInfo {
         uri: ui_uri,
         binary_path,
+        owns_window,
     })
+}
+
+/// Whether `subject predicate object` is asserted here or in the document the
+/// subject points at with `rdfs:seeAlso`.
+///
+/// A UI's own description usually lives in that separate document — it is where
+/// `requiredFeature` and `extensionData` sit — and only it is parsed: merging it
+/// into a copy of the bundle graph made discovery quadratic and hung the scan on
+/// big bundles (guitarix, Calf).
+fn ui_declares(graph: &ttl::Graph, ui_uri: &str, predicate: &str, object: &str) -> bool {
+    if graph
+        .objects(ui_uri, predicate)
+        .iter()
+        .any(|n| n.as_str() == object)
+    {
+        return true;
+    }
+    see_also_docs(graph, ui_uri).into_iter().any(|g| {
+        g.objects(ui_uri, predicate)
+            .iter()
+            .any(|n| n.as_str() == object)
+    })
+}
+
+/// Everything the UI says it requires, here and in its `rdfs:seeAlso` document.
+fn required_features_of(graph: &ttl::Graph, ui_uri: &str) -> Vec<String> {
+    let mut out: Vec<String> = graph
+        .objects(ui_uri, ttl::LV2_REQUIRED_FEATURE)
+        .iter()
+        .map(|n| n.as_str().to_string())
+        .collect();
+    for g in see_also_docs(graph, ui_uri) {
+        out.extend(
+            g.objects(ui_uri, ttl::LV2_REQUIRED_FEATURE)
+                .iter()
+                .map(|n| n.as_str().to_string()),
+        );
+    }
+    out
+}
+
+fn see_also_docs(graph: &ttl::Graph, subject: &str) -> Vec<ttl::Graph> {
+    graph
+        .objects(subject, ttl::RDFS_SEE_ALSO)
+        .into_iter()
+        .filter_map(node_to_path)
+        .filter_map(|p| ttl::Graph::parse_file(&p).ok())
+        .collect()
 }
 
 fn parse_port(graph: &Graph, pid: &str) -> Port {

@@ -226,17 +226,21 @@ fn x11_editors_are_discovered_and_the_crashing_families_are_not_offered() {
     }
 
     for p in &all {
-        if let Some(ui) = &p.x11_ui {
+        if let Some(ui) = &p.ui {
             assert!(
                 ui.binary_path.exists(),
                 "{} points at a missing UI binary",
                 p.name
             );
-            assert_ne!(
-                ui.binary_path, p.binary_path,
-                "{}: the UI is a separate binary from the DSP one",
-                p.name
-            );
+            // An embedded UI is always a second binary. One that owns its
+            // window may be the same one — Yoshimi's editor *is* Yoshimi.
+            if !ui.owns_window {
+                assert_ne!(
+                    ui.binary_path, p.binary_path,
+                    "{}: an embedded UI is a separate binary from the DSP one",
+                    p.name
+                );
+            }
         }
     }
 
@@ -247,14 +251,14 @@ fn x11_editors_are_discovered_and_the_crashing_families_are_not_offered() {
             p.uri
                 .starts_with("http://guitarix.sourceforge.net/plugins/")
         })
-        .filter(|p| p.x11_ui.is_some())
+        .filter(|p| p.ui.is_some())
         .count();
     assert_eq!(guitarix_with_ui, 0, "guitarix UIs segfault on instantiate");
 
     // And the discovery is not vacuously passing: this machine has plenty.
-    let with_ui = all.iter().filter(|p| p.x11_ui.is_some()).count();
+    let with_ui = all.iter().filter(|p| p.ui.is_some()).count();
     eprintln!(
-        "{with_ui} of {} installed LV2 plugins ship an X11 UI",
+        "{with_ui} of {} installed LV2 plugins ship an editor choz can drive",
         all.len()
     );
 
@@ -265,7 +269,7 @@ fn x11_editors_are_discovered_and_the_crashing_families_are_not_offered() {
     // that needs a DISPLAY, which CI has not got — only the handle is asked for.
     if let Some(last_lsp) = all
         .iter()
-        .rfind(|p| p.uri.starts_with("http://lsp-plug.in/plugins/lv2/") && p.x11_ui.is_some())
+        .rfind(|p| p.uri.starts_with("http://lsp-plug.in/plugins/lv2/") && p.ui.is_some())
     {
         let fx =
             choz_plugin_lv2::Lv2Effect::build(&last_lsp.bundle_dir, &last_lsp.uri, 48_000, 256);
@@ -503,4 +507,443 @@ fn bundle_presets_are_listed_and_applied() {
     if !checked {
         eprintln!("no LV2 instrument here publishes presets; skipping");
     }
+}
+
+/// ZynAddSubFX keeps its 2000 instruments in a *second* bundle beside the
+/// plugin's own (`ZynAddSubFX.lv2presets`), filed under `pset:Bank`s, and each
+/// one is a `state:state` document rather than a set of control ports. Both are
+/// why its banks used to show up as nothing at all.
+///
+/// Skipped where it is not installed.
+#[test]
+fn a_presets_only_sibling_bundle_is_read_too() {
+    let bundle = std::path::Path::new("/usr/lib/lv2/ZynAddSubFX.lv2");
+    if !bundle.join("manifest.ttl").is_file() {
+        eprintln!("ZynAddSubFX not installed; skipping");
+        return;
+    }
+    let uri = "http://zynaddsubfx.sourceforge.net";
+    let ports = Vec::new();
+    let listed = choz_plugin_lv2::presets::scan(bundle, uri, &ports);
+    assert!(
+        listed.len() > 100,
+        "the sibling bundle's presets are missing: {}",
+        listed.len()
+    );
+    let banks: std::collections::BTreeSet<&str> = listed
+        .iter()
+        .map(|p| p.entry.category.as_str())
+        .filter(|c| !c.is_empty())
+        .collect();
+    assert!(banks.contains("Arpeggios"), "the banks: {banks:?}");
+    // The bank is the sidebar; it is not repeated in every row's name.
+    let arp = listed
+        .iter()
+        .find(|p| p.entry.category == "Arpeggios")
+        .expect("a preset in that bank");
+    assert!(
+        !arp.entry.name.starts_with("Arpeggios:"),
+        "the name still carries its bank: {}",
+        arp.entry.name
+    );
+
+    // And picking one is heard: a `state:state` preset reaches the plugin
+    // through the state extension, which is the only way it can.
+    let _guard = plugin_lock();
+    let Some(mut inst) = Lv2Instrument::build(bundle, uri, SR, BLOCK) else {
+        eprintln!("ZynAddSubFX did not instantiate; skipping the sound half");
+        return;
+    };
+    let browser = inst.presets().expect("it has presets");
+    let two: Vec<String> = listed
+        .iter()
+        .filter(|p| p.entry.category == "Arpeggios")
+        .map(|p| p.entry.key.clone())
+        .take(2)
+        .collect();
+    let mut sound = |key: &str| {
+        browser.load(key);
+        inst.note_on(60, 110);
+        let mut out = vec![0.0f32; 1024];
+        let mut captured = Vec::new();
+        for _ in 0..60 {
+            inst.render(&mut out, SR);
+            captured.extend_from_slice(&out);
+        }
+        inst.note_off(60);
+        for _ in 0..60 {
+            inst.render(&mut out, SR);
+        }
+        captured
+    };
+    let a = sound(&two[0]);
+    let b = sound(&two[1]);
+    assert!(
+        a.iter().any(|s| s.abs() > 1e-6),
+        "the first preset made no sound at all"
+    );
+    assert_ne!(a, b, "two different instruments sounded identical");
+}
+
+/// An editor that opens **its own** window is an editor: `ui:showInterface` is
+/// what Yoshimi and ZynAddSubFX ship instead of an X11 UI, and looking only for
+/// `ui:X11UI` is why choz offered neither a window while Carla shows both.
+///
+/// Skipped where they are not installed. Only the discovery half is asserted —
+/// opening one puts a window on the screen, which is not a test's business.
+#[test]
+fn a_ui_that_owns_its_window_is_found() {
+    let mut checked = 0;
+    for (dir, plugin) in [
+        ("/usr/lib/lv2/yoshimi.lv2", "yoshimi"),
+        ("/usr/lib/lv2/ZynAddSubFX.lv2", "zynaddsubfx"),
+    ] {
+        let bundle = std::path::Path::new(dir);
+        if !bundle.join("manifest.ttl").is_file() {
+            continue;
+        }
+        for info in choz_plugin_lv2::discovery::discover_bundle(bundle) {
+            assert!(
+                info.uri.contains(plugin),
+                "wrong bundle: {} in {dir}",
+                info.uri
+            );
+            let ui = info
+                .ui
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} has an editor and none was found", info.name));
+            assert!(
+                ui.owns_window,
+                "{}: neither of these embeds; both show their own window",
+                info.name
+            );
+            assert!(ui.binary_path.is_file(), "the UI binary has to be there");
+            checked += 1;
+        }
+    }
+    if checked == 0 {
+        eprintln!("neither Yoshimi nor ZynAddSubFX installed; skipping");
+    }
+}
+
+/// A plugin that keeps its patches to itself still has a list: the kx
+/// `programs#Interface` is the only door to Yoshimi's 4466 instruments, and its
+/// bundle describes not one of them in Turtle.
+///
+/// Skipped where Yoshimi is not installed.
+#[test]
+fn the_programs_interface_lists_and_selects_a_patch() {
+    let bundle = std::path::Path::new("/usr/lib/lv2/yoshimi.lv2");
+    if !bundle.join("manifest.ttl").is_file() {
+        eprintln!("Yoshimi not installed; skipping");
+        return;
+    }
+    let _guard = plugin_lock();
+    let uri = "http://yoshimi.sourceforge.net/lv2_plugin";
+    let Some(mut inst) = Lv2Instrument::build(bundle, uri, SR, BLOCK) else {
+        eprintln!("Yoshimi did not instantiate; skipping");
+        return;
+    };
+    let browser = inst.presets().expect("its programs are its presets");
+    let list = browser.list();
+    assert!(list.len() > 1000, "only {} programs", list.len());
+
+    // The banks are named, not numbered: the extension hands over
+    // "Arpeggios -> Arpeggio1" and the bank half is the picker's sidebar.
+    let banks: std::collections::BTreeSet<&str> =
+        list.iter().map(|p| p.category.as_str()).collect();
+    assert!(
+        banks.iter().any(|b| !b.starts_with("BANK ")),
+        "no bank was named: {banks:?}"
+    );
+    assert!(
+        list.iter().all(|p| !p.name.contains(" -> ")),
+        "a row still carries its bank in its name"
+    );
+
+    // And picking one is heard.
+    let sound = |key: &str, inst: &mut Lv2Instrument| {
+        browser.load(key);
+        inst.note_on(60, 110);
+        let mut out = vec![0.0f32; 1024];
+        let mut captured = Vec::new();
+        for _ in 0..80 {
+            inst.render(&mut out, SR);
+            captured.extend_from_slice(&out);
+        }
+        inst.note_off(60);
+        for _ in 0..40 {
+            inst.render(&mut out, SR);
+        }
+        captured
+    };
+    let a = sound(&list[0].key, &mut inst);
+    let b = sound(&list[list.len() / 2].key, &mut inst);
+    assert_ne!(a, b, "two different instruments rendered the same audio");
+    assert!(
+        b.iter().any(|s| s.abs() > 1e-4),
+        "the selected instrument made no sound at all"
+    );
+}
+
+/// ZynAddSubFX's editor is a **program**, not a window: its `ui:showInterface`
+/// UI starts `zynaddsubfx-ext-gui` and hands it the address of the OSC server
+/// the DSP opened. DPF passes that address over an atom port choz does not
+/// implement, so the UI never started anything and the `[GUI]` button did
+/// nothing at all. The address is found from this side instead.
+///
+/// The window itself is not opened here — a test that leaves a synth on the
+/// screen is a test nobody runs twice.
+#[test]
+fn zyns_osc_server_is_found_and_its_editor_is_the_program() {
+    let bundle = std::path::Path::new("/usr/lib/lv2/ZynAddSubFX.lv2");
+    if !bundle.join("manifest.ttl").is_file() {
+        eprintln!("ZynAddSubFX not installed; skipping");
+        return;
+    }
+    let _guard = plugin_lock();
+    let uri = "http://zynaddsubfx.sourceforge.net";
+    let Some(inst) = Lv2Instrument::build(bundle, uri, SR, BLOCK) else {
+        eprintln!("ZynAddSubFX did not instantiate; skipping");
+        return;
+    };
+    let port = inst
+        .osc_port()
+        .expect("it opens an OSC server while instantiating");
+    assert!(port > 1024, "a server port, not {port}");
+
+    assert!(
+        choz_plugin_lv2::osc::udp_ports().contains(&port),
+        "the port is this process's own"
+    );
+
+    match choz_plugin_lv2::external_gui::program_for(uri) {
+        Some((program, url)) => {
+            assert_eq!(program, "zynaddsubfx-ext-gui");
+            assert!(url.contains("{port}"), "the address is built from it");
+            let ed = inst.editor().expect("an editor it can actually show");
+            assert!(ed.owns_window(), "the program brings its own window");
+            assert!(!ed.is_open(), "nothing is on screen until it is opened");
+        }
+        // The helper is part of the same package, but a stripped install could
+        // have the plugin without it — and then there is no editor to offer.
+        None => assert!(
+            inst.editor().is_none_or(|e| !e.owns_window()),
+            "no helper installed, so no window may be promised"
+        ),
+    }
+}
+
+/// The controls a plugin keeps behind its OSC server, reached by path: the
+/// chosen knobs, and the 128 harmonics its own editor draws as bars.
+///
+/// The names matter and were measured, not guessed: `magnitude<n>` is the port
+/// the plugin **answers** for, while its internal `Phmag<n>` accepts a write
+/// and replies to nothing — a view built on that one would have drawn an empty
+/// row for ever.
+#[test]
+fn zyns_knobs_and_harmonics_are_reachable_by_path() {
+    let bundle = std::path::Path::new("/usr/lib/lv2/ZynAddSubFX.lv2");
+    if !bundle.join("manifest.ttl").is_file() {
+        eprintln!("ZynAddSubFX not installed; skipping");
+        return;
+    }
+    let _guard = plugin_lock();
+    let uri = "http://zynaddsubfx.sourceforge.net";
+    let Some(mut inst) = Lv2Instrument::build(bundle, uri, SR, BLOCK) else {
+        eprintln!("ZynAddSubFX did not instantiate; skipping");
+        return;
+    };
+
+    // Its ports name nothing; the chosen list is what the panel gets instead.
+    let params = choz_plugin_lv2::read_params(bundle, uri);
+    assert!(
+        params.iter().all(|p| !p.name.starts_with("Slot ")),
+        "the sixteen numbered slots are still what the panel shows"
+    );
+    let cutoff = params
+        .iter()
+        .position(|p| p.name == "CUTOFF")
+        .expect("a filter cutoff among them");
+
+    let paths = inst.paths().expect("a by-path surface");
+    let set = paths.harmonics().expect("a set of harmonics");
+    assert_eq!(set.magnitude.len(), 128);
+    assert_eq!((set.min, set.max, set.zero), (0.0, 127.0, 64.0));
+
+    // What the plugin holds, asked for and collected: a fresh oscillator is one
+    // full harmonic and 127 silent ones.
+    for path in &set.magnitude {
+        paths.ask(path);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while paths.value(&set.magnitude[1]).is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        paths.value(&set.magnitude[0]),
+        Some(127.0),
+        "the fundamental"
+    );
+    assert_eq!(
+        paths.value(&set.magnitude[1]),
+        Some(64.0),
+        "and a silent one"
+    );
+
+    // Moving one reaches the plugin, and the plugin says so.
+    paths.set(&set.magnitude[1], 100.0);
+    paths.ask(&set.magnitude[1]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while paths.value(&set.magnitude[1]) != Some(100.0) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(paths.value(&set.magnitude[1]), Some(100.0));
+
+    // And a knob does too — the audio thread's own call, which only ever writes
+    // into a ring the sender thread drains.
+    let watch = "/part0/kit0/adpars/GlobalPar/GlobalFilter/Pfreq";
+    inst.set_param(cutoff, 0.25);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while paths.value(watch).is_none() && std::time::Instant::now() < deadline {
+        paths.ask(watch);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        paths.value(watch),
+        Some(32.0),
+        "a quarter of 0..127 is 32, and that is what the plugin holds"
+    );
+
+    // The harmonics are knobs of that same list, so moving one moves the
+    // oscillator — the same path the HARMONICS view writes.
+    let h2 = params
+        .iter()
+        .position(|p| p.name == "H2")
+        .expect("the second harmonic is a knob");
+    inst.set_param(h2, 1.0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while paths.value(&set.magnitude[1]) != Some(127.0) && std::time::Instant::now() < deadline {
+        paths.ask(&set.magnitude[1]);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        paths.value(&set.magnitude[1]),
+        Some(127.0),
+        "the knob and the view move the same harmonic"
+    );
+}
+
+/// The oscillator's harmonics are **parameters**, not only a view of their own:
+/// thirty-two magnitudes and thirty-two phases sit in the tab's own knob box,
+/// tagged so the panel draws them as the bank of vertical bars they are.
+#[test]
+fn the_harmonics_are_knobs_on_the_instrument_too() {
+    let params = choz_plugin_lv2::osc_params::params(choz_plugin_lv2::osc_params::ZYN.as_slice());
+    let n = choz_plugin_lv2::osc_params::HARMONIC_KNOBS;
+
+    let mags: Vec<&choz_ports::PluginParam> = params
+        .iter()
+        .filter(|p| p.group.as_deref() == Some("HARMONICS"))
+        .collect();
+    let phases: Vec<&choz_ports::PluginParam> = params
+        .iter()
+        .filter(|p| p.group.as_deref() == Some("H.PHASE"))
+        .collect();
+    assert_eq!((mags.len(), phases.len()), (n, n));
+    assert_eq!(mags[0].name, "H1", "the fundamental is the first of them");
+    assert_eq!(mags[0].default, 127.0, "and it is the one that sounds");
+    assert_eq!(mags[1].default, 64.0, "the rest are silent, not zero");
+    assert_eq!(phases[3].name, "P4");
+
+    // The tag is what makes a run of them a bank of bars rather than a row of
+    // numbered knobs.
+    assert!(mags.iter().all(|p| p.unit.as_deref() == Some("harmonic")));
+    assert!(phases.iter().all(|p| p.unit.as_deref() == Some("phase")));
+
+    // They are in the same list as the rest, so a CC learned on one is learned
+    // the same way as one on the filter.
+    assert!(params.iter().any(|p| p.name == "CUTOFF"));
+    assert_eq!(params.len(), 20 + 2 * n);
+
+    // And each one addresses its own harmonic.
+    let table = choz_plugin_lv2::osc_params::table_for("http://zynaddsubfx.sourceforge.net")
+        .expect("Zyn has a table");
+    let mag_paths: Vec<&str> = table
+        .iter()
+        .filter(|p| p.group == "HARMONICS")
+        .map(|p| p.path.as_str())
+        .collect();
+    assert!(mag_paths[0].ends_with("/magnitude0"), "{}", mag_paths[0]);
+    assert!(mag_paths[31].ends_with("/magnitude31"), "{}", mag_paths[31]);
+}
+
+/// What the knobs read back: the paths behind the plugin's parameters, and a
+/// patch loaded inside it moving them.
+///
+/// This is the half a parameter list cannot do. ZynAddSubFX's presets are state
+/// blobs that move every control it has, and none of it comes back through a
+/// port — so without this the panel keeps showing whatever choz last sent.
+#[test]
+fn a_patch_moves_what_the_knobs_read_back() {
+    let bundle = std::path::Path::new("/usr/lib/lv2/ZynAddSubFX.lv2");
+    if !bundle.join("manifest.ttl").is_file() {
+        eprintln!("ZynAddSubFX not installed; skipping");
+        return;
+    }
+    let _guard = plugin_lock();
+    let uri = "http://zynaddsubfx.sourceforge.net";
+    let Some(inst) = Lv2Instrument::build(bundle, uri, SR, BLOCK) else {
+        eprintln!("ZynAddSubFX did not instantiate; skipping");
+        return;
+    };
+    let paths = inst.paths().expect("a by-path surface");
+    let params = choz_plugin_lv2::read_params(bundle, uri);
+    let param_paths = paths.param_paths();
+    assert_eq!(
+        param_paths.len(),
+        params.len(),
+        "a path for every knob the panel draws"
+    );
+
+    // Ask, then read: the answers arrive on their own thread.
+    let settle = |paths: &choz_ports::PathsHandle, path: &str| -> Option<f32> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            paths.ask(path);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if let Some(v) = paths.value(path) {
+                return Some(v);
+            }
+        }
+        None
+    };
+    // A control the presets really move: the oscillator's waveform.
+    let wave = params
+        .iter()
+        .position(|p| p.name == "WAVE")
+        .expect("the waveform is a knob");
+    let path = param_paths[wave].clone();
+    let before = settle(&paths, &path).expect("the plugin answers for it");
+
+    // Load patches until one of them is a different waveform — a bank where
+    // every instrument happened to be a sine would prove nothing either way.
+    let browser = inst.presets().expect("its presets");
+    let list = browser.list();
+    assert!(list.len() > 100, "the bank is there");
+    let mut moved = None;
+    for entry in list.iter().step_by(37).take(12) {
+        browser.load(&entry.key);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        paths.ask(&path);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        if paths.value(&path).is_some_and(|v| v != before) {
+            moved = Some(entry.name.clone());
+            break;
+        }
+    }
+    assert!(
+        moved.is_some(),
+        "no patch moved the waveform, so nothing would ever read back"
+    );
 }

@@ -166,19 +166,6 @@ pub struct ArpSettings {
     pub on: bool,
     pub mode: ArpMode,
     pub div: TimeDiv,
-    /// Its own tempo, used while [`Self::sync`] is off.
-    pub bpm: f32,
-    /// Follow choz's transport instead of the tempo above.
-    ///
-    /// While the transport is **playing**, the steps land on its grid — the
-    /// beat is read from the song position, so two tabs stay in phase with each
-    /// other and with a tempo-synced plugin, and a busy UI thread cannot drag
-    /// them off it. While it is **stopped** the grid has nothing to lock to, so
-    /// the arpeggiator free-runs at the transport's tempo: somebody holding a
-    /// chord with the transport stopped wants to hear it, not to be told why
-    /// they cannot.
-    #[serde(default)]
-    pub sync: bool,
     /// Fraction of a step the note is held, 0.05..1.0.
     pub gate: f32,
     /// How far the off-beats are pushed late, 0.0..0.75 of a step.
@@ -202,8 +189,6 @@ impl Default for ArpSettings {
             on: false,
             mode: ArpMode::Up,
             div: TimeDiv::Sixteenth,
-            bpm: 120.0,
-            sync: false,
             gate: 0.5,
             swing: 0.0,
             octaves: 1,
@@ -529,14 +514,10 @@ impl Arp {
         // Taps are quarter notes, whatever the division is: that is what a tap
         // tempo means on every box that has one.
         let bpm = (60.0 / (total / intervals)).clamp(MIN_BPM, MAX_BPM);
-        // Synced there is one clock, and this is somebody asking *it* to go
-        // faster: writing a number the arpeggiator is not counting at would be
-        // a tap that does nothing.
-        if self.settings.sync {
-            choz_ports::transport().set_bpm(bpm);
-        } else {
-            self.settings.bpm = bpm;
-        }
+        // There is one clock, and this is somebody asking *it* to go faster:
+        // writing a number the arpeggiator is not counting at would be a tap
+        // that does nothing.
+        choz_ports::transport().set_bpm(bpm);
     }
 
     /// Stop whatever is sounding. `PANIC`, and switching the arpeggiator off.
@@ -611,9 +592,9 @@ impl Arp {
     /// position rather than from counting durations, so nothing accumulates.
     /// A stall skips steps instead of firing a burst to catch up, which is the
     /// same rule the free-running clock follows and for the same reason.
-    /// Whether the transport is the clock: `SYNC` on and something rolling.
+    /// Whether the transport is the clock: something rolling to lock to.
     fn synced(&self) -> bool {
-        self.settings.sync && choz_ports::transport().playing()
+        choz_ports::transport().playing()
     }
 
     /// The next step boundary, once it is close enough to send: `(index,
@@ -623,9 +604,6 @@ impl Arp {
     /// still further away than the lookahead. The index is remembered by the
     /// caller so the same one is never sent twice.
     fn next_grid_step(&self) -> Option<(i64, u64)> {
-        if !self.settings.sync {
-            return None;
-        }
         let transport = choz_ports::transport();
         if !transport.playing() {
             return None;
@@ -749,10 +727,10 @@ pub enum ArpParam {
     /// row the switch used to sit on, and that row is what a short screen does
     /// not have to spare.
     On,
-    /// Follow the transport's tempo and grid.
-    Sync,
     Mode,
     Div,
+    /// The transport's tempo, which is the only tempo the steps are counted
+    /// at — the arpeggiator follows the metronome, always.
     Bpm,
     Gate,
     Swing,
@@ -794,12 +772,6 @@ impl ArpSettings {
                 ArpParam::On,
                 "ARP",
                 self.on as u8 as f32,
-                ParamShape::Toggle,
-            ),
-            (
-                ArpParam::Sync,
-                "SYNC",
-                self.sync as u8 as f32,
                 ParamShape::Toggle,
             ),
             (
@@ -854,23 +826,18 @@ impl ArpSettings {
         out
     }
 
-    /// The tempo the steps are actually counted at: the transport's while
-    /// `SYNC` is on, its own otherwise. What the panel prints and what the
-    /// clock uses come from here, so they cannot disagree.
+    /// The tempo the steps are counted at: the transport's, always — the
+    /// arpeggiator has no clock of its own, so it cannot drift away from the
+    /// metronome. What the panel prints and what the clock uses come from here,
+    /// so they cannot disagree.
     pub fn tempo(&self) -> f32 {
-        if self.sync {
-            choz_ports::transport().bpm()
-        } else {
-            self.bpm
-        }
-        .clamp(MIN_BPM, MAX_BPM)
+        choz_ports::transport().bpm().clamp(MIN_BPM, MAX_BPM)
     }
 
     /// Where a control sits in 0..1 — the position the knob is drawn at.
     pub fn norm(&self, p: ArpParam) -> f32 {
         match p {
             ArpParam::On => self.on as u8 as f32,
-            ArpParam::Sync => self.sync as u8 as f32,
             ArpParam::Mode => {
                 let i = ArpMode::ALL
                     .iter()
@@ -885,8 +852,7 @@ impl ArpSettings {
                     .unwrap_or(0);
                 i as f32 / (TimeDiv::ALL.len() - 1) as f32
             }
-            // Synced, the knob shows the clock it is following — its own
-            // number would be a tempo nothing is playing at.
+            // The knob shows the clock it is following.
             ArpParam::Bpm => (self.tempo() - MIN_BPM) / (MAX_BPM - MIN_BPM),
             ArpParam::Gate => self.gate,
             ArpParam::Swing => self.swing / MAX_SWING,
@@ -908,18 +874,12 @@ impl ArpSettings {
         let pick = |n: usize| ((v * (n - 1) as f32).round() as usize).min(n - 1);
         match p {
             ArpParam::On => self.on = v >= 0.5,
-            ArpParam::Sync => self.sync = v >= 0.5,
             ArpParam::Mode => self.mode = ArpMode::ALL[pick(ArpMode::ALL.len())],
             ArpParam::Div => self.div = TimeDiv::ALL[pick(TimeDiv::ALL.len())],
-            // Synced, the knob moves the transport: there is one clock, and
-            // this is the tab asking for it to run faster.
+            // The knob moves the transport: there is one clock, and this is
+            // the tab asking for it to run faster.
             ArpParam::Bpm => {
-                let bpm = MIN_BPM + v * (MAX_BPM - MIN_BPM);
-                if self.sync {
-                    choz_ports::transport().set_bpm(bpm);
-                } else {
-                    self.bpm = bpm;
-                }
+                choz_ports::transport().set_bpm(MIN_BPM + v * (MAX_BPM - MIN_BPM));
             }
             ArpParam::Gate => self.gate = v.max(MIN_GATE),
             ArpParam::Swing => self.swing = v * MAX_SWING,
@@ -957,7 +917,6 @@ mod tests {
 
         let mut arp = Arp::default();
         arp.settings.on = true;
-        arp.settings.sync = true;
         arp.settings.swing = 0.0;
         arp.settings.div = TimeDiv::Sixteenth;
         arp.note_on(60, 100, Instant::now());
@@ -1020,7 +979,6 @@ mod tests {
 
         let mut arp = Arp::default();
         arp.settings.on = true;
-        arp.settings.sync = false;
         arp.note_on(60, 100, Instant::now());
 
         let start = Instant::now();
@@ -1063,5 +1021,4 @@ mod tests {
             "the new chord replaces the held one, and both its keys are in it"
         );
     }
-
 }

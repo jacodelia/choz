@@ -5,6 +5,7 @@ edition = "2024"
 description = "LV2 plugin hosting for choz (pure-Rust TTL parser + the LV2 C ABI, no lilv)."
 
 [dependencies]
+rtrb.workspace = true
 choz-ports.workspace = true
 anyhow.workspace = true
 libloading = "0.8"

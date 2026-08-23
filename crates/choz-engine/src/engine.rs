@@ -360,6 +360,10 @@ pub struct AudioEngine {
     /// capture moment, same reason: listing and loading a preset are main-thread
     /// work that the RT copy of the source can no longer be asked for.
     presets: Vec<Option<choz_ports::PresetsHandle>>,
+    /// Each slot's by-path control surface, when the plugin keeps its controls
+    /// somewhere a parameter list cannot reach — ZynAddSubFX's OSC server, and
+    /// its harmonics.
+    paths: Vec<Option<choz_ports::PathsHandle>>,
     /// What each slot's instrument reports when the user moves one of its knobs
     /// **inside the plugin's own window**. Same capture moment as the editor.
     touches: Vec<Option<choz_ports::TouchHandle>>,
@@ -678,6 +682,7 @@ impl AudioEngine {
             states: Vec::new(),
             fx_states: Vec::new(),
             presets: Vec::new(),
+            paths: Vec::new(),
             sandboxes: Vec::new(),
             fx_sandboxes: Vec::new(),
             fx_meters: Vec::new(),
@@ -889,6 +894,7 @@ impl AudioEngine {
         self.states.clear();
         self.fx_states.clear();
         self.presets.clear();
+        self.paths.clear();
         self.sandboxes.clear();
         self.fx_sandboxes.clear();
         self.fx_meters.clear();
@@ -1168,6 +1174,7 @@ impl AudioEngine {
         self.states.clear();
         self.fx_states.clear();
         self.presets.clear();
+        self.paths.clear();
         self.sandboxes.clear();
         self.fx_sandboxes.clear();
         self.fx_meters.clear();
@@ -1301,6 +1308,13 @@ impl AudioEngine {
             Some(Some(h)) => h.list(),
             _ => Vec::new(),
         }
+    }
+
+    /// Slot `slot`'s by-path control surface, when its instrument has one.
+    /// `None` for every plugin whose controls are all in its parameter list,
+    /// which is nearly all of them.
+    pub fn slot_paths(&self, slot: usize) -> Option<choz_ports::PathsHandle> {
+        self.paths.get(slot).cloned().flatten()
     }
 
     /// The key of the preset slot `slot`'s instrument says it is on, when its
@@ -1484,6 +1498,7 @@ impl AudioEngine {
         self.touches.push(source.param_touch());
         self.states.push(source.state());
         self.presets.push(source.presets());
+        self.paths.push(source.paths());
         self.sandboxes.push(source.sandbox());
         self.fx_editors.push(Vec::new());
         self.fx_touches.push(Vec::new());
@@ -1512,6 +1527,7 @@ impl AudioEngine {
             self.states.remove(slot);
             self.fx_states.remove(slot);
             self.presets.remove(slot);
+            self.paths.remove(slot);
             self.sandboxes.remove(slot);
             self.fx_sandboxes.remove(slot);
             self.fx_meters.remove(slot);
@@ -1708,6 +1724,7 @@ impl AudioEngine {
         self.touches[slot] = source.param_touch();
         self.states[slot] = source.state();
         self.presets[slot] = source.presets();
+        self.paths[slot] = source.paths();
         self.sandboxes[slot] = source.sandbox();
         self.send(EngineCommand::SetSlotSource { slot, source });
     }
