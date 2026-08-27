@@ -194,6 +194,18 @@ pub struct SplitView<'a> {
     pub chosen: usize,
     /// Whether `+` can still add one.
     pub can_add: bool,
+    /// The dialogue's own name: SPLIT, or the lane whose note is being picked.
+    pub title: String,
+    /// The line under the keyboard that says what clicking it does.
+    pub hint: String,
+    /// One key drawn as the chosen one — for the pickers that are choosing a
+    /// **note** rather than painting a zone, where nothing else on the keyboard
+    /// says where the setting currently sits.
+    pub highlight: Option<u8>,
+    /// Draw SELECT and CANCEL. SPLIT does not: it paints, and there is nothing
+    /// to take back. A picker does, because a note tried by ear has to be
+    /// possible to try and then not keep.
+    pub buttons: bool,
 }
 
 /// Where the SPLIT dialogue put things, for the mouse.
@@ -205,6 +217,10 @@ pub struct SplitRects {
     pub add: Option<Rect>,
     /// The piano. A click resolves to a note, and the note to its octave.
     pub keys: crate::views::midi_monitor::KeyMap,
+    /// Keep what was picked, and put back what was there. Drawn only for the
+    /// pickers that have something to take back — see [`SplitView::buttons`].
+    pub select: Option<Rect>,
+    pub cancel: Option<Rect>,
 }
 
 /// The octave index a note belongs to — the same indexing `octaves` uses.
@@ -230,7 +246,7 @@ pub fn draw_split_modal(f: &mut Frame, area: Rect, v: SplitView) -> SplitRects {
     };
     f.render_widget(Clear, popup);
     let block = Block::default()
-        .title(format!(" {} ", t("SPLIT")))
+        .title(format!(" {} ", v.title))
         .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border()))
@@ -286,9 +302,14 @@ pub fn draw_split_modal(f: &mut Frame, area: Rect, v: SplitView) -> SplitRects {
     }
 
     // ─── The piano, painted by which sound each octave plays ───────────
-    let note = t("  click an octave to give it the chosen sound, right-click to clear it");
+    let note = v.hint.as_str();
     let rows = content.height.saturating_sub(3).clamp(2, PIANO_ROWS);
     let paint = |n: u8| -> Option<Color> {
+        // The chosen note outranks the zones: on a picker there are none, and
+        // on one that has them the key being set is the thing to see.
+        if v.highlight == Some(n) {
+            return Some(HEADER); // the chosen note wears the accent every heading here does
+        }
         v.octaves
             .get(octave_of(n))
             .copied()
@@ -312,10 +333,43 @@ pub fn draw_split_modal(f: &mut Frame, area: Rect, v: SplitView) -> SplitRects {
     );
     rects.keys = keys;
 
-    f.render_widget(
-        Paragraph::new(Span::styled(note, Style::default().fg(HINT))),
-        Rect::new(content.x, content.y + content.height - 1, content.width, 1),
-    );
+    // The hint and the buttons share the last row: the box is sized to the
+    // keyboard, and a row of its own for two buttons would cost a row of keys.
+    let last = content.y + content.height - 1;
+    let mut hint_x = content.x;
+    if v.buttons {
+        let select = Rect::new(content.x, last, 10, 1);
+        let cancel = Rect::new(content.x + 11, last, 10, 1);
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                format!("  {}  ", t("SELECT")),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(OK)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            select,
+        );
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                format!("  {}  ", t("CANCEL")),
+                Style::default()
+                    .fg(Color::White)
+                    .bg(ERR)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            cancel,
+        );
+        hint_x = cancel.x + cancel.width + 2;
+        rects.select = Some(select);
+        rects.cancel = Some(cancel);
+    }
+    if hint_x < content.x + content.width {
+        f.render_widget(
+            Paragraph::new(Span::styled(note, Style::default().fg(HINT))),
+            Rect::new(hint_x, last, content.x + content.width - hint_x, 1),
+        );
+    }
     rects
 }
 

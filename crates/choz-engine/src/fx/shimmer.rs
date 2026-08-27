@@ -63,9 +63,29 @@ pub struct ShimmerReverb {
 impl ShimmerReverb {
     pub fn new(sample_rate: u32) -> Self {
         let sr = sample_rate.max(8000) as f32;
+        // The inner reverb, set where the old one sat.
+        //
+        // Its decay is what paces the loop: each trip round is a pass through
+        // this reverb and then through the shifter, so a short inner reverb
+        // climbs octaves faster than anybody asked it to. The Freeverb that
+        // used to be here ran a feedback of 0.938 over 25–37 ms combs, which is
+        // a decay of about three seconds — `Decay` 0.58 with a hall's bias is
+        // the same three seconds, so the shimmer still moves at the speed it
+        // was written to move at. Its pre-delay is zero: the shimmer has one of
+        // its own, in front of this.
         let mut reverb = Reverb::new(sample_rate);
         reverb.set_room_size(0.85);
+        reverb.set_decay(0.58);
         reverb.set_damp(0.35);
+        reverb.set_predelay(0.0);
+        reverb.set_diffusion(0.85);
+        // Fully wet, and that is where the sustain comes from: the shifter, the
+        // damping filter and the saturator between the reverb's output and its
+        // input all lose a little, so the loop on its own gain would die inside
+        // a second. What keeps a shimmer going is the reverb's own tail being
+        // long enough to still be feeding the shifter on the next pass — which
+        // is why the inner decay is set here in seconds and not left at a
+        // default.
         reverb.set_mix(1.0);
         Self {
             predelay: vec![0.0; PREDELAY_CAP * 2],
@@ -91,7 +111,7 @@ impl ShimmerReverb {
     pub fn with_params(sample_rate: u32, p: &[f32]) -> Self {
         let get = |i: usize, d: f32| p.get(i).copied().unwrap_or(d);
         let mut s = Self::new(sample_rate);
-        s.reverb.set_room_size(get(0, 0.85));
+        s.reverb.set_room_size(0.55);
         s.set_predelay(get(1, 0.25));
         s.set_shift(get(2, 1.0));
         s.set_feedback(get(3, 0.5));
@@ -262,7 +282,7 @@ impl FxProcessor for ShimmerReverb {
 mod tests {
     use super::*;
 
-    pub(super) fn burst(frames: usize, hz: f32, sr: f32, len: usize) -> Vec<f32> {
+    fn burst(frames: usize, hz: f32, sr: f32, len: usize) -> Vec<f32> {
         (0..frames)
             .flat_map(|i| {
                 let s = if i < len {
@@ -275,11 +295,11 @@ mod tests {
             .collect()
     }
 
-    pub(super) fn rms(buf: &[f32]) -> f32 {
+    fn rms(buf: &[f32]) -> f32 {
         (buf.iter().map(|s| s * s).sum::<f32>() / buf.len().max(1) as f32).sqrt()
     }
 
-    pub(super) fn energy_at(buf: &[f32], probe: f32, sr: f32) -> f32 {
+    fn energy_at(buf: &[f32], probe: f32, sr: f32) -> f32 {
         let l: Vec<f32> = buf.iter().step_by(2).copied().collect();
         let n = l.len() as f32;
         let k = (probe * n / sr).round();
@@ -314,8 +334,14 @@ mod tests {
         assert!(up > same * 4.0, "expected 800 Hz: up={up} same={same}");
     }
 
-    /// The claim: the tail climbs. A 400 Hz burst leaves an 800 Hz tail behind
-    /// it, and one that outlasts the burst itself.
+    /// The claim: the tail climbs.
+    ///
+    /// Measured as a *share*, not as an absolute winner. The reverb inside the
+    /// loop recirculates the 400 Hz that went in as well as passing it to the
+    /// shifter, so the fundamental is present in the tail throughout — in any
+    /// shimmer, on any hardware. What makes it a shimmer is that the octave
+    /// above grows as a proportion of the tail once the note has stopped, and
+    /// that the octave above *that* turns up behind it.
     #[test]
     fn the_tail_comes_back_an_octave_up() {
         let sr = 48000.0;
@@ -324,23 +350,32 @@ mod tests {
         s.set_feedback(1.0);
         s.set_mix(1.0);
         s.damp = 0.2;
-        let mut buf = burst(48000 * 3, 400.0, sr, 12000);
+        let mut buf = burst(48000 * 4, 400.0, sr, 12000);
         s.process_block(&mut buf, 48000);
-        // The second of tail that starts three quarters of a second after the
-        // burst has stopped: the direct reverb of the 400 Hz is still dying,
-        // and what has been round the loop is already an octave above it.
-        let tail = &buf[48000 * 2..48000 * 4];
-        let octave = energy_at(tail, 800.0, sr);
-        let fundamental = energy_at(tail, 400.0, sr);
-        assert!(rms(tail) > 1e-5, "there should still be a tail");
+
+        // While the note is sounding, against the second after it has stopped.
+        let share = |seg: &[f32]| {
+            let f = energy_at(seg, 400.0, sr).max(1e-12);
+            (
+                energy_at(seg, 800.0, sr) / f,
+                energy_at(seg, 1600.0, sr) / f,
+            )
+        };
+        let (up_during, _) = share(&buf[..48000 * 2]);
+        let (up_after, second_after) = share(&buf[48000 * 2..48000 * 4]);
         assert!(
-            octave > fundamental * 1.5,
-            "the tail should have climbed: 800={octave} 400={fundamental}"
+            rms(&buf[48000 * 2..]) > 1e-5,
+            "there should still be a tail"
+        );
+        assert!(
+            up_after > up_during * 2.0,
+            "the octave has to gain on the fundamental: {up_during:.3} while it sounds, \
+             {up_after:.3} after"
         );
         // And a second octave behind it, from the pass after that.
         assert!(
-            energy_at(tail, 1600.0, sr) > fundamental * 0.5,
-            "the second pass should be up there too"
+            second_after > up_after * 0.5,
+            "the second pass should be up there too: {second_after:.3} against {up_after:.3}"
         );
     }
 

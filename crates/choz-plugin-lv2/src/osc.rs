@@ -312,7 +312,11 @@ mod tests {
             let _ = read_value(&junk);
         }
         assert_eq!(read_value(&[]), None);
-        assert_eq!(read_value(b"/no-tags\0\0\0\0"), None, "no type tag, no value");
+        assert_eq!(
+            read_value(b"/no-tags\0\0\0\0"),
+            None,
+            "no type tag, no value"
+        );
     }
 
     /// A socket this process opened is one this process can find.    /// A socket this process opened is one this process can find.

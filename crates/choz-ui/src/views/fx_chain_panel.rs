@@ -27,7 +27,35 @@ const SEL: Color = Color::Yellow;
 /// A switch reads as on or off at a glance, which is the whole reason it is not
 /// drawn as an arc.
 const ON_COLOUR: Color = Color::Rgb(86, 200, 120);
+
+/// The looper strip's palette: a button's colour is how a symbol says which
+/// button it is. `M` and `S` are the same shape; white and amber are not.
+///
+/// Each has a banked-down twin for the same button switched off, so a strip
+/// reads the same whether anything is engaged on it or not.
+const WHITE: Color = Color::Rgb(236, 238, 244);
+const DIM_WHITE: Color = Color::Rgb(58, 62, 72);
+const AMBER: Color = Color::Rgb(230, 200, 120);
+const DIM_AMBER: Color = Color::Rgb(62, 54, 30);
+const BLUE: Color = Color::Rgb(96, 156, 236);
+const DIM_BLUE: Color = Color::Rgb(28, 44, 72);
+const RED: Color = Color::Rgb(224, 88, 84);
+const DIM_RED: Color = Color::Rgb(72, 28, 28);
+const DIM_GREEN: Color = Color::Rgb(26, 60, 38);
 const OFF_COLOUR: Color = Color::Rgb(96, 104, 118);
+
+/// Which of the tab's two note generators the RACK is showing.
+///
+/// They are drawn one at a time, as tabs: both boxes at once cost the panel
+/// nine rows it does not have, and a player is setting up one of them at a
+/// time. The switches stay visible on the tab row either way, so a running
+/// arpeggiator is never hidden behind a sequencer — only its controls are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GenTab {
+    #[default]
+    Arp,
+    Seq,
+}
 
 pub const FX_CELL_W: u16 = 13;
 
@@ -84,7 +112,8 @@ pub enum RackButton {
     InstrReset,
     /// The tab's arpeggiator. `ArpOn` is the only one drawn while it is off —
     /// a box of settings for something switched off is six rows of nothing in a
-    /// panel that is already tight.
+    /// panel that is already tight — and it sits on one row with `SeqOn`: the
+    /// two ways a tab makes notes are switched on side by side.
     ArpOn,
     ArpMode,
     ArpDiv,
@@ -98,6 +127,24 @@ pub enum RackButton {
     /// One key plays the memorised chord.
     ArpChord,
     ArpTap,
+    /// The tab's step sequencer. `SeqOn` is the only one drawn while it is
+    /// off, for the same reason `ArpOn` is: a grid for something switched off
+    /// is rows this panel does not have. Drawn beside `ArpOn`, in the same
+    /// shape.
+    SeqOn,
+    SeqPlay,
+    SeqRec,
+    /// Step the part being edited, `A`..`H`. In a box with a song chain it is
+    /// also what appends to it — see [`crate::seq::Seq::chain`].
+    SeqPart,
+    SeqChain,
+    SeqErase,
+    /// How long a step is — the sequencer's quantisation. Opens the list, the
+    /// way every other named value in this panel does.
+    SeqQuant,
+    /// The transport's time signature, which is what a bar of the pattern is
+    /// long. Opens the list too.
+    SeqTimeSig,
     /// What opens or ducks the selected effect: another tab, the external
     /// clock, or the internal metronome's tap.
     FxGate,
@@ -152,6 +199,149 @@ pub struct RackLayout {
     /// (knob index, rect) of the arpeggiator's own box, when it is drawn as
     /// one. Empty on a screen too short for it, where the controls are buttons.
     pub arp_knobs: Vec<(usize, Rect)>,
+    /// ((track, step), rect) of the sequencer's grid cells that are on screen.
+    /// Empty while it is off, or on a panel with no rows to draw a grid in.
+    pub seq_steps: Vec<((usize, usize), Rect)>,
+    /// (track, rect) of the grid's row letters. Clicking one opens the keyboard
+    /// that says which note the lane plays.
+    pub seq_tracks: Vec<(usize, Rect)>,
+    /// The FX CHAIN box itself. A click anywhere inside it hands it the arrows,
+    /// which is what turns its border yellow — the section is a box now, so it
+    /// says whether it is the live one the way every other box does.
+    pub fx_area: Option<Rect>,
+    /// `((track, button), rect)` for the looper deck's per-track transport.
+    /// Empty for every effect that is not one.
+    pub loop_hits: Vec<((usize, LoopBtn), Rect)>,
+    /// The deck's own row: paging, `+`, clear, export.
+    pub loop_deck: Vec<(LoopBtn, Rect)>,
+    /// `((channel, which), bar rect)` of a strip's two sliders — the pan and
+    /// the level. The rect is the bar alone, so where a click lands in it *is*
+    /// the value, the same contract the sequencer's sliders have.
+    pub loop_sliders: Vec<((usize, LoopBtn), Rect)>,
+    /// `(page, pages)` the deck was drawn with. The panel is the only side that
+    /// knows how many strips fit in the width, so it is the side that says how
+    /// many pages there are.
+    pub loop_pages: (usize, usize),
+    /// (slider, **bar** rect) of the sequencer's three variation sliders. The
+    /// rect is the bar alone and not the whole label, so where a click lands in
+    /// it *is* the value — see [`seq_slider_at`].
+    pub seq_sliders: Vec<(SeqSlider, Rect)>,
+}
+
+/// The sequencer's three variation sliders: what turns a written grid into a
+/// part that is played rather than repeated.
+///
+/// RAND and PROB are one gesture in two halves — **how far** a step may stray
+/// from what was written, and **how often** it is allowed to. Either at zero is
+/// the pattern exactly as it was typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeqSlider {
+    /// How far the off-beats are pushed back.
+    Swing,
+    /// How wide the deviation is when a step takes one.
+    Random,
+    /// How often a step takes one.
+    Prob,
+}
+
+/// A button on one looper channel strip, or on the deck's row under them.
+///
+/// Every one of these is a control the player can reach three ways — mouse,
+/// keyboard, or a learned CC — which is the point of a looper: whoever is
+/// recording has both hands on a guitar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopBtn {
+    /// Arm the channel, and close the take on the second press.
+    Rec,
+    /// Start the take — and, on a take already going, pause it in place. The
+    /// deck has one playhead, so a paused take comes back in time with the
+    /// others instead of at the top.
+    Play,
+    /// Give the take up. Where PAUSE keeps its place, this loses it, and the
+    /// deck rewinds once nothing is holding the playhead.
+    Stop,
+    Clear,
+    /// Out of the mix, this one.
+    Mute,
+    /// Only this one — a mute of everything else, and only while something is
+    /// soloed.
+    Solo,
+    /// Throw the channel away. On the strip's top-right corner, where a window
+    /// puts its close box.
+    Del,
+    /// Where the take sits between the speakers. A slider: what it answers is
+    /// **where** it was clicked, not that it was.
+    Pan,
+    /// How loud the take plays. A slider, like the pan.
+    Vol,
+    /// What this channel's closed take rounds to.
+    Quant,
+    /// choz's own metronome, from the strip. Not a setting of the deck's: it is
+    /// the same click every other part of the program hears, on the same
+    /// transport the quantise rounds to.
+    Metro,
+    Export,
+    /// One more channel strip, up to [`choz_ports::LOOP_TRACKS`].
+    AddChan,
+    PagePrev,
+    PageNext,
+}
+
+impl LoopBtn {
+    /// The buttons of one strip, top to bottom, as the keyboard walks them.
+    /// The input monitor is not among them — it is a reading, not a control.
+    /// ponytail: the two sliders are not on this walk — they are grabbed, and
+    /// they are parameters, so a learned CC reaches them. Give them a keyboard
+    /// step if anyone asks for one.
+    pub const STRIP: [LoopBtn; 8] = [
+        LoopBtn::Metro,
+        LoopBtn::Quant,
+        LoopBtn::Mute,
+        LoopBtn::Solo,
+        LoopBtn::Stop,
+        LoopBtn::Play,
+        LoopBtn::Rec,
+        LoopBtn::Del,
+    ];
+
+    /// The deck's own row, under the strips — one more stop on the same walk,
+    /// so `+`, the page arrows, CLEAR and EXPORT are all reachable without a
+    /// mouse.
+    pub const DECK: [LoopBtn; 5] = [
+        LoopBtn::PagePrev,
+        LoopBtn::PageNext,
+        LoopBtn::AddChan,
+        LoopBtn::Clear,
+        LoopBtn::Export,
+    ];
+
+    /// Whether this button belongs to the row under the strips.
+    pub fn on_deck(self) -> bool {
+        Self::DECK.contains(&self)
+    }
+}
+
+/// Cells the bar of a slider is drawn in.
+pub const SEQ_BAR_W: u16 = 8;
+
+/// A slider as it is drawn: the whole label, and how many columns come before
+/// its bar. The two are built together so the drawing and the mouse cannot
+/// disagree about where the bar is.
+fn seq_slider_label(name: &str, v: f32) -> (String, u16) {
+    let v = v.clamp(0.0, 1.0);
+    let filled = (v * SEQ_BAR_W as f32).round() as usize;
+    let bar: String = (0..SEQ_BAR_W as usize)
+        .map(|i| if i < filled { '\u{2588}' } else { '\u{2591}' })
+        .collect();
+    let head = format!(" {name} ");
+    let prefix = head.chars().count() as u16;
+    (format!("{head}{bar} {:>3.0}% ", v * 100.0), prefix)
+}
+
+/// The value a click at column `x` on a slider's bar means, 0..1.
+pub fn seq_slider_at(bar: Rect, x: u16) -> f32 {
+    let span = bar.width.saturating_sub(1).max(1) as f32;
+    (x.saturating_sub(bar.x) as f32 / span).clamp(0.0, 1.0)
 }
 
 /// What the SLOT box says about the selected effect beyond its buttons: what is
@@ -534,6 +724,13 @@ impl ButtonRow {
         self.draw(f, text, style, 1)
     }
 
+    /// Whether anything was drawn on it. A row nobody used costs a line the
+    /// RACK does not have — which is what the arpeggiator's row became once
+    /// its switch moved up beside the sequencer's.
+    fn used(&self) -> bool {
+        self.x > self.inner.x + self.indent
+    }
+
     /// The first line below the row.
     fn finish(self) -> u16 {
         self.y + 1
@@ -560,6 +757,7 @@ fn gate_source_mark(source: choz_engine::fx_chain::GateSource) -> String {
         GateSource::Tab(i) => (i + 1).to_string(),
         GateSource::Clock => "CLK".into(),
         GateSource::Metronome => "MET".into(),
+        GateSource::Seq => "SEQ".into(),
     }
 }
 
@@ -597,10 +795,6 @@ const ARP_KNOB_ROWS: usize = 2;
 /// What one row of knobs costs: the arc, the value and the name.
 const ARP_KNOBS_ROWS: u16 = 3;
 
-/// The row the TAP button sits on. It is never a knob — tapping a tempo is a
-/// gesture, and a gesture has no position to be turned to.
-const ARP_TAP_ROW: u16 = 1;
-
 /// Which of the three shapes the arpeggiator's controls take, decided by the
 /// rows the panel has left rather than by a setting: the same controls either
 /// way, and nothing to get wrong when a window is resized.
@@ -621,8 +815,17 @@ enum ArpShape {
 /// knob box for the selected one. The SLOT box below them is already drawn only
 /// where it fits, so it is not counted here — this is the floor, not the wish.
 ///
+/// A knob shape costs the arpeggiator no row of its own: its switch is on the
+/// row of switches above, beside the sequencer's, and TAP rides the box's top
+/// edge. Only the row-of-buttons shape spends a line, and it spends its own.
+///
 /// The arpeggiator only takes a knob shape when this much is left after it,
 /// which is what keeps a five-inch screen showing an FX chain at all.
+///
+/// Still seven now the section draws itself as a box: the frame costs a row
+/// more than the rule it replaced, and taking that row from this floor instead
+/// is what put a five-inch screen back to buttons where it used to have knobs.
+/// The chain gives up the row; the generator above it keeps its shape.
 const FX_CHAIN_ROWS: u16 = 7;
 
 pub fn param_grid(width: u16, n: usize) -> (usize, usize) {
@@ -812,6 +1015,293 @@ pub struct SoundsView<'a> {
     pub split: bool,
 }
 
+/// Rows the sequencer's grid needs before it is worth drawing one: the box's
+/// two border rows, its step ruler, and a single track.
+const SEQ_BOX_ROWS: u16 = 4;
+
+/// Columns the grid needs: the note label, sixteen cells, the three gaps
+/// between the four groups of four, and the border.
+const SEQ_BOX_COLS: u16 = 26;
+
+/// Draw the tab's step sequencer above the instrument — the order the signal
+/// runs in, which is the order the panel is read in: the notes are made here,
+/// the instrument plays them, the chain colours them.
+///
+/// One row of buttons while it is off, and the grid on top of that row when it
+/// is on and the panel has the rows for it. Same rule the arpeggiator follows,
+/// for the same reason: the RACK is short of rows before it is short of
+/// anything else.
+#[allow(clippy::too_many_arguments)]
+fn draw_seq_box(
+    f: &mut Frame,
+    inner: Rect,
+    mut y: u16,
+    seq: crate::seq::SeqView<'_>,
+    focused: bool,
+    bg: Style,
+    btn_style: Style,
+    layout: &mut RackLayout,
+) -> u16 {
+    use crate::seq::{part_name, STEPS, TRACKS};
+
+    let s = seq.settings;
+    let lit = Style::default()
+        .fg(Color::Black)
+        .bg(ON_COLOUR)
+        .add_modifier(Modifier::BOLD);
+    let armed = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Rgb(210, 80, 76))
+        .add_modifier(Modifier::BOLD);
+
+    // The switch is not here: it sits beside the arpeggiator's, on the row of
+    // switches above both of them. Off, this box is nothing at all.
+    if !s.on {
+        return y;
+    }
+    let mut row = ButtonRow::new(inner, bg, y, 2);
+    let mut button = |row: &mut ButtonRow, f: &mut Frame, btn, text: String, style| {
+        let rect = row.button(f, text, style);
+        layout.buttons.push((btn, rect));
+    };
+    button(
+        &mut row,
+        f,
+        RackButton::SeqPlay,
+        format!(" {} ", t(if seq.playing { "STOP" } else { "PLAY" })),
+        if seq.playing { lit } else { btn_style },
+    );
+    // REC arms the recorder; what it writes is whatever is played into the tab,
+    // quantised to the step the playhead is on.
+    button(
+        &mut row,
+        f,
+        RackButton::SeqRec,
+        " REC ".to_string(),
+        if seq.rec { armed } else { btn_style },
+    );
+    button(
+        &mut row,
+        f,
+        RackButton::SeqPart,
+        format!(" PART {} ", part_name(s.part)),
+        btn_style,
+    );
+    // Quantisation and metre: the step length, and how many steps a bar of it
+    // is. Both open a list rather than cycling — stepping eight divisions with
+    // a button to reach 1/16T is a knob pretending to be a menu.
+    button(
+        &mut row,
+        f,
+        RackButton::SeqQuant,
+        format!(" QUANT {} ", s.div.label()),
+        btn_style,
+    );
+    let (num, den) = choz_ports::transport().time_signature();
+    button(
+        &mut row,
+        f,
+        RackButton::SeqTimeSig,
+        format!(" {num}/{den} ", num = num, den = den),
+        btn_style,
+    );
+    // The chain is written the way an MMT-8 writes one: the part being edited,
+    // appended in the order the parts should play.
+    button(
+        &mut row,
+        f,
+        RackButton::SeqChain,
+        if s.song.is_empty() {
+            " SONG \u{2013} ".to_string()
+        } else {
+            format!(
+                " SONG {} ",
+                s.song
+                    .iter()
+                    .map(|p| part_name(*p).to_string())
+                    .collect::<Vec<_>>()
+                    .join("")
+            )
+        },
+        if s.song.is_empty() { btn_style } else { lit },
+    );
+    button(
+        &mut row,
+        f,
+        RackButton::SeqErase,
+        " ERASE ".to_string(),
+        btn_style,
+    );
+    // The three variations, as sliders: a grid is a rhythm nobody played, and
+    // these are what make it one that somebody might have. They wrap onto the
+    // next line with the rest of the row when the panel is narrow.
+    for (slider, name, value) in [
+        (SeqSlider::Swing, "SWING", s.swing / crate::seq::MAX_SWING),
+        (SeqSlider::Random, "RAND", s.random),
+        (SeqSlider::Prob, "PROB", s.prob),
+    ] {
+        let (label, prefix) = seq_slider_label(name, value);
+        let rect = row.button(
+            f,
+            label,
+            if value > 0.0 {
+                Style::default()
+                    .fg(ON_COLOUR)
+                    .bg(bg.bg.unwrap_or(Color::Reset))
+            } else {
+                btn_style
+            },
+        );
+        // Only the bar answers the mouse, and only as far as it was really
+        // drawn: a row that wrapped mid-label hands back a short rect.
+        let bar_x = rect.x + prefix;
+        let bar_w = SEQ_BAR_W.min((rect.x + rect.width).saturating_sub(bar_x));
+        if bar_w > 0 {
+            layout
+                .seq_sliders
+                .push((slider, Rect::new(bar_x, rect.y, bar_w, 1)));
+        }
+    }
+    y = row.finish();
+
+    // The grid, when there are rows left for one after the FX chain has its
+    // floor. Fewer tracks than eight is not a failure: the window follows the
+    // cursor, so every track is reachable on a screen that can only show two.
+    let room = (inner.y + inner.height).saturating_sub(y);
+    if room < SEQ_BOX_ROWS + FX_CHAIN_ROWS || inner.width < SEQ_BOX_COLS {
+        return y;
+    }
+    let rows = (room - FX_CHAIN_ROWS - 3).min(TRACKS as u16).max(1) as usize;
+    // Keep the cursor's track on screen, and show the tracks that follow it.
+    let first = seq
+        .cursor
+        .0
+        .saturating_sub(rows - 1)
+        .min(TRACKS.saturating_sub(rows));
+
+    // The cursor's lane says which note it plays: the rows are letters now, so
+    // this is where the note went — on the one row somebody is looking at.
+    let title = format!(
+        " {} \u{00B7} {} {} \u{00B7} {} {} \u{00B7} {} {}{} ",
+        t("SEQ"),
+        t("PART"),
+        part_name(s.part),
+        s.events(),
+        t("EVENTS"),
+        crate::seq::track_name(seq.cursor.0),
+        crate::seq::note_name(s.notes[seq.cursor.0.min(TRACKS - 1)]),
+        if focused && seq.focused {
+            String::new()
+        } else {
+            "  [K]".to_string()
+        }
+    );
+    let height = rows as u16 + 3;
+    let area = Rect::new(inner.x, y, inner.width, height);
+    let block = Block::default()
+        .title(title)
+        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(if focused && seq.focused {
+            Style::default().fg(SEL).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(ui_border())
+        });
+    let grid = block.inner(area);
+    f.render_widget(block, area);
+
+    // Where a step's cell starts, counting the gap after every fourth one —
+    // the beat, which is the only thing that makes sixteen cells readable.
+    let cell_x = |step: usize| grid.x + SEQ_LABEL_W + step as u16 + (step / 4) as u16;
+
+    // The ruler: the beat numbers, and the playhead over them.
+    let mut ruler: Vec<Span> = vec![Span::styled(
+        " ".repeat(SEQ_LABEL_W as usize),
+        Style::default().fg(LABEL),
+    )];
+    for step in 0..STEPS {
+        if step % 4 == 0 && step > 0 {
+            ruler.push(Span::raw(" "));
+        }
+        let here = seq.playing && seq.step == step;
+        ruler.push(Span::styled(
+            if step >= seq.bar {
+                " ".to_string()
+            } else if step % 4 == 0 {
+                (step / 4 + 1).to_string()
+            } else {
+                "\u{00B7}".to_string()
+            },
+            if here {
+                Style::default().fg(Color::Black).bg(SEL)
+            } else {
+                Style::default().fg(LABEL)
+            },
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(ruler)).style(bg),
+        Rect::new(grid.x, grid.y, grid.width, 1),
+    );
+
+    for (i, track) in (first..first + rows).enumerate() {
+        let row_y = grid.y + 1 + i as u16;
+        // The lane's letter, not its note: a row named after a setting is a
+        // row that renames itself while the pattern is being read. The note is
+        // one click away — the letter opens a keyboard.
+        let label = format!(" {}  ", crate::seq::track_name(track));
+        let mut spans: Vec<Span> = vec![Span::styled(
+            label,
+            Style::default().fg(if seq.cursor.0 == track { SEL } else { LABEL }),
+        )];
+        layout
+            .seq_tracks
+            .push((track, Rect::new(grid.x, row_y, SEQ_LABEL_W, 1)));
+        for step in 0..STEPS {
+            if step % 4 == 0 && step > 0 {
+                spans.push(Span::raw(" "));
+            }
+            let on = s.step_on(track, step);
+            let cursor = focused && seq.focused && seq.cursor == (track, step);
+            let head = seq.playing && seq.step == step;
+            // Past the end of the bar: drawn, so the metre is visible as the
+            // shape of the pattern, and never played.
+            let outside = step >= seq.bar;
+            let style = if cursor {
+                Style::default().fg(Color::Black).bg(SEL)
+            } else if on {
+                Style::default().fg(if outside { OFF_COLOUR } else { ON_COLOUR })
+            } else if head {
+                Style::default().fg(RULE).bg(Color::Rgb(48, 56, 68))
+            } else {
+                Style::default().fg(RULE)
+            };
+            spans.push(Span::styled(
+                if on {
+                    "\u{25A0}"
+                } else if outside {
+                    " "
+                } else {
+                    "\u{00B7}"
+                }
+                .to_string(),
+                style,
+            ));
+            layout
+                .seq_steps
+                .push(((track, step), Rect::new(cell_x(step), row_y, 1, 1)));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(bg),
+            Rect::new(grid.x, row_y, grid.width, 1),
+        );
+    }
+    area.y + area.height
+}
+
+/// Columns the note name of a track takes, plus the space after it.
+const SEQ_LABEL_W: u16 = 4;
+
 /// Draw the RACK panel and return its click rects.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_fx_chain_panel(
@@ -866,6 +1356,12 @@ pub fn draw_fx_chain_panel(
     // The tab's arpeggiator: settings plus where its sequencer is. Drawn as one
     // line while it is off, two when it is on.
     arp: crate::arp::ArpView<'_>,
+    // The tab's step sequencer, drawn above the instrument because that is the
+    // order the notes travel in. `None` for a rack with no tab at all.
+    seq: Option<crate::seq::SeqView<'_>>,
+    // Which generator's controls are on screen. The other one keeps running;
+    // only its box is put away.
+    gen_tab: GenTab,
     // Which input algorithm the tab runs, and the knobs of the ALGO box — the
     // picker first, then whatever the running algorithm owns. Both come from
     // the interface rather than being worked out again here: a box whose knobs
@@ -877,6 +1373,9 @@ pub fn draw_fx_chain_panel(
     fx_info: FxSlotInfo,
     // The tab's sound buttons: a footswitch's worth of patches.
     sounds: SoundsView<'_>,
+    // The looper deck in the selected slot, when that is what it is. Read from
+    // the handle's atomics, so what is drawn is what the callback published.
+    deck: Option<LoopView<'_>>,
 ) -> RackLayout {
     let has_presets = preset.is_some();
     let mut layout = RackLayout::default();
@@ -915,25 +1414,6 @@ pub fn draw_fx_chain_panel(
             );
         }
     };
-    let rule = |f: &mut Frame, label: &str, y: u16| {
-        if y >= inner.y + inner.height {
-            return;
-        }
-        let text = format!("\u{2500}\u{2500} {label} ");
-        let pad = (inner.width as usize).saturating_sub(text.chars().count());
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    text,
-                    Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("\u{2500}".repeat(pad), Style::default().fg(RULE)),
-            ]))
-            .style(bg),
-            Rect::new(inner.x, y, inner.width, 1),
-        );
-    };
-
     let mut y = inner.y;
 
     // ── Tabs ───────────────────────────────────────────────────────────────
@@ -1287,6 +1767,90 @@ pub fn draw_fx_chain_panel(
         y = row.finish();
     }
 
+    // ── The two note generators, as tabs ───────────────────────────────────
+    //
+    // A tab can make notes two ways — a pattern of steps and an arpeggiator —
+    // and they share one row and one strip of rows below it: the tabs pick
+    // which set of controls is on screen, and the `●`/`○` on each says whether
+    // that one is running whether or not it is the one showing. Both boxes at
+    // once cost nine rows the RACK does not have, and nobody is dialling in
+    // two generators in the same second.
+    //
+    // Clicking a tab that is not showing brings it up; clicking the one that
+    // already is switches it on or off — the same "select, then act" the knobs
+    // in this panel answer a second click with.
+    {
+        let mut row = ButtonRow::new(inner, bg, y, 2);
+        // The knob box addresses its controls by what they are, so the switch
+        // is highlighted from the cursor's *parameter*, not from its position.
+        let arp_selected = focused
+            && arp.focused
+            && arp
+                .knobs()
+                .get(arp.cursor)
+                .map(|(p, ..)| *p)
+                .is_some_and(|p| p == crate::arp::ArpParam::On);
+        let switch = |f: &mut Frame,
+                      row: &mut ButtonRow,
+                      layout: &mut RackLayout,
+                      btn: RackButton,
+                      label: &str,
+                      on: bool,
+                      selected: bool,
+                      showing: bool| {
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(SEL)
+                    .add_modifier(Modifier::BOLD)
+            } else if showing {
+                // The tab whose controls are on screen wears the panel's own
+                // header colour, exactly as the rack's slot tabs do — one tab
+                // idiom, not two.
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(if on { ON_COLOUR } else { HEADER })
+                    .add_modifier(Modifier::BOLD)
+            } else if on {
+                Style::default()
+                    .fg(ON_COLOUR)
+                    .bg(Color::Rgb(40, 46, 56))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::Rgb(200, 205, 215))
+                    .bg(Color::Rgb(40, 46, 56))
+            };
+            let text = format!(" {} {} ", label, if on { "\u{25CF}" } else { "\u{25CB}" });
+            let rect = row.button(f, text, style);
+            layout.buttons.push((btn, rect));
+        };
+        switch(
+            f,
+            &mut row,
+            &mut layout,
+            RackButton::ArpOn,
+            t("ARP"),
+            arp.settings.on,
+            arp_selected,
+            gen_tab == GenTab::Arp,
+        );
+        // Drawn even for a rack with no tab: an empty rack shows the controls
+        // it would have, and a switch that appears only sometimes is a switch
+        // nobody learns where to find.
+        switch(
+            f,
+            &mut row,
+            &mut layout,
+            RackButton::SeqOn,
+            t("SEQ"),
+            seq.is_some_and(|v| v.settings.on),
+            false,
+            gen_tab == GenTab::Seq,
+        );
+        y = row.finish();
+    }
+
     // ── Arpeggiator ────────────────────────────────────────────────────────
     //
     // Off, it is a single switch: a bordered box for something most tabs never
@@ -1298,8 +1862,8 @@ pub fn draw_fx_chain_panel(
     // a handful of rows, and five of them spent on a bordered box would leave
     // no FX chain — so there the controls stay a row of buttons, wrapping. Same
     // controls either way; only the shape changes.
-    let arp_boxed;
-    {
+    let mut arp_boxed = false;
+    if gen_tab == GenTab::Arp {
         let s = arp.settings;
         // Which control the arrows are on, as buttons rather than as a knob:
         // on a panel too short for the box the row **is** the box, and a
@@ -1355,9 +1919,9 @@ pub fn draw_fx_chain_panel(
         let room = (inner.y + inner.height).saturating_sub(y);
         let shape = if !s.on {
             ArpShape::Off
-        } else if room >= ARP_KNOBS_ROWS + 2 + ARP_TAP_ROW + FX_CHAIN_ROWS {
+        } else if room >= ARP_KNOBS_ROWS + 2 + FX_CHAIN_ROWS {
             ArpShape::Boxed
-        } else if room >= ARP_KNOBS_ROWS + ARP_TAP_ROW + FX_CHAIN_ROWS {
+        } else if room >= ARP_KNOBS_ROWS + FX_CHAIN_ROWS {
             ArpShape::Strip
         } else {
             ArpShape::Buttons
@@ -1365,26 +1929,11 @@ pub fn draw_fx_chain_panel(
         let boxed = matches!(shape, ArpShape::Boxed | ArpShape::Strip);
         arp_boxed = boxed;
 
-        // The switch is a knob inside the box when there is one — the header
-        // row it used to live on is a row, and a row is what is scarce. TAP is
-        // never a knob: tapping a tempo is a gesture, not a position.
+        // The switch is on the row of switches above, beside the sequencer's:
+        // the two generators a tab has are turned on in the same place, in the
+        // same shape, whatever shape their controls then take. TAP is never a
+        // knob either way: tapping a tempo is a gesture, not a position.
         let mut row = ButtonRow::new(inner, bg, y, 2);
-        if !boxed {
-            // One `ARP`, not two: the switch says the word, so a label saying
-            // it again beside the button read as `ARP ARP \u{25CB}`.
-            button(
-                &mut row,
-                f,
-                &mut layout,
-                RackButton::ArpOn,
-                format!(
-                    " {} {} ",
-                    t("ARP"),
-                    if s.on { "\u{25CF}" } else { "\u{25CB}" }
-                ),
-                s.on,
-            );
-        }
         // TAP only rides the button row in the shapes that *are* a button row.
         // With a box, it goes on the box's own top edge — a gesture that
         // belongs to the arpeggiator should not be floating above it.
@@ -1488,7 +2037,7 @@ pub fn draw_fx_chain_panel(
                 s.chord,
             );
         }
-        y = row.finish();
+        y = if row.used() { row.finish() } else { y };
 
         if boxed {
             let box_top = y;
@@ -1512,31 +2061,17 @@ pub fn draw_fx_chain_panel(
                 matches!(shape, ArpShape::Boxed),
             );
             layout.arp_knobs = rects;
-            // The switch and TAP ride the box's top edge, right-aligned, in
-            // that order. The switch is there at all because with the box open
-            // the only way to stop the arpeggiator was to walk the cursor onto
-            // its first knob and press Enter — a switch you can turn on with
-            // one click and not off with one is not a switch. The edge rather
-            // than a row of its own, because rows are what this panel never
-            // has, and not the left edge because that is where the box says
-            // which key hands it the arrows.
+            // TAP rides the box's top edge, right-aligned: a gesture that
+            // belongs to the arpeggiator should not be floating above it, and
+            // the edge costs no row — which is what this panel never has. Not
+            // the left edge, because that is where the box says which key
+            // hands it the arrows.
             if matches!(shape, ArpShape::Boxed) {
-                let labels = [
-                    (
-                        RackButton::ArpOn,
-                        format!(
-                            " {} {} ",
-                            t("ARP"),
-                            if s.on { "\u{25CF}" } else { "\u{25CB}" }
-                        ),
-                        true,
-                    ),
-                    (
-                        RackButton::ArpTap,
-                        format!(" TAP {:>3.0} ", s.tempo()),
-                        false,
-                    ),
-                ];
+                let labels = [(
+                    RackButton::ArpTap,
+                    format!(" TAP {:>3.0} ", s.tempo()),
+                    false,
+                )];
                 let total: u16 = labels
                     .iter()
                     .map(|(_, l, _)| l.chars().count() as u16)
@@ -1570,9 +2105,21 @@ pub fn draw_fx_chain_panel(
         }
     }
 
-    // Whichever box has the arrows is the one drawn live: with three boxes on
+    // ── Sequencer ──────────────────────────────────────────────────────────
+    //
+    // Above the instrument: the sequencer makes the notes, the instrument plays
+    // them. Reading the panel downwards is reading the signal in order.
+    let seq_focused = gen_tab == GenTab::Seq && seq.is_some_and(|v| v.focused);
+    if let (GenTab::Seq, Some(view)) = (gen_tab, seq) {
+        y = draw_seq_box(f, inner, y, view, focused, bg, btn_style, &mut layout);
+    }
+
+    // Whichever box has the arrows is the one drawn live: with four boxes on
     // the panel, "not the instrument's" stopped being the same as "the FX's".
-    let fx_focused = focused && !instr_focused && !(arp_boxed && arp.focused);
+    let fx_focused = focused
+        && !instr_focused
+        && !(gen_tab == GenTab::Arp && arp_boxed && arp.focused)
+        && !seq_focused;
 
     // ── Instrument parameters ──────────────────────────────────────────────
     if !instr_params.is_empty() {
@@ -1698,12 +2245,40 @@ pub fn draw_fx_chain_panel(
     }
 
     // ── FX chain ───────────────────────────────────────────────────────────
-    rule(f, t("FX CHAIN"), y);
-    y += 1;
+    //
+    // Its own box, and not a rule with everything after it floating on the
+    // panel: the chain's buttons, the effect's knobs and the SLOT controls are
+    // one section, and a divider said so in the wrong place — everything below
+    // it, including the hint, read as part of the chain. The INSTRUMENT above
+    // already draws itself as a box, and this is the same section drawn the
+    // same way.
+    let chain_area = Rect::new(
+        inner.x,
+        y,
+        inner.width,
+        (inner.y + inner.height).saturating_sub(y + 1),
+    );
+    if chain_area.height < 3 {
+        return layout;
+    }
+    let chain_block = Block::default()
+        .title(format!(" {} ", t("FX CHAIN")))
+        .title_style(Style::default().fg(LABEL).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(if fx_focused {
+            Style::default().fg(SEL).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(RULE)
+        })
+        .style(bg);
+    let fx_box = chain_block.inner(chain_area);
+    f.render_widget(chain_block, chain_area);
+    layout.fx_area = Some(chain_area);
+    y = fx_box.y;
 
     // Chain buttons wrap onto further lines instead of running off the panel —
     // the same row as the arpeggiator's, from the same helper.
-    let mut row = ButtonRow::new(inner, bg, y, 2);
+    let mut row = ButtonRow::new(fx_box, bg, y, 2);
     for (i, entry) in chain.iter().enumerate() {
         let st = if i == fx_slot && focused {
             Style::default()
@@ -1745,13 +2320,13 @@ pub fn draw_fx_chain_panel(
 
     let Some(entry) = chain.get(fx_slot) else {
         if chain.is_empty() {
-            put(
-                f,
-                Line::from(Span::styled(
-                    "   no FX yet \u{2014} press 'a' or click [+ ADD]",
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    " no FX yet \u{2014} press 'a' or click [+ ADD]",
                     Style::default().fg(Color::DarkGray),
-                )),
-                y,
+                )))
+                .style(bg),
+                Rect::new(fx_box.x, y, fx_box.width, 1),
             );
         }
         return layout;
@@ -1769,7 +2344,7 @@ pub fn draw_fx_chain_panel(
                 .add_modifier(Modifier::BOLD),
             false => btn_style,
         };
-        let mut row = ButtonRow::new(inner, bg, y, 2);
+        let mut row = ButtonRow::new(fx_box, bg, y, 2);
         let rect = row.button(
             f,
             match entry.gate {
@@ -1847,7 +2422,7 @@ pub fn draw_fx_chain_panel(
         let title = format!("{}:{}", fx_slot + 1, entry.label());
         let (band_rects, after) = draw_eq_bank(
             f,
-            inner,
+            fx_box,
             y,
             &entry.params[..n],
             &labels,
@@ -1861,7 +2436,7 @@ pub fn draw_fx_chain_panel(
             y = after;
             let (rest, next) = draw_knob_box(
                 f,
-                inner,
+                fx_box,
                 y,
                 "",
                 &entry.params[n..],
@@ -1882,12 +2457,23 @@ pub fn draw_fx_chain_panel(
         }
     }
 
-    let (rects, next) = if drawn {
+    // The deck draws in place of the knob grid — eight three-position knobs is
+    // sixteen arcs reading "0.50", and a transport is read as buttons. The SLOT
+    // box below still belongs to it: it is an effect in a chain like any other.
+    let deck_drawn = match deck {
+        Some(view) => {
+            y = draw_loop_deck(f, fx_box, y, view, fx_focused, bg, btn_style, &mut layout);
+            true
+        }
+        None => false,
+    };
+
+    let (rects, next) = if drawn || deck_drawn {
         (Vec::new(), y)
     } else {
         draw_knob_box(
             f,
-            inner,
+            fx_box,
             y,
             &format!(
                 "{}:{}{}",
@@ -1922,7 +2508,7 @@ pub fn draw_fx_chain_panel(
     // thing they cannot: the live reading. Two rows, because a pitch corrector
     // that cannot be seen working can only be trusted or not.
     if let Some((m, trace)) = at_view {
-        y = draw_autotune_readout(f, inner, y, m, trace, bg);
+        y = draw_autotune_readout(f, fx_box, y, m, trace, bg);
     }
 
     // ── What the parametric EQ is doing to the signal ─────────────────────
@@ -1930,14 +2516,14 @@ pub fn draw_fx_chain_panel(
     // the curve near Nyquist, and the panel does not get a knob's worth of
     // plumbing for a difference nobody can see at this many pixels per octave.
     if entry.plugin.is_none() && entry.kind == crate::source::AudioFxKind::ParamEq {
-        y = draw_eq_curve(f, inner, y, &entry.params, 48_000, bg);
+        y = draw_eq_curve(f, fx_box, y, &entry.params, 48_000, bg);
     }
 
     // ── Slot controls, in their own box, one blank line below the knobs ────
-    if y + 2 < inner.y + inner.height {
+    if y + 2 < fx_box.y + fx_box.height {
         y += 1;
         let ctrl_h = 3u16;
-        let ctrl_rect = Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), ctrl_h);
+        let ctrl_rect = Rect::new(fx_box.x, y, fx_box.width, ctrl_h);
         // The title carries the meter: the box is one row of buttons, and a
         // second row for two numbers would cost a line of knobs.
         let mut title = format!(" {} ", t("SLOT"));
@@ -2078,7 +2664,9 @@ pub fn draw_fx_chain_panel(
 
     // ── Hint, last line of the panel ───────────────────────────────────────
     let hint_y = (inner.y + inner.height).saturating_sub(1).max(y);
-    let hint = if focused {
+    let hint = if focused && deck_drawn {
+        "  k=box \u{2190}\u{2192}=channel \u{2191}\u{2193}=button enter=press \u{00B7} PLAY is also PAUSE \u{00B7} \u{2669} is choz's own click \u{00B7} [\u{00D7}] drops a channel \u{00B7} the pan and the level are grabbed, not walked"
+    } else if focused {
         "  1=source 2=bank/preset 3=learn 4=plugin window k=box p=instr P=fx preset x/X=sandbox \u{00B7} a=add d=del \u{2190}\u{2192}=FX \u{2191}\u{2193}=param wheel=value \u{00B7} -/+=vol ,/.=pan m=mute S=solo"
     } else {
         "  Tab=enter the rack"
@@ -2093,6 +2681,477 @@ pub fn draw_fx_chain_panel(
     );
 
     layout
+}
+
+/// What the panel needs to draw a deck. Read from the handle's atomics, which
+/// the audio thread publishes every block — the same contract the meters have.
+#[derive(Clone, Copy)]
+pub struct LoopView<'a> {
+    /// What the audio thread is publishing, when there is an audio thread.
+    ///
+    /// Optional on purpose: everything a strip **draws** comes from the
+    /// effect's parameters, and only the transport lights, the input monitor
+    /// and the deck's length come from here. A rack with no engine running
+    /// still draws its channels rather than falling back to a grid of eight
+    /// knobs called `T1`…`T8`.
+    pub state: Option<&'a choz_ports::LoopState>,
+    pub sample_rate: u32,
+    /// Bytes this deck holds, and the ceiling every deck shares.
+    pub held: usize,
+    pub budget: usize,
+    /// What each channel's take rounds to when it closes. From the effect's
+    /// parameters rather than the atomics: a setting the project saves, not
+    /// something the callback decides.
+    pub quant: [&'static str; choz_ports::LOOP_TRACKS],
+    /// The rest of what a strip decides, from the same parameters: out of the
+    /// mix, only this one, where it sits, and how loud it plays.
+    pub mute: [bool; choz_ports::LOOP_TRACKS],
+    pub solo: [bool; choz_ports::LOOP_TRACKS],
+    /// `-1..1`, the way the mixer says pan.
+    pub pan: [f32; choz_ports::LOOP_TRACKS],
+    /// `0..1`, linear.
+    pub vol: [f32; choz_ports::LOOP_TRACKS],
+    /// Whether choz's metronome is running. One state for the whole program,
+    /// shown on every strip, because that is what it is.
+    pub metro: bool,
+    /// Strips the deck offers, and which page of them is on screen.
+    pub chans: usize,
+    pub page: usize,
+    /// Where the keyboard is, when the deck has the arrows.
+    pub cursor: (usize, LoopBtn),
+}
+
+/// The narrowest a channel strip is allowed to get, and the rows it needs with
+/// and without the rules between its sections.
+///
+/// The strips **share the width**: as many as fit at `CH_MIN` are drawn, and
+/// then they are widened to fill the row, so four channels on a wide panel are
+/// four wide strips on one line rather than four narrow ones and a gap.
+const CH_MIN: u16 = 18;
+const CH_FULL: u16 = 9;
+const CH_TIGHT: u16 = 7;
+
+/// One channel's activity, drawn the way a desk draws it: the RMS as a filled
+/// bar, the peak as a single cell riding on top of it.
+///
+/// Both are what that **channel** is doing — what it is taking in while it
+/// records, what it is putting out while it plays — so four strips side by side
+/// say which of them is the one making the noise.
+fn level_bar(rms_db: f32, peak_db: f32, cells: usize) -> String {
+    // -60 dB is the floor: under it a channel reads as silent, which is what a
+    // player means by it.
+    let frac = |db: f32| ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+    let fill = (frac(rms_db) * cells as f32).round() as usize;
+    let mark = ((frac(peak_db) * cells as f32).round() as usize).min(cells.saturating_sub(1));
+    (0..cells)
+        .map(|i| match i {
+            i if peak_db > -60.0 && i == mark => '\u{2588}',
+            i if i < fill => '\u{2593}',
+            _ => '\u{2591}',
+        })
+        .collect()
+}
+
+/// The colour a level is read at: red at the top, green where it is working,
+/// dim where there is nothing.
+fn level_colour(peak_db: f32) -> Color {
+    match peak_db {
+        d if d > -1.0 => Color::Rgb(210, 80, 76),
+        d if d > -12.0 => ON_COLOUR,
+        d if d > -60.0 => Color::Rgb(120, 160, 120),
+        _ => LABEL,
+    }
+}
+
+/// The same reading with no room for its name.
+fn db_short(db: f32) -> String {
+    match db.is_finite() {
+        true => format!("{db:+.1}"),
+        false => "-inf".to_string(),
+    }
+}
+
+/// A linear peak as dB.
+fn peak_db(peak: f32) -> f32 {
+    match peak {
+        p if p <= 1e-5 => f32::NEG_INFINITY,
+        p => 20.0 * p.log10(),
+    }
+}
+
+/// Draw the looper as channel strips, side by side.
+///
+/// In place of the knob grid, not beside it. Eight tracks of four-position
+/// knobs is sixteen arcs saying "0.50", and a transport is read as buttons —
+/// which is also what a player with both hands on a guitar can hit.
+///
+/// How many strips are drawn is the width's answer, not a setting: the deck
+/// offers `v.chans` of them and the panel shows the ones that fit, with page
+/// arrows when they do not all.
+#[allow(clippy::too_many_arguments)]
+fn draw_loop_deck(
+    f: &mut Frame,
+    inner: Rect,
+    mut y: u16,
+    v: LoopView<'_>,
+    focused: bool,
+    bg: Style,
+    btn_style: Style,
+    layout: &mut RackLayout,
+) -> u16 {
+    use choz_ports::{LoopTrackState, LOOP_TRACKS};
+
+    let bottom = inner.y + inner.height;
+    let lit = Style::default()
+        .fg(Color::Black)
+        .bg(ON_COLOUR)
+        .add_modifier(Modifier::BOLD);
+    // A strip needs its rules dropped before it needs to disappear: the rows
+    // that carry controls are the ones worth the height.
+    let rows = bottom.saturating_sub(y);
+    let (ch_h, ruled) = match rows {
+        r if r > CH_FULL => (CH_FULL, true),
+        r if r > CH_TIGHT => (CH_TIGHT, false),
+        _ => return y,
+    };
+    // At least one strip, however narrow the panel is — a deck that draws
+    // nothing because the window shrank is worse than one that scrolls.
+    let chans = v.chans.clamp(1, LOOP_TRACKS);
+    let per_page = ((inner.width / CH_MIN).max(1) as usize).min(chans);
+    let cell_w = inner.width / per_page as u16;
+    // A strip needs its rules    // Every button on a strip is a symbol. Words were what made a strip's rows
+    // depend on the language and on how wide the panel happened to be, and a
+    // transport of five symbols is read faster than one of five words anyway.
+    // What is left of `wide` is the two sliders, which are labels and not
+    // buttons: they spell their name where there is room for it.
+    let wide = cell_w >= (t("LEVEL").chars().count() as u16 + 18);
+    let pages = chans.div_ceil(per_page);
+    let page = v.page.min(pages - 1);
+    layout.loop_pages = (page, pages);
+    let first = page * per_page;
+    let shown = per_page.min(chans - first);
+
+    for i in 0..shown {
+        let track = first + i;
+        let x = inner.x + i as u16 * cell_w;
+        let w = cell_w.min((inner.x + inner.width).saturating_sub(x));
+        if w < 4 {
+            break;
+        }
+        let state = v
+            .state
+            .map(|s| s.track(track))
+            .unwrap_or(LoopTrackState::Idle);
+        let here = focused && v.cursor.0 == track;
+        let block = Block::default()
+            .title(format!(" {} {} ", t("CHANNEL"), track + 1))
+            .title_style(
+                Style::default()
+                    .fg(match state {
+                        LoopTrackState::Idle => HEADER,
+                        _ => ON_COLOUR,
+                    })
+                    .add_modifier(Modifier::BOLD),
+            )
+            .borders(Borders::ALL)
+            .border_style(match here {
+                true => Style::default().fg(SEL).add_modifier(Modifier::BOLD),
+                false => Style::default().fg(ui_border()),
+            })
+            .style(bg);
+        let area = Rect::new(x, y, w, ch_h);
+        let box_inner = block.inner(area);
+        f.render_widget(block, area);
+        if box_inner.width == 0 || box_inner.height == 0 {
+            continue;
+        }
+
+        // ── The close box, on the corner a window puts one ─────────────────
+        // Drawn over the top border rather than inside the box: the strip has
+        // its rows full already, and the corner is the one place a "throw this
+        // away" reads without being reached for by accident.
+        if w >= 6 {
+            let del = Rect::new(area.x + w - 4, area.y, 3, 1);
+            let on_del = here && v.cursor.1 == LoopBtn::Del;
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "[\u{00D7}]",
+                    match on_del {
+                        true => Style::default()
+                            .fg(Color::Black)
+                            .bg(SEL)
+                            .add_modifier(Modifier::BOLD),
+                        false => Style::default().fg(Color::Rgb(200, 110, 105)),
+                    },
+                )))
+                .style(bg),
+                del,
+            );
+            layout.loop_hits.push(((track, LoopBtn::Del), del));
+        }
+
+        // A button in its own colour: what it *is*, banked down while it is
+        // off and lit while it is on — and the cursor still wins, because
+        // where the keyboard is has to read differently from what is engaged.
+        //
+        // Colour is how a symbol says which button it is. `M` and `S` are the
+        // same shape; white and amber are not.
+        let paint = |btn: LoopBtn, on: bool, colour: Color, dim: Color| -> Style {
+            match (here && v.cursor.1 == btn, on) {
+                (true, _) => Style::default()
+                    .fg(Color::Black)
+                    .bg(SEL)
+                    .add_modifier(Modifier::BOLD),
+                (false, true) => Style::default()
+                    .fg(Color::Black)
+                    .bg(colour)
+                    .add_modifier(Modifier::BOLD),
+                (false, false) => Style::default()
+                    .fg(colour)
+                    .bg(dim)
+                    .add_modifier(Modifier::BOLD),
+            }
+        };
+        let mut hit = |f: &mut Frame, row: &mut ButtonRow, btn, text: String, style| {
+            let rect = row.button(f, text, style);
+            layout.loop_hits.push(((track, btn), rect));
+        };
+        let rule = |f: &mut Frame, ry: u16| {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "\u{2500}".repeat(box_inner.width as usize),
+                    Style::default().fg(ui_border()),
+                ))
+                .style(bg),
+                Rect::new(box_inner.x, ry, box_inner.width, 1),
+            );
+        };
+
+        let mut ry = box_inner.y;
+        // ── What this channel is doing: RMS filled, peak riding on it ──────
+        let (peak, rms) = v.state.map(|s| s.track_level(track)).unwrap_or((0.0, 0.0));
+        let (peak, rms) = (peak_db(peak), peak_db(rms));
+        let mut row = ButtonRow::new(box_inner, bg, ry, 0);
+        let cells = match wide {
+            true => 8,
+            false => 4,
+        };
+        row.label(
+            f,
+            format!(" {} {:>5} ", level_bar(rms, peak, cells), db_short(peak)),
+            Style::default().fg(level_colour(peak)),
+        );
+        row.finish();
+        ry += 1;
+        if ruled {
+            rule(f, ry);
+            ry += 1;
+        }
+
+        // ── The four switches, one row ─────────────────────────────────────
+        // The metronome's own glyph from the bar above, because it is that
+        // metronome; then what the take rounds to, out of the mix, and only
+        // this one.
+        let mut row = ButtonRow::new(box_inner, bg, ry, 0);
+        hit(
+            f,
+            &mut row,
+            LoopBtn::Metro,
+            " \u{2669} ".to_string(),
+            paint(LoopBtn::Metro, v.metro, AMBER, DIM_AMBER),
+        );
+        hit(
+            f,
+            &mut row,
+            LoopBtn::Quant,
+            " Q ".to_string(),
+            paint(LoopBtn::Quant, v.quant[track] != "OFF", BLUE, DIM_BLUE),
+        );
+        hit(
+            f,
+            &mut row,
+            LoopBtn::Mute,
+            " M ".to_string(),
+            paint(LoopBtn::Mute, v.mute[track], WHITE, DIM_WHITE),
+        );
+        hit(
+            f,
+            &mut row,
+            LoopBtn::Solo,
+            " S ".to_string(),
+            paint(LoopBtn::Solo, v.solo[track], AMBER, DIM_AMBER),
+        );
+        row.finish();
+        ry += 1;
+
+        // ── How loud the take plays, and where it sits ─────────────────────
+        // The level first and the pan under it, the way a strip is read: how
+        // much, then where.
+        let mut row = ButtonRow::new(box_inner, bg, ry, 0);
+        let (label, prefix) = seq_slider_label(
+            match wide {
+                true => t("LEVEL"),
+                false => "V",
+            },
+            v.vol[track],
+        );
+        let whole = row.draw(f, label, Style::default().fg(KNOB), 0);
+        layout.loop_sliders.push((
+            (track, LoopBtn::Vol),
+            Rect::new(
+                whole.x + prefix,
+                whole.y,
+                whole.width.saturating_sub(prefix).min(SEQ_BAR_W),
+                1,
+            ),
+        ));
+        row.finish();
+        ry += 1;
+
+        let mut row = ButtonRow::new(box_inner, bg, ry, 0);
+        let pan_rect = row.draw(
+            f,
+            format!(" {} ", pan_slider(v.pan[track])),
+            Style::default().fg(KNOB),
+            1,
+        );
+        row.label(f, pan_label(v.pan[track]), Style::default().fg(LABEL));
+        // The bar alone answers the mouse — the space either side of it is not
+        // a value, and clicking it would be one.
+        layout.loop_sliders.push((
+            (track, LoopBtn::Pan),
+            Rect::new(
+                pan_rect.x + 1,
+                pan_rect.y,
+                pan_rect.width.saturating_sub(2),
+                1,
+            ),
+        ));
+        row.finish();
+        ry += 1;
+        if ruled {
+            rule(f, ry);
+            ry += 1;
+        }
+
+        // ── The transport: three buttons, one gesture each ─────────────────
+        // Each in its own colour, on and off: red is what REC *is*, and green
+        // is what PLAY is. A transport painted like the rest of the panel is
+        // one nobody finds with a guitar in their hands.
+        let mut row = ButtonRow::new(box_inner, bg, ry, 0);
+        hit(
+            f,
+            &mut row,
+            LoopBtn::Stop,
+            " \u{25A0} ".to_string(),
+            paint(LoopBtn::Stop, false, LABEL, Color::Rgb(38, 42, 52)),
+        );
+        // PLAY is also PAUSE: it shows which one the next press would be, and
+        // amber says "held" where green says "running".
+        let paused = state == LoopTrackState::Paused;
+        let playing = state == LoopTrackState::Playing;
+        hit(
+            f,
+            &mut row,
+            LoopBtn::Play,
+            match playing {
+                true => " \u{23F8} ".to_string(),
+                false => " \u{25B6} ".to_string(),
+            },
+            match paused {
+                true => paint(LoopBtn::Play, true, AMBER, DIM_AMBER),
+                false => paint(LoopBtn::Play, playing, ON_COLOUR, DIM_GREEN),
+            },
+        );
+        let recording = state == LoopTrackState::Recording;
+        hit(
+            f,
+            &mut row,
+            LoopBtn::Rec,
+            " \u{25CF} ".to_string(),
+            paint(LoopBtn::Rec, recording, RED, DIM_RED),
+        );
+        row.finish();
+    }
+    y += ch_h;
+
+    // ── The deck's own row: paging, one more strip, and what it holds ──────
+    if y >= bottom {
+        return y;
+    }
+    let mut row = ButtonRow::new(inner, bg, y, 0);
+    let mut hit = |f: &mut Frame, row: &mut ButtonRow, btn, text: String, style| {
+        let rect = row.button(f, text, style);
+        layout.loop_deck.push((btn, rect));
+    };
+    if pages > 1 {
+        hit(
+            f,
+            &mut row,
+            LoopBtn::PagePrev,
+            " \u{25C0} ".to_string(),
+            btn_style,
+        );
+        row.label(
+            f,
+            format!(" {}/{} ", page + 1, pages),
+            Style::default().fg(LABEL),
+        );
+        hit(
+            f,
+            &mut row,
+            LoopBtn::PageNext,
+            " \u{25B6} ".to_string(),
+            btn_style,
+        );
+    }
+    if chans < LOOP_TRACKS {
+        hit(
+            f,
+            &mut row,
+            LoopBtn::AddChan,
+            " + ".to_string(),
+            // Lit, not tinted: `+` in a slightly greener grey on a grey button
+            // was a button nobody could see.
+            lit,
+        );
+    }
+    hit(
+        f,
+        &mut row,
+        LoopBtn::Clear,
+        format!(" {} ", t("CLEAR")),
+        btn_style,
+    );
+    hit(
+        f,
+        &mut row,
+        LoopBtn::Export,
+        format!(" {} ", t("EXPORT")),
+        btn_style,
+    );
+    // The length the deck froze and what it is holding: the two questions a
+    // looper gets asked that are not a button.
+    let frames = v.state.map(|s| s.frames()).unwrap_or(0);
+    let secs = |n: usize| n as f32 / v.sample_rate.max(1) as f32;
+    row.label(
+        f,
+        match frames {
+            0 => match v.state.map(|s| s.recorded()).unwrap_or(0) {
+                0 => format!(" {} ", t("EMPTY")),
+                n => format!(" {:.1}s\u{2026} ", secs(n)),
+            },
+            n => format!(
+                " {:.2}s \u{00B7} {:.0} MiB / {:.0} ",
+                secs(n),
+                v.held as f32 / (1 << 20) as f32,
+                v.budget as f32 / (1 << 20) as f32,
+            ),
+        },
+        Style::default().fg(LABEL),
+    );
+    row.finish();
+    y + 1
 }
 
 /// The AutoTune strip: level, the note heard, the note aimed at, the error, and
@@ -2590,5 +3649,267 @@ mod tests {
         );
         assert_eq!(param_grid(10, 4), (1, 4), "a narrow panel stacks them");
         assert_eq!(param_grid(80, 0), (6, 0));
+    }
+
+    /// The deck draws a strip a channel, four of them unless asked for more,
+    /// and pages rather than dropping the ones that do not fit.
+    ///
+    /// Every button a strip carries is in `loop_hits` keyed by the channel it
+    /// belongs to — which is what the mouse hit-tests and what the keyboard
+    /// walks, so a strip drawn with no hits is a strip nobody can press.
+    #[test]
+    fn the_looper_draws_a_strip_a_channel_and_pages_the_rest() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        /// Wide enough for the spelled-out tier in any language the table has.
+        const CH_STRIP: u16 = 30;
+        let state = choz_ports::LoopState::default();
+        let view = |chans: usize, page: usize| LoopView {
+            state: Some(&state),
+            sample_rate: 48_000,
+            held: 0,
+            budget: 512 << 20,
+            quant: ["OFF"; choz_ports::LOOP_TRACKS],
+            mute: [false; choz_ports::LOOP_TRACKS],
+            solo: [false; choz_ports::LOOP_TRACKS],
+            pan: [0.0; choz_ports::LOOP_TRACKS],
+            vol: [1.0; choz_ports::LOOP_TRACKS],
+            metro: false,
+            chans,
+            page,
+            cursor: (0, LoopBtn::Play),
+        };
+        let draw = |w: u16, chans: usize, page: usize| {
+            let mut term = Terminal::new(TestBackend::new(w, 12)).unwrap();
+            let mut layout = RackLayout::default();
+            term.draw(|f| {
+                let area = f.area();
+                draw_loop_deck(
+                    f,
+                    area,
+                    area.y,
+                    view(chans, page),
+                    true,
+                    Style::default(),
+                    Style::default(),
+                    &mut layout,
+                );
+            })
+            .unwrap();
+            let screen = term
+                .backend()
+                .to_string()
+                .lines()
+                .map(|r| r.trim_matches('"').to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            (screen, layout)
+        };
+
+        // Wide enough for four strips: four strips, one page, no arrows.
+        let (screen, layout) = draw(CH_STRIP * 4, 4, 0);
+        for n in 1..=4 {
+            assert!(
+                screen.contains(&format!("CHANNEL {n}")),
+                "channel {n} is missing:\n{screen}"
+            );
+        }
+        assert_eq!(layout.loop_pages, (0, 1), "four in four fits on one page");
+        // All four on the same line, filling the width — the bug this replaced
+        // was four strips paged two at a time on a panel with room for four.
+        let tops: Vec<u16> = (0..4)
+            .map(|t| {
+                layout
+                    .loop_hits
+                    .iter()
+                    .find(|((c, b), _)| *c == t && *b == LoopBtn::Play)
+                    .expect("every channel has a transport")
+                    .1
+                    .y
+            })
+            .collect();
+        assert!(
+            tops.windows(2).all(|w| w[0] == w[1]),
+            "the strips are side by side, not stacked: {tops:?}"
+        );
+        assert!(
+            !layout
+                .loop_deck
+                .iter()
+                .any(|(b, _)| matches!(b, LoopBtn::PagePrev | LoopBtn::PageNext)),
+            "nothing to page through, so no arrows"
+        );
+        assert!(
+            layout.loop_deck.iter().any(|(b, _)| *b == LoopBtn::AddChan),
+            "four of eight, so there is one more to offer"
+        );
+        // Every button of every strip answers the mouse.
+        for track in 0..4 {
+            for btn in LoopBtn::STRIP {
+                assert!(
+                    layout
+                        .loop_hits
+                        .iter()
+                        .any(|((t, b), r)| *t == track && *b == btn && r.width > 0),
+                    "channel {track} has no {btn:?} to press"
+                );
+            }
+        }
+
+        // Eight channels in the width of three: three at a time, three pages,
+        // and the arrows to walk them.
+        let (screen, layout) = draw(CH_MIN * 3, 8, 1);
+        assert_eq!(layout.loop_pages, (1, 3));
+        assert!(
+            screen.contains("CHANNEL 4") && !screen.contains("CHANNEL 1"),
+            "the second page starts at channel 4:\n{screen}"
+        );
+        for want in [LoopBtn::PagePrev, LoopBtn::PageNext] {
+            assert!(
+                layout.loop_deck.iter().any(|(b, _)| *b == want),
+                "{want:?} is not on the deck row"
+            );
+        }
+
+        // A full deck has nothing left to add, so it does not offer to.
+        let (_, layout) = draw(CH_STRIP * 4, choz_ports::LOOP_TRACKS, 0);
+        assert!(
+            !layout.loop_deck.iter().any(|(b, _)| *b == LoopBtn::AddChan),
+            "eight is the ceiling"
+        );
+
+        // A page that no longer exists lands on the last one rather than
+        // drawing nothing.
+        let (screen, layout) = draw(CH_STRIP * 4, 4, 9);
+        assert_eq!(layout.loop_pages, (0, 1));
+        assert!(screen.contains("CHANNEL 1"), "{screen}");
+    }
+
+    /// The strip's shape, row by row: the trim on top, the two settings that
+    /// decide how a take starts and ends, then the transport and the level it
+    /// comes back at.
+    #[test]
+    fn the_strip_looks_like_a_channel_strip() {
+        use ratatui::{backend::TestBackend, Terminal};
+        const CH_STRIP: u16 = 30;
+        let state = choz_ports::LoopState::default();
+        let mut term = Terminal::new(TestBackend::new(CH_STRIP * 2, 10)).unwrap();
+        let mut layout = RackLayout::default();
+        term.draw(|f| {
+            let area = f.area();
+            draw_loop_deck(
+                f,
+                area,
+                area.y,
+                LoopView {
+                    state: Some(&state),
+                    sample_rate: 48_000,
+                    held: 0,
+                    budget: 512 << 20,
+                    quant: ["1 BAR"; choz_ports::LOOP_TRACKS],
+                    mute: [false; choz_ports::LOOP_TRACKS],
+                    solo: [false; choz_ports::LOOP_TRACKS],
+                    pan: [0.0; choz_ports::LOOP_TRACKS],
+                    vol: [1.0; choz_ports::LOOP_TRACKS],
+                    metro: true,
+                    chans: 2,
+                    page: 0,
+                    cursor: (0, LoopBtn::Play),
+                },
+                true,
+                Style::default(),
+                Style::default(),
+                &mut layout,
+            );
+        })
+        .unwrap();
+        let rows: Vec<String> = term
+            .backend()
+            .to_string()
+            .lines()
+            .map(|r| r.trim_matches('"').to_string())
+            .collect();
+        let want = [
+            "CHANNEL 1",
+            "\u{2591}",
+            "\u{2669}",
+            "LEVEL",
+            "L\u{2500}",
+            "\u{25A0}",
+        ];
+        let mut at = 0;
+        for label in want {
+            let found = rows
+                .iter()
+                .skip(at)
+                .position(|r| r.contains(label))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{label} is not below the row before it:\n{}",
+                        rows.join("\n")
+                    )
+                });
+            at += found;
+        }
+        // Not one word inside a button: the four switches are one row of
+        // symbols, and so is the transport.
+        assert!(
+            rows[3].contains("\u{2669}")
+                && rows[3].contains(" Q ")
+                && rows[3].contains(" M ")
+                && rows[3].contains(" S "),
+            "the four switches share a row:\n{}",
+            rows.join("\n")
+        );
+        // The level, then the pan under it — how much, then where.
+        assert!(
+            rows[4].contains("LEVEL") && rows[5].contains("L\u{2500}"),
+            "the pan sits under the level:\n{}",
+            rows.join("\n")
+        );
+        // The transport is three buttons, on the last row of the strip.
+        assert!(
+            rows[7].contains('\u{25A0}')
+                && rows[7].contains('\u{25B6}')
+                && rows[7].contains('\u{25CF}'),
+            "stop, play and rec are separate:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains("STOP") || r.contains("MUTE")),
+            "no words inside a button:\n{}",
+            rows.join("\n")
+        );
+        // The close box is on the corner of every strip, and the mouse knows
+        // where each one is.
+        assert!(
+            rows[0].matches("[\u{00D7}]").count() == 2,
+            "{}",
+            rows.join("\n")
+        );
+        assert_eq!(
+            layout
+                .loop_hits
+                .iter()
+                .filter(|((_, b), _)| *b == LoopBtn::Del)
+                .count(),
+            2,
+            "one close box a strip"
+        );
+        // And both sliders answer the mouse, on both strips.
+        assert_eq!(layout.loop_sliders.len(), 4, "a pan and a level a strip");
+        assert!(
+            !rows.iter().any(|r| r.contains("PLAY/REC")),
+            "the combined button is gone:\n{}",
+            rows.join("\n")
+        );
+        // The deck's row, under every strip.
+        assert!(
+            rows.iter().any(|r| r.contains("EXPORT") && r.contains('+')),
+            "the deck row is missing:\n{}",
+            rows.join("\n")
+        );
     }
 }

@@ -22,7 +22,7 @@
 //! it, and [`Arp::silence`] is what `PANIC` calls. A generator that forgets a
 //! note-off is a stuck note that no amount of releasing keys will clear.
 
-use crate::source::ParamShape;
+use crate::ParamShape;
 use std::time::{Duration, Instant};
 
 /// The order the held notes are played in.
@@ -766,7 +766,7 @@ fn steps_of<T: Copy>(all: &[T], label: impl Fn(T) -> &'static str) -> ParamShape
 
 impl ArpSettings {
     /// The knobs to draw, in order, with the value each one is at.
-    fn knob_list(&self) -> Vec<(ArpParam, &'static str, f32, ParamShape)> {
+    pub fn knob_list(&self) -> Vec<(ArpParam, &'static str, f32, ParamShape)> {
         let out = vec![
             (
                 ArpParam::On,
@@ -907,7 +907,7 @@ mod tests {
         // take turns on the same lock. Without this the step was measured
         // against a playhead another test had just rewound, which failed about
         // one run in four and looked like a timing bug for four sessions.
-        let _g = crate::views::theme::ui_guard();
+        let _g = crate::test_locks::transport();
         let t = choz_ports::transport();
         let was = t.playing();
         t.set_sample_rate(48_000);
@@ -972,7 +972,7 @@ mod tests {
     /// "now" — exactly what they were before any of this.
     #[test]
     fn the_free_running_clock_still_plays_immediately() {
-        let _g = crate::views::theme::ui_guard();
+        let _g = crate::test_locks::transport();
         let t = choz_ports::transport();
         let was = t.playing();
         t.set_playing(false);

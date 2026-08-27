@@ -240,7 +240,15 @@ fn collect_boxes(patcher: &serde_json::Value) -> HashMap<String, Box_> {
             .and_then(|t| t.split_whitespace().next())
             .unwrap_or(&class)
             .to_string();
-        out.insert(id.clone(), Box_ { id, name, class, index });
+        out.insert(
+            id.clone(),
+            Box_ {
+                id,
+                name,
+                class,
+                index,
+            },
+        );
     }
     out
 }
@@ -274,7 +282,10 @@ fn collect_cords(patcher: &serde_json::Value) -> Vec<(String, String)> {
 /// `None` when there is nothing to start from, which is when the caller falls
 /// back to file order and says so.
 fn walk<'a>(boxes: &'a HashMap<String, Box_>, cords: &[(String, String)]) -> Option<Vec<&'a Box_>> {
-    let start = boxes.values().filter(|b| is_input(&b.name)).min_by_key(|b| b.index)?;
+    let start = boxes
+        .values()
+        .filter(|b| is_input(&b.name))
+        .min_by_key(|b| b.index)?;
     let mut out = Vec::new();
     let mut at = start.id.clone();
     let mut seen = vec![at.clone()];
@@ -385,7 +396,11 @@ mod tests {
         assert!(!import.followed_cords);
         let kinds: Vec<&str> = import.chain.iter().map(|f| f.kind.as_str()).collect();
         assert_eq!(kinds, vec!["filter", "gain"]);
-        assert!(import.summary().contains("file order"), "{}", import.summary());
+        assert!(
+            import.summary().contains("file order"),
+            "{}",
+            import.summary()
+        );
     }
 
     /// A feedback loop in the patch is a cycle in the walk, and a walk that

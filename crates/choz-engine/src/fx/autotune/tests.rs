@@ -1087,7 +1087,11 @@ fn the_shift_is_walked_across_the_block_and_not_stepped() {
     // 0.4 · 2π · 220/48000 ≈ 0.012, so anything an order of magnitude past that
     // is a corner rather than a wave — which is what a staircase in pitch, or a
     // crossfade that does not line up, sounds like.
-    let biggest = |v: &[f32]| v.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max);
+    let biggest = |v: &[f32]| {
+        v.windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max)
+    };
     assert!(
         biggest(&a) < 0.05,
         "a step of {:.4} between two samples is a click",

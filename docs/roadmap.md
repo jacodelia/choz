@@ -6,7 +6,7 @@ día por día, con los porqués y lo último arriba; cómo encajan las piezas, e
 cierra, para que lo que quede sea sólo lo que queda — el 2026-08-19 se podó
 entero: lo que decía "hecho" o "cerrado" se fue al changelog.
 
-Última actualización: 2026-08-23.
+Última actualización: 2026-08-27.
 
 ## Estado en una línea
 
@@ -48,6 +48,33 @@ hacer.
 La sección **artifact** — arpegiador + piano roll de 128 pasos portado de
 seqterm. Es la pieza más grande de las pedidas, no compite con las demás por
 tiempo, y se replantea aparte.
+
+### Replanteado aparte
+
+**Looper multipista** — *hecho el 2026-08-26.* — [looper-multitrack.md](looper-multitrack.md). El looper
+de hoy es una pista de 32 s en un slot de FX, y **su transporte no tiene ningún
+llamador**: se puede agregar a una cadena y se queda en `Idle` para siempre. El
+plan lo deja donde está —en la cadena del tab, oyendo sólo ese tab— y lo lleva a
+N tomas apiladas sobre una misma fuente (una guitarra, un micrófono), que suenan
+juntas o no. Techo de 5 minutos por pista, cuantización con piso de un compás,
+metrónomo que se arma con el `REC`, exportación a WAV y presupuesto de memoria
+acotado. Seis fases. El nudo no es el DSP: `FxProcessor` no le da a un efecto
+ningún canal para pedir memoria ni devolver nada, y grabar cinco minutos lo
+necesita.
+
+### Efectos: lo que la auditoría del 2026-08-27 dejó abierto
+
+La auditoría entera está en [fx-audit.md](fx-audit.md), con archivo y línea por
+hallazgo; las fases 1 a 6 se cerraron ese día y están en el changelog. Lo que
+queda, en orden de daño audible:
+
+| # | Qué falta | Hallazgo |
+|---|-----------|----------|
+| 7 | **Bloqueador de DC después de las curvas de cinta y vinilo** | F8. Sólo `saturator` y `utility` tienen uno; el offset que dejan `cassette` y `vinyl` se suma a lo largo de una cadena y se come headroom. |
+| 8 | **Smoothing del cutoff del SVF y del tiempo del delay** | F3. `Svf::set_cutoff` recalcula `g = tan(πf/sr)` de inmediato, que es un escalón en el coeficiente; `delay.rs` salta el cabezal. |
+| 9 | **`delay_line.rs` en `delay`, `gran_delay` y `beat_repeat`** | F1 + F2. Los tres llevan su propia línea, y las tres son lineales en caminos que se realimentan. |
+| 10 | **Auditoría de aliasing en `harmonizer`, `freq_shift` y `vocoder`** | F4. Quince sitios con trascendentales por sample entre los dos primeros, y ninguno de los tres pasó por el oversampler. |
+| 11 | **Ley de mezcla y ganancia unificada** | Cada efecto inventa la suya: unos hacen `dry + wet·mix`, otros interpolan. Mover `Wet` cambia el volumen de forma distinta según el efecto. |
 
 ### Bordes que quedaron abiertos
 

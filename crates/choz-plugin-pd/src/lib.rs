@@ -464,7 +464,6 @@ impl Patch {
         let v = control.min + value.clamp(0.0, 1.0) * (control.max - control.min);
         imp::send_float(&control.receive, v);
     }
-
 }
 
 #[cfg(feature = "pd")]
@@ -567,9 +566,8 @@ mod imp {
             search.push(dir.join("externals").to_string_lossy().into_owned());
             search.extend(SYSTEM_EXTRA.iter().map(|p| p.to_string()));
             if let Some(env) = std::env::var_os("PD_PATH") {
-                search.extend(
-                    std::env::split_paths(&env).map(|p| p.to_string_lossy().into_owned()),
-                );
+                search
+                    .extend(std::env::split_paths(&env).map(|p| p.to_string_lossy().into_owned()));
             }
             for path in search {
                 if let Ok(c) = CString::new(path) {
@@ -829,5 +827,4 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 }

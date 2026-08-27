@@ -498,7 +498,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     /// A saved file written before a format existed still gets that format's
     /// default directories.
     ///

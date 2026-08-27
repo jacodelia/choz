@@ -128,7 +128,9 @@ fn installed_vst2_plugins_scan_host_and_expose_params() {
         };
         let restored = fresh.state().expect("same plugin, same capability");
         restored.restore(&blob);
-        let once = restored.save().expect("a plugin that saved once saves again");
+        let once = restored
+            .save()
+            .expect("a plugin that saved once saves again");
         assert!(!once.is_empty(), "{}: nothing came back", info.name);
 
         // **Stable from there**, rather than byte-for-byte the first save.

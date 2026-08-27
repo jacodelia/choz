@@ -61,7 +61,7 @@ fn main() {
     // Exactly the road a patch takes when the user picks it in ADD FX: an FX
     // spec with a plugin reference, built into a chain.
     let spec = FxSpec {
-            gate: None,
+        gate: None,
         kind: String::new(),
         enabled: true,
         wet: 1.0,
@@ -120,7 +120,7 @@ fn main() {
     assert_eq!(params[0].name, "GAIN");
 
     let spec = FxSpec {
-            gate: None,
+        gate: None,
         kind: String::new(),
         enabled: true,
         wet: 1.0,
@@ -176,7 +176,7 @@ fn main() {
     assert_eq!(params[0].name, "Gain", "and keep the patch's own label");
 
     let spec = FxSpec {
-            gate: None,
+        gate: None,
         kind: String::new(),
         enabled: true,
         wet: 1.0,

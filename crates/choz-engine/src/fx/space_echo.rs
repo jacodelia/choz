@@ -28,6 +28,7 @@
 //!   • Spring reverb = Schroeder dispersion (allpass) + 2 short combs for the
 //!     metallic resonant tail.
 
+use super::delay_line::MAX_RATE;
 use super::FxProcessor;
 
 const MAX_DELAY_S: f32 = 2.0;
@@ -64,23 +65,32 @@ impl OnePole {
 /// Schroeder allpass for spring dispersion.
 struct Allpass {
     buf: Vec<f32>,
+    len: usize,
     pos: usize,
     g: f32,
 }
 impl Allpass {
-    fn new(len: usize, g: f32) -> Self {
+    /// `cap` is the buffer, `len` the delay actually read. They are separate so
+    /// that a sample-rate change can move the delay without asking the audio
+    /// thread for memory — see [`SpaceEcho::retune`].
+    fn new(cap: usize, len: usize, g: f32) -> Self {
         Self {
-            buf: vec![0.0; len.max(1)],
+            buf: vec![0.0; cap.max(1)],
+            len: len.clamp(1, cap.max(1)),
             pos: 0,
             g,
         }
+    }
+    fn set_len(&mut self, len: usize) {
+        self.len = len.clamp(1, self.buf.len());
+        self.pos %= self.len;
     }
     #[inline]
     fn process(&mut self, x: f32) -> f32 {
         let buffered = self.buf[self.pos];
         let y = -x + buffered;
         self.buf[self.pos] = x + buffered * self.g;
-        self.pos = (self.pos + 1) % self.buf.len();
+        self.pos = (self.pos + 1) % self.len;
         y
     }
 }
@@ -88,25 +98,31 @@ impl Allpass {
 /// Feedback comb (metallic spring resonance).
 struct Comb {
     buf: Vec<f32>,
+    len: usize,
     pos: usize,
     fb: f32,
     damp: OnePole,
 }
 impl Comb {
-    fn new(len: usize, fb: f32) -> Self {
+    fn new(cap: usize, len: usize, fb: f32) -> Self {
         Self {
-            buf: vec![0.0; len.max(1)],
+            buf: vec![0.0; cap.max(1)],
+            len: len.clamp(1, cap.max(1)),
             pos: 0,
             fb,
             damp: OnePole::new(),
         }
+    }
+    fn set_len(&mut self, len: usize) {
+        self.len = len.clamp(1, self.buf.len());
+        self.pos %= self.len;
     }
     #[inline]
     fn process(&mut self, x: f32) -> f32 {
         let y = self.buf[self.pos];
         let d = self.damp.lp(y);
         self.buf[self.pos] = x + d * self.fb;
-        self.pos = (self.pos + 1) % self.buf.len();
+        self.pos = (self.pos + 1) % self.len;
         y
     }
 }
@@ -182,15 +198,25 @@ impl SpaceEcho {
         tone: f32,
     ) -> Self {
         let sr = sr.max(8000);
-        let len = (MAX_DELAY_S * sr as f32) as usize + 4;
+        // **Sized for the highest rate choz supports, not for this one.** The
+        // device can change under a running chain, and rebuilding the tape to
+        // fit would be an allocation on the audio thread — which is the one
+        // thing `FxProcessor` promises never happens. Buying the memory once
+        // costs 2.4 MB of tape at 192 kHz and buys `retune`, which is
+        // arithmetic.
+        let cap = (MAX_DELAY_S * MAX_RATE) as usize + 4;
         // Spring: 3 allpass (prime-ish lengths) + 2 short combs, scaled to sr.
         let s = |n: usize| ((n as f32) * sr as f32 / 44100.0) as usize;
+        let c = |n: usize| ((n as f32) * MAX_RATE / 44100.0) as usize + 4;
         let aps = vec![
-            Allpass::new(s(225), 0.6),
-            Allpass::new(s(556), 0.6),
-            Allpass::new(s(341), 0.6),
+            Allpass::new(c(225), s(225), 0.6),
+            Allpass::new(c(556), s(556), 0.6),
+            Allpass::new(c(341), s(341), 0.6),
         ];
-        let combs = vec![Comb::new(s(1557), 0.7), Comb::new(s(1116), 0.7)];
+        let combs = vec![
+            Comb::new(c(1557), s(1557), 0.7),
+            Comb::new(c(1116), s(1116), 0.7),
+        ];
         Self {
             sample_rate: sr,
             time,
@@ -201,12 +227,26 @@ impl SpaceEcho {
             spring,
             tone,
             wet: 0.4,
-            tape_l: Tape::new(len),
-            tape_r: Tape::new(len),
+            tape_l: Tape::new(cap),
+            tape_r: Tape::new(cap),
             aps,
             combs,
             wow_phase: 0.0,
             flutter_phase: 0.3,
+        }
+    }
+
+    /// Follow a sample-rate change. Arithmetic only — the buffers were sized
+    /// for the highest rate at construction, so all that moves is how far into
+    /// them the spring reads.
+    fn retune(&mut self, sr: u32) {
+        self.sample_rate = sr.max(8000);
+        let s = |n: usize| ((n as f32) * self.sample_rate as f32 / 44100.0) as usize;
+        for (ap, n) in self.aps.iter_mut().zip([225usize, 556, 341]) {
+            ap.set_len(s(n));
+        }
+        for (comb, n) in self.combs.iter_mut().zip([1557usize, 1116]) {
+            comb.set_len(s(n));
         }
     }
 
@@ -219,16 +259,7 @@ impl SpaceEcho {
 impl FxProcessor for SpaceEcho {
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
         if sample_rate != self.sample_rate {
-            *self = SpaceEcho::new(
-                sample_rate,
-                self.time,
-                self.feedback,
-                self.wow,
-                self.flutter,
-                self.age,
-                self.spring,
-                self.tone,
-            );
+            self.retune(sample_rate);
         }
         let sr = self.sample_rate as f32;
         let base = self.delay_samps();
@@ -350,6 +381,79 @@ impl FxProcessor for SpaceEcho {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A sample-rate change must not ask the audio thread for memory.**
+    ///
+    /// It used to do `*self = SpaceEcho::new(...)` inside `process_block`,
+    /// which reallocates the tape and the whole spring network on the callback
+    /// — the one thing `FxProcessor` promises never happens. The buffers are
+    /// sized for the highest rate now and a change only moves the read lengths.
+    ///
+    /// Checked at the mechanism rather than with a counting allocator: if any
+    /// buffer had been rebuilt, it would be at a different address. A global
+    /// allocator would prove the same thing and slow every other test in the
+    /// binary to do it.
+    #[test]
+    fn a_rate_change_does_not_allocate() {
+        let mut fx = SpaceEcho::new(48_000, 0.4, 0.5, 0.3, 0.3, 0.4, 0.3, 0.5);
+        let mut buf = vec![0.1f32; 512];
+        fx.process_block(&mut buf, 48_000);
+
+        let fingerprint = |fx: &SpaceEcho| {
+            let mut v = vec![
+                (fx.tape_l.buf.as_ptr() as usize, fx.tape_l.buf.len()),
+                (fx.tape_r.buf.as_ptr() as usize, fx.tape_r.buf.len()),
+            ];
+            v.extend(
+                fx.aps
+                    .iter()
+                    .map(|a| (a.buf.as_ptr() as usize, a.buf.len())),
+            );
+            v.extend(
+                fx.combs
+                    .iter()
+                    .map(|c| (c.buf.as_ptr() as usize, c.buf.len())),
+            );
+            v
+        };
+        let before = fingerprint(&fx);
+        for sr in [96_000u32, 44_100, 192_000, 48_000] {
+            fx.process_block(&mut buf, sr);
+            assert_eq!(
+                fingerprint(&fx),
+                before,
+                "{sr} Hz moved a buffer, so it allocated one"
+            );
+        }
+        assert!(buf.iter().all(|s| s.is_finite()), "and it stayed finite");
+    }
+
+    /// The spring still rings the same way after the device changes — the read
+    /// lengths follow the rate, which is what `retune` is for.
+    #[test]
+    fn the_spring_follows_the_sample_rate() {
+        for sr in [44_100u32, 48_000, 96_000, 192_000] {
+            let mut a = SpaceEcho::new(sr, 0.3, 0.4, 0.0, 0.0, 0.3, 0.9, 0.5);
+            let mut b = SpaceEcho::new(48_000, 0.3, 0.4, 0.0, 0.0, 0.3, 0.9, 0.5);
+            b.process_block(&mut [0.0; 64], 48_000);
+            b.process_block(&mut [0.0; 64], sr); // retuned rather than rebuilt
+
+            let mut buf_a = vec![0.0f32; sr as usize / 2 * 2];
+            let mut buf_b = buf_a.clone();
+            buf_a[0] = 1.0;
+            buf_a[1] = 1.0;
+            buf_b[0] = 1.0;
+            buf_b[1] = 1.0;
+            a.process_block(&mut buf_a, sr);
+            b.process_block(&mut buf_b, sr);
+            let rms = |x: &[f32]| (x.iter().map(|s| s * s).sum::<f32>()).sqrt();
+            let (ea, eb) = (rms(&buf_a), rms(&buf_b));
+            assert!(
+                eb > ea * 0.5 && eb < ea * 2.0,
+                "{sr} Hz: rebuilt {ea:.4}, retuned {eb:.4}"
+            );
+        }
+    }
 
     #[test]
     fn space_echo_is_finite_and_bounded() {

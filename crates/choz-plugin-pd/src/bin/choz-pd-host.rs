@@ -57,16 +57,19 @@ fn serve(patch: &Path, shm_name: &str, frames: u32) -> anyhow::Result<()> {
     // canvas is a different program.
     sandbox.set_editor_present(false);
 
-    while sandbox.serve(Duration::from_secs(5), &mut |input, output, _midi, params| {
-        // The knobs the interface is showing, by the same index it shows them
-        // in — both sides ask `choz_plugin_pd::addressable` for the order.
-        for (index, value) in params {
-            patch.set_control(*index, *value);
-        }
-        // Pd processes out of place; the block arrives in `input` and the
-        // patch's answer is what the host reads back.
-        output.copy_from_slice(input);
-        patch.process(output);
-    }) {}
+    while sandbox.serve(
+        Duration::from_secs(5),
+        &mut |input, output, _midi, params| {
+            // The knobs the interface is showing, by the same index it shows them
+            // in — both sides ask `choz_plugin_pd::addressable` for the order.
+            for (index, value) in params {
+                patch.set_control(*index, *value);
+            }
+            // Pd processes out of place; the block arrives in `input` and the
+            // patch's answer is what the host reads back.
+            output.copy_from_slice(input);
+            patch.process(output);
+        },
+    ) {}
     Ok(())
 }

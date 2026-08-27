@@ -672,7 +672,13 @@ mod tests {
             s.set_factor(factor);
             let mut buf = stereo(5_000.0, sr, 8192, 0.9);
             s.process_block(&mut buf, 48_000);
-            let left: Vec<f32> = buf.as_chunks::<2>().0.iter().skip(1024).map(|f| f[0]).collect();
+            let left: Vec<f32> = buf
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .skip(1024)
+                .map(|f| f[0])
+                .collect();
             let w = 2.0 * std::f32::consts::PI * 13_000.0 / sr;
             let coeff = 2.0 * w.cos();
             let (mut s1, mut s2) = (0.0f32, 0.0f32);

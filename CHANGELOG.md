@@ -12,12 +12,182 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **670 tests** con harness + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **766 tests** con harness en todo el workspace (681 entre `choz-engine` y `choz-ui`) + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio.
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
 - `cargo test --workspace` necesita `--no-fail-fast`: uno de los binarios con
   `harness = false` no reconoce los argumentos que cargo le pasa y aborta la
   corrida. Por crate (`-p choz-engine -p choz-ui`) va entero.
+
+## [Sin publicar] — 2026-08-26 / 27
+
+Tres cosas, y las tres empezaron como un pedido de interfaz y terminaron en el
+DSP. El looper multipista llegó a su tira de canal; agregarle un reverb a la
+cadena borraba lo grabado; y auditar por qué eso pasaba destapó que el reverb
+era un Freeverb de 1997 y que media suite de efectos tenía el mismo tipo de
+problema.
+
+### El looper: la tira de canal, sin una palabra adentro de un botón
+
+```text
+┌ CHANNEL 1 ──────────────[×]┐
+│ ▓▓▓▓█░░░  -6.2             │   ← RMS relleno, pico montado encima
+│────────────────────────────│
+│ ♩   Q   M   S              │
+│ LEVEL ████████ 100%        │
+│ L───●───R  C               │
+│────────────────────────────│
+│ ■   ▶   ●                  │
+└────────────────────────────┘
+ +   CLEAR   EXPORT
+```
+
+Las palabras adentro de los botones eran lo que hacía que las filas dependieran
+del idioma y del ancho que el panel tuviera — `QUANTIZE 1 COMPÁS` rompía la fila
+al minimizar los cajones IN/OUT. **El color es cómo un símbolo dice qué botón
+es**: `M` y `S` tienen la misma forma, blanco y ámbar no. Cada uno con su gemelo
+apagado, así la tira se lee igual haya algo activado o no.
+
+Lo que se agregó por canal: mute, solo, paneo y volumen (los dos últimos,
+sliders — donde cae el clic *es* el valor), un `[×]` en la esquina que tira el
+canal, y un monitor de actividad con RMS y pico. La cuantización abre un modal
+en vez de ciclar en el botón. `METRO` pasó a ser `♩`, el mismo glifo de la barra
+de arriba, porque es el mismo metrónomo.
+
+Los índices de `P_STATE`, `P_MUTE`, `P_QUANT` y `P_CHANS` no se movieron: los
+bloques nuevos van después, así que un proyecto guardado antes abre igual. Un
+`P_VOL` que no está se lee como unidad, no como silencio.
+
+### El bug que hacía que grabar no se oyera
+
+`REC` apretado por segunda vez manda `P_PLAY`, que llegaba a `Cmd::Play` →
+`start_play`, y eso **ponía el estado en Playing sin cerrar la toma**. Cerrar es
+lo que congela `loop_frames`, manda a casa el trozo a medio escribir y deja la
+pista sonando; sin eso `loop_frames` quedaba en cero, la rama de reproducción
+nunca corría, y apretar `REC` dos veces era silencio.
+
+Arreglado en `start_play`, donde entran todos los llamadores — la interfaz, un
+CC aprendido y un host.
+
+### Agregar un efecto borraba las tomas
+
+`set_slot_fx` reconstruye **todos** los procesadores desde sus specs, y un deck
+construido desde un spec es un deck vacío: todo lo grabado estaba en el
+procesador que se iba a tirar. Un delay que pierde su cola en un rebuild es un
+sonido; un looper que pierde sus tomas son minutos de tocar, perdidos porque
+alguien buscó un reverb.
+
+Ahora el deck **se lleva** de una cadena a la otra, emparejado por su posición
+entre los decks de cada una: un `std::mem::swap` de dos `Box`, dos punteros, sin
+allocar ni liberar nada, así que es seguro en el hilo de audio
+(`RtState::carry_loop_decks`). `FxProcessor::is_loop_deck()` es lo que lo hace
+posible — `loopdeck()` no sirve, porque el handle ya se entregó — y los wrappers
+`Metered` y `Gated` lo reenvían, como con `loopdeck()`.
+
+### Reverb: de Freeverb a una FDN
+
+Documentado entero en [docs/reverb.md](docs/reverb.md).
+
+Un comb es un resonador: su cola es un acorde de sus propios múltiplos de `1/T`,
+y ocho combs son ocho acordes. Eso *es* el timbre metálico, y más combs son más
+acordes. De ahí salían también el `input * 0.015` —nadie calculó la ganancia
+resonante, así que se bajaba la entrada hasta que dejaba de explotar—, el
+`room_size → feedback` —el decay no era un tiempo— y el estéreo de
+`tuning + 23 samples`, que es la misma señal dos veces corrida.
+
+Lo nuevo: FDN 4×4 / 8×8 con matriz Householder × diagonal ±1 × rotación coprima
+—ortogonal, `O(N)`—, `g_i = 10^(−3·T_i/RT60)` con `RT60 = 0.2·60^decay`
+(0.2 / 1.55 / 12 s), ocho early reflections por lado que no coinciden entre
+lados, difusión allpass a la entrada y a la salida, damping y low cut **dentro**
+del lazo, interpolación Catmull-Rom en las líneas realimentadas, cinco
+caracteres (Room / Hall / Chamber / Plate / Ambient) sobre un solo motor, dos
+calidades sin allocar al cambiar, y freeze.
+
+Los cuatro primeros índices de parámetros no se movieron —`Room` se llama `Size`
+y significa lo mismo— así que un proyecto viejo abre con su reverb intacto.
+
+Medido con `cargo run --release --example reverb_bench`, que cuenta las
+allocations con un allocator envolvente en vez de afirmar que no hay:
+
+```
+Economy (4×4 FDN)   0.83% de un core   ×120 realtime   0 allocations
+High    (8×8 FDN)   1.34% de un core   × 75 realtime   0 allocations
+por tamaño de bloque (32 / 128 / 512 / 2048): 1.34 – 1.35%
+```
+
+El test de bloque compara **bit a bit** entre 32 y 1024 frames: todo lo que se
+mueve es un `Smoothed` avanzado por sample, así que nada en el algoritmo sabe
+dónde termina un bloque.
+
+El shimmer lleva el reverb adentro de su lazo y su voicing dependía de que el
+Freeverb fuera accidentalmente flojo ahí. Se le fijó el decay interno en los ~3 s
+que el viejo daba, y su test pasó a medir el reclamo real —"el octavo gana
+terreno sobre el fundamental cuando la nota para"— en vez del umbral absoluto
+que estaba calibrado contra el motor viejo.
+
+### Auditoría de los 45 efectos
+
+Entera en [docs/fx-audit.md](docs/fx-audit.md), con archivo y línea por
+hallazgo. Lo que ya estaba bien —`compressor`, `parametric_eq`, `saturator`,
+`pedal`, `filter`— no se tocó: habría sido cambio sin beneficio audible.
+
+Lo que se arregló:
+
+- **Búferes en samples, no en tiempo.** El chorus tenía `4096` samples, que son
+  93 ms a 44.1 kHz y **21 ms a 192**; sus clamps de retardo y profundidad se
+  calculaban contra eso, así que el mismo patch era otro efecto en otra
+  interfaz. Igual el flanger (2048), e igual el `hold` del bitcrusher, que era
+  una cuenta de frames y ahora es una frecuencia en hertz.
+- **Interpolación lineal en lazo realimentado.** Un promedio de dos taps es un
+  pasabajos: −3.0 dB en fs/4 y −0.68 en fs/8. Leído una vez, nada; leído en cada
+  pasada de un lazo, la resonancia de un flanger a 0.9 sale sorda — y sorda en
+  cantidad variable, porque la fracción barre con el LFO. El cúbico está 1.1 dB
+  y 0.08 dB en esos mismos puntos.
+- **Sin smoothing donde se mueve un puntero o un coeficiente.** 36 de 45
+  efectos. Un salto de tiempo de retardo se oye dos veces: click y escalón de
+  afinación.
+- **Una allocation en el hilo de audio.** `space_echo` hacía
+  `*self = SpaceEcho::new(...)` adentro de `process_block` en un cambio de rate.
+  Ahora los búferes se dimensionan para el rate máximo y un cambio sólo mueve
+  las longitudes de lectura.
+- **Denormales sin flush en lazos.** El efecto se volvía *más caro* al quedarse
+  en silencio, que es cuando el host menos lo espera.
+
+Sale de ahí `fx/delay_line.rs`: una línea fraccionaria potencia de dos
+dimensionada en milisegundos al rate máximo, lectura lineal (taps que salen) y
+Catmull-Rom (lo que vuelve), `safe()` que descarta NaN, infinitos y denormales
+en cada escritura, `soft_clip` transparente por debajo de la rodilla, y un LFO
+cúbico C¹ en el wrap. El reverb pasó a usarla sin cambiar un sample de su
+salida.
+
+### Dos hallazgos que se retiraron después de medirlos
+
+Van acá porque el callejón sin salida es parte del historial.
+
+**El estéreo del chorus.** Su LFO derecho está a medio ciclo, que es exactamente
+`−lfo_l`: los dos cabezales se mueven en espejo, que es la forma que suele
+significar "el efecto desaparece al sumar a mono". Se cambió a cuadratura, se
+escribió el test… y el test pasaba con las dos. Medido lado a lado con el mismo
+ruido, el mismo LFO y el mismo búfer:
+
+```
+anti-phase  : movimiento en mono 0.68445, ratio 1.313
+quadrature  : movimiento en mono 0.68498, ratio 1.314
+```
+
+Una décima de por mil. El error de razonamiento: lo que se cancela son los dos
+*valores del LFO*, no el audio que producen — un retardo no es una función
+lineal de su tiempo de retardo, así que `d(base+m) + d(base−m)` no es
+`2·d(base)`. Se revirtió el offset en vez de cambiarle el carácter estéreo al
+efecto sobre un diagnóstico equivocado, y el test se quedó como lo que sí es:
+una propiedad, con el número en el comentario.
+
+**El indexado sin chequear.** `delay_line.rs` usó `get_unchecked` un rato: es el
+lazo más caliente del crate y todos los índices están enmascarados por
+construcción. Medido contra el benchmark del reverb —33 lecturas por frame sobre
+ocho líneas realimentadas— compró **0.018 % de un core**: 1.340 % contra
+1.358 %. Cuatro bloques `unsafe` en un camino de realimentación no valen una
+cincuentava parte de un por ciento, así que los chequeos se quedaron.
 
 ## [1.3.3] — 2026-08-23
 

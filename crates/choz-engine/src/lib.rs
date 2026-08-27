@@ -1,6 +1,9 @@
 //! choz audio engine: RT audio thread, sources, FX chain, MIDI input, and the
 //! plugin registry. Built on the RT-safe traits in `choz-ports`.
 
+/// The arpeggiator: a note generator, not an effect — see the module for
+/// why that means it cannot be an `FxProcessor`.
+pub mod arp;
 pub mod cache;
 pub mod chord;
 pub mod engine;
@@ -14,11 +17,13 @@ pub mod meter;
 pub mod metronome;
 pub mod midi;
 pub mod osc;
+pub mod param_shape;
 pub mod paths;
 pub mod pitch;
 pub mod preset_files;
 pub mod quarantine;
 pub mod sandboxed;
+pub mod seq;
 pub mod sf2_patch;
 pub mod sfz;
 pub mod sources;
@@ -29,6 +34,7 @@ pub use engine::{AudioBackend, AudioEngine, Dest, BUSES};
 /// [`AudioEngine::set_fx_param`], rather than one of the processor's params.
 pub const FX_MIX_PARAM: usize = usize::MAX;
 pub use fx_chain::FxSpec;
+pub use param_shape::ParamShape;
 
 pub use paths::{FoundPlugin, PluginFormat, PluginPaths, SearchDir};
 

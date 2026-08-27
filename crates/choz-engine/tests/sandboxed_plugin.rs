@@ -164,7 +164,7 @@ fn a_plugin_the_user_asked_for_runs_out_of_process() {
     // ZamComp is an effect, so the FX chain is where the policy applies to it —
     // the same `wants_sandbox` call the instrument path makes.
     let spec = || choz_engine::FxSpec {
-            gate: None,
+        gate: None,
         kind: String::new(),
         enabled: true,
         wet: 1.0,

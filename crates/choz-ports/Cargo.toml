@@ -4,3 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+# The looper deck's chunk rings. Same crate the engine already uses for its
+# command ring, so a buffer crosses the RT boundary the one way choz does it.
+rtrb.workspace = true

@@ -13,7 +13,8 @@ Built with Rust, ratatui and cpal. Provides a TUI for managing note inputs, inst
 **1.3.3.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
 LADSPA, DSSI, VST2, VST3 and Pure Data patches are really hosted** — instruments
 and audio effects, with their own parameters and their own windows — choz's own
-46 effects are published as a CLAP plugin for other hosts, and choz installs as a
+46 effects and both artifacts — the arpeggiator and the step sequencer — are
+published as CLAP plugins for other hosts, and choz installs as a
 `.deb`, an `.rpm` or a script, with an entry in the desktop menu.
 
 ### Plugin formats
@@ -76,7 +77,12 @@ time, moved by the wheel or the arrows in the same step the RACK's `VOL` uses,
 and paging with `◀ ▶` when the rack is wider than the panel; a **metronome** beside the LIVE/MULTI switch clicks off the same
 transport every synced plugin reads (tempo, time signature, three sounds), and
 it keeps counting with the transport stopped, which is when a metronome is
-wanted; and the arpeggiator's **HOLD** works the way a Keystep's does — let go
+wanted; every tab carries a **step sequencer built like an Alesis MMT-8** —
+eight tracks, sixteen steps, eight parts and a song chain, drawn above the
+instrument because that is the order the notes travel in, with `REC` writing what
+you play quantised to the step the playhead is on, and every step handed to the
+tab's arpeggiator when it has one running; and the arpeggiator's **HOLD** works
+the way a Keystep's does — let go
 and the chord keeps playing, and the next key pressed with nothing down starts a
 new one rather than piling onto the old.
 
@@ -178,7 +184,8 @@ cd choz-1.3.3-x86_64-unknown-linux-gnu
 ```
 
 The tarball carries the binary, the launcher, the desktop entry, every icon size,
-the MIME type, the wallpapers, choz's own effects as a CLAP plugin and the Pure
+the MIME type, the wallpapers, choz's own effects and artifacts as a CLAP plugin
+and the Pure
 Data host — the same set the `.deb` installs. On ARM, remember that **plugins are
 native binaries**: a Raspberry Pi loads plugins built for ARM, not the x86 ones.
 
@@ -186,7 +193,7 @@ native binaries**: a Raspberry Pi loads plugins built for ARM, not the x86 ones.
 
 | What | Where | Why |
 |---|---|---|
-| `choz.clap` | `~/.clap` (script) or `/usr/lib/clap` (packages) | choz's own 46 effects, usable from Bitwig, Reaper, Carla or any CLAP host. `--no-clap` skips it. |
+| `choz.clap` | `~/.clap` (script) or `/usr/lib/clap` (packages) | choz's own 46 effects plus the arpeggiator and step sequencer as note effects, usable from Bitwig, Reaper, Carla or any CLAP host. `--no-clap` skips it. |
 | Wallpapers | `<prefix>/share/choz/wallpapers` | A fresh install opens on the image choz ships with, and the picker starts there. |
 | `choz-pd-host` | next to `choz` | The only binary that links libpd — installed when libpd is present. |
 
@@ -197,7 +204,7 @@ native binaries**: a Raspberry Pi loads plugins built for ARM, not the x86 ones.
 ./packaging/install.sh --prefix /usr/local
 ./packaging/install.sh --binary target/release/choz   # skip the build
 ./packaging/install.sh --skip-deps-check   # install without checking ALSA
-./packaging/install.sh --no-clap          # skip choz's effects as a CLAP plugin
+./packaging/install.sh --no-clap          # skip the CLAP plugin (effects + artifacts)
 ./packaging/install.sh --uninstall
 ```
 
@@ -302,7 +309,7 @@ choz/                      11 crates, version 1.3.3
 │   ├── choz-plugin-vst3/   VST3 host — pure-Rust COM bindings, no Steinberg SDK
 │   ├── choz-plugin-pd/     Pure Data patches as effects; `choz-pd-host` is the
 │   │                       only binary that links libpd (feature `pd`)
-│   ├── choz-plugin-clap-export/ choz's own 46 effects, published as one `.clap`
+│   ├── choz-plugin-clap-export/ choz's 46 effects + 2 artifacts, as one `.clap`
 │   ├── choz-plugin-sandbox/ Shared-memory transport for out-of-process hosting
 │   │                       (audio blocks and the plugin's window)
 │   └── choz-ui/            The `choz` binary: TUI, rack, modals, drawers,

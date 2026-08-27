@@ -18,14 +18,9 @@ fn main() {
         "/home/jorge/.u-he/TyrellN6/Presets/TyrellN6/04 Instruments/Bell Flower.h2p".into()
     });
 
-    let mut i = choz_engine::engine::build_instrument(
-        fmt,
-        std::path::Path::new(&path),
-        "",
-        48_000,
-        128,
-    )
-    .expect("load");
+    let mut i =
+        choz_engine::engine::build_instrument(fmt, std::path::Path::new(&path), "", 48_000, 128)
+            .expect("load");
     let st = i.state().expect("state handle");
     let before = st.save().unwrap_or_default();
     println!(
@@ -35,10 +30,18 @@ fn main() {
     );
 
     let blob = std::fs::read(&preset).expect("read preset");
-    println!("preset {} bytes, head {:?}", blob.len(), String::from_utf8_lossy(&blob[..24]));
+    println!(
+        "preset {} bytes, head {:?}",
+        blob.len(),
+        String::from_utf8_lossy(&blob[..24])
+    );
     st.restore(&blob);
     let after = st.save().unwrap_or_default();
-    println!("after restore: {} bytes, changed = {}", after.len(), after != before);
+    println!(
+        "after restore: {} bytes, changed = {}",
+        after.len(),
+        after != before
+    );
 
     i.note_on(60, 100);
     let mut buf = vec![0.0f32; 256];

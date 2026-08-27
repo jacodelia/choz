@@ -69,6 +69,27 @@ pub trait FxProcessor: Send {
         None
     }
 
+    /// The interface's end of a looper deck, taken at the same moment as
+    /// [`Self::editor`] and for the same reason: it is the last instant anybody
+    /// but the audio thread can reach the processor.
+    ///
+    /// `&mut`, unlike the handles around it, because there is exactly one of
+    /// these and it is moved out — two ends of one ring cannot be cloned.
+    fn loopdeck(&mut self) -> Option<LoopHandle> {
+        None
+    }
+
+    /// Whether this processor is a looper deck — asked **after** the handle has
+    /// been taken, which is why it cannot just be `loopdeck().is_some()`.
+    ///
+    /// The audio thread uses it to carry a deck across a chain rebuild: adding
+    /// a reverb builds a whole new chain, and a deck rebuilt from its spec is a
+    /// deck with no takes in it. Minutes of playing, gone because the player
+    /// reached for another effect.
+    fn is_loop_deck(&self) -> bool {
+        false
+    }
+
     /// Parameters the user moves inside the plugin's own window, when the
     /// format can report them. Captured at the same moment as [`Self::editor`].
     fn param_touch(&self) -> Option<TouchHandle> {
@@ -184,6 +205,349 @@ impl FxMeter {
         buf.iter()
             .filter(|s| s.is_finite())
             .fold(0.0f32, |m, s| m.max(s.abs()))
+    }
+}
+
+// ─── The looper deck's thread bridge ────────────────────────────────────────
+
+/// One second of interleaved stereo audio, as the looper stores it.
+///
+/// **`i16`, not `f32`.** Five minutes of stereo `f32` at 48 kHz is 110 MiB a
+/// track, and eight of those is most of a gigabyte; `i16` halves that and is
+/// what the exported WAV is written as anyway, so nothing is lost twice.
+///
+/// **An `Arc`, so the interface can read what the audio thread is playing.**
+/// The UI allocates it and hands it over; while the audio thread holds the only
+/// reference it writes through `Arc::get_mut`, which is allocation-free. Once
+/// the chunk is full it sends a *clone* home — a refcount bump, nothing more —
+/// and from then on `get_mut` fails, which is exactly the guarantee wanted: a
+/// chunk anybody else can see is never written again.
+pub type LoopChunk = std::sync::Arc<[i16]>;
+
+/// Frames one chunk holds. A second at 48 kHz, which is 187.5 KiB — small
+/// enough that a track costs what it recorded, big enough that the ring is
+/// touched once a second rather than once a block.
+pub const LOOP_CHUNK_SECS: usize = 1;
+
+/// A chunk that came home: which track it belongs to, where in that track, and
+/// the audio. The interface keeps these to export from — see [`LoopHandle`].
+pub struct LoopFilled {
+    pub track: usize,
+    pub index: usize,
+    pub chunk: LoopChunk,
+}
+
+/// What a deck is doing, for the panel to draw. Atomics, published from the
+/// callback and read whenever the UI redraws — the same contract [`FxMeter`]
+/// has, for the same reason.
+#[derive(Default)]
+pub struct LoopState {
+    /// Per track: 0 idle, 1 recording, 2 playing, 3 paused. Packed four bits a
+    /// track so the whole deck is one load.
+    tracks: std::sync::atomic::AtomicU64,
+    /// Peak of what is **arriving** at the deck, as the panel's dB monitor
+    /// reads it. One number and not one a track: a deck hears one source, so
+    /// every channel's input is the same input.
+    in_peak: std::sync::atomic::AtomicU32,
+    /// The length track 1 froze, in frames. 0 until it does.
+    frames: std::sync::atomic::AtomicUsize,
+    /// Where the single playhead is.
+    pos: std::sync::atomic::AtomicUsize,
+    /// Frames the deck has recorded but not yet frozen — what the panel draws
+    /// while track 1 is still growing.
+    recorded: std::sync::atomic::AtomicUsize,
+    /// Per channel, what that channel is putting out this block: the peak and
+    /// the RMS, linear. What a strip's activity monitor draws — the input meter
+    /// answers "is the deck hearing anything", and this answers "is *this*
+    /// channel doing anything", which is the question a player with four
+    /// strips in front of them is actually asking.
+    ///
+    /// A recording channel reports what it is taking in, so a strip lights up
+    /// while the take is being made rather than only once it plays.
+    track_peak: [std::sync::atomic::AtomicU32; LOOP_TRACKS],
+    track_rms: [std::sync::atomic::AtomicU32; LOOP_TRACKS],
+    /// The audio thread ran out of chunks and closed the loop rather than lose
+    /// audio. Sticky until the interface reads it.
+    starved: std::sync::atomic::AtomicBool,
+}
+
+/// What one track of a deck is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoopTrackState {
+    #[default]
+    Idle,
+    Recording,
+    Playing,
+    /// Silent, but still the deck's: the shared playhead keeps running, so a
+    /// track let back in comes back **in time with the others** rather than at
+    /// the top of the loop. That is the whole difference between PAUSE and
+    /// STOP on a deck with one playhead.
+    Paused,
+}
+
+impl LoopTrackState {
+    fn code(self) -> u64 {
+        match self {
+            LoopTrackState::Idle => 0,
+            LoopTrackState::Recording => 1,
+            LoopTrackState::Playing => 2,
+            LoopTrackState::Paused => 3,
+        }
+    }
+
+    fn of(code: u64) -> Self {
+        match code {
+            1 => LoopTrackState::Recording,
+            2 => LoopTrackState::Playing,
+            3 => LoopTrackState::Paused,
+            _ => LoopTrackState::Idle,
+        }
+    }
+}
+
+/// Tracks one deck holds. Fixed, so the track array never grows on the RT
+/// thread — and eight is what fits on the panel at a readable size.
+pub const LOOP_TRACKS: usize = 8;
+
+impl LoopState {
+    pub fn set_track(&self, track: usize, state: LoopTrackState) {
+        if track >= LOOP_TRACKS {
+            return;
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        let shift = track * 4;
+        let mut now = self.tracks.load(Relaxed);
+        now &= !(0xF << shift);
+        now |= state.code() << shift;
+        self.tracks.store(now, Relaxed);
+    }
+
+    pub fn track(&self, track: usize) -> LoopTrackState {
+        use std::sync::atomic::Ordering::Relaxed;
+        if track >= LOOP_TRACKS {
+            return LoopTrackState::Idle;
+        }
+        LoopTrackState::of((self.tracks.load(Relaxed) >> (track * 4)) & 0xF)
+    }
+
+    /// The level arriving at the deck, as a linear peak.
+    pub fn set_in_peak(&self, peak: f32) {
+        self.in_peak
+            .store(peak.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn in_peak(&self) -> f32 {
+        f32::from_bits(self.in_peak.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// One channel's own activity: peak and RMS of what it put out, linear.
+    pub fn set_track_level(&self, track: usize, peak: f32, rms: f32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if track >= LOOP_TRACKS {
+            return;
+        }
+        self.track_peak[track].store(peak.to_bits(), Relaxed);
+        self.track_rms[track].store(rms.to_bits(), Relaxed);
+    }
+
+    /// `(peak, rms)`, both linear. Silence for a channel out of range.
+    pub fn track_level(&self, track: usize) -> (f32, f32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if track >= LOOP_TRACKS {
+            return (0.0, 0.0);
+        }
+        (
+            f32::from_bits(self.track_peak[track].load(Relaxed)),
+            f32::from_bits(self.track_rms[track].load(Relaxed)),
+        )
+    }
+
+    pub fn any_recording(&self) -> bool {
+        (0..LOOP_TRACKS).any(|t| self.track(t) == LoopTrackState::Recording)
+    }
+
+    pub fn set_frames(&self, frames: usize) {
+        self.frames
+            .store(frames, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn frames(&self) -> usize {
+        self.frames.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_pos(&self, pos: usize) {
+        self.pos.store(pos, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn pos(&self) -> usize {
+        self.pos.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_recorded(&self, frames: usize) {
+        self.recorded
+            .store(frames, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn recorded(&self) -> usize {
+        self.recorded.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_starved(&self, on: bool) {
+        self.starved.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// Whether the deck ran out of chunks, clearing the flag as it is read.
+    pub fn take_starved(&self) -> bool {
+        self.starved
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// The interface's end of a looper deck.
+///
+/// Taken out of the processor at build time — the way `meter()` and `editor()`
+/// already are, in the one moment `AudioEngine::set_slot_fx` calls "the last
+/// chance to reach the processors". [`FxProcessor::process_block`] gets a
+/// buffer and a sample rate and nothing else: a processor has no handle to the
+/// host, no channel, and no way to ask for memory. A looper that records five
+/// minutes needs all three, and this is where they come from.
+pub struct LoopHandle {
+    /// Empty chunks going out to the audio thread.
+    supply: rtrb::Producer<LoopChunk>,
+    /// Full ones coming back, so the interface can export what was recorded.
+    home: rtrb::Consumer<LoopFilled>,
+    state: std::sync::Arc<LoopState>,
+    /// Every chunk this handle ever handed out, per track, in order.
+    ///
+    /// Kept — not dropped — for two reasons: it is what EXPORT writes, and it
+    /// is what keeps the audio thread's own `Arc::drop` a refcount decrement
+    /// rather than a free. Cleared on the interface thread when a track is.
+    takes: Vec<Vec<LoopChunk>>,
+    /// Frames in one chunk, fixed when the deck was built.
+    chunk_frames: usize,
+    sample_rate: u32,
+}
+
+impl LoopHandle {
+    /// Build both ends. The processor keeps what this does not.
+    ///
+    /// `ring` is how many chunks may be in flight; the interface tops the
+    /// supply back up every time it redraws, so this only has to cover the gap
+    /// between two frames of the UI — a handful of seconds is plenty.
+    pub fn pair(
+        sample_rate: u32,
+        ring: usize,
+    ) -> (
+        LoopHandle,
+        rtrb::Consumer<LoopChunk>,
+        rtrb::Producer<LoopFilled>,
+        std::sync::Arc<LoopState>,
+    ) {
+        let (supply, supply_rx) = rtrb::RingBuffer::new(ring.max(2));
+        let (home_tx, home) = rtrb::RingBuffer::new(ring.max(2) * LOOP_TRACKS);
+        let state = std::sync::Arc::new(LoopState::default());
+        let handle = LoopHandle {
+            supply,
+            home,
+            state: state.clone(),
+            takes: vec![Vec::new(); LOOP_TRACKS],
+            chunk_frames: LOOP_CHUNK_SECS * sample_rate.max(1) as usize,
+            sample_rate,
+        };
+        (handle, supply_rx, home_tx, state)
+    }
+
+    pub fn state(&self) -> &LoopState {
+        &self.state
+    }
+
+    /// The same, owned — so the panel can hold it while the engine is borrowed
+    /// somewhere else.
+    pub fn shared_state(&self) -> std::sync::Arc<LoopState> {
+        self.state.clone()
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    pub fn chunk_frames(&self) -> usize {
+        self.chunk_frames
+    }
+
+    /// Bytes this deck is holding, counting each chunk once.
+    pub fn bytes(&self) -> usize {
+        self.takes
+            .iter()
+            .flat_map(|t| t.iter())
+            .map(|c| c.len() * std::mem::size_of::<i16>())
+            .sum()
+    }
+
+    /// The audio of one track, in order, for EXPORT to write.
+    pub fn take(&self, track: usize) -> &[LoopChunk] {
+        self.takes.get(track).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Collect what the audio thread has filled since the last call, and top the
+    /// supply back up to `want` chunks. Called once per redraw.
+    ///
+    /// `budget_left` is how many more bytes the whole program may hold; the
+    /// interface is the only side that allocates, so it is also the only side
+    /// that has to be told when to stop. Returns the bytes it allocated.
+    pub fn pump(&mut self, want: usize, budget_left: usize) -> usize {
+        while let Ok(filled) = self.home.pop() {
+            if let Some(track) = self.takes.get_mut(filled.track) {
+                if track.len() <= filled.index {
+                    track.resize(filled.index + 1, filled.chunk.clone());
+                }
+                track[filled.index] = filled.chunk;
+            }
+        }
+        let each = self.chunk_frames * 2 * std::mem::size_of::<i16>();
+        let mut spent = 0;
+        while self.supply.slots() > 0 && spent + each <= budget_left {
+            let chunk: LoopChunk = vec![0i16; self.chunk_frames * 2].into();
+            if self.supply.push(chunk).is_err() {
+                break;
+            }
+            spent += each;
+            if self.supply.slots() == 0 {
+                break;
+            }
+            // `want` is a target, not the ring's whole capacity: handing over
+            // every slot at once would allocate seconds of audio for a deck
+            // nobody has armed.
+            if (self.supply.buffer().capacity() - self.supply.slots()) >= want {
+                break;
+            }
+        }
+        spent
+    }
+
+    /// Forget one track's audio. The interface thread is where these are freed:
+    /// the audio thread only ever decrements.
+    pub fn forget(&mut self, track: usize) {
+        if let Some(t) = self.takes.get_mut(track) {
+            t.clear();
+        }
+    }
+
+    /// Throw one track's audio away and slide the ones above it down — the
+    /// interface's half of the deck's own `Remove`, so the takes stay lined up
+    /// with the channels EXPORT names.
+    pub fn remove(&mut self, track: usize) {
+        if track < self.takes.len() {
+            self.takes.remove(track);
+            self.takes.push(Vec::new());
+        }
+    }
+
+    pub fn forget_all(&mut self) {
+        for t in self.takes.iter_mut() {
+            t.clear();
+        }
+    }
+}
+
+impl std::fmt::Debug for LoopHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LoopHandle({} bytes)", self.bytes())
     }
 }
 

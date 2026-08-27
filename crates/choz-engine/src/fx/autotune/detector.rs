@@ -161,11 +161,7 @@ impl PitchDetector {
             acc: 0.0,
             acc_n: 0,
             antialias: [crate::fx::utility::Biquad::lowpass(ANTIALIAS_HZ, sr, 0.707); 2],
-            rumble: [crate::fx::utility::Biquad::highpass(
-                RUMBLE_HZ,
-                sr / decim as f32,
-                0.707,
-            ); 2],
+            rumble: [crate::fx::utility::Biquad::highpass(RUMBLE_HZ, sr / decim as f32, 0.707); 2],
             window: vec![0.0; WINDOW],
             write: 0,
             filled: 0,
