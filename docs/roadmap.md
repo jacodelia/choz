@@ -339,7 +339,10 @@ contra una habitación.
 ```bash
 cargo build --workspace                 # todos los hosts van en el build normal
 cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+# **Con `+beta`, o el CI encuentra lints que aquí no salen.** El runner usa
+# `dtolnay/rust-toolchain@stable`, que va por delante del stable de esta
+# máquina: `chunks_exact(2)` pasó local con clippy 1.97 y rebotó en 1.98.
+cargo +beta clippy --workspace --all-targets -- -D warnings
 cargo run --release --bin choz          # necesita una terminal real (tty)
 tail -f ~/.local/state/choz/choz.log    # ver errores/log en vivo
 

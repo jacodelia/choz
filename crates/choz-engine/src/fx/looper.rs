@@ -1052,7 +1052,7 @@ pub fn export_track(
         .map_err(|e| std::io::Error::other(format!("{path:?}: {e}")))?;
     let mut written = 0usize;
     'chunks: for chunk in handle.take(track) {
-        for frame in chunk.chunks_exact(2) {
+        for frame in chunk.as_chunks::<2>().0 {
             // The deck's length, not the chunk's: the last second of a take is
             // a whole chunk with silence after the end of the loop.
             if written >= frames {
