@@ -11,6 +11,7 @@ pub mod feedback;
 pub mod fx;
 pub mod fx_chain;
 pub mod input;
+pub mod layered;
 mod jack_backend;
 pub mod maxpat;
 pub mod meter;

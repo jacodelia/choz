@@ -1,5 +1,8 @@
 //! Open every installed CLAP plugin's window in a real X11 window.
-//! `cargo run -p choz-plugin-clap --example gui_probe [filtro]`
+//! `cargo run -p choz-plugin-clap --example clap_gui_probe [filtro]`
+//!
+//! Named for its format — see the VST3 one for why two `gui_probe`s cannot
+//! share the workspace.
 
 use choz_ports::{AudioSource, FxProcessor};
 

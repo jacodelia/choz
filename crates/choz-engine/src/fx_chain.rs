@@ -802,6 +802,63 @@ impl fx::FxProcessor for Bypass {
     }
 }
 
+/// Which tabs some effect is gated by, one bit each.
+///
+/// Read by the engine's render loop and written by whoever rebuilds a chain,
+/// which is the interface thread — a relaxed load per block against a store
+/// per edit.
+static GATE_SOURCES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The tabs that drive a gate somewhere in the rack, as a bitmask.
+///
+/// **What it is for: order.** A gate reads the source tab's level for the block
+/// it is in, so a source rendered *after* the gated tab is read a block late —
+/// audible as a rhythmic gate that lags its own kick by up to 5 ms. The render
+/// loop takes these tabs first; everything else follows in its own order, and
+/// the sum does not care which order it was added in.
+pub fn gate_sources() -> u32 {
+    GATE_SOURCES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Publish the whole mask. Called with **every** chain's sources, not one
+/// chain's: a bit that nobody drives any more has to go out.
+pub fn set_gate_sources(mask: u32) {
+    GATE_SOURCES.store(mask, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Wrap a processor in its gate, for a caller that has the two of them and no
+/// spec to build from — the engine's own tests, which is the only place that
+/// is true.
+pub fn gated(
+    inner: Box<dyn fx::FxProcessor>,
+    gate: GateSpec,
+    base_wet: f32,
+) -> Box<dyn fx::FxProcessor> {
+    Box::new(Gated {
+        inner,
+        gate,
+        base_wet,
+        env: 0.0,
+        sent: -1.0,
+    })
+}
+
+/// The tabs this chain's gates read, as a bitmask. The clock and the metronome
+/// are nobody's tab and set no bit; a gate on the **notes** of a tab does not
+/// either, because a note is published where it arrives and not where the tab
+/// renders.
+pub fn gate_sources_of(specs: &[FxSpec]) -> u32 {
+    specs
+        .iter()
+        .filter_map(|s| s.gate)
+        .filter_map(|g| match g.source {
+            GateSource::Tab(i) => Some(i),
+            _ => None,
+        })
+        .filter(|i| *i < 32)
+        .fold(0u32, |mask, i| mask | (1 << i))
+}
+
 pub fn build_chain_from_specs(
     specs: &[FxSpec],
     sample_rate: u32,

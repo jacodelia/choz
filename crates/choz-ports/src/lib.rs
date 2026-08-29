@@ -673,6 +673,14 @@ pub trait AudioSource: Send {
         None
     }
 
+    /// The patch of one **zone**, when this source is a tab split between two
+    /// instances of one plugin. `None` for everything else: a SoundFont's zones
+    /// are program numbers and need no blob, and a single instance has one
+    /// patch, reachable through [`AudioSource::state`].
+    fn zone_state(&self, _zone: u8) -> Option<StateHandle> {
+        None
+    }
+
     /// The plugin's own preset browser, when the format lets choz read it.
     /// Captured at the same moment as [`Self::editor`]; `None` means the tab's
     /// BANK key has nothing to show.
@@ -933,6 +941,64 @@ pub struct PluginParam {
     pub group: Option<String>,
 }
 
+/// The positions of a parameter and where they sit, `0..=1`.
+pub type Positions = (u32, Vec<(f64, String)>);
+
+/// What a sweep of labels, evenly spaced over `0..=1`, says the parameter is.
+///
+/// **A plugin that names its positions is telling you it has positions**, and
+/// the only way to hear that from a format whose parameters are all
+/// dimensionless floats is to read what a value *displays as*. A run of probes
+/// that all read "Bandpass" is a plateau, and a plateau is a step.
+///
+/// Shared because two formats need it and neither can ask outright: VST3 reads
+/// the labels with `getParamStringByValue`, VST2 by setting the parameter on a
+/// throwaway instance and reading it back. What is done with the answer — and
+/// what it costs to get — differs; what the answer *means* does not.
+///
+/// The flag says every probe read differently, which is the caller's cue to
+/// sweep again more finely.
+pub fn positions_from_labels(shown: &[String], max_steps: u32) -> Option<(bool, Positions)> {
+    let probes = shown.len();
+    if probes < 3 || shown.iter().any(|s| s.is_empty()) {
+        return None;
+    }
+    // A value, however it is dressed: "0.50", "440 Hz", "-12.0 dB".
+    if shown.iter().any(|s| {
+        s.split_whitespace()
+            .next()
+            .is_some_and(|w| w.parse::<f64>().is_ok())
+    }) {
+        return None;
+    }
+    // Runs of one label, in order: (label, first index, last index).
+    let mut runs: Vec<(&str, usize, usize)> = Vec::new();
+    for (k, s) in shown.iter().enumerate() {
+        match runs.last_mut() {
+            Some(r) if r.0 == s.as_str() => r.2 = k,
+            _ => runs.push((s.as_str(), k, k)),
+        }
+    }
+    if runs.len() < 2 || runs.len() as u32 > max_steps {
+        return None;
+    }
+    // The same name twice with something else between it is not a position:
+    // that is a table being read too coarsely to see what it really does.
+    let mut seen = std::collections::HashSet::new();
+    if !runs.iter().all(|(l, _, _)| seen.insert(*l)) {
+        return None;
+    }
+    let points = runs
+        .iter()
+        .map(|(label, lo, hi)| {
+            let mid = (lo + hi) as f64 / 2.0;
+            (mid / (probes - 1) as f64, label.to_string())
+        })
+        .collect();
+    Some((runs.len() == probes, (runs.len() as u32, points)))
+}
+
+
 impl PluginParam {
     /// A parameter with nothing but the numbers, which is all most hosts give.
     pub fn plain_range(id: u32, name: String, min: f64, max: f64, default: f64) -> Self {
@@ -1191,5 +1257,65 @@ mod transport_tests {
         t.set_time_signature(4, 4);
         t.set_bpm(Transport::DEFAULT_BPM);
         t.rewind();
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::positions_from_labels;
+
+    /// The ceiling VST3 uses; the shared reader takes it as an argument because
+    /// what counts as "too many to be a list" belongs to the caller.
+    const MAX: u32 = 32;
+
+    fn sweep(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_mode_list_reads_as_its_positions() {
+        // Surge XT's play mode, as it renders over the range.
+        let s = sweep(&[
+            "Poly", "Poly", "Mono", "Mono", "Mono ST", "Mono ST", "Latch", "Latch",
+        ]);
+        let (undersampled, (steps, points)) = positions_from_labels(&s, MAX).expect("a list");
+        assert!(!undersampled);
+        assert_eq!(steps, 4);
+        assert_eq!(points.len(), 4);
+        assert_eq!(points[0].1, "Poly");
+        // Each point sits inside its own run, not on the edge where the next
+        // position starts.
+        assert!((points[0].0 - 1.0 / 14.0).abs() < 1e-9);
+        assert!(points.iter().all(|(v, _)| (0.0..=1.0).contains(v)));
+    }
+
+    #[test]
+    fn a_switch_is_two_positions() {
+        let s = sweep(&["Off", "Off", "Off", "On"]);
+        let (_, (steps, _)) = positions_from_labels(&s, MAX).expect("a switch");
+        assert_eq!(steps, 2);
+    }
+
+    #[test]
+    fn numbers_stay_a_knob() {
+        assert!(positions_from_labels(&sweep(&["0.00", "0.50", "1.00"]), MAX).is_none());
+        assert!(positions_from_labels(&sweep(&["-12.0 dB", "-6.0 dB", "0.0 dB"]), MAX).is_none());
+    }
+
+    #[test]
+    fn a_name_that_comes_back_is_not_a_list() {
+        assert!(positions_from_labels(&sweep(&["Saw", "Sine", "Saw", "Sine"]), MAX).is_none());
+    }
+
+    #[test]
+    fn every_probe_different_asks_for_a_finer_sweep() {
+        let s = sweep(&["Off", "LP 24", "HP 12", "BP 12"]);
+        let (undersampled, _) = positions_from_labels(&s, MAX).expect("a list");
+        assert!(undersampled);
+    }
+
+    #[test]
+    fn a_blank_reading_says_nothing() {
+        assert!(positions_from_labels(&sweep(&["Off", "", "On"]), MAX).is_none());
     }
 }

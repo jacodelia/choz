@@ -1,6 +1,10 @@
 //! Open every installed VST3 plugin's window inside a real X11 window and count
 //! what actually got created.
-//! `cargo run -p choz-plugin-vst3 --example gui_probe [filtro]`
+//! `cargo run -p choz-plugin-vst3 --example vst3_gui_probe [filtro]`
+//!
+//! Named for its format: cargo builds every example of the workspace into one
+//! directory, so two crates with a `gui_probe` overwrite each other's binary —
+//! a warning today and a hard error in a future cargo.
 //!
 //! Two things this probe does on purpose, both learned the hard way (see
 //! docs/roadmap.md):

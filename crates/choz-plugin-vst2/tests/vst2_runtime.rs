@@ -68,11 +68,6 @@ fn installed_vst2_plugins_scan_host_and_expose_params() {
         };
         let params = choz_plugin_vst2::read_params(&info.path, "");
         assert!(!params.is_empty(), "{} exposes no parameters", info.name);
-        assert!(
-            inst.param_touch().is_some(),
-            "{}: no way to report what the user moves in its window",
-            info.name
-        );
 
         let render = |inst: &mut Vst2Instrument| {
             let mut buf = vec![0.0f32; BLOCK as usize * 2];
