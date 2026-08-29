@@ -168,6 +168,9 @@ impl FxProcessor for ShimmerReverb {
             let secs = self.pre_frames as f32 / self.sample_rate;
             self.sample_rate = sr;
             self.pre_frames = ((secs * sr) as usize).min(PREDELAY_CAP - 1);
+            for sh in &mut self.shifter {
+                sh.set_sample_rate(sr);
+            }
             self.reset();
         }
         // One-pole, ~2 kHz at full damping up to ~18 kHz at none.

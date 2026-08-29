@@ -1,6 +1,7 @@
 //! Vinyl simulation — wow/flutter (slow pitch modulation) + crackle noise.
 
 use super::FxProcessor;
+use super::dc::DcBlock;
 
 /// LFO-based wow and flutter + crackle noise, producing an analogue vinyl feel.
 pub struct VinylSim {
@@ -20,6 +21,10 @@ pub struct VinylSim {
     delay_write: usize,
     // LCG random state for crackle
     rng_state: u32,
+    // Crackle and a groove are not symmetric around zero; what they leave
+    // behind would eat headroom in every effect after this one.
+    dc: DcBlock,
+    sample_rate: u32,
 }
 
 impl VinylSim {
@@ -34,6 +39,8 @@ impl VinylSim {
             delay_buf: vec![0.0f32; 4096],
             delay_write: 0,
             rng_state: 0xDEAD_BEEF,
+            dc: DcBlock::new(48000.0),
+            sample_rate: 48000,
         }
     }
 
@@ -89,6 +96,10 @@ impl FxProcessor for VinylSim {
     }
 
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
+        if self.sample_rate != sample_rate {
+            self.sample_rate = sample_rate;
+            self.dc = DcBlock::new(sample_rate as f32);
+        }
         let sr = sample_rate as f32;
         let wow_rate = 0.5_f32; // Hz — slow wow
         let flutter_rate = 8.0_f32; // Hz — flutter
@@ -128,8 +139,9 @@ impl FxProcessor for VinylSim {
                 0.0
             };
 
-            let wet_l = modulated + crack;
-            let wet_r = modulated + crack;
+            let wet = self.dc.process(modulated + crack);
+            let wet_l = wet;
+            let wet_r = wet;
             buf[i * 2] = dry_l + self.wet * (wet_l - dry_l);
             buf[i * 2 + 1] = dry_r + self.wet * (wet_r - dry_r);
 
@@ -145,9 +157,35 @@ impl FxProcessor for VinylSim {
         self.delay_write = 0;
         self.wow_phase = 0.0;
         self.flutter_phase = 0.0;
+        self.dc.reset();
     }
 
     fn set_mix(&mut self, wet: f32) {
         self.wet = wet.clamp(0.0, 1.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_groove_does_not_leave_an_offset_behind() {
+        let sr = 48000u32;
+        let mut buf: Vec<f32> = (0..sr as usize)
+            .flat_map(|i| {
+                let s = (std::f32::consts::TAU * 220.0 * i as f32 / sr as f32)
+                    .sin()
+                    .max(0.0)
+                    * 0.8;
+                [s, s]
+            })
+            .collect();
+        let mut fx = VinylSim::new();
+        fx.set_crackle(1.0);
+        fx.process_block(&mut buf, sr);
+        let tail = &buf[buf.len() - 9600..];
+        let mean = tail.iter().sum::<f32>() / tail.len() as f32;
+        assert!(mean.abs() < 0.01, "DC left on the output: {mean}");
     }
 }

@@ -33,6 +33,7 @@
 //! the curve and the oversampling factor are **not** — half way between two
 //! curves is not a curve, so those switch on a block boundary.
 
+use super::dc::DcBlock;
 use super::oversample::{Factor, Oversampler, Tone};
 use super::smooth::Smoothed;
 use super::utility::Biquad;
@@ -221,35 +222,6 @@ impl Shape {
             Shape::Curve(c) => c.apply(x),
             Shape::Table(t) => t.apply(x),
         }
-    }
-}
-
-/// Blocks the DC an asymmetric curve leaves behind.
-///
-/// One pole at ~10 Hz: low enough not to touch a bass note, high enough that a
-/// bias change settles in a few tens of milliseconds instead of sagging.
-#[derive(Clone, Copy)]
-struct DcBlock {
-    x1: f32,
-    y1: f32,
-    r: f32,
-}
-
-impl DcBlock {
-    fn new(sr: f32) -> Self {
-        Self {
-            x1: 0.0,
-            y1: 0.0,
-            r: 1.0 - (2.0 * std::f32::consts::PI * 10.0 / sr.max(8000.0)),
-        }
-    }
-
-    #[inline]
-    fn process(&mut self, x: f32) -> f32 {
-        let y = x - self.x1 + self.r * self.y1;
-        self.x1 = x;
-        self.y1 = y;
-        y
     }
 }
 

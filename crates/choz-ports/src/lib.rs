@@ -47,6 +47,22 @@ pub trait FxProcessor: Send {
     fn reset(&mut self);
 
     /// Dry/wet mix (0.0 = dry, 1.0 = fully wet).
+    ///
+    /// **The law, and it is the same one in every effect**:
+    ///
+    /// ```text
+    /// out = dry + wet · (processed − dry)
+    /// ```
+    ///
+    /// A crossfade, so `0` is a wire and `1` is the effect with none of the
+    /// signal that went in. Not `dry + wet · processed`, which is a send level:
+    /// with that, turning the knob up can only make the tab louder and can
+    /// never take the dry away, so the same knob would mean two different
+    /// things depending on which effect it was on.
+    ///
+    /// The one deliberate exception is the looper, which adds: its takes play
+    /// *under* what is being played now, and a crossfade would turn the live
+    /// instrument down as the loops came up.
     fn set_mix(&mut self, wet: f32);
 
     /// Human-readable name.

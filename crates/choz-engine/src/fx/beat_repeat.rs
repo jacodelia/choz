@@ -20,8 +20,16 @@
 
 use choz_ports::transport;
 
-/// How much audio can be captured: 2 s at 192 kHz, 8 s at 48 kHz.
-const CAPACITY_FRAMES: usize = 384_000;
+/// How much audio can be captured: [`MAX_GRAIN_S`] at every rate choz supports.
+const CAPACITY_FRAMES: usize = (MAX_GRAIN_S * super::delay_line::MAX_RATE) as usize;
+
+/// The longest grain, in seconds. The buffer holds this much at 192 kHz, so at
+/// 48 it holds four times as much — and the clamp below is in **seconds**, not
+/// in samples, so the same knob at the same tempo captures the same music
+/// whatever the interface runs at. Sized in samples it did not: 384 000 frames
+/// is 2 s at 192 kHz and 8 s at 48, so a slow tempo with a long grain was
+/// truncated on a fast device and not on a slow one.
+const MAX_GRAIN_S: f32 = 2.0;
 
 /// Loop crossfade, in frames at 48 kHz. Scaled with the sample rate.
 const FADE_48K: usize = 128;
@@ -180,7 +188,7 @@ impl super::FxProcessor for BeatRepeat {
         let q0 = t.ppq();
         let q_per_frame = (t.bpm() / 60.0 / sr) as f64;
         let want_grain = ((self.grain_q * 60.0 / t.bpm().max(1.0)) * sr) as usize;
-        let want_grain = want_grain.clamp(1, CAPACITY_FRAMES);
+        let want_grain = want_grain.clamp(1, ((MAX_GRAIN_S * sr) as usize).min(CAPACITY_FRAMES));
         let fade = self.fade();
         let mix = self.mix;
 
@@ -348,6 +356,39 @@ mod tests {
         br.process_block(&mut buf, 48000);
         t.set_playing(was);
         assert_eq!(buf, before, "no grid, no repeat");
+    }
+
+    /// A long grain at a slow tempo used to be clamped by a capacity measured
+    /// in **samples**: 8 s of room at 48 kHz and 2 s at 192, so the same knob
+    /// at the same tempo captured a different amount of music per interface.
+    /// Now the ceiling is two seconds everywhere.
+    #[test]
+    fn a_long_grain_is_the_same_length_at_every_rate() {
+        let captured = |sr: u32| {
+            with_transport(30.0, sr, || {
+                // 30 bpm: a quarter is 2 s, so a 1/2 grain asks for 4 s and
+                // meets the ceiling at both rates. The interval is short so a
+                // boundary — which is what sets the grain length — comes soon.
+                let mut br = BeatRepeat::new(sr);
+                br.interval_q = 0.5;
+                br.grain_q = 2.0;
+                br.chance = 1.0;
+                br.set_mix(1.0);
+                // One block, because the transport only advances when the
+                // engine renders and there is no engine here: two seconds of
+                // it crosses four intervals.
+                let mut buf = vec![0.1f32; sr as usize * 2 * 2];
+                br.process_block(&mut buf, sr);
+                assert!(br.grain_len > 0, "no boundary was ever crossed");
+                br.grain_len as f32 / sr as f32
+            })
+        };
+        let slow = captured(48_000);
+        let fast = captured(192_000);
+        assert!(
+            (slow - fast).abs() < 1e-3,
+            "the same grain is {slow} s at 48 kHz and {fast} s at 192"
+        );
     }
 
     /// On the grid, a slice comes back: the ramp stops rising and repeats a

@@ -517,6 +517,15 @@ impl GateSource {
             GateSource::Named(n) if n == "clock" => E::Clock,
             GateSource::Named(n) if n == "tap" => E::Metronome,
             GateSource::Named(n) if n == "seq" => E::Seq,
+            // `note:<tab>` rather than a variant of its own: the file format
+            // already had a name for "a source that is not a tab's level", and
+            // a choz too old to know this one falls back to the first tab
+            // instead of failing to open the project.
+            GateSource::Named(n) if n.starts_with("note:") => n
+                .trim_start_matches("note:")
+                .parse()
+                .map(E::Note)
+                .unwrap_or(E::Tab(0)),
             // A name from a newer choz means nothing here; the first tab is the
             // reading that at least does something.
             GateSource::Named(_) => E::Tab(0),
@@ -530,6 +539,7 @@ impl GateSource {
             E::Clock => GateSource::Named("clock".into()),
             E::Metronome => GateSource::Named("tap".into()),
             E::Seq => GateSource::Named("seq".into()),
+            E::Note(i) => GateSource::Named(format!("note:{i}")),
         }
     }
 }

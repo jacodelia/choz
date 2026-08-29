@@ -1304,6 +1304,65 @@ impl Vst3RealInstance {
             ids: self.param_ids.clone(),
         }
     }
+    /// Which **unit** each parameter belongs to, by parameter index, and what
+    /// that unit is called.
+    ///
+    /// A VST3 plugin says where its controls live: `ParameterInfo::unitId`
+    /// points at a unit, and `IUnitInfo` names the units and their parents. It
+    /// is the plugin's own answer, and it replaces guessing sections out of the
+    /// names — which is right for Surge XT and a coin toss for anything else.
+    ///
+    /// Two things make this more than a lookup:
+    ///
+    /// * **The top of the tree is dropped**, and not by name: the prefix every
+    ///   unit shares says nothing, because a heading over the whole list is not
+    ///   a heading. Surge XT hangs everything off a unit called "Root" which
+    ///   itself hangs off "Root Unit"; u-he's plugins have one called "Root".
+    ///   Both fall out of "discard what they all have in common", and a plugin
+    ///   with a single unit ends up with no section at all, which is correct —
+    ///   one section is not a section.
+    /// * **What is left keeps its path**, joined with `/`: a plugin with two
+    ///   filters names them apart in the tree, not in the leaf.
+    ///
+    /// Measured on this machine: Surge XT reports 774 parameters in 14
+    /// sections, TyrellN6 94 in 9, TripleCheese 90 in 11 — and the Zam plugins
+    /// report no units at all, which is what leaves them to the name heuristic
+    /// they were already using.
+    pub fn param_groups(&self) -> Vec<Option<String>> {
+        let count = self.param_count();
+        let empty = vec![None; count as usize];
+        let Some(c) = &self.controller else {
+            return empty;
+        };
+        let Some(units) = c.cast::<IUnitInfo>() else {
+            return empty;
+        };
+        // The unit tree, by id: name and parent.
+        let mut tree: std::collections::HashMap<i32, (String, i32)> =
+            std::collections::HashMap::new();
+        let n = unsafe { units.getUnitCount() }.max(0);
+        for i in 0..n {
+            let mut info: UnitInfo = unsafe { std::mem::zeroed() };
+            if unsafe { units.getUnitInfo(i, &mut info) } != kResultOk {
+                continue;
+            }
+            tree.insert(info.id, (w_arr_to_string(&info.name), info.parentUnitId));
+        }
+        if tree.is_empty() {
+            return empty;
+        }
+        let of_param: Vec<i32> = (0..count)
+            .map(|index| {
+                let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
+                match unsafe { c.getParameterInfo(index as int32, &mut info) } == kResultOk {
+                    true => info.unitId,
+                    false => kNoParentUnitId,
+                }
+            })
+            .collect();
+        sections_from_units(&tree, &of_param)
+    }
+
     pub fn param_name(&self, index: u32) -> String {
         let Some(c) = &self.controller else {
             return format!("P{index}");
@@ -1684,5 +1743,147 @@ mod transport_tests {
         );
         t.set_bpm(choz_ports::Transport::DEFAULT_BPM);
         t.rewind();
+    }
+}
+
+/// The section each parameter is in, from the unit tree and each parameter's
+/// unit id. Split out from [`Vst3RealInstance::param_groups`] because this is
+/// the part with a decision in it, and a decision wants a test that does not
+/// need a plugin.
+pub(crate) fn sections_from_units(
+    tree: &std::collections::HashMap<i32, (String, i32)>,
+    of_param: &[i32],
+) -> Vec<Option<String>> {
+    // Root-first path of unit ids. Bounded by the number of units, so a plugin
+    // that reports a cycle cannot hang the scan.
+    let chain = |mut id: i32| -> Vec<i32> {
+        let mut path = Vec::new();
+        for _ in 0..tree.len() {
+            let Some((_, parent)) = tree.get(&id) else {
+                break;
+            };
+            path.push(id);
+            id = *parent;
+        }
+        path.reverse();
+        path
+    };
+    let paths: Vec<Vec<i32>> = of_param.iter().map(|id| chain(*id)).collect();
+    // What they all have in common is the top of the tree, and the top of the
+    // tree is not a section.
+    let mut shared: Option<Vec<i32>> = None;
+    for path in paths.iter().filter(|p| !p.is_empty()) {
+        shared = Some(match shared {
+            None => path.clone(),
+            Some(cur) => cur
+                .iter()
+                .zip(path.iter())
+                .take_while(|(a, b)| a == b)
+                .map(|(a, _)| *a)
+                .collect(),
+        });
+    }
+    let skip = shared.map(|s| s.len()).unwrap_or(0);
+    paths
+        .into_iter()
+        .map(|path| {
+            let parts: Vec<String> = path
+                .into_iter()
+                .skip(skip)
+                .filter_map(|id| tree.get(&id).map(|(name, _)| name.clone()))
+                .filter(|name| !name.is_empty())
+                .collect();
+            (!parts.is_empty()).then(|| parts.join(" / "))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::sections_from_units;
+    use std::collections::HashMap;
+
+    fn tree(rows: &[(i32, &str, i32)]) -> HashMap<i32, (String, i32)> {
+        rows.iter()
+            .map(|(id, name, parent)| (*id, (name.to_string(), *parent)))
+            .collect()
+    }
+
+    /// Both shapes seen on this machine, and in both of them the plugin has a
+    /// unit called "Root" that is not a section.
+    ///
+    /// Surge XT hangs everything off "Root", which itself hangs off "Root
+    /// Unit"; u-he's plugins have one "Root" at the top. Nothing here knows
+    /// either name — what is dropped is the prefix every parameter shares.
+    #[test]
+    fn the_top_of_the_tree_is_not_a_section() {
+        let surge = tree(&[
+            (0, "Root Unit", -1),
+            (9, "Root", 0),
+            (10, "A Filters", 9),
+            (11, "A LFOs", 9),
+        ]);
+        let got = sections_from_units(&surge, &[10, 10, 11]);
+        assert_eq!(
+            got,
+            vec![
+                Some("A Filters".into()),
+                Some("A Filters".into()),
+                Some("A LFOs".into())
+            ]
+        );
+
+        let uhe = tree(&[(0, "Root", -1), (2, "Core", 0), (3, "ADSR1", 0)]);
+        assert_eq!(
+            sections_from_units(&uhe, &[2, 3]),
+            vec![Some("Core".into()), Some("ADSR1".into())]
+        );
+    }
+
+    /// A nested unit keeps its path: two filters are told apart in the tree and
+    /// not in the leaf, so the heading has to carry the branch.
+    ///
+    /// And only as far as the branch goes: with something outside `Voice` in
+    /// the list, `Voice` is worth saying; with everything inside it, it is the
+    /// prefix they all share and it goes the way "Root" does.
+    #[test]
+    fn a_nested_unit_is_named_with_its_parent() {
+        let t = tree(&[
+            (0, "Root", -1),
+            (1, "Voice", 0),
+            (2, "Filter 1", 1),
+            (3, "Filter 2", 1),
+            (4, "Global", 0),
+        ]);
+        assert_eq!(
+            sections_from_units(&t, &[2, 3, 4]),
+            vec![
+                Some("Voice / Filter 1".into()),
+                Some("Voice / Filter 2".into()),
+                Some("Global".into()),
+            ]
+        );
+        // The same tree with nothing outside `Voice`: it heads the whole list,
+        // so it heads nothing.
+        assert_eq!(
+            sections_from_units(&t, &[2, 3]),
+            vec![Some("Filter 1".into()), Some("Filter 2".into())]
+        );
+    }
+
+    /// One section is not a section: with everything in the same unit there is
+    /// nothing to head, and the names keep the panel's own heuristic.
+    #[test]
+    fn a_single_unit_is_no_section_at_all() {
+        let t = tree(&[(0, "Root", -1), (1, "Everything", 0)]);
+        assert_eq!(sections_from_units(&t, &[1, 1, 1]), vec![None, None, None]);
+    }
+
+    /// A plugin that reports a unit as its own ancestor must not hang the scan.
+    #[test]
+    fn a_cycle_in_the_tree_is_survived() {
+        let t = tree(&[(1, "A", 2), (2, "B", 1)]);
+        let got = sections_from_units(&t, &[1]);
+        assert_eq!(got.len(), 1);
     }
 }

@@ -11,7 +11,7 @@
 //! * **a waveform window** — a few dozen samples, decimated, so the interface
 //!   can draw the shape of the sound rather than only its size.
 
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// How many points the waveform window holds. Wide enough for a panel, small
 /// enough that writing it costs nothing on the audio thread.
@@ -197,6 +197,96 @@ pub fn slot_levels() -> &'static SlotLevels {
     &L
 }
 
+/// What each tab was **played** with, as opposed to how loud it came out.
+///
+/// A gate opened by another tab reads that tab's level, which is the right
+/// answer for a kick drum and the wrong one for anything that is quiet on
+/// purpose: a pad holding a chord under everything else never crosses a
+/// threshold, so a gate could not be driven by the part that was actually
+/// playing. This is the note itself — velocity when it arrives, decaying over
+/// an eighth of a second, the same shape the beat pulse has.
+///
+/// One reading per gate per block, and one store per note. Nothing here is
+/// consumed by reading: two gates on the same tab both see the note.
+pub struct NoteLevels {
+    /// Nanoseconds since the process's own zero — see [`NoteLevels::now`].
+    at: [AtomicU64; MAX_SLOTS],
+    vel: [AtomicU32; MAX_SLOTS],
+}
+
+pub fn note_levels() -> &'static NoteLevels {
+    static L: NoteLevels = NoteLevels::new();
+    &L
+}
+
+impl NoteLevels {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO32: AtomicU32 = AtomicU32::new(0);
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO64: AtomicU64 = AtomicU64::new(0);
+
+    const fn new() -> Self {
+        Self {
+            at: [Self::ZERO64; MAX_SLOTS],
+            vel: [Self::ZERO32; MAX_SLOTS],
+        }
+    }
+
+    /// Wall clock and not the transport: a gate driven by playing has to work
+    /// with the transport stopped, which is most of the time somebody is
+    /// playing.
+    fn now() -> u64 {
+        static ZERO: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        ZERO.get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_nanos() as u64
+    }
+
+    /// A note just started on this tab. Called where the note reaches the slot.
+    pub fn hit(&self, slot: usize, vel: u8) {
+        if slot >= MAX_SLOTS || vel == 0 {
+            return;
+        }
+        self.vel[slot].store((vel as f32 / 127.0).to_bits(), Ordering::Relaxed);
+        self.at[slot].store(Self::now(), Ordering::Relaxed);
+    }
+
+    /// How open the last note on this tab still has this gate, 0..1.
+    pub fn level(&self, slot: usize) -> f32 {
+        if slot >= MAX_SLOTS {
+            return 0.0;
+        }
+        let at = self.at[slot].load(Ordering::Relaxed);
+        if at == 0 {
+            return 0.0;
+        }
+        let vel = f32::from_bits(self.vel[slot].load(Ordering::Relaxed));
+        let since = Self::now().saturating_sub(at) as f32 * 1e-9;
+        // Same eighth of a second the beat pulse decays over, so a gate feels
+        // the same whichever of the two is driving it.
+        vel * (-since / 0.125).exp()
+    }
+
+    pub fn reset_all(&self) {
+        for i in 0..MAX_SLOTS {
+            self.at[i].store(0, Ordering::Relaxed);
+            self.vel[i].store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The same meter, one entry per **subgroup**, read where the group is summed.
+///
+/// The panel used to show a group the loudest of the tabs routed into it,
+/// pre-fader, which answers a different question: two quiet tabs summing into
+/// one group are louder than either, and a tab pulled down to nothing still
+/// lit the group up. This is the sum itself, taken after the tabs' faders and
+/// before the group's own — the same place a tab's meter is taken.
+pub fn bus_levels() -> &'static SlotLevels {
+    static L: SlotLevels = SlotLevels::new();
+    &L
+}
+
 impl SlotLevels {
     #[allow(clippy::declare_interior_mutable_const)]
     const ZERO: AtomicU32 = AtomicU32::new(0);
@@ -231,6 +321,30 @@ impl SlotLevels {
         }
         // `fetch_max` on the bits works because both are non-negative and
         // finite: for those, f32 bit order is value order.
+        self.peaks[slot].fetch_max(peak.to_bits(), Ordering::Relaxed);
+        self.rms[slot].fetch_max(rms.to_bits(), Ordering::Relaxed);
+        self.live[slot].store(peak.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Publish one block held as two separate channels, which is how the
+    /// engine carries a bus: same reading as [`SlotLevels::publish`], without
+    /// interleaving a buffer to get it.
+    pub fn publish_pair(&self, slot: usize, l: &[f32], r: &[f32], frames: usize) {
+        if slot >= MAX_SLOTS || frames == 0 {
+            return;
+        }
+        let n = frames.min(l.len()).min(r.len());
+        let mut peak = 0.0f32;
+        let mut sum = 0.0f64;
+        for f in 0..n {
+            let mono = (l[f] + r[f]) * 0.5;
+            peak = peak.max(mono.abs());
+            sum += (mono as f64) * (mono as f64);
+        }
+        let rms = (sum / n.max(1) as f64).sqrt() as f32;
+        if !peak.is_finite() || !rms.is_finite() {
+            return;
+        }
         self.peaks[slot].fetch_max(peak.to_bits(), Ordering::Relaxed);
         self.rms[slot].fetch_max(rms.to_bits(), Ordering::Relaxed);
         self.live[slot].store(peak.to_bits(), Ordering::Relaxed);

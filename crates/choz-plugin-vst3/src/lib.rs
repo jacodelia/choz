@@ -92,6 +92,9 @@ pub fn read_params(path: &Path, _id: &str) -> Vec<PluginParam> {
     let Ok(inst) = Vst3RealInstance::load(path, 48_000, 64) else {
         return Vec::new();
     };
+    // What the plugin says its sections are, once for the whole list — see
+    // `Vst3RealInstance::param_groups`.
+    let groups = inst.param_groups();
     (0..inst.param_count())
         .map(|id| {
             let (steps, points) = inst.param_steps(id);
@@ -107,7 +110,7 @@ pub fn read_params(path: &Path, _id: &str) -> Vec<PluginParam> {
             };
             let unit = inst.param_label(id);
             PluginParam {
-                group: None,
+                group: groups.get(id as usize).cloned().flatten(),
                 id,
                 name: inst.param_name(id),
                 // VST3 parameters are normalised by definition.

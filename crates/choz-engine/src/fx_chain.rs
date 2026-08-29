@@ -39,6 +39,15 @@ pub struct FxSpec {
 pub enum GateSource {
     /// Another tab's level, by rack index.
     Tab(usize),
+    /// Another tab's **notes**, by rack index: velocity when one arrives,
+    /// decaying like a beat.
+    ///
+    /// The level source answers "how loud is that tab", which is the right
+    /// question for a kick drum and the wrong one for a pad holding a chord
+    /// underneath everything — quiet on purpose, and never crossing a
+    /// threshold. This one asks "is that tab being played", which does not
+    /// care how loud the answer came out.
+    Note(usize),
     /// The transport's beat, wherever the transport is getting it — choz's own
     /// clock or an external one. Silent metronome included: this is the count,
     /// not the click.
@@ -95,6 +104,7 @@ impl GateSource {
     pub fn level(self) -> f32 {
         match self {
             GateSource::Tab(i) => crate::meter::slot_levels().live(i),
+            GateSource::Note(i) => crate::meter::note_levels().level(i),
             GateSource::Metronome => crate::metronome::metronome().tap_level(),
             GateSource::Clock => crate::metronome::beat_pulse(),
             GateSource::Seq => seq_pulse(),
@@ -851,6 +861,93 @@ mod tests {
     /// exactly the drift it was supposed to catch.
     fn fx_ids() -> Vec<&'static str> {
         BUILT_IN_KINDS.iter().map(|(id, _)| *id).collect()
+    }
+
+    /// A gate driven by notes opens for a tab that makes no sound worth
+    /// metering — which is the whole reason that source exists.
+    ///
+    /// The level source answers "how loud is that tab": right for a kick,
+    /// wrong for a pad holding a chord underneath everything, which never
+    /// crosses a threshold and so could never drive a gate at all.
+    #[test]
+    fn a_gate_can_be_opened_by_playing_rather_than_by_loudness() {
+        let notes = crate::meter::note_levels();
+        let levels = crate::meter::slot_levels();
+        notes.reset_all();
+        levels.reset(3);
+
+        let quiet = GateSource::Tab(3);
+        let played = GateSource::Note(3);
+        assert!(quiet.level() < 1e-6, "nothing has been metered yet");
+        assert!(played.level() < 1e-6, "and nothing has been played");
+
+        // A note arrives on a tab that is not making a metered sound.
+        notes.hit(3, 100);
+        assert!(
+            played.level() > 0.7,
+            "the note opens it: {}",
+            played.level()
+        );
+        assert!(
+            quiet.level() < 1e-6,
+            "while the level source still says nothing, which is the bug"
+        );
+
+        // And it falls: the source is a hit, not a switch.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            played.level() < 0.3,
+            "it decays after the note: {}",
+            played.level()
+        );
+        notes.reset_all();
+    }
+
+    /// The dry/wet law, checked on **every** built-in at once: a wet of zero
+    /// is a wire.
+    ///
+    /// It is one property, and it catches the whole family — an effect that
+    /// adds its output instead of crossfading it, one that forgot to apply the
+    /// mix at all, one whose output has a gain baked in. The looper adds on
+    /// purpose (its takes play under what is being played) and still passes,
+    /// because at zero there is nothing to add.
+    ///
+    /// Compared as levels rather than sample by sample: the compressor and
+    /// Auto-Tune delay the dry to line it up with their own latency, which is
+    /// right and which no sample-by-sample comparison would forgive.
+    #[test]
+    fn a_wet_of_zero_is_a_wire_in_every_built_in() {
+        let sr = 48_000u32;
+        let mut rng = 0x1234_5678u32;
+        let mut lp = 0.0f32;
+        let dry: Vec<f32> = (0..sr as usize)
+            .flat_map(|i| {
+                rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                let white = (rng >> 8) as f32 / 8_388_608.0 - 1.0;
+                lp += 0.05 * (white - lp);
+                let tone = (std::f32::consts::TAU * 220.0 * i as f32 / sr as f32).sin();
+                let s = 0.35 * tone + 0.25 * lp;
+                [s, s]
+            })
+            .collect();
+        let rms = |x: &[f32]| (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt();
+        let dry_rms = rms(&dry);
+        for kind in fx_ids() {
+            let params = [0.5f32; 16];
+            let Some(mut p) = build_processor(kind, &params, sr) else {
+                panic!("{kind} is in the list and cannot be built");
+            };
+            p.set_mix(0.0);
+            let mut buf = dry.clone();
+            for block in buf.chunks_mut(512) {
+                p.process_block(block, sr);
+            }
+            let db = 20.0 * (rms(&buf[buf.len() / 2..]) / dry_rms).log10();
+            assert!(
+                db.abs() < 0.5,
+                "{kind} at a dry/wet of zero moved the level by {db:.2} dB"
+            );
+        }
     }
 
     fn spec(kind: &str, plugin: Option<PluginFxRef>) -> FxSpec {

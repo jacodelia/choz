@@ -1587,8 +1587,10 @@ mod autotune_defaults {
 /// differs.
 ///
 /// The section comes from the plugin when the plugin gives one — CLAP's
-/// `module`. When it does not (VST2, VST3, LV2, LADSPA all name parameters and
-/// nothing else), it is **read off the names**: a run of consecutive parameters
+/// `module`, and VST3's units (`IUnitInfo`, which is where Surge XT's fourteen
+/// sections and TyrellN6's nine come from). When it does not (VST2, LV2 and
+/// LADSPA name parameters and nothing else, and so do the DPF-built VST3s), it
+/// is **read off the names**: a run of consecutive parameters
 /// that begin with the same words is a section, because that is how every
 /// plugin that has sections writes them. Nothing is invented for a lone
 /// parameter: it keeps its whole name and has no heading.

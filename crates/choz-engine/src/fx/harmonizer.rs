@@ -536,6 +536,11 @@ impl super::FxProcessor for Harmonizer {
         if (sr - self.sample_rate).abs() > 0.5 {
             self.sample_rate = sr;
             self.env.set_sample_rate(sr);
+            // The shifter's window is a length of time, and it is the only one
+            // that has to be told the rate itself.
+            for v in self.voices.iter_mut() {
+                v.shifter.set_sample_rate(sr);
+            }
             self.dirty = true;
         }
         // A hand that moved on the keyboard is a rebuild, and only that: the

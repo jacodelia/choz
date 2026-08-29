@@ -881,6 +881,11 @@ impl FxProcessor for Looper {
                     sum_l += l;
                     sum_r += r;
                 }
+                // **The one effect here whose wet is added and not crossfaded**,
+                // and the reason is the instrument in your hands: the takes
+                // play *under* what is being played now. A crossfade would turn
+                // the live signal down as the loops came up, which is the one
+                // thing a looper must never do.
                 buf[i * 2] = dry_l + self.wet * sum_l;
                 buf[i * 2 + 1] = dry_r + self.wet * sum_r;
                 self.pos = (self.pos + 1) % self.loop_frames;

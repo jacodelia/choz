@@ -4,7 +4,15 @@
 //! Stable at all frequencies, minimal distortion, suitable for realtime.
 
 use super::FxProcessor;
+use super::smooth::Smoothed;
 use std::f32::consts::PI;
+
+/// Time constant of the cutoff sweep. Long enough to have no corner, short
+/// enough that a filter still feels like it answers the knob.
+const CUTOFF_MS: f32 = 15.0;
+
+/// How often the coefficients are rebuilt while the cutoff is moving.
+const COEFF_EVERY: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SvfMode {
@@ -17,7 +25,12 @@ pub enum SvfMode {
 /// Stereo State Variable Filter.
 pub struct Svf {
     mode: SvfMode,
+    /// Where the knob is. The coefficients follow `cutoff` towards it.
     cutoff_hz: f32,
+    /// The cutoff actually in the coefficients, smoothed in octaves so a sweep
+    /// sounds even. Recalculating `g = tan(πf/sr)` the instant the knob moves
+    /// is a step in the coefficient, and a step is a click.
+    cutoff: Smoothed,
     resonance: f32, // 0.0 (max resonance) – 1.0 (no resonance, butterworth)
     wet: f32,
     // Per-channel state (L, R)
@@ -39,6 +52,7 @@ impl Svf {
         let mut s = Self {
             mode,
             cutoff_hz: cutoff_hz.clamp(10.0, 20000.0),
+            cutoff: Smoothed::new(cutoff_hz.clamp(10.0, 20000.0).log2(), CUTOFF_MS, 48000.0),
             resonance: resonance.clamp(0.0, 1.0),
             wet: 1.0,
             ic1eq: [0.0; 2],
@@ -56,7 +70,7 @@ impl Svf {
 
     pub fn set_cutoff(&mut self, hz: f32) {
         self.cutoff_hz = hz.clamp(10.0, 20000.0);
-        self.update_coeffs();
+        self.cutoff.set_target(self.cutoff_hz.log2());
     }
 
     pub fn set_resonance(&mut self, r: f32) {
@@ -70,7 +84,7 @@ impl Svf {
 
     fn update_coeffs(&mut self) {
         let sr = self.sample_rate as f32;
-        self.g = (PI * self.cutoff_hz / sr).tan();
+        self.g = (PI * self.cutoff.value().exp2().clamp(10.0, sr * 0.45) / sr).tan();
         // k = 2*(1 - resonance): at resonance=0 → k=2 (max damp), at resonance=1 → k=0 (self-osc)
         self.k = 2.0 - 2.0 * self.resonance;
         let g = self.g;
@@ -111,10 +125,17 @@ impl FxProcessor for Svf {
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
         if self.sample_rate != sample_rate {
             self.sample_rate = sample_rate;
+            self.cutoff.set_sample_rate(sample_rate as f32);
             self.update_coeffs();
         }
         let frames = buf.len() / 2;
         for i in 0..frames {
+            // The pole moves at control rate: a `tan()` per sample is what F4
+            // is about, and 16 samples is a third of a millisecond.
+            let moving = self.cutoff.tick() != self.cutoff.target();
+            if i % COEFF_EVERY == 0 && (moving || i == 0) {
+                self.update_coeffs();
+            }
             let dry_l = buf[i * 2];
             let dry_r = buf[i * 2 + 1];
             let wet_l = self.process_sample(0, dry_l);
@@ -127,6 +148,8 @@ impl FxProcessor for Svf {
     fn reset(&mut self) {
         self.ic1eq = [0.0; 2];
         self.ic2eq = [0.0; 2];
+        self.cutoff.snap(self.cutoff_hz.log2());
+        self.update_coeffs();
     }
 
     fn set_mix(&mut self, wet: f32) {
@@ -154,6 +177,44 @@ mod tests {
         // After the filter the amplitude should be significantly reduced
         let peak = buf.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
         assert!(peak < 0.1, "highfreq should be attenuated, peak={peak}");
+    }
+
+    /// Slamming the cutoff end to end must not step the coefficient. Measured
+    /// against the same signal with the cutoff held still, because a resonant
+    /// filter always moves the waveform some.
+    #[test]
+    fn sweeping_the_cutoff_does_not_click() {
+        let sr = 48_000u32;
+        let worst = |automate: bool| {
+            let mut svf = Svf::new(SvfMode::Lowpass, 800.0, 0.7);
+            let mut worst = 0.0f32;
+            let mut prev = 0.0f32;
+            let mut phase = 0.0f32;
+            for block in 0..40 {
+                if automate {
+                    svf.set_param(0, (block % 2) as f32);
+                }
+                let mut buf: Vec<f32> = (0..256)
+                    .flat_map(|_| {
+                        phase = (phase + 220.0 / sr as f32).fract();
+                        let s = (std::f32::consts::TAU * phase).sin() * 0.8;
+                        [s, s]
+                    })
+                    .collect();
+                svf.process_block(&mut buf, sr);
+                for s in buf.chunks(2).map(|c| c[0]) {
+                    worst = worst.max((s - prev).abs());
+                    prev = s;
+                }
+            }
+            worst
+        };
+        let still = worst(false);
+        let swept = worst(true);
+        assert!(
+            swept < still * 3.0,
+            "the cutoff stepped: {swept:.3} while automated, {still:.3} while still"
+        );
     }
 
     #[test]

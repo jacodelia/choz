@@ -2256,6 +2256,11 @@ impl RtState {
                 } => {
                     if let Some(s) = state.slots.get_mut(slot) {
                         s.schedule(at, note, vel, true);
+                        // What a gate driven by *playing* reads — see
+                        // [`crate::meter::NoteLevels`]. Published where the
+                        // note arrives and not where the slot renders, so a
+                        // silent instrument still drives it.
+                        crate::meter::note_levels().hit(slot, vel);
                     }
                 }
                 EngineCommand::NoteOff { slot, note, at } => {
@@ -2410,7 +2415,16 @@ impl RtState {
             let slot_started = std::time::Instant::now();
             // Synths always render (envelope tails / live keys); generators
             // (tone, WAV) honor the transport play flag.
-            if !playing && !slot.source.plays_on_transport_stop() {
+            //
+            // **A tab fed from the interface is neither**, and it renders
+            // whatever the transport is doing: live audio arrives because
+            // something is plugged in, not because anything was started, and
+            // choz is a multi-effect as much as it is an instrument host. This
+            // is what made an input tab go dead — a headset into a tab whose
+            // instrument was a plugin (a plugin does not claim to play with the
+            // transport stopped) reached no effect at all, so the looper on it
+            // recorded silence and read as broken.
+            if !playing && slot.in_pair.is_none() && !slot.source.plays_on_transport_stop() {
                 continue;
             }
             let sc = &mut scratch[..n];
@@ -2628,6 +2642,9 @@ impl RtState {
             let n = frames
                 .min(bus_mix[b * 2].len())
                 .min(bus_mix[b * 2 + 1].len());
+            // What arrived at the group: after the tabs' faders, before its
+            // own, which is where a tab's meter is read too.
+            crate::meter::bus_levels().publish_pair(b, &bus_mix[b * 2], &bus_mix[b * 2 + 1], n);
             for f in 0..n {
                 let (a, c) = (bus_mix[b * 2][f] * g, bus_mix[b * 2 + 1][f] * g);
                 mix[l][f] += a;
@@ -4423,6 +4440,104 @@ mod tests {
 
         levels.reset(probed);
         levels.reset(skipped);
+    }
+
+    /// A tab fed from the interface plays with the transport stopped.
+    ///
+    /// Live audio arrives because something is plugged in, not because anything
+    /// was started. The slot used to be skipped whole when the transport was
+    /// stopped and its *instrument* did not claim to play stopped — which is
+    /// every hosted plugin — so a headset into such a tab reached none of its
+    /// effects, and a looper on it recorded silence.
+    #[test]
+    fn an_input_tab_renders_with_the_transport_stopped() {
+        let _clock = crate::test_locks::transport();
+        // A source that only plays while rolling: the default, and what a
+        // hosted plugin answers.
+        struct Rolling;
+        impl AudioSource for Rolling {
+            fn render(&mut self, out: &mut [f32], _sr: u32) -> usize {
+                out.fill(0.0);
+                out.len() / 2
+            }
+        }
+        let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 2);
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(Rolling)))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotIn {
+                slot: 0,
+                pair: Some((0, 1)),
+            })
+            .unwrap();
+        state.apply_commands();
+        state.playing.store(false, std::sync::atomic::Ordering::Relaxed);
+        for ch in state.capture.iter_mut() {
+            ch.fill(0.5);
+        }
+        state.render(16);
+        assert!(
+            state.mix[0][0].abs() > 0.1,
+            "the input never reached the mix: {}",
+            state.mix[0][0]
+        );
+    }
+
+    /// The group's meter is the sum arriving at it, not the loudest tab in it.
+    ///
+    /// Two tabs into one group read louder than either on its own, and a tab
+    /// pulled down stops feeding it — which is what the panel used to get
+    /// wrong: it took the loudest of the tabs routed there, **pre-fader**, so a
+    /// tab at zero still lit its group up.
+    #[test]
+    fn a_group_meters_what_arrives_at_it() {
+        let _clock = crate::test_locks::transport();
+        let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 0);
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(DcSource(0.4))))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(DcSource(0.4))))
+            .unwrap();
+        for slot in 0..2 {
+            cmd_tx
+                .push(EngineCommand::SetSlotDest {
+                    slot,
+                    dest: Dest::Bus(2),
+                })
+                .unwrap();
+        }
+        state.apply_commands();
+        let levels = crate::meter::bus_levels();
+        levels.reset_all();
+        state.render(16);
+        let both = levels.live(2);
+        assert!(
+            levels.live(0) < 1e-6,
+            "a group nothing is routed to reads nothing: {}",
+            levels.live(0)
+        );
+
+        // One tab pulled to silence: the group reads half of what it did.
+        cmd_tx
+            .push(EngineCommand::SetSlotMix {
+                slot: 1,
+                gain: 0.0,
+                gain_r: 0.0,
+                pan: 0.0,
+                mute: false,
+            })
+            .unwrap();
+        state.apply_commands();
+        levels.reset_all();
+        state.render(16);
+        let one = levels.live(2);
+        assert!(
+            (both - one * 2.0).abs() < both * 0.05,
+            "two tabs should read twice one: both {both}, one {one}"
+        );
+        levels.reset_all();
     }
 
     /// A subgroup is a destination that is not a device: tabs sum into it, its

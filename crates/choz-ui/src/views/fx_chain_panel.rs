@@ -755,6 +755,9 @@ fn gate_source_mark(source: choz_engine::fx_chain::GateSource) -> String {
     use choz_engine::fx_chain::GateSource;
     match source {
         GateSource::Tab(i) => (i + 1).to_string(),
+        // The tab's number with a note on it: the button has room for two
+        // cells, and which of the two readings it is has to be one of them.
+        GateSource::Note(i) => format!("{}\u{266A}", i + 1),
         GateSource::Clock => "CLK".into(),
         GateSource::Metronome => "MET".into(),
         GateSource::Seq => "SEQ".into(),

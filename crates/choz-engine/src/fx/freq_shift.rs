@@ -128,6 +128,14 @@ pub struct FreqShift {
     /// How far apart the two channels' carriers run, in cycles.
     spread: f32,
     phase: f32,
+    /// The carrier as a point on the unit circle: `(cos θ, sin θ)`.
+    ///
+    /// Turned by a complex multiply each sample instead of being asked for by
+    /// name — `cos` and `sin` of a growing angle was four transcendentals a
+    /// frame, 192 000 a second, to walk an angle that moves by the same amount
+    /// every time. The rotation for one sample is worked out once a block; the
+    /// per-sample cost is four multiplies.
+    carrier: (f32, f32),
     hilbert: [Hilbert; 2],
     mix: f32,
     sample_rate: f32,
@@ -148,6 +156,7 @@ impl FreqShift {
             ),
             spread: 0.0,
             phase: 0.0,
+            carrier: (1.0, 0.0),
             hilbert: [Hilbert::new(); 2],
             mix: 1.0,
             sample_rate: sr,
@@ -196,17 +205,37 @@ impl super::FxProcessor for FreqShift {
         let mix = self.mix;
         let spread = self.spread;
 
+        // One rotation for the whole block, from where the smoothed frequency
+        // is headed. The angle stays continuous across the change — only the
+        // rate it turns at steps, and a frequency that steps is not a click.
+        let step = std::f32::consts::TAU * self.freq.target() / sr;
+        let (rot_c, rot_s) = (step.cos(), step.sin());
+        // The right channel is the left one turned by the spread, which is a
+        // fixed angle: two more multiplies, no second oscillator.
+        let (sp_c, sp_s) = {
+            let a = std::f32::consts::TAU * spread;
+            (a.cos(), a.sin())
+        };
+
         for frame in buf.as_chunks_mut::<2>().0 {
+            // Keeps `freq.value()` walking so a knob turn is still smoothed,
+            // and keeps `phase` meaningful for whoever reads it.
             let hz = self.freq.tick();
             self.phase += hz / sr;
             // Wrapped, not left to grow: a phase counted in millions of cycles
             // loses the fraction that is the actual angle.
             self.phase -= self.phase.floor();
 
+            let (c, s) = self.carrier;
+            self.carrier = (c * rot_c - s * rot_s, s * rot_c + c * rot_s);
+
             let dry = [frame[0], frame[1]];
             for ch in 0..2 {
-                let theta =
-                    std::f32::consts::TAU * (self.phase + if ch == 1 { spread } else { 0.0 });
+                let (cos, sin) = if ch == 1 {
+                    (c * sp_c - s * sp_s, s * sp_c + c * sp_s)
+                } else {
+                    (c, s)
+                };
                 let (re, im) = self.hilbert[ch].process(dry[ch]);
                 let wet = match self.kind {
                     // One sideband: the imaginary part is what cancels the
@@ -214,16 +243,27 @@ impl super::FxProcessor for FreqShift {
                     // `+`, not `−`, for this pair's ordering — measured with a
                     // Goertzel, because the sign convention of a Hilbert pair
                     // is the one thing about it not worth taking on faith.
-                    Carrier::Shift => re * theta.cos() + im * theta.sin(),
-                    Carrier::Ring => dry[ch] * theta.cos(),
+                    Carrier::Shift => re * cos + im * sin,
+                    Carrier::Ring => dry[ch] * cos,
                 };
                 frame[ch] = dry[ch] + mix * (wet - dry[ch]);
             }
+        }
+
+        // A rotation applied thousands of times drifts off the unit circle.
+        // One Newton step a block, which is exact enough that the amplitude
+        // never moves and costs nothing at block rate.
+        let (c, s) = self.carrier;
+        let mag2 = c * c + s * s;
+        if (mag2 - 1.0).abs() > 1e-6 {
+            let k = 1.5 - 0.5 * mag2;
+            self.carrier = (c * k, s * k);
         }
     }
 
     fn reset(&mut self) {
         self.phase = 0.0;
+        self.carrier = (1.0, 0.0);
         for h in &mut self.hilbert {
             h.reset();
         }
@@ -400,5 +440,37 @@ mod tests {
             fx.process_block(&mut [1.0], 96000);
             fx.reset();
         }
+    }
+
+    /// The oscillator is a rotation applied over and over, and a rotation in
+    /// `f32` walks off the unit circle if nobody puts it back. Half a minute of
+    /// audio, and the level at the end has to be the level at the start.
+    #[test]
+    fn the_carrier_does_not_drift_off_the_circle() {
+        let sr = 48_000u32;
+        let mut f = FreqShift::new(Carrier::Ring, sr);
+        f.set_param(0, 1.0);
+        f.set_mix(1.0);
+        let level = |f: &mut FreqShift| {
+            let mut buf: Vec<f32> = (0..2048)
+                .flat_map(|i| {
+                    let s = (std::f32::consts::TAU * 300.0 * i as f32 / sr as f32).sin() * 0.5;
+                    [s, s]
+                })
+                .collect();
+            f.process_block(&mut buf, sr);
+            (buf.iter().map(|s| s * s).sum::<f32>() / buf.len() as f32).sqrt()
+        };
+        let first = level(&mut f);
+        // ~30 s of audio at 48 kHz.
+        for _ in 0..700 {
+            let mut buf = vec![0.0f32; 2048];
+            f.process_block(&mut buf, sr);
+        }
+        let after = level(&mut f);
+        assert!(
+            (after - first).abs() < first * 0.01,
+            "the carrier drifted: {first:.5} at the start, {after:.5} half a minute later"
+        );
     }
 }

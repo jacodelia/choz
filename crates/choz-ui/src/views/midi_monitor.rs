@@ -1413,10 +1413,14 @@ fn draw_mixer(f: &mut Frame, area: Rect, strips: &[MixerStrip]) -> Vec<MixerRect
         return hits;
     }
     let per_page = ((area.width / STRIP_W) as usize).max(1);
-    // The panel's width, shared out equally. `STRIP_W` is the *minimum* a strip
-    // reads at; leaving the remainder unused put a ragged gap on the right and
-    // made two desks of the same rack look like different instruments.
-    let cell = (area.width / per_page as u16).max(STRIP_W);
+    // The panel's width, shared out equally, **up to a ceiling**. `STRIP_W` is
+    // the minimum a strip reads at and `STRIP_W_MAX` the widest one is worth:
+    // sharing out everything made a desk with three tabs draw three columns
+    // wide enough to park a fader in, which reads as padding rather than as a
+    // channel. Past the ceiling the extra room is simply left over — a mixing
+    // desk has strips of a fixed width, and two racks of the same size should
+    // look the same whatever else is on screen.
+    let cell = (area.width / per_page as u16).clamp(STRIP_W, STRIP_W_MAX);
     let active = strips.iter().position(|s| s.active).unwrap_or(0);
     // The window follows the active tab, like every other list in choz: no
     // second piece of state to keep in step with the rack.
@@ -1462,6 +1466,10 @@ fn draw_mixer(f: &mut Frame, area: Rect, strips: &[MixerStrip]) -> Vec<MixerRect
 
 /// Columns one channel strip takes, its one-column gutter included.
 const STRIP_W: u16 = 9;
+
+/// The widest one is drawn, gutter included. Room for the fader pair and for
+/// the three buttons under it (`O M S`), and not a column more.
+const STRIP_W_MAX: u16 = 12;
 
 /// One channel: name, a vertical fader, its two flags and its pan.
 fn draw_strip(f: &mut Frame, area: Rect, tab: usize, st: &MixerStrip) -> Vec<MixerRect> {
@@ -1529,7 +1537,14 @@ fn draw_strip(f: &mut Frame, area: Rect, tab: usize, st: &MixerStrip) -> Vec<Mix
                 f,
                 bar,
                 st.gain,
-                if st.mute { DIM } else { HEADER },
+                match (st.mute, st.side.is_some()) {
+                    (true, _) => DIM,
+                    // Lit when the MIXER's keyboard is on this group, the same
+                    // way a tab's fader lights: a cursor nobody can see is a
+                    // cursor that cannot be moved on purpose.
+                    (false, true) => ACCENT,
+                    (false, false) => HEADER,
+                },
                 st.level,
             );
             // The click target stays the full width: the fader is thin now, and
@@ -1592,26 +1607,54 @@ fn finish_strip(
     let bottom = strip_bottom(area);
     let mut y = area.y + area.height - bottom;
     if bottom >= 2 {
-        let flags = Rect::new(area.x, y, area.width, 1);
-        // A group has no solo — soloing a sum is soloing the tabs in it, which
-        // is what their own strips already do.
-        let second = match st.kind {
-            StripKind::Tab => Span::styled(" S ", flag(st.solo, Color::Rgb(220, 190, 70))),
-            _ => Span::styled("   ", theme::panel_style()),
+        // `O M S`, in that order and on one line: where the tab goes, and its
+        // two flags. `O` used to be a row of its own, printing the destination
+        // across the whole strip and stepping OUT/A/B/C/D on every click — a
+        // whole row for one setting, and no way to see the choices before
+        // making one. It opens its list instead, which is what every other
+        // named setting in choz does.
+        //
+        // Padded to three cells while there is room, and to one when there is
+        // not: a button is easier to hit with space around it, and a narrow
+        // desk would rather have the buttons than the space.
+        let wide = area.width >= 11;
+        let cell_w: u16 = if wide { 3 } else { 1 };
+        let mut spans: Vec<Span> = Vec::new();
+        let mut x = area.x;
+        let mut button = |hit: MixerHit, text: &str, on: bool, colour: Color| {
+            let label = match wide {
+                true => format!(" {text} "),
+                false => text.to_string(),
+            };
+            spans.push(Span::styled(label, flag(on, colour)));
+            spans.push(Span::styled(" ", theme::panel_style()));
+            // The gap after a button belongs to it as far as the mouse is
+            // concerned: on a narrow desk the button itself is one cell, and a
+            // one-cell target is a target nobody hits.
+            let at = Rect::new(x, y, cell_w + 1, 1);
+            x += cell_w + 1;
+            (hit, at)
         };
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(" M ", flag(st.mute, Color::Rgb(200, 80, 80))),
-                Span::styled(" ", theme::panel_style()),
-                second,
-            ]))
-            .style(theme::panel_style()),
-            flags,
-        );
-        hits.push((MixerHit::Mute(tab), Rect::new(flags.x, y, 3, 1)));
-        if st.kind == StripKind::Tab {
-            hits.push((MixerHit::Solo(tab), Rect::new(flags.x + 4, y, 3, 1)));
+        // Only a tab has somewhere to sum to, and only a tab has a solo:
+        // soloing a sum is soloing the tabs in it, which their own strips
+        // already do.
+        // `O` is a door, not a flag: it has no on and off, so it wears the
+        // accent all the time. Drawn like an unlit mute it would read as a
+        // setting that is switched off rather than as something to press.
+        if st.dest.is_some() {
+            let out = button(MixerHit::Dest(tab), "O", true, ACCENT);
+            hits.push(out);
         }
+        let mute = button(MixerHit::Mute(tab), "M", st.mute, Color::Rgb(200, 80, 80));
+        hits.push(mute);
+        if st.kind == StripKind::Tab {
+            let solo = button(MixerHit::Solo(tab), "S", st.solo, Color::Rgb(220, 190, 70));
+            hits.push(solo);
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(theme::panel_style()),
+            Rect::new(area.x, y, area.width, 1),
+        );
         y += 1;
     }
     // The level in numbers, and the pan. Two faders and one number: the number
@@ -1641,46 +1684,24 @@ fn finish_strip(
         row,
     );
     y += 1;
-    // Rows still to come under the numbers.
-    let mut left = bottom.saturating_sub(2);
 
     // The pan, as something to grab rather than a word to read: the two faders
     // above are levels, and the one control that reads across is drawn across.
     // The word stays on the numbers row — a slider says where it is, not what
     // it is called.
-    if left > 0 {
+    //
+    // One row left under the numbers, or none at all on a short panel: where
+    // the tab sums is a button on the flags row now, not a row of its own.
+    if bottom > 2 {
         if is_stereo(st.kind) {
             let bar = Rect::new(area.x, y, area.width, 1);
             draw_pan_slider(f, bar, st.pan, if st.mute { DIM } else { ACCENT });
             hits.push((MixerHit::Pan(tab), bar));
         }
-        y += 1;
-        left -= 1;
     } else if is_stereo(st.kind) {
         // No row for it: the numbers row carries the pan, the way it always
         // did on a panel with nothing to spare.
         hits.push((MixerHit::Pan(tab), row));
-    }
-
-    // Where the tab sums, when the panel is tall enough to say it. On a desk
-    // with groups this is the setting that explains a tab nobody can hear —
-    // and clicking it walks `OUT → A → B → C → D`.
-    if left > 0 {
-        if let Some(d) = st.dest {
-            let cell = Rect::new(area.x, y, area.width, 1);
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!("{:^w$}", format!("\u{25B8}{d}")),
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                )))
-                .style(theme::panel_style()),
-                cell,
-            );
-            hits.push((MixerHit::Dest(tab), cell));
-        }
     }
     hits
 }
@@ -1699,9 +1720,6 @@ fn finish_strip(
 fn strip_bottom(area: Rect) -> u16 {
     let mut want = 2;
     if area.height >= 6 {
-        want += 1;
-    }
-    if area.height >= 8 {
         want += 1;
     }
     want.min(area.height.saturating_sub(1))
