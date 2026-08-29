@@ -12,7 +12,7 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **799 tests** con harness en todo el workspace (708 entre `choz-engine` y `choz-ui`) + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **808 tests** con harness en todo el workspace (716 entre `choz-engine` y `choz-ui`) + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio.
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
 - `cargo test --workspace` necesita `--no-fail-fast`: uno de los binarios con
@@ -22,12 +22,189 @@ lleva lo que falta —nada de lo ya hecho— y
 ## [1.3.4] — 2026-08-29
 
 Cuatro días de trabajo, y el hilo que los une es el mismo: **medir antes de
-tocar**. La auditoría de DSP quedó cerrada entera, la suite de efectos se apila
+tocar**. La segunda mitad del día 29 —lo que el CI encontró y los bordes del
+roadmap que se cerraron con la interfaz delante— entró en esta misma versión. La auditoría de DSP quedó cerrada entera, la suite de efectos se apila
 sin saturar, tres bordes del roadmap se cerraron, el MIXER dejó de gastar una
 fila en un botón, y dos bugs de la entrada de audio —que sólo aparecían con la
 interfaz delante— tienen su arreglo y su test.
 
-### 2026-08-29
+### 2026-08-29 · lo que el CI encontró, y los bordes cerrados con el equipo delante
+
+#### El CI en rojo: dos cosas, ninguna del código de la release
+
+- **`real_host.rs` contaba 46 y el bundle exporta 48.** Los dos artifacts —el
+  arpegiador y el secuenciador— viajan en el mismo `.clap` desde el cambio del
+  26/27; el test unitario de al lado ya contaba `+ 2` y el de integración se
+  quedó atrás. Pasó en local y falló en el runner porque el test toma el `.so`
+  de `target/debug`: uno viejo exporta 46 y coincide con la cuenta vieja. Para
+  reproducir un fallo de este test hay que construir el crate primero.
+- **Dos ejemplos llamados `gui_probe`** —uno en VST3 y otro en CLAP— escriben el
+  mismo binario en `target/debug/examples`, que cargo avisa hoy y hará error
+  mañana. Ahora son `vst3_gui_probe` y `clap_gui_probe`.
+
+#### Lo que cuesta un puerto JACK, medido
+
+El roadmap tenía un punto sobre registrar sólo los puertos que un rack usa —en
+una UMC1820 son 34 y el grafo los mueve todos— y una pregunta sin responder que
+lo bloqueaba: **¿cuesta el puerto que existe, o el puerto que tiene algo
+conectado?** De la respuesta depende si se puede hacer, porque el nivel que
+muestra cada fila del cajón IN sale de nuestros propios puertos: sin registrar,
+las filas quedan ciegas.
+
+`examples/port_cost` (nuevo) lo mide contra el tiempo de CPU del servidor, en
+tres ventanas iguales — sin puertos, con 34 registrados y callados, con 34
+registrados y conectados a lo que el grafo tenga. Tres corridas:
+
+```
+nothing of ours               1.25 / 2.62 / 2.50 % de un núcleo   (línea base, ruidosa)
+registered, wired to nothing  0.87 / 0.62 / 0.87 %                (34 puertos, callados)
+registered and connected      2.00 / 2.12 / 2.25 %                (6 conectados)
+```
+
+**Registrar no cuesta nada** —queda por debajo de la línea base, que es el ruido
+de los otros clientes del grafo— y **conectar seis cuesta ~1,3 puntos**, unos
+0,2 por conexión: los 20 de entrada de una UMC1820 son los ~4 puntos que se
+midieron en su día.
+
+Así que el arreglo es desconectar, no dejar de registrar: los índices de
+`in_pair` y las filas del cajón se conservan enteros. Queda escrito y sin
+escribir, a propósito — el caso que importa son 34 puertos y esta máquina tiene
+8, así que se hace con la interfaz grande delante.
+
+#### El gate ya no llega un bloque tarde
+
+Un gate lee el nivel de la pestaña que lo maneja **para el bloque en el que
+está**. Si esa pestaña se renderizaba después de la gateada, lo que se leía era
+el bloque anterior: hasta 5 ms a 256 frames, que en algo percusivo se oye como
+un gate que llega detrás de su propio bombo. El roadmap lo tenía como "se
+arregla ordenando los slots por dependencia, que es más máquina de la que el
+problema pide", y la máquina resultó ser una línea:
+
+```rust
+let order = (0..slots.len())
+    .filter(is_source)
+    .chain((0..slots.len()).filter(|i| !is_source(i)));
+```
+
+Dos rangos filtrados en lugar de una lista ordenada: **no aloca** —está en el
+callback de audio— y lo que no es fuente conserva el orden que tenía. La suma de
+la mezcla no distingue en qué orden se le sumó.
+
+La máscara de quién maneja un gate la publica `fx_chain::set_gate_sources`
+cuando se reconstruye una cadena, que es trabajo de la interfaz; el callback la
+lee con un load relajado por bloque. Un gate sobre el **reloj**, el metrónomo o
+las **notas** de otra pestaña no pone bit: una nota se publica donde llega, no
+donde la pestaña se renderiza, así que ahí nunca hubo retraso que arreglar.
+
+Dos tests: uno sobre el orden mismo —cada pestaña una vez, las fuentes
+primero, el resto sin moverse— y uno de punta a punta que mide el sonido: con la
+fuente en la pestaña 1 y el efecto en la 0, el gate ya actuó en el primer
+bloque. Sin el orden, ese test lee 1,414 en vez de 0,707.
+
+#### Un plugin también parte el teclado, entre dos sonidos
+
+Un SoundFont parte gratis: oxisynth tiene dieciséis canales MIDI y un archivo
+cargado, así que una zona es un canal con su programa y el audio es de un solo
+sintetizador. Un plugin alojado tiene **un** patch, y hasta ahora un split sobre
+un plugin era el rack cambiándole el patch al cruzar la junta — que es un
+conmutador, no un split: la nota que estaba sonando se cortaba.
+
+Lo que lo hace un split es que suenen dos, y eso son dos instancias.
+`choz_engine::layered::Layered` las lleva: las notas van a la zona de su octava,
+todo lo demás —pedal, rueda, bend— va a las dos, y la **note-off va a las dos
+siempre**, porque el split se puede repintar con una tecla pisada y una note-off
+que llega a la instancia equivocada es una nota que no para nunca. Es la misma
+regla que el SoundFont ya seguía mandándola a todos sus canales.
+
+El techo son **dos** zonas, y es una decisión: un plugin cuesta lo que cuesta, y
+quien quiera cuatro sonidos a la vez está pidiendo cuatro tabs, que es lo que
+hace MULTI. Dos cosas más que salen de ahí:
+
+- **La segunda instancia se construye al pintar la segunda zona**, y se suelta
+  al quitarla. Cargarla cuesta lo que cargar un plugin; hacerlo al abrir cada
+  tab sería cobrarle el doble de memoria a todo el rack por algo que casi nadie
+  usa.
+- **Una octava pintada con un tercer botón suena el sonido del propio tab**, no
+  el de la segunda zona. Un proyecto escrito sobre un SoundFont puede traer
+  cuatro zonas —ahí son gratis— y abrirse sobre un plugin: esas octavas se leen
+  como no asignadas, que es más honesto que hacerlas sonar cualquier cosa.
+
+El sonido de una zona es un **blob de estado** y no un número de programa, que
+es lo que un SoundFont tiene y un plugin no: va por `set_slot_zone_state`, y
+`set_zone_program` sigue siendo la puerta del SoundFont.
+
+#### El grafo sólo carga los jacks que alguien escucha
+
+Con la UMC1820 enchufada, choz registraba 34 puertos y **los conectaba todos**:
+el grafo copiaba veintiún capturas cada bloque para un rack que leía dos. La
+medición del punto anterior ya decía dónde está el coste —registrar no cuesta,
+conectar sí— y aquí está el número con la interfaz delante:
+
+```
+todo conectado    8.22 % de un núcleo
+un par conectado  4.61 %              (-3.61)
+```
+
+Casi la mitad del grafo, y lo que se paga por ello es nada: los puertos siguen
+registrados, así que `in_pair` sigue siendo el mismo índice y el cajón IN sigue
+teniendo una fila por jack. **Con el cajón abierto se conecta todo**, porque sus
+filas muestran el nivel que llega a cada uno y un jack desconectado no tiene
+nivel que mostrar — que es justamente el diagnóstico por el que se abre.
+
+Comprobado contra el grafo real con `examples/wire_check` (nuevo): 32 conexiones
+al arrancar, 2 con un par estéreo pedido, 0 sin nadie escuchando, 32 con el
+cajón abierto.
+
+#### El readback OSC ya no es sólo de la pestaña en pantalla
+
+Un plugin que guarda sus mandos fuera de sus puertos —ZynAddSubFX— se lee
+preguntándole por OSC, y eso se hacía sólo para la pestaña que se estaba
+mirando: las demás mostraban lo que choz les había mandado por última vez, que
+después de cargar un patch es un panel describiendo un sonido que nadie toca.
+Ahora la ronda recorre todas. El reloj es **uno por ronda y no uno por pestaña**,
+así que agregar una no acorta el intervalo de las otras, y sólo pregunta quien
+tiene algo que preguntar: un plugin sin interfaz de paths no cuesta ni una
+consulta.
+
+#### VST2: los pasos con nombre, leídos y no inventados
+
+Un parámetro con posiciones nombradas —un tipo de filtro, una forma de onda, la
+fuente de una matriz de modulación— abre su lista en LV2 enumerado, CLAP y
+VST3. En VST2 no, porque el ABI no tiene forma de preguntar **cómo se leería**
+un valor: `effGetParamDisplay` contesta por el valor en el que el parámetro
+está. El roadmap lo daba por perdido — "habría que adivinar cuántas son" — y
+resulta que no: se leen igual que en VST3, barriendo el rango y mirando dónde
+la etiqueta se repite. Una corrida de sondeos que dicen "Bandpass" es una
+meseta, y una meseta es una posición.
+
+Lo que cambia es **dónde** se puede hacer eso. VST3 lee las etiquetas sin tocar
+nada; VST2 tiene que poner el parámetro en cada punto. Así que el barrido vive
+en `read_params`, que carga una instancia suya y la tira cuando terminó de leer
+la lista, y **deja cada parámetro donde estaba**. El test que lo sostiene falla
+si se le quita la restauración.
+
+La lectura en sí —qué significa una corrida de etiquetas iguales— subió a
+`choz-ports` con sus tests: los dos formatos difieren en cómo consiguen las
+etiquetas, no en lo que dicen.
+
+Medido con los VST2 de esta máquina (`examples/steps_probe`, nuevo):
+
+```
+TyrellN6       94 params, 29 con posiciones  (Matrix1 Source: 17 fuentes con nombre)
+TripleCheese   90 params, 19 con posiciones  (Sync: 27 divisiones, Voices: few/medium/many)
+Pianoteq 9    213 params, 25 con posiciones
+los Zam, amsynth              0 — sus parámetros son números, y así se quedan
+```
+
+Y lo que cuesta, que era la duda: **nada que se note**. Leer los 213 parámetros
+de Pianoteq tarda 663 ms con el barrido y 675 ms sin él — el tiempo es cargar el
+plugin. TyrellN6: 16 ms contra 13. Se paga una vez, al agregar el instrumento.
+
+Del roadmap, el punto pasa a nombrar sólo a LADSPA y DSSI: sus puertos declaran
+un rango y nada más, y no hay ninguna llamada que diga cómo se lee un valor, así
+que ahí no queda de dónde leerlo.
+
+### 2026-08-29 · la tanda de interfaz y la auditoría de VST3
 
 #### El MIXER: `O M S` en una línea, y una strip del ancho de una strip
 

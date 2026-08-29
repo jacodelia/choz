@@ -389,7 +389,7 @@ Not tests — small programs that measure something against the real machine:
 
 ```bash
 cargo run -p choz-plugin-lv2  --example ui_probe    # open every LV2 X11 editor
-cargo run -p choz-plugin-clap --example gui_probe   # same for CLAP
+cargo run -p choz-plugin-clap --example clap_gui_probe   # same for CLAP
 cargo run -p choz-engine      --example latency_probe
 cargo run -p choz-engine      --example devlist
 cargo run --release -p choz-engine --example sf2_voices -- <sf2> 96000 128   # what a pedalful of notes costs

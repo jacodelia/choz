@@ -93,11 +93,13 @@ choz/
 │   │       ├── meter.rs         # Peak/RMS + a waveform window, for the monitor
 │   │       ├── paths.rs         # PluginFormat + per-format scan dirs (Carla-style)
 │   │       ├── cache.rs         # State dir + on-disk plugin scan cache
-│   │       ├── jack_backend.rs  # Native JACK client: one port per device channel
+│   │       ├── jack_backend.rs  # Native JACK client: a port per device channel,
+│   │       │                    # wired only where somebody is listening
+│   │       ├── layered.rs       # Two instances of one plugin, so a tab can split
 │   │       ├── sfz.rs           # SFZ parser + 32-voice sampler (samples decoded on load)
 │   │       ├── quarantine.rs    # Probe a plugin in a child process; cache the verdict
 │   │       ├── sandboxed.rs     # AudioSource/FxProcessor backed by a child process
-│   │       └── fx/              # 35 DSP processors (see below)
+│   │       └── fx/              # 46 DSP processors (see below)
 │   ├── choz-plugin-clap/
 │   │   └── src/
 │   │       ├── lib.rs           # Discovery + ClapPluginInfo

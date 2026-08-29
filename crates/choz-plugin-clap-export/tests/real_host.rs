@@ -35,11 +35,15 @@ fn a_clap_host_loads_the_bundle_and_hears_an_effect() {
     std::fs::copy(&so, &bundle).unwrap();
 
     // Exactly what choz does when it scans a plugin directory.
+    //
+    // Every built-in **and both artifacts** — the arpeggiator and the step
+    // sequencer travel in the same bundle, which is what the `+ 2` is. The unit
+    // test beside the factory counts them the same way.
     let found = choz_plugin_clap::scan_directory(&dir);
     assert_eq!(
         found.len(),
-        choz_engine::fx_chain::BUILT_IN_KINDS.len(),
-        "one file, every effect: {found:?}"
+        choz_engine::fx_chain::BUILT_IN_KINDS.len() + 2,
+        "one file, every effect and both artifacts: {found:?}"
     );
     let gain = found
         .iter()

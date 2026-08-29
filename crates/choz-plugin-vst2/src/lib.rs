@@ -228,6 +228,10 @@ pub fn read_params(path: &Path, _id: &str) -> Vec<PluginParam> {
     }
 }
 
+/// The most positions a parameter can have and still be a list rather than a
+/// range. The same ceiling VST3 uses.
+const MAX_NAMED_STEPS: u32 = 32;
+
 // ─── Instance ───────────────────────────────────────────────────────────────
 
 /// A loaded plugin: the `AEffect`, its de-interleaved port buffers, and the
@@ -614,24 +618,78 @@ impl Instance {
 
     fn params(&self) -> Vec<PluginParam> {
         (0..self.num_params())
-            .map(|i| PluginParam {
-                id: i as u32,
-                name: {
-                    let n = self.get_string(opcode::GET_PARAM_NAME, i as i32);
-                    if n.is_empty() {
-                        format!("P{i}")
-                    } else {
-                        n
-                    }
-                },
-                // VST2 parameters are normalised by definition, and the ABI
-                // says nothing about steps or units: everything is a knob.
-                min: 0.0,
-                max: 1.0,
-                default: self.get_param(i) as f64,
-                ..PluginParam::default()
+            .map(|i| {
+                let (steps, points) = self.positions(i);
+                PluginParam {
+                    id: i as u32,
+                    name: {
+                        let n = self.get_string(opcode::GET_PARAM_NAME, i as i32);
+                        if n.is_empty() {
+                            format!("P{i}")
+                        } else {
+                            n
+                        }
+                    },
+                    // VST2 parameters are normalised by definition and the ABI
+                    // says nothing about steps: everything is a knob until the
+                    // labels say otherwise — see [`Instance::positions`].
+                    min: 0.0,
+                    max: 1.0,
+                    default: self.get_param(i) as f64,
+                    unit: {
+                        let u = self.get_string(opcode::GET_PARAM_LABEL, i as i32);
+                        (!u.is_empty()).then_some(u)
+                    },
+                    steps,
+                    points,
+                    ..PluginParam::default()
+                }
             })
             .collect()
+    }
+
+    /// The named positions of a parameter, read off what its values *display*
+    /// as — a filter type that reads "Bandpass" over a stretch of its range has
+    /// a position there, and a knob that reads "-6.0 dB" has none.
+    ///
+    /// VST2 has no way to ask what a value would look like: the only reading is
+    /// `effGetParamDisplay`, which answers for the value the parameter is **on**.
+    /// So this sets it, reads, and puts it back. That is safe **here and
+    /// nowhere else**: `read_params` loads a throwaway instance of its own,
+    /// which is not the one in anybody's rack and is dropped when the list has
+    /// been read. Doing the same to a playing plugin would be heard.
+    ///
+    /// The reading itself is [`choz_ports::positions_from_labels`], the same
+    /// one VST3 uses — the formats differ in how the labels are obtained, not
+    /// in what a run of equal labels means.
+    fn positions(&self, index: usize) -> (u32, Vec<(f64, String)>) {
+        let Some(set) = (unsafe { (*self.effect).set_parameter }) else {
+            return (0, Vec::new());
+        };
+        let was = self.get_param(index);
+        let sweep = |probes: usize| -> Vec<String> {
+            (0..probes)
+                .map(|k| {
+                    let v = k as f32 / (probes - 1) as f32;
+                    unsafe { set(self.effect, index as i32, v) };
+                    self.get_string(opcode::GET_PARAM_DISPLAY, index as i32)
+                })
+                .collect()
+        };
+        // Coarse first, and finely again only for the one parameter whose every
+        // probe read differently — the same two-pass shape VST3 uses, for the
+        // same reason: a mode list with more entries than the sweep has points
+        // is invisible to it.
+        let coarse = choz_ports::positions_from_labels(&sweep(17), MAX_NAMED_STEPS);
+        let out = match coarse {
+            Some((true, _)) => {
+                choz_ports::positions_from_labels(&sweep(65), MAX_NAMED_STEPS).map(|(_, p)| p)
+            }
+            Some((false, p)) => Some(p),
+            None => None,
+        };
+        unsafe { set(self.effect, index as i32, was) };
+        out.unwrap_or((0, Vec::new()))
     }
 
     fn get_param(&self, index: usize) -> f32 {
@@ -955,6 +1013,46 @@ impl AudioSource for Vst2Instrument {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Reading a parameter's positions must put it back where it was.**
+    ///
+    /// VST2 cannot be asked what a value would display as: the only way to see
+    /// the label of a position is to set the parameter there and read it back.
+    /// That is done on the throwaway instance `read_params` loads, and the
+    /// promise that makes it safe is this one — every parameter ends the sweep
+    /// on the value it started on.
+    ///
+    /// Runs against whatever VST2 is installed, and says so when there is none.
+    #[test]
+    fn probing_the_positions_leaves_every_parameter_where_it_was() {
+        let mut found = scan_directory(Path::new("/usr/lib/vst"));
+        found.extend(scan_directory(Path::new("/usr/lib/lxvst")));
+        if let Some(home) = std::env::var_os("HOME") {
+            found.extend(scan_directory(&PathBuf::from(home).join(".vst")));
+        }
+        let Some(info) = found.into_iter().find(|p| !p.is_instrument) else {
+            eprintln!("no VST2 installed; skipping");
+            return;
+        };
+        let Ok(inst) = Instance::load(&info.path, 48_000, 64) else {
+            eprintln!("{} did not load; skipping", info.name);
+            return;
+        };
+        let n = inst.num_params();
+        assert!(n > 0, "{} exposes no parameters", info.name);
+        let before: Vec<f32> = (0..n).map(|i| inst.get_param(i)).collect();
+        for i in 0..n {
+            let _ = inst.positions(i);
+        }
+        for (i, was) in before.iter().enumerate() {
+            let now = inst.get_param(i);
+            assert!(
+                (was - now).abs() < 1e-6,
+                "{}: the sweep left parameter {i} at {now} instead of {was}",
+                info.name
+            );
+        }
+    }
 
     /// `audioMasterGetTime` must hand back a real `VstTimeInfo`. Plugins ask
     /// for it inside `processReplacing` and several (u-he's TyrellN6, found the

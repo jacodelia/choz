@@ -354,6 +354,9 @@ pub struct AudioEngine {
     /// Captured where the editor is, and for the same reason — it is the last
     /// moment the UI can reach the plugin.
     states: Vec<Option<choz_ports::StateHandle>>,
+    /// The **second zone's** patch, on a tab split between two instances of one
+    /// plugin. `None` on every tab that is not layered, which is most of them.
+    zone_states: Vec<Option<choz_ports::StateHandle>>,
     /// Same, per FX: `fx_states[slot][fx]`.
     fx_states: Vec<Vec<Option<choz_ports::StateHandle>>>,
     /// Each slot's instrument preset browser, when the plugin has one. Same
@@ -382,6 +385,10 @@ pub struct AudioEngine {
     /// moment, and the only one there is — a deck's rings cannot be cloned, so
     /// this is moved out of the processor rather than copied from it.
     fx_loopers: Vec<Vec<Option<choz_ports::LoopHandle>>>,
+    /// Which tabs each slot's gates read, one bit per tab. Kept per slot so the
+    /// mask the render loop orders by can be rebuilt whole when any one chain
+    /// changes — a gate that was removed has to stop counting.
+    slot_gate_sources: Vec<u32>,
     /// What each effect adds to the signal's delay, in samples:
     /// `fx_latency[slot][fx]`. A constant of the algorithm, so it is read once,
     /// here, instead of asked for on the audio thread.
@@ -423,6 +430,10 @@ pub struct AudioEngine {
     /// capture jack in the system, not one device's. The UI reads these for
     /// the row labels, so what the drawer lists is what is actually wired.
     input_ports: Vec<String>,
+    /// The capture wiring last asked for, so an unchanged one is not re-sent:
+    /// connecting is a call into the server, and the interface would otherwise
+    /// make thirty-four of them per redraw.
+    capture_wiring: Option<u64>,
 }
 
 /// The live audio connection. Held only to keep it alive: dropping either
@@ -684,6 +695,7 @@ impl AudioEngine {
             touches: Vec::new(),
             fx_touches: Vec::new(),
             states: Vec::new(),
+            zone_states: Vec::new(),
             fx_states: Vec::new(),
             presets: Vec::new(),
             paths: Vec::new(),
@@ -691,6 +703,7 @@ impl AudioEngine {
             fx_sandboxes: Vec::new(),
             fx_meters: Vec::new(),
             fx_loopers: Vec::new(),
+            slot_gate_sources: Vec::new(),
             fx_latency: Vec::new(),
             cmd_tx,
             retired_rx,
@@ -706,6 +719,7 @@ impl AudioEngine {
             out_wired: 0,
             in_channels: 0,
             input_ports: Vec::new(),
+            capture_wiring: None,
         }
     }
 
@@ -844,6 +858,10 @@ impl AudioEngine {
                 self.out_channels = channels;
                 self.in_channels = ins;
                 self.input_ports = capture;
+        self.capture_wiring = None;
+                // A fresh client is wired the way `start` left it, whatever was
+                // asked for before it existed.
+                self.capture_wiring = None;
                 // The device the audio actually reached, which is not always
                 // the one that was asked for: a saved name outlives the box.
                 self.out_wired = wired.as_ref().map(|(_, n)| *n).unwrap_or(0);
@@ -1307,6 +1325,23 @@ impl AudioEngine {
         }
     }
 
+    /// Restore a patch onto the **second zone** of a layered tab.
+    ///
+    /// A zone's sound is a blob and not a program number — that is what a
+    /// hosted plugin has — so a split between two patches is this call and
+    /// [`Self::set_slot_state`], one per instance. Silently nothing on a tab
+    /// that is not layered, which is every tab until a second zone is painted.
+    pub fn set_slot_zone_state(&self, slot: usize, data: &[u8]) {
+        if let Some(Some(h)) = self.zone_states.get(slot) {
+            h.restore(data);
+        }
+    }
+
+    /// Whether this tab has a second instance to put a patch in.
+    pub fn slot_has_zone_state(&self, slot: usize) -> bool {
+        matches!(self.zone_states.get(slot), Some(Some(_)))
+    }
+
     /// Everything slot `slot`'s instrument offers in its own preset browser.
     /// Empty for a SoundFont (its programs are the engine's own business), for
     /// an effect, and for any plugin whose format cannot report presets.
@@ -1522,6 +1557,7 @@ impl AudioEngine {
         self.layers.push(source.layers_zones());
         self.touches.push(source.param_touch());
         self.states.push(source.state());
+        self.zone_states.push(source.zone_state(1));
         self.presets.push(source.presets());
         self.paths.push(source.paths());
         self.sandboxes.push(source.sandbox());
@@ -1531,6 +1567,7 @@ impl AudioEngine {
         self.fx_sandboxes.push(Vec::new());
         self.fx_meters.push(Vec::new());
         self.fx_loopers.push(Vec::new());
+        self.slot_gate_sources.push(0);
         self.fx_latency.push(Vec::new());
         self.send(EngineCommand::AddSlot(source));
         self.slot_count += 1;
@@ -1566,6 +1603,15 @@ impl AudioEngine {
     pub fn set_slot_fx(&mut self, slot: usize, specs: Vec<FxSpec>) {
         if slot >= self.slot_count {
             return;
+        }
+        // What this chain listens to, and then the whole rack's answer: the
+        // render loop puts these tabs first so a gate reads its source in the
+        // block it is in rather than one late.
+        if slot < self.slot_gate_sources.len() {
+            self.slot_gate_sources[slot] = crate::fx_chain::gate_sources_of(&specs);
+            crate::fx_chain::set_gate_sources(
+                self.slot_gate_sources.iter().fold(0, |mask, m| mask | m),
+            );
         }
         let mut fx = build_chain_from_specs(&specs, self.sample_rate, self.buffer_size);
         // Last chance to reach the processors: after this they belong to the
@@ -1631,6 +1677,28 @@ impl AudioEngine {
             return;
         }
         self.send(EngineCommand::SetSlotIn { slot, pair });
+    }
+
+    /// Wire the capture jacks somebody is listening to, and unwire the rest.
+    ///
+    /// `wanted` is a bit per capture channel. **What is not connected costs the
+    /// graph nothing and shows no level**, which is the whole trade: the rows of
+    /// the IN drawer are still there and still numbered the same — only the ones
+    /// nobody reads stop being copied every block. The interface passes every
+    /// jack while that drawer is open, so its meters are live exactly when
+    /// somebody is looking at them.
+    ///
+    /// Only the native JACK client has ports to wire; on the others this is a
+    /// no-op and the whole device is captured as before.
+    pub fn set_capture_wiring(&mut self, wanted: u64) {
+        if self.capture_wiring == Some(wanted) {
+            return;
+        }
+        let Some(BackendHandle::Jack(handle)) = self._stream.as_ref() else {
+            return;
+        };
+        crate::jack_backend::set_capture_wiring(handle.as_client(), &self.input_ports, wanted);
+        self.capture_wiring = Some(wanted);
     }
 
     /// Turn a tab's audio input into notes for its own instrument — a guitar
@@ -1774,6 +1842,9 @@ impl AudioEngine {
         self.layers[slot] = source.layers_zones();
         self.touches[slot] = source.param_touch();
         self.states[slot] = source.state();
+        // A layered tab has a second instance behind the first, and its patch
+        // is reached through its own handle — see [`Self::set_slot_zone_state`].
+        self.zone_states[slot] = source.zone_state(1);
         self.presets[slot] = source.presets();
         self.paths[slot] = source.paths();
         self.sandboxes[slot] = source.sandbox();
@@ -1890,6 +1961,33 @@ impl AudioEngine {
     }
 
     /// Load a hosted plugin instrument as slot `slot`'s source.
+    /// Load a plugin instrument into `slot` **twice**, so the tab can be split
+    /// between two of its patches.
+    ///
+    /// The second instance is what makes a split on a plugin a split rather
+    /// than a patch swap at the join: both sound, and a note held across the
+    /// join keeps sounding. It costs what a second plugin costs — memory, CPU
+    /// and its own load time — so this is not what loading an instrument does:
+    /// the rack asks for it when a second zone is painted, and goes back to one
+    /// instance when that zone is cleared.
+    ///
+    /// Two and no more. Somebody who wants four sounds at once is asking for
+    /// four tabs, which is what MULTI is for.
+    pub fn load_plugin_layered(
+        &mut self,
+        slot: usize,
+        format: crate::PluginFormat,
+        path: &std::path::Path,
+        id: &str,
+    ) -> Result<()> {
+        refuse_if_quarantined(format, path, id)?;
+        let first = self.build_instrument(format, path, id)?;
+        let second = self.build_instrument(format, path, id)?;
+        let block = self.buffer_size;
+        self.set_slot_source(slot, Box::new(crate::layered::Layered::new([first, second], block)));
+        Ok(())
+    }
+
     pub fn load_plugin(
         &mut self,
         slot: usize,
@@ -2411,7 +2509,19 @@ impl RtState {
         // effect problem, which look the same from a panel.
         crate::meter::capture_levels().publish(capture, frames);
 
-        for (slot_index, slot) in slots.iter_mut().enumerate() {
+        // **The tabs some gate listens to go first.** A gate reads its source's
+        // level for the block it is in, so a source rendered after the tab it
+        // gates would be read one block late — up to 5 ms of a rhythmic gate
+        // lagging its own kick. Two filtered ranges rather than a sorted list:
+        // nothing is allocated, and what is not a source keeps the order it had.
+        // The sum does not care which order it was added in.
+        let sources = crate::fx_chain::gate_sources();
+        let is_source = |i: &usize| *i < 32 && sources & (1 << *i) != 0;
+        let order = (0..slots.len())
+            .filter(is_source)
+            .chain((0..slots.len()).filter(|i| !is_source(i)));
+        for slot_index in order {
+            let slot = &mut slots[slot_index];
             let slot_started = std::time::Instant::now();
             // Synths always render (envelope tails / live keys); generators
             // (tone, WAV) honor the transport play flag.
@@ -4440,6 +4550,143 @@ mod tests {
 
         levels.reset(probed);
         levels.reset(skipped);
+    }
+
+    /// A tab that drives a gate is rendered **before** the tab it gates.
+    ///
+    /// The gate reads its source's level for the block it is in. With the
+    /// source rendered afterwards it read the *previous* block — up to 5 ms of
+    /// a rhythmic gate lagging its own kick, which at 256 frames is audible on
+    /// anything percussive.
+    ///
+    /// Checked on the order itself rather than on the sound: what the render
+    /// loop decides is the order, and a level that is one block old is what
+    /// comes out of getting it wrong.
+    #[test]
+    fn a_tab_that_drives_a_gate_is_rendered_before_the_one_it_gates() {
+        let _clock = crate::test_locks::transport();
+        let order = |sources: u32, n: usize| -> Vec<usize> {
+            let is_source = |i: &usize| *i < 32 && sources & (1 << *i) != 0;
+            (0..n)
+                .filter(is_source)
+                .chain((0..n).filter(|i| !is_source(i)))
+                .collect()
+        };
+        // Tab 3 drives a gate: it goes first, and the rest keep their order.
+        assert_eq!(order(1 << 3, 5), vec![3, 0, 1, 2, 4]);
+        // Nobody drives one: nothing moves.
+        assert_eq!(order(0, 4), vec![0, 1, 2, 3]);
+        // Two sources: both first, in the order they were in.
+        assert_eq!(order((1 << 1) | (1 << 4), 5), vec![1, 4, 0, 2, 3]);
+        // Every tab is rendered exactly once, whatever the mask says.
+        let mut seen = order(0b1010_1010, 8);
+        seen.sort_unstable();
+        assert_eq!(seen, (0..8).collect::<Vec<_>>());
+
+        // And the mask is what the chains say: a gate on a tab counts, one on
+        // the clock or on another tab's **notes** does not — a note is
+        // published where it arrives, not where the tab renders.
+        use crate::fx_chain::{FxSpec, GateMode, GateSource, GateSpec};
+        let spec = |source| FxSpec {
+            kind: "gain".into(),
+            enabled: true,
+            wet: 1.0,
+            params: Vec::new(),
+            plugin: None,
+            gate: Some(GateSpec {
+                source,
+                mode: GateMode::Open,
+                depth: 1.0,
+                threshold: 0.5,
+                release_ms: 20.0,
+            }),
+        };
+        assert_eq!(
+            crate::fx_chain::gate_sources_of(&[spec(GateSource::Tab(2))]),
+            1 << 2
+        );
+        assert_eq!(
+            crate::fx_chain::gate_sources_of(&[
+                spec(GateSource::Clock),
+                spec(GateSource::Note(1)),
+            ]),
+            0
+        );
+    }
+
+    /// And the render loop really uses that order, end to end.
+    ///
+    /// Slot 0 carries an effect gated by slot **1**, which without the ordering
+    /// is rendered afterwards: the gate would read a level that does not exist
+    /// yet and stay shut for the first block. The effect here is audible on
+    /// purpose — full wet is silence — so what is being measured is the sound
+    /// and not the bookkeeping.
+    #[test]
+    fn the_gate_opens_in_the_same_block_its_source_plays() {
+        let _clock = crate::test_locks::transport();
+        use crate::fx::FxProcessor;
+
+        /// Wet 1 is silence, wet 0 is the signal. The gate moves `set_mix`, so
+        /// this makes what the gate did audible in one number.
+        struct Silencer {
+            wet: f32,
+        }
+        impl FxProcessor for Silencer {
+            fn process_block(&mut self, buf: &mut [f32], _sr: u32) {
+                for s in buf.iter_mut() {
+                    *s *= 1.0 - self.wet;
+                }
+            }
+            fn reset(&mut self) {}
+            fn set_mix(&mut self, wet: f32) {
+                self.wet = wet.clamp(0.0, 1.0);
+            }
+        }
+
+        crate::meter::slot_levels().reset_all();
+        let (mut cmd_tx, _retired, mut state) = mk_state();
+        // 0 is the tab being gated, 1 is the one driving it.
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(DcSource(1.0))))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(DcSource(1.0))))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotFx {
+                slot: 0,
+                fx: vec![crate::fx_chain::gated(
+                    Box::new(Silencer { wet: 1.0 }),
+                    crate::fx_chain::GateSpec {
+                        source: crate::fx_chain::GateSource::Tab(1),
+                        mode: crate::fx_chain::GateMode::Open,
+                        depth: 1.0,
+                        threshold: 0.5,
+                        release_ms: 20.0,
+                    },
+                    1.0,
+                )],
+            })
+            .unwrap();
+        crate::fx_chain::set_gate_sources(1 << 1);
+
+        // One block, from cold. Slot 1 is loud, so by the time slot 0 is
+        // processed the gate has to be **open** — and open means the effect is
+        // applied, which for this one means slot 0 goes quiet. Two tabs at full
+        // scale would peak at twice the pan law; with slot 0 silenced only slot
+        // 1 is left.
+        let mut buf = [0.0f32; 8];
+        audio_callback(&mut buf, &mut state);
+        let peak = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let unity = std::f32::consts::FRAC_1_SQRT_2;
+        assert!(
+            (peak - unity).abs() < 0.05,
+            "the gate was still shut on the first block: {peak} (both tabs \
+             through is {:.3}, the gate having acted is {unity:.3})",
+            2.0 * unity
+        );
+        crate::meter::slot_levels().reset_all();
+        crate::fx_chain::set_gate_sources(0);
     }
 
     /// A tab fed from the interface plays with the transport stopped.

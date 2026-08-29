@@ -65,7 +65,7 @@ impl ClapEditor {
     /// `on_timer`, not from an idle callback). Surge XT registers a 20 ms timer
     /// the moment the host offers one.
     ///
-    /// Measured with `examples/gui_probe`, which counts the parent window's real
+    /// Measured with `examples/clap_gui_probe`, which counts the parent window's real
     /// X11 children rather than trusting the return values: **20 of the 20 CLAP
     /// plugins installed here open a window with the size they ask for**.
     pub fn new(shared: SharedGui, state: SharedGuiState) -> Option<Arc<Self>> {

@@ -2,9 +2,10 @@
 
 Qué falta. **Lo cerrado no vive aquí**: está en [CHANGELOG.md](../CHANGELOG.md),
 día por día, con los porqués y lo último arriba; cómo encajan las piezas, en
-[architecture.md](architecture.md). Este documento se poda cuando un punto se
-cierra, para que lo que quede sea sólo lo que queda — el 2026-08-19 se podó
-entero: lo que decía "hecho" o "cerrado" se fue al changelog.
+[architecture.md](architecture.md). Este documento se poda cada vez que un punto
+se cierra, para que lo que quede sea sólo lo que queda: se podó entero el
+2026-08-19 y otra vez el 2026-08-29, y las dos veces lo que decía "hecho" se fue
+al changelog.
 
 Última actualización: 2026-08-29.
 
@@ -17,21 +18,25 @@ jack del grafo) y por ALSA/PulseAudio/PipeWire (un dispositivo de captura
 elegible en Settings), así que también es un multiefecto; hay tres capas contra
 el código ajeno que revienta —escaneo fuera de proceso, cuarentena y sandbox—;
 hay transporte propio con compás, automatización contra ese reloj, `A→M` (audio
-a notas), AutoTune y un arpegiador por tab; 46 efectos
-propios (**la suite está completa**), que además se publican como un `.clap`
-para usarlos en cualquier otro host; un patch de Max se importa hasta donde se
+a notas), AutoTune, un arpegiador y un secuenciador por tab; 46 efectos propios
+(**la suite está completa y auditada**: se apilan sin pasarse de escala, y su
+dry/wet es una sola ley), que además se publican como un `.clap` —los dos
+artifacts incluidos— para usarlos en cualquier otro host; un looper multipista
+con sus tiras de canal y exportación a WAV; un patch de Max se importa hasta donde se
 puede, diciendo qué no; hay guardia de acople en la entrada; el mixer tiene un
 main **estéreo** y cuatro subgrupos; una tab guarda sus sonidos en botones —que
 se asignan desde el mismo modal de bank/preset— y puede partir el teclado entre
 ellos; y un efecto puede abrirse con el bombo de otra tab —por su nivel o por
 las notas que se le tocan—, con el clock, o con el tap del metrónomo. El MIXER
 se maneja entero desde el teclado, grupos y main incluidos, y cada strip lleva
-su `O M S` bajo el fader. Un plugin que guarda sus controles fuera de sus puertos
+su `O M S` bajo el fader. Los mandos de un plugin se agrupan por lo que el
+plugin dice —las unidades de VST3, el módulo de CLAP— y los que tienen
+posiciones con nombre abren su lista en los cuatro formatos que saben decirlas. Un plugin que guarda sus controles fuera de sus puertos
 —ZynAddSubFX— se maneja por su propio servidor OSC: mandos con nombre, los
 armónicos del oscilador, su ventana real, y los mandos leyendo lo que el plugin
 tiene. **La 1.0.0 está publicada y sus paquetes verificados; la
 1.3.4 es este árbol.**
-799 tests, `clippy --workspace --all-targets -D warnings` limpio.
+808 tests, `clippy --workspace --all-targets -D warnings` limpio.
 
 Las comprobaciones con hardware delante quedaron dichas en los gotchas, que es
 donde se van a leer.
@@ -40,10 +45,11 @@ donde se van a leer.
 
 ## Pendiente
 
-Nada de lo pedido queda abierto como punto: lo del 2026-08-19, lo del
-2026-08-22 y lo del 2026-08-23 está cerrado y contado en el changelog. Lo que
-sigue son los bordes que cada uno dejó dichos, y la pieza que se decidió no
-hacer.
+**No hay ningún punto pedido abierto.** Todo lo que se pidió está cerrado y
+contado día por día en el changelog; lo que sigue son los bordes que cada cierre
+dejó dichos, la pieza que se decidió no hacer, y lo que hay que saber para
+retomar. Un punto que se cierra sale de aquí — este documento es lo que queda,
+no lo que hubo.
 
 ### Fuera de la lista, por decisión del 2026-08-19
 
@@ -51,27 +57,16 @@ La sección **artifact** — arpegiador + piano roll de 128 pasos portado de
 seqterm. Es la pieza más grande de las pedidas, no compite con las demás por
 tiempo, y se replantea aparte.
 
-### Replanteado aparte
+Lo que sí existe, y cubre parte de lo que aquella sección iba a traer: cada tab
+tiene su **arpegiador** y su **secuenciador de pasos** —hecho como un MMT-8, con
+su propio reloj contra el transporte—, y los dos se publican como plugins CLAP.
+Lo que no está es la sección como tal: una vista aparte con el piano roll largo.
 
-**Looper multipista** — *hecho el 2026-08-26.* — [looper-multitrack.md](looper-multitrack.md). El looper
-de hoy es una pista de 32 s en un slot de FX, y **su transporte no tiene ningún
-llamador**: se puede agregar a una cadena y se queda en `Idle` para siempre. El
-plan lo deja donde está —en la cadena del tab, oyendo sólo ese tab— y lo lleva a
-N tomas apiladas sobre una misma fuente (una guitarra, un micrófono), que suenan
-juntas o no. Techo de 5 minutos por pista, cuantización con piso de un compás,
-metrónomo que se arma con el `REC`, exportación a WAV y presupuesto de memoria
-acotado. Seis fases. El nudo no es el DSP: `FxProcessor` no le da a un efecto
-ningún canal para pedir memoria ni devolver nada, y grabar cinco minutos lo
-necesita.
+### Lo que la auditoría de efectos dejó dicho
 
-### Efectos: la auditoría del 2026-08-27, cerrada
-
-La auditoría entera está en [fx-audit.md](fx-audit.md), con archivo y línea por
-hallazgo; **las once fases están cerradas** —las seis primeras el 2026-08-27, el
-resto el 28— y contadas en el changelog. No queda ningún punto de la auditoría
-abierto.
-
-Lo que quedó dicho al cerrarla, que no es una tarea sino algo que saber:
+Las once fases están cerradas —[fx-audit.md](fx-audit.md) tiene el archivo y la
+línea de cada hallazgo, el changelog lo que se hizo con cada uno—. Esto no son
+tareas: es lo que hay que saber antes de tocar un efecto.
 
 - **La ley de la mezcla vive en el doc de `FxProcessor::set_mix`**, y es
   `out = dry + wet·(procesado − dry)`. La única excepción a propósito es el
@@ -99,13 +94,8 @@ Lo que quedó dicho al cerrarla, que no es una tarea sino algo que saber:
 
 | # | Qué falta | Dónde | Por qué no se hizo |
 |---|-----------|-------|--------------------|
-| 1 | **Un bloque de retraso en el gate** | FX | Una tab que se renderiza después de la gateada llega un bloque tarde (< 3 ms). Se arregla ordenando los slots por dependencia, que es más máquina de la que el problema pide. |
-| 2 | **El split superpone en SF2, no en plugins** | SOUNDS | Cerrado para SoundFonts: una zona por canal MIDI de oxisynth, el archivo compartido, coste cero de memoria. Un plugin alojado tiene **un** patch, así que ahí el rack sigue conmutando al cruzar la junta. Dos plugins a la vez son dos tabs, que es lo que MULTI hace. |
-| 3 | **Registrar sólo los puertos que se usan** | JACK | choz registra un puerto por canal del dispositivo: en una UMC1820 son 12 de salida y 20 de entrada, y PipeWire mueve los 34 en cada bloque, 750 veces por segundo, los use alguien o no. Medido: con el proceso parado, el hilo del grafo come 5,5% de un núcleo mientras el DSP de choz cuesta 0,4%. **Y hay un conflicto que este punto no sabía cuando se escribió** (2026-08-29): la lista del cajón IN *es* `all_capture_ports()`, y el nivel que cada fila muestra sale de **nuestros** puertos (`capture_levels`), que es el diagnóstico que distingue un problema de cableado de uno de efecto. Registrar menos deja filas sin nivel. La salida que conserva las dos cosas es registrar todo y **desconectar** lo que ninguna tab usa, reconectándolo mientras el cajón IN está abierto — y antes de escribirlo hay que medir si el coste es por puerto conectado o por puerto registrado, que es una medición con la interfaz delante. |
-| 4 | **Los mandos del editor SF2 no son por zona** | SOUNDS | El editor escribe sus offsets en todos los canales, así que da forma al instrumento entero. Una envolvente distinta por zona del split querría un juego de mandos por zona, y eso es un panel nuevo. |
-| 5 | **La ventana de ZynAddSubFX es un proceso aparte** | LV2 | Se abre y se cierra con la pestaña, pero es su propio programa hablando OSC con la instancia. Meterla dentro de choz querría el plumbing de atom ports UI↔DSP (`__dpf_ui_data__`), que es lo que DPF usa para pasarle la dirección. |
-| 6 | **VST2 y LADSPA/DSSI no listan los nombres de los pasos** | RACK | Un parámetro con nombres abre su lista en LV2 enumerado, CLAP y VST3. En VST2 se podrían sondear con `effGetParamDisplay` posición por posición, pero hay que adivinar cuántas son: sería inventarlas, no leerlas. |
-| 7 | **El readback OSC es sólo de la pestaña activa** | RACK | Los mandos de la pestaña en pantalla siguen al plugin; los de las otras se ponen al día cuando se las mira. Preguntarlo todo para todas las pestañas es tráfico por algo que nadie está viendo. |
+| 1 | **Los mandos del editor SF2 no son por zona** | SOUNDS | El editor escribe sus offsets en todos los canales, así que da forma al instrumento entero. Una envolvente distinta por zona del split querría un juego de mandos por zona, y eso es un panel nuevo. |
+| 2 | **LADSPA y DSSI no listan los nombres de los pasos** | RACK | Un parámetro con nombres abre su lista en LV2 enumerado, CLAP, VST3 y —desde el 2026-08-29— VST2. LADSPA sí dice **cuántas** posiciones tiene un puerto y choz ya lo respeta (`steps_of`, con `HINT_TOGGLED` e `HINT_INTEGER`): lo que no hay es de dónde sacar los **nombres**, porque el ABI no tiene ninguna llamada que diga cómo se lee un valor. Un interruptor se dibuja como interruptor; un puerto de cuatro posiciones sigue siendo cuatro números. |
 
 ### Y lo de siempre
 
@@ -130,6 +120,44 @@ contra una habitación.
   —captura lineal, lectura entera hacia adelante, sin realimentación— y no es un
   olvido: lo que tenía era el techo del grano medido en samples, que ahora está
   en segundos.
+
+- **Un tab de plugin partido lleva dos instancias, y sólo mientras las usa**
+  (2026-08-29). `choz_engine::layered::Layered` es el envoltorio; la segunda se
+  construye **al pintar la segunda zona** y se suelta al quitarla, porque un
+  plugin cuesta lo que cuesta y casi ningún tab parte el teclado. El techo es
+  dos a propósito: cuatro sonidos a la vez son cuatro tabs, que es lo que hace
+  MULTI. Un octava pintada con un tercer botón suena el sonido del propio tab,
+  no el de la segunda zona — la lectura honesta de "no hay tercera instancia",
+  y lo que hace que un proyecto escrito sobre un SoundFont (donde cuatro zonas
+  son gratis) se abra en un plugin sin sonar cualquier cosa. El sonido de una
+  zona es un **blob**, no un número de programa: va por `set_slot_zone_state`,
+  y `set_zone_program` sigue siendo la puerta del SoundFont.
+
+- **El orden de render no es el de las pestañas** (2026-08-29). Las que manejan
+  un gate van primero: un gate lee el nivel de su fuente para el bloque en el
+  que está, y una fuente renderizada después se leía un bloque tarde — hasta
+  5 ms de un gate rítmico llegando detrás de su propio bombo. La máscara la
+  publica `fx_chain::set_gate_sources` cuando se reconstruye una cadena, y el
+  callback la lee con dos rangos filtrados: no aloca, y lo que no es fuente
+  conserva el orden que tenía. La suma no distingue en qué orden se le sumó.
+
+- **Un puerto de captura que nadie escucha se desconecta, no se desregistra**
+  (2026-08-29). Registrar no cuesta —34 puertos callados quedan bajo el ruido
+  del propio grafo— y conectar sí: ~0,19 puntos de un núcleo por conexión,
+  medido con la UMC1820 delante. Con el rack leyendo un par de veintiuno, el
+  grafo pasa de **8,22 % a 4,61 %**. Lo que decide la máscara es
+  `App::capture_mask`, y **con el cajón IN abierto se conecta todo**: sus filas
+  muestran el nivel de cada jack, y un jack desconectado no tiene nivel que
+  mostrar — que es justo el diagnóstico por el que se abre ese cajón.
+
+- **Un sondeo de etiquetas se hace en la instancia de lectura, nunca en la que
+  suena** (2026-08-29). VST2 no tiene con qué preguntar cómo se *leería* un
+  valor: la única lectura es `effGetParamDisplay`, que contesta por el valor en
+  el que el parámetro está. Por eso el barrido lo hace `read_params`, que carga
+  una instancia suya y la tira, y por eso deja cada parámetro donde estaba —
+  `probing_the_positions_leaves_every_parameter_where_it_was` lo sostiene, y
+  falla si se le quita la restauración. Hacer lo mismo sobre un plugin que está
+  sonando se oiría.
 
 - **El flake de los tests de UI sigue ahí, y un intento de arreglarlo lo
   empeoró** (2026-08-29). `XDG_STATE_HOME` es global al proceso y
@@ -254,8 +282,9 @@ contra una habitación.
   propósito y se alarga con un patch real delante; un `.pd` necesita `adc~`
   **y** `dac~`; el dispositivo de audio no cambia solo **nunca**; JSFX no
   existe en choz.
-- **Lo que se instala con choz**: sus 46 efectos como `.clap` (`~/.clap` desde
-  el instalador, `/usr/lib/clap` desde los paquetes), los wallpapers en
+- **Lo que se instala con choz**: sus 46 efectos **y los dos artifacts** —el
+  arpegiador y el secuenciador— como un solo `.clap` de 48 plugins (`~/.clap`
+  desde el instalador, `/usr/lib/clap` desde los paquetes), los wallpapers en
   `share/choz/wallpapers` —una instalación nueva abre con el que trae— y
   `choz-pd-host` cuando hay libpd. `--no-clap` para quien no quiera el plugin.
 
@@ -265,7 +294,7 @@ contra una habitación.
   esos controles en el log al cargarlo. Los que sí tienen símbolo salen como
   knobs. Y ojo: **Pd no crea un `hsl` con campos de menos**, aunque el lector de
   choz lo acepte.
-- **Los cajones IN y OUT hacen scroll** (ya no es el gotcha que era): `drawer::{list_height, list_scroll}` calculan la ventana visible **a partir del cursor**, sin offset guardado, y las llaman tanto el dibujo como los rects de clic — que es lo que impide que se desvíen. La rueda del ratón mueve el cursor. Si aparece otra lista larga en un panel, ésa es la pieza a reusar.
+- **Una lista larga en un panel se hace con `drawer::{list_height, list_scroll}`**: calculan la ventana visible **a partir del cursor**, sin offset guardado, y las llaman tanto el dibujo como los rects de clic — que es lo que impide que se desvíen.
 - **Un rect de clic no se calcula con offsets a mano.** Es la raíz del bug de los botones de banco: cualquier texto anterior en la línea puede estar traducido, y entonces el rect apunta a otra columna. Los rects salen de las anchuras reales de los spans (`Span::width`, no `chars().count()`, que miente con CJK).
 - **`in_pair` es un índice en esa lista plana de puertos**, y esa lista se mueve: desenchufa una tarjeta y todos los índices posteriores se corren. Por eso un proyecto guarda además **el nombre de los dos jacks** (`Mixer.in_ports`) y al abrir manda el nombre; si el jack ya no está, la tab se queda **sin entrada de audio** en vez de escuchar el micro de otro — `resolve_in_pair`. Dentro de una sesión el índice sigue siendo la moneda.
 - **Tener ventana manda el plugin al sandbox, aunque el probe lo vea sano.** `quarantine::check` devuelve `Report{verdict, editor}` y `wants_sandbox` mira las dos cosas, así que en esta máquina casi todo lo que tiene GUI (Zam, guitarix, u-he) pasa a correr fuera de proceso. Si algo suena distinto o el rendimiento cambia, ésa es la razón: `CHOZ_SANDBOX_GUI=0` la apaga.
@@ -280,12 +309,13 @@ contra una habitación.
 - **Las UIs de guitarix matan el proceso** (nueve rebanadas, nueve `gx_*`, SIGSEGV). El probe levanta la deny-list a propósito; choz no, y el sandbox se las queda porque tienen ventana.
 - **La deny-list de UIs es propiedad del proceso, no del plugin.** `choz-plugin-lv2::allow_denied_uis(true)` la levanta, y el único sitio que lo hace es el hijo del sandbox.
 - **El host no puede ver si un plugin sandboxeado tiene ventana**: por eso el hijo publica `editor_present` en la cabecera **antes de servir su primer bloque**.
-- **Los probes de editores abren ventanas de verdad.** `examples/ui_probe` (LV2) y `examples/gui_probe` (CLAP) instancian plugins y abren su GUI: usar `Xvfb` (o la ventana padre sin mapear) y **matarlos al terminar**. Ningún test abre ventanas, y así debe seguir.
+- **Los probes de editores abren ventanas de verdad.** `examples/ui_probe` (LV2) y `examples/clap_gui_probe` (CLAP) instancian plugins y abren su GUI: usar `Xvfb` (o la ventana padre sin mapear) y **matarlos al terminar**. Ningún test abre ventanas, y así debe seguir.
 - **En VST3, la GUI no habla con el procesador.** El edit controller reporta al host (`IComponentHandler::performEdit`) y es el host quien lleva el valor al procesador por `inputParameterChanges`. Y `getParameterInfo` toma un **índice** y devuelve un **id arbitrario**: confundirlos mueve otro parámetro.
 - **Un valor que no se guarda tampoco se puede editar.** El cap de 7 parámetros truncaba la lista *al construirla*, no sólo al dibujarla.
 - **Una nota-off tiene que ir a donde fue su nota-on.** `App.sounding` es la memoria; `PANIC` es la salida de emergencia.
 - **Un fondo de celda es opaco, y va por encima de la imagen del protocolo gráfico.** En halfblocks la transparencia se mezcla en las celdas (fg *y* bg); bajo kitty el lavado es una segunda imagen con alfa.
 - **Un binario de plugin puede publicar cientos de descriptores.** LSP tiene ~390 UIs en un `.so`: recorrer hasta el primer nulo, nunca con un N fijo.
+- **Un test que carga el `.so` del propio workspace puede estar leyendo uno viejo.** `real_host` compara lo que el bundle CLAP exporta contra la lista de built-ins, y toma el `.so` de `target/debug`: con uno de antes de los artifacts pasaba en local y fallaba en el runner, que compila limpio. Un fallo de esos se reproduce construyendo el crate primero.
 - **"No carga" y "no tiene ventana" son respuestas distintas.** Mezclarlas escondió un bug dos sesiones.
 - **La primera explicación de una medición rara suele ser falsa.** Medir la hipótesis cuesta menos que escribirla en el roadmap como si fuera un hecho.
 - **El fondo por protocolo gráfico depende del `z`**: por debajo de -1073741824 la imagen queda bajo los fondos de celda. `ratatui-image` no vale para esto.
@@ -326,25 +356,35 @@ cargo test -p choz-plugin-pd --features pd
 cargo build -p choz-plugin-pd --features pd
 cargo test -p choz-engine --test pd_patch
 
+# Las sondas de medición, que son con lo que se decide antes de tocar DSP.
+cargo run --release -p choz-engine --example alias_probe    # artefactos que no estaban en la entrada
+cargo run --release -p choz-engine --example mix_probe      # la ley del dry/wet, efecto por efecto
+cargo run --release -p choz-engine --example port_cost      # lo que cuesta un puerto JACK
+cargo run --release -p choz-plugin-vst2 --example steps_probe   # posiciones con nombre en VST2
+cargo run --release -p choz-plugin-vst3 --example units_probe   # secciones que declara un VST3
+cargo test --release -p choz-ui -- --ignored --nocapture measure_stacking  # los 46 apilados
+
 # barridos largos: hostear TODOS los plugins instalados de un formato
 cargo test --release -p choz-plugin-lv2 -- --ignored
 cargo test --release -p choz-plugin-ladspa -- --ignored
 
 # Probes de editores: INSTANCIAN PLUGINS Y ABREN SU GUI.
 cargo run -p choz-plugin-lv2  --example ui_probe            # --limit N, --skip N
-cargo run -p choz-plugin-vst3 --example gui_probe
+cargo run -p choz-plugin-vst3 --example vst3_gui_probe
 Xvfb :99 -screen 0 1280x800x24 &
-DISPLAY=:99 cargo run -p choz-plugin-clap --example gui_probe
+DISPLAY=:99 cargo run -p choz-plugin-clap --example clap_gui_probe
 
 # Tests de runtime con los instrumentos VST2 del usuario.
 CHOZ_VST2_DIR=/ruta/a/tus/vst cargo test -p choz-plugin-vst2
 
 # Los efectos de choz como plugin CLAP: construir, probar y usar fuera.
+# `real_host` lee el `.so` de `target/debug`: construir antes, o se está
+# probando el de la vez pasada.
 cargo test -p choz-plugin-clap-export          # ABI en proceso + carga por dlopen
 cargo build --release -p choz-plugin-clap-export
 cp target/release/libchoz_plugin_clap_export.so ~/.clap/choz.clap
 
 # Comprobar un paquete publicado sin instalarlo.
-dpkg-deb -c choz_1.1.0-1_amd64.deb
+dpkg-deb -c choz_1.3.4-1_amd64.deb
 strings usr/bin/choz | grep -c /home/       # tiene que dar 0
 ```

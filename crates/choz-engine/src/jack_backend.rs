@@ -172,6 +172,46 @@ pub(crate) fn in_order(mut ports: Vec<String>) -> Vec<String> {
 pub type Wiring = Option<(String, usize)>;
 
 /// Open the client, register the ports, wire them to `sink` when one is named,
+/// Wire the capture jacks a rack is actually listening to, and unwire the rest.
+///
+/// **Why bother**: a port that exists costs nothing, and a port with something
+/// connected to it costs the graph a buffer copy every block. Measured on this
+/// machine with a UMC1820 in the graph (`examples/port_cost`): 34 registered
+/// and silent sit at 0.62 % of a core — under the graph's own noise floor —
+/// and sixteen of them wired cost 3.6 %, about 0.19 points each. A rack using
+/// two inputs of twenty-one was paying for nineteen it never read.
+///
+/// **Why not unregister instead**: `in_pair` is an index into this list and the
+/// IN drawer draws a row per port, with the level each jack is receiving —
+/// which is what tells a wiring problem from an effect problem. Unregistering
+/// renumbers the first and blinds the second. Connections are the cheap thing
+/// to change and the only thing that costs.
+///
+/// `wanted` is a bit per capture channel. The graph is asked what is connected
+/// rather than remembered here: it is the only answer that survives somebody
+/// patching choz by hand from outside.
+pub fn set_capture_wiring(client: &Client, capture: &[String], wanted: u64) {
+    for (i, from) in capture.iter().enumerate() {
+        let ours = format!("{CLIENT_NAME}:in_{}", i + 1);
+        let Some(port) = client.port_by_name(&ours) else {
+            continue;
+        };
+        let connected = port.is_connected_to(from).unwrap_or(false);
+        let want = i < 64 && wanted & (1 << i) != 0;
+        let r = match (want, connected) {
+            (true, false) => client.connect_ports_by_name(from, &ours),
+            (false, true) => client.disconnect_ports_by_name(from, &ours),
+            _ => continue,
+        };
+        // Not fatal, and not silent: a jack that would not wire is a channel
+        // that will be quiet, and that is exactly the thing that looks like a
+        // broken effect from the panel.
+        if let Err(e) = r {
+            eprintln!("choz: capture '{from}' -> '{ours}': {e}");
+        }
+    }
+}
+
 /// and start processing. Returns the live client, the number of output ports
 /// registered, and — when a sink was asked for — which one the audio actually
 /// ended up going to and how many of our ports reached it.

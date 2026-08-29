@@ -2519,6 +2519,9 @@ impl App {
     /// Open/close the IN drawer, same focus rules as the OUT one.
     fn toggle_in_drawer(&mut self) {
         self.in_open = !self.in_open;
+        // Open, every jack is wired so its meter reads; shut, only what a tab
+        // is listening to — see [`App::push_capture_wiring`].
+        self.push_capture_wiring();
         if self.in_open {
             self.refresh_in_ports();
             self.input_cursor = self
@@ -3348,6 +3351,9 @@ impl App {
         if let Some(slot) = self.slots.get_mut(self.active_slot) {
             slot.octave_sound[oct] = at;
         }
+        // A plugin tab needs a second instance the moment a second zone is
+        // painted on it, and stops needing it when that zone is cleared.
+        self.sync_plugin_layers(self.active_slot);
         self.push_split(self.active_slot);
     }
 
@@ -3388,6 +3394,117 @@ impl App {
         self.recall_sound(tab, want);
     }
 
+    /// The sound buttons a tab's split uses, in the order the keyboard meets
+    /// them, capped at what a plugin can layer.
+    ///
+    /// A SoundFont has a zone per button for free; a hosted plugin needs an
+    /// instance per zone, so choz builds **two** and no more — see
+    /// `choz_engine::layered`. What the octaves point at is a button; what the
+    /// instrument understands is a zone, and this is the map between them.
+    fn split_zones(&self, tab: usize) -> Vec<usize> {
+        let Some(slot) = self.slots.get(tab) else {
+            return Vec::new();
+        };
+        let mut zones: Vec<usize> = Vec::new();
+        for at in slot.octave_sound.iter().flatten() {
+            if !zones.contains(at) {
+                zones.push(*at);
+            }
+        }
+        zones
+    }
+
+    /// The two patches of a layered plugin tab, and which octave plays which.
+    ///
+    /// The engine's zones are 0 and 1; the rack's are sound buttons, of which
+    /// there can be eight. [`App::split_zones`] is the map, and an octave
+    /// painted with a third button lands on no zone at all — the instrument
+    /// then plays the tab's own sound there, which is the honest reading of
+    /// "there is no third instance".
+    fn push_zone_patches(&mut self, tab: usize) {
+        let zones = self.split_zones(tab);
+        let Some(slot) = self.slots.get(tab) else {
+            return;
+        };
+        // Octave → zone index, as the instrument understands it.
+        let mut split = [None; choz_ports::SPLIT_OCTAVES];
+        for (oct, at) in slot.octave_sound.iter().take(split.len()).enumerate() {
+            split[oct] = at.and_then(|b| zones.iter().position(|z| *z == b)).map(|z| z as u8);
+        }
+        let patches: Vec<(usize, Vec<u8>)> = zones
+            .iter()
+            .take(choz_engine::layered::MAX_ZONES)
+            .enumerate()
+            .filter_map(|(zone, button)| {
+                slot.sounds
+                    .get(*button)
+                    .filter(|s| !s.state.is_empty())
+                    .map(|s| (zone, s.state.clone()))
+            })
+            .collect();
+        if let Some(engine) = self.audio_engine.as_ref() {
+            for (zone, blob) in patches {
+                match zone {
+                    0 => engine.set_slot_state(tab, &blob),
+                    _ => engine.set_slot_zone_state(tab, &blob),
+                }
+            }
+        }
+        if let Some(engine) = self.audio_engine.as_mut() {
+            engine.set_split(tab, split);
+        }
+    }
+
+    /// Give a plugin tab a second instance when its split needs one, and take
+    /// it away when it does not.
+    ///
+    /// **Reloading, because two instances is what the tab *is*.** A plugin
+    /// costs what it costs, so a tab carries one until somebody paints a second
+    /// zone on it — and goes back to one when that zone is cleared. A
+    /// SoundFont is left alone: it layers on its own and always could.
+    fn sync_plugin_layers(&mut self, tab: usize) {
+        let Some((format, path, id)) = self.plugin_ref(None) else {
+            return;
+        };
+        // A SoundFont layers on its own and always could — `plugin_ref` has
+        // already answered `None` for one, so reaching here means a plugin.
+        let wants = self.split_zones(tab).len() >= 2;
+        let has = self
+            .audio_engine
+            .as_ref()
+            .is_some_and(|e| e.slot_has_zone_state(tab));
+        if wants == has {
+            return;
+        }
+        // The window belongs to the instance that is about to be replaced.
+        self.close_editor_for(Some(tab));
+        let state = self.slots.get(tab).map(|s| s.instr_state.clone());
+        let config = self
+            .slots
+            .get(tab)
+            .map(|s| s.dssi_config.clone())
+            .unwrap_or_default();
+        let loaded = match self.audio_engine.as_mut() {
+            Some(engine) => match wants {
+                true => engine.load_plugin_layered(tab, format, &path, &id),
+                false => Self::load_plugin_into(engine, tab, format, &path, &id, &config),
+            },
+            None => return,
+        };
+        if let Err(e) = loaded {
+            eprintln!("choz: {e}");
+            return;
+        }
+        // The patch the tab was on survives the swap; the zones get theirs from
+        // `push_split` right after.
+        if let (Some(engine), Some(blob)) = (self.audio_engine.as_ref(), state) {
+            if !blob.is_empty() {
+                engine.set_slot_state(tab, &blob);
+            }
+        }
+        self.push_split(tab);
+    }
+
     /// Whether tab `tab`'s instrument can sound several keyboard zones at once.
     fn layers_zones(&self, tab: usize) -> bool {
         self.audio_engine
@@ -3408,6 +3525,17 @@ impl App {
     /// knobs, however many zones are sounding through it.
     fn push_split(&mut self, tab: usize) {
         if !self.layers_zones(tab) {
+            return;
+        }
+        // A layered plugin takes **patches**, one per instance, because that is
+        // what a zone's sound is when it is not a SoundFont: the buttons hold
+        // opaque blobs and the programs below are for a font that has them.
+        if self
+            .audio_engine
+            .as_ref()
+            .is_some_and(|e| e.slot_has_zone_state(tab))
+        {
+            self.push_zone_patches(tab);
             return;
         }
         let Some(slot) = self.slots.get(tab) else {
@@ -7704,6 +7832,33 @@ impl App {
         }
     }
 
+    /// Tell the engine which capture jacks anybody is listening to.
+    ///
+    /// **Everything, while the IN drawer is open**: its rows show the level
+    /// arriving on each jack, and that reading is what tells a wiring problem
+    /// from an effect problem. Shut, only what a tab actually reads — a jack
+    /// nobody uses costs the graph a buffer copy every block, which on a
+    /// twenty-input interface is most of what choz was making it do.
+    fn push_capture_wiring(&mut self) {
+        let mask = self.capture_mask();
+        if let Some(engine) = self.audio_engine.as_mut() {
+            engine.set_capture_wiring(mask);
+        }
+    }
+
+    /// Which capture jacks have to reach choz, one bit each.
+    fn capture_mask(&self) -> u64 {
+        if self.in_open {
+            return u64::MAX;
+        }
+        self.slots
+            .iter()
+            .filter_map(|s| s.in_pair)
+            .flat_map(channels_of)
+            .filter(|c| *c < 64)
+            .fold(0u64, |mask, c| mask | (1 << c))
+    }
+
     /// Feed the active tab from a capture pair (or put it back on its own
     /// instrument). A tab can only have one source of sound, so this is a swap.
     fn set_active_capture(&mut self, pair: Option<(usize, usize)>) {
@@ -7715,6 +7870,8 @@ impl App {
         if let Some(ref mut engine) = self.audio_engine {
             engine.set_slot_in(idx, pair);
         }
+        // What the graph has to carry changed with it.
+        self.push_capture_wiring();
     }
 
     /// Give a capture jack a tab of its own — or go to the one that already has
@@ -9747,6 +9904,9 @@ impl App {
                 }
             }
         }
+        // A rebuilt client is wired the way it was started; the rack's own
+        // answer has to be pushed again.
+        self.push_capture_wiring();
         // The preset handles belong to the instances that were just built, so
         // the lists have to come back with them — a project load lands here.
         for i in 0..self.slots.len() {
@@ -10451,7 +10611,29 @@ impl App {
     /// client's table and are read on the next one, so nothing ever waits on a
     /// socket while the interface draws.
     fn poll_instr_readback(&mut self) {
-        let slot = self.active_slot;
+        // **Every tab, not only the one on screen.** A tab whose knobs are
+        // stale is a tab that lies the moment it is switched to, and the ones
+        // out of sight are exactly the ones a patch was loaded into and left.
+        // The traffic is what it looked like from the one-tab version times the
+        // handful of tabs that answer at all: only a plugin with a path
+        // interface has anything to ask, and on this machine that is
+        // ZynAddSubFX and nothing else.
+        // One clock for the whole round rather than one per tab: every tab asks
+        // on the same tick, so a second one does not halve the interval.
+        let due = self
+            .instr_asked
+            .is_none_or(|at| at.elapsed() > Duration::from_millis(500));
+        for slot in 0..self.slots.len() {
+            self.read_back_slot(slot, due);
+        }
+        if due {
+            self.instr_asked = Some(Instant::now());
+        }
+    }
+
+    /// One tab's round of the readback above. `ask` says whether this round is
+    /// also the one that puts the questions out.
+    fn read_back_slot(&mut self, slot: usize, ask: bool) {
         let Some(paths) = self.audio_engine.as_ref().and_then(|e| e.slot_paths(slot)) else {
             return;
         };
@@ -10460,11 +10642,15 @@ impl App {
             return;
         }
         // A knob under the hand keeps its position: the plugin's answer to the
-        // question before the move would put it back where it was.
-        let held = self
-            .instr_moved
-            .filter(|(_, at)| at.elapsed() < Duration::from_millis(400))
-            .map(|(i, _)| i);
+        // question before the move would put it back where it was. Only the tab
+        // being looked at can have a hand on it.
+        let held = match slot == self.active_slot {
+            true => self
+                .instr_moved
+                .filter(|(_, at)| at.elapsed() < Duration::from_millis(400))
+                .map(|(i, _)| i),
+            false => None,
+        };
         if let Some(s) = self.slots.get_mut(slot) {
             let answered = |i: usize| param_paths.get(i).and_then(|p| paths.value(p));
             read_back(&s.instr_params, &mut s.instr_values, &answered, held);
@@ -10472,11 +10658,7 @@ impl App {
         // …and ask again, slowly. Eighty-four questions twice a second is
         // nothing on a socket, and a knob that follows a patch within half a
         // second follows it as far as anyone can tell.
-        let due = self
-            .instr_asked
-            .is_none_or(|at| at.elapsed() > Duration::from_millis(500));
-        if due {
-            self.instr_asked = Some(Instant::now());
+        if ask {
             for path in &param_paths {
                 paths.ask(path);
             }
@@ -24186,6 +24368,37 @@ mod tests {
         assert!(app.slots[1].octave_sound.iter().all(Option::is_none));
     }
 
+    /// The graph only carries the jacks somebody is listening to — and every
+    /// one of them while the IN drawer is open, because that is when its meters
+    /// are being read.
+    ///
+    /// Measured with a UMC1820 in the graph (`examples/port_cost`): thirty-four
+    /// ports registered and silent cost 0.62 % of a core, under the graph's own
+    /// noise; sixteen of them wired cost 3.6 %. A rack reading two inputs of
+    /// twenty-one was paying for nineteen it never looked at.
+    #[test]
+    fn only_the_capture_jacks_in_use_are_wired() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.in_ports = (0..8).map(|i| format!("card:capture_{i}")).collect();
+
+        // Nothing is listening: nothing has to be carried.
+        assert_eq!(app.capture_mask(), 0);
+
+        // One tab on a stereo pair, another on a single jack.
+        app.slots[0].in_pair = Some((2, 3));
+        app.slots[1].in_pair = Some((6, 6));
+        assert_eq!(app.capture_mask(), (1 << 2) | (1 << 3) | (1 << 6));
+
+        // The drawer open is the one case that wants them all: its rows show
+        // what each jack is receiving, and a jack that is not wired shows
+        // nothing — which is exactly the reading somebody opens it for.
+        app.in_open = true;
+        assert_eq!(app.capture_mask(), u64::MAX);
+    }
+
     /// The way out asks about work that is not on disk — and only then.
     ///
     /// A rack that opened and was never touched is not unsaved work: a question
@@ -24273,6 +24486,48 @@ mod tests {
         let written = std::fs::read_to_string(&target).unwrap();
         assert!(written.contains("rack"), "the project replaced it: {written}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Un tab de plugin parte el teclado entre **dos** sonidos, y el mapa de
+    /// octavas a zonas es lo que decide cuál suena dónde.
+    ///
+    /// A SoundFont tiene una zona por botón gratis —un canal MIDI de oxisynth
+    /// cada una— y un plugin necesita una instancia por zona, así que el techo
+    /// es dos: quien quiera cuatro sonidos a la vez está pidiendo cuatro tabs,
+    /// que es lo que hace MULTI. Una octava pintada con un tercer botón no
+    /// suena ese botón: suena el sonido del propio tab, que es la lectura
+    /// honesta de "no hay una tercera instancia".
+    #[test]
+    fn a_plugin_tab_splits_between_two_sounds() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        for _ in 0..3 {
+            app.slots[0].sounds.push(SavedSound {
+                name: "s".into(),
+                state: vec![1, 2, 3],
+                values: Vec::new(),
+                preset: 0,
+            });
+        }
+
+        // Sin pintar nada, no hay zonas y no hace falta una segunda instancia.
+        assert!(app.split_zones(0).is_empty());
+
+        // Dos botones distintos son dos zonas, en el orden en que el teclado se
+        // los encuentra.
+        app.slots[0].octave_sound[5] = Some(2);
+        app.slots[0].octave_sound[3] = Some(0);
+        assert_eq!(app.split_zones(0), vec![0, 2], "de grave a agudo");
+
+        // Un tercero no abre una tercera zona.
+        app.slots[0].octave_sound[7] = Some(1);
+        let zones = app.split_zones(0);
+        assert_eq!(zones, vec![0, 2, 1], "los botones que el split usa");
+        assert!(
+            zones.len() > choz_engine::layered::MAX_ZONES,
+            "y son más de los que un plugin puede sonar a la vez"
+        );
     }
 
     /// SPLIT has a way out: CANCEL puts back the map it was opened on.
