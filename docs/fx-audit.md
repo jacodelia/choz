@@ -246,14 +246,16 @@ Ordenado por daño audible. Cada fase entrega algo probado.
 | **4** | Phaser: LFO cúbico, smoothing del centro y de la profundidad, flush | `phaser` | **hecho** |
 | **5** | Bitcrusher: decimación en Hz | `bitcrusher` | **hecho** |
 | **6** | Space Echo: reconfigurar sin allocar | `space_echo` | **hecho** |
-| 7 | DC blocker después de las curvas de cinta y vinilo | `cassette`, `vinyl` | pendiente |
-| 8 | Smoothing del cutoff del SVF y del tiempo del delay | `filter`, `delay` | pendiente |
-| 9 | `delay_line.rs` en `delay`, `gran_delay`, `beat_repeat` | 3 efectos | pendiente |
-| 10 | Auditoría de aliasing en `harmonizer`, `freq_shift`, `vocoder` | 3 efectos | pendiente |
-| 11 | Ley de mezcla y ganancia unificada (hoy cada efecto inventa la suya) | todos | pendiente |
+| **7** | DC blocker después de las curvas de cinta y vinilo | `cassette`, `vinyl` | **hecho** |
+| **8** | Smoothing del cutoff del SVF y del tiempo del delay | `filter`, `delay` | **hecho** |
+| **9** | `delay_line.rs` en `delay` y `gran_delay`; `beat_repeat` no lleva línea, se le arregló el techo en samples | 3 efectos | **hecho** |
+| **10** | Auditoría de aliasing: portadora del vocoder band-limitada, lectura cúbica y ventana en tiempo en el shifter, oscilador recursivo en el freq shifter | `vocoder`, `shift`, `freq_shift` | **hecho** |
+| **11** | Ley de mezcla unificada. **Medido**: 44 de 46 ya hacían lo mismo; el delay sumaba y ahora cruza, el looper suma a propósito | `delay`, y la ley escrita en el trait | **hecho** |
 
-Las fases 1–6 son este cambio. Las 7–11 quedan escritas acá porque están
-medidas, no porque suenen bien: cada una tiene su hallazgo arriba.
+Las fases 1–6 son el cambio del 2026-08-27 y las 7 a 11 el del 28. **La
+auditoría está cerrada entera.** Cada fase quedó escrita acá porque está
+medida, no porque suene bien: cada una tiene su hallazgo arriba, y lo que se
+midió y se decidió **no** cambiar está dicho en el changelog junto a lo que sí.
 
 ---
 

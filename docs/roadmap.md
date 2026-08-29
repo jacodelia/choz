@@ -6,7 +6,7 @@ día por día, con los porqués y lo último arriba; cómo encajan las piezas, e
 cierra, para que lo que quede sea sólo lo que queda — el 2026-08-19 se podó
 entero: lo que decía "hecho" o "cerrado" se fue al changelog.
 
-Última actualización: 2026-08-27.
+Última actualización: 2026-08-29.
 
 ## Estado en una línea
 
@@ -23,13 +23,15 @@ para usarlos en cualquier otro host; un patch de Max se importa hasta donde se
 puede, diciendo qué no; hay guardia de acople en la entrada; el mixer tiene un
 main **estéreo** y cuatro subgrupos; una tab guarda sus sonidos en botones —que
 se asignan desde el mismo modal de bank/preset— y puede partir el teclado entre
-ellos; y un efecto puede abrirse con el bombo de otra tab, con el clock, o con
-el tap del metrónomo. Un plugin que guarda sus controles fuera de sus puertos
+ellos; y un efecto puede abrirse con el bombo de otra tab —por su nivel o por
+las notas que se le tocan—, con el clock, o con el tap del metrónomo. El MIXER
+se maneja entero desde el teclado, grupos y main incluidos, y cada strip lleva
+su `O M S` bajo el fader. Un plugin que guarda sus controles fuera de sus puertos
 —ZynAddSubFX— se maneja por su propio servidor OSC: mandos con nombre, los
 armónicos del oscilador, su ventana real, y los mandos leyendo lo que el plugin
 tiene. **La 1.0.0 está publicada y sus paquetes verificados; la
-1.3.3 es este árbol.**
-670 tests, `clippy --workspace --all-targets -D warnings` limpio.
+1.3.4 es este árbol.**
+799 tests, `clippy --workspace --all-targets -D warnings` limpio.
 
 Las comprobaciones con hardware delante quedaron dichas en los gotchas, que es
 donde se van a leer.
@@ -62,35 +64,48 @@ acotado. Seis fases. El nudo no es el DSP: `FxProcessor` no le da a un efecto
 ningún canal para pedir memoria ni devolver nada, y grabar cinco minutos lo
 necesita.
 
-### Efectos: lo que la auditoría del 2026-08-27 dejó abierto
+### Efectos: la auditoría del 2026-08-27, cerrada
 
 La auditoría entera está en [fx-audit.md](fx-audit.md), con archivo y línea por
-hallazgo; las fases 1 a 6 se cerraron ese día y están en el changelog. Lo que
-queda, en orden de daño audible:
+hallazgo; **las once fases están cerradas** —las seis primeras el 2026-08-27, el
+resto el 28— y contadas en el changelog. No queda ningún punto de la auditoría
+abierto.
 
-| # | Qué falta | Hallazgo |
-|---|-----------|----------|
-| 7 | **Bloqueador de DC después de las curvas de cinta y vinilo** | F8. Sólo `saturator` y `utility` tienen uno; el offset que dejan `cassette` y `vinyl` se suma a lo largo de una cadena y se come headroom. |
-| 8 | **Smoothing del cutoff del SVF y del tiempo del delay** | F3. `Svf::set_cutoff` recalcula `g = tan(πf/sr)` de inmediato, que es un escalón en el coeficiente; `delay.rs` salta el cabezal. |
-| 9 | **`delay_line.rs` en `delay`, `gran_delay` y `beat_repeat`** | F1 + F2. Los tres llevan su propia línea, y las tres son lineales en caminos que se realimentan. |
-| 10 | **Auditoría de aliasing en `harmonizer`, `freq_shift` y `vocoder`** | F4. Quince sitios con trascendentales por sample entre los dos primeros, y ninguno de los tres pasó por el oversampler. |
-| 11 | **Ley de mezcla y ganancia unificada** | Cada efecto inventa la suya: unos hacen `dry + wet·mix`, otros interpolan. Mover `Wet` cambia el volumen de forma distinta según el efecto. |
+Lo que quedó dicho al cerrarla, que no es una tarea sino algo que saber:
+
+- **La ley de la mezcla vive en el doc de `FxProcessor::set_mix`**, y es
+  `out = dry + wet·(procesado − dry)`. La única excepción a propósito es el
+  looper, que suma: sus tomas suenan *debajo* de lo que se está tocando.
+- **Los efectos se apilan sin saturar, y hay un test que lo sostiene**
+  (2026-08-28). `no_built_in_effect_is_a_gain_stage` recorre los 46 con los
+  mandos que el rack les da: ninguno suma más de 4,5 dB y los ocho más fuertes
+  apilados no pasan de 6. Antes de eso, protocosmos sumaba 9,1 dB solo —clipeaba
+  por sí mismo desde una entrada a −8,7 dBFS— y 46 de los 2 070 pares pasaban de
+  escala; los 46 lo tenían a él adentro. `measure_stacking` (ignorado, en
+  `choz-ui`) imprime la tabla entera.
+- Con la entrada a −2,7 dBFS, 57 pares siguen pasando de escala, el peor a 1,34.
+  Eso ya no es un efecto que amplifique: son 2,7 dB de headroom y cualquier
+  cadena se los come. Se resuelve en el fader del tab.
+- La dispersión de nivel que queda al mover `Wet` a media posición —de +2,9 dB
+  en protocosmos a −9,0 en el shimmer— **no es la ley, es el nivel del wet de
+  cada efecto**, y emparejarlos querría medir cada uno contra un programa real y
+  no contra ruido. `examples/mix_probe` es la tabla.
+- Lo que la fase 10 midió y **no** arregló: el shifter de voces suma dos
+  cabezales a media ventana de distancia, y eso peina una nota aguda —2,1 dB a
+  14 kHz— haga lo que haga el interpolador. Sacarlo pide otro shifter, no otra
+  lectura.
 
 ### Bordes que quedaron abiertos
 
 | # | Qué falta | Dónde | Por qué no se hizo |
 |---|-----------|-------|--------------------|
-| 1 | **Medidor por bus** | MIXER | Los grupos tienen fader y mute; el nivel que llevan no se ve. `SlotLevels` ya publica por tab, así que es sumar por bus y dibujar. |
-| 2 | **Strips de grupo desde el teclado** | MIXER | Se manejan con el mouse; el teclado del MIXER sigue siendo el de las tabs. |
-| 3 | **Gates disparados por nota** | FX | Hoy la fuente es el **nivel de audio** de la otra tab. Para un bombo de SF2 da igual; para un pad silencioso que igual manda notas, no. |
-| 4 | **Un bloque de retraso en el gate** | FX | Una tab que se renderiza después de la gateada llega un bloque tarde (< 3 ms). Se arregla ordenando los slots por dependencia, que es más máquina de la que el problema pide. |
-| 5 | **El split superpone en SF2, no en plugins** | SOUNDS | Cerrado para SoundFonts: una zona por canal MIDI de oxisynth, el archivo compartido, coste cero de memoria. Un plugin alojado tiene **un** patch, así que ahí el rack sigue conmutando al cruzar la junta. Dos plugins a la vez son dos tabs, que es lo que MULTI hace. |
-| 6 | **Secciones de parámetros en VST3** | RACK | VST3 tiene `unitId` + `IUnitInfo`, que es la respuesta del plugin. Hoy VST3 cae en la heurística por nombre, que para Surge XT acierta — pero es una heurística. |
-| 7 | **Registrar sólo los puertos que se usan** | JACK | choz registra un puerto por canal del dispositivo: en una UMC1820 son 12 de salida y 20 de entrada, y PipeWire mueve los 34 en cada bloque, 750 veces por segundo, los use alguien o no. Medido: con el proceso parado, el hilo del grafo come 5,5% de un núcleo mientras el DSP de choz cuesta 0,4%. Lo que se **muestra** en los cajones IN/OUT sale de consultar el grafo y no cambiaría; lo que baja es lo que se registra. |
-| 8 | **Los mandos del editor SF2 no son por zona** | SOUNDS | El editor escribe sus offsets en todos los canales, así que da forma al instrumento entero. Una envolvente distinta por zona del split querría un juego de mandos por zona, y eso es un panel nuevo. |
-| 9 | **La ventana de ZynAddSubFX es un proceso aparte** | LV2 | Se abre y se cierra con la pestaña, pero es su propio programa hablando OSC con la instancia. Meterla dentro de choz querría el plumbing de atom ports UI↔DSP (`__dpf_ui_data__`), que es lo que DPF usa para pasarle la dirección. |
-| 10 | **VST2 y LADSPA/DSSI no listan los nombres de los pasos** | RACK | Un parámetro con nombres abre su lista en LV2 enumerado, CLAP y VST3. En VST2 se podrían sondear con `effGetParamDisplay` posición por posición, pero hay que adivinar cuántas son: sería inventarlas, no leerlas. |
-| 11 | **El readback OSC es sólo de la pestaña activa** | RACK | Los mandos de la pestaña en pantalla siguen al plugin; los de las otras se ponen al día cuando se las mira. Preguntarlo todo para todas las pestañas es tráfico por algo que nadie está viendo. |
+| 1 | **Un bloque de retraso en el gate** | FX | Una tab que se renderiza después de la gateada llega un bloque tarde (< 3 ms). Se arregla ordenando los slots por dependencia, que es más máquina de la que el problema pide. |
+| 2 | **El split superpone en SF2, no en plugins** | SOUNDS | Cerrado para SoundFonts: una zona por canal MIDI de oxisynth, el archivo compartido, coste cero de memoria. Un plugin alojado tiene **un** patch, así que ahí el rack sigue conmutando al cruzar la junta. Dos plugins a la vez son dos tabs, que es lo que MULTI hace. |
+| 3 | **Registrar sólo los puertos que se usan** | JACK | choz registra un puerto por canal del dispositivo: en una UMC1820 son 12 de salida y 20 de entrada, y PipeWire mueve los 34 en cada bloque, 750 veces por segundo, los use alguien o no. Medido: con el proceso parado, el hilo del grafo come 5,5% de un núcleo mientras el DSP de choz cuesta 0,4%. **Y hay un conflicto que este punto no sabía cuando se escribió** (2026-08-29): la lista del cajón IN *es* `all_capture_ports()`, y el nivel que cada fila muestra sale de **nuestros** puertos (`capture_levels`), que es el diagnóstico que distingue un problema de cableado de uno de efecto. Registrar menos deja filas sin nivel. La salida que conserva las dos cosas es registrar todo y **desconectar** lo que ninguna tab usa, reconectándolo mientras el cajón IN está abierto — y antes de escribirlo hay que medir si el coste es por puerto conectado o por puerto registrado, que es una medición con la interfaz delante. |
+| 4 | **Los mandos del editor SF2 no son por zona** | SOUNDS | El editor escribe sus offsets en todos los canales, así que da forma al instrumento entero. Una envolvente distinta por zona del split querría un juego de mandos por zona, y eso es un panel nuevo. |
+| 5 | **La ventana de ZynAddSubFX es un proceso aparte** | LV2 | Se abre y se cierra con la pestaña, pero es su propio programa hablando OSC con la instancia. Meterla dentro de choz querría el plumbing de atom ports UI↔DSP (`__dpf_ui_data__`), que es lo que DPF usa para pasarle la dirección. |
+| 6 | **VST2 y LADSPA/DSSI no listan los nombres de los pasos** | RACK | Un parámetro con nombres abre su lista en LV2 enumerado, CLAP y VST3. En VST2 se podrían sondear con `effGetParamDisplay` posición por posición, pero hay que adivinar cuántas son: sería inventarlas, no leerlas. |
+| 7 | **El readback OSC es sólo de la pestaña activa** | RACK | Los mandos de la pestaña en pantalla siguen al plugin; los de las otras se ponen al día cuando se las mira. Preguntarlo todo para todas las pestañas es tráfico por algo que nadie está viendo. |
 
 ### Y lo de siempre
 
@@ -99,6 +114,41 @@ dudar de un número: todo el DSP está verificado contra señales sintéticas, n
 contra una habitación.
 
 ## Notas / gotchas para el que retome
+
+- **La ventana del shifter de voces está escrita como `2048 / 48` a propósito**
+  (2026-08-28). Es tiempo, no samples, pero el número es el viejo conteo sobre
+  el rate común: la segunda octava del shimmer es una resonancia de esa longitud
+  contra el reverb que lleva adentro, y moverla dos samples le baja la tercera
+  aserción de su test de 0,74 a 0,14. Mismo sonido a 48 kHz, y ahora el mismo en
+  todos lados. `examples/alias_probe` es la herramienta con la que se midió todo
+  esto.
+
+- **`space_echo` sigue con su propia línea** (2026-08-28). Es el único que
+  queda: se le arregló la allocation y el dimensionado por tiempo en la fase 6,
+  así que no tiene ninguno de los dos bugs por los que existía la línea
+  compartida, y portarlo sería diff sin sonido. `beat_repeat` tampoco la lleva
+  —captura lineal, lectura entera hacia adelante, sin realimentación— y no es un
+  olvido: lo que tenía era el techo del grano medido en samples, que ahora está
+  en segundos.
+
+- **El flake de los tests de UI sigue ahí, y un intento de arreglarlo lo
+  empeoró** (2026-08-29). `XDG_STATE_HOME` es global al proceso y
+  `sandbox_state_dir()` borra `ui.json` sin sostener el `ui_guard`, así que un
+  test que guarda ajustes y otro que los borra se cruzan y algo sin relación
+  falla una vez cada cuatro corridas. Hacer que `sandbox_state_dir()` devolviera
+  el guard **no** lo arregló: serializó media suite (23 s → 45 s) y cambió el
+  orden lo bastante como para destapar otro test que deja el idioma en español
+  sin `UiRestore`, que entonces fallaba en las tres corridas de tres. Se
+  revirtió. Lo que hace falta es que **todo** test que llame a `App::new()`
+  sostenga el guard, no sólo los que tocan el estado a propósito.
+
+- **El cutoff del SVF ya no obedece en el acto** (2026-08-28). Se suaviza en
+  octavas con 15 ms de constante y los coeficientes se rehacen cada 16 samples
+  mientras se mueve — un `tan()` por sample sería pagar el hallazgo F4 para
+  arreglar el F3. Si algún día un efecto quiere que el filtro salte (un mode
+  switch, un preset), lo que hace falta es `Smoothed::snap`, que es lo que
+  `reset()` usa. Lo mismo con el tiempo del delay: camina en 80 ms, a propósito,
+  porque así glisa como una cinta.
 
 - **El cazador de acoples estaba calibrado al revés** (2026-08-20). Reportado
   como "el harmonizer empieza bien pero no sostiene una nota larga", y no era

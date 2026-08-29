@@ -10,7 +10,7 @@ Built with Rust, ratatui and cpal. Provides a TUI for managing note inputs, inst
 
 ## Status
 
-**1.3.3.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
+**1.3.4.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
 LADSPA, DSSI, VST2, VST3 and Pure Data patches are really hosted** — instruments
 and audio effects, with their own parameters and their own windows — choz's own
 46 effects and both artifacts — the arpeggiator and the step sequencer — are
@@ -72,9 +72,12 @@ patch picked in its browser — through VST2 chunks, VST3 `IComponent::getState`
 Playing rather than patching: a **MIXER** tab at the bottom shows every rack tab
 at once as channel strips — **one vertical fader per output channel** with a
 link between them (tied by default, broken to trim one side against the other),
-pan, mute and solo, each editable where it is drawn instead of one tab at a
-time, moved by the wheel or the arrows in the same step the RACK's `VOL` uses,
-and paging with `◀ ▶` when the rack is wider than the panel; a **metronome** beside the LIVE/MULTI switch clicks off the same
+pan, and an `O M S` row under the fader — where the tab sums, mute, solo — each
+editable where it is drawn instead of one tab at a time, moved by the wheel or
+the arrows in the same step the RACK's `VOL` uses, and paging with `◀ ▶` when
+the rack is wider than the panel. **The arrows walk the whole desk**: past the
+last tab come the four groups and the main, so a machine that is played rather
+than pointed at can reach every fader; a **metronome** beside the LIVE/MULTI switch clicks off the same
 transport every synced plugin reads (tempo, time signature, three sounds), and
 it keeps counting with the transport stopped, which is when a metronome is
 wanted; every tab carries a **step sequencer built like an Alesis MMT-8** —
@@ -178,8 +181,8 @@ architecture (x86-64, aarch64, armv7), a `.deb`, an `.rpm` and a `PKGBUILD` for
 Arch, plus `SHA256SUMS.txt`:
 
 ```bash
-tar xzf choz-1.3.3-x86_64-unknown-linux-gnu.tar.gz
-cd choz-1.3.3-x86_64-unknown-linux-gnu
+tar xzf choz-1.3.4-x86_64-unknown-linux-gnu.tar.gz
+cd choz-1.3.4-x86_64-unknown-linux-gnu
 ./install.sh            # uses the binary shipped beside it — no cargo involved
 ```
 
@@ -272,11 +275,12 @@ headroom for plugin DSP at small buffer sizes.
 | `<` `>` / `;` `:` | rack | input trim / `A→M` sensitivity of a tab fed by audio |
 | `F7` / `F8` / `F9` | anywhere | roll-stop the rack / arm automation recording / panic (all-notes-off) — the same three buttons that sit on the menu bar |
 | `m` / `S` | rack | mute / solo the tab |
-| `↑` `↓` / wheel | MIXER | that tab's level, one step (`Tab` focuses the MIXER while it is showing, or click a strip) |
+| `↑` `↓` / wheel | MIXER | that strip's level, one step (`Tab` focuses the MIXER while it is showing, or click a strip) |
+| `←` `→` | MIXER | the strip beside it — the tabs, then the four groups, then the main |
 | `l` / `k` | MIXER | link the strip's two channels / pick which side the arrows move |
 | `C` | rack (FX) | which keyboard the selected effect takes its chord from |
 | `v` | rack | split the keyboard: which saved sound each octave plays |
-| `c` | rack (FX) | gate the selected effect from another tab — the kick that opens it |
+| `c` | rack (FX) | gate the selected effect from another tab — its level, or the notes played into it |
 | `n` / `N` | rack, MIXER | level the tab / the whole rack again, from what it has played since it was loaded |
 | `c` / `r` | IN drawer | connect-disconnect a port / rescan inputs |
 
@@ -285,7 +289,7 @@ headroom for plugin DSP at small buffer sizes.
 ## Architecture
 
 ```
-choz/                      11 crates, version 1.3.3
+choz/                      11 crates, version 1.3.4
 ├── crates/
 │   ├── choz-ports/         RT-safe traits every host implements: AudioSource,
 │   │                       FxProcessor, PluginEditor, PluginParam, SandboxStatus
@@ -336,7 +340,7 @@ ring so they are freed off the RT thread.
 
 | | |
 |---|---|
-| choz | **1.3.3** |
+| choz | **1.3.4** |
 | Rust edition | 2021 (`choz-plugin-lv2` is 2024) |
 | Toolchain tested | rustc 1.97.1 |
 | Platform | Linux. ALSA/JACK/PipeWire. Released for x86-64, aarch64 and armv7 |

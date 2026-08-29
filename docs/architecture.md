@@ -162,7 +162,7 @@ choz/
 │               └── theme.rs           # Colours, and the wash panels blend with
 ```
 
-FX processors under `crates/choz-engine/src/fx/` (35 built-ins, each with its own tests):
+FX processors under `crates/choz-engine/src/fx/` (46 built-ins, each with its own tests):
 
 ```
 fx/
@@ -172,6 +172,7 @@ fx/
 ├── reverse.rs      # Reverse delay
 ├── space_echo.rs   # Tape-style space echo
 ├── delay_line.rs   # Shared fractional delay line, denormal flush, soft clip
+├── dc.rs           # Shared DC blocker: one pole at 10 Hz, after any asymmetric curve
 ├── reverb.rs       # Reverb (FDN + early reflections — see docs/reverb.md)
 ├── protocosmos.rs  # Wide ambient texture reverb
 ├── z5_texture.rs   # 16-parameter texture processor
