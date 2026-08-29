@@ -8,7 +8,10 @@ fn main() {
         ("TyrellN6", "/home/jorge/.vst3/u-he/TyrellN6.vst3"),
         ("TyrellN6", "/home/jorge/.vst/u-he/TyrellN6.64.so"),
         ("TripleCheese", "/home/jorge/.vst3/u-he/TripleCheese.vst3"),
-        ("Pianoteq 9", "/home/jorge/repo/Pianoteq 9/x86-64bit/Pianoteq 9.lv2"),
+        (
+            "Pianoteq 9",
+            "/home/jorge/repo/Pianoteq 9/x86-64bit/Pianoteq 9.lv2",
+        ),
     ] {
         let p = std::path::Path::new(path);
         match choz_engine::preset_files::guess_bank_dir(name, p) {

@@ -15,21 +15,48 @@
 //! the shimmer and the harmoniser wanted the same one and were about to have a
 //! copy each.
 
-/// How much delay line one voice gets.
+use super::delay_line::DelayLine as Line;
+
+/// The window, in milliseconds.
 ///
-/// The window is the trade: long enough that the crossfade is not heard as a
-/// flutter, short enough that the echo of it is not heard as a second sound.
-/// ~46 ms at 48 kHz.
-pub const SHIFT_WINDOW: usize = 2048;
+/// The trade: long enough that the crossfade is not heard as a flutter, short
+/// enough that its echo is not heard as a second sound. **In time and not in
+/// samples** — it used to be a count of 2048, which is 43 ms at 48 kHz and
+/// 11 at 192, so the same harmony warbled four times as fast on a fast
+/// interface.
+///
+/// Written as the old count over the common rate rather than as a round
+/// number: the shimmer's second octave is a resonance of this length against
+/// the reverb inside its loop, and moving the window by two samples moves it.
+/// Same sound at 48 kHz, and now the same sound everywhere else too.
+pub const WINDOW_MS: f32 = 2048.0 / 48.0;
 
 pub struct VoiceShifter {
-    buf: Vec<f32>,
-    write: usize,
+    line: Line,
+    /// The window in samples at the rate this shifter was last told about.
+    window: f32,
     /// How far behind the writer the first head reads, in samples. The writer
     /// advances by 1 and the reader by `ratio`, so this closes at `ratio − 1`
     /// per sample and wraps round the window when it runs out.
     behind: f32,
     ratio: f32,
+}
+
+/// The gain of the first head at phase `t`, the second head getting `1 − g`.
+///
+/// A bump, not a ramp: the heads are half a window apart, so head one is
+/// silent at both ends of the window and loudest in the middle, and head two
+/// is the other way round. `smoothstep(u) + smoothstep(1 − u) == 1` exactly,
+/// which is the one property the pair needs — the two heads read the same
+/// signal, so their gains have to add to one or the level moves as they cross.
+///
+/// `sin²`/`cos²` had that property too, and cost two transcendentals per
+/// sample per voice: eight voices of harmony is 768 000 of them a second, for
+/// a curve three multiplies can draw.
+#[inline(always)]
+fn head_gain(t: f32) -> f32 {
+    let u = 1.0 - (t + t - 1.0).abs();
+    u * u * (3.0 - u - u)
 }
 
 impl Default for VoiceShifter {
@@ -40,20 +67,38 @@ impl Default for VoiceShifter {
 
 impl VoiceShifter {
     pub fn new() -> Self {
-        Self {
-            // Two windows: the second head reads half a window away from the
-            // first, and both have to stay inside the buffer.
-            buf: vec![0.0; SHIFT_WINDOW * 2],
-            write: 0,
-            behind: SHIFT_WINDOW as f32 * 0.5,
+        // Two windows: the second head reads half a window away from the
+        // first, and both have to stay inside the line.
+        let mut s = Self {
+            line: Line::with_ms(WINDOW_MS * 2.0),
+            window: 0.0,
+            behind: 0.0,
             ratio: 1.0,
+        };
+        s.set_sample_rate(48_000.0);
+        s
+    }
+
+    /// The window is a length of **time**, so it needs to know the rate. Call
+    /// it from the block: it does nothing when the rate has not moved.
+    pub fn set_sample_rate(&mut self, sr: f32) {
+        // Rounded to whole samples: the wrap then lands on a sample boundary
+        // every time round, which keeps the crossfade's own sidebands where
+        // they were rather than smearing them with a fractional period.
+        let window = (WINDOW_MS * 0.001 * sr.max(8000.0))
+            .round()
+            .min((self.line.capacity() / 2 - 4) as f32)
+            .max(64.0);
+        if (window - self.window).abs() < 0.5 {
+            return;
         }
+        self.window = window;
+        self.behind = window * 0.5;
     }
 
     pub fn reset(&mut self) {
-        self.buf.fill(0.0);
-        self.write = 0;
-        self.behind = SHIFT_WINDOW as f32 * 0.5;
+        self.line.clear();
+        self.behind = self.window * 0.5;
     }
 
     /// Above 1 raises. Set on a block boundary, not per sample: half way
@@ -71,46 +116,24 @@ impl VoiceShifter {
         self.ratio
     }
 
-    #[inline]
-    fn read_behind(&self, distance: f32) -> f32 {
-        let cap = self.buf.len() as f32;
-        let p = (self.write as f32 - distance).rem_euclid(cap);
-        let i = p as usize;
-        let frac = p - i as f32;
-        let n = self.buf.len();
-        let a = self.buf[i % n];
-        let b = self.buf[(i + 1) % n];
-        a + (b - a) * frac
-    }
-
     /// One sample in, one sample out, pitched by `ratio`.
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
-        let win = SHIFT_WINDOW as f32;
-        self.buf[self.write] = x;
-        self.write = (self.write + 1) % self.buf.len();
+        let win = self.window;
+        self.line.write(x);
 
         // Reading faster than writing closes the gap; reading slower opens it.
         self.behind += 1.0 - self.ratio;
         self.behind = self.behind.rem_euclid(win);
 
+        // Cubic on both heads. This is a resampler — the head walks the line at
+        // a fraction of a sample per sample — and a two-tap average is a
+        // low-pass whose depth follows the fraction, so with linear reads a
+        // held note is dulled by an amount that moves as the head does.
         let t = self.behind / win;
-        let g1 = (std::f32::consts::PI * t).sin();
-        let g2 = (std::f32::consts::PI * t).cos();
-        self.read_behind(self.behind) * g1 * g1
-            + self.read_behind(self.behind + win * 0.5) * g2 * g2
-    }
-
-    /// Read the line `distance` samples back without shifting it — the same
-    /// buffer a voice is already writing, used as that voice's delay.
-    ///
-    /// A harmony that arrives at exactly the same instant as the note under it
-    /// is a chorus; one that arrives a few tens of milliseconds later is a
-    /// second singer. Reusing the shifter's own line means the delay costs no
-    /// memory of its own.
-    #[inline]
-    pub fn tap(&self, distance: f32) -> f32 {
-        self.read_behind(distance.clamp(0.0, (SHIFT_WINDOW * 2 - 2) as f32))
+        let g = head_gain(t);
+        self.line.read_cubic(self.behind) * g
+            + self.line.read_cubic(self.behind + win * 0.5) * (1.0 - g)
     }
 }
 
@@ -152,6 +175,45 @@ mod tests {
             assert!(
                 there > here * 3.0,
                 "{semis} semitones should land at {expect} Hz: {there} vs {here} at the original"
+            );
+        }
+    }
+
+    /// The top end survives the read.
+    ///
+    /// A ratio just off unity walks the read head slowly through every
+    /// fraction of a sample, which is where an interpolator is judged: a
+    /// two-tap average is a low-pass whose depth follows the fraction, so with
+    /// linear reads a held 14 kHz came out 3.6 dB down, against 2.1 with the
+    /// four-point cubic. The rest of that 2.1 dB is the two heads themselves:
+    /// they are half a window apart, and summing a high note with a delayed
+    /// copy of itself combs it whatever reads it.
+    #[test]
+    fn a_high_note_comes_through_the_read() {
+        let sr = 48_000.0;
+        let mut sh = VoiceShifter::new();
+        sh.set_semitones(0.5);
+        let out: Vec<f32> = (0..48_000)
+            .map(|i| sh.process((std::f32::consts::TAU * 14_000.0 * i as f32 / sr).sin() * 0.5))
+            .collect();
+        let tail = &out[24_000..];
+        let rms = (tail.iter().map(|s| s * s).sum::<f32>() / tail.len() as f32).sqrt();
+        let db = 20.0 * (rms / 0.353_55).log10();
+        assert!(db > -2.8, "14 kHz came out {db:.2} dB down");
+    }
+
+    /// The window is a length of time, so the warble it puts on a held note is
+    /// the same speed on every device. As a count of samples it was four times
+    /// faster at 192 kHz than at 48.
+    #[test]
+    fn the_window_is_the_same_time_at_every_rate() {
+        for sr in [44_100.0f32, 48_000.0, 96_000.0, 192_000.0] {
+            let mut sh = VoiceShifter::new();
+            sh.set_sample_rate(sr);
+            let ms = sh.window * 1000.0 / sr;
+            assert!(
+                (ms - WINDOW_MS).abs() < 0.1,
+                "{sr} Hz gives a {ms} ms window, wanted {WINDOW_MS}"
             );
         }
     }

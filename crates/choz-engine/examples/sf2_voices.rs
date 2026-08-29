@@ -45,7 +45,11 @@ fn main() {
             med,
             times[times.len() * 99 / 100],
             med / budget * 100.0,
-            if med > budget { "   ← over budget on its own" } else { "" }
+            if med > budget {
+                "   ← over budget on its own"
+            } else {
+                ""
+            }
         );
         let _ = round;
     }

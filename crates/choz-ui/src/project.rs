@@ -132,6 +132,10 @@ pub struct Slot {
     pub midi_out: Option<String>,
     #[serde(default)]
     pub arp: crate::arp::ArpSettings,
+    /// The tab's step sequencer — pattern, parts and song. Added later, so
+    /// `default` (off, empty) keeps every project written before it loadable.
+    #[serde(default)]
+    pub seq: crate::seq::SeqSettings,
 }
 
 fn default_channel() -> u8 {
@@ -422,6 +426,18 @@ mod tests {
                     latch: true,
                     chord: true,
                 },
+                seq: {
+                    let mut seq = crate::seq::SeqSettings {
+                        on: true,
+                        part: 1,
+                        song: vec![0, 1],
+                        ..Default::default()
+                    };
+                    // Four on the floor on the first track, so the round trip
+                    // has a pattern to lose.
+                    seq.parts[1][0] = 0b0001_0001_0001_0001;
+                    seq
+                },
             }],
         }
     }
@@ -500,6 +516,16 @@ impl GateSource {
             GateSource::Tab(i) => E::Tab(*i),
             GateSource::Named(n) if n == "clock" => E::Clock,
             GateSource::Named(n) if n == "tap" => E::Metronome,
+            GateSource::Named(n) if n == "seq" => E::Seq,
+            // `note:<tab>` rather than a variant of its own: the file format
+            // already had a name for "a source that is not a tab's level", and
+            // a choz too old to know this one falls back to the first tab
+            // instead of failing to open the project.
+            GateSource::Named(n) if n.starts_with("note:") => n
+                .trim_start_matches("note:")
+                .parse()
+                .map(E::Note)
+                .unwrap_or(E::Tab(0)),
             // A name from a newer choz means nothing here; the first tab is the
             // reading that at least does something.
             GateSource::Named(_) => E::Tab(0),
@@ -512,6 +538,8 @@ impl GateSource {
             E::Tab(i) => GateSource::Tab(i),
             E::Clock => GateSource::Named("clock".into()),
             E::Metronome => GateSource::Named("tap".into()),
+            E::Seq => GateSource::Named("seq".into()),
+            E::Note(i) => GateSource::Named(format!("note:{i}")),
         }
     }
 }

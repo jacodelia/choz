@@ -392,133 +392,10 @@ pub struct FxParamDesc {
     pub shape: ParamShape,
 }
 
-/// The control a parameter deserves, decided by what the parameter *is*.
-///
-/// Never guessed from the name — that is the mistake `FxCategory::guess` gets
-/// away with because a wrong category only misfiles a row in a list, while a
-/// cutoff drawn as a switch is unusable. A host that reports nothing leaves
-/// everything [`ParamShape::Continuous`], which is what choz always drew.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub enum ParamShape {
-    /// A knob: any value in the range.
-    #[default]
-    Continuous,
-    /// On or off. Nothing in between exists, so an arc at 0.00 is a lie.
-    Toggle,
-    /// Named positions in order, each with the 0..1 place it sits at.
-    ///
-    /// The positions are **not** evenly spaced in general: Ardour's a-delay
-    /// names ten note divisions at 1, 2, 4, 6, 8, 12, 16, 24, 32 and 48 over a
-    /// range of 1..48. Assuming a uniform grid there shows the wrong name and
-    /// steps to values the plugin never offered.
-    Named(Vec<(f32, String)>),
-    /// A travel rather than a rotation: a mix, a pan, a time. Same values a
-    /// knob would take, drawn as the distance covered because that is how the
-    /// parameter reads.
-    ///
-    /// Carries the plugin's unit, which is both why it is a fader and how a run
-    /// of them is recognised as one group — an ADSR is four consecutive times.
-    Fader(String),
-}
-
-/// Units that mean "a distance along something" — a time, a share, a position.
-///
-/// This is the plugin's own `units:unit`, not a guess at its name: `FxCategory`
-/// guesses from names and gets away with it because a wrong category only
-/// misfiles a row, while a control that does not match the parameter is used
-/// wrong. A plugin that reports no unit keeps the knob.
-/// `pc` is LV2's name for percent (`units:pc`), and after inline definitions it
-/// and `ms` are the two most common units in the 261 bundles installed here.
-const FADER_UNITS: &[&str] = &[
-    "s", "ms", "sec", "seconds", "%", "pc", "percent", "cent", "cents",
-    // Not measurements: tags a plugin's own list uses to say "these belong
-    // together and their shape is the point" — a set of harmonics, and the
-    // phase of each. Drawn as a bank of bars, which is the only way 32 of them
-    // read as a spectrum rather than as 32 numbers.
-    "harmonic", "phase",
-];
-
-impl ParamShape {
-    /// The shape a hosted plugin's parameter reports.
-    pub fn of(p: &choz_engine::PluginParam) -> Self {
-        if p.is_toggle() {
-            return ParamShape::Toggle;
-        }
-        // Named steps only when every step has a name: a partial list would
-        // draw "3/8" for the ones the plugin skipped and lie about the rest.
-        if !p.points.is_empty() && p.points.len() as u32 == p.steps {
-            return ParamShape::Named(
-                p.points
-                    .iter()
-                    .map(|(v, l)| (p.normalised(*v) as f32, l.clone()))
-                    .collect(),
-            );
-        }
-        // A time, a share or a position is read as how far along it is; a
-        // frequency or a gain is read as a setting. The unit is the only thing
-        // the plugin says about which of the two this is.
-        if p.unit.as_deref().is_some_and(|u| {
-            let u = u.trim().to_lowercase();
-            FADER_UNITS.contains(&u.as_str())
-        }) {
-            return ParamShape::Fader(p.unit.clone().unwrap_or_default());
-        }
-        ParamShape::Continuous
-    }
-
-    /// Where one press of `←`/`→` lands.
-    ///
-    /// A stepped parameter moves one position, not one twentieth of its range:
-    /// a switch nudged by 0.05 needs twenty presses to flip and spends the
-    /// other nineteen in places it has no name for.
-    pub fn nudge(&self, current: f32, delta: f32) -> f32 {
-        let Some((k, n)) = self.step_at(current) else {
-            return (current + delta).clamp(0.0, 1.0);
-        };
-        let dir: i64 = if delta >= 0.0 { 1 } else { -1 };
-        let next = (k as i64 + dir).clamp(0, n as i64 - 1) as usize;
-        self.position_of(next)
-    }
-
-    /// The 0..1 value of step `k`.
-    fn position_of(&self, k: usize) -> f32 {
-        match self {
-            ParamShape::Continuous | ParamShape::Fader(_) => 0.0,
-            ParamShape::Toggle => k.min(1) as f32,
-            ParamShape::Named(points) => points.get(k).map(|(v, _)| *v).unwrap_or(0.0),
-        }
-    }
-
-    /// Index of the position `norm` (0..1) selects, and how many there are.
-    /// `None` for a continuous parameter, which has neither.
-    pub fn step_at(&self, norm: f32) -> Option<(usize, usize)> {
-        let norm = norm.clamp(0.0, 1.0);
-        match self {
-            // Neither has positions: they take any value in the range.
-            ParamShape::Continuous | ParamShape::Fader(_) => None,
-            ParamShape::Toggle => Some((usize::from(norm >= 0.5), 2)),
-            ParamShape::Named(points) if points.is_empty() => None,
-            // Nearest, not rounded onto a grid: the positions can sit anywhere.
-            ParamShape::Named(points) => {
-                let k = points
-                    .iter()
-                    .enumerate()
-                    .min_by(|(_, a), (_, b)| (a.0 - norm).abs().total_cmp(&(b.0 - norm).abs()))
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                Some((k, points.len()))
-            }
-        }
-    }
-
-    /// The label of step `k`, when it has one.
-    pub fn label(&self, k: usize) -> Option<&str> {
-        match self {
-            ParamShape::Named(points) => points.get(k).map(|(_, l)| l.as_str()),
-            _ => None,
-        }
-    }
-}
+/// The control a parameter deserves. Defined in the engine — see
+/// [`choz_engine::ParamShape`] — because the note generators that describe
+/// their knobs with it live there now.
+pub use choz_engine::ParamShape;
 
 /// Same, for a knob that reads as a distance rather than a setting. Three or
 /// more in a row sharing one unit are drawn as a bank of vertical faders — see
@@ -563,11 +440,29 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         pd!("ModRate", 0.03),
         pd!("ModDepth", 0.00),
     ];
+    /// The reverb's list, in the order `Reverb::params` publishes it.
+    ///
+    /// The first four indices are where they were before the engine was
+    /// rewritten — `Room` is now called `Size` and means the same thing — so a
+    /// project written against the old reverb opens with its settings intact
+    /// and the nine that follow at their defaults.
+    ///
+    /// Times, cuts and the mix are faders: they are distances along something,
+    /// and a knob at "0.35" says less about a pre-delay than a travel does.
     static REVERB: &[FxParamDesc] = &[
-        pd!("Room", 0.50),
+        pd!("Size", 0.50),
         pd!("Damping", 0.50),
         pd!("Width", 1.00),
-        pd!("Wet", 0.35),
+        pdf!("Wet", 0.35),
+        pdf!("Decay", 0.45),
+        pdf!("PreDelay", 0.08),
+        pd!("Diffusion", 0.70),
+        pd!("Tone", 0.50),
+        pd!("Modulation", 0.25),
+        pdf!("LowCut", 0.15),
+        pdf!("HighCut", 0.80),
+        pd!("Character", 0.25),
+        pd!("Quality", 1.00),
     ];
     static GRNDLY: &[FxParamDesc] = &[
         pd!("Size", 0.40),
@@ -860,7 +755,140 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
     static GAIN: &[FxParamDesc] = &[pd!("Gain", 0.50), pd!("Wet", 1.00)];
     static PHASEINV: &[FxParamDesc] = &[pd!("InvertL", 1.00), pd!("InvertR", 0.00)];
     static MONO: &[FxParamDesc] = &[pd!("Wet", 1.00)];
-    static LOOPER: &[FxParamDesc] = &[pd!("Length", 0.50), pd!("Feedback", 0.70), pd!("Wet", 1.00)];
+    /// The deck's transport, one knob a track, plus a mute each.
+    ///
+    /// **These are the parameters the processor really has.** The three that
+    /// used to be here — `Length`, `Feedback`, `Wet` — were drawn on the panel
+    /// and reached nothing: `Looper` overrode only `set_mix`, so two of the
+    /// three moved a knob and changed no sound. Modelling the transport as
+    /// parameters is what makes the deck reachable at all: the panel, a learned
+    /// CC and a host all arrive through `SetFxParam`.
+    /// One block a control, one entry a channel, in the order `looper::P_*`
+    /// names them — the interface's list has to be the processor's list, by
+    /// index, because that is what `SetFxParam` addresses.
+    ///
+    /// What a strip only *shows* is absent: the input monitor is a meter, and
+    /// METRO works choz's own metronome. Neither is a setting of the deck's, so
+    /// neither is a knob here.
+    static LOOPER: &[FxParamDesc] = &[
+        pd!("T1", 0.00),
+        pd!("T2", 0.00),
+        pd!("T3", 0.00),
+        pd!("T4", 0.00),
+        pd!("T5", 0.00),
+        pd!("T6", 0.00),
+        pd!("T7", 0.00),
+        pd!("T8", 0.00),
+        FxParamDesc {
+            name: Cow::Borrowed("T1 Mute"),
+            default: 0.0,
+            shape: ParamShape::Toggle,
+        },
+        FxParamDesc {
+            name: Cow::Borrowed("T2 Mute"),
+            default: 0.0,
+            shape: ParamShape::Toggle,
+        },
+        FxParamDesc {
+            name: Cow::Borrowed("T3 Mute"),
+            default: 0.0,
+            shape: ParamShape::Toggle,
+        },
+        FxParamDesc {
+            name: Cow::Borrowed("T4 Mute"),
+            default: 0.0,
+            shape: ParamShape::Toggle,
+        },
+        FxParamDesc {
+            name: Cow::Borrowed("T5 Mute"),
+            default: 0.0,
+            shape: ParamShape::Toggle,
+        },
+        FxParamDesc {
+            name: Cow::Borrowed("T6 Mute"),
+            default: 0.0,
+            shape: ParamShape::Toggle,
+        },
+        FxParamDesc {
+            name: Cow::Borrowed("T7 Mute"),
+            default: 0.0,
+            shape: ParamShape::Toggle,
+        },
+        FxParamDesc {
+            name: Cow::Borrowed("T8 Mute"),
+            default: 0.0,
+            shape: ParamShape::Toggle,
+        },
+        pd!("T1 Quant", 0.00),
+        pd!("T2 Quant", 0.00),
+        pd!("T3 Quant", 0.00),
+        pd!("T4 Quant", 0.00),
+        pd!("T5 Quant", 0.00),
+        pd!("T6 Quant", 0.00),
+        pd!("T7 Quant", 0.00),
+        pd!("T8 Quant", 0.00),
+        pd!("Chans", 0.50),
+        FxParamDesc {
+            name: Cow::Borrowed("T1 Solo"),
+            default: 0.0,
+            shape: ParamShape::Toggle,
+        },
+        FxParamDesc {
+            name: Cow::Borrowed("T2 Solo"),
+            default: 0.0,
+            shape: ParamShape::Toggle,
+        },
+        FxParamDesc {
+            name: Cow::Borrowed("T3 Solo"),
+            default: 0.0,
+            shape: ParamShape::Toggle,
+        },
+        FxParamDesc {
+            name: Cow::Borrowed("T4 Solo"),
+            default: 0.0,
+            shape: ParamShape::Toggle,
+        },
+        FxParamDesc {
+            name: Cow::Borrowed("T5 Solo"),
+            default: 0.0,
+            shape: ParamShape::Toggle,
+        },
+        FxParamDesc {
+            name: Cow::Borrowed("T6 Solo"),
+            default: 0.0,
+            shape: ParamShape::Toggle,
+        },
+        FxParamDesc {
+            name: Cow::Borrowed("T7 Solo"),
+            default: 0.0,
+            shape: ParamShape::Toggle,
+        },
+        FxParamDesc {
+            name: Cow::Borrowed("T8 Solo"),
+            default: 0.0,
+            shape: ParamShape::Toggle,
+        },
+        pd!("T1 Pan", 0.50),
+        pd!("T2 Pan", 0.50),
+        pd!("T3 Pan", 0.50),
+        pd!("T4 Pan", 0.50),
+        pd!("T5 Pan", 0.50),
+        pd!("T6 Pan", 0.50),
+        pd!("T7 Pan", 0.50),
+        pd!("T8 Pan", 0.50),
+        // The `X` on a strip, as a value: a gesture written and written
+        // straight back to zero. Zero is its rest position, so a project that
+        // saves it does not delete a channel when it loads.
+        pd!("Del", 0.00),
+        pd!("T1 Vol", 1.00),
+        pd!("T2 Vol", 1.00),
+        pd!("T3 Vol", 1.00),
+        pd!("T4 Vol", 1.00),
+        pd!("T5 Vol", 1.00),
+        pd!("T6 Vol", 1.00),
+        pd!("T7 Vol", 1.00),
+        pd!("T8 Vol", 1.00),
+    ];
     static SIDECHAIN: &[FxParamDesc] =
         &[pd!("Amount", 0.80), pd!("Release", 0.30), pd!("Wet", 1.00)];
 
@@ -1246,6 +1274,52 @@ impl AudioFxEntry {
                         );
                     }
                 }
+                // A looper track is in one of three states, and a number
+                // between them means nothing.
+                if self.kind == AudioFxKind::Looper {
+                    use choz_engine::fx::looper as deck;
+                    for d in descs.iter_mut().filter(|d| d.name.ends_with(" Quant")) {
+                        let n = deck::Quantise::ALL.len() - 1;
+                        d.shape = ParamShape::Named(
+                            deck::Quantise::ALL
+                                .iter()
+                                .enumerate()
+                                .map(|(i, q)| (i as f32 / n as f32, q.label().to_string()))
+                                .collect(),
+                        );
+                    }
+                    // Four positions, not three: PLAY is also PAUSE.
+                    for d in descs.iter_mut().filter(|d| d.name.len() == 2) {
+                        d.shape = ParamShape::Named(vec![
+                            (deck::P_STOP, "STOP".to_string()),
+                            (deck::P_PAUSE, "PAUSE".to_string()),
+                            (deck::P_PLAY, "PLAY".to_string()),
+                            (deck::P_REC, "REC".to_string()),
+                        ]);
+                    }
+                }
+                // A hall is not 0.25 of anything. The two controls that pick
+                // a *kind* get their names from the DSP's own enums, so a
+                // label cannot drift from what the processor does.
+                if self.kind == AudioFxKind::Reverb {
+                    use choz_engine::fx::reverb::{Character, Quality};
+                    if let Some(d) = descs.iter_mut().find(|d| d.name == "Character") {
+                        d.shape = ParamShape::Named(
+                            Character::ALL
+                                .iter()
+                                .map(|c| (c.to_norm(), c.label().to_string()))
+                                .collect(),
+                        );
+                    }
+                    if let Some(d) = descs.iter_mut().find(|d| d.name == "Quality") {
+                        d.shape = ParamShape::Named(
+                            Quality::ALL
+                                .iter()
+                                .map(|q| (q.to_norm(), q.label().to_string()))
+                                .collect(),
+                        );
+                    }
+                }
                 if self.kind == AudioFxKind::AutoFilter {
                     use choz_engine::fx::auto_filter::FilterMode;
                     if let Some(d) = descs.iter_mut().find(|d| d.name == "Mode") {
@@ -1513,8 +1587,10 @@ mod autotune_defaults {
 /// differs.
 ///
 /// The section comes from the plugin when the plugin gives one — CLAP's
-/// `module`. When it does not (VST2, VST3, LV2, LADSPA all name parameters and
-/// nothing else), it is **read off the names**: a run of consecutive parameters
+/// `module`, and VST3's units (`IUnitInfo`, which is where Surge XT's fourteen
+/// sections and TyrellN6's nine come from). When it does not (VST2, LV2 and
+/// LADSPA name parameters and nothing else, and so do the DPF-built VST3s), it
+/// is **read off the names**: a run of consecutive parameters
 /// that begin with the same words is a section, because that is how every
 /// plugin that has sections writes them. Nothing is invented for a lone
 /// parameter: it keeps its whole name and has no heading.

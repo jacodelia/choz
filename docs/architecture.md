@@ -82,6 +82,9 @@ choz/
 │   │       ├── lib.rs           # Public re-exports (AudioEngine, FxSpec, …)
 │   │       ├── engine.rs        # RT audio engine: slots, mixer, cpal callback
 │   │       ├── sources.rs       # TestTone / WavPlayer / Sf2Synth (AudioSource impls)
+│   │       ├── arp.rs           # The arpeggiator — a note generator, not an FX
+│   │       ├── seq.rs           # MMT-8: 8 tracks × 16 steps, parts, song
+│   │       ├── param_shape.rs   # What control a parameter deserves (knob/switch/fader)
 │   │       ├── input.rs         # InputSource / NoteMsg / InputEvent
 │   │       ├── midi.rs          # Hardware MIDI in (midir → flume) + clock + MIDI out
 │   │       ├── osc.rs           # OSC UDP listener (notes + remote control)
@@ -135,7 +138,6 @@ choz/
 │           ├── editor.rs        # X11 window thread hosting a plugin's own GUI
 │           ├── source.rs        # Instrument model, AudioFxKind, FxCategory, param descs
 │           ├── project.rs       # choz-project.yml save model (serde_yaml)
-│           ├── arp.rs           # Per-tab arpeggiator + step sequencer (one clock)
 │           ├── automation.rs    # Lanes against the beat, addressed like MIDI learn
 │           ├── settings.rs      # ui.json: color, language, audio + OSC settings
 │           ├── file_browser.rs  # Filesystem browser (files and DIR_PICK mode)
@@ -160,7 +162,7 @@ choz/
 │               └── theme.rs           # Colours, and the wash panels blend with
 ```
 
-FX processors under `crates/choz-engine/src/fx/` (35 built-ins, each with its own tests):
+FX processors under `crates/choz-engine/src/fx/` (46 built-ins, each with its own tests):
 
 ```
 fx/
@@ -169,7 +171,9 @@ fx/
 ├── gran_delay.rs   # Granular delay / pitch-shift delay
 ├── reverse.rs      # Reverse delay
 ├── space_echo.rs   # Tape-style space echo
-├── reverb.rs       # Reverb
+├── delay_line.rs   # Shared fractional delay line, denormal flush, soft clip
+├── dc.rs           # Shared DC blocker: one pole at 10 Hz, after any asymmetric curve
+├── reverb.rs       # Reverb (FDN + early reflections — see docs/reverb.md)
 ├── protocosmos.rs  # Wide ambient texture reverb
 ├── z5_texture.rs   # 16-parameter texture processor
 ├── compressor.rs   # Compressor / Limiter
@@ -443,6 +447,35 @@ there: the rows drew, the clicks did nothing.
 shifts what a saved project points at. Names in the project would fix it; a
 rescan is the honest workaround until someone hits it.
 
+### Out of choz: the CLAP bundle
+
+`choz-plugin-clap-export` is the other direction from `choz-plugin-clap` —
+somebody else's host loading choz's own things. One `.clap` file publishes two
+kinds of plugin, split by `Sort`:
+
+- **Effects** (`org.choz.fx.*`), one per entry of `BUILT_IN_KINDS`: audio ports,
+  the processor's own knobs, and the dry/wet appended because outside choz there
+  is no chain to hold one.
+- **Artifacts** (`org.choz.gen.arp`, `org.choz.gen.seq`): **note** ports and no
+  audio ports at all. The arpeggiator takes keys and answers with keys; the
+  sequencer takes nothing and plays what is written on it.
+
+The two sets of ports are exclusive on purpose — a plugin claiming both and then
+reporting zero of one is a plugin a host has to guess about.
+
+The sequencer publishes **its whole grid as parameters** — one per cell, then a
+note per lane, then the four controls. That is a hundred and forty knobs for a
+generic panel, and the reason is that this crate implements no `clap.state`: a
+host saves parameter values, so a pattern that was not a parameter would not
+survive reopening the project. `ponytail:` one part, not the eight choz keeps;
+the upgrade path is `clap.state`, which would take the grid back out of the
+parameter list.
+
+Both generators keep their own clock and follow a transport whenever one is
+rolling, which in a host it always is — `follow_host_transport` points
+`choz_ports::transport()` at the DAW's timeline, and `ArpEvent::at` becomes a
+frame offset inside the block.
+
 ### Where the notes go
 
 A tab's notes end at its own instrument, and — when the OUT drawer's `MIDI OUT`
@@ -461,6 +494,85 @@ Connections are **shared by port name** (`App.midi_outs`): ALSA hands a port to
 one client, so two tabs pointed at the same synth have to be one connection. The
 tab stores the **name**, not an index: ports come and go, and an index into a
 list that changed while choz was closed points at somebody else's synth.
+
+#### The sequencer, an MMT-8 in the RACK
+
+Both generators live in **`choz-engine`**, not in the interface. A note is not
+audio, but it is not interface either: they are settings and a clock, with no
+ratatui in them, and the CLAP bundle cannot carry what only the binary can see.
+See *Out of choz* below.
+
+`seq.rs` is the other note generator: eight tracks, sixteen steps, eight parts
+`A`..`H` and a song chain — an Alesis MMT-8, which is a *multitrack recorder*
+rather than a drum machine, so a track is one note pointed at the tab's own
+instrument and a part is a pattern of them. It is drawn **above** the instrument
+box, because that is the order the notes travel in: the sequencer makes them,
+the instrument plays them, the chain colours them.
+
+The two generators share one strip of the panel as **tabs** (`GenTab`): the row
+above them carries `ARP ●` and `SEQ ●`, and only the selected one's controls are
+drawn. Both boxes at once cost nine rows the RACK does not have, and the `●`/`○`
+stays visible on both tabs. A click on the tab that is *not* showing brings it
+up; a click on the one that is switches it on or off, which is the "select, then
+act" a second click on a knob already answers with. `k` walks the same tabs: FX →
+INSTRUMENT → ARP → SEQ, bringing each up as it hands it the arrows.
+
+**One artifact to a tab.** Switching one on switches the other off
+(`App::stop_seq` / `App::stop_arp`, which also hand back whatever it had
+sounding). Both feed the same instrument, so a tab running both is a sequencer
+whose steps come out arpeggiated — which is not what switching one on ever
+means, and was the one setting nothing on the panel showed.
+
+`swing`, `random` and `prob` are the sequencer's three variation sliders, and
+the last two are one gesture in halves: **`random` is how far** a step may stray
+from what was written and **`prob` is how often** it is allowed to. Either at
+zero plays the grid exactly as typed.
+
+What `random` moves is *when* a note sounds and *how often* — velocity, gate
+length, a **ratchet** that repeats the step's chord inside its own slice, a
+**nudge** that lands the hit off its boundary, and a **ghost** on a step nothing
+was written on. What it never moves is *which* note: the ghost borrows from the
+lanes that already have something written on them (`Seq::pick_written`), and an
+empty part stays silent however wild the knobs are. An octave jump was the first
+thing tried here and is the one deviation this box must not have — a lane's note
+is a choice, and answering a written C2 with a C3 is playing something nobody
+selected.
+
+`prob` deliberately does *not* silence written steps: a pattern that dropped
+notes would be a mute, not a variation. The repeats live in a queue
+(`Seq::pending`) rather than on `ArpEvent::at`, because both clocks have to work
+the same way — the transport-following one could carry a sample, the
+free-running one has no timeline to carry — and `stop` clears it, since a repeat
+left queued speaks one tick after the transport was stopped. `swing` carries the arpeggiator's own
+number on the arpeggiator's own scale (`step * swing`, not half of it), which is
+what makes the same reading of the same control audible on both boxes.
+
+It emits `arp::ArpEvent` rather than a type of its own, and `App::tick_seqs`
+hands each event to the tab's **arpeggiator** when that is on and to
+`send_note_at` when it is not. That is the whole integration, and it is why
+there is no second note path to keep in step: the sequencer plays the keys, and
+whatever the tab does to keys it does to these.
+
+A part is stored as one `u16` per track — a bit per step — so a project writes
+eight numbers per part instead of a hundred and twenty-eight booleans.
+
+REC is armed from the box and writes what is *played* into the pattern, quantised
+to the step the playhead is on (`App::record_step`, called from every path a note
+reaches a tab by, so MIDI, OSC and the drawn keyboard all record the same).
+
+`QUANT` picks the step length out of the arpeggiator's own divisions, and the
+button beside it picks the **time signature** — the transport's, the one every
+synced plugin and the metronome already read. That is what a bar of a part is
+long: `SeqSettings::bar_steps` reads the signature at the step length, so 3/4 at
+1/16 loops after twelve steps and the four past the end are drawn out of the way
+rather than played. Both, and the part being edited, open a list
+(`ModalKind::SeqChoice`) instead of cycling: eight divisions and a dozen
+signatures are a menu, and a button that steps through them is a knob pretending
+to be one.
+
+`ponytail:` no per-step velocity and no lookahead scheduling — a step is "now",
+where the arpeggiator's carries a transport sample. The upgrade path is
+`Arp::next_grid_step`, not a different design here.
 
 #### HOLD, the way a Keystep does it
 

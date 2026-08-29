@@ -39,6 +39,15 @@ pub struct FxSpec {
 pub enum GateSource {
     /// Another tab's level, by rack index.
     Tab(usize),
+    /// Another tab's **notes**, by rack index: velocity when one arrives,
+    /// decaying like a beat.
+    ///
+    /// The level source answers "how loud is that tab", which is the right
+    /// question for a kick drum and the wrong one for a pad holding a chord
+    /// underneath everything — quiet on purpose, and never crossing a
+    /// threshold. This one asks "is that tab being played", which does not
+    /// care how loud the answer came out.
+    Note(usize),
     /// The transport's beat, wherever the transport is getting it — choz's own
     /// clock or an external one. Silent metronome included: this is the count,
     /// not the click.
@@ -46,6 +55,41 @@ pub enum GateSource {
     /// The internal metronome's tap, as it actually sounds: off when the
     /// metronome is off, and accented on the downbeat the way the click is.
     Metronome,
+    /// The step sequencer's own hits — the SEQ artifact, driving the gate the
+    /// way a tab of clicks used to have to.
+    ///
+    /// A pattern *is* a rhythm, so a tremolo or a delay wired to this opens on
+    /// the steps that were written rather than on whatever happens to be loud.
+    /// One per rack, like the metronome's tap: it follows whichever sequencer
+    /// fired last, which on a rig running one is the only one there is.
+    Seq,
+}
+
+/// The transport sample the last sequencer step fired on, or `u64::MAX` for a
+/// rack whose sequencers have not played anything yet.
+static SEQ_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// A sequencer step just played. Called from the interface, which is where the
+/// step clock lives — see `choz-ui/src/seq.rs`.
+pub fn seq_hit() {
+    SEQ_HIT.store(
+        choz_ports::transport().samples(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The envelope of that step, on the same 0..1 scale a tab's level is read on.
+///
+/// Same shape and length as [`crate::metronome::beat_pulse`], so a gate set up
+/// against the clock reads the same wired to the sequencer.
+pub fn seq_pulse() -> f32 {
+    let last = SEQ_HIT.load(std::sync::atomic::Ordering::Relaxed);
+    if last == u64::MAX {
+        return 0.0;
+    }
+    let t = choz_ports::transport();
+    let secs = t.samples().saturating_sub(last) as f32 / t.sample_rate().max(1) as f32;
+    (-(secs / 0.125)).exp()
 }
 
 impl Default for GateSource {
@@ -60,8 +104,10 @@ impl GateSource {
     pub fn level(self) -> f32 {
         match self {
             GateSource::Tab(i) => crate::meter::slot_levels().live(i),
+            GateSource::Note(i) => crate::meter::note_levels().level(i),
             GateSource::Metronome => crate::metronome::metronome().tap_level(),
             GateSource::Clock => crate::metronome::beat_pulse(),
+            GateSource::Seq => seq_pulse(),
         }
     }
 }
@@ -200,9 +246,26 @@ pub fn build_processor(
             Box::new(d)
         }
         "reverb" => {
+            // Per-index defaults rather than the shared `p`, which answers 0.0
+            // for anything a project did not write. A reverb saved before this
+            // engine existed has four parameters; reading the other nine as
+            // zero would open it with no decay, no diffusion and no tail —
+            // the settings kept, the sound gone.
+            let q = |i: usize, d: f32| params.get(i).copied().unwrap_or(d);
             let mut r = fx::Reverb::new(sample_rate);
-            r.set_room_size(p(0));
-            r.set_damp(p(1));
+            r.set_room_size(q(0, 0.50));
+            r.set_damp(q(1, 0.50));
+            r.set_width(q(2, 1.00));
+            // 3 is the dry/wet, which the chain applies itself.
+            r.set_decay(q(4, 0.45));
+            r.set_predelay(q(5, 0.08));
+            r.set_diffusion(q(6, 0.70));
+            r.set_tone(q(7, 0.50));
+            r.set_modulation(q(8, 0.25));
+            r.set_low_cut(q(9, 0.15));
+            r.set_high_cut(q(10, 0.80));
+            r.set_character(fx::reverb::Character::from_norm(q(11, 0.25)));
+            r.set_quality(fx::reverb::Quality::from_norm(q(12, 1.0)));
             Box::new(r)
         }
         "grandelay" => Box::new(fx::GranularDelay::new(
@@ -636,6 +699,14 @@ impl fx::FxProcessor for Gated {
         self.inner.meter()
     }
 
+    fn loopdeck(&mut self) -> Option<choz_ports::LoopHandle> {
+        self.inner.loopdeck()
+    }
+
+    fn is_loop_deck(&self) -> bool {
+        self.inner.is_loop_deck()
+    }
+
     fn latency_samples(&self) -> u32 {
         self.inner.latency_samples()
     }
@@ -694,8 +765,40 @@ impl fx::FxProcessor for Metered {
         Some(self.meter.clone())
     }
 
+    /// A deck's handle has exactly two ends, and the wrapper must not be where
+    /// one of them stops. Everything the interface needs from a looper — the
+    /// chunks it feeds it, the state it draws, the transport it drives — comes
+    /// through here, so a wrapper that swallows it is a looper that cannot
+    /// record and a panel with nothing to draw.
+    fn loopdeck(&mut self) -> Option<choz_ports::LoopHandle> {
+        self.inner.loopdeck()
+    }
+
+    fn is_loop_deck(&self) -> bool {
+        self.inner.is_loop_deck()
+    }
+
     fn latency_samples(&self) -> u32 {
         self.inner.latency_samples()
+    }
+}
+
+/// A slot that is switched off, or one whose plugin would not load.
+///
+/// It stays in the chain rather than being dropped from it, because **every
+/// handle the interface holds is addressed by position**: `fx_editors[slot][i]`,
+/// `fx_loopers[slot][i]`, and the `fx` in a `SetFxParam` are all the index of
+/// the effect *as the rack draws it*. Dropping a spec here shifted every effect
+/// after it by one, so switching off an early effect quietly pointed the panel,
+/// the meters and the learned CCs at their neighbours.
+struct Bypass;
+
+impl fx::FxProcessor for Bypass {
+    fn process_block(&mut self, _buf: &mut [f32], _sample_rate: u32) {}
+    fn reset(&mut self) {}
+    fn set_mix(&mut self, _wet: f32) {}
+    fn name(&self) -> &str {
+        "off"
     }
 }
 
@@ -706,19 +809,26 @@ pub fn build_chain_from_specs(
 ) -> Vec<Box<dyn fx::FxProcessor>> {
     specs
         .iter()
-        .filter(|s| s.enabled)
-        .filter_map(|s| {
-            let mut proc = match &s.plugin {
-                Some(r) => {
-                    // A hosted plugin keeps its own parameters; hand it the
-                    // values the UI is showing so a rebuild doesn't reset them.
-                    let mut p = build_plugin_fx(r, sample_rate, max_block)?;
-                    for (i, v) in s.params.iter().enumerate() {
-                        p.set_param(i, *v);
+        .map(|s| {
+            let built = match s.enabled {
+                false => None,
+                true => match &s.plugin {
+                    Some(r) => {
+                        // A hosted plugin keeps its own parameters; hand it the
+                        // values the UI is showing so a rebuild doesn't reset
+                        // them.
+                        build_plugin_fx(r, sample_rate, max_block).map(|mut p| {
+                            for (i, v) in s.params.iter().enumerate() {
+                                p.set_param(i, *v);
+                            }
+                            p
+                        })
                     }
-                    p
-                }
-                None => build_processor(&s.kind, &s.params, sample_rate)?,
+                    None => build_processor(&s.kind, &s.params, sample_rate),
+                },
+            };
+            let Some(mut proc) = built else {
+                return Box::new(Bypass) as Box<dyn fx::FxProcessor>;
             };
             proc.set_mix(s.wet);
             // The gate wraps the processor and the meter wraps the gate, so
@@ -734,10 +844,10 @@ pub fn build_chain_from_specs(
                 }),
                 None => proc,
             };
-            Some(Box::new(Metered {
+            Box::new(Metered {
                 inner: proc,
                 meter: choz_ports::FxMeter::default(),
-            }) as Box<dyn fx::FxProcessor>)
+            }) as Box<dyn fx::FxProcessor>
         })
         .collect()
 }
@@ -751,6 +861,93 @@ mod tests {
     /// exactly the drift it was supposed to catch.
     fn fx_ids() -> Vec<&'static str> {
         BUILT_IN_KINDS.iter().map(|(id, _)| *id).collect()
+    }
+
+    /// A gate driven by notes opens for a tab that makes no sound worth
+    /// metering — which is the whole reason that source exists.
+    ///
+    /// The level source answers "how loud is that tab": right for a kick,
+    /// wrong for a pad holding a chord underneath everything, which never
+    /// crosses a threshold and so could never drive a gate at all.
+    #[test]
+    fn a_gate_can_be_opened_by_playing_rather_than_by_loudness() {
+        let notes = crate::meter::note_levels();
+        let levels = crate::meter::slot_levels();
+        notes.reset_all();
+        levels.reset(3);
+
+        let quiet = GateSource::Tab(3);
+        let played = GateSource::Note(3);
+        assert!(quiet.level() < 1e-6, "nothing has been metered yet");
+        assert!(played.level() < 1e-6, "and nothing has been played");
+
+        // A note arrives on a tab that is not making a metered sound.
+        notes.hit(3, 100);
+        assert!(
+            played.level() > 0.7,
+            "the note opens it: {}",
+            played.level()
+        );
+        assert!(
+            quiet.level() < 1e-6,
+            "while the level source still says nothing, which is the bug"
+        );
+
+        // And it falls: the source is a hit, not a switch.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            played.level() < 0.3,
+            "it decays after the note: {}",
+            played.level()
+        );
+        notes.reset_all();
+    }
+
+    /// The dry/wet law, checked on **every** built-in at once: a wet of zero
+    /// is a wire.
+    ///
+    /// It is one property, and it catches the whole family — an effect that
+    /// adds its output instead of crossfading it, one that forgot to apply the
+    /// mix at all, one whose output has a gain baked in. The looper adds on
+    /// purpose (its takes play under what is being played) and still passes,
+    /// because at zero there is nothing to add.
+    ///
+    /// Compared as levels rather than sample by sample: the compressor and
+    /// Auto-Tune delay the dry to line it up with their own latency, which is
+    /// right and which no sample-by-sample comparison would forgive.
+    #[test]
+    fn a_wet_of_zero_is_a_wire_in_every_built_in() {
+        let sr = 48_000u32;
+        let mut rng = 0x1234_5678u32;
+        let mut lp = 0.0f32;
+        let dry: Vec<f32> = (0..sr as usize)
+            .flat_map(|i| {
+                rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                let white = (rng >> 8) as f32 / 8_388_608.0 - 1.0;
+                lp += 0.05 * (white - lp);
+                let tone = (std::f32::consts::TAU * 220.0 * i as f32 / sr as f32).sin();
+                let s = 0.35 * tone + 0.25 * lp;
+                [s, s]
+            })
+            .collect();
+        let rms = |x: &[f32]| (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt();
+        let dry_rms = rms(&dry);
+        for kind in fx_ids() {
+            let params = [0.5f32; 16];
+            let Some(mut p) = build_processor(kind, &params, sr) else {
+                panic!("{kind} is in the list and cannot be built");
+            };
+            p.set_mix(0.0);
+            let mut buf = dry.clone();
+            for block in buf.chunks_mut(512) {
+                p.process_block(block, sr);
+            }
+            let db = 20.0 * (rms(&buf[buf.len() / 2..]) / dry_rms).log10();
+            assert!(
+                db.abs() < 0.5,
+                "{kind} at a dry/wet of zero moved the level by {db:.2} dB"
+            );
+        }
     }
 
     fn spec(kind: &str, plugin: Option<PluginFxRef>) -> FxSpec {
@@ -900,10 +1097,15 @@ mod tests {
         levels.reset(drums);
     }
 
-    /// A CLAP effect that can't be loaded (missing file) is dropped from the
-    /// chain — the built-ins around it still build.
+    /// A CLAP effect that can't be loaded (missing file) becomes a bypass, and
+    /// the built-ins around it still build **and keep their positions**.
+    ///
+    /// Position is the whole contract: `fx_editors[slot][i]`, `fx_loopers`, and
+    /// the `fx` of a `SetFxParam` are all the effect's index as the rack draws
+    /// it. A chain that came back one short pointed every effect after the hole
+    /// at its neighbour.
     #[test]
-    fn unloadable_clap_fx_is_skipped() {
+    fn an_unloadable_fx_becomes_a_bypass_and_keeps_everyone_in_place() {
         let specs = vec![
             spec("gain", None),
             spec(
@@ -916,7 +1118,22 @@ mod tests {
             ),
             spec("reverb", None),
         ];
-        assert_eq!(build_chain_from_specs(&specs, 48_000, 256).len(), 2);
+        let chain = build_chain_from_specs(&specs, 48_000, 256);
+        assert_eq!(chain.len(), 3, "one processor a spec, hole included");
+        assert_eq!(chain[1].name(), "off", "the hole is a bypass");
+        assert_ne!(chain[2].name(), "off", "and the reverb is still at 2");
+
+        // A switched-off effect is the same story, and passes the signal.
+        let mut off = vec![spec("gain", None), spec("reverb", None)];
+        off[0].enabled = false;
+        let mut chain = build_chain_from_specs(&off, 48_000, 256);
+        assert_eq!(chain.len(), 2);
+        let mut buf = vec![0.5f32; 64];
+        chain[0].process_block(&mut buf, 48_000);
+        assert!(
+            buf.iter().all(|s| *s == 0.5),
+            "an effect that is off is a wire"
+        );
     }
 
     /// Every effect in a built chain is metered, whatever it is — that is the
@@ -983,5 +1200,45 @@ mod tests {
                 }
             }
         }
+    }
+    /// A looper's handle survives the wrappers the chain builder puts around
+    /// every effect.
+    ///
+    /// The deck reaches the interface through `loopdeck()` and nowhere else:
+    /// the chunks it is fed, the state the panel draws, and the transport REC
+    /// drives all ride on it. `Metered` wraps every effect and `Gated` wraps
+    /// the ones with a gate, and while neither forwarded it the looper could
+    /// be added to a chain, drawn, and pressed — and record nothing, because
+    /// the interface had no end of the rings to hold.
+    #[test]
+    fn a_looper_hands_its_deck_through_the_chain_wrappers() {
+        let bare = &mut build_chain_from_specs(&[spec("looper", None)], 48_000, 512)[0];
+        assert!(
+            bare.loopdeck().is_some(),
+            "the meter wrapper swallowed the deck"
+        );
+
+        let mut gated = spec("looper", None);
+        gated.gate = Some(GateSpec::default());
+        let with_gate = &mut build_chain_from_specs(&[gated], 48_000, 512)[0];
+        assert!(
+            with_gate.loopdeck().is_some(),
+            "the gate wrapper swallowed the deck"
+        );
+
+        // And it is handed out once: the rings have two ends, not three.
+        assert!(
+            with_gate.loopdeck().is_none(),
+            "a second caller must not get a second end of the same rings"
+        );
+
+        // Nothing else in the chain claims to be one.
+        let other = &mut build_chain_from_specs(&[spec("delay", None)], 48_000, 512)[0];
+        assert!(other.loopdeck().is_none(), "a delay is not a deck");
+
+        // And it says so after the handle is gone, which is what carrying a
+        // deck across a rebuild asks it.
+        assert!(with_gate.is_loop_deck(), "still a deck without its handle");
+        assert!(!other.is_loop_deck());
     }
 }

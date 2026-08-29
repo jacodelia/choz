@@ -103,7 +103,10 @@ fn the_deb_carries_the_desktop_files_in_the_base_table() {
 fn exists(source: &str) -> bool {
     // Paths are written relative to the crate that declares them, so they are
     // resolved from there — `../../assets/…` is the repository's.
-    if source.trim_start_matches("../../").starts_with("target/release/") {
+    if source
+        .trim_start_matches("../../")
+        .starts_with("target/release/")
+    {
         return true;
     }
     let Some((dir, pattern)) = source.rsplit_once('/') else {

@@ -7,6 +7,8 @@
 pub mod bitcrusher;
 pub mod cassette;
 pub mod delay;
+pub mod dc;
+pub mod delay_line;
 pub mod filter;
 pub mod filterbank;
 pub mod gran_delay;
@@ -62,7 +64,7 @@ pub use filter::{Svf, SvfMode};
 pub use filterbank::FilterBankFx;
 pub use gran_delay::GranularDelay;
 pub use isolator::Isolator;
-pub use looper::{Looper, LooperState};
+pub use looper::{Looper, MAX_SECS as LOOP_MAX_SECS};
 pub use reverb::Reverb;
 pub use sidechain::SidechainDuck;
 pub use vinyl::VinylSim;

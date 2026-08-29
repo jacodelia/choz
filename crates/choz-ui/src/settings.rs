@@ -192,6 +192,15 @@ pub struct AudioSettings {
     pub alsa_hw_device: String,
     /// JACK server name, empty = default.
     pub jack_server_name: String,
+    /// How much audio every looper deck in the program may hold together, in
+    /// MiB. Added later, hence the default.
+    ///
+    /// Global and not per tab: two tabs with a looper are two decks, and a
+    /// ceiling that only counted one of them would not be a ceiling. Five
+    /// minutes of stereo at 48 kHz in `i16` is 55 MiB, so 512 is a little over
+    /// nine full-length takes — and a take is usually seconds, not minutes.
+    #[serde(default = "default_loop_budget")]
+    pub loop_budget_mib: usize,
     /// Tempo of choz's own transport, in BPM — what a tempo-synced plugin reads
     /// on every block. Added later, hence the default.
     #[serde(default = "default_bpm")]
@@ -215,6 +224,10 @@ fn default_time_sig() -> (u16, u16) {
     (4, 4)
 }
 
+fn default_loop_budget() -> usize {
+    512
+}
+
 fn default_bpm() -> f32 {
     choz_ports::Transport::DEFAULT_BPM
 }
@@ -231,6 +244,7 @@ impl Default for AudioSettings {
             pipewire_quantum: 0,
             alsa_hw_device: String::new(),
             jack_server_name: String::new(),
+            loop_budget_mib: default_loop_budget(),
             bpm: default_bpm(),
             time_sig: default_time_sig(),
             feedback_guard: true,

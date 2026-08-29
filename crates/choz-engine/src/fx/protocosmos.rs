@@ -30,6 +30,34 @@ use super::FxProcessor;
 const MAX_BUF_S: f32 = 4.0;
 const MAX_GRAINS: usize = 12;
 
+/// `1/√n`, for `n` grains sounding at once.
+///
+/// The grains read the buffer at offsets a spray apart, so they are
+/// uncorrelated: their **powers** add, not their amplitudes, and the sum of
+/// `n` of them is `√n` louder than one. Without this the effect's level was
+/// the density knob — measured at its defaults, 9.1 dB over the signal that
+/// went in, which is a cloud that clips on its own and takes anything stacked
+/// after it with it. Dividing by the root keeps the loudness of the cloud
+/// where the sound of it is, which is what `Density` should be moving.
+const INV_SQRT: [f32; MAX_GRAINS + 1] = {
+    let mut t = [1.0f32; MAX_GRAINS + 1];
+    // A const fn `sqrt` does not exist, so the roots are written out.
+    t[0] = 1.0;
+    t[1] = 1.0;
+    t[2] = std::f32::consts::FRAC_1_SQRT_2;
+    t[3] = 0.577_350_3;
+    t[4] = 0.5;
+    t[5] = 0.447_213_6;
+    t[6] = 0.408_248_3;
+    t[7] = 0.377_964_5;
+    t[8] = 0.353_553_4;
+    t[9] = 0.333_333_34;
+    t[10] = 0.316_227_77;
+    t[11] = 0.301_511_35;
+    t[12] = 0.288_675_14;
+    t
+};
+
 struct Grain {
     pos: f64,   // fractional read index into the buffer
     speed: f64, // signed playback rate (negative = reverse)
@@ -238,10 +266,12 @@ impl FxProcessor for Protocosmos {
             // Sum active grains (Hann-windowed, fractional read).
             let mut gl = 0.0f32;
             let mut gr = 0.0f32;
+            let mut sounding = 0usize;
             for g in self.grains.iter_mut() {
                 if !g.active {
                     continue;
                 }
+                sounding += 1;
                 let p0 = g.pos as usize % len;
                 let p1 = (p0 + 1) % len;
                 let frac = g.pos.fract() as f32;
@@ -259,6 +289,13 @@ impl FxProcessor for Protocosmos {
                     g.active = false;
                 }
             }
+
+            // Loudness of the cloud against how many grains happen to be in
+            // it — see [`INV_SQRT`]. Applied before the feedback path reads it,
+            // so density cannot drive the loop either.
+            let norm = INV_SQRT[sounding.min(MAX_GRAINS)];
+            gl *= norm;
+            gr *= norm;
 
             // Write input (+ grain feedback) into the buffer, unless frozen.
             if !frozen {

@@ -10,10 +10,11 @@ Built with Rust, ratatui and cpal. Provides a TUI for managing note inputs, inst
 
 ## Status
 
-**1.3.3.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
+**1.3.4.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
 LADSPA, DSSI, VST2, VST3 and Pure Data patches are really hosted** — instruments
 and audio effects, with their own parameters and their own windows — choz's own
-46 effects are published as a CLAP plugin for other hosts, and choz installs as a
+46 effects and both artifacts — the arpeggiator and the step sequencer — are
+published as CLAP plugins for other hosts, and choz installs as a
 `.deb`, an `.rpm` or a script, with an entry in the desktop menu.
 
 ### Plugin formats
@@ -71,12 +72,20 @@ patch picked in its browser — through VST2 chunks, VST3 `IComponent::getState`
 Playing rather than patching: a **MIXER** tab at the bottom shows every rack tab
 at once as channel strips — **one vertical fader per output channel** with a
 link between them (tied by default, broken to trim one side against the other),
-pan, mute and solo, each editable where it is drawn instead of one tab at a
-time, moved by the wheel or the arrows in the same step the RACK's `VOL` uses,
-and paging with `◀ ▶` when the rack is wider than the panel; a **metronome** beside the LIVE/MULTI switch clicks off the same
+pan, and an `O M S` row under the fader — where the tab sums, mute, solo — each
+editable where it is drawn instead of one tab at a time, moved by the wheel or
+the arrows in the same step the RACK's `VOL` uses, and paging with `◀ ▶` when
+the rack is wider than the panel. **The arrows walk the whole desk**: past the
+last tab come the four groups and the main, so a machine that is played rather
+than pointed at can reach every fader; a **metronome** beside the LIVE/MULTI switch clicks off the same
 transport every synced plugin reads (tempo, time signature, three sounds), and
 it keeps counting with the transport stopped, which is when a metronome is
-wanted; and the arpeggiator's **HOLD** works the way a Keystep's does — let go
+wanted; every tab carries a **step sequencer built like an Alesis MMT-8** —
+eight tracks, sixteen steps, eight parts and a song chain, drawn above the
+instrument because that is the order the notes travel in, with `REC` writing what
+you play quantised to the step the playhead is on, and every step handed to the
+tab's arpeggiator when it has one running; and the arpeggiator's **HOLD** works
+the way a Keystep's does — let go
 and the chord keeps playing, and the next key pressed with nothing down starts a
 new one rather than piling onto the old.
 
@@ -172,13 +181,14 @@ architecture (x86-64, aarch64, armv7), a `.deb`, an `.rpm` and a `PKGBUILD` for
 Arch, plus `SHA256SUMS.txt`:
 
 ```bash
-tar xzf choz-1.3.3-x86_64-unknown-linux-gnu.tar.gz
-cd choz-1.3.3-x86_64-unknown-linux-gnu
+tar xzf choz-1.3.4-x86_64-unknown-linux-gnu.tar.gz
+cd choz-1.3.4-x86_64-unknown-linux-gnu
 ./install.sh            # uses the binary shipped beside it — no cargo involved
 ```
 
 The tarball carries the binary, the launcher, the desktop entry, every icon size,
-the MIME type, the wallpapers, choz's own effects as a CLAP plugin and the Pure
+the MIME type, the wallpapers, choz's own effects and artifacts as a CLAP plugin
+and the Pure
 Data host — the same set the `.deb` installs. On ARM, remember that **plugins are
 native binaries**: a Raspberry Pi loads plugins built for ARM, not the x86 ones.
 
@@ -186,7 +196,7 @@ native binaries**: a Raspberry Pi loads plugins built for ARM, not the x86 ones.
 
 | What | Where | Why |
 |---|---|---|
-| `choz.clap` | `~/.clap` (script) or `/usr/lib/clap` (packages) | choz's own 46 effects, usable from Bitwig, Reaper, Carla or any CLAP host. `--no-clap` skips it. |
+| `choz.clap` | `~/.clap` (script) or `/usr/lib/clap` (packages) | choz's own 46 effects plus the arpeggiator and step sequencer as note effects, usable from Bitwig, Reaper, Carla or any CLAP host. `--no-clap` skips it. |
 | Wallpapers | `<prefix>/share/choz/wallpapers` | A fresh install opens on the image choz ships with, and the picker starts there. |
 | `choz-pd-host` | next to `choz` | The only binary that links libpd — installed when libpd is present. |
 
@@ -197,7 +207,7 @@ native binaries**: a Raspberry Pi loads plugins built for ARM, not the x86 ones.
 ./packaging/install.sh --prefix /usr/local
 ./packaging/install.sh --binary target/release/choz   # skip the build
 ./packaging/install.sh --skip-deps-check   # install without checking ALSA
-./packaging/install.sh --no-clap          # skip choz's effects as a CLAP plugin
+./packaging/install.sh --no-clap          # skip the CLAP plugin (effects + artifacts)
 ./packaging/install.sh --uninstall
 ```
 
@@ -265,11 +275,12 @@ headroom for plugin DSP at small buffer sizes.
 | `<` `>` / `;` `:` | rack | input trim / `A→M` sensitivity of a tab fed by audio |
 | `F7` / `F8` / `F9` | anywhere | roll-stop the rack / arm automation recording / panic (all-notes-off) — the same three buttons that sit on the menu bar |
 | `m` / `S` | rack | mute / solo the tab |
-| `↑` `↓` / wheel | MIXER | that tab's level, one step (`Tab` focuses the MIXER while it is showing, or click a strip) |
+| `↑` `↓` / wheel | MIXER | that strip's level, one step (`Tab` focuses the MIXER while it is showing, or click a strip) |
+| `←` `→` | MIXER | the strip beside it — the tabs, then the four groups, then the main |
 | `l` / `k` | MIXER | link the strip's two channels / pick which side the arrows move |
 | `C` | rack (FX) | which keyboard the selected effect takes its chord from |
 | `v` | rack | split the keyboard: which saved sound each octave plays |
-| `c` | rack (FX) | gate the selected effect from another tab — the kick that opens it |
+| `c` | rack (FX) | gate the selected effect from another tab — its level, or the notes played into it |
 | `n` / `N` | rack, MIXER | level the tab / the whole rack again, from what it has played since it was loaded |
 | `c` / `r` | IN drawer | connect-disconnect a port / rescan inputs |
 
@@ -278,7 +289,7 @@ headroom for plugin DSP at small buffer sizes.
 ## Architecture
 
 ```
-choz/                      11 crates, version 1.3.3
+choz/                      11 crates, version 1.3.4
 ├── crates/
 │   ├── choz-ports/         RT-safe traits every host implements: AudioSource,
 │   │                       FxProcessor, PluginEditor, PluginParam, SandboxStatus
@@ -302,7 +313,7 @@ choz/                      11 crates, version 1.3.3
 │   ├── choz-plugin-vst3/   VST3 host — pure-Rust COM bindings, no Steinberg SDK
 │   ├── choz-plugin-pd/     Pure Data patches as effects; `choz-pd-host` is the
 │   │                       only binary that links libpd (feature `pd`)
-│   ├── choz-plugin-clap-export/ choz's own 46 effects, published as one `.clap`
+│   ├── choz-plugin-clap-export/ choz's 46 effects + 2 artifacts, as one `.clap`
 │   ├── choz-plugin-sandbox/ Shared-memory transport for out-of-process hosting
 │   │                       (audio blocks and the plugin's window)
 │   └── choz-ui/            The `choz` binary: TUI, rack, modals, drawers,
@@ -329,7 +340,7 @@ ring so they are freed off the RT thread.
 
 | | |
 |---|---|
-| choz | **1.3.3** |
+| choz | **1.3.4** |
 | Rust edition | 2021 (`choz-plugin-lv2` is 2024) |
 | Toolchain tested | rustc 1.97.1 |
 | Platform | Linux. ALSA/JACK/PipeWire. Released for x86-64, aarch64 and armv7 |

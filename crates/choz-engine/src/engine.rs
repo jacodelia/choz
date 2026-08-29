@@ -378,6 +378,10 @@ pub struct AudioEngine {
     /// `fx_meters[slot][fx]`. Captured where the editor is — the last moment
     /// the UI can reach the processor.
     fx_meters: Vec<Vec<Option<choz_ports::FxMeter>>>,
+    /// The interface's end of a looper deck: `fx_loopers[slot][fx]`. Same
+    /// moment, and the only one there is — a deck's rings cannot be cloned, so
+    /// this is moved out of the processor rather than copied from it.
+    fx_loopers: Vec<Vec<Option<choz_ports::LoopHandle>>>,
     /// What each effect adds to the signal's delay, in samples:
     /// `fx_latency[slot][fx]`. A constant of the algorithm, so it is read once,
     /// here, instead of asked for on the audio thread.
@@ -686,6 +690,7 @@ impl AudioEngine {
             sandboxes: Vec::new(),
             fx_sandboxes: Vec::new(),
             fx_meters: Vec::new(),
+            fx_loopers: Vec::new(),
             fx_latency: Vec::new(),
             cmd_tx,
             retired_rx,
@@ -898,6 +903,7 @@ impl AudioEngine {
         self.sandboxes.clear();
         self.fx_sandboxes.clear();
         self.fx_meters.clear();
+        self.fx_loopers.clear();
         self.fx_latency.clear();
         self._stream = Some(BackendHandle::Jack(Box::new(handle)));
         self.out_channels = channels;
@@ -1178,6 +1184,7 @@ impl AudioEngine {
         self.sandboxes.clear();
         self.fx_sandboxes.clear();
         self.fx_meters.clear();
+        self.fx_loopers.clear();
         self.fx_latency.clear();
         self.backend = backend;
         self.output_device = device.name().ok();
@@ -1384,6 +1391,24 @@ impl AudioEngine {
         self.fx_meters.get(slot)?.get(fx).cloned().flatten()
     }
 
+    /// The looper deck in FX `fx` of slot `slot`, when that effect is one.
+    ///
+    /// `&mut`, because pumping it is what moves chunks: the interface is the
+    /// only side that allocates, and this is where it does it.
+    pub fn fx_looper(&mut self, slot: usize, fx: usize) -> Option<&mut choz_ports::LoopHandle> {
+        self.fx_loopers.get_mut(slot)?.get_mut(fx)?.as_mut()
+    }
+
+    /// Every deck the rack is holding, for the one pump that keeps them all
+    /// supplied — and for the budget, which is global to the program and not to
+    /// a tab: two tabs with a looper are two decks.
+    pub fn loopers(&mut self) -> impl Iterator<Item = &mut choz_ports::LoopHandle> {
+        self.fx_loopers
+            .iter_mut()
+            .flat_map(|slot| slot.iter_mut())
+            .filter_map(|h| h.as_mut())
+    }
+
     /// How much delay slot `slot`'s FX chain adds, in samples: the sum of what
     /// every effect in it reports.
     ///
@@ -1505,6 +1530,7 @@ impl AudioEngine {
         self.fx_states.push(Vec::new());
         self.fx_sandboxes.push(Vec::new());
         self.fx_meters.push(Vec::new());
+        self.fx_loopers.push(Vec::new());
         self.fx_latency.push(Vec::new());
         self.send(EngineCommand::AddSlot(source));
         self.slot_count += 1;
@@ -1531,6 +1557,7 @@ impl AudioEngine {
             self.sandboxes.remove(slot);
             self.fx_sandboxes.remove(slot);
             self.fx_meters.remove(slot);
+            self.fx_loopers.remove(slot);
             self.fx_latency.remove(slot);
         }
     }
@@ -1540,7 +1567,7 @@ impl AudioEngine {
         if slot >= self.slot_count {
             return;
         }
-        let fx = build_chain_from_specs(&specs, self.sample_rate, self.buffer_size);
+        let mut fx = build_chain_from_specs(&specs, self.sample_rate, self.buffer_size);
         // Last chance to reach the processors: after this they belong to the
         // RT thread.
         self.fx_editors[slot] = fx.iter().map(|p| p.editor()).collect();
@@ -1548,6 +1575,30 @@ impl AudioEngine {
         self.fx_states[slot] = fx.iter().map(|p| p.state()).collect();
         self.fx_sandboxes[slot] = fx.iter().map(|p| p.sandbox()).collect();
         self.fx_meters[slot] = fx.iter().map(|p| p.meter()).collect();
+        // Moved, not copied: a deck's rings have exactly two ends.
+        let mut decks: Vec<Option<choz_ports::LoopHandle>> =
+            fx.iter_mut().map(|p| p.loopdeck()).collect();
+        // A deck survives the rebuild — see [`carry_loop_decks`], which does
+        // the same walk on the audio thread and moves the processors. This end
+        // keeps the **old** handle wherever a deck was carried: it owns the
+        // chunks the deck recorded, and its rings are the ones that processor
+        // is still holding. The fresh handle beside it goes out with the chain
+        // being replaced.
+        let old_at = |v: &[Option<choz_ports::LoopHandle>]| -> Vec<usize> {
+            v.iter()
+                .enumerate()
+                .filter(|(_, h)| h.is_some())
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let carried: Vec<(usize, usize)> = old_at(&decks)
+            .into_iter()
+            .zip(old_at(&self.fx_loopers[slot]))
+            .collect();
+        for (new_at, was_at) in carried {
+            decks[new_at] = self.fx_loopers[slot][was_at].take();
+        }
+        self.fx_loopers[slot] = decks;
         self.fx_latency[slot] = fx.iter().map(|p| p.latency_samples()).collect();
         self.send(EngineCommand::SetSlotFx { slot, fx });
     }
@@ -2004,6 +2055,38 @@ pub(crate) fn publish_load(
 }
 
 impl RtState {
+    /// Move the looper decks out of the chain being replaced and into the one
+    /// replacing it, matched by their order in each chain.
+    ///
+    /// **Why the audio thread does this.** Adding a reverb builds a whole new chain
+    /// from the specs, and a deck built from a spec is a deck with nothing in it:
+    /// every take the player recorded is in the processor that is about to be
+    /// thrown away. A delay losing its echoes on a rebuild is a sound; a looper
+    /// losing its takes is minutes of playing, gone because somebody reached for
+    /// another effect.
+    ///
+    /// A swap of two `Box`es — two pointer moves, no allocation, nothing freed —
+    /// which is what makes it safe here. The empty deck goes out with the old
+    /// chain and is dropped on the interface thread, like everything else that
+    /// leaves.
+    ///
+    /// ponytail: decks only, matched by position among decks. Every other effect is
+    /// still rebuilt, because what it loses is a tail and not the player's work.
+    /// Carry the rest by comparing specs if a delay tail ever turns out to matter.
+    fn carry_loop_decks(old: &mut FxChain, new: &mut FxChain) {
+        let mut from = 0;
+        for slot in new.iter_mut().filter(|p| p.is_loop_deck()) {
+            while from < old.len() && !old[from].is_loop_deck() {
+                from += 1;
+            }
+            let Some(was) = old.get_mut(from) else {
+                return;
+            };
+            std::mem::swap(slot, was);
+            from += 1;
+        }
+    }
+
     /// Apply pending commands to the slot list. Retired slots/chains go back
     /// over `retired_tx` so they are freed on the UI thread, not here.
     pub(crate) fn apply_commands(&mut self) {
@@ -2036,8 +2119,9 @@ impl RtState {
                         let _ = state.retired_tx.push(Retired::Source(source));
                     }
                 }
-                EngineCommand::SetSlotFx { slot, fx } => {
+                EngineCommand::SetSlotFx { slot, mut fx } => {
                     if let Some(s) = state.slots.get_mut(slot) {
+                        Self::carry_loop_decks(&mut s.fx, &mut fx);
                         let old = std::mem::replace(&mut s.fx, fx);
                         let _ = state.retired_tx.push(Retired::Fx(old));
                     } else {
@@ -2172,6 +2256,11 @@ impl RtState {
                 } => {
                     if let Some(s) = state.slots.get_mut(slot) {
                         s.schedule(at, note, vel, true);
+                        // What a gate driven by *playing* reads — see
+                        // [`crate::meter::NoteLevels`]. Published where the
+                        // note arrives and not where the slot renders, so a
+                        // silent instrument still drives it.
+                        crate::meter::note_levels().hit(slot, vel);
                     }
                 }
                 EngineCommand::NoteOff { slot, note, at } => {
@@ -2326,7 +2415,16 @@ impl RtState {
             let slot_started = std::time::Instant::now();
             // Synths always render (envelope tails / live keys); generators
             // (tone, WAV) honor the transport play flag.
-            if !playing && !slot.source.plays_on_transport_stop() {
+            //
+            // **A tab fed from the interface is neither**, and it renders
+            // whatever the transport is doing: live audio arrives because
+            // something is plugged in, not because anything was started, and
+            // choz is a multi-effect as much as it is an instrument host. This
+            // is what made an input tab go dead — a headset into a tab whose
+            // instrument was a plugin (a plugin does not claim to play with the
+            // transport stopped) reached no effect at all, so the looper on it
+            // recorded silence and read as broken.
+            if !playing && slot.in_pair.is_none() && !slot.source.plays_on_transport_stop() {
                 continue;
             }
             let sc = &mut scratch[..n];
@@ -2544,6 +2642,9 @@ impl RtState {
             let n = frames
                 .min(bus_mix[b * 2].len())
                 .min(bus_mix[b * 2 + 1].len());
+            // What arrived at the group: after the tabs' faders, before its
+            // own, which is where a tab's meter is read too.
+            crate::meter::bus_levels().publish_pair(b, &bus_mix[b * 2], &bus_mix[b * 2 + 1], n);
             for f in 0..n {
                 let (a, c) = (bus_mix[b * 2][f] * g, bus_mix[b * 2 + 1][f] * g);
                 mix[l][f] += a;
@@ -3270,6 +3371,67 @@ mod tests {
         );
         health.clear();
         assert_eq!(health.counts(), (0, 0));
+    }
+
+    /// Adding an effect to a chain that holds a looper must not throw the
+    /// takes away.
+    ///
+    /// The rebuild builds every processor again from its spec, and a deck built
+    /// from a spec is empty — so reaching for a reverb used to wipe minutes of
+    /// playing. The deck is carried across instead, matched by its position
+    /// among the decks in each chain.
+    #[test]
+    fn adding_an_effect_does_not_wipe_the_looper() {
+        use crate::fx::looper as deck;
+        let spec = |kind: &str| FxSpec {
+            kind: kind.to_string(),
+            enabled: true,
+            wet: 1.0,
+            params: Vec::new(),
+            plugin: None,
+            gate: None,
+        };
+
+        // A deck with a take in it, in a chain of its own.
+        let mut old = build_chain_from_specs(&[spec("looper")], 48_000, 512);
+        let mut handle = old[0].loopdeck().expect("the deck's own end");
+        for _ in 0..4 {
+            handle.pump(4, usize::MAX);
+        }
+        let state = handle.shared_state();
+        old[0].set_param(deck::P_STATE, deck::P_REC);
+        old[0].process_block(&mut vec![0.5f32; 4_800], 48_000);
+        old[0].set_param(deck::P_STATE, deck::P_PLAY);
+        old[0].process_block(&mut vec![0.0f32; 512], 48_000);
+        assert_eq!(
+            state.track(0),
+            choz_ports::LoopTrackState::Playing,
+            "the take closed and is rolling"
+        );
+        let frames = state.frames();
+        assert!(frames > 0, "and it froze a length");
+
+        // The rebuild the user's reverb causes: a reverb in front, the deck
+        // behind it, both brand new.
+        let mut new = build_chain_from_specs(&[spec("reverb"), spec("looper")], 48_000, 512);
+        RtState::carry_loop_decks(&mut old, &mut new);
+
+        // The deck that came out the other side is the one that was recorded
+        // into: it is still playing, and still that long.
+        let mut out = vec![0.0f32; 512];
+        for p in new.iter_mut() {
+            p.process_block(&mut out, 48_000);
+        }
+        assert_eq!(state.track(0), choz_ports::LoopTrackState::Playing);
+        assert_eq!(state.frames(), frames);
+        assert!(
+            out.iter().fold(0.0f32, |m, s| m.max(s.abs())) > 0.0,
+            "and it is audible in the new chain"
+        );
+
+        // The empty one went out with the chain being replaced, where it is
+        // dropped on this thread like everything else that leaves.
+        assert!(old[0].is_loop_deck(), "swapped, not cloned");
     }
 
     /// choz as a multi-effect: a tab fed by a capture pair, with an effect on
@@ -4278,6 +4440,104 @@ mod tests {
 
         levels.reset(probed);
         levels.reset(skipped);
+    }
+
+    /// A tab fed from the interface plays with the transport stopped.
+    ///
+    /// Live audio arrives because something is plugged in, not because anything
+    /// was started. The slot used to be skipped whole when the transport was
+    /// stopped and its *instrument* did not claim to play stopped — which is
+    /// every hosted plugin — so a headset into such a tab reached none of its
+    /// effects, and a looper on it recorded silence.
+    #[test]
+    fn an_input_tab_renders_with_the_transport_stopped() {
+        let _clock = crate::test_locks::transport();
+        // A source that only plays while rolling: the default, and what a
+        // hosted plugin answers.
+        struct Rolling;
+        impl AudioSource for Rolling {
+            fn render(&mut self, out: &mut [f32], _sr: u32) -> usize {
+                out.fill(0.0);
+                out.len() / 2
+            }
+        }
+        let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 2);
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(Rolling)))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotIn {
+                slot: 0,
+                pair: Some((0, 1)),
+            })
+            .unwrap();
+        state.apply_commands();
+        state.playing.store(false, std::sync::atomic::Ordering::Relaxed);
+        for ch in state.capture.iter_mut() {
+            ch.fill(0.5);
+        }
+        state.render(16);
+        assert!(
+            state.mix[0][0].abs() > 0.1,
+            "the input never reached the mix: {}",
+            state.mix[0][0]
+        );
+    }
+
+    /// The group's meter is the sum arriving at it, not the loudest tab in it.
+    ///
+    /// Two tabs into one group read louder than either on its own, and a tab
+    /// pulled down stops feeding it — which is what the panel used to get
+    /// wrong: it took the loudest of the tabs routed there, **pre-fader**, so a
+    /// tab at zero still lit its group up.
+    #[test]
+    fn a_group_meters_what_arrives_at_it() {
+        let _clock = crate::test_locks::transport();
+        let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 0);
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(DcSource(0.4))))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(DcSource(0.4))))
+            .unwrap();
+        for slot in 0..2 {
+            cmd_tx
+                .push(EngineCommand::SetSlotDest {
+                    slot,
+                    dest: Dest::Bus(2),
+                })
+                .unwrap();
+        }
+        state.apply_commands();
+        let levels = crate::meter::bus_levels();
+        levels.reset_all();
+        state.render(16);
+        let both = levels.live(2);
+        assert!(
+            levels.live(0) < 1e-6,
+            "a group nothing is routed to reads nothing: {}",
+            levels.live(0)
+        );
+
+        // One tab pulled to silence: the group reads half of what it did.
+        cmd_tx
+            .push(EngineCommand::SetSlotMix {
+                slot: 1,
+                gain: 0.0,
+                gain_r: 0.0,
+                pan: 0.0,
+                mute: false,
+            })
+            .unwrap();
+        state.apply_commands();
+        levels.reset_all();
+        state.render(16);
+        let one = levels.live(2);
+        assert!(
+            (both - one * 2.0).abs() < both * 0.05,
+            "two tabs should read twice one: both {both}, one {one}"
+        );
+        levels.reset_all();
     }
 
     /// A subgroup is a destination that is not a device: tabs sum into it, its

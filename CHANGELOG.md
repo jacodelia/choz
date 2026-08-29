@@ -12,12 +12,560 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **670 tests** con harness + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **799 tests** con harness en todo el workspace (708 entre `choz-engine` y `choz-ui`) + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio.
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
 - `cargo test --workspace` necesita `--no-fail-fast`: uno de los binarios con
   `harness = false` no reconoce los argumentos que cargo le pasa y aborta la
   corrida. Por crate (`-p choz-engine -p choz-ui`) va entero.
+
+## [1.3.4] — 2026-08-29
+
+Cuatro días de trabajo, y el hilo que los une es el mismo: **medir antes de
+tocar**. La auditoría de DSP quedó cerrada entera, la suite de efectos se apila
+sin saturar, tres bordes del roadmap se cerraron, el MIXER dejó de gastar una
+fila en un botón, y dos bugs de la entrada de audio —que sólo aparecían con la
+interfaz delante— tienen su arreglo y su test.
+
+### 2026-08-29
+
+#### El MIXER: `O M S` en una línea, y una strip del ancho de una strip
+
+- **El destino es un botón `O`** que abre su lista. Era una fila entera de la
+  strip que imprimía `OUT` a lo ancho y, al clickearla, saltaba
+  `OUT → A → B → C → D`: cinco posiciones, ninguna visible hasta haber pasado
+  por ella, y ninguna forma de volver que no fuera seguir. Ahora abre el picker
+  que abre cualquier otro ajuste con nombre en choz — y la fila que ocupaba se
+  la quedó el fader.
+- **`O M S`, en ese orden y en una línea.** Con tres celdas cada uno mientras
+  hay lugar y con una cuando no; el área que responde al ratón incluye el
+  espacio de al lado, porque un botón de una celda es un botón que nadie acierta.
+  Un grupo no tiene destino ni solo —solear una suma es solear las pestañas que
+  la forman, que ya hacen sus propias strips—, así que ahí la fila es más corta.
+- **Una strip tiene un ancho.** El panel repartía todo el espacio entre las
+  strips que hubiera, así que un rack de tres pestañas dibujaba tres columnas
+  con sitio para aparcar un fader: eso se lee como relleno, no como un canal.
+  Ahora hay un techo (`STRIP_W_MAX`) y lo que sobra queda sobrando, que es lo
+  que hace una mesa de mezclas.
+
+#### SPLIT: SELECT y CANCEL
+
+El picker de octavas pinta, y pintar es inmediato —cada clic se oye en el
+instrumento, que es justamente para lo que sirve—, así que la única forma
+honesta de ofrecer una salida es guardar una copia de cómo estaba **al entrar**.
+Eso hace CANCEL; SELECT se queda con lo pintado. Los dos botones ya existían
+para el picker de notas del secuenciador: lo que cambió es que SPLIT también
+tiene algo que devolver.
+
+#### Dos preguntas que faltaban: al salir, y al reemplazar
+
+- **Al salir con trabajo sin guardar**, choz pregunta: guardar y salir, salir
+  igual, o quedarse. "Sin guardar" se mide comparando el proyecto entero contra
+  el último que se escribió o se leyó, y no con un flag: un flag hay que
+  ponerlo en cada camino que cambia algo, y el camino que se olvida es el que
+  pierde el set de alguien. La referencia se toma también **al arrancar**, así
+  que un rack que se abrió y nadie tocó se va sin decir nada — una pregunta que
+  aparece siempre es una pregunta que se deja de leer.
+  Guardar desde ahí sólo sale si el proyecto llegó a escribirse: uno que nunca
+  tuvo nombre abre el prompt del nombre, y salir en la mitad de eso es cómo se
+  pierde el trabajo por culpa del diálogo que estaba para salvarlo.
+- **Al reemplazar un proyecto existente** ya se preguntaba, y sigue: el prompt
+  empieza sobre "renombrar", así que Enter dos veces seguidas no es cómo se pisa
+  el set de alguien. Ahora tiene test.
+
+
+#### VST3: las secciones las dice el plugin, no el nombre del mando
+
+Un VST3 dice dónde vive cada control: `ParameterInfo::unitId` apunta a una
+unidad e `IUnitInfo` nombra las unidades y sus padres. choz no lo leía —
+adivinaba las secciones partiendo los nombres, que para Surge XT acierta y para
+cualquier otra cosa es una moneda al aire.
+
+Medido con `examples/units_probe` contra los VST3 de esta máquina:
+
+```
+Surge XT       774 params, 774 en 14 secciones: A Common, A Envelopes, A Filters…
+TyrellN6        94 params,  94 en  9 secciones: ADSR1, ADSR2, Chorus1, Core…
+TripleCheese    90 params,  90 en 11 secciones: CombSynOsc1, EffectUnit1…
+los Zam         sin unidades → siguen con la heurística por nombre, que es correcta
+```
+
+Dos decisiones adentro, y ninguna es por nombre:
+
+- **La cima del árbol se descarta**, porque un encabezado sobre la lista entera
+  no es un encabezado. Surge XT cuelga todo de una unidad llamada "Root" que a
+  su vez cuelga de "Root Unit"; las de u-he tienen una "Root" arriba. Las dos
+  caen solas con "descartar el prefijo que todos comparten", y un plugin de una
+  sola unidad termina sin sección, que es lo correcto: una sección no es una
+  sección.
+- **Lo que queda conserva su camino**, unido con `/`: un plugin con dos filtros
+  los distingue en el árbol y no en la hoja.
+
+La decisión vive en `sections_from_units`, aparte del COM, y tiene sus tests sin
+plugin: los dos árboles reales, el anidado, el de una sola unidad y uno con un
+ciclo, que no debe colgar el escaneo.
+
+
+#### Una tab alimentada por la entrada no sonaba con el transporte parado
+
+Reportado como "conecté el headset H340, le puse el looper y no funciona". El
+looper no tenía nada que ver: el slot **entero** se salteaba.
+
+```rust
+// engine.rs, en el bucle de slots
+if !playing && !slot.source.plays_on_transport_stop() { continue; }
+```
+
+Esa condición mira el *instrumento* de la tab, y un plugin alojado contesta
+`false` — es el default del trait, y lo correcto para un generador que no debe
+correr con el transporte parado. Pero una tab alimentada desde la interfaz no es
+un generador: **el audio en vivo llega porque hay algo enchufado, no porque
+alguien haya apretado play**, y choz es tanto un multiefecto como un anfitrión
+de instrumentos. Con el transporte parado —que es como se toca la mayor parte
+del tiempo— esa tab no llegaba a ninguno de sus efectos, así que el looper
+grababa silencio y se leía como roto.
+
+Ahora la condición pregunta primero si la tab tiene entrada:
+
+```rust
+if !playing && slot.in_pair.is_none() && !slot.source.plays_on_transport_stop() { continue; }
+```
+
+Test `an_input_tab_renders_with_the_transport_stopped`, comprobado quitando el
+arreglo: sin él la mezcla queda en 0.
+
+### 2026-08-28 · una entrada de audio abre su propia tab
+
+Reportado: con la tab de un Keystation Pro 88 abierta, elegir un canal de audio
+en el cajón IN **se lo montaba encima a esa tab** en vez de abrir una nueva. Lo
+que pasaba es exactamente eso: `InTarget::Channel` llamaba a
+`set_active_capture`, que le pone el `in_pair` a la pestaña activa — así que la
+tab del teclado quedaba alimentada por un micrófono, y del teclado no se oía
+nada.
+
+La mitad de notas de ese mismo cajón ya hacía lo correcto desde siempre:
+`bind_selected_input` va a la tab ligada a ese puerto, y si no hay ninguna, crea
+una. Ahora el audio es su gemelo, `open_capture_tab`, con la misma forma: **una
+entrada es algo que llega, y lo que llega necesita a dónde llegar**.
+
+- La tab de adelante **no** es una tab de entrada → el jack abre su propia tab
+  (o va a la que ya lo tiene, igual que un puerto de notas).
+- La tab de adelante **sí** es una tab de entrada → los picks siguen armando su
+  par, que es la única forma de decir "estos dos jacks son una entrada": uno es
+  mono, el segundo lo hace estéreo, y el último lo devuelve a su instrumento.
+
+El caso del rack vacío, que era la razón de que esto llamara a `ensure_slot`,
+cae solo: la tab que hacía falta es justamente la que se abre.
+
+### 2026-08-28 · tres bordes del MIXER y del gate
+
+Tres de los que quedaban en [docs/roadmap.md](docs/roadmap.md), y los tres eran
+lo mismo visto de tres lados: un control existía y no se podía alcanzar.
+
+#### El medidor de un grupo era el más fuerte de sus tabs
+
+El panel tomaba, de los tabs ruteados a un grupo, el **más alto de sus picos y
+pre-fader**, que responde otra pregunta: dos tabs suaves sumando en un grupo son
+más fuertes que cualquiera de los dos, y un tab bajado a cero seguía prendiendo
+su grupo. Ahora el nivel se lee **en el engine, donde el grupo se suma** —
+después del fader de cada tab y antes del propio, que es exactamente donde se
+lee el de un tab. `meter::bus_levels()` es el mismo `SlotLevels` con una entrada
+por grupo, y `publish_pair` lo llena sin interleavear un búfer para eso. Test:
+dos tabs en un grupo leen el doble que uno.
+
+#### Los grupos y el main, desde el teclado
+
+Las flechas del MIXER paraban en el último tab: en una máquina que se toca en
+vez de apuntarse con el ratón, los faders de grupo y el main **no se podían
+alcanzar**. Ahora las flechas caminan todas las strips —tabs, los cuatro grupos,
+el main— y todo lo que una strip tiene responde a las mismas teclas que en un
+tab: `m` silencia, las flechas mueven el fader, `,`/`.` panean donde hay dónde
+panear, `l` liga los dos lados del main. Lo que una strip no tiene —un grupo no
+tiene pan ni solo— simplemente no hay que apretarlo.
+
+Los movimientos van por los mismos `set_strip_gain` / `set_strip_pan` /
+`toggle_strip_mute` que ya usaban el ratón y un CC aprendido, así que un fader
+no puede comportarse distinto según qué lo movió. El cursor se guarda como
+`desk_strip: Option<usize>` —desplazamiento dentro del desk, no índice absoluto—
+porque los tabs van y vienen debajo: un rack que pierde un tab no puede dejar el
+cursor apuntando al grupo de al lado. La strip bajo el teclado se dibuja
+iluminada, los grupos incluidos.
+
+#### Un gate abierto por lo que se toca, no por lo que suena
+
+`GateSource::Tab` lee el nivel de otra tab, que es la respuesta correcta para un
+bombo y la equivocada para un pad sosteniendo un acorde debajo de todo: silencio
+a propósito, nunca cruza el umbral, así que no podía manejar un gate. Nueva
+fuente **`GateSource::Note(tab)`**: la velocity cuando llega la nota, decayendo
+en un octavo de segundo — la misma forma que el pulso del beat, para que un gate
+se sienta igual lo maneje quien lo maneje.
+
+Se publica donde la nota **llega al slot** y no donde el slot se renderiza, así
+que un instrumento callado igual lo mueve; nada se consume al leer, así que dos
+gates sobre la misma tab ven la misma nota; y el reloj es de pared y no el
+transporte, porque tocar con el transporte parado es la mitad de las veces que
+se toca. En el picker cada tab aparece dos veces —lo que suena y lo que se toca,
+con un ♪— y en el proyecto se guarda como `note:<tab>` dentro del nombre que el
+formato ya tenía, así que un choz viejo abre el archivo igual.
+
+### 2026-08-28 · auditoría de apilado
+
+**¿Se pueden encadenar estos efectos sin que sature?** Uno solo es fácil de
+mantener bajo escala completa; la cadena es donde se rompe, porque cada efecto
+está hecho para sonar bien solo y cinco que suman 3 dB suman 15. Medido con
+`cargo test --release -p choz-ui -- --ignored --nocapture measure_stacking`: los
+46 built-ins **con los mandos que el rack le da a un efecto recién agregado**,
+solos, en los 2 070 pares posibles, y apilados de a ocho. Pico y no RMS: lo que
+un conversor hace pasando de 1.0 es clipear, y una muestra de más es un click.
+
+Al empezar, con una señal de bus a −8,7 dBFS de pico:
+
+| | antes | ahora |
+|---|---|---|
+| El más fuerte solo | protocosmos **+9,13 dB** (pico 1,045: clipea solo) | protocosmos +3,69 dB |
+| Segundo | cassette +4,62 dB | flanger +2,16 dB |
+| Pares que pasan de escala | **46 de 2 070** | **0 de 2 070** |
+| Los ocho más fuertes, apilados | +14,42 dB (pico 1,922) | +2,31 dB (pico 0,477) |
+
+Y los 46 pares que se pasaban tenían todos el mismo nombre adentro: los ocho más
+fuertes **sin** protocosmos apilados daban +0,95 dB. Era un efecto, no la suite.
+
+Lo que se cambió, que son dos números:
+
+- **Protocosmos sumaba sus granos sin normalizar.** Los granos leen el búfer a
+  offsets separados por el spray, o sea que están descorrelacionados: sus
+  *potencias* se suman, y `n` de ellos son `√n` más fuertes que uno. Sin eso, el
+  mando `Density` era el volumen. Ahora la nube se divide por `√n` (una tabla de
+  trece entradas, ningún `sqrt` por sample), **antes** de que la realimentación
+  la lea, así que la densidad tampoco puede empujar el lazo.
+- **La cinta subía 4,6 dB con su drive por defecto**, el built-in más fuerte de
+  la suite. Un saturador es una *forma*, no un volumen: si el drive decide
+  también cuánto suena, el nivel salta cada vez que cambia el carácter. Ahora
+  lleva compensación de medio drive en dB (`1/√drive`) — no entero, porque una
+  cinta que se hace más silenciosa cuanto más fuerte se la pega tampoco es una
+  cinta. Queda en +1,61 dB.
+
+El test `no_built_in_effect_is_a_gain_stage` fija las dos propiedades sobre la
+lista entera: ningún built-in suma más de 4,5 dB con sus defaults, y los ocho
+más fuertes apilados no pasan de 6. Los dos arreglos se comprobaron quitándolos
+—el test dice `protocosmos adds 9.13 dB` y `cassette adds 4.62 dB`— y mide dos
+segundos de señal a propósito: una nube granular tarda cerca de un segundo en
+llegar a los granos con los que se queda, y medio segundo se pierde lo más
+fuerte que hace.
+
+Lo que queda dicho y no arreglado: con la entrada a −2,7 dBFS —un tab caliente—
+57 de los 2 070 pares pasan de escala, el peor a 1,34. Eso ya no es un efecto
+que amplifique, es gain staging: quedan 2,7 dB de headroom y casi cualquier
+cadena se los come. El sitio para resolverlo es el fader del tab, que es donde
+está.
+
+### 2026-08-28 · la auditoría de efectos, cerrada
+
+Se siguen los pendientes que dejó la auditoría del 27, en su orden de daño
+audible: los puntos 7 a 11 de [docs/roadmap.md](docs/roadmap.md).
+
+#### El offset que la cinta y el vinilo dejaban puesto
+
+`saturator` y `utility` tenían bloqueador de DC; `cassette` y `vinyl` no, y lo
+que dejan se suma a lo largo de una cadena y se come headroom. Medido con media
+onda de un seno de 220 Hz a 0.8, la media del último décimo de segundo a la
+salida: **cassette 0.346, vinyl 0.256**. Con el bloqueador, las dos por debajo
+de 0.01.
+
+El `DcBlock` que vivía privado dentro de `saturator.rs` es ahora `fx/dc.rs` —un
+polo a 10 Hz, bajo para no tocar un bajo y alto para que un cambio de bias se
+asiente en decenas de milisegundos— y lo usan los tres. Sus dos tests dicen las
+dos mitades: un offset constante se va, y un 60 Hz pasa entero.
+
+#### El cutoff del SVF y el tiempo del delay ya no saltan
+
+`Svf::set_cutoff` recalculaba `g = tan(πf/sr)` en el acto, que es un escalón en
+el coeficiente; `delay.rs` movía el cabezal de lectura de golpe. Los dos se oyen
+igual: un click, y en el delay además un escalón de afinación.
+
+- **SVF**: el cutoff se suaviza en **octavas** (`log2`), 15 ms, y los
+  coeficientes se rehacen cada 16 samples mientras se mueve — un `tan()` por
+  sample era pagar el hallazgo F4 para arreglar el F3. Medido con el cutoff
+  yendo de punta a punta cada bloque, el peor salto entre samples pasa de
+  **0.635 a menos del triple del que el filtro hace quieto** (0.028).
+- **Delay**: el tiempo camina a su destino en 80 ms y se lee con
+  `read_frac`, así que un cambio de tiempo glisa como una cinta en vez de
+  saltar. El peor salto pasa de **0.883** a la misma vecindad del quieto.
+  `set_param(0, …)` llamaba a mano a `delay_frames` y se saltaba el suavizado:
+  ahora pasa por `set_delay_ms`.
+
+Cada uno con su test, y los tres tests fallan si se les quita la pieza que
+prueban — se comprobó quitándola.
+
+#### La línea de retardo compartida, en el delay y en el granular
+
+Fase 9 de la auditoría. `fx/delay_line.rs` existía desde el 27 y la usaban el
+chorus, el flanger y el reverb; el `delay` y el `gran_delay` seguían con la suya,
+dimensionada en **samples** y leída en lineal dentro del lazo.
+
+- **`delay`**: dos `Line::with_ms(2000)` en lugar de dos `Vec<f32>` de 192 001
+  samples —que son 4 s a 48 kHz y **1 s a 192**, así que un delay de 1.5 s se
+  volvía uno de 1 s en una interfaz rápida— y el camino realimentado pasa a
+  `read_cubic`. La escritura va por `safe()`, así que la cola llega a cero en
+  vez de molerse en denormales. El clamp de `set_delay_ms` baja de 4 s a 2, que
+  es la escala que `params()` reporta desde siempre y el doble de lo que el
+  mando alcanza. Cuesta 4 MB por instancia en vez de 1,5.
+- **`gran_delay`**: un grano deja de ser una posición absoluta y pasa a ser una
+  **distancia al cabezal de escritura**, que se cierra a `1 - speed` por sample
+  — que es lo que le permite leer de la línea compartida. El tap realimentado va
+  en cúbica y los granos, que salen y no vuelven, en lineal. Un grano que
+  alcanza al cabezal ahora **se termina**; antes daba la vuelta al búfer, que es
+  saltar a audio de un retardo entero de distancia: un click con scatter alto.
+- **`beat_repeat` no lleva línea de retardo y no se le puso una**: captura
+  lineal, lectura entera hacia adelante, sin realimentación ni lectura
+  fraccionaria. Forzarla habría sido diff sin sonido. Lo que sí tenía era el
+  hallazgo F1: `CAPACITY_FRAMES` medido en samples, o sea 8 s de grano a 48 kHz
+  y 2 s a 192. El techo del grano ahora está en **segundos** — dos, en cualquier
+  interfaz. El búfer no cambió de tamaño.
+
+Tres tests nuevos, los tres comprobados quitando la pieza que prueban: un delay
+de 1,5 s vuelve a los 1,5 s a 192 kHz, la nube del granular con realimentación
+0.9 y scatter abierto queda acotada y llega al silencio, y el mismo grano dura
+lo mismo a 48 y a 192 kHz.
+
+Queda `space_echo` con línea propia, a propósito: la fase 6 ya le quitó la
+allocation y le dimensionó los búferes por tiempo, así que no tiene ninguno de
+los dos bugs por los que la línea compartida existe.
+
+#### Aliasing: lo que cada uno ponía en la salida y no estaba en la entrada
+
+Fase 10, y una auditoría antes que un arreglo: `examples/alias_probe` mide, con
+un tono puro adentro, cuánta energía sale en frecuencias que no son del sonido.
+Queda en el árbol porque es con lo que se comprueba lo que sigue.
+
+- **Vocoder**: la sierra y el pulso se contaban directo del acumulador de fase,
+  o sea con un flanco vertical, o sea con armónicos por encima de Nyquist que no
+  desaparecen: se pliegan y caen en frecuencias que **no** son múltiplos de la
+  nota. Medido en la portadora sola a 356 Hz —el mando llega a 400—: **−20,2 dB
+  de energía inarmónica, y −31,7 con la corrección BLEP**. Ahora las dos formas,
+  y las sierras del acorde, llevan `poly_blep`: una comparación por sample.
+- **Shifter de voces** (`shift.rs`, que usan el armonizador y el shimmer): la
+  lectura pasó de lineal a la cúbica de la línea compartida —un 14 kHz sostenido
+  sale **2,1 dB abajo en vez de 3,6**— y la ventana dejó de medirse en samples.
+  Eran 2048, que son 43 ms a 48 kHz y **11 a 192**: la misma armonía ondulaba
+  cuatro veces más rápido en una interfaz rápida. El crossfade `sin²`/`cos²` es
+  ahora un par de smoothsteps que suman exactamente uno igual, sin dos
+  trascendentales por sample por voz —ocho voces son 768 000 por segundo— y
+  medido no cambia el resultado en ningún punto. También se borró `tap()`, que
+  no llamaba nadie.
+- **Frequency shifter**: pedía `cos` y `sin` de un ángulo que crece, cuatro
+  trascendentales por frame, para girar siempre lo mismo. Ahora la portadora es
+  un punto en el círculo unidad que se multiplica por la rotación de un sample
+  —calculada una vez por bloque— con un paso de Newton por bloque para que no se
+  salga del círculo. **De 2,38 a 1,18 ms de CPU por segundo de audio**, con los
+  artefactos donde estaban (−43 a −55 dB, que es el residuo del par de Hilbert).
+
+Lo que se midió y **no** se arregló: los dos cabezales del shifter están a media
+ventana de distancia, así que peinan una nota aguda pase lo que pase con el
+interpolador. Eso pide otro shifter, no otra lectura.
+
+#### La ley de la mezcla, y qué medía el hallazgo en realidad
+
+Fase 11, la última de la auditoría. El hallazgo decía que cada efecto se
+inventaba su dry/wet. Medido con `examples/mix_probe` —el mismo ruido con una
+nota adentro por los 46, a cuatro posiciones del mando—, **44 de los 46 ya
+hacían exactamente lo mismo**: `out = dry + wet·(procesado − dry)`.
+
+Los dos que no:
+
+- **Delay**: sumaba el eco al dry, así que `Wet` era un nivel de envío —
+  subirlo sólo podía hacer la pestaña más fuerte y nunca podía sacar el dry. Ya
+  cruza como los demás; a wet 1 se oyen los ecos y nada más, que es lo que hace
+  cualquier delay de cualquier host. Su valor por defecto sigue siendo 0,5.
+- **Looper**: suma, y se queda sumando. Sus tomas suenan **debajo** de lo que se
+  está tocando; un crossfade bajaría el instrumento en las manos a medida que
+  suben los loops, que es lo único que un looper no puede hacer. Dicho en el
+  código y en el trait.
+
+La ley quedó escrita donde se la va a leer: el doc de `FxProcessor::set_mix`. Y
+el test que la cubre corre sobre **la lista entera de built-ins**: con el
+dry/wet en cero, ninguno mueve el nivel más de 0,5 dB. Es una propiedad, y caza
+la familia entera — el que se olvidó de aplicar la mezcla, el que trae una
+ganancia horneada, el que suma cuando debería cruzar. Comparado por nivel y no
+sample a sample porque el compresor y el AutoTune retrasan el dry para alinearlo
+con su propia latencia, que está bien.
+
+Lo que **no** se tocó, y por qué: a media posición el nivel va de +2,9 dB en
+protocosmos a −9,0 en el shimmer. Eso no es la ley, es cuánto sale cada efecto,
+y emparejarlo querría medir los 46 contra programa real en vez de contra ruido.
+La tabla queda en el ejemplo para quien quiera hacerlo.
+
+**Con esto la auditoría de los 46 efectos está cerrada entera.**
+
+### 2026-08-26 / 27
+
+Tres cosas, y las tres empezaron como un pedido de interfaz y terminaron en el
+DSP. El looper multipista llegó a su tira de canal; agregarle un reverb a la
+cadena borraba lo grabado; y auditar por qué eso pasaba destapó que el reverb
+era un Freeverb de 1997 y que media suite de efectos tenía el mismo tipo de
+problema.
+
+#### El looper: la tira de canal, sin una palabra adentro de un botón
+
+```text
+┌ CHANNEL 1 ──────────────[×]┐
+│ ▓▓▓▓█░░░  -6.2             │   ← RMS relleno, pico montado encima
+│────────────────────────────│
+│ ♩   Q   M   S              │
+│ LEVEL ████████ 100%        │
+│ L───●───R  C               │
+│────────────────────────────│
+│ ■   ▶   ●                  │
+└────────────────────────────┘
+ +   CLEAR   EXPORT
+```
+
+Las palabras adentro de los botones eran lo que hacía que las filas dependieran
+del idioma y del ancho que el panel tuviera — `QUANTIZE 1 COMPÁS` rompía la fila
+al minimizar los cajones IN/OUT. **El color es cómo un símbolo dice qué botón
+es**: `M` y `S` tienen la misma forma, blanco y ámbar no. Cada uno con su gemelo
+apagado, así la tira se lee igual haya algo activado o no.
+
+Lo que se agregó por canal: mute, solo, paneo y volumen (los dos últimos,
+sliders — donde cae el clic *es* el valor), un `[×]` en la esquina que tira el
+canal, y un monitor de actividad con RMS y pico. La cuantización abre un modal
+en vez de ciclar en el botón. `METRO` pasó a ser `♩`, el mismo glifo de la barra
+de arriba, porque es el mismo metrónomo.
+
+Los índices de `P_STATE`, `P_MUTE`, `P_QUANT` y `P_CHANS` no se movieron: los
+bloques nuevos van después, así que un proyecto guardado antes abre igual. Un
+`P_VOL` que no está se lee como unidad, no como silencio.
+
+#### El bug que hacía que grabar no se oyera
+
+`REC` apretado por segunda vez manda `P_PLAY`, que llegaba a `Cmd::Play` →
+`start_play`, y eso **ponía el estado en Playing sin cerrar la toma**. Cerrar es
+lo que congela `loop_frames`, manda a casa el trozo a medio escribir y deja la
+pista sonando; sin eso `loop_frames` quedaba en cero, la rama de reproducción
+nunca corría, y apretar `REC` dos veces era silencio.
+
+Arreglado en `start_play`, donde entran todos los llamadores — la interfaz, un
+CC aprendido y un host.
+
+#### Agregar un efecto borraba las tomas
+
+`set_slot_fx` reconstruye **todos** los procesadores desde sus specs, y un deck
+construido desde un spec es un deck vacío: todo lo grabado estaba en el
+procesador que se iba a tirar. Un delay que pierde su cola en un rebuild es un
+sonido; un looper que pierde sus tomas son minutos de tocar, perdidos porque
+alguien buscó un reverb.
+
+Ahora el deck **se lleva** de una cadena a la otra, emparejado por su posición
+entre los decks de cada una: un `std::mem::swap` de dos `Box`, dos punteros, sin
+allocar ni liberar nada, así que es seguro en el hilo de audio
+(`RtState::carry_loop_decks`). `FxProcessor::is_loop_deck()` es lo que lo hace
+posible — `loopdeck()` no sirve, porque el handle ya se entregó — y los wrappers
+`Metered` y `Gated` lo reenvían, como con `loopdeck()`.
+
+#### Reverb: de Freeverb a una FDN
+
+Documentado entero en [docs/reverb.md](docs/reverb.md).
+
+Un comb es un resonador: su cola es un acorde de sus propios múltiplos de `1/T`,
+y ocho combs son ocho acordes. Eso *es* el timbre metálico, y más combs son más
+acordes. De ahí salían también el `input * 0.015` —nadie calculó la ganancia
+resonante, así que se bajaba la entrada hasta que dejaba de explotar—, el
+`room_size → feedback` —el decay no era un tiempo— y el estéreo de
+`tuning + 23 samples`, que es la misma señal dos veces corrida.
+
+Lo nuevo: FDN 4×4 / 8×8 con matriz Householder × diagonal ±1 × rotación coprima
+—ortogonal, `O(N)`—, `g_i = 10^(−3·T_i/RT60)` con `RT60 = 0.2·60^decay`
+(0.2 / 1.55 / 12 s), ocho early reflections por lado que no coinciden entre
+lados, difusión allpass a la entrada y a la salida, damping y low cut **dentro**
+del lazo, interpolación Catmull-Rom en las líneas realimentadas, cinco
+caracteres (Room / Hall / Chamber / Plate / Ambient) sobre un solo motor, dos
+calidades sin allocar al cambiar, y freeze.
+
+Los cuatro primeros índices de parámetros no se movieron —`Room` se llama `Size`
+y significa lo mismo— así que un proyecto viejo abre con su reverb intacto.
+
+Medido con `cargo run --release --example reverb_bench`, que cuenta las
+allocations con un allocator envolvente en vez de afirmar que no hay:
+
+```
+Economy (4×4 FDN)   0.83% de un core   ×120 realtime   0 allocations
+High    (8×8 FDN)   1.34% de un core   × 75 realtime   0 allocations
+por tamaño de bloque (32 / 128 / 512 / 2048): 1.34 – 1.35%
+```
+
+El test de bloque compara **bit a bit** entre 32 y 1024 frames: todo lo que se
+mueve es un `Smoothed` avanzado por sample, así que nada en el algoritmo sabe
+dónde termina un bloque.
+
+El shimmer lleva el reverb adentro de su lazo y su voicing dependía de que el
+Freeverb fuera accidentalmente flojo ahí. Se le fijó el decay interno en los ~3 s
+que el viejo daba, y su test pasó a medir el reclamo real —"el octavo gana
+terreno sobre el fundamental cuando la nota para"— en vez del umbral absoluto
+que estaba calibrado contra el motor viejo.
+
+#### Auditoría de los 45 efectos
+
+Entera en [docs/fx-audit.md](docs/fx-audit.md), con archivo y línea por
+hallazgo. Lo que ya estaba bien —`compressor`, `parametric_eq`, `saturator`,
+`pedal`, `filter`— no se tocó: habría sido cambio sin beneficio audible.
+
+Lo que se arregló:
+
+- **Búferes en samples, no en tiempo.** El chorus tenía `4096` samples, que son
+  93 ms a 44.1 kHz y **21 ms a 192**; sus clamps de retardo y profundidad se
+  calculaban contra eso, así que el mismo patch era otro efecto en otra
+  interfaz. Igual el flanger (2048), e igual el `hold` del bitcrusher, que era
+  una cuenta de frames y ahora es una frecuencia en hertz.
+- **Interpolación lineal en lazo realimentado.** Un promedio de dos taps es un
+  pasabajos: −3.0 dB en fs/4 y −0.68 en fs/8. Leído una vez, nada; leído en cada
+  pasada de un lazo, la resonancia de un flanger a 0.9 sale sorda — y sorda en
+  cantidad variable, porque la fracción barre con el LFO. El cúbico está 1.1 dB
+  y 0.08 dB en esos mismos puntos.
+- **Sin smoothing donde se mueve un puntero o un coeficiente.** 36 de 45
+  efectos. Un salto de tiempo de retardo se oye dos veces: click y escalón de
+  afinación.
+- **Una allocation en el hilo de audio.** `space_echo` hacía
+  `*self = SpaceEcho::new(...)` adentro de `process_block` en un cambio de rate.
+  Ahora los búferes se dimensionan para el rate máximo y un cambio sólo mueve
+  las longitudes de lectura.
+- **Denormales sin flush en lazos.** El efecto se volvía *más caro* al quedarse
+  en silencio, que es cuando el host menos lo espera.
+
+Sale de ahí `fx/delay_line.rs`: una línea fraccionaria potencia de dos
+dimensionada en milisegundos al rate máximo, lectura lineal (taps que salen) y
+Catmull-Rom (lo que vuelve), `safe()` que descarta NaN, infinitos y denormales
+en cada escritura, `soft_clip` transparente por debajo de la rodilla, y un LFO
+cúbico C¹ en el wrap. El reverb pasó a usarla sin cambiar un sample de su
+salida.
+
+#### Dos hallazgos que se retiraron después de medirlos
+
+Van acá porque el callejón sin salida es parte del historial.
+
+**El estéreo del chorus.** Su LFO derecho está a medio ciclo, que es exactamente
+`−lfo_l`: los dos cabezales se mueven en espejo, que es la forma que suele
+significar "el efecto desaparece al sumar a mono". Se cambió a cuadratura, se
+escribió el test… y el test pasaba con las dos. Medido lado a lado con el mismo
+ruido, el mismo LFO y el mismo búfer:
+
+```
+anti-phase  : movimiento en mono 0.68445, ratio 1.313
+quadrature  : movimiento en mono 0.68498, ratio 1.314
+```
+
+Una décima de por mil. El error de razonamiento: lo que se cancela son los dos
+*valores del LFO*, no el audio que producen — un retardo no es una función
+lineal de su tiempo de retardo, así que `d(base+m) + d(base−m)` no es
+`2·d(base)`. Se revirtió el offset en vez de cambiarle el carácter estéreo al
+efecto sobre un diagnóstico equivocado, y el test se quedó como lo que sí es:
+una propiedad, con el número en el comentario.
+
+**El indexado sin chequear.** `delay_line.rs` usó `get_unchecked` un rato: es el
+lazo más caliente del crate y todos los índices están enmascarados por
+construcción. Medido contra el benchmark del reverb —33 lecturas por frame sobre
+ocho líneas realimentadas— compró **0.018 % de un core**: 1.340 % contra
+1.358 %. Cuatro bloques `unsafe` en un camino de realimentación no valen una
+cincuentava parte de un por ciento, así que los chequeos se quedaron.
 
 ## [1.3.3] — 2026-08-23
 

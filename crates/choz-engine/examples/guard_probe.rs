@@ -20,7 +20,10 @@ fn run(name: &str, sr: f32, amp: impl Fn(f32) -> f32, secs: f32) {
             marks.push(format!("{gain:.2}"));
         }
     }
-    println!("{name:<22} worst {worst:.3}  gain each 250 ms: {}", marks.join(" "));
+    println!(
+        "{name:<22} worst {worst:.3}  gain each 250 ms: {}",
+        marks.join(" ")
+    );
 }
 
 fn main() {
@@ -30,15 +33,33 @@ fn main() {
     // A slower swell, the way a singer actually enters a long note.
     run("sung swell 600 ms", sr, |t| (t / 0.6).min(1.0) * 0.4, 4.0);
     // A held note with vibrato on it.
-    run("sung + vibrato", sr, |t| {
-        (t / 0.3).min(1.0) * 0.35 * (1.0 + 0.25 * (t * 5.0 * std::f32::consts::TAU).sin())
-    }, 4.0);
+    run(
+        "sung + vibrato",
+        sr,
+        |t| (t / 0.3).min(1.0) * 0.35 * (1.0 + 0.25 * (t * 5.0 * std::f32::consts::TAU).sin()),
+        4.0,
+    );
     // The hardest case for any rule of this shape: a slow operatic crescendo,
     // which really is 1.5 s of continuous growth and which the guard cannot
     // tell from a slow loop by growth alone.
-    run("crescendo 2 s", sr, |t| (0.06 + 0.3 * (t / 2.0).min(1.0)).min(1.0), 5.0);
+    run(
+        "crescendo 2 s",
+        sr,
+        |t| (0.06 + 0.3 * (t / 2.0).min(1.0)).min(1.0),
+        5.0,
+    );
     // A real loop: 6 dB a second, forever, from something already audible.
-    run("howl +6 dB/s", sr, |t| (0.06 * 2.0f32.powf(t)).min(1.0), 4.0);
+    run(
+        "howl +6 dB/s",
+        sr,
+        |t| (0.06 * 2.0f32.powf(t)).min(1.0),
+        4.0,
+    );
     // A fast one.
-    run("howl +18 dB/s", sr, |t| (0.06 * 8.0f32.powf(t)).min(1.0), 4.0);
+    run(
+        "howl +18 dB/s",
+        sr,
+        |t| (0.06 * 8.0f32.powf(t)).min(1.0),
+        4.0,
+    );
 }
