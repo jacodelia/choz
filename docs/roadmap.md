@@ -8,10 +8,11 @@ cierra, para que lo que quede sea sólo lo que queda: se podó entero el
 2026-08-19, el 2026-08-29 y el 2026-08-31, y las tres veces lo que decía "hecho"
 se fue al changelog.
 
-**Hoy no falta nada pedido.** Lo que queda son dos decisiones de no hacer y las
-notas para el que retome.
+**Hoy no falta nada pedido.** Lo que queda son dos cosas sin cerrar —una
+decisión de diseño y un fallo intermitente sin explicar—, dos decisiones de no
+hacer, y las notas para el que retome.
 
-Última actualización: 2026-08-31.
+Última actualización: 2026-08-31 (1.3.5 publicada).
 
 ## Estado en una línea
 
@@ -53,18 +54,70 @@ donde se van a leer.
 
 ## Pendiente
 
-**No queda nada.** Ningún punto pedido, ningún borde, ninguna auditoría
-abierta: todo lo que se pidió está hecho y contado día por día en el
-[changelog](../CHANGELOG.md). Lo que sigue son las **dos piezas que se decidió
-no hacer**, con su porqué, y lo que hay que saber antes de tocar cada zona del
-código. Un punto que se cierra sale de aquí — este documento es lo que queda, no
-lo que hubo.
+**Ningún punto pedido, ningún borde, ninguna auditoría abierta.** Todo lo que se
+pidió está hecho y contado día por día en el [changelog](../CHANGELOG.md). Lo
+que queda son **dos cosas sin cerrar** —una decisión que no es mía y un fallo
+que no supe reproducir— y después las dos piezas que se decidió no hacer. Un
+punto que se cierra sale de aquí: este documento es lo que queda, no lo que
+hubo.
 
 Las dos auditorías —la de DSP y la de guardado— viven enteras en
 [fx-audit.md](fx-audit.md), con el archivo y la línea de cada hallazgo: la
 sección 6 tiene lo único que se midió y se decidió **no** arreglar (el peine del
 shifter de voces), y la 7 lo que hay que saber antes de tocar el guardado de un
 efecto. No se repiten acá.
+
+### 1 · El CC 7 que llega al SoundFont (abierto desde el 2026-08-31)
+
+**Falta una decisión, no código.**
+
+`Sf2Synth::control_change` reparte cualquier CC entrante a los nueve canales de
+la tab. Con el CC 7 —volumen de canal GM— eso significa que **el slider de un
+teclado es un segundo control de volumen peleando con el fader VOL de la tab**,
+y peleando a escondidas: no se dibuja en ningún lado y no se guarda en el
+proyecto.
+
+Lo que se arregló el 2026-08-31 fue la mitad incoherente: el canal 0 se quedaba
+con el CC y las zonas volvían a 100 en el siguiente `push_split`, así que un
+sonido quedaba 15,2 dB por debajo de sus vecinos. Ahora los nueve pierden la
+pelea igual — el CC 7 dura hasta el próximo cambio de programa, en todos.
+
+Eso es coherente pero no es obviamente lo correcto. Lo que encaja con el resto
+de choz es que **el CC 7 no llegue al sintetizador**: el volumen de la tab es su
+fader, y un mando de un controlador se ata a lo que uno quiera con MIDI learn,
+como cualquier otro. Cambia comportamiento —quien hoy usa el slider de su
+teclado sobre una tab de SF2 lo perdería hasta aprenderlo— así que no se hizo
+solo.
+
+Las dos salidas, para el que retome:
+
+| | Qué pasa con el slider del teclado |
+|---|---|
+| **Como está** | Baja el SoundFont hasta el próximo cambio de sonido, y después vuelve solo. |
+| **Filtrando el CC 7** | No hace nada hasta que se lo aprende; aprendido, mueve lo que se le haya atado (el VOL de la tab, lo natural). |
+
+### 2 · `cargo test --workspace` falla de a varios, de tanto en tanto
+
+**Visto dos veces, sin explicar y sin nombres**: una corrida con **14** tests de
+`choz-engine` fallando de golpe y otra con **7**. Las dos veces la corrida
+siguiente pasó limpia, y por crate (`-p choz-engine`) nunca falló.
+
+No es ninguno de los dos flakes que sí se cerraron el 2026-08-30 —el medidor de
+AutoTune y `capture_health`—: ésos fallaban **de a uno**.
+
+**El error de método, dicho para no repetirlo**: las dos veces se pidió la lista
+de nombres corriendo `cargo test` *de nuevo*, y esa corrida pasó, así que los
+nombres se perdieron. Hay que sacarlos de la misma corrida:
+
+```bash
+cargo test --workspace > /tmp/ws.log 2>&1
+grep -E '^---- ' /tmp/ws.log      # los nombres, si falló
+```
+
+La hipótesis es la máquina cargada —el workspace corre varios binarios de test a
+la vez y varios hacen `dlopen` de plugins reales, con la inicialización global
+que eso trae— pero **no está verificada**, y hasta tener los nombres no se puede
+verificar.
 
 ## Las dos piezas que quedan fuera, por decisión
 
@@ -119,6 +172,9 @@ demás (transporte y después medidor). En `choz-ui` el par es `ui_guard()` y
 Un test que lee un global para comprobar algo de *su* objeto está mal escrito:
 pregúntele al objeto. `AutoTune::reading()` existe por eso.
 
+Eso explica los flakes que **fallan de a uno**. El que falla de a varios sigue
+sin explicar — ver **Pendiente 2**.
+
 ### Y lo de siempre
 
 **Mirar con el equipo delante.** Léase el primer punto de los gotchas antes de
@@ -133,18 +189,8 @@ contra una habitación.
   mandársela a los nueve: el CC 7 que se mandaba a las zonas en cada
   `push_split` y al canal 0 sólo al cargar dejaba el sonido propio de la tab
   15,2 dB por debajo en cuanto el teclado movía su slider de volumen
-  (2026-08-31). Sigue abierto, como decisión de diseño: que un CC 7 entrante
-  llegue al sintetizador es un segundo control de volumen peleando con el fader
-  VOL, escondido — lo coherente sería que fuera un destino de MIDI learn y no un
-  paso directo.
-- **`cargo test --workspace` falla de tanto en tanto con varios tests de
-  `choz-engine` a la vez** —14 una vez, 7 otra— y no se reprodujo nunca al
-  correrlo de nuevo, ni por crate. No están capturados los nombres: las dos
-  veces se corrió un `cargo test` *nuevo* para pedirlos, y ese pasó. **Si vuelve
-  a pasar, hay que sacar los nombres de la misma corrida** (`cargo test
-  --workspace > log 2>&1` y después buscar `^---- ` en ese archivo). Encaja con
-  la máquina cargada —el workspace corre varios binarios de test a la vez y
-  varios hacen `dlopen` de plugins reales— pero eso no está verificado.
+  (2026-08-31). Lo que queda abierto de eso es una decisión, y está arriba, en
+  **Pendiente 1**.
 
 - **La ventana del shifter de voces está escrita como `2048 / 48` a propósito**
   (2026-08-28). Es tiempo, no samples, pero el número es el viejo conteo sobre
