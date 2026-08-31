@@ -39,6 +39,25 @@ impl Default for Expander {
 }
 
 impl super::FxProcessor for Expander {
+    /// The five knobs the rack draws, in `set_param` order. No dry/wet: an
+    /// expander that is half in is a gate that does not gate.
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        vec![
+            FxParam::new("Thresh", 1.0 + self.threshold_db / 80.0, -80.0, 0.0, "dB"),
+            FxParam::new("Ratio", (self.ratio - 1.0) / 9.0, 1.0, 10.0, ":1"),
+            FxParam::new("Attack", (self.attack_ms - 0.1) / 49.9, 0.1, 50.0, "ms"),
+            FxParam::new(
+                "Release",
+                (self.release_ms - 10.0) / 990.0,
+                10.0,
+                1000.0,
+                "ms",
+            ),
+            FxParam::new("Range", self.range_db / 80.0, 0.0, 80.0, "dB"),
+        ]
+    }
+
     /// Live, so a knob turn does not rebuild the chain — which would reset
     /// every other effect's tail along with this one's envelope.
     fn set_param(&mut self, index: usize, value: f32) {

@@ -236,3 +236,105 @@ fn render_note(inst: &mut DssiInstrument, label: &str) -> Vec<f32> {
     }
     captured
 }
+
+/// A port whose positions have names comes back with them.
+///
+/// LADSPA's ABI cannot say this — a hint gives the *count* and nothing else —
+/// so the names come from the metadata files beside the plugins, which is what
+/// every other host reads them from too. Skipped when neither the plugins nor
+/// their metadata are installed.
+#[test]
+fn a_ports_named_positions_come_from_the_metadata_beside_the_plugin() {
+    let _g = plugin_lock();
+    let found = ladspa();
+    if found.is_empty() {
+        eprintln!("no LADSPA plugins installed; skipping");
+        return;
+    }
+    let named: Vec<(&str, &choz_ports::PluginParam)> = found
+        .iter()
+        .flat_map(|p| {
+            p.params
+                .iter()
+                .filter(|q| !q.points.is_empty())
+                .map(move |q| (p.label.as_str(), q))
+        })
+        .collect();
+    if named.is_empty() {
+        eprintln!("no LADSPA metadata with scale points installed; skipping");
+        return;
+    }
+    for (label, p) in &named {
+        assert!(
+            p.points.iter().all(|(_, l)| !l.is_empty()),
+            "{label}/{}: a position with no name is not a name",
+            p.name
+        );
+        // In value order, so stepping through them walks the knob one way.
+        assert!(
+            p.points.windows(2).all(|w| w[0].0 <= w[1].0),
+            "{label}/{}: the positions are out of order",
+            p.name
+        );
+        // Every named value has to be a value the port can actually take.
+        for (v, name) in &p.points {
+            assert!(
+                *v >= p.min - 1e-6 && *v <= p.max + 1e-6,
+                "{label}/{}: \"{name}\" sits at {v}, outside [{}..{}]",
+                p.name,
+                p.min,
+                p.max
+            );
+        }
+        // A list is drawn only when the names cover every position — see
+        // `ParamShape::of`. Where they do not, the port keeps the count its
+        // hint gave and the names label whatever the knob lands on; what must
+        // never happen is the count shrinking to the number of names.
+        assert!(
+            p.steps as usize >= p.points.len(),
+            "{label}/{}: {} steps for {} names",
+            p.name,
+            p.steps,
+            p.points.len()
+        );
+        // `steps == points.len()` is exactly the condition `ParamShape::of`
+        // asks before drawing a list of names rather than a knob — asserted
+        // here as the number it is, because the engine that owns that rule
+        // depends on this crate and not the other way round.
+    }
+    eprintln!("{} LADSPA port(s) have named positions", named.len());
+}
+
+/// A file that names only *some* of a port's positions must not shrink it.
+///
+/// swh's `gate` runs −1..1 with three integer settings — key listen, gate,
+/// bypass — and its metadata names two of them. Taking the file's word turned
+/// the port into a two-position switch whose ends are −1 and 1, so the middle
+/// setting, the one the plugin calls "gate", could not be reached at all.
+#[test]
+fn a_partial_scale_does_not_shrink_the_port_it_names() {
+    let _g = plugin_lock();
+    let found = ladspa();
+    if found.is_empty() {
+        eprintln!("no LADSPA plugins installed; skipping");
+        return;
+    }
+    let mut checked = 0usize;
+    for p in &found {
+        for q in p.params.iter().filter(|q| !q.points.is_empty()) {
+            // Whatever the count is, the two ends of the travel have to be
+            // reachable **and** every integer setting between them.
+            let span = (q.max - q.min).abs();
+            if q.steps == 2 && span > 1.5 {
+                panic!(
+                    "{}/{}: drawn as a switch over a range of {span} ({} named positions)",
+                    p.label,
+                    q.name,
+                    q.points.len()
+                );
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "nothing with names to check");
+}

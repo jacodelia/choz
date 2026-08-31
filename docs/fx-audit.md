@@ -1,11 +1,15 @@
 # Auditoría DSP de los efectos de choz
 
-Escrito el 2026-08-27, contra el árbol de trabajo. 45 efectos, 19 400 líneas en
-`crates/choz-engine/src/fx/`.
+Escrito el 2026-08-27 contra el árbol de trabajo —45 efectos entonces, 46 hoy,
+19 400 líneas en `crates/choz-engine/src/fx/`— y ampliado después: la sección 6
+son las mediciones del 28 y la 7 la auditoría de guardado del 29, cerrada el 30.
+
+**Está cerrado entero.** No queda ningún hallazgo sin resolver; lo único que se
+midió y se decidió no arreglar está en la sección 6, con el porqué.
 
 Esto **no** es una lista de deseos: cada hallazgo cita archivo y línea y dice qué
-se oye. El roadmap al final está ordenado por *daño audible por línea de diff*,
-no por lo interesante que sea el DSP.
+se oye. El roadmap de la sección 3 está ordenado por *daño audible por línea de
+diff*, no por lo interesante que sea el DSP.
 
 Restricciones respetadas en todo lo que sigue: sin samples, sin IR, sin archivos
 de audio, sin circuitos propietarios, sin dependencias nuevas, sin romper la API
@@ -25,7 +29,7 @@ patrones que hay que copiar al resto.
 | `saturator.rs` | Oversampling 2×/4×/8× con `Oversampler`, DC blocker después de la curva asimétrica, tone. Hace lo correcto. |
 | `pedal.rs` | Igual: `Oversampler2x` alrededor de cada `tanh`. |
 | `filter.rs` | SVF topology-preserving (Simper). Estable en todo el rango, sin el colapso del Chamberlin. |
-| `reverb.rs` | Reescrito el 2026-08-27 — ver [reverb.md](reverb.md). Es el patrón de referencia para smoothing, interpolación en lazo y decorrelación estéreo. |
+| `reverb.rs` | Reescrito el 2026-08-27. Es el patrón de referencia para smoothing, interpolación en lazo y decorrelación estéreo. |
 | `oversample.rs`, `smooth.rs`, `lfo.rs` | Infraestructura compartida, ya escrita y ya probada. **El problema es que la mitad de los efectos no la usa.** |
 
 Y una comprobación que pasa en todo el árbol: **ningún `process_block` alloca**,
@@ -314,3 +318,162 @@ Todo lo de arriba se comprueba con tests, no con el oído:
 - **El offset de LFO del chorus.** F5 se investigó, se midió y resultó falso.
   Cambiarlo igual habría sido cambiarle el carácter estéreo al efecto para
   arreglar algo que no estaba roto.
+
+---
+
+## 6 · Lo que se midió el 2026-08-28, y lo que no se arregló
+
+**Antes de todo, la ley.** La mezcla de un efecto vive documentada en
+`FxProcessor::set_mix` y es `out = dry + wet·(procesado − dry)` — un crossfade,
+así que `0` es un cable y `1` es el efecto sin nada de lo que entró. No es
+`dry + wet·procesado`, que es un nivel de envío: con eso, subir el mando sólo
+puede hacer el tab más fuerte y nunca saca el dry, y el mismo mando significaría
+dos cosas distintas según el efecto. **La única excepción a propósito es el
+looper**, que suma: sus tomas suenan *debajo* de lo que se está tocando, y un
+crossfade bajaría el instrumento en vivo a medida que suben los loops.
+
+
+Las fases 10 y 11 midieron dos cosas que no son hallazgos de un efecto sino de
+la **suite entera**, y quedaron fuera de las tablas de arriba porque este
+documento se escribió el 27. Van acá porque son lo que hay que saber antes de
+tocar un efecto, y porque una de ellas es lo único de toda la auditoría que se
+midió y **no** se arregló.
+
+### Los efectos se apilan sin saturar, y hay un test que lo sostiene
+
+`no_built_in_effect_is_a_gain_stage` (en `choz-ui`) recorre los 46 con los
+mandos que el rack les da, sobre dos segundos de tono más ruido:
+
+- **ninguno suma más de 4,5 dB solo**, y
+- **los ocho más fuertes apilados no pasan de 6**.
+
+Antes de eso, `protocosmos` sumaba **9,1 dB él solo** —clipeaba por sí mismo
+desde una entrada a −8,7 dBFS— y 46 de los 2 070 pares posibles pasaban de
+escala; los 46 lo tenían a él adentro. `measure_stacking` (ignorado, al lado)
+imprime la tabla entera cuando hace falta mirarla.
+
+**Lo que el test no cubre, a propósito**: con la entrada a −2,7 dBFS, 57 pares
+siguen pasando de escala, el peor a 1,34. Eso ya no es un efecto que amplifique
+—son 2,7 dB de headroom y cualquier cadena se los come—, así que se resuelve en
+el fader del tab y no en el DSP.
+
+### La dispersión de nivel del wet no es la ley de mezcla
+
+Con `Wet` a media posición el nivel va de **+2,9 dB** en protocosmos a
+**−9,0** en el shimmer. Eso **no** es la ley de `set_mix` fallando —los 46 hacen
+`out = dry + wet·(procesado − dry)`, medido— sino el nivel del wet de cada
+efecto. Emparejarlos querría medir cada uno contra un programa real y no contra
+ruido, que es otra auditoría. `examples/mix_probe` imprime la tabla.
+
+### Lo único que se midió y no se arregló: el peine del shifter de voces
+
+`fx::shift::VoiceShifter` suma dos cabezales de lectura a **media ventana** de
+distancia. Sumar una nota aguda con una copia retardada de sí misma la peina, y
+eso pasa haga lo que haga el interpolador: la fase 10 pasó la lectura a cúbica y
+una nota de 14 kHz mejoró de 3,6 dB a **2,1 dB** abajo, que es el peine, no la
+interpolación. `a_high_note_comes_through_the_read` (en `fx/shift.rs`) lo fija en
+−2,8 dB para que no empeore.
+
+Sacarlo pide **otro shifter**, no otra lectura — uno de fase vocoder, o uno que
+sincronice los cabezales con el período detectado como hace
+`autotune::shifter::RetuneShifter`. Es un efecto nuevo, no un arreglo, y por eso
+no se hizo: el shifter de voces es el que usan el shimmer y el harmonizador, y
+ahí la copia retardada es parte del sonido.
+
+---
+
+## 7 · Auditoría de guardado (2026-08-29)
+
+Pregunta distinta de la del resto del documento: no *cómo suena* un efecto sino
+**si vuelve a sonar igual** cuando se reabre el proyecto. Recorrida efecto por
+efecto, con el formato de proyecto delante.
+
+### Cómo se guarda un efecto
+
+Un efecto en el YAML es `kind`, `enabled`, `wet`, `params`, y —si es un plugin
+hosteado— `plugin_path` + `plugin_id` + `state` en base64. Los `params` son el
+vector que dibuja el rack (`fx_param_descs`), aplicados por **índice**. De ahí
+sale la regla: *todo lo que el rack dibuja se guarda; nada más se guarda*.
+
+### Qué encontró la recorrida
+
+| | |
+|---|---|
+| **44 de los 46 efectos: completos** | Todo su estado editable son parámetros. No hay un solo efecto propio que cargue archivos (ni IR, ni samples, ni presets en disco), así que no hay rutas que perder. |
+| **Los que tienen preset interno** (`autotune`, `graphiceq`, `waveshaper`, `pedal`) | El preset **es** un parámetro más y se guarda como tal; y como los mandos se aplican en orden de índice, un knob debajo del preset lo pisa — por eso los descs del auto-tune escriben los valores del preset explícitamente. |
+| **Los de tiempo** (`delay`, `grandelay`, `space_echo`, `reverse`, `shimmer`, `beat_repeat`) | Sin estado oculto: tiempo, realimentación, damping, ping-pong, cruce y modulación son parámetros. Lo que hay dentro de la línea de retardo es **audio en vuelo**, no ajustes: se pierde al reabrir y así tiene que ser (un delay que reabre con la cola de la sesión anterior es un delay con ruido de otra persona). |
+| **El looper: era el único agujero real** | Sus 50 parámetros llevan estado, mute, solo, pan, volumen, cuantización y cantidad de canales — todo eso se guardaba. Lo que no se guardaba eran **las tomas**: minutos de audio que no caben en ningún parámetro. Cerrado el 2026-08-29. |
+
+### Cómo se guarda un looper ahora
+
+- Al guardar, cada canal con audio se escribe como WAV estéreo `i16` en
+  `<proyecto>.loops/tab<N>-fx<M>-ch<K>.wav` — el mismo `export_track` que ya
+  usaba el botón EXPORT, así que no hay un segundo camino que mantener. Los
+  archivos que el proyecto ya no nombra se borran en el mismo guardado.
+- El YAML nombra cada toma en `fx.loops` con su ruta **relativa al proyecto**,
+  la longitud del loop en frames y la frecuencia a la que se grabó. Mover un
+  proyecto es mover el `.yml` y su directorio.
+- Al abrir, `looper::import_track` vuelve a cortar el WAV en chunks del deck
+  actual y `FxProcessor::load_loops` los mete en el deck **antes** de que salga
+  al hilo de audio — el único instante en que alguien que no sea el callback
+  puede tocarlo. La otra punta (`LoopHandle::adopt`) recibe los mismos `Arc`,
+  que es lo que hace que EXPORT siga escribiendo lo que hay y que el presupuesto
+  de memoria los cuente.
+- **Vuelven en PAUSE, no en PLAY.** El estado del canal es un parámetro y viene
+  con los demás, así que un deck que estaba rodando arrancaría solo al abrir el
+  proyecto: un rack que hace ruido antes de que nadie se lo pida. PAUSE conserva
+  la toma y la longitud del loop, y espera.
+- **Una toma grabada a otra frecuencia se resamplea** (2026-08-30).
+  `import_track` lee la cabecera del WAV y saca la frecuencia del deck del
+  propio `chunk_frames` —que es `LOOP_CHUNK_SECS` segundos a esa frecuencia—,
+  así que una toma de 44,1 kHz abierta en un equipo a 48 conserva su afinación
+  y su duración en segundos en vez de sonar casi un tono arriba y un 8 % más
+  corta. `read_loops` escala también el largo del loop, que se guardó en frames
+  de la frecuencia de grabación: compararlo tal cual cortaba el loop antes de
+  tiempo, cada vuelta. La interpolación es lineal —sirve para 44,1 → 48, que es
+  el caso real; una toma traída de 8 kHz va a sonar apagada—.
+
+### El otro agujero: los efectos como plugin (cerrado el 2026-08-30)
+
+`FxProcessor::params()` es lo que publica el `.clap` exportado, y **22 de los 46
+efectos devolvían una lista vacía**: en un DAW aparecían como cajas sin mandos
+que mover, automatizar ni guardar. Dentro de choz estaban completos, porque el
+rack usa su propia tabla de descriptores. `graphiceq` y `autotune` publicaban
+listas *incompletas* (les faltaban PRESET/WET), que es peor que vacías porque
+los índices dejan de coincidir con los del rack.
+
+**Los 46 publican su lista entera, en el orden que dibuja el rack.** Escribir
+esas listas obligó a escribir el `set_param` que faltaba, y ahí aparecieron
+cinco mandos que no llegaban a ninguna parte —cuatro efectos que
+`build_processor` construía con `::new()` sin leer sus `params` (`filterbank`,
+`isolator`, `cassette`, `sidechain`), y el `Wet` de `gain`, que se guardaba y no
+se usaba— y dos mandos del `grandelay` con el nombre cambiado. Tres más
+publicaban una constante en vez de su posición (`Preset` del graphic EQ, `Size`
+y `Width` del shimmer): el mando andaba, lo que no andaba era preguntarle dónde
+estaba, que es lo que un host hace para guardar.
+
+Dos tests lo sostienen, y hay que mantener los dos verdes al tocar un efecto:
+
+- `a_published_parameter_list_matches_the_knobs_the_rack_draws` — ya sin techo:
+  cero efectos mudos, y la cuenta sólo puede bajar.
+- `every_live_knob_reaches_the_processor` — lleva cada mando de cada efecto que
+  toma valores en vivo a los dos extremos de su recorrido y exige que lo
+  publicado se mueva. Es lo que habría cazado el `Drive` de la cassette el día
+  que se escribió. Se saltan dos nombres: `Wet`, que entra por `FX_MIX_PARAM`, y
+  `Preset`, que `AudioFxEntry::apply_preset` resuelve en los mandos de abajo.
+
+**Compatibilidad, dicha una vez**: `filterbank`, `isolator`, `cassette` y
+`sidechain` se construían descartando sus `params`, así que sonaban siempre en
+los valores de su `new()`. Ahora leen lo que el proyecto guardó. En los dos
+primeros el defecto es neutro y no cambia nada; en los otros dos se corrieron los
+defectos de los descriptores para que un efecto agregado hoy suene como sonaba
+—`Drive` 0,40 → 0,20 y `Release` 0,30 → 0,14—, pero **un proyecto guardado antes
+del 2026-08-30 con una cassette o un ducker adentro suena distinto al
+reabrirlo**. No hay forma de evitarlo: el mando que guardó nunca hizo nada, y
+ahora hace lo que dice.
+
+Como consecuencia, **doce efectos dejaron de reconstruir la cadena** en cada
+giro de mando (`takes_live_params`): una reconstrucción reemplaza todos los
+procesadores del slot, así que mover el `Drive` de un saturador tiraba la cola
+del reverb que estaba detrás. El único que sigue reconstruyéndose es el LOOPER,
+que es un deck y no un juego de mandos.

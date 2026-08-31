@@ -105,6 +105,21 @@ impl GranularDelay {
 }
 
 impl FxProcessor for GranularDelay {
+    /// What a host is handed, in the order [`Self::set_param`] reads it.
+    ///
+    /// The names are the processor's own: index 1 is the feedback and index 3
+    /// is the density, whatever a panel three crates away chooses to call them.
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        vec![
+            FxParam::new("Size", (self.delay_ms - 20.0) / 980.0, 20.0, 1000.0, "ms"),
+            FxParam::new("Feedback", self.feedback, 0.0, 1.0, ""),
+            FxParam::new("Pitch", self.scatter_st / 24.0 + 0.5, -12.0, 12.0, "st"),
+            FxParam::new("Density", (self.density - 1.0) / 31.0, 1.0, 32.0, "/s"),
+            FxParam::new("Wet", self.wet, 0.0, 1.0, ""),
+        ]
+    }
+
     /// The chain is **not** rebuilt for a knob turn — that would throw away the
     /// delay buffer, and a delay with no buffer is silence. Same order as
     /// `build_processor` maps them.
@@ -118,6 +133,7 @@ impl FxProcessor for GranularDelay {
             1 => self.feedback = v,
             2 => self.scatter_st = (v - 0.5) * 24.0,
             3 => self.density = 1.0 + v * 31.0,
+            4 => self.wet = v,
             _ => {}
         }
     }

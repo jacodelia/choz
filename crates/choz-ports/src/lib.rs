@@ -95,6 +95,16 @@ pub trait FxProcessor: Send {
         None
     }
 
+    /// Put takes back into a looper deck, before it leaves for the RT thread.
+    ///
+    /// The one piece of an effect's state that is not a parameter: minutes of
+    /// recorded audio, which a project stores as WAVs beside itself and hands
+    /// back here. `frames` is the loop's own length — the deck's, not the
+    /// chunks', because the last chunk of a take runs past the end of the loop.
+    ///
+    /// Default no-op: every effect but the looper has nothing to load.
+    fn load_loops(&mut self, _takes: &[(usize, Vec<LoopChunk>)], _frames: usize) {}
+
     /// Whether this processor is a looper deck — asked **after** the handle has
     /// been taken, which is why it cannot just be `loopdeck().is_some()`.
     ///
@@ -493,6 +503,18 @@ impl LoopHandle {
             .flat_map(|t| t.iter())
             .map(|c| c.len() * std::mem::size_of::<i16>())
             .sum()
+    }
+
+    /// Take ownership of a track's audio that came from somewhere other than
+    /// the deck — a project being reopened.
+    ///
+    /// The deck gets the same chunks through [`FxProcessor::load_loops`], so
+    /// both ends hold the take the way they do after it was played in: this end
+    /// is what EXPORT writes and what the memory budget counts.
+    pub fn adopt(&mut self, track: usize, chunks: Vec<LoopChunk>) {
+        if let Some(slot) = self.takes.get_mut(track) {
+            *slot = chunks;
+        }
     }
 
     /// The audio of one track, in order, for EXPORT to write.
@@ -997,7 +1019,6 @@ pub fn positions_from_labels(shown: &[String], max_steps: u32) -> Option<(bool, 
         .collect();
     Some((runs.len() == probes, (runs.len() as u32, points)))
 }
-
 
 impl PluginParam {
     /// A parameter with nothing but the numbers, which is all most hosts give.

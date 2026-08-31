@@ -6,8 +6,8 @@
 // ── Original ──────────────────────────────────────────────────────────────────
 pub mod bitcrusher;
 pub mod cassette;
-pub mod delay;
 pub mod dc;
+pub mod delay;
 pub mod delay_line;
 pub mod filter;
 pub mod filterbank;

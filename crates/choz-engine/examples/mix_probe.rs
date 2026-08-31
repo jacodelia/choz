@@ -40,7 +40,10 @@ fn rms(x: &[f32]) -> f32 {
 fn main() {
     let dry = signal(SR as usize * 2);
     let dry_rms = rms(&dry);
-    println!("{:<16} {:>8} {:>8} {:>8} {:>8}", "effect", "wet 0", "0.25", "0.5", "1.0");
+    println!(
+        "{:<16} {:>8} {:>8} {:>8} {:>8}",
+        "effect", "wet 0", "0.25", "0.5", "1.0"
+    );
     for (kind, _) in BUILT_IN_KINDS {
         // Mid-position knobs: what the rack hands a freshly added effect.
         let params = [0.5f32; 16];

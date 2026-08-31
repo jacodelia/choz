@@ -776,6 +776,16 @@ impl Reverb {
         self.update();
     }
 
+    /// Where the size and the width knobs are — what a host asks for when it
+    /// saves, and what the shimmer publishes as its own two.
+    pub fn size(&self) -> f32 {
+        self.p_size
+    }
+
+    pub fn width(&self) -> f32 {
+        self.p_width
+    }
+
     /// Decay time, as a normalised knob. See [`Reverb::rt60`] for the seconds.
     pub fn set_decay(&mut self, d: f32) {
         self.p_decay = d.clamp(0.0, 1.0);

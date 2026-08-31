@@ -577,8 +577,9 @@ struct Scheduled {
 /// Smallest quantum choz will force on the graph. Forcing 64 frames onto a
 /// class-compliant USB interface stalls its endpoints (`urb status -32`), and on
 /// AMD Renoir xHCI a stalled endpoint can take the whole host controller down
-/// ("HC died"), dropping every USB device until a PCI rebind — see
-/// `docs/usb-xhci-crash.md`. Below this, choz asks and lets the graph decide.
+/// ("HC died"), dropping every USB device until a PCI rebind — recovered by
+/// rebinding the controller, not by rebooting. Below this, choz asks and lets
+/// the graph decide.
 const MIN_FORCED_QUANTUM: u32 = 128;
 
 /// Tell PipeWire what period to run our node at, before the JACK client exists —
@@ -858,7 +859,6 @@ impl AudioEngine {
                 self.out_channels = channels;
                 self.in_channels = ins;
                 self.input_ports = capture;
-        self.capture_wiring = None;
                 // A fresh client is wired the way `start` left it, whatever was
                 // asked for before it existed.
                 self.capture_wiring = None;
@@ -1641,8 +1641,25 @@ impl AudioEngine {
             .into_iter()
             .zip(old_at(&self.fx_loopers[slot]))
             .collect();
+        let carried_at: Vec<usize> = carried.iter().map(|(new_at, _)| *new_at).collect();
         for (new_at, was_at) in carried {
             decks[new_at] = self.fx_loopers[slot][was_at].take();
+        }
+        // Takes a project handed back go to this end too: the processor got
+        // them in `build_chain_from_specs`, and the interface's end is what
+        // EXPORT writes and what the memory budget counts. Never onto a carried
+        // deck — that one has been recording, and its own takes are the newer
+        // ones.
+        for (i, spec) in specs.iter().enumerate() {
+            if spec.loops.is_empty() || carried_at.contains(&i) {
+                continue;
+            }
+            let Some(Some(handle)) = decks.get_mut(i) else {
+                continue;
+            };
+            for (track, chunks) in &spec.loops {
+                handle.adopt(*track, chunks.clone());
+            }
         }
         self.fx_loopers[slot] = decks;
         self.fx_latency[slot] = fx.iter().map(|p| p.latency_samples()).collect();
@@ -1984,7 +2001,10 @@ impl AudioEngine {
         let first = self.build_instrument(format, path, id)?;
         let second = self.build_instrument(format, path, id)?;
         let block = self.buffer_size;
-        self.set_slot_source(slot, Box::new(crate::layered::Layered::new([first, second], block)));
+        self.set_slot_source(
+            slot,
+            Box::new(crate::layered::Layered::new([first, second], block)),
+        );
         Ok(())
     }
 
@@ -3430,6 +3450,10 @@ mod tests {
     /// backlog cannot turn into latency that grows all night.
     #[test]
     fn the_capture_ring_answers_for_both_kinds_of_drift() {
+        // `capture_health` is process-wide, and this test asserts its exact
+        // counts: another test calling `clear()` on it half way through zeroes
+        // the block this one is counting. It failed about one run in eight.
+        let _meter = crate::test_locks::meter();
         let (_tx, _rx, mut state) = mk_state_ch(2, 2);
         let (mut tx, rx) = rtrb::RingBuffer::<f32>::new(4096);
         state.capture_rx = Some(rx);
@@ -3500,6 +3524,8 @@ mod tests {
             params: Vec::new(),
             plugin: None,
             gate: None,
+            loops: Vec::new(),
+            loop_frames: 0,
         };
 
         // A deck with a take in it, in a chain of its own.
@@ -3801,6 +3827,8 @@ mod tests {
             wet: 1.0,
             params: vec![0.334, 0.0, 0.0, 0.20, 0.32, 0.36, 0.50, 1.0, 1.0],
             plugin: None,
+            loops: Vec::new(),
+            loop_frames: 0,
         };
         let chain = crate::fx_chain::build_chain_from_specs(&[spec], 48_000, 64);
         assert_eq!(chain.len(), 1, "the harmoniser built");
@@ -3914,8 +3942,11 @@ mod tests {
     /// so the panel can say which knob to turn down.
     #[test]
     fn a_trim_past_full_scale_is_limited_and_counted() {
-        // Shares the process-wide transport: `render` advances it.
+        // Shares the process-wide transport: `render` advances it. And the
+        // capture health, which it clears — always in this order, so the two
+        // tests that take both cannot deadlock against each other.
         let _clock = crate::test_locks::transport();
+        let _meter = crate::test_locks::meter();
         let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 2);
         let health = crate::meter::capture_health();
         health.clear();
@@ -4600,16 +4631,17 @@ mod tests {
                 threshold: 0.5,
                 release_ms: 20.0,
             }),
+            loops: Vec::new(),
+            loop_frames: 0,
         };
         assert_eq!(
             crate::fx_chain::gate_sources_of(&[spec(GateSource::Tab(2))]),
             1 << 2
         );
         assert_eq!(
-            crate::fx_chain::gate_sources_of(&[
-                spec(GateSource::Clock),
-                spec(GateSource::Note(1)),
-            ]),
+            crate::fx_chain::gate_sources_of(
+                &[spec(GateSource::Clock), spec(GateSource::Note(1)),]
+            ),
             0
         );
     }
@@ -4719,7 +4751,9 @@ mod tests {
             })
             .unwrap();
         state.apply_commands();
-        state.playing.store(false, std::sync::atomic::Ordering::Relaxed);
+        state
+            .playing
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         for ch in state.capture.iter_mut() {
             ch.fill(0.5);
         }

@@ -159,6 +159,17 @@ impl super::FxProcessor for Flanger {
         self.mix = wet.clamp(0.0, 1.0);
     }
 
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        vec![
+            FxParam::new("Rate", (self.rate - 0.05) / 4.95, 0.05, 5.0, "Hz"),
+            FxParam::new("Depth", self.depth / 7.0, 0.0, 7.0, "ms"),
+            FxParam::new("Delay", (self.delay_ms - 0.5) / 9.5, 0.5, 10.0, "ms"),
+            FxParam::new("Feedback", self.feedback / 1.9 + 0.5, -0.95, 0.95, ""),
+            FxParam::new("Wet", self.mix, 0.0, 1.0, ""),
+        ]
+    }
+
     fn set_param(&mut self, index: usize, value: f32) {
         let v = value.clamp(0.0, 1.0);
         match index {

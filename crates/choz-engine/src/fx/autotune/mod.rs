@@ -128,6 +128,11 @@ pub struct AutoTune {
     dry_write: usize,
     detected_hz: f32,
     target_hz: f32,
+    /// Input RMS of the last block, for the level bar. Kept here rather than
+    /// only in the shared meter so [`AutoTune::reading`] is the whole answer:
+    /// a test can ask this instance what it heard instead of reading a global
+    /// every other `AutoTune` in the process is also writing.
+    level: f32,
     wet: f32,
     pub params: AutoTuneParameters,
 }
@@ -155,6 +160,7 @@ impl AutoTune {
             dry_write: 0,
             detected_hz: 0.0,
             target_hz: 0.0,
+            level: 0.0,
             wet: 1.0,
             params: AutoTuneParameters::default(),
         };
@@ -206,7 +212,7 @@ impl AutoTune {
             pitch_error_cents: cents,
             confidence: e.confidence,
             voiced: e.voiced,
-            level: 0.0,
+            level: self.level,
         }
     }
 
@@ -292,10 +298,8 @@ impl AutoTune {
         }
         self.dry_write = (self.dry_write + frames) % dry_len;
 
-        meter::meter().publish(AutoTuneMeter {
-            level,
-            ..self.reading()
-        });
+        self.level = level;
+        meter::meter().publish(self.reading());
     }
 }
 
@@ -400,6 +404,10 @@ impl FxProcessor for AutoTune {
                 24.0,
                 "dB",
             ),
+            // The mix, which every other effect publishes and this one did not:
+            // the exported CLAP plugin's parameter list is this list, so a host
+            // had no dry/wet to automate or save.
+            FxParam::new("Wet", self.wet, 0.0, 1.0, ""),
         ]
     }
 
@@ -433,6 +441,10 @@ impl FxProcessor for AutoTune {
             9 => self.params.max_frequency = denorm(v, 400.0, 1200.0),
             10 => self.params.input_gain_db = denorm(v, -24.0, 24.0),
             11 => self.params.output_gain_db = denorm(v, -24.0, 24.0),
+            12 => {
+                self.wet = v;
+                return;
+            }
             _ => return,
         }
         self.apply_params();

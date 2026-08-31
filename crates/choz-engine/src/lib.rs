@@ -11,8 +11,8 @@ pub mod feedback;
 pub mod fx;
 pub mod fx_chain;
 pub mod input;
-pub mod layered;
 mod jack_backend;
+pub mod layered;
 pub mod maxpat;
 pub mod meter;
 pub mod metronome;
@@ -517,8 +517,9 @@ pub(crate) mod test_locks {
         TRANSPORT.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Held while a test reads or clears the output meter — which every
-    /// `render` writes to.
+    /// Held while a test reads or clears a meter — the output meter, which
+    /// every `render` writes to, and `capture_health`, whose counters one test
+    /// asserts exactly and another clears.
     pub(crate) fn meter() -> MutexGuard<'static, ()> {
         METER.lock().unwrap_or_else(|e| e.into_inner())
     }

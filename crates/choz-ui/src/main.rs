@@ -839,7 +839,14 @@ fn fx_scope(t: &LearnTarget) -> Option<(usize, usize)> {
 
 /// Rack buttons a CC can press. `DEL` is deliberately absent — nothing should
 /// delete an FX because a fader was nudged.
+///
+/// Written to a project as **one string** (`"sound-recall:1"`), not as a
+/// tagged enum: this sits inside [`LearnTarget::Trigger`], and serde_yaml
+/// cannot write an enum inside an enum — a rack with a single learned button
+/// used to fail to save at all, with "serializing nested enums in YAML is not
+/// supported yet" and no project file at the end of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(into = "String", try_from = "String")]
 pub enum TriggerAction {
     PresetPrev,
     PresetNext,
@@ -916,6 +923,140 @@ impl TriggerAction {
                 "(retired)".to_string()
             }
         }
+    }
+
+    /// The name it is written under, and the number it carries when it has one.
+    fn id(self) -> String {
+        match self {
+            TriggerAction::PresetPrev => "preset-prev".into(),
+            TriggerAction::PresetNext => "preset-next".into(),
+            TriggerAction::InstrPagePrev => "instr-page-prev".into(),
+            TriggerAction::InstrPageNext => "instr-page-next".into(),
+            TriggerAction::InstrReset => "instr-reset".into(),
+            TriggerAction::FxToggle => "fx-toggle".into(),
+            TriggerAction::FxMoveLeft => "fx-move-left".into(),
+            TriggerAction::FxMoveRight => "fx-move-right".into(),
+            TriggerAction::FxSelect(i) => format!("fx-select:{i}"),
+            TriggerAction::FxAdd => "fx-add".into(),
+            TriggerAction::Mute => "mute".into(),
+            TriggerAction::Solo => "solo".into(),
+            TriggerAction::ArpToggle => "arp-toggle".into(),
+            TriggerAction::ArpTap => "arp-tap".into(),
+            TriggerAction::ArpLatch => "arp-latch".into(),
+            TriggerAction::SoundRecall(i) => format!("sound-recall:{i}"),
+            TriggerAction::LoopClear(i) => format!("loop-clear:{i}"),
+            TriggerAction::LoopAdd => "loop-add".into(),
+            TriggerAction::LoopPagePrev => "loop-page-prev".into(),
+            TriggerAction::LoopPageNext => "loop-page-next".into(),
+            TriggerAction::LoopExport => "loop-export".into(),
+            TriggerAction::ArpPlayPause => "arp-play-pause".into(),
+            TriggerAction::ArpStop => "arp-stop".into(),
+            TriggerAction::ArpRecord => "arp-record".into(),
+        }
+    }
+}
+
+impl From<TriggerAction> for String {
+    fn from(t: TriggerAction) -> String {
+        t.id()
+    }
+}
+
+impl TryFrom<String> for TriggerAction {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, String> {
+        let (name, arg) = match s.split_once(':') {
+            Some((name, n)) => (name, n.parse::<usize>().unwrap_or(0)),
+            None => (s.as_str(), 0),
+        };
+        // **The spelling projects were saved with.** Before these ids existed,
+        // serde wrote the variant's own name — `FxToggle` — and a project with
+        // a learned rack button has that on disk. `try_from` failing is not one
+        // lost binding: it fails the whole `Project::load`, so the file stops
+        // opening at all. A name with an upper-case letter in it is one of
+        // those, and reads as the id it would have been written as today.
+        let kebab;
+        let name = match name.contains(|c: char| c.is_ascii_uppercase()) {
+            false => name,
+            true => {
+                kebab = name.chars().fold(String::new(), |mut out, c| {
+                    if c.is_ascii_uppercase() && !out.is_empty() {
+                        out.push('-');
+                    }
+                    out.extend(c.to_lowercase());
+                    out
+                });
+                kebab.as_str()
+            }
+        };
+        Ok(match name {
+            "preset-prev" => TriggerAction::PresetPrev,
+            "preset-next" => TriggerAction::PresetNext,
+            "instr-page-prev" => TriggerAction::InstrPagePrev,
+            "instr-page-next" => TriggerAction::InstrPageNext,
+            "instr-reset" => TriggerAction::InstrReset,
+            "fx-toggle" => TriggerAction::FxToggle,
+            "fx-move-left" => TriggerAction::FxMoveLeft,
+            "fx-move-right" => TriggerAction::FxMoveRight,
+            "fx-select" => TriggerAction::FxSelect(arg),
+            "fx-add" => TriggerAction::FxAdd,
+            "mute" => TriggerAction::Mute,
+            "solo" => TriggerAction::Solo,
+            "arp-toggle" => TriggerAction::ArpToggle,
+            "arp-tap" => TriggerAction::ArpTap,
+            "arp-latch" => TriggerAction::ArpLatch,
+            "sound-recall" => TriggerAction::SoundRecall(arg),
+            "loop-clear" => TriggerAction::LoopClear(arg),
+            "loop-add" => TriggerAction::LoopAdd,
+            "loop-page-prev" => TriggerAction::LoopPagePrev,
+            "loop-page-next" => TriggerAction::LoopPageNext,
+            "loop-export" => TriggerAction::LoopExport,
+            "arp-play-pause" => TriggerAction::ArpPlayPause,
+            "arp-stop" => TriggerAction::ArpStop,
+            "arp-record" => TriggerAction::ArpRecord,
+            // A button from a newer choz: named, not fatal. Losing one binding
+            // beats refusing to open the rack.
+            other => return Err(format!("unknown trigger '{other}'")),
+        })
+    }
+}
+
+#[cfg(test)]
+mod trigger_spelling {
+    use super::*;
+
+    /// **A project saved before the ids existed still opens.**
+    ///
+    /// `TriggerAction` used to serialise as its own variant name, and a rack
+    /// with a learned button has that on disk. `try_from` rejecting it does not
+    /// cost one binding — it fails `Project::load`, and the file stops opening.
+    #[test]
+    fn the_old_spelling_of_a_trigger_still_reads() {
+        for (old, want) in [
+            ("FxToggle", TriggerAction::FxToggle),
+            ("PresetNext", TriggerAction::PresetNext),
+            ("InstrPagePrev", TriggerAction::InstrPagePrev),
+            ("ArpPlayPause", TriggerAction::ArpPlayPause),
+            ("LoopExport", TriggerAction::LoopExport),
+            ("Mute", TriggerAction::Mute),
+        ] {
+            assert_eq!(
+                TriggerAction::try_from(old.to_string()),
+                Ok(want),
+                "{old} is what a saved project has"
+            );
+        }
+        // And through serde, which is the path that actually matters.
+        let learned: LearnTarget =
+            serde_yaml::from_str("!Trigger FxToggle").expect("an old binding reads");
+        assert_eq!(learned, LearnTarget::Trigger(TriggerAction::FxToggle));
+        // The id written today reads too, and round-trips.
+        let now: LearnTarget = serde_yaml::from_str("!Trigger fx-toggle").expect("and the new one");
+        assert_eq!(now, learned);
+        // One that never existed is still an error, so a typo is not silently a
+        // different button.
+        assert!(TriggerAction::try_from("NotAButton".to_string()).is_err());
     }
 }
 
@@ -2105,10 +2246,7 @@ impl App {
         let here = self.slots.get(tab).map(|s| s.dest.index()).unwrap_or(0);
         let mut modal = Modal::new(
             ModalKind::MixerDest(strip),
-            views::modal::ListModal::new(
-                format!("{} \u{00B7} {}", i18n::t("OUT"), tab + 1),
-                items,
-            ),
+            views::modal::ListModal::new(format!("{} \u{00B7} {}", i18n::t("OUT"), tab + 1), items),
         );
         modal.list.cursor = here.min(choz_engine::BUSES);
         self.modal = Some(modal);
@@ -3032,6 +3170,10 @@ impl App {
                 } else {
                     bpm
                 });
+                // Same as the Settings page below it: a tempo set here is a
+                // tempo the next start has to open at.
+                self.ui.audio.bpm = t.bpm();
+                self.ui.save();
             }
             2 | 3 => {
                 let (num, den) = t.time_signature();
@@ -3429,7 +3571,9 @@ impl App {
         // Octave → zone index, as the instrument understands it.
         let mut split = [None; choz_ports::SPLIT_OCTAVES];
         for (oct, at) in slot.octave_sound.iter().take(split.len()).enumerate() {
-            split[oct] = at.and_then(|b| zones.iter().position(|z| *z == b)).map(|z| z as u8);
+            split[oct] = at
+                .and_then(|b| zones.iter().position(|z| *z == b))
+                .map(|z| z as u8);
         }
         let patches: Vec<(usize, Vec<u8>)> = zones
             .iter()
@@ -5333,6 +5477,141 @@ impl App {
         }
     }
 
+    /// Write every deck's takes into `<project>.loops/` and name them in
+    /// `project`.
+    ///
+    /// Called by the save and by nothing else: it writes megabytes, and the
+    /// snapshot it fills in is also the one taken once a frame to answer "is
+    /// there unsaved work?".
+    fn write_loops(&mut self, project: &mut project::Project, file: &std::path::Path) {
+        let dir = project::Project::loops_dir(file);
+        // What this project wrote last time. Anything that is no longer a take
+        // goes: a deck whose channel was cleared must not leave the audio it
+        // used to hold sitting next to the file for ever.
+        let stale: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with("tab"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        let mut written: Vec<std::path::PathBuf> = Vec::new();
+        let Some(engine) = self.audio_engine.as_mut() else {
+            return;
+        };
+        for (slot, tab) in project.rack.iter_mut().enumerate() {
+            // The engine holds only the *enabled* effects, the same arithmetic
+            // the states and the meters use.
+            let mut engine_fx = 0usize;
+            for fx in tab.fx.iter_mut() {
+                // A disabled effect is not in the engine's chain at all, so
+                // it has no deck and no index of its own — its takes are gone
+                // the moment it was switched off, the same as any other.
+                if !fx.enabled {
+                    continue;
+                }
+                let at = engine_fx;
+                engine_fx += 1;
+                let Some(handle) = engine.fx_looper(slot, at) else {
+                    continue;
+                };
+                let frames = handle.state().frames();
+                if frames == 0 {
+                    continue;
+                }
+                let sample_rate = handle.sample_rate();
+                for track in 0..choz_ports::LOOP_TRACKS {
+                    if handle.take(track).is_empty() {
+                        continue;
+                    }
+                    let name = format!("tab{}-fx{}-ch{}.wav", slot + 1, at + 1, track + 1);
+                    if let Err(e) = std::fs::create_dir_all(&dir) {
+                        eprintln!("choz: cannot write {}: {e}", dir.display());
+                        return;
+                    }
+                    let path = dir.join(&name);
+                    match choz_engine::fx::looper::export_track(handle, track, frames, &path) {
+                        Ok(_) => {
+                            written.push(path);
+                            fx.loops.push(project::LoopTake {
+                                track,
+                                file: format!(
+                                    "{}/{name}",
+                                    dir.file_name().unwrap_or_default().to_string_lossy()
+                                ),
+                                frames,
+                                sample_rate,
+                            });
+                        }
+                        Err(e) => eprintln!("choz: cannot write {}: {e}", path.display()),
+                    }
+                }
+            }
+        }
+        for old in stale.iter().filter(|p| !written.contains(p)) {
+            let _ = std::fs::remove_file(old);
+        }
+    }
+
+    /// The takes an effect names, read back as the chunks a deck plays.
+    ///
+    /// Anything missing is said out loud and skipped, like a missing plugin: a
+    /// project that lost its audio still opens.
+    fn read_loops(&self, fx: &project::Fx) -> (Vec<(usize, Vec<choz_ports::LoopChunk>)>, usize) {
+        let mut out = Vec::new();
+        let mut frames = 0usize;
+        let base = self
+            .project_file
+            .as_ref()
+            .and_then(|f| f.parent())
+            .map(|d| d.to_path_buf());
+        // One chunk is one second at the deck's rate — the rate the engine is
+        // running at now, whatever the take was recorded at.
+        let deck_rate = self
+            .audio_engine
+            .as_ref()
+            .map(|e| e.sample_rate)
+            .unwrap_or(48_000)
+            .max(1);
+        let chunk_frames = choz_ports::LOOP_CHUNK_SECS * deck_rate as usize;
+        for take in &fx.loops {
+            let path = match &base {
+                Some(dir) => dir.join(&take.file),
+                None => std::path::PathBuf::from(&take.file),
+            };
+            let (chunks, read) = match choz_engine::fx::looper::import_track(&path, chunk_frames) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("choz: loop {}: {e}", path.display());
+                    continue;
+                }
+            };
+            if take.sample_rate != deck_rate {
+                eprintln!(
+                    "choz: loop {} was recorded at {} Hz and this device runs at {deck_rate} Hz: resampled",
+                    path.display(),
+                    take.sample_rate
+                );
+            }
+            if chunks.is_empty() {
+                continue;
+            }
+            // The take's length was written in the frames of the rate it was
+            // recorded at; `import_track` handed back frames at this deck's.
+            // Comparing the two straight would cut a 44.1 kHz loop short on a
+            // 48 kHz device — the loop would come round early, every time.
+            let want =
+                (take.frames as u64 * deck_rate as u64 / take.sample_rate.max(1) as u64) as usize;
+            frames = frames.max(want.min(read));
+            out.push((take.track, chunks));
+        }
+        (out, frames)
+    }
+
     fn open_dir_picker(&mut self) {
         let start = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
@@ -6380,6 +6659,12 @@ impl App {
                                 .map(|b| project::encode_state(&b))
                                 .unwrap_or_default(),
                             chord_port: e.chord_port.clone(),
+                            // Filled in by the save, which is the only side
+                            // that knows where the file is going and is the
+                            // only side allowed to write megabytes of audio —
+                            // this snapshot is also taken to answer "is there
+                            // unsaved work?", once a frame.
+                            loops: Vec::new(),
                             gate: e.gate.map(|g| project::Gate {
                                 source: project::GateSource::from_engine(g.source),
                                 duck: g.mode == choz_engine::fx_chain::GateMode::Duck,
@@ -6470,6 +6755,7 @@ impl App {
                             })
                             .collect(),
                     },
+                    sound_at: slot.sound_at,
                     split: slot
                         .octave_sound
                         .iter()
@@ -6487,6 +6773,15 @@ impl App {
         project::Project {
             version: 1,
             automation: self.automation.clone(),
+            program_change: self
+                .pc_bindings
+                .iter()
+                .map(|(program, target)| project::ProgramBinding {
+                    program: *program,
+                    target: *target,
+                    label: self.learn_label(target),
+                })
+                .collect(),
             buses: project::Buses {
                 group: self
                     .buses
@@ -6515,6 +6810,33 @@ impl App {
                 output_device: engine.and_then(|e| e.output_device().map(|d| d.to_string())),
                 osc_port: self.osc_port,
                 disabled_midi_inputs: self.midi_disabled.clone(),
+                // The live transport, not the settings file: the tempo moves
+                // from the metronome's menu, the ARP knob and an incoming MIDI
+                // clock, and what the project has to carry is what is counting
+                // right now.
+                // While the transport follows a port, its tempo is the other
+                // machine's and drifts by a fraction of a BPM every block —
+                // saving *that* would make a rack sitting still look like
+                // unsaved work on the way out. What the project carries there
+                // is choz's own tempo, which is what it plays at on its own.
+                bpm: Some(match self.ui.clock_source.is_external() {
+                    true => self.ui.audio.bpm,
+                    false => choz_ports::transport().bpm(),
+                }),
+                time_sig: Some(choz_ports::transport().time_signature()),
+                metronome: {
+                    let m = choz_engine::metronome::metronome();
+                    Some(project::Metronome {
+                        on: m.on(),
+                        gain: m.gain(),
+                        style: m.style().label().to_string(),
+                        groups: m.groups(),
+                        dest: m.dest().index(),
+                    })
+                },
+                clock_source: Some(self.ui.clock_source.clone()),
+                rack_mode: Some(self.ui.rack_mode),
+                input_device: self.ui.audio.input_device.clone(),
             },
             interface: project::Interface {
                 text_color: self.ui.text_color,
@@ -6532,10 +6854,15 @@ impl App {
     /// on another machine will be missing plugins, and losing one tab beats
     /// refusing to open the file.
     fn apply_project(&mut self, p: project::Project) {
-        // What was just read is what is on disk, so it is the baseline the way
-        // out measures against — a project opened and left alone is not
-        // unsaved work.
-        self.saved_project = Some(p.clone());
+        // The baseline the way out measures against. **Taken again at the end
+        // of this function, not from the file**: a project written by an older
+        // choz has no `clock_source`, no `rack_mode` and no `bpm`, and the
+        // snapshot this build takes always fills them in — so comparing the
+        // file against the snapshot made every old project unsaved work the
+        // instant it opened, which is the nag the whole comparison exists to
+        // avoid. What matters is that reopening produces the same rack, and
+        // that is what a snapshot of the applied rack says.
+        self.saved_project = None;
         // ── Configuration ────────────────────────────────────────────────
         // Skipped when the user asked for the rack alone: a project written on
         // another machine carries plugin paths and interface settings that are
@@ -6543,6 +6870,7 @@ impl App {
         // only came for the sound.
         if self.load_rack_only {
             self.apply_project_rack(p);
+            self.saved_project = Some(self.project_snapshot().without_loops());
             return;
         }
         self.plugin_paths = p.plugin_paths.clone();
@@ -6552,6 +6880,26 @@ impl App {
         self.ui.text_color = p.interface.text_color;
         if let Some(lang) = i18n::Lang::from_code(&p.interface.language) {
             self.ui.language = lang;
+        }
+        // Where the tempo comes from and which card the live-audio tabs listen
+        // to: configuration, like the output device, and both name a port on
+        // this machine.
+        //
+        // The clock is read live from this field, so it is already following
+        // the project's master by the time this returns. The old on/off flag
+        // is kept in step by hand — the same thing [`App::set_clock_source`]
+        // does, minus its `save`, because the one below covers it.
+        if let Some(src) = p.audio.clock_source.clone() {
+            self.ui.clock_source = src;
+            self.ui.midi_clock = self.ui.clock_source.is_external();
+        }
+        // The capture device is applied **after** the rack is loaded, at the
+        // bottom of this function: choosing one rebuilds the stream, and a
+        // rebuilt stream has no slots — doing it here would fill the engine
+        // with the rack that is about to be replaced.
+        let want_input = p.audio.input_device.clone();
+        if let Some(dev) = want_input.clone() {
+            self.ui.audio.input_device = Some(dev);
         }
         self.ui.apply();
         self.ui.save();
@@ -6566,6 +6914,20 @@ impl App {
         }
 
         self.apply_project_rack(p);
+        // Everything is applied: this is what saving now would write.
+        self.saved_project = Some(self.project_snapshot().without_loops());
+        // Now that the rack is in the engine, point the live-audio tabs at the
+        // card the project named. Only when it is not already the one running:
+        // this tears the stream down and puts it back, which is not something
+        // to do on every open for nothing.
+        let current = self
+            .audio_engine
+            .as_ref()
+            .filter(|e| e.input_enabled())
+            .and_then(|e| e.input_device().map(|d| d.to_string()));
+        if want_input.is_some() && want_input != current {
+            self.set_input_device(want_input);
+        }
     }
 
     /// The sound half of a project: tabs, instruments, FX, mixer, routing and
@@ -6575,6 +6937,39 @@ impl App {
         // half of a project and travel with it.
         self.automation = p.automation.clone();
         self.automation.recording = false;
+        // The tempo, the meter and the click. Part of the *sound* and not of
+        // the configuration — an arpeggio, a sequence and a synced delay are
+        // all counted in these — so they come back even on a rack-only load.
+        // Written through to the settings file as well, because that is what
+        // the transport is rebuilt from the next time choz starts.
+        let t = choz_ports::transport();
+        if let Some(bpm) = p.audio.bpm {
+            t.set_bpm(bpm);
+            self.ui.audio.bpm = t.bpm();
+        }
+        if let Some((num, den)) = p.audio.time_sig {
+            t.set_time_signature(num, den);
+            self.ui.audio.time_sig = t.time_signature();
+        }
+        if let Some(m) = &p.audio.metronome {
+            let met = choz_engine::metronome::metronome();
+            met.set_gain(m.gain);
+            met.set_style(
+                choz_engine::metronome::ClickStyle::ALL
+                    .into_iter()
+                    .find(|s| s.label() == m.style)
+                    .unwrap_or_default(),
+            );
+            met.set_groups(&m.groups);
+            met.set_dest(choz_engine::Dest::from_index(m.dest));
+            met.set_on(m.on);
+        }
+        // LIVE or MULTI decides which tab a note reaches, so it is the rack's
+        // and not the machine's.
+        if let Some(mode) = p.audio.rack_mode {
+            self.ui.rack_mode = mode;
+        }
+        self.ui.save();
         // The desk's own strips, before the tabs: a group's level is what the
         // tabs about to be routed into it will come out at.
         for (i, b) in p.buses.group.iter().take(choz_engine::BUSES).enumerate() {
@@ -6602,6 +6997,9 @@ impl App {
         }
         self.cc_bindings.clear();
         self.pc_bindings.clear();
+        for b in &p.program_change {
+            self.pc_bindings.push((b.program, b.target));
+        }
 
         for (idx, slot) in p.rack.iter().enumerate() {
             let mut rack = RackSlot::new(AudioSource::Midi);
@@ -6683,6 +7081,7 @@ impl App {
                     rack.octave_sound[oct] = Some(at);
                 }
             }
+            rack.sound_at = slot.sound_at.filter(|i| *i < SOUNDS_MAX);
             if !slot.sounds.is_empty() {
                 rack.sounds = slot
                     .sounds
@@ -6712,7 +7111,9 @@ impl App {
                 .mixer
                 .in_gate
                 .unwrap_or(choz_engine::pitch::DEFAULT_GATE);
-            rack.channel = slot.channel.clamp(1, 16);
+            // `min`, not `clamp`: 0 is ANY — a tab that answers every channel —
+            // and clamping it up to 1 reopened a MULTI rack listening to one.
+            rack.channel = slot.channel.min(16);
             rack.arp = arp::Arp::new(slot.arp);
             rack.seq = seq::Seq::new(slot.seq.clone());
             // A patch that is no longer on this machine is said out loud and
@@ -6814,6 +7215,7 @@ impl App {
         };
         entry.enabled = fx.enabled;
         entry.wet = fx.wet;
+        (entry.loops, entry.loop_frames) = self.read_loops(fx);
         // Knob count is decided by the plugin/built-in, not the file: an old
         // project with fewer (or more) values keeps the rest at their defaults.
         for (i, v) in fx.params.iter().enumerate() {
@@ -6918,14 +7320,11 @@ impl App {
     fn load_project_from(&mut self, path: &std::path::Path) {
         match project::Project::load(path) {
             Ok(p) => {
+                // Where "Save project" writes from now on — set *before* the
+                // rack is built, because a looper's takes are named relative to
+                // this file and are read while the chain is being made.
+                self.project_file = Some(project::Project::resolve(path));
                 self.apply_project(p);
-                // Where "Save project" will write from now on. A directory was
-                // a valid thing to open, so store the file it resolved to.
-                self.project_file = Some(if path.is_dir() {
-                    path.join(project::DEFAULT_NAME)
-                } else {
-                    path.to_path_buf()
-                });
             }
             Err(e) => eprintln!("choz: {e}"),
         }
@@ -7016,11 +7415,17 @@ impl App {
     /// leaving the error on screen when it did not.
     fn save_project_to(&mut self, path: &std::path::Path) {
         let project = self.project_snapshot();
-        match project.save(path) {
+        // The takes go to disk first: a project that names WAVs which are not
+        // there yet is a project that cannot be reopened if choz dies between
+        // the two writes.
+        let mut on_disk = project.clone();
+        self.write_loops(&mut on_disk, &project::Project::resolve(path));
+        match on_disk.save(path) {
             Ok(file) => {
                 eprintln!("choz: project saved to {}", file.display());
                 self.project_file = Some(file);
-                // What "unsaved" is measured against from here on.
+                // What "unsaved" is measured against from here on — without the
+                // take paths, which no snapshot of the live rack ever carries.
                 self.saved_project = Some(project);
                 self.close_modal();
             }
@@ -7302,12 +7707,7 @@ impl App {
                 self.loop_deck_button(views::fx_chain_panel::LoopBtn::PageNext)
             }
             TriggerAction::LoopExport => self.open_loop_export(),
-            TriggerAction::FxToggle => {
-                if let Some(entry) = self.fx_chain.get_mut(self.fx_slot) {
-                    entry.enabled = !entry.enabled;
-                    self.rebuild_fx();
-                }
-            }
+            TriggerAction::FxToggle => self.toggle_fx_enabled(),
             TriggerAction::FxMoveLeft => {
                 if self.fx_slot > 0 {
                     self.fx_chain.swap(self.fx_slot, self.fx_slot - 1);
@@ -7898,7 +8298,12 @@ impl App {
         }
         // An empty rack has no tab to put it on either, and this is the same
         // answer to both cases.
-        if self.audio_engine.as_mut().and_then(|e| e.add_silent()).is_none() {
+        if self
+            .audio_engine
+            .as_mut()
+            .and_then(|e| e.add_silent())
+            .is_none()
+        {
             eprintln!("choz: rack full");
             return;
         }
@@ -8613,6 +9018,8 @@ impl App {
                     } else {
                         bpm
                     });
+                    self.ui.audio.bpm = t.bpm();
+                    self.ui.save();
                 }
                 ArpEdit::Gate => {
                     s.gate = if s.gate >= 0.95 { 0.1 } else { s.gate + 0.1 };
@@ -9884,6 +10291,13 @@ impl App {
                 eprintln!("choz: reloading tab {}: {e}", i + 1);
             }
             let specs: Vec<FxSpec> = slot.fx_chain.iter().map(|e| e.to_spec()).collect();
+            // Same as `rebuild_fx`: delivered once, then the deck is its own.
+            // `slots` is a clone, so the clearing goes on the real one.
+            if let Some(real) = self.slots.get_mut(i) {
+                for entry in real.fx_chain.iter_mut() {
+                    entry.loops.clear();
+                }
+            }
             if let Some(ref mut engine) = self.audio_engine {
                 engine.set_slot_fx(i, specs);
                 // A reloaded plugin is back at its own defaults. The patch
@@ -10217,13 +10631,11 @@ impl App {
                 side: (i == self.active_slot
                     && self.desk_strip.is_none()
                     && self.focus == Focus::Mixer)
-                    .then_some(
-                    match self.mix_side {
+                    .then_some(match self.mix_side {
                         MixSide::Left => views::midi_monitor::MixerSide::Left,
                         MixSide::Right => views::midi_monitor::MixerSide::Right,
                         MixSide::Both => views::midi_monitor::MixerSide::Both,
-                    },
-                ),
+                    }),
                 dest: Some(s.dest.label()),
             })
             .collect();
@@ -10441,6 +10853,39 @@ impl App {
         }
     }
 
+    /// Switch the selected effect off, or back on.
+    ///
+    /// One place, because switching a **looper** off destroys its deck: a
+    /// disabled effect is not in the engine's chain at all, so its takes are
+    /// gone the instant it is turned off and the save has nothing left to
+    /// write. Somebody reaching for this to "mute" the loops has to be told
+    /// before it happens, not after they have saved.
+    fn toggle_fx_enabled(&mut self) {
+        let Some(entry) = self.fx_chain.get(self.fx_slot) else {
+            return;
+        };
+        if entry.enabled && entry.kind == source::AudioFxKind::Looper {
+            let takes = self
+                .engine_fx_index(self.fx_slot)
+                .zip(Some(self.active_slot))
+                .and_then(|(fx, slot)| {
+                    let engine = self.audio_engine.as_mut()?;
+                    let handle = engine.fx_looper(slot, fx)?;
+                    Some(handle.state().frames() > 0)
+                })
+                .unwrap_or(false);
+            if takes {
+                eprintln!(
+                    "choz: switching this looper off discards its takes — save the project first, or clear the channels you meant to silence"
+                );
+            }
+        }
+        if let Some(entry) = self.fx_chain.get_mut(self.fx_slot) {
+            entry.enabled = !entry.enabled;
+            self.rebuild_fx();
+        }
+    }
+
     /// Position of UI FX `fx_idx` in the engine's chain, which only holds the
     /// enabled entries. `None` when that entry is disabled (nothing to update).
     fn engine_fx_index(&self, fx_idx: usize) -> Option<usize> {
@@ -10459,6 +10904,16 @@ impl App {
         if let Some(ref mut engine) = self.audio_engine {
             let specs: Vec<FxSpec> = self.fx_chain.iter().map(|e| e.to_spec()).collect();
             engine.set_slot_fx(idx, specs);
+        }
+        // **Handed over once.** The takes a project carries are for the first
+        // chain built after it opens; from there the deck carries itself across
+        // a rebuild. Keeping them on the entry meant every later rebuild
+        // offered them again, and the engine only refuses a deck it *carried* —
+        // the carry is positional, so inserting a second looper ahead of an
+        // existing one leaves that one uncarried and re-adopting the file's
+        // audio, silently throwing away what was recorded into it this session.
+        for entry in self.fx_chain.iter_mut() {
+            entry.loops.clear();
         }
     }
 
@@ -12545,12 +13000,7 @@ fn handle_fx_keys(app: &mut App, key: KeyCode) {
                 app.auto_trim(i);
             }
         }
-        KeyCode::Char(' ') => {
-            if let Some(entry) = app.fx_chain.get_mut(app.fx_slot) {
-                entry.enabled = !entry.enabled;
-                app.rebuild_fx();
-            }
-        }
+        KeyCode::Char(' ') => app.toggle_fx_enabled(),
         KeyCode::Char('a') => app.open_add_fx_modal(),
         // `c` for "connect": which other tab opens this effect. (`g` is the
         // plugin's own window, and a key that already means something is not
@@ -13503,12 +13953,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         MouseAction::MonitorTab(tab) => app.monitor_tab = tab,
         MouseAction::ChannelStep(d) => app.step_channel(d),
         MouseAction::FxAdd => app.open_add_fx_modal(),
-        MouseAction::FxToggle => {
-            if let Some(entry) = app.fx_chain.get_mut(app.fx_slot) {
-                entry.enabled = !entry.enabled;
-                app.rebuild_fx();
-            }
-        }
+        MouseAction::FxToggle => app.toggle_fx_enabled(),
         MouseAction::FxDelete => {
             if !app.fx_chain.is_empty() {
                 app.fx_chain.remove(app.fx_slot);
@@ -15407,7 +15852,10 @@ mod tests {
         };
         let db = |p: f32| 20.0 * (p / dry_peak).max(1e-9).log10();
 
-        println!("input peak {dry_peak:.3} ({:.1} dBFS)", 20.0 * dry_peak.log10());
+        println!(
+            "input peak {dry_peak:.3} ({:.1} dBFS)",
+            20.0 * dry_peak.log10()
+        );
 
         // The same sweep with the input where a hot tab actually sits. What
         // matters is not that nothing clips at −8.7 dBFS — it is how much room
@@ -15479,7 +15927,10 @@ mod tests {
         }
         pairs.sort_by(|x, y| y.1.total_cmp(&x.1));
         let over = pairs.iter().filter(|(_, p)| *p > 1.0).count();
-        println!("\n== pairs: {over} of {} go past full scale ==", pairs.len());
+        println!(
+            "\n== pairs: {over} of {} go past full scale ==",
+            pairs.len()
+        );
         for (name, p) in pairs.iter().take(8) {
             println!("  {name:<34} {:>6.2} dB  peak {p:.3}", db(*p));
         }
@@ -15501,7 +15952,11 @@ mod tests {
             .collect();
         println!(
             "\n== the eight loudest without protocosmos ==\n  {}\n  {:>6.2} dB  peak {:.3}",
-            without.iter().map(|k| k.id()).collect::<Vec<_>>().join(" → "),
+            without
+                .iter()
+                .map(|k| k.id())
+                .collect::<Vec<_>>()
+                .join(" → "),
             db(run(&without)),
             run(&without)
         );
@@ -20217,6 +20672,11 @@ mod tests {
     /// folder and name.
     #[test]
     fn save_rewrites_the_current_file_and_save_as_always_asks() {
+        // It loads a project, and loading one applies its language and colour
+        // process-wide: without the lock and the restore this leaks a foreign
+        // language into whichever rendering test happens to be running.
+        let _g = ui_guard();
+        let _restore = UiRestore;
         sandbox_state_dir();
         let dir = std::env::temp_dir().join(format!("choz_save_as_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -22306,15 +22766,13 @@ mod tests {
             "and the value did land"
         );
 
-        // One that cannot take them live still asks for the rebuild, because
-        // otherwise the knob would do nothing at all.
-        app.fx_chain.push(AudioFxEntry::new(AudioFxKind::Cassette));
+        // The looper is the last one that still asks for the rebuild: every
+        // other built-in writes its knobs through `set_param` now, and a
+        // rebuild throws away the tail of everything else in the slot.
+        app.fx_chain.push(AudioFxEntry::new(AudioFxKind::Looper));
         app.fx_dirty = false;
         app.set_fx_param(1, 0, 0.3);
-        assert!(
-            app.fx_dirty,
-            "cassette has no live path, so it must rebuild"
-        );
+        assert!(app.fx_dirty, "the looper deck is still built, not set");
     }
 
     /// The ENVELOPE effect writes a contour onto the FX chain, and its five
@@ -22835,8 +23293,8 @@ mod tests {
             );
         }
 
-        // And the ones that really are built at construction still say so.
-        app.fx_chain = vec![source::AudioFxEntry::new(source::AudioFxKind::FilterBank)];
+        // And the one that really is built at construction still says so.
+        app.fx_chain = vec![source::AudioFxEntry::new(source::AudioFxKind::Looper)];
         app.fx_slot = 0;
         app.fx_param = 0;
         app.fx_dirty = false;
@@ -22943,7 +23401,10 @@ mod tests {
         // Enter on it leaves the keyboard's tab alone and opens one for the
         // input, which is where the rack now is.
         app.in_select(ch2);
-        assert_eq!(app.slots[0].in_pair, None, "the keyboard's tab is untouched");
+        assert_eq!(
+            app.slots[0].in_pair, None,
+            "the keyboard's tab is untouched"
+        );
         assert_eq!(app.slots.len(), 2, "and the input got a tab of its own");
         assert_eq!(app.active_slot, 1);
         assert_eq!(app.slots[1].in_pair, Some((1, 1)));
@@ -22959,7 +23420,11 @@ mod tests {
         let ch3 = row_of(&app, 2);
         app.in_select(ch3);
         assert_eq!(app.slots[1].in_pair, Some((1, 2)));
-        assert_eq!(app.slots.len(), 2, "a stereo pair is one input, not two tabs");
+        assert_eq!(
+            app.slots.len(),
+            2,
+            "a stereo pair is one input, not two tabs"
+        );
         app.in_select(ch3);
         assert_eq!(app.slots[1].in_pair, Some((1, 1)));
 
@@ -24439,7 +24904,10 @@ mod tests {
             m.list.cursor = 1;
         }
         assert!(app.modal_select());
-        assert!(app.quit, "the second answer leaves the work behind on purpose");
+        assert!(
+            app.quit,
+            "the second answer leaves the work behind on purpose"
+        );
     }
 
     /// Saving over a project that is already there asks before it writes.
@@ -24484,7 +24952,10 @@ mod tests {
         }
         app.save_name_key(KeyCode::Enter);
         let written = std::fs::read_to_string(&target).unwrap();
-        assert!(written.contains("rack"), "the project replaced it: {written}");
+        assert!(
+            written.contains("rack"),
+            "the project replaced it: {written}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -24674,6 +25145,66 @@ mod tests {
         fresh.apply_project_rack(saved);
         assert_eq!(fresh.slots[0].octave_sound[5], Some(0));
         assert_eq!(fresh.slots[0].sounds[0].values, vec![0.25, 0.5]);
+    }
+
+    /// Everything that decides how the rack *counts* travels with the project:
+    /// the tempo, the meter, the click, LIVE/MULTI, the buttons a pedalboard
+    /// presses — and a tab set to ANY channel stays on ANY.
+    #[test]
+    fn the_tempo_the_click_and_the_buttons_come_back_with_the_project() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let t = choz_ports::transport();
+        let met = choz_engine::metronome::metronome();
+
+        let mut app = App::new();
+        app.push_slot(AudioSource::Midi);
+        app.slots[0].channel = ANY_CHANNEL;
+        app.slots[0].sound_at = Some(1);
+        app.pc_bindings
+            .push((7, LearnTarget::Trigger(TriggerAction::SoundRecall(1))));
+        app.ui.rack_mode = settings::RackMode::Multi;
+        t.set_bpm(137.0);
+        t.set_time_signature(7, 8);
+        met.set_on(true);
+        met.set_gain(0.3);
+        met.set_style(choz_engine::metronome::ClickStyle::Wood);
+        met.set_groups(&[2, 2, 3]);
+
+        // Through the file, not just through memory: a nested enum used to
+        // make the whole save fail.
+        let yaml = serde_yaml::to_string(&app.project_snapshot()).unwrap();
+        let saved: project::Project = serde_yaml::from_str(&yaml).unwrap();
+
+        // Everything back to how a fresh choz starts, so what comes back can
+        // only have come from the file.
+        t.set_bpm(choz_ports::Transport::DEFAULT_BPM);
+        t.set_time_signature(4, 4);
+        met.set_on(false);
+        met.set_gain(0.5);
+        met.set_style(choz_engine::metronome::ClickStyle::Beep);
+        met.set_groups(&[]);
+
+        let mut fresh = App::new();
+        fresh.apply_project_rack(saved);
+        assert_eq!(t.bpm(), 137.0);
+        assert_eq!(t.time_signature(), (7, 8));
+        assert!(met.on());
+        assert_eq!(met.gain(), 0.3);
+        assert_eq!(met.style(), choz_engine::metronome::ClickStyle::Wood);
+        assert_eq!(met.groups(), vec![2, 2, 3]);
+        assert_eq!(fresh.ui.rack_mode, settings::RackMode::Multi);
+        assert_eq!(
+            fresh.pc_bindings,
+            vec![(7, LearnTarget::Trigger(TriggerAction::SoundRecall(1)))]
+        );
+        assert_eq!(fresh.slots[0].channel, ANY_CHANNEL, "ANY stays ANY");
+        assert_eq!(fresh.slots[0].sound_at, Some(1));
+
+        met.set_on(false);
+        t.set_bpm(choz_ports::Transport::DEFAULT_BPM);
+        t.set_time_signature(4, 4);
     }
 
     /// The chord the harmoniser follows can be pinned to one keyboard, which is
@@ -24905,7 +25436,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("no rect for {want:?}"))
         };
         use views::midi_monitor::MixerHit;
-        let (o, m, s) = (at(MixerHit::Dest(0)), at(MixerHit::Mute(0)), at(MixerHit::Solo(0)));
+        let (o, m, s) = (
+            at(MixerHit::Dest(0)),
+            at(MixerHit::Mute(0)),
+            at(MixerHit::Solo(0)),
+        );
         assert_eq!((o.y, m.y), (m.y, s.y), "one line for the three of them");
         assert!(o.x < m.x && m.x < s.x, "in the order O M S");
         assert!(m.width >= 2 && s.width >= 2, "each one is something to hit");
@@ -25068,7 +25603,11 @@ mod tests {
 
         // Right walks the tabs first, and only then leaves them.
         handle_mixer_keys(&mut app, KeyCode::Right);
-        assert_eq!((app.active_slot, app.desk_strip), (1, None), "the second tab");
+        assert_eq!(
+            (app.active_slot, app.desk_strip),
+            (1, None),
+            "the second tab"
+        );
         handle_mixer_keys(&mut app, KeyCode::Right);
         assert_eq!(app.desk_strip, Some(0), "off the tabs, onto group A");
 
@@ -25086,7 +25625,11 @@ mod tests {
         }
         assert_eq!(app.desk_strip, Some(choz_engine::BUSES), "the main");
         handle_mixer_keys(&mut app, KeyCode::Right);
-        assert_eq!(app.desk_strip, Some(choz_engine::BUSES), "and it stops there");
+        assert_eq!(
+            app.desk_strip,
+            Some(choz_engine::BUSES),
+            "and it stops there"
+        );
         handle_mixer_keys(&mut app, KeyCode::Down);
         assert!(app.main.gain < 1.0, "the main fader answers too");
 
@@ -25222,6 +25765,8 @@ mod tests {
     #[test]
     fn a_stereo_strip_pans_from_the_slider_under_it() {
         let _g = ui_guard();
+        // It applies a project, which is a process-wide language and colour.
+        let _restore = UiRestore;
         let mut app = App::new();
         app.splash_done = true;
         app.slots.push(RackSlot::new(AudioSource::Midi));
@@ -25515,6 +26060,38 @@ mod tests {
         // it twice cannot walk the level away.
         assert_eq!(trim_gain(0.3, 0.08, 2.0), trim_gain(0.3, 0.08, 2.0));
     }
+
+    /// **A project written by an older choz opens clean.**
+    ///
+    /// The snapshot this build takes always fills in `bpm`, `time_sig`,
+    /// `clock_source` and `rack_mode`; a file from before those existed carries
+    /// `None` for them. Taking the *file* as the baseline made every such
+    /// project unsaved work the instant it opened — the exact nag the
+    /// comparison exists to avoid — so the baseline is a snapshot of the rack
+    /// once it has been applied.
+    #[test]
+    fn an_old_project_without_the_newer_fields_is_not_unsaved_work() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        let mut old = app.project_snapshot();
+        // A file from before these were written.
+        old.audio.bpm = None;
+        old.audio.time_sig = None;
+        old.audio.clock_source = None;
+        old.audio.rack_mode = None;
+        old.audio.metronome = None;
+
+        let mut fresh = App::new();
+        fresh.apply_project(old);
+        assert!(
+            !fresh.project_is_dirty(),
+            "a project just opened is not unsaved work"
+        );
+    }
+
     /// A looper slot draws its channel strips whether or not an engine is
     /// running.
     ///

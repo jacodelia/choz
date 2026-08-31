@@ -91,6 +91,18 @@ impl Default for Bitcrusher {
 }
 
 impl FxProcessor for Bitcrusher {
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        // `Rate` reads as the 1..16 frames the rack labels it, resolved
+        // against 48 kHz — the same number [`Self::set_param`] writes.
+        let frames = (48_000.0 / self.rate_hz.max(1.0)).clamp(1.0, 16.0);
+        vec![
+            FxParam::new("Bits", (self.bits as f32 - 1.0) / 15.0, 1.0, 16.0, "bit"),
+            FxParam::new("Rate", (frames - 1.0) / 15.0, 1.0, 16.0, "fr"),
+            FxParam::new("Wet", self.wet, 0.0, 1.0, ""),
+        ]
+    }
+
     fn set_param(&mut self, index: usize, value: f32) {
         let v = value.clamp(0.0, 1.0);
         match index {
@@ -102,6 +114,7 @@ impl FxProcessor for Bitcrusher {
                 let frames = (1.0 + v * 15.0).max(1.0);
                 self.set_rate_hz(48_000.0 / frames);
             }
+            2 => self.wet = v,
             _ => {}
         }
     }

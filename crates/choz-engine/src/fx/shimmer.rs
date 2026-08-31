@@ -244,7 +244,7 @@ impl FxProcessor for ShimmerReverb {
     fn params(&self) -> Vec<crate::fx::FxParam> {
         use crate::fx::FxParam;
         vec![
-            FxParam::new("Size", 0.85, 0.0, 1.0, ""),
+            FxParam::new("Size", self.reverb.size(), 0.0, 1.0, ""),
             FxParam::new(
                 "PreDelay",
                 (self.pre_frames as f32 / self.sample_rate / 0.25).clamp(0.0, 1.0),
@@ -261,7 +261,7 @@ impl FxProcessor for ShimmerReverb {
             ),
             FxParam::new("Feedback", self.feedback / 0.85, 0.0, 1.0, ""),
             FxParam::new("Damping", self.damp, 0.0, 1.0, ""),
-            FxParam::new("Width", 0.5, 0.0, 1.0, ""),
+            FxParam::new("Width", self.reverb.width() / 2.0, 0.0, 2.0, ""),
             FxParam::new("Wet", self.mix, 0.0, 1.0, ""),
         ]
     }

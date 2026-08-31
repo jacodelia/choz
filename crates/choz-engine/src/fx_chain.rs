@@ -13,6 +13,17 @@ pub struct FxSpec {
     pub plugin: Option<PluginFxRef>,
     /// Driven by another tab's level, when the user asked for it.
     pub gate: Option<GateSpec>,
+    /// Takes to put back into a looper deck, as `(track, chunks)`.
+    ///
+    /// The one part of an effect's state that a parameter cannot carry: the
+    /// audio somebody played into it. A project stores it as WAVs beside the
+    /// file and hands it back here, so a deck built from a spec is a deck with
+    /// its loops in it — see [`choz_ports::FxProcessor::load_loops`]. Empty for
+    /// every effect that is not a looper, and for a deck that never recorded.
+    pub loops: Vec<(usize, Vec<choz_ports::LoopChunk>)>,
+    /// The deck's own loop length in frames, which the chunks do not say: the
+    /// last chunk of a take runs past the end of the loop.
+    pub loop_frames: usize,
 }
 
 /// An effect opened (or closed) by what **another tab** is playing.
@@ -347,7 +358,16 @@ pub fn build_processor(
             }
             Box::new(at)
         }
-        "filterbank" => Box::new(fx::FilterBankFx::new(sample_rate)),
+        // Low, mid and high were drawn and reached nothing: the bank was
+        // built at its defaults and the knobs went nowhere.
+        "filterbank" => {
+            use fx::FxProcessor as _;
+            let mut fb = fx::FilterBankFx::new(sample_rate);
+            for i in 0..3 {
+                fb.set_param(i, p(i));
+            }
+            Box::new(fb)
+        }
         // One processor, two effects: the LFO points at level or at balance.
         "tremolo" => Box::new(fx::Tremolo::with_params(
             fx::ModTarget::Tremolo,
@@ -414,7 +434,11 @@ pub fn build_processor(
             v.set_crackle(p(2));
             Box::new(v)
         }
-        "cassette" => Box::new(fx::Cassette::new()),
+        "cassette" => {
+            let mut c = fx::Cassette::new();
+            c.set_drive(0.5 + p(0) * 7.5);
+            Box::new(c)
+        }
         // The general waveshaper: curve and oversampling are its own knobs.
         "saturator" => Box::new(fx::Saturator::with_params(sample_rate, params)),
         // The same processor: the curve is drawn instead of computed.
@@ -435,7 +459,14 @@ pub fn build_processor(
             w.width = p(0) * 2.0;
             Box::new(w)
         }
-        "isolator" => Box::new(fx::Isolator::new()),
+        "isolator" => {
+            use fx::FxProcessor as _;
+            let mut iso = fx::Isolator::new();
+            for i in 0..3 {
+                iso.set_param(i, params.get(i).copied().unwrap_or(0.5));
+            }
+            Box::new(iso)
+        }
         "gain" => {
             let mut g = fx::Gain::new();
             g.gain_db = (p(0) - 0.5) * 48.0;
@@ -447,7 +478,12 @@ pub fn build_processor(
         }),
         "monomaker" => Box::new(fx::MonoMaker::new()),
         "looper" => Box::new(fx::Looper::new(sample_rate)),
-        "sidechain" => Box::new(fx::SidechainDuck::new()),
+        "sidechain" => {
+            let mut sc = fx::SidechainDuck::new();
+            sc.set_depth(p(0));
+            sc.set_release(0.01 + p(1) * 0.99);
+            Box::new(sc)
+        }
         "expander" => {
             let mut exp = fx::Expander::new();
             exp.threshold_db = -(1.0 - p(0)) * 80.0;
@@ -703,6 +739,10 @@ impl fx::FxProcessor for Gated {
         self.inner.loopdeck()
     }
 
+    fn load_loops(&mut self, takes: &[(usize, Vec<choz_ports::LoopChunk>)], frames: usize) {
+        self.inner.load_loops(takes, frames)
+    }
+
     fn is_loop_deck(&self) -> bool {
         self.inner.is_loop_deck()
     }
@@ -772,6 +812,10 @@ impl fx::FxProcessor for Metered {
     /// record and a panel with nothing to draw.
     fn loopdeck(&mut self) -> Option<choz_ports::LoopHandle> {
         self.inner.loopdeck()
+    }
+
+    fn load_loops(&mut self, takes: &[(usize, Vec<choz_ports::LoopChunk>)], frames: usize) {
+        self.inner.load_loops(takes, frames)
     }
 
     fn is_loop_deck(&self) -> bool {
@@ -888,6 +932,11 @@ pub fn build_chain_from_specs(
                 return Box::new(Bypass) as Box<dyn fx::FxProcessor>;
             };
             proc.set_mix(s.wet);
+            // Before any wrapper and before the RT thread: the one moment a
+            // deck can be handed the audio a project saved for it.
+            if !s.loops.is_empty() {
+                proc.load_loops(&s.loops, s.loop_frames);
+            }
             // The gate wraps the processor and the meter wraps the gate, so
             // what the interface's meter shows is what actually came out —
             // gate and all.
@@ -1015,6 +1064,8 @@ mod tests {
             wet: 1.0,
             params: vec![0.5; 8],
             plugin,
+            loops: Vec::new(),
+            loop_frames: 0,
         }
     }
 

@@ -42,6 +42,20 @@ impl Default for Pan {
 }
 
 impl super::FxProcessor for Pan {
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        vec![
+            FxParam::new("Pan", self.pan / 2.0 + 0.5, -1.0, 1.0, ""),
+            FxParam::new(
+                "ConstPwr",
+                if self.constant_power { 1.0 } else { 0.0 },
+                0.0,
+                1.0,
+                "",
+            ),
+        ]
+    }
+
     fn set_param(&mut self, index: usize, value: f32) {
         let v = value.clamp(0.0, 1.0);
         match index {

@@ -187,6 +187,9 @@ impl Biquad {
 pub struct GraphicEq {
     gains_db: [f32; EQ_BANDS],
     preamp_db: f32,
+    /// Which of [`PRESETS`] was last loaded. Kept only so the picker can be
+    /// read back — a host that cannot ask where a knob is cannot save it.
+    preset: usize,
     wet: f32,
     filters: [[Biquad; EQ_BANDS]; 2],
     /// Sample rate the coefficients were computed at; a change recomputes them.
@@ -205,6 +208,7 @@ impl GraphicEq {
         Self {
             gains_db: [0.0; EQ_BANDS],
             preamp_db: 0.0,
+            preset: 0,
             wet: 1.0,
             filters: [[Biquad::identity(); EQ_BANDS]; 2],
             fs: 0.0,
@@ -213,9 +217,21 @@ impl GraphicEq {
     }
 
     /// Load one of [`PRESETS`] by index. Out of range leaves it alone.
+    ///
+    /// **Re-picking the preset that is already loaded does nothing**, and that
+    /// is what makes the EQ safe to drive by parameter index. A host replays
+    /// every parameter in ascending order when it activates a plugin — see
+    /// `plugin_activate` in `choz-plugin-clap-export` — so the preset at index
+    /// 11 arrives *after* the ten band gains it would overwrite: without this
+    /// guard, a session whose bands were shaped by hand snapped back to the
+    /// preset's table on every activate.
     pub fn set_preset(&mut self, index: usize) {
+        if index == self.preset {
+            return;
+        }
         if let Some((_, gains)) = PRESETS.get(index) {
             self.gains_db = *gains;
+            self.preset = index;
             self.dirty = true;
         }
     }
@@ -306,6 +322,18 @@ impl FxProcessor for GraphicEq {
             EQ_MAX_DB,
             "dB",
         ));
+        // The picker and the mix, which the interface draws and a host was
+        // never told about: this list is what the exported CLAP plugin
+        // publishes, so a knob missing here is a knob a DAW cannot move,
+        // automate or save.
+        out.push(FxParam::new(
+            "Preset",
+            self.preset as f32 / (PRESETS.len() - 1) as f32,
+            0.0,
+            (PRESETS.len() - 1) as f32,
+            "",
+        ));
+        out.push(FxParam::new("Wet", self.wet, 0.0, 1.0, ""));
         out
     }
 
@@ -319,6 +347,7 @@ impl FxProcessor for GraphicEq {
             // without this, picking "Rock" only took effect the next time the
             // chain was rebuilt (a project reload), which reads as a dead knob.
             11 => self.set_preset(preset_index(value)),
+            12 => self.wet = value.clamp(0.0, 1.0),
             _ => {}
         }
     }
@@ -401,7 +430,11 @@ mod tests {
     #[test]
     fn every_band_is_a_parameter_a_cc_can_reach() {
         let mut eq = GraphicEq::new();
-        assert_eq!(eq.params().len(), EQ_BANDS + 1, "ten bands and the preamp");
+        assert_eq!(
+            eq.params().len(),
+            EQ_BANDS + 3,
+            "ten bands, the preamp, the preset and the mix"
+        );
         assert_eq!(eq.params()[4].name, "1k");
 
         // The middle of the knob is flat, the top is +12 dB.

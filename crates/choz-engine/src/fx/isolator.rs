@@ -140,7 +140,55 @@ impl Default for Isolator {
     }
 }
 
+/// Knob position to linear gain: a fade to silence below the middle, up to
+/// +12 dB above it. Unity at 0.5, and continuous across it.
+fn norm_to_gain(v: f32) -> f32 {
+    if v <= 0.5 {
+        v * 2.0
+    } else {
+        10.0f32.powf((v - 0.5) * 24.0 / 20.0)
+    }
+}
+
+/// The inverse, so a rebuild reads back the knob that was set.
+fn gain_to_norm(g: f32) -> f32 {
+    if g <= 1.0 {
+        (g * 0.5).clamp(0.0, 0.5)
+    } else {
+        (0.5 + g.log10() * 20.0 / 24.0).clamp(0.5, 1.0)
+    }
+}
+
 impl FxProcessor for Isolator {
+    /// Three band gains and the mix.
+    ///
+    /// The knob is a kill fader: the bottom half fades the band to nothing —
+    /// an isolator that could only reach −12 dB would not isolate anything —
+    /// and the top half is up to +12 dB, with unity in the middle.
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        vec![
+            FxParam::new("Low", gain_to_norm(self.band_gain[0]), 0.0, 12.0, "dB"),
+            FxParam::new("Mid", gain_to_norm(self.band_gain[1]), 0.0, 12.0, "dB"),
+            FxParam::new("High", gain_to_norm(self.band_gain[2]), 0.0, 12.0, "dB"),
+            FxParam::new("Wet", self.wet, 0.0, 1.0, ""),
+        ]
+    }
+
+    /// Live: the crossover filters keep their state, so killing the bass and
+    /// bringing it back is a fade and not a click.
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match index {
+            // ponytail: the gain steps rather than glides. A kill fader
+            // ridden fast can tick; smoothing it wants a `Smoothed` per band,
+            // which is the upgrade if anybody hears it.
+            0..=2 => self.band_gain[index] = norm_to_gain(v),
+            3 => self.wet = v,
+            _ => {}
+        }
+    }
+
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
         if self.sample_rate != sample_rate {
             self.sample_rate = sample_rate;

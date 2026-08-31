@@ -403,13 +403,17 @@ mod tests {
         }
         // Past the dry impulse, which the mix always lets through.
         let skip = sr as usize / 10;
-        let (at, peak) = out
-            .iter()
-            .enumerate()
-            .skip(skip)
-            .fold((0usize, 0.0f32), |(bi, bv), (i, &v)| {
-                if v.abs() > bv { (i, v.abs()) } else { (bi, bv) }
-            });
+        let (at, peak) =
+            out.iter()
+                .enumerate()
+                .skip(skip)
+                .fold((0usize, 0.0f32), |(bi, bv), (i, &v)| {
+                    if v.abs() > bv {
+                        (i, v.abs())
+                    } else {
+                        (bi, bv)
+                    }
+                });
         let ms = at as f32 * 1000.0 / sr as f32;
         assert!(peak > 0.5, "the echo never came back: peak {peak}");
         assert!(

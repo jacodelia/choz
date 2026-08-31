@@ -901,18 +901,50 @@ fn the_shifter_cannot_make_the_signal_louder() {
     }
 }
 
+/// What the interface draws, asked of **this** effect.
+///
+/// Not of [`meter::meter()`]: that one is process-wide by design — "two
+/// AutoTunes in a rack share it and the last one to run wins" — and the test
+/// harness runs the other AutoTune tests on other threads at the same time, so
+/// reading it here was reading whatever effect happened to run last. It failed
+/// about one run in six.
 #[test]
 fn the_meter_carries_what_the_ui_needs() {
     let sr = 48_000.0;
-    meter::meter().clear();
     let mut at = AutoTune::new(sr);
     run(&mut at, 445.0, sr, 40);
-    let m = meter::meter().read();
+    let m = at.reading();
     assert!(m.voiced && m.detected_frequency > 400.0, "{m:?}");
     assert!(m.target_frequency > 0.0 && m.level > 0.0);
     assert!(m.pitch_error_cents.is_finite());
-    meter::meter().clear();
-    assert_eq!(meter::meter().read(), AutoTuneMeter::default());
+
+    // And it reaches the shared one, which is what the interface reads. Only
+    // that it is no longer empty: a parallel test writing its own reading in
+    // between would still leave it non-empty, so this cannot flake either.
+    assert_ne!(
+        meter::meter().read(),
+        AutoTuneMeter::default(),
+        "the effect published nothing to the meter the UI reads"
+    );
+}
+
+/// The meter's own contract, on one nobody else is writing.
+#[test]
+fn a_meter_holds_what_was_published_and_clears_to_nothing() {
+    let m = meter::SharedMeter::new();
+    assert_eq!(m.read(), AutoTuneMeter::default(), "a fresh one is empty");
+    let written = AutoTuneMeter {
+        detected_frequency: 445.0,
+        target_frequency: 440.0,
+        pitch_error_cents: 19.6,
+        confidence: 0.8,
+        voiced: true,
+        level: 0.3,
+    };
+    m.publish(written);
+    assert_eq!(m.read(), written);
+    m.clear();
+    assert_eq!(m.read(), AutoTuneMeter::default());
 }
 
 #[test]

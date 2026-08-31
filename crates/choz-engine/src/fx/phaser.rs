@@ -169,6 +169,23 @@ impl super::FxProcessor for Phaser {
         self.mix = wet.clamp(0.0, 1.0);
     }
 
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        vec![
+            FxParam::new("Rate", (self.rate - 0.05) / 4.95, 0.05, 5.0, "Hz"),
+            FxParam::new("Depth", self.depth, 0.0, 1.0, ""),
+            FxParam::new(
+                "Center",
+                (self.center - 200.0) / 1800.0,
+                200.0,
+                2000.0,
+                "Hz",
+            ),
+            FxParam::new("Feedback", self.feedback / 1.8 + 0.5, -0.9, 0.9, ""),
+            FxParam::new("Wet", self.mix, 0.0, 1.0, ""),
+        ]
+    }
+
     fn set_param(&mut self, index: usize, value: f32) {
         let v = value.clamp(0.0, 1.0);
         match index {

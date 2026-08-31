@@ -8,8 +8,8 @@
 //!
 //! No dynamic compression stage to keep latency at zero (sample-by-sample).
 
-use super::FxProcessor;
 use super::dc::DcBlock;
+use super::FxProcessor;
 
 /// Cassette tape saturation effect.
 pub struct Cassette {
@@ -139,6 +139,25 @@ impl Default for Cassette {
 }
 
 impl FxProcessor for Cassette {
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        vec![
+            FxParam::new("Drive", (self.drive - 0.5) / 7.5, 0.5, 8.0, ""),
+            FxParam::new("Wet", self.wet, 0.0, 1.0, ""),
+        ]
+    }
+
+    /// Live: the drive only moves the curve and its makeup, and the emphasis
+    /// filters keep their state — a rebuild would clear them for nothing.
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match index {
+            0 => self.set_drive(0.5 + v * 7.5),
+            1 => self.wet = v,
+            _ => {}
+        }
+    }
+
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
         if self.sample_rate != sample_rate {
             self.sample_rate = sample_rate;

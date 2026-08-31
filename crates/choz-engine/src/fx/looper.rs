@@ -779,6 +779,38 @@ impl Looper {
 }
 
 impl FxProcessor for Looper {
+    /// Takes read back from a project, before this deck leaves for the RT
+    /// thread.
+    ///
+    /// **Paused, not playing.** The state knob is a parameter and comes back
+    /// with the rest of them, so a deck that was rolling would start rolling
+    /// the instant the project opened — a rack that makes noise before anybody
+    /// asked it to. Paused keeps the take, keeps the deck's length, and waits
+    /// for PLAY.
+    fn load_loops(&mut self, takes: &[(usize, Vec<LoopChunk>)], frames: usize) {
+        if frames == 0 {
+            return;
+        }
+        for (track, chunks) in takes {
+            let Some(t) = self.tracks.get_mut(*track) else {
+                continue;
+            };
+            for (i, chunk) in chunks.iter().enumerate() {
+                match t.chunks.get_mut(i) {
+                    Some(slot) => *slot = Some(chunk.clone()),
+                    // Longer than this deck can hold: the ceiling is the
+                    // ceiling, and what fits is what plays.
+                    None => break,
+                }
+            }
+            t.frames = frames.min(chunks.len() * self.chunk_frames);
+            t.state = LoopTrackState::Paused;
+        }
+        self.loop_frames = frames.min(self.max_frames);
+        self.pos = 0;
+        self.publish();
+    }
+
     fn process_block(&mut self, buf: &mut [f32], _sample_rate: u32) {
         // Commands first, at the boundary — a transport that changed mid-block
         // would put half a frame in the wrong take.
@@ -1067,6 +1099,69 @@ pub fn export_track(
     w.finalize()
         .map_err(|e| std::io::Error::other(format!("{path:?}: {e}")))?;
     Ok(written)
+}
+
+/// Resample an interleaved stereo take from `from` Hz to `to` Hz.
+///
+/// Linear interpolation between the two nearest frames. A take is a recording
+/// of a room and a player, not a test tone: the harmonics linear interpolation
+/// loses at 44.1→48 sit above 15 kHz and under everything else in the loop.
+///
+/// ponytail: linear, so a large ratio (a take pulled in from 8 kHz) will sound
+/// dull. A windowed-sinc pass is the upgrade, and it wants a reason.
+fn resample_stereo(src: &[i16], from: usize, to: usize) -> Vec<i16> {
+    let frames = src.len() / 2;
+    if frames == 0 || from == 0 || to == 0 || from == to {
+        return src.to_vec();
+    }
+    let out_frames = (frames as u64 * to as u64 / from as u64) as usize;
+    let step = from as f64 / to as f64;
+    let mut out = Vec::with_capacity(out_frames * 2);
+    for i in 0..out_frames {
+        let pos = i as f64 * step;
+        let a = (pos as usize).min(frames - 1);
+        let b = (a + 1).min(frames - 1);
+        let t = (pos - a as f64) as f32;
+        for ch in 0..2 {
+            let (x, y) = (src[a * 2 + ch] as f32, src[b * 2 + ch] as f32);
+            out.push((x + (y - x) * t).round().clamp(-32768.0, 32767.0) as i16);
+        }
+    }
+    out
+}
+
+/// Read a take back from a WAV, as the chunks a deck plays.
+///
+/// The mirror of [`export_track`], and the reason a project can reopen with the
+/// loops in it. `chunk_frames` is the deck's own chunk length — [`LOOP_CHUNK_SECS`]
+/// seconds at the rate the engine is running at now — which is also where the
+/// deck's rate is read from: a take recorded at another rate is **resampled**
+/// to it, so it keeps its pitch and its length in seconds, and only then cut
+/// into this deck's chunks. Returns the chunks and how many frames of audio
+/// they hold, counted at the deck's rate.
+pub fn import_track(
+    path: &std::path::Path,
+    chunk_frames: usize,
+) -> std::io::Result<(Vec<LoopChunk>, usize)> {
+    let mut reader = hound::WavReader::open(path)
+        .map_err(|e| std::io::Error::other(format!("{path:?}: {e}")))?;
+    let file_rate = reader.spec().sample_rate as usize;
+    let samples: Vec<i16> = reader.samples::<i16>().filter_map(|s| s.ok()).collect();
+    let deck_rate = chunk_frames / LOOP_CHUNK_SECS.max(1);
+    let samples = resample_stereo(&samples, file_rate, deck_rate);
+    let per_chunk = chunk_frames.max(1) * 2;
+    let chunks: Vec<LoopChunk> = samples
+        .chunks(per_chunk)
+        .map(|c| {
+            // Padded to the full chunk, because the deck indexes into it by
+            // position: what stops playback is the loop's length, not the end
+            // of a short last chunk.
+            let mut full = vec![0i16; per_chunk];
+            full[..c.len()].copy_from_slice(c);
+            LoopChunk::from(full)
+        })
+        .collect();
+    Ok((chunks, samples.len() / 2))
 }
 
 #[cfg(test)]
@@ -1407,6 +1502,102 @@ mod tests {
             .filter_map(|s| s.ok())
             .fold(0i16, |m, s| m.max(s.abs()));
         assert!(peak > 20_000, "and it carries the audio: {peak}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A take recorded on one device opens on another at its own pitch.
+    ///
+    /// The take was cut at 8 kHz and the deck runs at 16: without the resample
+    /// the same samples were handed over unchanged and played twice as fast —
+    /// an octave up and half as long. What the file holds is a tone, so the
+    /// tone is what the check is on: the same period in seconds, at both rates.
+    #[test]
+    fn a_take_from_another_device_keeps_its_pitch_and_its_length() {
+        let (mut lp, mut handle) = deck(8_000, 2);
+        // 500 Hz at 8 kHz: sixteen samples a cycle, well inside what linear
+        // interpolation carries.
+        let tone: Vec<f32> = (0..2 * 8_000)
+            .map(|i| ((i / 2) as f32 * 500.0 * std::f32::consts::TAU / 8_000.0).sin() * 0.8)
+            .collect();
+        lp.record(0);
+        lp.process_block(&mut tone.clone(), 8_000);
+        lp.stop(0);
+        lp.process_block(&mut [0.0f32; 32], 8_000);
+        handle.pump(RING, usize::MAX);
+        let frames = lp.loop_frames();
+
+        let path = std::env::temp_dir().join("choz_test_loop_rate.wav");
+        let _ = std::fs::remove_file(&path);
+        export_track(&handle, 0, frames, &path).expect("it writes");
+
+        // The same file into a 16 kHz deck.
+        let (chunks, read) = import_track(&path, LOOP_CHUNK_SECS * 16_000).expect("it reads");
+        let want = frames * 2;
+        assert!(
+            read.abs_diff(want) <= 2,
+            "a take is as long in seconds as it was: {read} frames at 16 kHz for {frames} at 8"
+        );
+
+        let (mut fresh, _h) = deck(16_000, 4);
+        fresh.load_loops(&[(0, chunks)], want);
+        fresh.play(0);
+        let mut buf = vec![0.0f32; 2 * 3_200];
+        fresh.process_block(&mut buf, 16_000);
+        // Zero crossings on the left channel: 500 Hz for a fifth of a second is
+        // 100 cycles, so 200 crossings — and 400 if the take played twice as
+        // fast, which is what this is here to catch.
+        let crossings = buf
+            .chunks(2)
+            .map(|f| f[0])
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+            .count();
+        assert!(
+            (180..=220).contains(&crossings),
+            "500 Hz stays 500 Hz: {crossings} crossings in 0.2 s"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A take written to a WAV comes back into a deck and plays — which is a
+    /// project reopening with its loops in it.
+    #[test]
+    fn a_take_read_back_from_a_wav_plays_in_a_fresh_deck() {
+        let (mut lp, mut handle) = deck(8_000, 4);
+        lp.record(0);
+        lp.process_block(&mut vec![0.75f32; 2 * 12_000], 8_000);
+        lp.stop(0);
+        lp.process_block(&mut [0.0f32; 32], 8_000);
+        handle.pump(RING, usize::MAX);
+        let frames = lp.loop_frames();
+
+        let path = std::env::temp_dir().join("choz_test_loop_reload.wav");
+        let _ = std::fs::remove_file(&path);
+        export_track(&handle, 0, frames, &path).expect("it writes");
+
+        // A deck as a reopened project builds it: nothing recorded, the take
+        // handed to it before it ever sees the audio thread.
+        let (chunks, read) = import_track(&path, LOOP_CHUNK_SECS * 8_000).expect("it reads");
+        assert_eq!(read, frames, "the whole loop came back");
+        let (mut fresh, _h) = deck(8_000, 4);
+        fresh.load_loops(&[(0, chunks)], frames);
+        assert_eq!(fresh.loop_frames(), frames);
+        assert_eq!(
+            fresh.track_state(0),
+            LoopTrackState::Paused,
+            "a reopened project does not start making noise"
+        );
+
+        // Paused is silent; PLAY is the take.
+        let mut buf = vec![0.0f32; 2 * 256];
+        fresh.process_block(&mut buf, 8_000);
+        assert!(buf.iter().all(|s| s.abs() < 1e-6), "paused plays nothing");
+        fresh.play(0);
+        let mut buf = vec![0.0f32; 2 * 256];
+        fresh.process_block(&mut buf, 8_000);
+        let peak = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak > 0.5, "the take is there: peak {peak}");
         let _ = std::fs::remove_file(&path);
     }
 

@@ -464,11 +464,16 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         pd!("Character", 0.25),
         pd!("Quality", 1.00),
     ];
+    /// The names are the processor's, and they were wrong here: index 1 is
+    /// `GranularDelay`'s feedback and index 3 its density, so the knob labelled
+    /// "Density" was riding the feedback and the one labelled "Feedback" the
+    /// grain rate. Renamed rather than reordered — every value stays at the
+    /// index a saved project wrote it to, so nothing sounds different.
     static GRNDLY: &[FxParamDesc] = &[
         pd!("Size", 0.40),
-        pd!("Density", 0.50),
+        pd!("Feedback", 0.50),
         pd!("Pitch", 0.50),
-        pd!("Feedback", 0.30),
+        pd!("Density", 0.30),
         pd!("Wet", 0.80),
     ];
     /// The order is the processor's own `set_param` order — the compressor
@@ -712,7 +717,10 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         pd!("Crackle", 0.10),
         pd!("Wet", 1.00),
     ];
-    static CASSETTE: &[FxParamDesc] = &[pd!("Drive", 0.40), pd!("Wet", 1.00)];
+    /// `Drive` opens at 0.20 because that is `Cassette::new()`'s 2.0 on the
+    /// 0,5–8 range the knob now spans. It read 0.40 while the knob reached
+    /// nothing, so a cassette added today sounds like a cassette always did.
+    static CASSETTE: &[FxParamDesc] = &[pd!("Drive", 0.20), pd!("Wet", 1.00)];
     static SOFTCLIP: &[FxParamDesc] = &[pd!("Drive", 0.25), pd!("Wet", 1.00)];
     /// `Curve` and `Oversamp` are lists of names, not knobs — the shapes are
     /// filled in by `param_descs`, from the DSP's own enums, so a label can
@@ -889,8 +897,11 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         pd!("T7 Vol", 1.00),
         pd!("T8 Vol", 1.00),
     ];
+    /// Same reasoning as the cassette's `Drive`: `Release` opens where
+    /// `SidechainDuck::new()` had it (0,15 s on the 0,01–1 range), which is not
+    /// where the dead knob claimed.
     static SIDECHAIN: &[FxParamDesc] =
-        &[pd!("Amount", 0.80), pd!("Release", 0.30), pd!("Wet", 1.00)];
+        &[pd!("Amount", 0.80), pd!("Release", 0.14), pd!("Wet", 1.00)];
 
     match kind {
         Delay => DELAY,
@@ -1023,6 +1034,15 @@ pub struct AudioFxEntry {
     /// opening this effect. `None` is an effect that answers only to its own
     /// knobs, which is every effect until somebody says otherwise.
     pub gate: Option<choz_engine::fx_chain::GateSpec>,
+    /// A looper's takes, as a project handed them back: `(track, chunks)`.
+    ///
+    /// Kept on the entry and not only handed over once, because a chain is
+    /// rebuilt on every knob move and every added effect — the deck that
+    /// survives a rebuild keeps its own audio (`carry_loop_decks`), and the one
+    /// built from scratch has to be handed it again.
+    pub loops: Vec<(usize, Vec<choz_ports::LoopChunk>)>,
+    /// The loop length those takes were recorded at, in frames.
+    pub loop_frames: usize,
     /// Which keyboard the chord comes from, for the effects that follow one.
     /// `None` is any of them, which is what a rig with one controller wants and
     /// what every project written before this said.
@@ -1049,6 +1069,8 @@ impl AudioFxEntry {
             state: Vec::new(),
             gate: None,
             chord_port: None,
+            loops: Vec::new(),
+            loop_frames: 0,
         }
     }
 
@@ -1074,6 +1096,8 @@ impl AudioFxEntry {
             state: Vec::new(),
             gate: None,
             chord_port: None,
+            loops: Vec::new(),
+            loop_frames: 0,
         }
     }
 
@@ -1123,6 +1147,23 @@ impl AudioFxEntry {
                 | VelvetFuzz
                 | AutoTune
                 | Envelope
+                // Everything below took its parameters only through a rebuild
+                // until they published a list a host could see: writing
+                // `set_param` for the exported plugin is what makes them
+                // reachable live here too, and a rebuild throws away every
+                // other effect's tail in the slot.
+                | ParamEq
+                | FilterBank
+                | Cassette
+                | SoftClip
+                | Saturator
+                | WaveShaper
+                | TubeSat
+                | Isolator
+                | Gain
+                | PhaseInvert
+                | MonoMaker
+                | SidechainDuck
         )
     }
 
@@ -1515,6 +1556,11 @@ impl AudioFxEntry {
                     path: c.path.clone(),
                     id: c.id.clone(),
                 }),
+            // Takes read back from a project, until the deck exists to hold
+            // them. Cloning them is cloning `Arc`s, so a rebuild costs a
+            // refcount and not a copy of the audio.
+            loops: self.loops.clone(),
+            loop_frames: self.loop_frames,
         }
     }
 
@@ -1537,6 +1583,8 @@ impl AudioFxEntry {
             state: Vec::new(),
             gate: None,
             chord_port: None,
+            loops: Vec::new(),
+            loop_frames: 0,
         })
     }
 }
@@ -1728,6 +1776,101 @@ mod param_sections_tests {
         for (group, name) in param_sections(&params) {
             assert_eq!(group, None);
             assert!(!name.is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod param_audit {
+    use super::*;
+
+    /// What a processor **publishes** has to be what the rack draws.
+    ///
+    /// The exported CLAP plugin's parameter list is `FxProcessor::params()`,
+    /// and the rack's knobs are [`fx_param_descs`]. Where the two disagree, a
+    /// host cannot move, automate or *save* the knobs that are missing — the
+    /// effect sounds different in the DAW the next time the session opens.
+    ///
+    /// Counts and order, not names: the rack abbreviates ("Thresh" for the
+    /// compressor's "Threshold") because a knob cell is thirteen columns wide,
+    /// and a parameter is addressed by index everywhere that matters.
+    ///
+    /// Every built-in publishes its list now, so an empty one is a failure:
+    /// what a host cannot see it cannot move, automate or save.
+    #[test]
+    fn a_published_parameter_list_matches_the_knobs_the_rack_draws() {
+        use choz_engine::fx_chain::build_processor;
+
+        let mut silent: Vec<&str> = Vec::new();
+        for kind in ALL_FX_KINDS {
+            let descs = fx_param_descs(*kind);
+            let params: Vec<f32> = descs.iter().map(|d| d.default).collect();
+            let p = build_processor(kind.id(), &params, 48_000)
+                .unwrap_or_else(|| panic!("{} is in the list and cannot be built", kind.id()));
+            let published = p.params();
+            if published.is_empty() {
+                silent.push(kind.id());
+                continue;
+            }
+            assert_eq!(
+                published.len(),
+                descs.len(),
+                "{}: publishes {} parameter(s), the rack draws {}",
+                kind.id(),
+                published.len(),
+                descs.len()
+            );
+        }
+        assert!(
+            silent.is_empty(),
+            "{} effect(s) publish no parameters to a host: {silent:?}",
+            silent.len()
+        );
+    }
+
+    /// A published knob has to *move* something.
+    ///
+    /// [`AudioFxEntry::takes_live_params`] says the chain is not rebuilt for
+    /// these, so `set_param` is the only path a value has: an index it does
+    /// not handle is a knob that turns and changes nothing — which is what
+    /// the graphic EQ's preset and the cassette's drive both were.
+    ///
+    /// Driven from the ends of the travel, because a toggle or a list of
+    /// names does not move for a nudge.
+    #[test]
+    fn every_live_knob_reaches_the_processor() {
+        use choz_engine::fx_chain::build_processor;
+
+        for kind in ALL_FX_KINDS {
+            if !AudioFxEntry::takes_live_params(*kind) {
+                continue;
+            }
+            let descs = fx_param_descs(*kind);
+            let params: Vec<f32> = descs.iter().map(|d| d.default).collect();
+            let mut p = build_processor(kind.id(), &params, 48_000).unwrap();
+            for i in 0..descs.len() {
+                // The dry/wet is the one index that has a second door — the
+                // rack sends it as `FX_MIX_PARAM` — so it is allowed to be
+                // deaf to `set_param`.
+                // Two names are allowed to be deaf to `set_param`: the
+                // dry/wet, which the rack sends as `FX_MIX_PARAM`, and a
+                // preset picker, which [`AudioFxEntry::apply_preset`] resolves
+                // into the knobs below it before anything is rebuilt.
+                if matches!(descs[i].name.as_ref(), "Wet" | "Preset") {
+                    continue;
+                }
+                p.set_param(i, 0.0);
+                let low = p.params()[i].value;
+                p.set_param(i, 1.0);
+                let high = p.params()[i].value;
+                assert!(
+                    (low - high).abs() > 1e-6,
+                    "{}: knob {i} ({}) reads {low} at both ends of its travel",
+                    kind.id(),
+                    descs[i].name
+                );
+                p.set_param(i, params[i]);
+            }
         }
     }
 }

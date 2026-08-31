@@ -174,6 +174,8 @@ fn a_plugin_the_user_asked_for_runs_out_of_process() {
             path: path.to_path_buf(),
             id: String::new(),
         }),
+        loops: Vec::new(),
+        loop_frames: 0,
     };
     let build = || choz_engine::fx_chain::build_chain_from_specs(&[spec()], SR, FRAMES);
 
