@@ -374,6 +374,84 @@ impl Saturator {
 }
 
 impl super::FxProcessor for Saturator {
+    /// Two lists, because this is two effects: the computed-curve saturator
+    /// publishes its six knobs, the drawn-curve waveshaper publishes its eight
+    /// points and then the four it shares. Each is the exact inverse of the
+    /// constructor that reads it — [`Saturator::with_params`] and
+    /// [`Saturator::waveshaper`] — so what a host saves rebuilds as itself.
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        let drive = self.drive.target().max(1.0).ln() / 40.0f32.ln();
+        let bias = self.bias.target() / 1.2 + 0.5;
+        let output = (self.output.target().max(1e-4).log10() * 20.0 / 24.0 + 0.5).clamp(0.0, 1.0);
+        match self.shape {
+            Shape::Curve(c) => vec![
+                FxParam::new("Drive", drive, 1.0, 40.0, "×"),
+                FxParam::new("Curve", c.to_norm(), 0.0, 7.0, ""),
+                FxParam::new("Bias", bias, -0.6, 0.6, ""),
+                FxParam::new("Tone", self.tone, 0.0, 1.0, ""),
+                FxParam::new("Output", output, -12.0, 12.0, "dB"),
+                FxParam::new("Oversamp", self.factor.to_norm(), 0.0, 3.0, "×"),
+                FxParam::new("Wet", self.mix, 0.0, 1.0, ""),
+            ],
+            Shape::Table(t) => {
+                // The eight points are addressed by index everywhere, so they
+                // are named by index too — `P1`..`P8`, as the panel draws them.
+                const POINT_NAMES: [&str; TABLE_POINTS] =
+                    ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8"];
+                let mut out: Vec<FxParam> = POINT_NAMES
+                    .iter()
+                    .zip(t.points.iter())
+                    .map(|(n, p)| FxParam::new(n, (p + 1.0) * 0.5, -1.0, 1.0, ""))
+                    .collect();
+                out.push(FxParam::new("Drive", drive, 1.0, 40.0, "×"));
+                out.push(FxParam::new("Tone", self.tone, 0.0, 1.0, ""));
+                out.push(FxParam::new("Output", output, -12.0, 12.0, "dB"));
+                out.push(FxParam::new(
+                    "Oversamp",
+                    self.factor.to_norm(),
+                    0.0,
+                    3.0,
+                    "×",
+                ));
+                out.push(FxParam::new("Wet", self.mix, 0.0, 1.0, ""));
+                out
+            }
+        }
+    }
+
+    /// Live, in the order [`Self::params`] publishes: drive, bias, output and
+    /// mix are smoothed, and the curve, the table and the oversampling factor
+    /// switch on the next block. Rebuilding instead would drop the
+    /// oversampler's filter state, which is a click on every knob turn.
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match self.shape {
+            Shape::Curve(_) => match index {
+                0 => self.set_drive(v),
+                1 => self.set_curve(Curve::from_norm(v)),
+                2 => self.set_bias(v),
+                3 => self.set_tone(v),
+                4 => self.set_output(v),
+                5 => self.set_factor(Factor::from_norm(v)),
+                6 => self.mix = v,
+                _ => {}
+            },
+            Shape::Table(mut t) => match index {
+                i if i < TABLE_POINTS => {
+                    t.points[i] = v * 2.0 - 1.0;
+                    self.set_table(t);
+                }
+                i if i == TABLE_POINTS => self.set_drive(v),
+                i if i == TABLE_POINTS + 1 => self.set_tone(v),
+                i if i == TABLE_POINTS + 2 => self.set_output(v),
+                i if i == TABLE_POINTS + 3 => self.set_factor(Factor::from_norm(v)),
+                i if i == TABLE_POINTS + 4 => self.mix = v,
+                _ => {}
+            },
+        }
+    }
+
     fn process_block(&mut self, buf: &mut [f32], sr: u32) {
         let sr = (sr.max(8000)) as f32;
         if (sr - self.sample_rate).abs() > 0.5 {

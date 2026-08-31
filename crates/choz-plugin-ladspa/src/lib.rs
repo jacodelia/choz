@@ -13,6 +13,7 @@
 //! ```
 
 pub mod abi;
+pub mod rdf;
 
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
@@ -181,6 +182,54 @@ struct PortTable {
     other: Vec<usize>,
 }
 
+/// How many positions a port has, once the metadata has had its say.
+///
+/// [`steps_of`] answers from the hint alone, which is all the ABI carries. A
+/// port the RDF names positions for has exactly as many as it named — the same
+/// rule LV2 uses for `lv2:enumeration` — and that has to win: a caps port whose
+/// three named settings sit at 0, 50 and 100 is three positions, not the
+/// hundred and one an integer hint would claim, and naming three of a hundred
+/// and one would draw two names and ninety-nine numbers.
+/// The named positions a port can actually be set to.
+///
+/// Metadata drifts from the plugin it describes: caps' file names four modes
+/// for `Compress/mode` — the last at 3 — and the port the binary declares runs
+/// 0..2. A name for a value nothing can select is worse than no name, because
+/// it is the one a list would offer and the knob could never reach.
+fn usable_points(points: Vec<(f64, String)>, min: f32, max: f32) -> Vec<(f64, String)> {
+    let (lo, hi) = (min.min(max) as f64, min.max(max) as f64);
+    points
+        .into_iter()
+        .filter(|(v, _)| *v >= lo - 1e-6 && *v <= hi + 1e-6)
+        .collect()
+}
+
+fn steps_with_names(
+    hint: &LADSPA_PortRangeHint,
+    min: f32,
+    max: f32,
+    points: &[(f64, String)],
+) -> u32 {
+    let hinted = steps_of(hint, min, max);
+    match points.len() as u32 {
+        // Nothing named: the hint is all there is.
+        0 => hinted,
+        // The hint says nothing (a plain float port) and the file named the
+        // positions: those are the positions, the way `lv2:enumeration` works.
+        named if hinted == 0 => named,
+        // Both agree.
+        named if named == hinted => named,
+        // **They disagree, so the file named only some of them.** Keep the
+        // hint's count: swh's `gate` runs −1..1 with three integer settings and
+        // its metadata names two, and taking the file's word turned a
+        // three-position port into a switch — whose two ends are −1 and 1, so
+        // the middle setting the plugin calls "gate" could not be reached at
+        // all. The names still label whatever the knob lands on, which is what
+        // `PluginParam::label_for` is for.
+        _ => hinted,
+    }
+}
+
 /// # Safety
 /// `d` must be a valid descriptor from a loaded library.
 unsafe fn port_table(d: *const LADSPA_Descriptor) -> PortTable {
@@ -191,6 +240,8 @@ unsafe fn port_table(d: *const LADSPA_Descriptor) -> PortTable {
     let descs = unsafe { (*d).port_descriptors };
     let hints = unsafe { (*d).port_range_hints };
     let names = unsafe { (*d).port_names };
+    // What the metadata files address a port by. See [`crate::rdf`].
+    let unique = unsafe { (*d).unique_id };
     let mut t = PortTable {
         audio_in: Vec::new(),
         audio_out: Vec::new(),
@@ -214,15 +265,20 @@ unsafe fn port_table(d: *const LADSPA_Descriptor) -> PortTable {
                 } else {
                     unsafe { cstr(*names.add(i)) }
                 };
+                let name = name.unwrap_or_else(|| format!("P{i}"));
+                let points =
+                    usable_points(crate::rdf::points_for(unique, i as u32, &name), min, max);
                 t.params.push(PluginParam {
                     id: i as u32,
-                    name: name.unwrap_or_else(|| format!("P{i}")),
+                    name,
                     min: min as f64,
                     max: max as f64,
                     default: default_for(&hint, NOMINAL_SR) as f64,
-                    steps: steps_of(&hint, min, max),
-                    // LADSPA has no units and no step names; a hint is all it
-                    // says about a port beyond the numbers.
+                    steps: steps_with_names(&hint, min, max, &points),
+                    // LADSPA has no units. The step *names* are not in the ABI
+                    // either — they are in the metadata beside the plugin, see
+                    // [`crate::rdf`].
+                    points,
                     ..PluginParam::default()
                 });
             }
@@ -324,11 +380,15 @@ fn build(
             // expressed as a fraction of it.
             let hint = unsafe { *(*descriptor).port_range_hints.add(p.id as usize) };
             let (min, max) = bounds(&hint, sample_rate);
+            // The bounds are re-read at the real rate, so a point that was in
+            // range at the nominal one may not be at this one.
+            let points = usable_points(p.points.clone(), min, max);
             PluginParam {
                 min: min as f64,
                 max: max as f64,
                 default: default_for(&hint, sample_rate) as f64,
-                steps: steps_of(&hint, min, max),
+                steps: steps_with_names(&hint, min, max, &points),
+                points,
                 ..p.clone()
             }
         })

@@ -1,7 +1,7 @@
 //! Vinyl simulation — wow/flutter (slow pitch modulation) + crackle noise.
 
-use super::FxProcessor;
 use super::dc::DcBlock;
+use super::FxProcessor;
 
 /// LFO-based wow and flutter + crackle noise, producing an analogue vinyl feel.
 pub struct VinylSim {
@@ -85,12 +85,23 @@ impl Default for VinylSim {
 }
 
 impl FxProcessor for VinylSim {
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        vec![
+            FxParam::new("Wow", self.wow_depth / 0.1, 0.0, 0.1, ""),
+            FxParam::new("Flutter", self.flutter_depth / 0.05, 0.0, 0.05, ""),
+            FxParam::new("Crackle", self.crackle, 0.0, 1.0, ""),
+            FxParam::new("Wet", self.wet, 0.0, 1.0, ""),
+        ]
+    }
+
     fn set_param(&mut self, index: usize, value: f32) {
         let v = value.clamp(0.0, 1.0);
         match index {
             0 => self.set_wow(v * 0.1),
             1 => self.set_flutter(v * 0.05),
             2 => self.set_crackle(v),
+            3 => self.wet = v,
             _ => {}
         }
     }

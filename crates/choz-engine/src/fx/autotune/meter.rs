@@ -31,20 +31,30 @@ pub struct SharedMeter {
     voiced: AtomicU32,
 }
 
-static METER: SharedMeter = SharedMeter {
-    detected: AtomicU32::new(0),
-    target: AtomicU32::new(0),
-    cents: AtomicU32::new(0),
-    confidence: AtomicU32::new(0),
-    level: AtomicU32::new(0),
-    voiced: AtomicU32::new(0),
-};
+static METER: SharedMeter = SharedMeter::new();
 
 pub fn meter() -> &'static SharedMeter {
     &METER
 }
 
 impl SharedMeter {
+    /// An empty one.
+    ///
+    /// Public so a test can hold its own rather than reach for [`meter()`]:
+    /// the process-wide one is written by every `AutoTune` that runs, and a
+    /// test that reads it while another test's effect is processing is a test
+    /// that fails for a reason that has nothing to do with it.
+    pub const fn new() -> Self {
+        Self {
+            detected: AtomicU32::new(0),
+            target: AtomicU32::new(0),
+            cents: AtomicU32::new(0),
+            confidence: AtomicU32::new(0),
+            level: AtomicU32::new(0),
+            voiced: AtomicU32::new(0),
+        }
+    }
+
     /// Called from the audio callback: six relaxed stores, no more.
     pub fn publish(&self, m: AutoTuneMeter) {
         self.detected
@@ -73,5 +83,11 @@ impl SharedMeter {
 
     pub fn clear(&self) {
         self.publish(AutoTuneMeter::default());
+    }
+}
+
+impl Default for SharedMeter {
+    fn default() -> Self {
+        Self::new()
     }
 }

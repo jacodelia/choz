@@ -90,6 +90,33 @@ impl Default for SidechainDuck {
 }
 
 impl FxProcessor for SidechainDuck {
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        vec![
+            FxParam::new("Amount", self.depth, 0.0, 1.0, ""),
+            FxParam::new(
+                "Release",
+                (self.release_secs - 0.01) / 0.99,
+                10.0,
+                1000.0,
+                "ms",
+            ),
+            FxParam::new("Wet", self.wet, 0.0, 1.0, ""),
+        ]
+    }
+
+    /// Live: the envelope and the LFO phase are the whole state, and losing
+    /// them mid-pump is an audible stumble.
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match index {
+            0 => self.set_depth(v),
+            1 => self.set_release(0.01 + v * 0.99),
+            2 => self.wet = v,
+            _ => {}
+        }
+    }
+
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
         self.sample_rate = sample_rate;
         let sr = sample_rate as f32;

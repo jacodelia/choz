@@ -71,6 +71,8 @@ fn main() {
             path: patch.clone(),
             id: String::new(),
         }),
+        loops: Vec::new(),
+        loop_frames: 0,
     };
     let mut chain = build_chain_from_specs(&[spec], SR, FRAMES);
     assert_eq!(chain.len(), 1, "the patch should have become an effect");
@@ -130,6 +132,8 @@ fn main() {
             path: knobs,
             id: String::new(),
         }),
+        loops: Vec::new(),
+        loop_frames: 0,
     };
     let mut chain = build_chain_from_specs(&[spec], SR, FRAMES);
     assert_eq!(chain.len(), 1);
@@ -186,6 +190,8 @@ fn main() {
             path: unnamed,
             id: String::new(),
         }),
+        loops: Vec::new(),
+        loop_frames: 0,
     };
     let mut chain = build_chain_from_specs(&[spec], SR, FRAMES);
     assert_eq!(chain.len(), 1);

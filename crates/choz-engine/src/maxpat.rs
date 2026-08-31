@@ -201,6 +201,8 @@ pub fn read_maxpat(path: &Path) -> anyhow::Result<MaxImport> {
                 // to convert them would be the guessing this refuses to do.
                 params: vec![0.5; 16],
                 plugin: None,
+                loops: Vec::new(),
+                loop_frames: 0,
             }),
             None => {
                 if !out.dropped.iter().any(|d| d == &b.name) {

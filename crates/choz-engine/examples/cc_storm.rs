@@ -13,6 +13,8 @@ fn main() {
             wet: 0.5,
             params: vec![0.5; 8],
             plugin: None,
+            loops: Vec::new(),
+            loop_frames: 0,
         };
         let n = 200;
         let t = std::time::Instant::now();

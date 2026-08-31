@@ -24,10 +24,30 @@ impl Default for Gain {
 }
 
 impl super::FxProcessor for Gain {
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        vec![
+            FxParam::new("Gain", self.gain_db / 48.0 + 0.5, -24.0, 24.0, "dB"),
+            FxParam::new("Wet", self.mix, 0.0, 1.0, ""),
+        ]
+    }
+
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match index {
+            0 => self.gain_db = (v - 0.5) * 48.0,
+            1 => self.mix = v,
+            _ => {}
+        }
+    }
+
     fn process_block(&mut self, buf: &mut [f32], _sr: u32) {
+        // The mix was kept and never read: the dry/wet knob moved and the
+        // level did not. It is the same law as everywhere else — at 0 the
+        // stage is a wire, whatever the dB knob says.
         let g = 10.0f32.powf(self.gain_db / 20.0);
         for s in buf.iter_mut() {
-            *s *= g;
+            *s += self.mix * (*s * g - *s);
         }
     }
     fn reset(&mut self) {}
@@ -66,6 +86,23 @@ impl Default for PhaseInvert {
 }
 
 impl super::FxProcessor for PhaseInvert {
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        let flag = |b: bool| if b { 1.0 } else { 0.0 };
+        vec![
+            FxParam::new("InvertL", flag(self.invert_l), 0.0, 1.0, ""),
+            FxParam::new("InvertR", flag(self.invert_r), 0.0, 1.0, ""),
+        ]
+    }
+
+    fn set_param(&mut self, index: usize, value: f32) {
+        match index {
+            0 => self.invert_l = value > 0.5,
+            1 => self.invert_r = value > 0.5,
+            _ => {}
+        }
+    }
+
     fn process_block(&mut self, buf: &mut [f32], _sr: u32) {
         let frames = buf.len() / 2;
         for i in 0..frames {
@@ -101,6 +138,17 @@ impl Default for MonoMaker {
 }
 
 impl super::FxProcessor for MonoMaker {
+    /// One knob, and it is the mix: how far towards mono the signal goes.
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        vec![crate::fx::FxParam::new("Wet", self.mix, 0.0, 1.0, "")]
+    }
+
+    fn set_param(&mut self, index: usize, value: f32) {
+        if index == 0 {
+            self.mix = value.clamp(0.0, 1.0);
+        }
+    }
+
     fn process_block(&mut self, buf: &mut [f32], _sr: u32) {
         let frames = buf.len() / 2;
         for i in 0..frames {
@@ -250,6 +298,23 @@ impl Default for SoftClipper {
 }
 
 impl super::FxProcessor for SoftClipper {
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        vec![
+            FxParam::new("Drive", (self.drive - 1.0) / 9.0, 1.0, 10.0, ""),
+            FxParam::new("Wet", self.mix, 0.0, 1.0, ""),
+        ]
+    }
+
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match index {
+            0 => self.drive = 1.0 + v * 9.0,
+            1 => self.mix = v,
+            _ => {}
+        }
+    }
+
     fn process_block(&mut self, buf: &mut [f32], sr: u32) {
         if sr != self.sample_rate {
             self.sample_rate = sr;
@@ -330,6 +395,25 @@ impl Default for TubeSaturation {
 }
 
 impl super::FxProcessor for TubeSaturation {
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        vec![
+            FxParam::new("Drive", (self.drive - 1.0) / 19.0, 1.0, 20.0, ""),
+            FxParam::new("Tone", self.tone, 0.0, 1.0, ""),
+            FxParam::new("Wet", self.mix, 0.0, 1.0, ""),
+        ]
+    }
+
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match index {
+            0 => self.drive = 1.0 + v * 19.0,
+            1 => self.tone = v,
+            2 => self.mix = v,
+            _ => {}
+        }
+    }
+
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
         if buf.len() < 2 {
             return;

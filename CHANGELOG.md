@@ -12,12 +12,312 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **808 tests** con harness en todo el workspace (716 entre `choz-engine` y `choz-ui`) + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **820 tests** con harness en todo el workspace (723 entre `choz-engine` y `choz-ui`) + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio.
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
 - `cargo test --workspace` necesita `--no-fail-fast`: uno de los binarios con
   `harness = false` no reconoce los argumentos que cargo le pasa y aborta la
   corrida. Por crate (`-p choz-engine -p choz-ui`) va entero.
+- **Un test que falla "a veces" es un global del proceso**, no un bug del código
+  que prueba: el harness corre los tests de un crate en paralelo, y el
+  transporte, los medidores y `capture_health` son singletons a propósito.
+  `choz-engine::test_locks` tiene un candado por global; en `choz-ui` el par es
+  `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
+  *su* objeto está mal escrito: pregúntele al objeto.
+
+## [1.3.5] — 2026-08-31
+
+Tres días. El hilo es el mismo que el de la 1.3.4 —**medir antes de tocar**—
+aplicado a lo que quedaba abierto: el roadmap se cerró entero, y lo que quedó
+fuera quedó **escrito como decisión**, no como olvido.
+
+Lo grande: los 46 efectos publican por fin su lista de mandos a un host, y
+escribir esas listas destapó **cinco mandos que se movían y no llegaban a
+nada**; LADSPA y DSSI dicen los nombres de sus posiciones leyéndolos de donde
+están de verdad; el looper resamplea una toma grabada en otro equipo; y un
+sonido de SoundFont que sonaba más bajo que sus vecinos resultó ser un canal
+MIDI que nadie reinicializaba.
+
+**Un aviso de compatibilidad.** Cuatro efectos —FILTER BANK, ISOLATOR, CASSETTE
+y SIDECHAIN DUCK— se construían **descartando las posiciones de sus mandos**, así
+que sonaban siempre en sus valores por defecto. Ahora leen lo que el proyecto
+guardó. En el filter bank y el isolator el valor por defecto es neutro y nada
+cambia; en la cassette y el ducker se corrieron los valores por defecto de los
+descriptores para que un efecto agregado hoy suene como sonaba siempre
+(`Drive` 0,40 → 0,20 y `Release` 0,30 → 0,14, que son el 2.0 y los 0,15 s que
+tenían sus `new()`). **Un proyecto guardado antes del 2026-08-30 con una
+cassette o un ducker adentro va a sonar distinto al reabrirlo**: el mando que
+guardó nunca hizo nada, y ahora hace lo que dice.
+
+### 2026-08-31 · lo que encontró la auditoría del diff antes de publicar
+
+Seis hallazgos sobre el árbol entero —no sólo sobre lo de estos tres días—, con
+la suite en verde en los tres crates, así que ninguno estaba cubierto por un
+test. Los seis atendidos, cada uno con el suyo:
+
+- **Un proyecto con un botón aprendido dejaba de abrir.** `TriggerAction` pasó a
+  serializarse como id en kebab (`fx-toggle`) porque serde_yaml no escribe un
+  enum dentro de otro; lo que había en disco era el nombre de la variante
+  (`FxToggle`), y `try_from` lo rechazaba — y eso no cuesta un binding, hace
+  fallar `Project::load` entero. Ahora un nombre con mayúsculas se lee como el
+  id que sería hoy. Test: `the_old_spelling_of_a_trigger_still_reads`.
+- **El preset del graphic EQ pisaba las bandas en cada activate.** Un host
+  reproduce los parámetros en orden ascendente al activar el plugin, así que el
+  índice 11 —el preset— llegaba *después* de las diez bandas y las reemplazaba
+  por su tabla. `set_preset` no hace nada si el preset ya es el cargado, que es
+  además lo correcto en general.
+- **Todo proyecto viejo abría "sucio".** El snapshot rellena siempre `bpm`,
+  `time_sig`, `clock_source` y `rack_mode`, y un archivo anterior los tiene en
+  `None`: comparar el archivo contra el snapshot marcaba trabajo sin guardar en
+  el instante de abrir, que es justo el aviso que esa comparación existe para
+  evitar. La referencia se toma ahora del rack ya aplicado. Test:
+  `an_old_project_without_the_newer_fields_is_not_unsaved_work`.
+- **Las tomas del proyecto se re-adoptaban y borraban lo grabado.** Se entregan
+  una sola vez: el deck se lleva a sí mismo entre reconstrucciones, y el motor
+  sólo rechaza el que *acarreó* —el acarreo es posicional, así que meter un
+  segundo looper delante de uno existente dejaba a ése sin acarrear y
+  re-adoptando el audio del archivo, tirando lo que se hubiera grabado en la
+  sesión—.
+- **Una escala parcial encogía el puerto.** El `gate` de swh corre −1..1 con
+  tres posiciones enteras y su `.rdf` nombra dos: tomar la palabra del archivo
+  lo convertía en un interruptor cuyos extremos son −1 y 1, y la posición del
+  medio —la que el plugin llama "gate"— dejaba de ser alcanzable. Cuando el
+  conteo del hint y el de los nombres no coinciden gana el hint, y los nombres
+  siguen etiquetando. Además se descartan los puntos fuera de rango: el archivo
+  de caps nombra un cuarto modo para `Compress/mode` en el valor 3 y el puerto
+  llega hasta 2. Test:
+  `a_partial_scale_does_not_shrink_the_port_it_names`.
+- Y una línea repetida en `engine.rs`, que estaba desde antes.
+
+### 2026-08-31 · un sonido del SF2 más bajo que los otros tres: el canal que nadie reinicializaba
+
+Reportado desde un rack con cuatro sonidos de SoundFont en una tab: tres sonaban
+a un nivel y el piano a otro, más bajo. No era el SoundFont ni el fader.
+
+**Un `Sf2Synth` reparte sus sonidos entre nueve canales MIDI**: el 0 es el
+programa de la tab —el que suena en las octavas sin zona pintada— y del 1 al 8
+son las zonas del split, una por botón de sonido. Los dos caminos que eligen un
+programa no eran simétricos:
+
+- `set_zone_program` manda el volumen de canal GM (**CC 7 = 100**) cada vez, y
+  lo llama `push_split`, que corre en casi cualquier interacción — pintar el
+  split, guardar un botón de sonido, elegir un preset, reconstruir el rack.
+- `program_change` —el canal 0— sólo seleccionaba el programa. Su CC 7 se
+  mandaba **una vez**, al cargar el archivo, y nunca más.
+
+Y `control_change` reparte cualquier CC entrante a **todos** los canales. Así
+que el primer CC 7 que manda un teclado con slider de volumen se queda pegado en
+el canal 0 y se borra de las zonas en el próximo push. Medido con la misma nota,
+el mismo preset y la misma velocidad: **15,2 dB** entre una zona y el sonido
+propio de la tab. Sin ese CC, los dos miden igual (relación 1,00).
+
+El arreglo es que `program_change` mande el mismo CC 7 que mandan las zonas: los
+nueve canales se comportan igual. Test:
+`a_volume_cc_does_not_leave_the_tabs_own_sound_behind`, que compara zona contra
+canal propio antes y después del CC y exige menos de 1 dB entre los dos —
+verificado que falla con +15,2 dB sin el arreglo.
+
+**Queda una pregunta de diseño, sin decidir**: que el CC 7 de un teclado llegue
+al SoundFont significa que hay un segundo control de volumen peleando con el
+fader VOL de la tab, escondido. Ahora los nueve canales pierden esa pelea igual
+—el próximo cambio de sonido lo pisa— pero lo coherente con el resto de choz
+sería que el CC 7 no llegue al sintetizador y sea un destino de MIDI learn como
+cualquier otro mando. Eso cambia comportamiento y no se hizo solo.
+
+### 2026-08-30 · el editor SF2 por zona queda fuera, por decisión
+
+Era el último borde abierto del roadmap. Los once generadores de `sf2_patch`
+se escriben hoy en todos los canales a la vez, así que el editor da forma al
+instrumento entero. Hacerlo por zona son 8 × 11 = **88 valores**, y las dos
+formas posibles cuestan lo mismo por caminos distintos: una lista de 101 mandos
+—ilegible con las flechas— o un mando `ZONE` que apunte los once, y entonces los
+88 valores tienen que vivir en `instr_values` más allá de los descriptores
+dibujados, lo que pide un mapeo, tocar la ruta de carga que hoy trunca lo que
+sobra, y decidir a qué sigue un CC aprendido: ¿a la zona apuntada al aprenderlo,
+o al mando dibujado? Ninguna respuesta es obviamente la buena y la equivocada se
+nota recién tocando.
+
+Queda fuera como la sección artifact y el formato `.stz`: escrito en el roadmap
+con el porqué, para que sea una decisión y no un olvido. El split ya reparte el
+teclado entre presets distintos del SoundFont, que es de donde viene la mayor
+parte de la diferencia entre dos mitades del teclado; lo que no hay es una
+envolvente distinta por zona del mismo preset.
+
+**Con esto el roadmap no tiene ni puntos pedidos ni bordes abiertos.**
+
+### 2026-08-30 · dos tests que fallaban uno de cada seis, y por qué
+
+Los dos por lo mismo, y ninguno por un bug del código que probaban: leían un
+**singleton del proceso** mientras el harness corría los demás tests en otros
+hilos, escribiéndolo.
+
+- **`the_meter_carries_what_the_ui_needs`** leía `autotune::meter::meter()`,
+  que es global a propósito —"dos AutoTunes en un rack lo comparten y gana el
+  último que corra"—, así que leía lo que hubiera publicado el último efecto
+  en correr, no el suyo. Ahora pregunta a **su** instancia, con
+  `AutoTune::reading()`, que ya existía y a la que sólo le faltaba el nivel de
+  entrada (un campo). Del global sólo se afirma que dejó de estar vacío: eso no
+  puede romperse aunque otro test escriba en medio. La segunda mitad —que
+  `clear()` lo deja en cero— se mudó a un test propio sobre un `SharedMeter`
+  local, que nadie más toca (`SharedMeter::new()`, nuevo y `const`).
+- **`the_capture_ring_answers_for_both_kinds_of_drift`** afirma cuentas exactas
+  de `meter::capture_health()`, y `a_trim_past_full_scale_is_limited_and_counted`
+  llama a `clear()` sobre el mismo global. Los dos toman ahora
+  `test_locks::meter()` —el candado que ya existía para esto— y el que toma los
+  dos candados los toma siempre en el mismo orden.
+
+Doce corridas seguidas de `choz-engine` en verde después. Antes fallaba uno de
+cada seis y uno de cada ocho.
+
+**Queda una corrida sin explicar**: una de `cargo test --workspace` falló con 14
+tests de `choz-engine` a la vez y no volvió a reproducirse en más de diez
+corridas. No es ninguno de estos dos —los dos fallan de a uno—; encaja con la
+máquina cargada (el workspace corre varios binarios de test a la vez, y varios
+hacen `dlopen` de plugins reales), pero eso no está verificado.
+
+### 2026-08-30 · LADSPA y DSSI dicen por fin cómo se llama cada posición
+
+Segundo de los dos bordes abiertos, cerrado. El roadmap decía que no se podía:
+"el ABI no tiene ninguna llamada que diga cómo se lee un valor". Sigue siendo
+cierto —un `LADSPA_Descriptor` dice si un puerto es un interruptor o un entero
+y hasta dónde llega, y nada más— pero **los nombres no están en el ABI: están
+en los `.rdf` que se instalan junto a los plugins**, que es de donde los lee
+cualquier otro host. `/usr/share/ladspa/rdf` direcciona un puerto como
+`&ladspa;<id>.<índice>` y le cuelga un `hasScale` de `Point`s con valor y
+etiqueta — la misma información que LV2 pone en `lv2:scalePoint` y que CLAP
+contesta por llamada.
+
+En esta máquina eso son **47 puertos** que eran números y ahora son listas: los
+43 tipos de reverb de `tap_reverb`, los 25 gabinetes de caps `CabinetIV`, los
+nueve tonestacks de `AmpVTS`, las quince curvas de `tap_dynamics_m`.
+
+- **`choz-plugin-ladspa::rdf`**, nuevo. Lee el path de búsqueda
+  (`LADSPA_RDF_PATH`, o `/usr/share/ladspa/rdf`, `/usr/local/share/ladspa/rdf`,
+  `/usr/share/dssi/rdf` y `~/.ladspa/rdf`) una sola vez, en un `OnceLock`, y
+  arma un `(id, puerto) → posiciones`. No es un parser de RDF: lee las dos
+  formas en que esos archivos están escritos de verdad —el puerto dentro del
+  bloque del plugin, y el puerto suelto en un archivo de escalas— y busca dos
+  atributos. Un almacén de tripletas sería la herramienta correcta y costaría
+  una dependencia y una consulta de grafo para una tabla de unas pocas filas.
+- **`steps_with_names`**: cuando el `.rdf` nombra posiciones, ésas son las
+  posiciones —la misma regla que LV2 usa para `lv2:enumeration`—. Un puerto de
+  caps con tres ajustes en 0, 50 y 100 son tres posiciones, no las ciento una
+  que reclamaría un `HINT_INTEGER`: nombrar tres de ciento una dibujaría dos
+  nombres y noventa y nueve números.
+- **Un `.rdf` que se equivoca de puerto no se cree.** El de blop está escrito
+  contando desde uno, así que su escala de `Mode` cae sobre el puerto de al
+  lado —el que el plugin llama `Steps (1 - 100)`— y un mando de cien pasos
+  volvía con tres nombres que no eran suyos. Cuando el archivo da un nombre
+  para el puerto, se compara con el que da el plugin; si no concuerdan, la fila
+  se descarta. **Un nombre equivocado es peor que un número**: el número al
+  menos era honesto. Los archivos que no nombran el puerto —el de escalas de
+  swh está escrito así— se toman al pie de la letra: no hay con qué
+  contrastarlos, y de swh viene este vocabulario.
+
+Cinco tests: las dos formas de archivo, el vecino que no hereda la escala, el
+descarte por nombre, y uno de integración que recorre lo que haya instalado y
+exige que cada puerto con nombres los tenga completos, en orden de valor y en
+la misma cantidad que sus pasos —que es exactamente la condición que
+`ParamShape::of` pide para dibujar una lista en vez de un mando—.
+
+### 2026-08-30 · los 46 efectos hablan con un host, y la auditoría de guardado cerrada
+
+Punto 1 de la auditoría de guardado, cerrado: **los 21 efectos que no publicaban
+ningún parámetro ahora publican su lista entera**, y la lista es la que el rack
+dibuja —mismo orden, misma cuenta—. En un DAW, el `.clap` exportado de un
+saturador, un isolator o un waveshaper tiene por fin mandos que mover,
+automatizar **y guardar**; hasta hoy eran cajas sin controles. Escribir esas
+listas obligó a escribir también el `set_param` que les faltaba, y ahí
+aparecieron los bugs de abajo.
+
+#### Mandos que se movían y no llegaban a nada
+
+Cuatro efectos se construían tirando a la basura las posiciones de sus mandos
+(`build_processor` los creaba con `::new()` y nunca leía `params`):
+
+- **FILTER BANK** — `Low`, `Mid` y `High` no tocaban ninguna de las 48 bandas.
+- **ISOLATOR** — lo mismo con sus tres bandas.
+- **CASSETTE** — el `Drive` no llegaba a la cinta.
+- **SIDECHAIN DUCK** — ni el `Amount` ni el `Release`.
+
+Y dos más, de otra clase:
+
+- **GAIN guardaba su dry/wet y no lo usaba nunca.** El mando se movía y el nivel
+  no cambiaba. Ahora es la misma ley que en todos los demás: en 0 la etapa es un
+  cable, diga lo que diga el mando de dB.
+- **GRANDELAY tenía dos mandos con el nombre cambiado.** El índice 1 es el
+  feedback del procesador y el 3 su densidad; el panel los llamaba al revés, así
+  que "Density" montaba el feedback y "Feedback" la tasa de granos. Se
+  **renombraron**, no se reordenaron: cada valor se queda en el índice donde un
+  proyecto guardado lo escribió, así que nada suena distinto.
+
+#### Lo que se leía mal al guardar
+
+Tres mandos publicaban una constante en vez de dónde estaban: el `Preset` del
+GRAPHIC EQ (siempre 0), y el `Size` y el `Width` del SHIMMER (siempre 0,85 y
+0,5). El mando funcionaba; lo que no funcionaba era preguntarle a dónde había
+llegado, que es exactamente lo que un host hace para guardar. El EQ recuerda su
+preset, y el shimmer lee los del reverb que lleva dentro (`Reverb::size` y
+`Reverb::width`, nuevos).
+
+#### Un mando ya no reconstruye la cadena entera
+
+Como cada efecto propio tiene ahora un `set_param` completo, doce dejaron de
+necesitar la reconstrucción: PARAM EQ, FILTER BANK, CASSETTE, SOFT CLIP,
+SATURATOR, WAVESHAPER, TUBE SAT, ISOLATOR, GAIN, PHASE INVERT, MONO MAKER y
+SIDECHAIN DUCK. Una reconstrucción reemplaza **todos** los procesadores del
+slot: mover el `Drive` de un saturador tiraba la cola del reverb que estaba
+detrás. El único que sigue reconstruyéndose es el LOOPER, que es un deck y no
+un juego de mandos.
+
+#### Lo que quedaba de la auditoría de guardado, cerrado
+
+- **Una toma grabada a otra frecuencia se resamplea.** `looper::import_track`
+  volvía a cortar el WAV en chunks del deck actual sin tocar las muestras: una
+  toma de 44,1 kHz abierta en un equipo a 48 sonaba casi un tono arriba y un
+  8 % más corta. Ahora lee la cabecera del WAV, saca la frecuencia del deck del
+  propio `chunk_frames` —que es `LOOP_CHUNK_SECS` segundos a esa frecuencia— y
+  resamplea por interpolación lineal, así que la toma conserva su afinación y
+  su duración en segundos. `read_loops` escala también el largo del loop: se
+  guardó en frames de la frecuencia de grabación, y compararlo tal cual cortaba
+  un loop de 44,1 antes de tiempo, cada vuelta. Test:
+  `a_take_from_another_device_keeps_its_pitch_and_its_length` (cuenta cruces
+  por cero: 500 Hz siguen siendo 500 Hz).
+- **Apagar un looper con tomas dentro avisa antes.** Un efecto deshabilitado no
+  está en la cadena del motor, así que sus tomas desaparecen en el momento en
+  que se apaga y el guardado ya no tiene nada que escribir. Los tres sitios que
+  hacían `entry.enabled = !entry.enabled` —teclado, ratón y trigger— pasan por
+  un único `App::toggle_fx_enabled`, que mira si el efecto es un LOOPER con
+  tomas y lo dice por el log antes de tirarlas.
+- **El dispositivo de captura del proyecto se aplica al abrirlo.** Se escribía
+  en los ajustes y el stream no se rehacía hasta el arranque siguiente. Ahora
+  `apply_project` llama a `set_input_device` **después** de cargar el rack
+  —elegir un dispositivo rehace el stream, y un stream rehecho no tiene slots—
+  y sólo cuando no es ya el que está corriendo. La frecuencia de muestreo y el
+  buffer siguen siendo del arranque siguiente, a propósito. De paso: el reloj
+  del proyecto ya se aplicaba en vivo, pero dejaba `midi_clock` diciendo lo
+  contrario de lo que el transporte seguía; ahora se mantiene en paso.
+
+#### Un flake de los tests, que no era del código
+
+`cargo test -p choz-ui` fallaba una de cada tres corridas, en un test de
+renderizado distinto cada vez y siempre por lo mismo: la interfaz aparecía en
+español. Cargar un proyecto aplica su idioma y su color **al proceso**, y dos
+tests que lo hacían no lo dejaban como estaba —
+`save_rewrites_the_current_file_and_save_as_always_asks` ni siquiera tomaba el
+lock—, así que el idioma se escapaba a cualquier test de dibujo que estuviera
+corriendo al lado. Los dos toman ahora `ui_guard()` y `UiRestore`.
+
+#### Los dos tests que lo sostienen
+
+- `a_published_parameter_list_matches_the_knobs_the_rack_draws` ya no tiene
+  techo: **cero** efectos mudos, y un cambio que baje la cuenta falla.
+- `every_live_knob_reaches_the_processor` (nuevo) recorre cada mando de cada
+  efecto que toma valores en vivo, lo lleva a los dos extremos de su recorrido y
+  exige que lo publicado se mueva. Es lo que habría cazado el `Drive` de la
+  cassette el día que se escribió. Se saltan dos nombres, y por qué: `Wet` entra
+  por `FX_MIX_PARAM`, y `Preset` lo resuelve `AudioFxEntry::apply_preset` antes
+  de reconstruir.
 
 ## [1.3.4] — 2026-08-29
 
@@ -641,7 +941,7 @@ posible — `loopdeck()` no sirve, porque el handle ya se entregó — y los wra
 
 #### Reverb: de Freeverb a una FDN
 
-Documentado entero en [docs/reverb.md](docs/reverb.md).
+Documentado entero en `docs/reverb.md` (borrado el 2026-08-31).
 
 Un comb es un resonador: su cola es un acorde de sus propios múltiplos de `1/T`,
 y ocho combs son ocho acordes. Eso *es* el timbre metálico, y más combs son más
@@ -3980,7 +4280,7 @@ Probado con voz: sonaba sucio, con clip, y en pentatónica sólo ruido. Tres cau
 
 ### 2026-08-09 (quindecies) — AutoTune: corrección de altura en tiempo real, built-in
 
-Un efecto de pitch correction nativo, no un envoltorio de nada. Documentación entera en [docs/autotune.md](docs/autotune.md).
+Un efecto de pitch correction nativo, no un envoltorio de nada. Tenía su documentación entera en `docs/autotune.md` (borrado el 2026-08-31).
 
 #### Añadido
 - **`AUTO-TUNE` es un built-in más** (`a → PITCH → AUTO-TUNE`), con su propia categoría porque un corrector de altura no es una textura ni un filtro. Efecto 34 de la casa.
@@ -4488,7 +4788,7 @@ Cierra el punto 1 de Pendiente: el mecanismo estaba hecho la sesión anterior, f
 - `App::poll_midi_hotplug()`: el bucle principal compara la lista de puertos MIDI cada 2 s y reconecta si cambió. Un controlador enchufado con choz ya abierto ahora suena sin tocar nada.
 - `engine::request_pipewire_period()`: exporta `PIPEWIRE_QUANTUM` además de `PIPEWIRE_LATENCY` antes de abrir el cliente JACK, con piso `MIN_FORCED_QUANTUM = 128`.
 - `midi::is_disabled()`: coincidencia por nombre de cliente o prefijo `"Cliente:"`.
-- [docs/audio-latency.md](docs/audio-latency.md): diagnóstico, configuración de PipeWire/WirePlumber/ALSA de la máquina y comandos para verificarla.
+- `docs/audio-latency.md` (borrado el 2026-08-31): diagnóstico, configuración de PipeWire/WirePlumber/ALSA de la máquina y comandos para verificarla.
 - Este `CHANGELOG.md`.
 
 #### Corregido

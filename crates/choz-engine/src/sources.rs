@@ -532,6 +532,21 @@ impl AudioSource for Sf2Synth {
         let _ = self
             .synth
             .select_program(0, self.font_id, bank as u32, preset);
+        // **The same GM volume every zone gets**, and for the same reason.
+        //
+        // Without this, channel 0 was the one channel whose volume was set once
+        // at load and never again, while every zone channel had it re-asserted
+        // by `set_zone_program` on each `push_split`. Since `control_change`
+        // forwards an incoming CC 7 to *all* of them, a controller with a
+        // volume slider left the tab's own sound stuck at whatever the slider
+        // said and snapped every zone back to full — measured at **15.2 dB**
+        // between the same note on the same preset, which reads as "one of my
+        // sounds is quieter than the others".
+        let _ = self.synth.send_event(oxisynth::MidiEvent::ControlChange {
+            channel: 0,
+            ctrl: 7,
+            value: 100,
+        });
     }
 
     fn plays_on_transport_stop(&self) -> bool {
@@ -548,6 +563,70 @@ mod tests {
         let mut buf = vec![0.0f32; frames * 2];
         s.render(&mut buf, 48_000);
         buf.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+    }
+
+    /// RMS of a rendered block, for comparing two levels rather than telling
+    /// sound from silence.
+    fn rms_of(s: &mut Sf2Synth, frames: usize) -> f32 {
+        let mut buf = vec![0.0f32; frames * 2];
+        s.render(&mut buf, 48_000);
+        (buf.iter().map(|x| x * x).sum::<f32>() / buf.len() as f32).sqrt()
+    }
+
+    /// **The tab's own sound is not quieter than the ones on split zones.**
+    ///
+    /// Reported from a rack with four SoundFont sounds on one tab: three played
+    /// at one level and the piano at another. The three were on split zones —
+    /// channels 1..8 — and the piano was the tab's own program, on channel 0.
+    ///
+    /// The cause was a channel that nobody re-initialised. `set_zone_program`
+    /// sends the GM channel volume every time `push_split` runs, which is on
+    /// almost every interaction; channel 0 got it once, when the file loaded.
+    /// `control_change` forwards an incoming CC to *all* the channels, so the
+    /// first CC 7 from a keyboard's volume slider stuck on channel 0 and was
+    /// wiped from every zone at the next push — **15.2 dB** between the same
+    /// note, on the same preset, at the same velocity.
+    #[test]
+    fn a_volume_cc_does_not_leave_the_tabs_own_sound_behind() {
+        let path = std::path::Path::new("/usr/share/sounds/sf2/FluidR3_GM.sf2");
+        if !path.exists() {
+            return;
+        }
+        // The same note and the same preset throughout: the only thing that
+        // changes is which channel it lands on.
+        let level = |after_cc: bool| {
+            let mut s = Sf2Synth::load(path, 0, 0, 48_000).expect("load SF2");
+            s.set_zone_program(0, 0, 0);
+            let mut split = [None; choz_ports::SPLIT_OCTAVES];
+            split[5] = Some(0);
+            s.set_split(split);
+            if after_cc {
+                // The keyboard's volume slider, and then the interaction that
+                // re-pushes both programs — a sound button, a preset pick.
+                s.control_change(7, 40);
+                s.set_zone_program(0, 0, 0);
+                s.program_change(0, 0);
+            }
+            s.note_on(60, 100);
+            let zone = rms_of(&mut s, 24_000);
+            s.all_notes_off();
+            let _ = rms_of(&mut s, 8_000);
+            // The same key, with nothing pointing at a zone: channel 0.
+            s.set_split([None; choz_ports::SPLIT_OCTAVES]);
+            s.note_on(60, 100);
+            let own = rms_of(&mut s, 24_000);
+            (zone, own)
+        };
+
+        for after_cc in [false, true] {
+            let (zone, own) = level(after_cc);
+            assert!(zone > 1e-4 && own > 1e-4, "both have to sound");
+            let db = 20.0 * (zone / own).log10();
+            assert!(
+                db.abs() < 1.0,
+                "a zone and the tab's own sound differ by {db:+.1} dB (CC sent: {after_cc})"
+            );
+        }
     }
 
     /// **A split has to layer, not choose.**

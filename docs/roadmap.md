@@ -2,12 +2,16 @@
 
 Qué falta. **Lo cerrado no vive aquí**: está en [CHANGELOG.md](../CHANGELOG.md),
 día por día, con los porqués y lo último arriba; cómo encajan las piezas, en
-[architecture.md](architecture.md). Este documento se poda cada vez que un punto
-se cierra, para que lo que quede sea sólo lo que queda: se podó entero el
-2026-08-19 y otra vez el 2026-08-29, y las dos veces lo que decía "hecho" se fue
-al changelog.
+[architecture.md](architecture.md); las dos auditorías, en
+[fx-audit.md](fx-audit.md). Este documento se poda cada vez que un punto se
+cierra, para que lo que quede sea sólo lo que queda: se podó entero el
+2026-08-19, el 2026-08-29 y el 2026-08-31, y las tres veces lo que decía "hecho"
+se fue al changelog.
 
-Última actualización: 2026-08-29.
+**Hoy no falta nada pedido.** Lo que queda son dos decisiones de no hacer y las
+notas para el que retome.
+
+Última actualización: 2026-08-31.
 
 ## Estado en una línea
 
@@ -19,11 +23,12 @@ elegible en Settings), así que también es un multiefecto; hay tres capas contr
 el código ajeno que revienta —escaneo fuera de proceso, cuarentena y sandbox—;
 hay transporte propio con compás, automatización contra ese reloj, `A→M` (audio
 a notas), AutoTune, un arpegiador y un secuenciador por tab; 46 efectos propios
-(**la suite está completa y auditada**: se apilan sin pasarse de escala, y su
-dry/wet es una sola ley), que además se publican como un `.clap` —los dos
-artifacts incluidos— para usarlos en cualquier otro host; un looper multipista
-con sus tiras de canal y exportación a WAV; un patch de Max se importa hasta donde se
-puede, diciendo qué no; hay guardia de acople en la entrada; el mixer tiene un
+(**la suite está completa y auditada**: se apilan sin pasarse de escala, su
+dry/wet es una sola ley, y los 46 publican su lista entera de mandos), que
+además se publican como un `.clap` —los dos artifacts incluidos— para usarlos en
+cualquier otro host; un looper multipista con sus tiras de canal, exportación a
+WAV y **tomas que el proyecto guarda** —resampleadas si el equipo cambió de
+frecuencia—; un patch de Max se importa hasta donde se puede, diciendo qué no; hay guardia de acople en la entrada; el mixer tiene un
 main **estéreo** y cuatro subgrupos; una tab guarda sus sonidos en botones —que
 se asignan desde el mismo modal de bank/preset— y puede partir el teclado entre
 ellos; y un efecto puede abrirse con el bombo de otra tab —por su nivel o por
@@ -31,12 +36,15 @@ las notas que se le tocan—, con el clock, o con el tap del metrónomo. El MIXE
 se maneja entero desde el teclado, grupos y main incluidos, y cada strip lleva
 su `O M S` bajo el fader. Los mandos de un plugin se agrupan por lo que el
 plugin dice —las unidades de VST3, el módulo de CLAP— y los que tienen
-posiciones con nombre abren su lista en los cuatro formatos que saben decirlas. Un plugin que guarda sus controles fuera de sus puertos
+posiciones con nombre abren su lista en **los seis formatos**: cuatro las dicen
+por su ABI, y LADSPA y DSSI —que no tienen ninguna llamada para eso— las sacan
+de los `.rdf` que se instalan junto al plugin, que es de donde las lee cualquier
+otro host. Un plugin que guarda sus controles fuera de sus puertos
 —ZynAddSubFX— se maneja por su propio servidor OSC: mandos con nombre, los
 armónicos del oscilador, su ventana real, y los mandos leyendo lo que el plugin
 tiene. **La 1.0.0 está publicada y sus paquetes verificados; la
-1.3.4 es este árbol.**
-808 tests, `clippy --workspace --all-targets -D warnings` limpio.
+1.3.5 es este árbol.**
+820 tests, `clippy --workspace --all-targets -D warnings` limpio.
 
 Las comprobaciones con hardware delante quedaron dichas en los gotchas, que es
 donde se van a leer.
@@ -45,57 +53,71 @@ donde se van a leer.
 
 ## Pendiente
 
-**No hay ningún punto pedido abierto.** Todo lo que se pidió está cerrado y
-contado día por día en el changelog; lo que sigue son los bordes que cada cierre
-dejó dichos, la pieza que se decidió no hacer, y lo que hay que saber para
-retomar. Un punto que se cierra sale de aquí — este documento es lo que queda,
-no lo que hubo.
+**No queda nada.** Ningún punto pedido, ningún borde, ninguna auditoría
+abierta: todo lo que se pidió está hecho y contado día por día en el
+[changelog](../CHANGELOG.md). Lo que sigue son las **dos piezas que se decidió
+no hacer**, con su porqué, y lo que hay que saber antes de tocar cada zona del
+código. Un punto que se cierra sale de aquí — este documento es lo que queda, no
+lo que hubo.
 
-### Fuera de la lista, por decisión del 2026-08-19
+Las dos auditorías —la de DSP y la de guardado— viven enteras en
+[fx-audit.md](fx-audit.md), con el archivo y la línea de cada hallazgo: la
+sección 6 tiene lo único que se midió y se decidió **no** arreglar (el peine del
+shifter de voces), y la 7 lo que hay que saber antes de tocar el guardado de un
+efecto. No se repiten acá.
 
-La sección **artifact** — arpegiador + piano roll de 128 pasos portado de
-seqterm. Es la pieza más grande de las pedidas, no compite con las demás por
-tiempo, y se replantea aparte.
+## Las dos piezas que quedan fuera, por decisión
 
-Lo que sí existe, y cubre parte de lo que aquella sección iba a traer: cada tab
-tiene su **arpegiador** y su **secuenciador de pasos** —hecho como un MMT-8, con
-su propio reloj contra el transporte—, y los dos se publican como plugins CLAP.
-Lo que no está es la sección como tal: una vista aparte con el piano roll largo.
+### El editor SF2 por zona (2026-08-30)
 
-### Lo que la auditoría de efectos dejó dicho
+Los once generadores de
+[`sf2_patch::EDITS`](../crates/choz-engine/src/sf2_patch.rs) se escriben hoy en
+todos los canales a la vez (`Sf2Synth::set_param`, `for channel in 0..=ZONES`),
+así que el editor da forma al instrumento entero y no a media teclado.
 
-Las once fases están cerradas —[fx-audit.md](fx-audit.md) tiene el archivo y la
-línea de cada hallazgo, el changelog lo que se hizo con cada uno—. Esto no son
-tareas: es lo que hay que saber antes de tocar un efecto.
+Hacerlo por zona son 8 zonas × 11 generadores = **88 valores**, y de ahí no se
+sale barato. O la lista de mandos pasa de 13 a 101 —ilegible con las flechas— o
+hace falta un mando `ZONE` que apunte los once a una zona, y entonces los 88
+valores tienen que vivir en `instr_values` más allá de los descriptores
+dibujados: eso pide un mapeo dibujado↔guardado, tocar la ruta de carga que hoy
+trunca lo que sobra (`rack.instr_values.resize(rack.instr_params.len(), ..)`), y
+decidir a qué sigue un CC aprendido — ¿a la zona que estaba apuntada cuando se
+aprendió, o al mando dibujado, sea cual sea la zona? Ninguna de las dos
+respuestas es obviamente la buena, y la equivocada se nota recién tocando.
 
-- **La ley de la mezcla vive en el doc de `FxProcessor::set_mix`**, y es
-  `out = dry + wet·(procesado − dry)`. La única excepción a propósito es el
-  looper, que suma: sus tomas suenan *debajo* de lo que se está tocando.
-- **Los efectos se apilan sin saturar, y hay un test que lo sostiene**
-  (2026-08-28). `no_built_in_effect_is_a_gain_stage` recorre los 46 con los
-  mandos que el rack les da: ninguno suma más de 4,5 dB y los ocho más fuertes
-  apilados no pasan de 6. Antes de eso, protocosmos sumaba 9,1 dB solo —clipeaba
-  por sí mismo desde una entrada a −8,7 dBFS— y 46 de los 2 070 pares pasaban de
-  escala; los 46 lo tenían a él adentro. `measure_stacking` (ignorado, en
-  `choz-ui`) imprime la tabla entera.
-- Con la entrada a −2,7 dBFS, 57 pares siguen pasando de escala, el peor a 1,34.
-  Eso ya no es un efecto que amplifique: son 2,7 dB de headroom y cualquier
-  cadena se los come. Se resuelve en el fader del tab.
-- La dispersión de nivel que queda al mover `Wet` a media posición —de +2,9 dB
-  en protocosmos a −9,0 en el shimmer— **no es la ley, es el nivel del wet de
-  cada efecto**, y emparejarlos querría medir cada uno contra un programa real y
-  no contra ruido. `examples/mix_probe` es la tabla.
-- Lo que la fase 10 midió y **no** arregló: el shifter de voces suma dos
-  cabezales a media ventana de distancia, y eso peina una nota aguda —2,1 dB a
-  14 kHz— haga lo que haga el interpolador. Sacarlo pide otro shifter, no otra
-  lectura.
+Lo que sí existe y cubre la mayor parte: el split reparte el teclado entre
+zonas y **cada zona puede tener su propio preset del SoundFont**, que es de
+donde viene casi toda la diferencia entre dos mitades del teclado. Lo que no hay
+es una envolvente distinta por zona del mismo preset.
 
-### Bordes que quedaron abiertos
+### El formato de proyecto: YAML + directorio al lado, no el `.stz` de seqterm (2026-08-29)
 
-| # | Qué falta | Dónde | Por qué no se hizo |
-|---|-----------|-------|--------------------|
-| 1 | **Los mandos del editor SF2 no son por zona** | SOUNDS | El editor escribe sus offsets en todos los canales, así que da forma al instrumento entero. Una envolvente distinta por zona del split querría un juego de mandos por zona, y eso es un panel nuevo. |
-| 2 | **LADSPA y DSSI no listan los nombres de los pasos** | RACK | Un parámetro con nombres abre su lista en LV2 enumerado, CLAP, VST3 y —desde el 2026-08-29— VST2. LADSPA sí dice **cuántas** posiciones tiene un puerto y choz ya lo respeta (`steps_of`, con `HINT_TOGGLED` e `HINT_INTEGER`): lo que no hay es de dónde sacar los **nombres**, porque el ABI no tiene ninguna llamada que diga cómo se lee un valor. Un interruptor se dibuja como interruptor; un puerto de cuatro posiciones sigue siendo cuatro números. |
+El `.stz` es un ZIP con manifiesto, assets direccionados por sha256, migraciones
+y validador: 2 600 líneas y `zip`, `sha2`, `uuid`, `chrono` de dependencias,
+sobre un modelo de dominio que es una *timeline* con pistas, clips y grafo de
+ruteo — que no es lo que choz guarda. El puente choz→stz sería casi todo el
+trabajo y no serviría para nada más.
+
+Lo único que choz necesitaba de aquel diseño era **assets fuera del archivo de
+texto**, y eso es el directorio `<proyecto>.loops/`: el proyecto sigue siendo un
+YAML que se lee, se diffea y entra en un repositorio, y el audio vive al lado.
+Si algún día hace falta un archivo único para mandar por correo, el paso es
+comprimir ese directorio junto al YAML —una función y una dependencia—, no
+importar el modelo de seqterm.
+
+## Lo que hay que saber para retomar
+
+### Los tests
+
+Los globales del proceso son la causa de todo test que falla "a veces": el
+harness corre los tests de un crate en paralelo, y el transporte, los medidores
+y `capture_health` son singletons a propósito. `crate::test_locks` tiene **un
+candado por global**, y el que necesita dos los toma en el mismo orden que los
+demás (transporte y después medidor). En `choz-ui` el par es `ui_guard()` y
+`UiRestore`: cargar un proyecto aplica su idioma y su color al proceso entero.
+
+Un test que lee un global para comprobar algo de *su* objeto está mal escrito:
+pregúntele al objeto. `AutoTune::reading()` existe por eso.
 
 ### Y lo de siempre
 
@@ -103,7 +125,26 @@ tareas: es lo que hay que saber antes de tocar un efecto.
 dudar de un número: todo el DSP está verificado contra señales sintéticas, no
 contra una habitación.
 
-## Notas / gotchas para el que retome
+### Notas / gotchas
+
+- **Una tab de SoundFont son nueve canales MIDI**, y hay que tratarlos igual.
+  El 0 es el programa de la tab —lo que suena en las octavas sin zona— y del 1
+  al 8 son las zonas del split. Cualquier cosa que se le mande a uno hay que
+  mandársela a los nueve: el CC 7 que se mandaba a las zonas en cada
+  `push_split` y al canal 0 sólo al cargar dejaba el sonido propio de la tab
+  15,2 dB por debajo en cuanto el teclado movía su slider de volumen
+  (2026-08-31). Sigue abierto, como decisión de diseño: que un CC 7 entrante
+  llegue al sintetizador es un segundo control de volumen peleando con el fader
+  VOL, escondido — lo coherente sería que fuera un destino de MIDI learn y no un
+  paso directo.
+- **`cargo test --workspace` falla de tanto en tanto con varios tests de
+  `choz-engine` a la vez** —14 una vez, 7 otra— y no se reprodujo nunca al
+  correrlo de nuevo, ni por crate. No están capturados los nombres: las dos
+  veces se corrió un `cargo test` *nuevo* para pedirlos, y ese pasó. **Si vuelve
+  a pasar, hay que sacar los nombres de la misma corrida** (`cargo test
+  --workspace > log 2>&1` y después buscar `^---- ` en ese archivo). Encaja con
+  la máquina cargada —el workspace corre varios binarios de test a la vez y
+  varios hacen `dlopen` de plugins reales— pero eso no está verificado.
 
 - **La ventana del shifter de voces está escrita como `2048 / 48` a propósito**
   (2026-08-28). Es tiempo, no samples, pero el número es el viejo conteo sobre
@@ -388,6 +429,6 @@ cargo build --release -p choz-plugin-clap-export
 cp target/release/libchoz_plugin_clap_export.so ~/.clap/choz.clap
 
 # Comprobar un paquete publicado sin instalarlo.
-dpkg-deb -c choz_1.3.4-1_amd64.deb
+dpkg-deb -c choz_1.3.5-1_amd64.deb
 strings usr/bin/choz | grep -c /home/       # tiene que dar 0
 ```

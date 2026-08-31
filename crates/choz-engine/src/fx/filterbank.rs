@@ -101,6 +101,40 @@ fn biquad(x: f32, z1: f32, z2: f32, c: &[f32; 5]) -> (f32, f32, f32) {
 }
 
 impl FxProcessor for FilterBankFx {
+    /// Three knobs over forty-eight bands: the bank is drawn as low, mid and
+    /// high because that is what a channel strip is, and each one tilts its
+    /// third of the spectrum. Read back from the first band of each third —
+    /// they move together, so any one of them answers for the group.
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        let g = |third: usize| self.gains_db[third * (BANDS / 3)] / 48.0 + 0.5;
+        vec![
+            FxParam::new("Low", g(0), -24.0, 24.0, "dB"),
+            FxParam::new("Mid", g(1), -24.0, 24.0, "dB"),
+            FxParam::new("High", g(2), -24.0, 24.0, "dB"),
+            FxParam::new("Wet", self.mix, 0.0, 1.0, ""),
+        ]
+    }
+
+    /// Live: the bank has no tail to lose, but a rebuild would throw away the
+    /// biquad state of forty-eight filters, and forty-eight filters resetting
+    /// at once is a click.
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        if index == 3 {
+            self.mix = v;
+            return;
+        }
+        if index >= 3 {
+            return;
+        }
+        let db = (v - 0.5) * 48.0;
+        let width = BANDS / 3;
+        for b in index * width..(index + 1) * width {
+            self.set_band_gain(b, db);
+        }
+    }
+
     fn process_block(&mut self, block: &mut [f32], sample_rate: u32) {
         if sample_rate != self.sample_rate {
             self.sample_rate = sample_rate;

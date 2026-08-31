@@ -121,6 +121,7 @@ choz/
 │   ├── choz-plugin-ladspa/
 │   │   └── src/
 │   │       ├── lib.rs           # Instance, LadspaEffect, DssiInstrument
+│   │       ├── rdf.rs           # Step names, from the .rdf beside the plugin
 │   │       └── abi.rs           # LADSPA + DSSI + snd_seq_event_t
 │   ├── choz-plugin-vst2/
 │   │   └── src/
@@ -184,7 +185,7 @@ fx/
 ├── sidechain.rs    # Sidechain ducking
 ├── parametric_eq.rs# 4-band parametric EQ
 ├── graphic_eq.rs   # 10-band Winamp graphic EQ + its 18 presets (from tanu)
-├── autotune/       # Real-time pitch correction — see docs/autotune.md
+├── autotune/       # Real-time pitch correction (YIN + PSOLA)
 │   ├── detector.rs   # YIN at 16 kHz: F0, confidence, voiced
 │   ├── quantizer.rs  # Hz → note → the note it should have been (key + scale)
 │   ├── corrector.rs  # Retune speed, correction, humanise → a pitch ratio
@@ -457,7 +458,9 @@ kinds of plugin, split by `Sort`:
 
 - **Effects** (`org.choz.fx.*`), one per entry of `BUILT_IN_KINDS`: audio ports,
   the processor's own knobs, and the dry/wet appended because outside choz there
-  is no chain to hold one.
+  is no chain to hold one. All 46 publish their list — twenty-one published
+  nothing at all until 2026-08-30, which is to say they appeared in a DAW as
+  boxes with no controls.
 - **Artifacts** (`org.choz.gen.arp`, `org.choz.gen.seq`): **note** ports and no
   audio ports at all. The arpeggiator takes keys and answers with keys; the
   sequencer takes nothing and plays what is written on it.
@@ -743,7 +746,18 @@ everything else in the rack:
 - `reset()` that leaves nothing behind;
 - output bounded: an effect that can run away takes the mix bus with it, so a
   feedback loop is bounded **structurally** (a saturator) and not by a constant
-  someone measured once.
+  someone measured once;
+- **`params()` publishes every knob the rack draws, in the same order, and
+  `set_param` reaches every one of them.** The exported `.clap`'s parameter
+  list *is* `params()`, so a knob missing there is a knob a DAW cannot move,
+  automate or save; and a `set_param` that ignores an index is a knob that turns
+  and changes nothing, because the rack stopped rebuilding the chain for a knob
+  turn (a rebuild throws away every other effect's tail in the slot). Two tests
+  hold both ends: `a_published_parameter_list_matches_the_knobs_the_rack_draws`
+  and `every_live_knob_reaches_the_processor`, which drives each knob to both
+  ends of its travel and fails if what is published does not move. `Wet` is
+  exempt from the second — the rack sends it as `FX_MIX_PARAM` — and so is a
+  `Preset`, which `AudioFxEntry::apply_preset` resolves into the knobs below it.
 
 The test pattern each one follows: silence, an impulse, a sine, noise, mono and
 stereo, both ends of every parameter, a sample-rate change, tiny and huge
@@ -999,8 +1013,9 @@ without waiting for its GUI to build.
 and `points` — the named steps with the place each sits at — filled by each host
 from what its format reports: `lv2:portProperty`/`lv2:scalePoint`/`units:unit`,
 VST3's `stepCount` + `getParamStringByValue` + `units`, CLAP's `IS_STEPPED` +
-`value_to_text`, LADSPA's `TOGGLED`/`INTEGER` hints. VST2 reports none of it and
-stays continuous. `source::ParamShape` turns that into the control:
+`value_to_text`, LADSPA's `TOGGLED`/`INTEGER` hints **plus the scale points in
+the `.rdf` beside the plugin** (see below). VST2 reports none of it and stays
+continuous. `source::ParamShape` turns that into the control:
 
 | Report | Control |
 |---|---|
@@ -1014,6 +1029,59 @@ Two things this must keep, and there are tests for both: a stepped parameter
 moves **one position** per arrow or wheel click (`ParamShape::nudge`), and every
 control — bank bars included — keeps its own rect in `RackLayout.instr_knobs`,
 which is what the mouse and MIDI learn work off.
+
+#### A SoundFont tab is nine MIDI channels
+
+`Sf2Synth` loads the file once and points channels at programs inside it, so a
+split zone costs a channel and no memory. **Channel 0 is the tab's own program**
+— what plays in every octave with no zone painted on it — and channels 1–8 are
+the zones, one per sound button.
+
+Two things follow, and one of them was a bug for a while:
+
+* Every channel needs its **GM channel volume** set or it plays at whatever it
+  was left at. `set_zone_program` sends CC 7 = 100 each time, and `push_split`
+  calls it on almost any interaction; `program_change` (channel 0) used to send
+  it only once, when the file loaded.
+* `control_change` forwards an incoming CC to **all nine**, because a pedal or a
+  wheel belongs to the keyboard and not to a zone of it.
+
+Together those made a keyboard's volume slider land unevenly: the first CC 7
+stuck on channel 0 and was wiped from every zone at the next push, leaving the
+tab's own sound **15.2 dB** under the ones on zones — the same preset, the same
+note, the same velocity. Both paths send it now, and
+`a_volume_cc_does_not_leave_the_tabs_own_sound_behind` measures the two against
+each other.
+
+#### LADSPA's step names are not in LADSPA
+
+The ABI has no call for them. A `LADSPA_Descriptor` says a port is `TOGGLED` or
+`INTEGER` and how far it runs, so `steps_of` can answer *how many* positions a
+port has and nothing at all about what any of them **mean** — which is why a
+reverb type was forty-three numbers.
+
+The names live in the metadata files installed beside the plugins, which is
+where every other host reads them from too. `crate::rdf` reads the search path
+(`LADSPA_RDF_PATH`, else `/usr/share/ladspa/rdf`, `/usr/local/share/ladspa/rdf`,
+`/usr/share/dssi/rdf`, `~/.ladspa/rdf`) once into a `OnceLock`, keyed by
+`(unique id, port index)` — the `&ladspa;1675.4` that `rdf:about` names. It is
+deliberately not an RDF parser: it reads the two shapes those files are written
+in and looks for two attributes, because a triple store is a dependency and a
+graph query for a lookup table of a few hundred rows.
+
+Two rules make it safe to trust:
+
+* **A named scale sets the step count**, the same way `lv2:enumeration` does. A
+  caps port with three settings at 0, 50 and 100 is three positions, not the
+  hundred and one an `INTEGER` hint claims — naming three of a hundred and one
+  would draw two names and ninety-nine numbers.
+* **A file that names the wrong port is not believed.** blop's is written
+  one-based, so its `Mode` scale lands on the port the plugin calls
+  `Steps (1 - 100)`. When the file gives a label for the port it is checked
+  against the plugin's own port name and dropped if they disagree: a wrong name
+  is worse than a number, because the number was at least honest. Files that
+  name no port (swh's scales file) are taken at their word — there is nothing to
+  check against, and swh is where the vocabulary comes from.
 
 #### What is a knob, and what is not
 

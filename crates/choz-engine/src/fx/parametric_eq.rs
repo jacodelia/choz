@@ -336,6 +336,88 @@ impl Default for ParametricEq {
 }
 
 impl super::FxProcessor for ParametricEq {
+    /// The ten knobs [`ParametricEq::from_params`] reads, read back out. The
+    /// inverse of that mapping, index for index: what a host saves has to be
+    /// what a rebuild would have made of the same numbers.
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        let gain = |i: usize| self.bands[i].gain_db / 36.0 + 0.5;
+        vec![
+            FxParam::new("Low", gain(0), -18.0, 18.0, "dB"),
+            FxParam::new("LowMid", gain(1), -18.0, 18.0, "dB"),
+            FxParam::new("HiMid", gain(2), -18.0, 18.0, "dB"),
+            FxParam::new("High", gain(3), -18.0, 18.0, "dB"),
+            FxParam::new(
+                "LowFreq",
+                (self.bands[0].freq / 20.0).max(1.0).ln() / 40.0f32.ln(),
+                20.0,
+                800.0,
+                "Hz",
+            ),
+            FxParam::new(
+                "HiFreq",
+                (self.bands[3].freq / 1000.0).max(1.0).ln() / 20.0f32.ln(),
+                1000.0,
+                20000.0,
+                "Hz",
+            ),
+            FxParam::new("MidQ", (self.bands[1].q - 0.1) / 9.9, 0.1, 10.0, ""),
+            FxParam::new("Mode", self.mode.to_norm(), 0.0, 4.0, ""),
+            FxParam::new(
+                "Solo",
+                self.solo.map_or(0.0, |i| (i + 1) as f32 / 4.0),
+                0.0,
+                4.0,
+                "",
+            ),
+            FxParam::new("Wet", self.mix, 0.0, 1.0, ""),
+        ]
+    }
+
+    /// Live, and the same mapping as [`ParametricEq::from_params`]: only the
+    /// coefficients of the band that moved are recomputed, so riding the low
+    /// shelf does not rebuild the other three.
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        let sr = self.last_sr.max(1);
+        let mut touched: &[usize] = &[];
+        match index {
+            0..=3 => {
+                self.bands[index].gain_db = (v - 0.5) * 36.0;
+                touched = match index {
+                    0 => &[0],
+                    1 => &[1],
+                    2 => &[2],
+                    _ => &[3],
+                };
+            }
+            4 => {
+                self.bands[0].freq = 20.0 * (800.0f32 / 20.0).powf(v);
+                touched = &[0];
+            }
+            5 => {
+                self.bands[3].freq = 1000.0 * 20.0f32.powf(v);
+                touched = &[3];
+            }
+            6 => {
+                let q = 0.1 + v * 9.9;
+                self.bands[1].q = q;
+                self.bands[2].q = q;
+                touched = &[1, 2];
+            }
+            7 => self.mode = EqMode::from_norm(v),
+            8 => {
+                let solo = (v * 4.0).round() as usize;
+                self.solo = (solo > 0).then(|| solo - 1);
+            }
+            9 => self.mix = v,
+            _ => {}
+        }
+        for &b in touched {
+            self.bands[b].compute_coeffs(sr);
+        }
+    }
+
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
         if buf.len() < 2 {
             return;

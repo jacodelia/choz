@@ -30,6 +30,23 @@ pub struct Project {
     /// exactly what those projects sounded like.
     #[serde(default)]
     pub buses: Buses,
+    /// Controller **buttons** that press a rack button, by program number.
+    /// Filed with the project and not with a tab because a program change
+    /// carries no channel here: one keyboard's buttons drive the whole rack.
+    /// Absent in projects written before they were saved at all, which is a
+    /// rig whose buttons did nothing until they were learned again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub program_change: Vec<ProgramBinding>,
+}
+
+/// One program-change binding. Same shape as [`Binding`], minus the source:
+/// a program change is a button press, and the rig has one set of buttons.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProgramBinding {
+    pub program: u8,
+    pub target: crate::LearnTarget,
+    #[serde(default)]
+    pub label: String,
 }
 
 /// The desk's own strips: four subgroups and the main.
@@ -93,6 +110,47 @@ pub struct Audio {
     pub osc_port: Option<u16>,
     /// MIDI ports the user switched off.
     pub disabled_midi_inputs: Vec<String>,
+    /// The transport's tempo and meter — what the arpeggiator, the sequencer,
+    /// every tempo-synced plugin and the click all count in, so a project that
+    /// does not carry them reopens playing the same notes at another speed.
+    /// Absent is "leave the transport where it is", which is what a project
+    /// written before this did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bpm: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_sig: Option<(u16, u16)>,
+    /// The click: on, level, sound, how the bar is counted and where it lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metronome: Option<Metronome>,
+    /// Where the tempo comes from — choz's own clock or a port sending MIDI
+    /// clock. Part of the configuration half of the file, like the device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_source: Option<crate::settings::ClockSource>,
+    /// LIVE or MULTI: whether the tabs take turns on one input or each answers
+    /// its own MIDI channel. It decides which tab a note reaches, so a rack
+    /// saved in MULTI that reopens in LIVE is a different instrument.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rack_mode: Option<crate::settings::RackMode>,
+    /// Capture device, for the tabs that run on live audio. `Some("")` is
+    /// whatever the host calls default; absent leaves the setting alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_device: Option<String>,
+}
+
+/// The click as it was left. Mirrors [`choz_engine::metronome::Metronome`],
+/// which holds it in atomics the audio thread reads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Metronome {
+    pub on: bool,
+    /// Linear, 0..1.
+    pub gain: f32,
+    /// `BEEP` / `CLICK` / `WOOD`, as the menu spells it.
+    pub style: String,
+    /// How the bar is counted, `[2, 2, 3]` for a 7/8. Empty is no grouping.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<u8>,
+    /// Where it lands, as [`choz_engine::Dest::index`].
+    pub dest: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -123,6 +181,10 @@ pub struct Slot {
     /// eleven nulls is not worth writing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub split: Vec<(usize, usize)>,
+    /// Which of those buttons the tab is currently on, so the lamp comes back
+    /// lit on the sound that is actually loaded. Absent is none of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sound_at: Option<usize>,
     /// MIDI-learn bindings that target this tab.
     pub midi_learn: Vec<Binding>,
     /// The tab's arpeggiator. Added later, so `default` (off) keeps every
@@ -272,6 +334,32 @@ pub struct Fx {
     /// any of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chord_port: Option<String>,
+    /// A looper's takes: the audio, which is the one thing about an effect that
+    /// a knob position cannot say.
+    ///
+    /// The WAVs live in a directory beside the project — `<name>.loops/` — and
+    /// not inside it: a project stays a file somebody can read, diff and put in
+    /// a repository, and minutes of audio in base64 is none of those things.
+    /// Moving a project means moving both, which is why the paths here are
+    /// relative to the project file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loops: Vec<LoopTake>,
+}
+
+/// One channel of a looper deck, as a file beside the project.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoopTake {
+    /// Which channel strip it belongs to, 0-based.
+    pub track: usize,
+    /// Where the WAV is, relative to the project file.
+    pub file: String,
+    /// The deck's loop length when it was written. The file can be longer: the
+    /// last chunk of a take runs past the end of the loop.
+    pub frames: usize,
+    /// What it was recorded at. A project opened on a device running at another
+    /// rate plays it at that rate — the take is audio, not a tape it can
+    /// re-cut — and choz says so in the log rather than silently retuning it.
+    pub sample_rate: u32,
 }
 
 /// One of a tab's saved sounds: the patch as the player left it.
@@ -326,14 +414,43 @@ impl Project {
             .map_err(|e| anyhow::anyhow!("{} is not a choz project: {e}", file.display()))
     }
 
+    /// The file a path names: itself, or the default name inside it when it is
+    /// a directory. What the loops directory is named after, so the name is
+    /// worked out once and in one place.
+    pub fn resolve(path: &Path) -> PathBuf {
+        match path.is_dir() {
+            true => path.join(DEFAULT_NAME),
+            false => path.to_path_buf(),
+        }
+    }
+
+    /// Where this project's looper takes live: `<name>.loops`, beside the file.
+    pub fn loops_dir(file: &Path) -> PathBuf {
+        let stem = file
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "choz-project".to_string());
+        file.with_file_name(format!("{stem}.loops"))
+    }
+
+    /// Forget where the takes are, for the copy that "unsaved work" is measured
+    /// against: the WAVs are written by the save itself, so a project that has
+    /// just been read would otherwise differ from a snapshot of the live rack
+    /// in nothing but those paths, and choz would ask about work nobody did.
+    pub fn without_loops(&self) -> Self {
+        let mut out = self.clone();
+        for slot in out.rack.iter_mut() {
+            for fx in slot.fx.iter_mut() {
+                fx.loops.clear();
+            }
+        }
+        out
+    }
+
     /// Write the project to `path`, or to `path/choz-project.yml` when `path`
     /// is a directory.
     pub fn save(&self, path: &Path) -> anyhow::Result<PathBuf> {
-        let file = if path.is_dir() {
-            path.join(DEFAULT_NAME)
-        } else {
-            path.to_path_buf()
-        };
+        let file = Self::resolve(path);
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -347,7 +464,7 @@ impl Project {
 mod tests {
     use super::*;
 
-    fn sample() -> Project {
+    pub(super) fn sample() -> Project {
         Project {
             buses: Buses::default(),
             automation: crate::automation::Automation::default(),
@@ -359,15 +476,33 @@ mod tests {
                 output_device: Some("default".into()),
                 osc_port: Some(9000),
                 disabled_midi_inputs: vec!["Midi Through".into()],
+                bpm: Some(132.0),
+                time_sig: Some((7, 8)),
+                metronome: Some(Metronome {
+                    on: true,
+                    gain: 0.4,
+                    style: "WOOD".into(),
+                    groups: vec![2, 2, 3],
+                    dest: 0,
+                }),
+                clock_source: Some(crate::settings::ClockSource::Internal),
+                rack_mode: Some(crate::settings::RackMode::Multi),
+                input_device: Some(String::new()),
             },
             interface: Interface {
                 text_color: (240, 180, 90),
                 language: "es".into(),
             },
             plugin_paths: choz_engine::PluginPaths::default(),
+            program_change: vec![ProgramBinding {
+                program: 3,
+                target: crate::LearnTarget::Trigger(crate::TriggerAction::SoundRecall(1)),
+                label: "tab 1 \u{00b7} SOUND 2".into(),
+            }],
             rack: vec![Slot {
                 sounds: Vec::new(),
                 split: Vec::new(),
+                sound_at: None,
                 input: Some("MIDI:Keystation".into()),
                 channel: 3,
                 instrument: Instrument {
@@ -399,6 +534,7 @@ mod tests {
                     in_gate: None,
                 },
                 fx: vec![Fx {
+                    loops: Vec::new(),
                     gate: None,
                     chord_port: None,
                     kind: "amberfang".into(),
@@ -490,6 +626,38 @@ pub fn encode_state(data: &[u8]) -> String {
 
 pub fn decode_state(text: &str) -> Option<Vec<u8>> {
     (!text.is_empty()).then(|| base64_simd::STANDARD.decode_to_vec(text).ok())?
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+
+    /// The takes live beside the project and are named after it, and the copy
+    /// that "unsaved work" is measured against never mentions them.
+    #[test]
+    fn the_takes_live_in_a_directory_named_after_the_project() {
+        let file = Path::new("/home/x/sets/friday.yml");
+        assert_eq!(
+            Project::loops_dir(file),
+            Path::new("/home/x/sets/friday.loops")
+        );
+        // A directory resolves to the default name first, so the takes of an
+        // unnamed project are not called after the folder.
+        assert_eq!(
+            Project::loops_dir(&Project::resolve(Path::new("/nope/does/not/exist.yml"))),
+            Path::new("/nope/does/not/exist.loops")
+        );
+
+        let mut p = super::tests::sample();
+        p.rack[0].fx[0].loops = vec![LoopTake {
+            track: 0,
+            file: "friday.loops/tab1-fx1-ch1.wav".into(),
+            frames: 96_000,
+            sample_rate: 48_000,
+        }];
+        assert!(p.without_loops().rack[0].fx[0].loops.is_empty());
+        assert_eq!(p.rack[0].fx[0].loops.len(), 1, "the original is untouched");
+    }
 }
 
 #[cfg(test)]

@@ -3,8 +3,8 @@
 //! Based on the topology-preserving SVF from Simper (2012).
 //! Stable at all frequencies, minimal distortion, suitable for realtime.
 
-use super::FxProcessor;
 use super::smooth::Smoothed;
+use super::FxProcessor;
 use std::f32::consts::PI;
 
 /// Time constant of the cutoff sweep. Long enough to have no corner, short
@@ -111,6 +111,21 @@ impl Svf {
 }
 
 impl FxProcessor for Svf {
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        vec![
+            FxParam::new(
+                "Cutoff",
+                ((self.cutoff_hz - 20.0) / 19980.0).clamp(0.0, 1.0),
+                20.0,
+                20000.0,
+                "Hz",
+            ),
+            FxParam::new("Res", self.resonance / 0.98, 0.0, 0.98, ""),
+            FxParam::new("Wet", self.wet, 0.0, 1.0, ""),
+        ]
+    }
+
     /// Cutoff and resonance, live: rebuilding would clear the filter's state
     /// and a state-variable filter with no state is a click.
     fn set_param(&mut self, index: usize, value: f32) {
@@ -118,6 +133,7 @@ impl FxProcessor for Svf {
         match index {
             0 => self.set_cutoff(20.0 + v * 19980.0),
             1 => self.set_resonance(v * 0.98),
+            2 => self.wet = v,
             _ => {}
         }
     }

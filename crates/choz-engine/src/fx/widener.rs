@@ -24,9 +24,20 @@ impl Default for StereoWidener {
 }
 
 impl super::FxProcessor for StereoWidener {
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        vec![
+            FxParam::new("Width", self.width / 2.0, 0.0, 2.0, ""),
+            FxParam::new("Wet", self.mix, 0.0, 1.0, ""),
+        ]
+    }
+
     fn set_param(&mut self, index: usize, value: f32) {
-        if index == 0 {
-            self.width = value.clamp(0.0, 1.0) * 2.0;
+        let v = value.clamp(0.0, 1.0);
+        match index {
+            0 => self.width = v * 2.0,
+            1 => self.mix = v,
+            _ => {}
         }
     }
 
