@@ -76,7 +76,6 @@ pub enum RackButton {
     /// Open the SF2 bank/preset picker (SoundFont tabs only).
     Preset,
     /// Arm MIDI learn.
-    Learn,
     /// Listen to the tab's audio input and play its instrument from the pitch.
     PitchToMidi,
     /// How much of a converting tab's output is the instrument and how much is
@@ -609,7 +608,6 @@ fn gate_db(gate: f32) -> String {
 /// back through `t()` and re-adds the padding the layout expects.
 pub const BTN_SOURCE: &str = "SOURCE";
 pub const BTN_PRESET: &str = "BANK/PRESET";
-pub const BTN_LEARN: &str = "MIDI LEARN";
 
 /// A button label, translated and padded to sit inside its box.
 pub fn btn(key: &str) -> String {
@@ -1604,7 +1602,6 @@ pub fn draw_fx_chain_panel(
         (RackButton::Source, Some(btn(BTN_SOURCE))),
         // Bank/preset only exists while the tab holds a SoundFont.
         (RackButton::Preset, has_presets.then(|| btn(BTN_PRESET))),
-        (RackButton::Learn, Some(btn(BTN_LEARN))),
         // A guitar into a synth: only offered where there is audio coming in.
         (
             RackButton::PitchToMidi,

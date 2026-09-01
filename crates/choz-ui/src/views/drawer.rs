@@ -196,16 +196,16 @@ pub fn draw_output_panel(f: &mut Frame, area: Rect, focused: bool, rows: &[OutRo
             lines.push(Line::from(Span::styled(format!(" {}", row.label), dim)));
             continue;
         }
-        let live = row.mark == '\u{2713}';
+        // One colour for the whole list, like the INPUTS drawer: the tick and
+        // the dot carry which output is live, and dimming the rest made a jack
+        // that is simply not in use look like one that is not there.
         let style = if focused && i == cursor {
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
-        } else if live {
-            Style::default().fg(ui_text())
         } else {
-            Style::default().fg(Color::Rgb(110, 115, 125))
+            Style::default().fg(ui_text())
         };
         lines.push(Line::from(Span::styled(
             format!(" {} {}", row.mark, row.label),

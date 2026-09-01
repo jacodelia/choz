@@ -12,8 +12,9 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **820 tests** con harness en todo el workspace (723 entre `choz-engine` y `choz-ui`) + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **850 tests** con harness en todo el workspace (751 entre `choz-engine` y `choz-ui`) + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio.
+- **56 efectos propios**, publicados también como un `.clap` con los dos artifacts.
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
 - `cargo test --workspace` necesita `--no-fail-fast`: uno de los binarios con
   `harness = false` no reconoce los argumentos que cargo le pasa y aborta la
@@ -24,6 +25,198 @@ lleva lo que falta —nada de lo ya hecho— y
   `choz-engine::test_locks` tiene un candado por global; en `choz-ui` el par es
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
+
+## [1.3.6] — 2026-09-01
+
+Un día. Empezó con choz congelado en pantalla y terminó con **diez efectos
+nuevos**, dos teclados tocando a la vez y una auditoría que encontró tres
+`process_block` que allocaban. El hilo, otra vez: **medir antes de tocar** — y
+esta vez lo medido fue un proceso colgado, con `gdb` encima.
+
+### El cuelgue: `strip = true` costaba catorce `??`
+
+Reportado como "se congeló al elegir un banco de sonidos para SurgeXT". El
+proceso seguía vivo: tres hilos, todos dormidos, main en un futex. Los dos hilos
+de Surge (`MessageThread` y `JUCE Timer`) **sanos**, así que no eran ellos.
+
+El binario venía con `strip = true` y el backtrace de main eran catorce `??`.
+Resueltos contra un build con símbolos —el ancla es exacta, `main+0x25` coincide
+con el `main` que reporta gdb— el fondo de la pila dice:
+
+```
+main → lang_start → choz::main → drop_glue::<choz::App>
+     → …drop del cliente JACK y de los slots…
+     → <Vst3RealInstance as Drop>::drop → futex, para siempre
+```
+
+**No era el modal.** choz estaba *saliendo*, y `Vst3RealInstance::drop` abría
+con `shared_view.lock()` sin plazo — el mismo lock que `Vst3Editor::idle`
+sostiene durante toda su llamada *dentro* del plugin, que para un JUCE es su
+propio bucle de mensajes. Plugin trabado adentro = `Drop` trabado = interfaz
+trabada. VST2 tenía el mismo defecto (`Vst2Editor::dispatch` sostiene `shared`
+en cada opcode, `effEditIdle` incluido).
+
+Arreglo: `choz_ports::lock_within` —`try_lock` con plazo, 2 s, el mismo que
+`EditorWindow::drop` ya esperaba por ese hilo— y, si vence, **se filtra la
+instancia** en vez de esperar: +1 refcount sobre todo lo que el hilo del editor
+puede tocar, la librería sin `dlclose`, y choz sigue. Es el trato que los hosts
+CLAP y LV2 ya hacían con los plugins que revientan en su propio teardown. Cuesta
+la memoria de una tab hasta salir; antes costaba la sesión.
+
+Y `strip = true` → `strip = "debuginfo"`: los símbolos quedan (+3,5 MB), la info
+de depuración se va. Un freeze dentro de un plugin se diagnostica con `gdb -p`, y
+un binario stripped contesta con `??`.
+
+Probado, además, lo que **no** era: dos sondas nuevas cargaron los 637 patches de
+fábrica de Surge XT —una contra la instancia pelada, otra con el motor y JACK
+arriba— sin colgarse nunca. `examples/audition_hang` queda en el árbol.
+
+### Butter cargaba y no sonaba
+
+Segundo reporte del mismo rig: asignar `Butter` a un botón de SOUNDS y quedarse
+sin sonido, hasta volver a abrir BANK y elegirlo otra vez. Medido:
+
+```
+nota 1 después de cargar el patch:  -180.0 dBFS   (silencio absoluto)
+nota 2:                              -10.4 dBFS
+```
+
+Surge —como cualquier plugin serio— **mata las voces que encuentra** al cargar
+un patch. La nota que arranca junto con la carga no suena nunca. Y choz cargaba
+el patch **dos veces**: la audición al mover el cursor, y otra vez al elegir esa
+misma fila. Dos cargas, dos notas comidas, y la segunda cae justo cuando soltás
+el modal y tocás.
+
+- `App::already_auditioned`: elegir la fila que ya venía sonando no vuelve a
+  mandar el patch. Elegir otra, o la misma en un picker abierto después, sí.
+- `knobs_over_patch`: recuperar un botón mandaba **los 774 parámetros** que la
+  tab carga para Surge XT — que no son los de Butter, son los *defaults* leídos
+  de una instancia de scan al cargar el plugin y nunca releídos. Medido: Butter
+  a −10 dBFS quedaba en −40/−51 dBFS después del empujón. Ahora, con un patch
+  abajo, sólo se manda lo que difiere del default del parámetro. De yapa, 774
+  comandos contra un anillo RT de 512 tiraban lo que hubiera en el medio.
+
+### Diez efectos nuevos, y lo que se decidió no hacer
+
+Auditado contra `oximedia-effects`, que fue el pedido. Los built-in pasaron de
+**46 a 56**, y todos salen solos por el bundle CLAP porque el export lee
+`BUILT_IN_KINDS`:
+
+| | |
+|---|---|
+| **Pitch Shifter** | La transposición sola: el shifter del armonizador sin la armonía. Semi (semitonos enteros), Fine, Wet. |
+| **Vibrato** | El pitch movido por un LFO, sin mitad seca. |
+| **Multi-tap Delay** | Cuatro cabezas sobre una línea, con tiempo (fracción de `Time`), nivel y pan cada una. |
+| **Plate Reverb** | El tanque de Dattorro (JAES 1997): difusor de cuatro all-pass y figura de ocho. Denso desde el primer milisegundo. |
+| **Moog Ladder** | Cuatro polos ZDF con realimentación saturada. |
+| **De-esser** | Compresor que sólo oye la sibilancia, con `Listen`. |
+| **Transient Shaper** | Ataque y cola en mandos separados, desde la *forma* de la envolvente y no desde un umbral. |
+| **Multiband Comp** | Tres bandas sobre un crossover Linkwitz-Riley de cuarto orden. |
+| **Exciter** | Agudos generados, no ecualizados. |
+| **Bass Enhancer** | Armónicos del grave **sin** el fundamental. |
+
+Tres cosas que las mediciones corrigieron durante el trabajo, y que quedaron
+escritas en el código:
+
+- El de-esser dividía con un pasa-altos y **subía** 8 kHz en vez de bajarlo:
+  `x − lowpass(x)` reconstruye exacto, dos filtros al mismo corte no. Lo mismo
+  aplicado al exciter y al bass enhancer, que ahora usan pasos reales de 24
+  dB/oct — antes el enhancer dejaba medio fundamental adentro y era un realce de
+  graves con otro nombre.
+- El multiband con `resonance = 0` no era Linkwitz-Riley (Q 0,5 en vez de
+  0,707): las bandas volvían 2,4 dB abajo en el cruce.
+- El plate tapeaba de la *segunda* línea de cada mitad: 150 ms de silencio y
+  después todo junto.
+
+**Lo que se descartó, con motivo**: ping-pong y lookahead limiter ya existen
+(el 4º mando del DELAY y `Compressor::limiter`); la reverb por convolución es
+una función —cargar IRs, FFT particionada—, no un efecto; el time stretch no es
+un insert en vivo; el medidor LUFS es un medidor y los mandos de un FX son
+entradas, no lecturas; y los formantes del armonizador cambiarían el sonido de
+algo que ya funciona.
+
+### Dos teclados, dos tabs, a la vez
+
+Un rig con una Keystation Pro 88 en la tab 1 y una KeyStep 32 en la tab 2. Dos
+defectos, la misma causa: el mensaje llegaba sin saber de dónde venía.
+
+- **Los knobs.** `apply_target` cortaba con *"only the active tab has a live
+  working copy of its chain"*, así que los knobs de la Keystation dejaban de
+  mover sus efectos al pasar a la otra tab. `set_background_fx_param` escribe la
+  cadena **guardada** de esa tab y empuja el valor a su slot del motor; si el
+  built-in no toma parámetros en vivo, la tab se marca y se reconstruye una vez
+  por drenaje (nunca por mensaje: un fader manda cien por segundo).
+- **Los botones.** Los de la Keystation mandan **program change**, no CC, y esa
+  ruta tiraba la fuente en el drenaje (`let mut programs: Vec<u8>`) — el
+  `ProgramMsg` ya la traía. Así que un botón de un teclado recuperaba un sonido
+  en la tab que el *otro* teclado había dejado adelante.
+
+`App::home_tab_for` es ahora la única regla, y la usan las dos rutas: la tab de
+adelante si es una de las que escuchan ese controlador, si no la primera que lo
+escucha. Una tercera tab en la Keystation se queda sus botones mientras es la
+que se toca, que es exactamente lo pedido.
+
+### El resto del día
+
+- **Buscar escribiendo** en CHANGE SOURCE y ADD FX: cualquier tecla imprimible
+  filtra mientras se escribe, `Backspace` borra, `Esc` devuelve la lista entera
+  y recién el segundo cierra. La búsqueda ignora la categoría del sidebar
+  —encontrar nada porque la respuesta estaba archivada en otro lado es lo único
+  que una búsqueda no puede hacer— y el rescan pasó de `r` a **F5**, porque las
+  letras ahora escriben.
+- **MIDI LEARN salió de la tab** y entró al panel superior derecho, junto al
+  switch LIVE/MULTI: lo que ata es el rack, no la tab de adelante. Arma el
+  puntero, y ahora **una pestaña del rack es un destino**
+  (`TriggerAction::TabSelect`, serializado como `tab-select:n`).
+- **INPUTS pregunta antes de reemplazar.** Un jack que la tab no escuchaba,
+  sobre una tab que ya escucha algo, abre un `REPLACE IT` / `KEEP WHAT IS THERE`
+  con el cursor en la respuesta segura. No pregunta en lo explícito: botón
+  derecho, `NO CAPTURE`, o Enter sobre un jack que la tab ya tiene.
+- **NAM no abría su ventana.** `resolve_ui` buscaba sólo `ui:binary`, que la
+  propia extensión declara obsoleta en favor de `lv2:binary`. Casi todos los
+  bundles instalados escriben el viejo; el Neural Amp Modeler escribe sólo el
+  nuevo, y para choz no tenía editor. Ahora acepta los dos.
+- **SOUNDS: la segunda pulsación reemplaza.** Apretar el botón que **ya suena**
+  abre su picker, sobre el patch que tiene guardado — recuperar lo que ya está
+  puesto no hacía nada, así que era el único gesto del panel sin significado.
+  Todo lo demás sigue igual, y un footswitch o un CC **siempre** recuperan: un
+  diálogo que se abre solo a mitad de un set es lo que esto no puede hacer.
+- **Dos secuenciadores, un groove.** Con el transporte rodando ya estaban
+  sincronizados (cada uno cuenta sus pasos contra `transport.ppq()`), y quedó
+  con test. Sin transporte, cada uno arrancaba su reloj en el instante de la
+  tecla: `Seq::play_with` hace que el segundo adopte el borde de paso y el paso
+  del compás del que ya corre.
+- **INPUTS y OUT, un solo color.** Las filas se pintaban en dos —el color del
+  tema si choz escuchaba esa entrada, gris si no—, y el gris hacía parecer rota
+  a una entrada que sólo estaba apagada. El tilde contra el punto ya lo decía.
+- **El micrófono entraba sin nivelar.** Toda otra fuente pasa por el probe de
+  auto-trim al cargarse; a un micrófono no hay nada que tocarle, así que entraba
+  con el fader en 1.0 y con lo que diera el conversor — con un headset, más
+  fuerte que todo lo que choz estaba haciendo. `poll_capture_trim` espera al
+  jugador: la primera señal por encima del piso es con la que se calcula el
+  fader, una sola vez, medida **después** de la cadena de FX. `IN GAIN` e
+  `IN GATE` quedan como estaban, por pedido.
+- **Un SoundFont en la misma liga que un plugin.** `examples/level_probe` midió
+  el hueco en ~14 dB con la ganancia propia de oxisynth (0,2): FluidR3 a −26,7
+  dBFS contra −13,5 de Surge XT. Ahora 0,5, con el techo cubierto por
+  `a_held_chord_leaves_headroom`.
+
+### La auditoría del diff antes de publicar
+
+Dos hallazgos, los dos con la suite en verde — o sea, ninguno cubierto:
+
+- **Tres `process_block` allocaban.** El de-esser, el multiband y el par
+  exciter/bass enhancer hacían `buf.to_vec()` por bloque para filtrar una copia:
+  un `malloc` por bloque en el hilo de audio, que es la única regla que
+  [`docs/fx-audit.md`](docs/fx-audit.md) declara respetada en todo el árbol.
+  Ahora el scratch se reserva en el constructor y sólo crece si el host pide un
+  bloque más grande.
+- **El picker abierto "en frío" habría guardado el patch equivocado.** Al abrir
+  un botón lleno sobre la fila que tiene guardada, se marcaba esa fila como "ya
+  sonando" — cierto cuando el botón se acaba de recuperar, falso cuando el
+  picker se abre con el botón derecho desde otro sonido: elegirla se habría
+  saltado la carga y `save_sound` habría guardado encima lo que estuviera
+  sonando. Test: `a_picker_opened_cold_does_not_claim_the_tab_is_on_that_patch`.
 
 ## [1.3.5] — 2026-08-31
 

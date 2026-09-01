@@ -1,8 +1,9 @@
 # Auditoría DSP de los efectos de choz
 
-Escrito el 2026-08-27 contra el árbol de trabajo —45 efectos entonces, 46 hoy,
-19 400 líneas en `crates/choz-engine/src/fx/`— y ampliado después: la sección 6
-son las mediciones del 28 y la 7 la auditoría de guardado del 29, cerrada el 30.
+Escrito el 2026-08-27 contra el árbol de trabajo —45 efectos entonces, **56**
+hoy, en `crates/choz-engine/src/fx/`— y ampliado después: la sección 6 son las
+mediciones del 28, la 7 la auditoría de guardado del 29 (cerrada el 30) y la 8
+los diez efectos que entraron el 2026-09-01.
 
 **Está cerrado entero.** No queda ningún hallazgo sin resolver; lo único que se
 midió y se decidió no arreglar está en la sección 6, con el porqué.
@@ -33,7 +34,9 @@ patrones que hay que copiar al resto.
 | `oversample.rs`, `smooth.rs`, `lfo.rs` | Infraestructura compartida, ya escrita y ya probada. **El problema es que la mitad de los efectos no la usa.** |
 
 Y una comprobación que pasa en todo el árbol: **ningún `process_block` alloca**,
-con una excepción (F6).
+con una excepción (F6). Se rompió una vez —tres de los efectos nuevos del
+2026-09-01 copiaban el bloque para filtrarlo— y la auditoría del diff antes de
+publicar la 1.3.6 la restauró; ver la sección 8.
 
 ---
 
@@ -477,3 +480,77 @@ giro de mando (`takes_live_params`): una reconstrucción reemplaza todos los
 procesadores del slot, así que mover el `Drive` de un saturador tiraba la cola
 del reverb que estaba detrás. El único que sigue reconstruyéndose es el LOOPER,
 que es un deck y no un juego de mandos.
+
+
+---
+
+## 8 · Los diez efectos del 2026-09-01
+
+Pedido: auditar los efectos de choz contra [`oximedia-effects`](https://docs.rs/oximedia-effects/)
+e implementar como built-in lo que faltara. De los 56 que hay hoy, éstos son los
+que entraron ese día, con lo que hace falta saber de cada uno.
+
+| Efecto | id | Topología | Reusa |
+|---|---|---|---|
+| Pitch Shifter | `pitchshifter` | Dos cabezas cruzadas, una por canal | `shift::VoiceShifter` |
+| Vibrato | `vibrato` | Línea leída por una cabeza que el LFO mueve | `delay_line`, `lfo` |
+| Multi-tap Delay | `multitap` | Cuatro tomas de una línea; la última realimenta | `delay_line` |
+| Plate Reverb | `platereverb` | Tanque de Dattorro (JAES 1997) | `delay_line` |
+| Moog Ladder | `moogladder` | Cuatro polos ZDF, realimentación con `tanh` | `smooth` |
+| De-esser | `deesser` | Detector sobre la banda alta, ganancia sobre esa banda | `filter::Svf` |
+| Transient Shaper | `transient` | Dos seguidores a distinta velocidad | — |
+| Multiband Comp | `multiband` | Linkwitz-Riley de 4º orden, tres bandas | `filter::Svf` |
+| Exciter | `exciter` | Armónicos de la banda alta, sumados debajo | `filter::Svf` |
+| Bass Enhancer | `bassenhance` | Armónicos del grave **sin** el fundamental | `filter::Svf` |
+
+### Lo que las mediciones corrigieron
+
+**Un pasa-altos y un pasa-bajos al mismo corte no reconstruyen la señal.** El
+de-esser dividía así y un tono de 8 kHz salía **más fuerte** que como entró: la
+diferencia de fase entre las dos ramas suma en vez de restar. La división por
+sustracción (`alto := x − lowpass(x)`) reconstruye exacto por construcción, y es
+lo que usa ahora. Donde hace falta separación de verdad —el exciter, el guard
+del bass enhancer— va un paso real de 24 dB/octava.
+
+**`Svf::new(mode, hz, 0.0)` no es Butterworth.** `k = 2 − 2·resonance` y
+`Q = 1/k`, así que en 0 la sección está críticamente amortiguada (Q 0,5). Dos de
+ésas en cascada **no** son un Linkwitz-Riley: medido, las bandas del multiband
+volvían 2,4 dB abajo en el cruce. La constante es
+`BUTTERWORTH = 1 − √2/2`, y está escrita en los dos archivos que la usan.
+
+**El tanque de Dattorro tiene dos líneas por mitad, y las tomas van en la
+primera.** Tapeadas en la segunda, el plate quedaba mudo 150 ms —lo que tarda la
+primera en llenarse— y después llegaba todo junto. Un plate es denso desde el
+primer milisegundo; eso es lo que lo distingue de una sala.
+
+**El `SvfMode::Allpass` es nuevo y existe por el crossover.** La banda que se
+salta un cruce necesita el all-pass del otro para volver en fase; sin él las
+tres bandas recombinan con error de fase, que es un peine en medio de la mezcla.
+Nadie pide un all-pass como efecto, y por eso no está en la lista de mandos de
+`filter.rs`.
+
+### La regla que se rompió y se restauró
+
+Los tres efectos que necesitan una copia del bloque para filtrarla —de-esser,
+multiband, exciter/bass— la hacían con `buf.to_vec()` **dentro de
+`process_block`**: un `malloc` por bloque en el hilo de audio. Lo cazó la
+auditoría del diff antes de publicar la 1.3.6, con la suite entera en verde: no
+hay test que lo cubra, y escribir uno pide un allocador propio. El patrón que
+quedó, y el que hay que copiar:
+
+```rust
+const SCRATCH: usize = 8192;       // frames estéreo, reservados en el `new()`
+if self.low.len() < buf.len() {    // sólo si el host agranda el bloque
+    self.low.resize(buf.len(), 0.0);
+}
+```
+
+### Lo que se decidió no implementar
+
+| | Por qué |
+|---|---|
+| Reverb por convolución | Es una función, no un efecto: cargar IRs de disco, un picker y convolución particionada por FFT. |
+| Time stretch | No es un insert en vivo — cambiar el tempo sin cambiar el tono necesita material con principio y fin. Su lugar es el looper. |
+| Medidor LUFS | Es un medidor. Los mandos de un `FxProcessor` son entradas, no lecturas. |
+| Formantes en el armonizador | Cambiaría el sonido de algo que ya funciona. Iría como modo nuevo, no como cambio. |
+| Ping-pong, lookahead limiter | Ya existen: el 4º mando del DELAY y `Compressor::limiter`. |

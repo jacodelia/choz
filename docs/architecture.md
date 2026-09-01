@@ -99,7 +99,7 @@ choz/
 │   │       ├── sfz.rs           # SFZ parser + 32-voice sampler (samples decoded on load)
 │   │       ├── quarantine.rs    # Probe a plugin in a child process; cache the verdict
 │   │       ├── sandboxed.rs     # AudioSource/FxProcessor backed by a child process
-│   │       └── fx/              # 46 DSP processors (see below)
+│   │       └── fx/              # 56 DSP processors (see below)
 │   ├── choz-plugin-clap/
 │   │   └── src/
 │   │       ├── lib.rs           # Discovery + ClapPluginInfo
@@ -165,23 +165,28 @@ choz/
 │               └── theme.rs           # Colours, and the wash panels blend with
 ```
 
-FX processors under `crates/choz-engine/src/fx/` (46 built-ins, each with its own tests):
+FX processors under `crates/choz-engine/src/fx/` (56 built-ins, each with its own tests):
 
 ```
 fx/
 ├── mod.rs          # re-exports FxProcessor + FxParam from choz-ports
 ├── delay.rs        # Stereo delay with ping-pong
+├── multitap.rs     # Multi-tap delay: four heads, each with time, level and pan
 ├── gran_delay.rs   # Granular delay / pitch-shift delay
 ├── reverse.rs      # Reverse delay
 ├── space_echo.rs   # Tape-style space echo
 ├── delay_line.rs   # Shared fractional delay line, denormal flush, soft clip
 ├── dc.rs           # Shared DC blocker: one pole at 10 Hz, after any asymmetric curve
 ├── reverb.rs       # Reverb (FDN + early reflections — see docs/reverb.md)
+├── plate.rs        # Plate reverb: the Dattorro tank (JAES 1997)
 ├── protocosmos.rs  # Wide ambient texture reverb
 ├── z5_texture.rs   # 16-parameter texture processor
 ├── compressor.rs   # Compressor / Limiter
 ├── gate.rs         # Noise gate
 ├── expander.rs     # Expander
+├── deesser.rs      # De-esser: a compressor that only hears the sibilance
+├── transient.rs    # Transient shaper: attack and sustain, from the envelope's shape
+├── multiband.rs    # Three-band compressor on a Linkwitz-Riley crossover
 ├── sidechain.rs    # Sidechain ducking
 ├── parametric_eq.rs# 4-band parametric EQ
 ├── graphic_eq.rs   # 10-band Winamp graphic EQ + its 18 presets (from tanu)
@@ -192,12 +197,16 @@ fx/
 │   ├── shifter.rs    # PSOLA: pitch without time, formants for free
 │   ├── formant.rs    # …and the switch that gives them up on purpose
 │   └── meter.rs      # What it heard, for the readout under the knobs
-├── filter.rs       # State-variable filter (LP/HP/BP/Notch)
+├── filter.rs       # State-variable filter (LP/HP/BP/Notch/Allpass)
+├── ladder.rs       # Moog-style ladder: four ZDF poles, saturating feedback
 ├── filterbank.rs   # Multi-band filter bank
 ├── isolator.rs     # 3-band isolator
 ├── chorus.rs       # Chorus
 ├── flanger.rs      # Flanger
 ├── phaser.rs       # Phaser
+├── vibrato.rs      # Vibrato: the pitch moved by an LFO, with no dry half
+├── shift.rs        # One voice shifter, shared by shimmer and harmonizer
+├── pitch_shift.rs  # Pitch shifter: the transposition on its own
 ├── bitcrusher.rs   # Bitcrusher / sample-rate reducer
 ├── vinyl.rs        # Vinyl simulation (wow, flutter, crackle)
 ├── cassette.rs     # Cassette tape simulation
@@ -208,6 +217,7 @@ fx/
 ├── utility.rs      # Gain, PhaseInvert, MonoMaker, SoftClipper, TubeSaturation,
 │                   # plus shared Biquad / Oversampler2x helpers
 ├── widener.rs      # Stereo widener
+├── exciter.rs      # Harmonic exciter + bass enhancer: harmonics of a band
 ├── looper.rs       # Live looper
 └── pan.rs          # Constant-power stereo panner
 ```
@@ -458,7 +468,7 @@ kinds of plugin, split by `Sort`:
 
 - **Effects** (`org.choz.fx.*`), one per entry of `BUILT_IN_KINDS`: audio ports,
   the processor's own knobs, and the dry/wet appended because outside choz there
-  is no chain to hold one. All 46 publish their list — twenty-one published
+  is no chain to hold one. All 56 publish their list — twenty-one published
   nothing at all until 2026-08-30, which is to say they appeared in a DAW as
   boxes with no controls.
 - **Artifacts** (`org.choz.gen.arp`, `org.choz.gen.seq`): **note** ports and no

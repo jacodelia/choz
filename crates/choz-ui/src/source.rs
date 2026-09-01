@@ -108,6 +108,29 @@ pub enum AudioFxKind {
     VelvetFuzz,
     // Pitch.
     AutoTune,
+    /// The transposition on its own: a guitar an octave down, a voice a fifth
+    /// up. The harmoniser's shifter with the harmony taken off it.
+    PitchShifter,
+    /// The pitch swung by an LFO and nothing else — a chorus with no dry half.
+    Vibrato,
+    /// Four heads on one line: a written pattern rather than a decaying echo.
+    MultiTapDelay,
+    /// Steel under tension: dense from the first millisecond, no early
+    /// reflections, the bright tail no room has.
+    PlateReverb,
+    /// Four poles and a saturating feedback path — the filter the SVF is not.
+    MoogLadder,
+    /// A compressor that only hears the sibilance.
+    DeEsser,
+    /// The attack and the tail on separate knobs, worked from the shape of the
+    /// envelope rather than from a threshold.
+    TransientShaper,
+    /// Three bands, three sets of dynamics, one Linkwitz-Riley crossover.
+    MultibandComp,
+    /// Top end generated rather than boosted.
+    Exciter,
+    /// Bottom end a small speaker implies rather than plays.
+    BassEnhancer,
 }
 
 /// What an effect does, for grouping the ADD FX list.
@@ -197,19 +220,23 @@ impl AudioFxKind {
     pub fn category(self) -> FxCategory {
         use AudioFxKind::*;
         match self {
-            Delay | GranDelay | ReverseDelay | SpaceEcho => FxCategory::Delay,
-            Reverb | Shimmer => FxCategory::Reverb,
-            Compressor | Limiter | Gate | Expander | SidechainDuck => FxCategory::Dynamics,
-            ParamEq | GraphicEq | Filter | FilterBank | Isolator => FxCategory::EqFilter,
-            Chorus | Flanger | Phaser | Tremolo | AutoPan | AutoFilter | FreqShifter | RingMod => {
+            Delay | GranDelay | ReverseDelay | SpaceEcho | MultiTapDelay => FxCategory::Delay,
+            Reverb | Shimmer | PlateReverb => FxCategory::Reverb,
+            Compressor | Limiter | Gate | Expander | SidechainDuck | DeEsser
+            | TransientShaper | MultibandComp => FxCategory::Dynamics,
+            ParamEq | GraphicEq | Filter | FilterBank | Isolator | MoogLadder => {
+                FxCategory::EqFilter
+            }
+            Chorus | Flanger | Phaser | Tremolo | AutoPan | AutoFilter | FreqShifter | RingMod
+            | Vibrato => {
                 FxCategory::Modulation
             }
             BitCrusher | Vinyl | Cassette | SoftClip | Saturator | WaveShaper | TubeSat
-            | AmberFang | VelvetFuzz => FxCategory::Distortion,
+            | AmberFang | VelvetFuzz | Exciter | BassEnhancer => FxCategory::Distortion,
             Widener | Pan => FxCategory::Spatial,
             Envelope => FxCategory::Dynamics,
             Protocosmos | Z5Texture | Looper | BeatRepeat => FxCategory::Texture,
-            AutoTune | Harmonizer | Vocoder => FxCategory::Pitch,
+            AutoTune | Harmonizer | Vocoder | PitchShifter => FxCategory::Pitch,
             Gain | PhaseInvert | MonoMaker => FxCategory::Utility,
         }
     }
@@ -269,6 +296,16 @@ pub const ALL_FX_KINDS: &[AudioFxKind] = &[
     AudioFxKind::AmberFang,
     AudioFxKind::VelvetFuzz,
     AudioFxKind::AutoTune,
+    AudioFxKind::PitchShifter,
+    AudioFxKind::Vibrato,
+    AudioFxKind::MultiTapDelay,
+    AudioFxKind::PlateReverb,
+    AudioFxKind::MoogLadder,
+    AudioFxKind::DeEsser,
+    AudioFxKind::TransientShaper,
+    AudioFxKind::MultibandComp,
+    AudioFxKind::Exciter,
+    AudioFxKind::BassEnhancer,
     AudioFxKind::Envelope,
 ];
 
@@ -297,6 +334,16 @@ impl AudioFxKind {
             Self::Vocoder => "VOCODER",
             Self::FreqShifter => "FREQ SHIFT",
             Self::RingMod => "RING MOD",
+            Self::PitchShifter => "PITCH SHIFT",
+            Self::Vibrato => "VIBRATO",
+            Self::MultiTapDelay => "MULTI-TAP",
+            Self::PlateReverb => "PLATE",
+            Self::MoogLadder => "LADDER",
+            Self::DeEsser => "DE-ESSER",
+            Self::TransientShaper => "TRANSIENT",
+            Self::MultibandComp => "MULTIBAND",
+            Self::Exciter => "EXCITER",
+            Self::BassEnhancer => "BASS ENH",
             Self::Shimmer => "SHIMMER",
             Self::BitCrusher => "BITCRUSH",
             Self::Vinyl => "VINYL",
@@ -348,6 +395,16 @@ impl AudioFxKind {
             Self::Vocoder => "vocoder",
             Self::FreqShifter => "freqshifter",
             Self::RingMod => "ringmod",
+            Self::PitchShifter => "pitchshifter",
+            Self::Vibrato => "vibrato",
+            Self::MultiTapDelay => "multitap",
+            Self::PlateReverb => "platereverb",
+            Self::MoogLadder => "moogladder",
+            Self::DeEsser => "deesser",
+            Self::TransientShaper => "transient",
+            Self::MultibandComp => "multiband",
+            Self::Exciter => "exciter",
+            Self::BassEnhancer => "bassenhance",
             Self::Shimmer => "shimmer",
             Self::BitCrusher => "bitcrusher",
             Self::Vinyl => "vinyl",
@@ -654,6 +711,106 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
     /// The shifter and the ring modulator share their knobs the way the
     /// tremolo and the auto-pan do: one processor, one carrier, two uses.
     static FREQSHIFT: &[FxParamDesc] = &[pd!("Freq", 0.50), pd!("Spread", 0.00), pd!("Wet", 1.00)];
+    /// Opens where [`choz_engine::fx::Vibrato::new`] does: 5 Hz, a third of the
+    /// swing, sine, both channels together.
+    static VIBRATO: &[FxParamDesc] = &[
+        pd!("Rate", 0.41),
+        pd!("Depth", 0.35),
+        pd!("Shape", 0.00),
+        pd!("Spread", 0.00),
+        pd!("Wet", 1.00),
+    ];
+
+    /// A pattern, not four heads in one place: quarter, half, three-quarter and
+    /// the whole of `Time`, bouncing across the image and getting quieter.
+    static MULTITAP: &[FxParamDesc] = &[
+        pd!("Time", 0.24),
+        pd!("T1 Time", 0.25),
+        pd!("T1 Level", 0.80),
+        pd!("T1 Pan", 0.15),
+        pd!("T2 Time", 0.50),
+        pd!("T2 Level", 0.60),
+        pd!("T2 Pan", 0.85),
+        pd!("T3 Time", 0.75),
+        pd!("T3 Level", 0.45),
+        pd!("T3 Pan", 0.30),
+        pd!("T4 Time", 1.00),
+        pd!("T4 Level", 0.35),
+        pd!("T4 Pan", 0.70),
+        pd!("Feedback", 0.26),
+        pd!("Wet", 0.40),
+    ];
+
+    static PLATE: &[FxParamDesc] = &[
+        pd!("PreDelay", 0.05),
+        pd!("Decay", 0.66),
+        pd!("Damping", 0.35),
+        pd!("Tone", 0.85),
+        pd!("Wet", 0.30),
+    ];
+
+    /// `Cutoff` is logarithmic, so 0.56 is 1 kHz — half way up the knob is
+    /// 630 Hz, which is where a hand expects it.
+    static LADDER: &[FxParamDesc] = &[
+        pd!("Cutoff", 0.56),
+        pd!("Res", 0.30),
+        pd!("Drive", 0.00),
+        pd!("Wet", 1.00),
+    ];
+
+    static DEESSER: &[FxParamDesc] = &[
+        pd!("Freq", 0.29),
+        pd!("Thresh", 0.50),
+        pd!("Amount", 1.00),
+        pd!("Listen", 0.00),
+        pd!("Wet", 1.00),
+    ];
+
+    /// Both halves open in the middle, which is the only value a shaper added
+    /// to a chain may start on: anything else reshapes the take on insert.
+    static TRANSIENT: &[FxParamDesc] = &[
+        pd!("Attack", 0.50),
+        pd!("Sustain", 0.50),
+        pd!("Wet", 1.00),
+    ];
+
+    static MULTIBAND: &[FxParamDesc] = &[
+        pd!("LoXover", 0.33),
+        pd!("HiXover", 0.22),
+        pd!("Lo Thr", 0.60),
+        pd!("Lo Ratio", 0.11),
+        pd!("Mid Thr", 0.70),
+        pd!("Mid Ratio", 0.11),
+        pd!("Hi Thr", 0.70),
+        pd!("Hi Ratio", 0.11),
+        pd!("Attack", 0.10),
+        pd!("Release", 0.10),
+        pd!("Makeup", 0.00),
+        pd!("Wet", 1.00),
+    ];
+
+    static EXCITER: &[FxParamDesc] = &[
+        pd!("Freq", 0.22),
+        pd!("Drive", 0.22),
+        pd!("Blend", 0.50),
+        pd!("Amount", 0.30),
+        pd!("Wet", 1.00),
+    ];
+
+    static BASSENH: &[FxParamDesc] = &[
+        pd!("Freq", 0.31),
+        pd!("Drive", 0.33),
+        pd!("Blend", 0.50),
+        pd!("Amount", 0.40),
+        pd!("Wet", 1.00),
+    ];
+
+    /// Centred knobs: `Semi` and `Fine` open at no shift, which is the only
+    /// value an effect added to a chain may start on — anything else retunes
+    /// the tab the moment it is added.
+    static PITCHSHIFT: &[FxParamDesc] =
+        &[pd!("Semi", 0.50), pd!("Fine", 0.50), pd!("Wet", 1.00)];
+
     static SHIMMER: &[FxParamDesc] = &[
         pd!("Size", 0.85),
         pd!("PreDelay", 0.25),
@@ -925,6 +1082,16 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         Harmonizer => HARMONIZER,
         Vocoder => VOCODER,
         FreqShifter | RingMod => FREQSHIFT,
+        PitchShifter => PITCHSHIFT,
+        Vibrato => VIBRATO,
+        MultiTapDelay => MULTITAP,
+        PlateReverb => PLATE,
+        MoogLadder => LADDER,
+        DeEsser => DEESSER,
+        TransientShaper => TRANSIENT,
+        MultibandComp => MULTIBAND,
+        Exciter => EXCITER,
+        BassEnhancer => BASSENH,
         Shimmer => SHIMMER,
         BitCrusher => CRUSH,
         Vinyl => VINYL,
@@ -1146,6 +1313,16 @@ impl AudioFxEntry {
                 | AmberFang
                 | VelvetFuzz
                 | AutoTune
+                | PitchShifter
+                | Vibrato
+                | MultiTapDelay
+                | PlateReverb
+                | MoogLadder
+                | DeEsser
+                | TransientShaper
+                | MultibandComp
+                | Exciter
+                | BassEnhancer
                 | Envelope
                 // Everything below took its parameters only through a rebuild
                 // until they published a list a host could see: writing

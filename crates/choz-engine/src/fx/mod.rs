@@ -7,6 +7,7 @@
 pub mod bitcrusher;
 pub mod cassette;
 pub mod dc;
+pub mod deesser;
 pub mod delay;
 pub mod delay_line;
 pub mod filter;
@@ -35,25 +36,33 @@ pub mod flanger;
 pub mod freq_shift;
 pub mod lfo;
 pub mod phaser;
+pub mod transient;
 pub mod tremolo;
 // ── Spatial ──────────────────────────────────────────────────────────────────
 pub mod widener;
 // ── Utility ──────────────────────────────────────────────────────────────────
+pub mod multiband;
+pub mod multitap;
 pub mod oversample;
 pub mod saturator;
 pub mod smooth;
 pub mod utility;
 pub mod vocoder;
 // ── New processors ───────────────────────────────────────────────────────────
+pub mod exciter;
 pub mod expander;
 pub mod pan;
 // ── Creative time/texture ─────────────────────────────────────────────────────
+pub mod ladder;
 pub mod pedal;
+pub mod pitch_shift;
+pub mod plate;
 pub mod protocosmos;
 pub mod reverse;
 pub mod shift;
 pub mod shimmer;
 pub mod space_echo;
+pub mod vibrato;
 pub mod z5_texture;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
@@ -100,6 +109,15 @@ pub use pan::Pan;
 pub use pedal::{AmberFang, VelvetFuzz};
 pub use protocosmos::Protocosmos;
 pub use reverse::ReverseDelay;
+pub use deesser::DeEsser;
+pub use exciter::{BassEnhancer, Exciter};
+pub use ladder::MoogLadder;
+pub use multiband::MultibandCompressor;
+pub use multitap::MultiTapDelay;
+pub use transient::TransientShaper;
+pub use pitch_shift::PitchShifter;
+pub use plate::PlateReverb;
+pub use vibrato::Vibrato;
 pub use shift::VoiceShifter;
 pub use shimmer::ShimmerReverb;
 pub use space_echo::SpaceEcho;

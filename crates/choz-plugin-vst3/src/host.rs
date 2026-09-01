@@ -1520,6 +1520,40 @@ impl Vst3RealInstance {
     }
 }
 
+impl Vst3RealInstance {
+    /// Leave the instance loaded and unterminated, holding one extra reference
+    /// on everything the plugin can still reach through the editor thread.
+    ///
+    /// The alternative, when that thread is inside the plugin and not coming
+    /// out, is to terminate objects it is using — or to wait for it, which is
+    /// what froze choz with Surge XT loaded: the whole interface stuck in
+    /// `Drop`, on a lock the editor thread holds for the length of its call
+    /// into the plugin. A tab's worth of memory until choz exits is the
+    /// cheaper of the two. Same trade the CLAP and LV2 hosts already make for
+    /// plugins that crash in their own teardown.
+    fn leak(&self) {
+        eprintln!(
+            "choz: this plugin's editor is still running inside it; leaving the instance \
+             loaded rather than freezing (its memory stays used until choz exits)"
+        );
+        std::mem::forget(self.component.clone());
+        std::mem::forget(self.processor.clone());
+        if let Some(c) = &self.controller {
+            std::mem::forget(c.clone());
+        }
+        std::mem::forget(self._ctx.clone());
+        std::mem::forget(self._handler.clone());
+        std::mem::forget(self.param_changes.clone());
+        // The cells stay alive with their contents, so the editor thread's
+        // next call still finds a live view instead of freed memory.
+        std::mem::forget(Arc::clone(&self.shared_view));
+        std::mem::forget(Arc::clone(&self.shared_state));
+        // …and the bundle stays mapped, so it never `dlclose`s under that
+        // thread.
+        std::mem::forget(Arc::clone(&self._lib));
+    }
+}
+
 impl Drop for Vst3RealInstance {
     fn drop(&mut self) {
         // Cut the editor thread loose first: past this it can no longer reach
@@ -1527,18 +1561,24 @@ impl Drop for Vst3RealInstance {
         // Detaching is NOT done here: `removed()` on a view that was never
         // attached trips a hard assert in DPF plugins, and the editor thread
         // already calls `close()` on its way out. Releasing the view is enough.
-        drop(
-            self.shared_view
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take(),
-        );
-        drop(
-            self.shared_state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take(),
-        );
+        //
+        // With a deadline, because that thread holds this lock for the whole
+        // of `idle()` — see [`choz_ports::lock_within`].
+        let Some(mut view) = choz_ports::lock_within(&self.shared_view, choz_ports::TEARDOWN_WAIT)
+        else {
+            self.leak();
+            return;
+        };
+        drop(view.take());
+        drop(view);
+        let Some(mut state) =
+            choz_ports::lock_within(&self.shared_state, choz_ports::TEARDOWN_WAIT)
+        else {
+            self.leak();
+            return;
+        };
+        drop(state.take());
+        drop(state);
         unsafe {
             self.processor.setProcessing(0);
             self.component.setActive(0);
