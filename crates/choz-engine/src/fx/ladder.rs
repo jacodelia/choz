@@ -130,7 +130,7 @@ impl choz_ports::FxProcessor for MoogLadder {
         // Four stages of feedback want a gain of 4 to oscillate; 3.9 leaves the
         // filter on the near side of it at the top of the knob.
         let k = self.resonance * 3.9;
-        for frame in buf.chunks_exact_mut(2) {
+        for frame in buf.as_chunks_mut::<2>().0 {
             self.cutoff.tick();
             let g = self.g();
             for (ch, s) in frame.iter_mut().enumerate() {

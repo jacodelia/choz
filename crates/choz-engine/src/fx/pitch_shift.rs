@@ -101,7 +101,7 @@ impl choz_ports::FxProcessor for PitchShifter {
             self.sample_rate = sr;
             self.refresh();
         }
-        for frame in buf.chunks_exact_mut(2) {
+        for frame in buf.as_chunks_mut::<2>().0 {
             for (ch, s) in frame.iter_mut().enumerate() {
                 let dry = *s;
                 let shifted = self.shifter[ch].process(dry);
@@ -146,7 +146,9 @@ mod tests {
             // The second half only: the first is the line filling up.
             let tail = &buf[buf.len() / 2..];
             let crossings = tail
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|f| f[0])
                 .collect::<Vec<_>>()
                 .windows(2)
