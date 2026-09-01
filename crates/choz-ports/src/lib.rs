@@ -1102,6 +1102,40 @@ pub struct Transport {
     time_sig: std::sync::atomic::AtomicU32,
 }
 
+/// How long teardown waits for a lock the plugin's own GUI thread may be
+/// holding, before giving up on it. Two seconds is what [`choz::editor`]'s
+/// window already waits for the same thread.
+pub const TEARDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Lock `m`, but not forever: `None` once `wait` has gone by.
+///
+/// A plugin's editor thread holds the lock on the shared cell for the whole of
+/// its call *into* the plugin — for a JUCE editor that is the plugin's own
+/// message loop — so a plugin wedged in there wedges every `Mutex::lock` that
+/// waits on it. Everything that tears an instance down goes through one of
+/// those locks, which is how a freeze in a plugin became a frozen choz: the
+/// interface waiting on a thread that was waiting on the plugin. A deadline
+/// turns that into a leaked instance and a session that carries on.
+pub fn lock_within<T>(
+    m: &std::sync::Mutex<T>,
+    wait: std::time::Duration,
+) -> Option<std::sync::MutexGuard<'_, T>> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match m.try_lock() {
+            Ok(g) => return Some(g),
+            // A panic elsewhere left the data behind; teardown still wants it.
+            Err(std::sync::TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+}
+
 /// The one clock. See [`Transport`] for why it is global.
 pub fn transport() -> &'static Transport {
     static TRANSPORT: Transport = Transport::new();
@@ -1333,6 +1367,26 @@ mod label_tests {
         let s = sweep(&["Off", "LP 24", "HP 12", "BP 12"]);
         let (undersampled, _) = positions_from_labels(&s, MAX).expect("a list");
         assert!(undersampled);
+    }
+
+    /// The whole point of the deadline: a lock somebody else is inside of
+    /// gives up instead of holding the interface there for ever.
+    #[test]
+    fn a_lock_held_past_the_deadline_is_given_up_on() {
+        let m = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let held = std::sync::Arc::clone(&m);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            let g = held.lock().unwrap();
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(g);
+        });
+        rx.recv().unwrap();
+        assert!(crate::lock_within(&m, std::time::Duration::from_millis(20)).is_none());
+        t.join().unwrap();
+        // …and a free one is still just a lock.
+        assert!(crate::lock_within(&m, std::time::Duration::from_millis(20)).is_some());
     }
 
     #[test]

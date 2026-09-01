@@ -847,9 +847,28 @@ impl Drop for Instance {
         touch_feeds().retain(|(p, _)| *p != self.effect as usize);
         // Cut the editor thread loose first: past this it can no longer reach
         // the AEffect we are about to close.
-        if let Some(cell) = self.shared.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        //
+        // With a deadline: the editor thread holds this lock for the whole of
+        // every opcode it sends, `effEditIdle` included, so a plugin wedged in
+        // its own message loop would otherwise wedge the interface here. What
+        // it costs to give up is the plugin's memory until choz exits — see
+        // [`choz_ports::lock_within`].
+        let Some(mut shared) = choz_ports::lock_within(&self.shared, choz_ports::TEARDOWN_WAIT)
+        else {
+            eprintln!(
+                "choz: this plugin's editor is still running inside it; leaving the instance \
+                 loaded rather than freezing (its memory stays used until choz exits)"
+            );
+            // The cell keeps the `AEffect` and the mapped library alive for the
+            // thread still using them, and nothing here is closed.
+            std::mem::forget(Arc::clone(&self.shared));
+            std::mem::forget(Arc::clone(&self._lib));
+            return;
+        };
+        if let Some(cell) = shared.take() {
             drop(cell);
         }
+        drop(shared);
         self.dispatch(opcode::EDIT_CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
         self.dispatch(opcode::MAIN_RESUME, 0, 0, std::ptr::null_mut(), 0.0);
         if self.opened {

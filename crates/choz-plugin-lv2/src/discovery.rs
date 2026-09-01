@@ -286,7 +286,7 @@ fn find_ui(graph: &ttl::Graph, plugin_uri: &str) -> Option<Lv2UiInfo> {
     let others: Vec<String> = graph
         .triples
         .iter()
-        .filter(|t| t.p == ttl::UI_BINARY)
+        .filter(|t| t.p == ttl::UI_BINARY || t.p == ttl::LV2_BINARY)
         .map(|t| t.s.as_str().to_string())
         .filter(|u| !x11.contains(u))
         .collect();
@@ -295,6 +295,21 @@ fn find_ui(graph: &ttl::Graph, plugin_uri: &str) -> Option<Lv2UiInfo> {
         .filter(|u| ui_declares(graph, u, ttl::LV2_EXTENSION_DATA, ttl::UI_SHOW_INTERFACE))
         .collect();
     resolve_ui(graph, plugin_uri, &shows, true)
+}
+
+/// Where a UI's shared object is, whichever way the bundle spells it.
+///
+/// `ui:binary` is the old name and `lv2:binary` the current one — the ui
+/// extension itself says so: `ui:binary` is deprecated and `owl:sameAs
+/// lv2:binary`. Nearly every bundle on a Linux box still writes the old one
+/// (Nekobi, MVerb, 3BandEQ), so that is what choz looked for, and a bundle that
+/// writes only the new one had no editor at all: the Neural Amp Modeler's
+/// window could not be opened, and the rack said the plugin had none.
+fn ui_binary_of(graph: &ttl::Graph, ui_uri: &str) -> Option<std::path::PathBuf> {
+    graph
+        .object(ui_uri, ttl::UI_BINARY)
+        .or_else(|| graph.object(ui_uri, ttl::LV2_BINARY))
+        .and_then(node_to_path)
 }
 
 /// Which of `candidates` is `plugin_uri`'s, and where its binary is.
@@ -336,9 +351,7 @@ fn resolve_ui(
     let only_one = || (candidates.len() == 1).then(|| candidates[0].clone());
 
     let ui_uri = declared.or_else(applies).or_else(only_one)?;
-    let binary_path = graph
-        .object(&ui_uri, ttl::UI_BINARY)
-        .and_then(node_to_path)?;
+    let binary_path = ui_binary_of(graph, &ui_uri)?;
     // A UI whose binary is missing is worse than no UI: the button would offer a
     // window that can never open.
     if !binary_path.exists() {
@@ -527,6 +540,40 @@ fn node_to_path(node: &Node) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bundle that spells its UI binary the **current** way still has an
+    /// editor. `ui:binary` is deprecated in favour of `lv2:binary`, and the
+    /// Neural Amp Modeler writes only the new one — choz used to answer "this
+    /// plugin has no window" for it while every older bundle opened fine.
+    #[test]
+    fn a_ui_that_declares_lv2_binary_is_still_found() {
+        let dir = std::env::temp_dir().join(format!("choz_lv2_ui_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let so = dir.join("amp_ui.so");
+        std::fs::write(&so, b"not really a library").unwrap();
+        let ttl_path = dir.join("amp.ttl");
+        std::fs::write(
+            &ttl_path,
+            r#"@prefix lv2: <http://lv2plug.in/ns/lv2core#> .
+@prefix ui:  <http://lv2plug.in/ns/extensions/ui#> .
+
+<urn:choz:test:amp> a lv2:Plugin ;
+    ui:ui <urn:choz:test:amp#ui> .
+
+<urn:choz:test:amp#ui> a ui:X11UI ;
+    lv2:binary <amp_ui.so> .
+"#,
+        )
+        .unwrap();
+        let graph = ttl::Graph::parse_file(&ttl_path).unwrap();
+
+        let ui = find_ui(&graph, "urn:choz:test:amp").expect("the editor is declared");
+        assert_eq!(ui.binary_path, so);
+        assert!(!ui.owns_window, "an X11 UI goes in choz's own window");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// The UI deny-list is a property of the *process*, not of the plugin: in
     /// choz it hides the editors that segfault, and inside a sandbox child —

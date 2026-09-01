@@ -337,6 +337,38 @@ impl Seq {
         }
     }
 
+    /// Start **in step with a sequencer that is already running**.
+    ///
+    /// Two tabs each running a pattern have to be one groove, not two: the
+    /// second one to start lands on the other's step boundary and on the same
+    /// step of the bar, so the downbeats agree from the first note.
+    ///
+    /// Only for the free-running clock. With the transport rolling both count
+    /// their steps off the song position and are already locked to it — and to
+    /// each other — whoever started first; this is the case where there is no
+    /// shared clock to count off, and every sequencer used to start its own on
+    /// the instant the key was pressed.
+    pub fn play_with(&mut self, running: &Seq) {
+        self.play();
+        if !running.playing {
+            return;
+        }
+        self.next_step = running.next_step;
+        self.grid = running.grid;
+        // `step` is the step that last played: matching it makes the next one
+        // the same position in the bar, which is what puts the two downbeats
+        // together. A pattern with a shorter bar wraps inside the other's.
+        self.step = running
+            .step
+            .min(self.settings.bar_steps().saturating_sub(1));
+    }
+
+    /// Whether this one is running its own clock right now — what
+    /// [`Self::play_with`] needs to find one to follow.
+    pub fn is_running_free(&self) -> bool {
+        self.playing && self.settings.on && self.grid.is_none()
+    }
+
     /// Stop, and take the notes out with it. Recording stops too: a REC left
     /// armed writes the next thing played into a pattern nobody was looking at.
     pub fn stop(&mut self, out: &mut Vec<ArpEvent>) {
@@ -757,6 +789,65 @@ mod tests {
 
     fn on(seq: &Seq, track: usize, step: usize) -> bool {
         seq.settings.step_on(track, step)
+    }
+
+    /// Two tabs, two patterns, one groove: the second sequencer to start lands
+    /// on the first one's step boundary instead of starting its own clock
+    /// where the key happened to be pressed.
+    #[test]
+    fn a_second_sequencer_starts_in_step_with_the_first() {
+        let _g = crate::test_locks::transport();
+        let settings = || SeqSettings {
+            on: true,
+            ..Default::default()
+        };
+        let mut first = Seq::new(settings());
+        // Every step written, so each one is audible in the comparison below:
+        // the question is *when* they fire, not what is on them.
+        for s in 0..STEPS {
+            first.toggle_step(0, s);
+        }
+        first.play();
+
+        // Half a step later, the other tab is started.
+        let step = first.step_len();
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        first.tick(t0, &mut out);
+        let mut second = Seq::new(settings());
+        for s in 0..STEPS {
+            second.toggle_step(0, s);
+        }
+        second.play_with(&first);
+
+        // The two agree on when the next step is due, and on which one it is.
+        assert_eq!(
+            second.next_step, first.next_step,
+            "the newcomer took the running clock"
+        );
+        assert_eq!(second.step, first.step, "…and its place in the bar");
+
+        // Played forward, they fire together rather than half a step apart.
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        let mut fired = (0, 0);
+        for i in 1..=16 {
+            let now = t0 + step.mul_f32(i as f32 * 0.5);
+            a.clear();
+            b.clear();
+            first.tick(now, &mut a);
+            second.tick(now, &mut b);
+            let hit = |v: &Vec<ArpEvent>| v.iter().any(|e| matches!(e, ArpEvent::On { .. }));
+            if hit(&a) || hit(&b) {
+                assert_eq!(
+                    hit(&a),
+                    hit(&b),
+                    "one of them fired on its own at tick {i}"
+                );
+                fired = (fired.0 + hit(&a) as usize, fired.1 + hit(&b) as usize);
+            }
+        }
+        assert!(fired.0 > 0, "nothing played at all");
     }
 
     /// A step written on track 0 plays its note, and the gate closes it.
@@ -1254,6 +1345,63 @@ mod tests {
             out.iter().any(|e| matches!(e, ArpEvent::On { .. })),
             "and it plays late: {out:?}"
         );
+
+        t.set_playing(false);
+        t.rewind();
+    }
+
+    /// With the transport rolling, a sequencer started late is **already** in
+    /// step: the steps are counted off the song position, not off the instant
+    /// the key was pressed, so the second tab lands on the bar where the first
+    /// one is rather than starting a bar of its own.
+    ///
+    /// This is the half of the sync that was always right; the free-running
+    /// half is [`Seq::play_with`].
+    #[test]
+    fn a_rolling_transport_puts_every_sequencer_on_the_same_bar() {
+        let _g = crate::test_locks::transport();
+        let t = choz_ports::transport();
+        t.set_time_signature(4, 4);
+        t.set_bpm(120.0);
+        t.set_playing(true);
+        t.rewind();
+
+        let settings = || SeqSettings {
+            on: true,
+            ..Default::default()
+        };
+        let mut first = Seq::new(settings());
+        let mut second = Seq::new(settings());
+        for s in 0..STEPS {
+            first.toggle_step(0, s);
+            second.toggle_step(0, s);
+        }
+        first.play();
+
+        let step_q = first.settings.div.quarters() as f64;
+        let now = Instant::now();
+        let mut out = Vec::new();
+        // The first one runs for five steps on its own.
+        for i in 0..5 {
+            t.set_position_beats(step_q * i as f64);
+            out.clear();
+            first.tick(now, &mut out);
+        }
+        // The second starts here, five steps into the bar.
+        second.play();
+        for i in 5..12 {
+            t.set_position_beats(step_q * i as f64);
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            first.tick(now, &mut a);
+            second.tick(now, &mut b);
+            let hit = |v: &Vec<ArpEvent>| v.iter().any(|e| matches!(e, ArpEvent::On { .. }));
+            // From the step after it came in, the two fire together and on the
+            // same step of the bar.
+            if i > 5 {
+                assert_eq!(hit(&a), hit(&b), "they parted company at step {i}");
+                assert_eq!(first.step, second.step, "different steps at {i}");
+            }
+        }
 
         t.set_playing(false);
         t.rewind();

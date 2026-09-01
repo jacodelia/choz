@@ -164,6 +164,11 @@ struct RackSlot {
     /// hears a note. A guitar into a preamp is nowhere near a synth's level,
     /// so without the trim the two are stuck wherever the interface left them.
     in_gain: f32,
+    /// Set when a jack lands on this tab, cleared once its level has been
+    /// measured: a live input cannot be probed with a note the way an
+    /// instrument is, so its fader is set from the first thing that arrives.
+    /// See [`App::poll_capture_trim`].
+    awaiting_trim: bool,
     in_gate: f32,
     /// Which note input drives this tab. `None` = only the QWERTY piano (which
     /// always plays the active tab) reaches it.
@@ -268,6 +273,7 @@ impl RackSlot {
             midi_out: None,
             pitch_to_midi: false,
             in_gain: 1.0,
+            awaiting_trim: false,
             in_gate: choz_engine::pitch::DEFAULT_GATE,
             input: None,
             source,
@@ -537,6 +543,9 @@ enum ModalKind {
     ArpChoice,
     /// The way out with work that is not on disk: save, leave anyway, or stay.
     QuitConfirm,
+    /// "This tab already listens to something" — the input about to be taken
+    /// off it, and the one about to land. `(row, how)` is the pick being held.
+    InputConfirm(usize, Assign),
     /// Where one strip of the MIXER sums: the device, or one of the four
     /// groups. `(strip)` — the desk edits every strip, not only the active tab.
     MixerDest(usize),
@@ -875,6 +884,11 @@ pub enum TriggerAction {
     /// reaches for with both hands busy: a footswitch, or the program change a
     /// pedalboard sends when its patch changes.
     SoundRecall(usize),
+    /// Go to rack tab `n`. The one binding that is about the rack rather than
+    /// about a tab: a controller's buttons switch instruments, which is what a
+    /// program change already did for the tabs it could reach — this reaches
+    /// them all, from a CC, a note or a program change.
+    TabSelect(usize),
     /// The looper's channel strips, for a player with both hands on a guitar.
     ///
     /// The transport, the metronome and the two levels of a channel are already
@@ -914,6 +928,7 @@ impl TriggerAction {
             TriggerAction::ArpTap => "ARP TAP".to_string(),
             TriggerAction::ArpLatch => "ARP HOLD".to_string(),
             TriggerAction::SoundRecall(i) => format!("SOUND {}", i + 1),
+            TriggerAction::TabSelect(i) => format!("TAB {}", i + 1),
             TriggerAction::LoopClear(i) => format!("LOOP CH {} CLEAR", i + 1),
             TriggerAction::LoopAdd => "LOOP +CHANNEL".to_string(),
             TriggerAction::LoopPagePrev => "LOOP PAGE \u{25C0}".to_string(),
@@ -944,6 +959,7 @@ impl TriggerAction {
             TriggerAction::ArpTap => "arp-tap".into(),
             TriggerAction::ArpLatch => "arp-latch".into(),
             TriggerAction::SoundRecall(i) => format!("sound-recall:{i}"),
+            TriggerAction::TabSelect(i) => format!("tab-select:{i}"),
             TriggerAction::LoopClear(i) => format!("loop-clear:{i}"),
             TriggerAction::LoopAdd => "loop-add".into(),
             TriggerAction::LoopPagePrev => "loop-page-prev".into(),
@@ -1007,6 +1023,7 @@ impl TryFrom<String> for TriggerAction {
             "arp-tap" => TriggerAction::ArpTap,
             "arp-latch" => TriggerAction::ArpLatch,
             "sound-recall" => TriggerAction::SoundRecall(arg),
+            "tab-select" => TriggerAction::TabSelect(arg),
             "loop-clear" => TriggerAction::LoopClear(arg),
             "loop-add" => TriggerAction::LoopAdd,
             "loop-page-prev" => TriggerAction::LoopPagePrev,
@@ -1220,6 +1237,13 @@ struct Modal {
     browser: Option<file_browser::FileBrowser>,
     /// Which FX parameter a [`ModalKind::FxChoice`] is picking a position for.
     fx_param: usize,
+    /// What is being typed into the picker, when it is one that searches.
+    ///
+    /// `None` is "not searching", which is not the same as an empty string: an
+    /// empty search still shows the caret and still swallows the next letter,
+    /// so backspacing to nothing does not silently hand the keys back to the
+    /// shortcuts underneath.
+    search: Option<String>,
     /// The octave map SPLIT was opened on, for its CANCEL button to put back.
     ///
     /// Painting is immediate — every click is heard on the instrument, which is
@@ -1237,6 +1261,7 @@ impl Modal {
             targets: Vec::new(),
             browser: None,
             fx_param: 0,
+            search: None,
             split_undo: None,
         }
     }
@@ -1271,6 +1296,11 @@ struct UiLayout {
     out_device_rect: Option<Rect>,
     /// The PANIC button on the menu bar.
     panic_rect: Option<Rect>,
+    /// MIDI LEARN, on the menu bar. It used to sit on the RACK's instrument
+    /// line, which made it look like a control of the tab in front; what it
+    /// binds is the whole rack — the tabs included — so it belongs with the
+    /// mode switch and the transport.
+    learn_rect: Option<Rect>,
     /// The automation's arm button on the menu bar. Right-clicking it clears
     /// the lanes, which is the other half of what the old panel's `x` did.
     rec_rect: Option<Rect>,
@@ -1693,6 +1723,9 @@ struct App {
     /// A MIDI/OSC-driven FX parameter changed and the chain has to be rebuilt.
     /// Coalesced: one rebuild per input drain, never one per message.
     fx_dirty: bool,
+    /// The same, for tabs that are not in front: a CC from their own keyboard
+    /// moved a knob whose processor only reads it when it is rebuilt.
+    fx_dirty_slots: Vec<usize>,
     /// Last value seen per CC, for the rising-edge test button bindings use.
     cc_last: [u8; 128],
     /// UDP port the OSC listener bound to, if it started.
@@ -1829,6 +1862,7 @@ impl App {
             cc_bindings: Vec::new(),
             pc_bindings: Vec::new(),
             fx_dirty: false,
+            fx_dirty_slots: Vec::new(),
             cc_last: [0; 128],
             osc_port: None,
             osc: None,
@@ -2090,6 +2124,36 @@ impl App {
             }
         }
         out
+    }
+
+    /// What the open picker is being searched for, lower-cased. `None` when it
+    /// is not searching.
+    fn modal_search(&self) -> Option<String> {
+        self.modal
+            .as_ref()
+            .and_then(|m| m.search.as_ref())
+            .filter(|q| !q.is_empty())
+            .map(|q| q.to_lowercase())
+    }
+
+    /// The SOURCE picker's rows: the format chip first, then whatever is being
+    /// typed. One list, so the rows drawn and the row chosen cannot drift.
+    fn source_rows(&self) -> Vec<SourceChoice> {
+        let Some(m) = self.modal.as_ref() else {
+            return Vec::new();
+        };
+        let fmt = SOURCE_FORMATS[m.list.filter];
+        let q = self.modal_search();
+        m.sources
+            .iter()
+            .filter(|c| fmt == "ALL" || c.fmt == fmt)
+            .filter(|c| {
+                q.as_ref().is_none_or(|q| {
+                    c.label.to_lowercase().contains(q) || c.fmt.to_lowercase().contains(q)
+                })
+            })
+            .cloned()
+            .collect()
     }
 
     fn open_source_modal(&mut self) {
@@ -2738,29 +2802,53 @@ impl App {
     /// button you cannot plan a set with. Recall stays a single left click, so
     /// nothing about playing the row changed.
     fn open_sound_assign_modal(&mut self, i: usize) {
-        if self
-            .slots
-            .get(self.active_slot)
-            .is_none_or(|s| i >= s.sounds.len())
-        {
+        let Some(slot) = self.slots.get(self.active_slot) else {
+            return;
+        };
+        if i >= slot.sounds.len() {
             return;
         }
+        let held = slot.sounds.get(i).filter(|s| !s.is_empty()).cloned();
         let mut list =
             views::modal::ListModal::new(format!("{} {}", i18n::t("SOUND"), i + 1), Vec::new());
         // The same picker the BANK button opens, with one row in front of it:
         // two lists of the same patches must not be two different dialogues.
         self.dress_patch_list(&mut list);
+        // A button that already holds something opens **on what it holds**:
+        // replacing a sound means looking at the one being replaced, and a
+        // picker that opens on row 0 makes the player find it again first.
+        if let Some(sound) = held.as_ref() {
+            if let Some(row) = self
+                .preset_rows()
+                .iter()
+                .position(|(index, _)| *index == sound.preset)
+            {
+                list.cursor = row + 1; // row 0 is the live patch
+            }
+            list.note = format!("  {}: {}", i18n::t("HOLDS"), sound.name);
+        }
+        let cursor = list.cursor;
         let was = self
             .slots
             .get(self.active_slot)
             .map(|s| s.preset_cursor)
             .unwrap_or(0);
+        // Which row the tab is **actually** on, which is not always the row the
+        // picker opened on. Row 0 is the live patch, so it always is; the row a
+        // filled button holds only is when that button is the one playing —
+        // opened from the right button on a tab that has moved on since, the
+        // patch it holds is *not* what is sounding, and claiming otherwise
+        // would skip the load and save whatever was playing back onto it.
+        let on_it = cursor == 0
+            || self
+                .slots
+                .get(self.active_slot)
+                .is_some_and(|s| s.sound_at == Some(i));
         self.preset_audition = Some(PresetAudition {
             was,
-            row: 0,
+            row: cursor,
             at: Instant::now(),
-            // Row 0 is what is already playing.
-            played: Some(0),
+            played: on_it.then_some(cursor),
         });
         self.modal = Some(Modal::new(ModalKind::SoundAssign(i), list));
         self.refresh_modal();
@@ -2798,6 +2886,12 @@ impl App {
             .unwrap_or(0);
         for i in 0..sounds {
             targets.push(LearnTarget::Trigger(TriggerAction::SoundRecall(i)));
+        }
+        // Every tab in the rack, not only this one: LEARN is a rack control
+        // now (it sits in the top bar), and switching instrument from a
+        // controller button is the thing a player needs it for most.
+        for i in 0..self.slots.len() {
+            targets.push(LearnTarget::Trigger(TriggerAction::TabSelect(i)));
         }
         for fx in 0..self.fx_chain.len() {
             targets.push(LearnTarget::Trigger(TriggerAction::FxSelect(fx)));
@@ -3305,6 +3399,11 @@ impl App {
             slot.preset_cursor = sound.preset;
             slot.sound_at = Some(i);
         }
+        let knobs = self
+            .slots
+            .get(tab)
+            .map(|s| knobs_over_patch(&s.instr_params, &s.instr_values, !sound.state.is_empty()))
+            .unwrap_or_default();
         if let Some(engine) = self.audio_engine.as_mut() {
             // The patch first: restoring it moves every parameter, so the knob
             // positions go on top of it rather than under it — the same order
@@ -3312,8 +3411,8 @@ impl App {
             if !sound.state.is_empty() {
                 engine.set_slot_state(tab, &sound.state);
             }
-            for (p, v) in sound.values.iter().enumerate() {
-                engine.set_slot_param(tab, p, *v);
+            for (p, v) in knobs {
+                engine.set_slot_param(tab, p, v);
             }
         }
         // A SoundFont's sound *is* its program, and that is a message rather
@@ -5639,15 +5738,11 @@ impl App {
         // row stays selected (and therefore visible) while the text changes.
         let mut edit_row: Option<usize> = None;
         let items: Vec<String> = match kind {
-            ModalKind::Source => {
-                let m = self.modal.as_ref().unwrap();
-                let fmt = SOURCE_FORMATS[m.list.filter];
-                m.sources
-                    .iter()
-                    .filter(|c| fmt == "ALL" || c.fmt == fmt)
-                    .map(|c| format!("[{}] {}", c.fmt, c.label))
-                    .collect()
-            }
+            ModalKind::Source => self
+                .source_rows()
+                .iter()
+                .map(|c| format!("[{}] {}", c.fmt, c.label))
+                .collect(),
             ModalKind::AddFx => {
                 let sidebar: Vec<(String, usize)> = self
                     .fx_categories()
@@ -5699,6 +5794,7 @@ impl App {
             ModalKind::FxChoice
             | ModalKind::FxPreset
             | ModalKind::ArpChoice
+            | ModalKind::InputConfirm(..)
             | ModalKind::QuitConfirm
             | ModalKind::MixerDest(_)
             | ModalKind::SeqChoice(_)
@@ -5975,6 +6071,27 @@ impl App {
                 }
                 m.list.title = "SAVE PROJECT".to_string();
             }
+            // The search box, when there is one: the letters typed so far, with
+            // a caret, in the line the picker keeps its hints on.
+            if matches!(m.kind, ModalKind::Source | ModalKind::AddFx) {
+                m.list.note = match m.search.as_deref() {
+                    Some(q) => format!(
+                        "  {}: {q}\u{2588}  \u{00B7}  Esc={}",
+                        i18n::t("SEARCH"),
+                        i18n::t("back to the whole list"),
+                    ),
+                    None if m.kind == ModalKind::AddFx => format!(
+                        "  {}  \u{00B7}  \u{2190}\u{2192}=category/list  Tab=format  F5={}",
+                        i18n::t("type to search"),
+                        i18n::t("rescan plugins"),
+                    ),
+                    None => format!(
+                        "  {}  \u{00B7}  Tab=format  F5={}",
+                        i18n::t("type to search"),
+                        i18n::t("rescan plugins"),
+                    ),
+                };
+            }
             m.list.items = items;
             let last = m.list.items.len().saturating_sub(1);
             m.list.cursor = m.list.cursor.min(last);
@@ -6035,13 +6152,7 @@ impl App {
         let i = m.list.cursor;
         match m.kind {
             ModalKind::Source => {
-                let fmt = SOURCE_FORMATS[m.list.filter];
-                let choice = m
-                    .sources
-                    .iter()
-                    .filter(|c| fmt == "ALL" || c.fmt == fmt)
-                    .nth(i)
-                    .cloned();
+                let choice = self.source_rows().into_iter().nth(i);
                 match choice.map(|c| c.action) {
                     Some(SourceAction::Plugin { format, path, id }) => {
                         self.load_plugin_source(format, &path, &id);
@@ -6078,13 +6189,18 @@ impl App {
                 if let Some(slot) = self.slots.get_mut(self.active_slot) {
                     slot.preset_cursor = index;
                 }
-                self.apply_selected_preset();
+                // Unless the audition already put this very row on the
+                // instrument — see [`App::already_auditioned`].
+                if !self.already_auditioned(i) {
+                    self.apply_selected_preset();
+                }
                 // Chosen: there is nothing left to put back.
                 self.preset_audition = None;
                 true
             }
             ModalKind::SoundAssign(button) => {
                 // Whatever was auditioned is being kept, one way or another.
+                let played = self.already_auditioned(i);
                 self.preset_audition = None;
                 let tab = self.active_slot;
                 // Row 0 is the live patch; the rest are presets, and assigning
@@ -6100,7 +6216,9 @@ impl App {
                         if let Some(slot) = self.slots.get_mut(tab) {
                             slot.preset_cursor = index;
                         }
-                        self.apply_selected_preset();
+                        if !played {
+                            self.apply_selected_preset();
+                        }
                         self.save_sound(tab, button);
                     }
                 }
@@ -6167,6 +6285,15 @@ impl App {
                 use choz_engine::fx::looper as deck;
                 let n = deck::Quantise::ALL.len();
                 self.set_fx_param_at(deck::P_QUANT + track, i.min(n - 1) as f32 / (n - 1) as f32);
+                true
+            }
+            ModalKind::InputConfirm(row, how) => {
+                // Row 0 replaces, anything else leaves the tab as it was. The
+                // modal is still open while the pick runs, which is what tells
+                // [`App::input_change_needs_asking`] not to ask again.
+                if i == 0 {
+                    self.in_select_side(row, how);
+                }
                 true
             }
             ModalKind::QuitConfirm => {
@@ -6515,12 +6642,19 @@ impl App {
     /// into [`Self::fx_menu_entries`].
     fn fx_menu_rows(&self) -> Vec<(Option<usize>, String)> {
         let wanted = self.fx_format_filter();
-        let section = self
-            .modal
-            .as_ref()
-            .map(|m| m.list.sidebar_cursor)
-            .and_then(|i| self.fx_categories().get(i).map(|(c, _)| *c))
-            .unwrap_or(None);
+        // A search looks through the whole catalogue: the category in the
+        // sidebar is a way of narrowing the list *instead* of typing, and
+        // finding nothing because the answer was filed elsewhere is the one
+        // thing a search must not do.
+        let section = match self.modal_search().is_some() {
+            true => None,
+            false => self
+                .modal
+                .as_ref()
+                .map(|m| m.list.sidebar_cursor)
+                .and_then(|i| self.fx_categories().get(i).map(|(c, _)| *c))
+                .unwrap_or(None),
+        };
         self.fx_menu_entries()
             .into_iter()
             .enumerate()
@@ -6530,6 +6664,11 @@ impl App {
             // opens with it, and it still works — it is only off the menu.
             .filter(|(i, _)| ALL_FX_KINDS.get(*i) != Some(&source::AudioFxKind::Vocoder))
             .filter(|(_, e)| e.matches_filter(wanted) && section.is_none_or(|c| e.category == c))
+            // …and whatever is being typed, over the name a player would read.
+            .filter(|(_, e)| {
+                self.modal_search()
+                    .is_none_or(|q| e.label.to_lowercase().contains(&q))
+            })
             .map(|(i, e)| {
                 let fmt = e.format.map(|f| f.label()).unwrap_or("BUILT-IN");
                 let mark = if e.hosted { "" } else { "  (not hosted yet)" };
@@ -7637,6 +7776,16 @@ impl App {
                 .iter()
                 .find(|(_, r)| r.contains(pos))
                 .map(|&(i, _)| TriggerAction::FxSelect(i))
+        })
+        // **The tabs themselves.** LEARN lives in the top bar now because what
+        // it binds is the rack, and the first thing a player wants a
+        // controller button for is the instrument it switches to. Point at the
+        // tab, press the button.
+        .or_else(|| {
+            rack.tabs
+                .iter()
+                .find(|(_, r)| r.contains(pos))
+                .map(|&(i, _)| TriggerAction::TabSelect(i))
         });
         if let Some(action) = trigger {
             return Some(LearnTarget::Trigger(action));
@@ -7680,7 +7829,32 @@ impl App {
     }
 
     /// Run a button binding. Same code paths the mouse and keys use.
-    fn fire_trigger(&mut self, action: TriggerAction) {
+    /// Fire a bound trigger on the tab the message belongs to.
+    ///
+    /// `tab` is the tab whose keyboard sent this — the active one for a click
+    /// or for a controller the tab in front is listening to, and the other
+    /// tab's when a second keyboard's button arrives while its tab is not on
+    /// screen. Only the actions that *are* a tab's — its saved sounds, its
+    /// mute and its solo — take it: the rest act on what is selected on
+    /// screen (the FX unit, the knob page), and a background tab has no
+    /// selection to act on.
+    fn fire_trigger_on(&mut self, tab: usize, action: TriggerAction) {
+        match action {
+            TriggerAction::SoundRecall(i) => return self.recall_sound(tab, i),
+            TriggerAction::Mute => {
+                if let Some(s) = self.slots.get_mut(tab) {
+                    s.mute = !s.mute;
+                }
+                return self.push_mix();
+            }
+            TriggerAction::Solo => {
+                if let Some(s) = self.slots.get_mut(tab) {
+                    s.solo = !s.solo;
+                }
+                return self.push_mix();
+            }
+            _ => {}
+        }
         match action {
             TriggerAction::PresetPrev => self.step_preset(-1),
             TriggerAction::PresetNext => self.step_preset(1),
@@ -7732,6 +7906,15 @@ impl App {
             }
             TriggerAction::FxAdd => self.open_add_fx_modal(),
             TriggerAction::SoundRecall(i) => self.recall_sound(self.active_slot, i),
+            // Not a wrap-around step: a bound button is a *place*, and a
+            // button that lands somewhere else because a tab was removed is
+            // worse than one that does nothing.
+            TriggerAction::TabSelect(i) => {
+                if i < self.slots.len() && i != self.active_slot {
+                    self.panic();
+                    self.switch_slot(i);
+                }
+            }
         }
     }
 
@@ -7743,6 +7926,24 @@ impl App {
             S::Midi(i) => self.midi_connected.get(i).cloned().map(InputRef::Midi),
             S::Osc => Some(InputRef::Osc),
             S::Keyboard => None,
+        }
+    }
+
+    /// Which tab a message from `source` belongs to.
+    ///
+    /// The tab in front when it is one of the ones listening to that
+    /// controller — a third tab on the Keystation takes the Keystation's
+    /// buttons over while it is the one being played — and otherwise the first
+    /// tab that is. A controller nothing is bound to (the QWERTY piano, a port
+    /// no tab took) speaks for the tab in front, which is what it always did.
+    fn home_tab_for(&self, source: choz_engine::input::InputSource) -> usize {
+        let Some(input) = self.source_ref(source) else {
+            return self.active_slot;
+        };
+        let owners = self.tabs_on_input(&input);
+        match owners.contains(&self.active_slot) {
+            true => self.active_slot,
+            false => owners.first().copied().unwrap_or(self.active_slot),
         }
     }
 
@@ -7835,6 +8036,7 @@ impl App {
         // active tab. Only consulted when the port really is shared.
         let owners = from.as_ref().map(|i| self.tabs_on_input(i));
         let playing = self.targets_for(source, channel);
+        let home = self.home_tab_for(source);
         for binding in self.cc_bindings.clone() {
             if binding.cc != cc {
                 continue;
@@ -7852,7 +8054,8 @@ impl App {
                     continue;
                 }
             }
-            self.apply_target(binding.target, v, rising);
+            // Whose message this is — see [`App::home_tab_for`].
+            self.apply_target_on(home, binding.target, v, rising);
         }
     }
 
@@ -7860,10 +8063,17 @@ impl App {
     /// automation lane, a click. One place, so a control that can be learned can
     /// also be automated without being wired up twice.
     fn apply_target(&mut self, target: LearnTarget, v: f32, rising: bool) {
+        self.apply_target_on(self.active_slot, target, v, rising)
+    }
+
+    /// The same, for a message that belongs to `tab` — the tab whose keyboard
+    /// sent it, which is not always the tab on screen. See
+    /// [`App::fire_trigger_on`].
+    fn apply_target_on(&mut self, tab: usize, target: LearnTarget, v: f32, rising: bool) {
         match target {
             LearnTarget::Trigger(action) => {
                 if rising {
-                    self.fire_trigger(action);
+                    self.fire_trigger_on(tab, action);
                 }
             }
             LearnTarget::Gain(slot) => {
@@ -7926,7 +8136,15 @@ impl App {
             }
             LearnTarget::FxParam { slot, fx, param } => {
                 if slot != self.active_slot {
-                    // Only the active tab has a live working copy of its chain.
+                    // **A tab that is not in front still plays.** Two keyboards
+                    // is the normal case on stage: the Keystation's knobs are
+                    // on its own tab's effects and have to keep moving them
+                    // while the KeyStep's tab is the one being looked at.
+                    // Nothing about the fader changed — the binding names the
+                    // tab and the unit — only this branch, which used to bail
+                    // because the *working copy* of a chain belongs to the
+                    // active tab. The stored chain is right there.
+                    self.set_background_fx_param(slot, fx, param, v);
                     return;
                 }
                 if fx != self.fx_slot {
@@ -8174,6 +8392,15 @@ impl App {
             InTarget::Note(_) => self.bind_selected_input(),
             InTarget::Channel(ch) => {
                 let current = self.slots.get(self.active_slot).and_then(|s| s.in_pair);
+                // The tab is already listening to something else: ask before
+                // taking it off. A mis-click on the row below is how a headset
+                // microphone stops being the tab's input mid-session, and the
+                // drawer gives no other way back than remembering which jack
+                // it was.
+                if self.input_change_needs_asking(ch, how, current) {
+                    self.ask_before_input_change(row, how);
+                    return;
+                }
                 // The tab in front is not an input tab: it has a keyboard on
                 // it, or an instrument, or nothing at all. Putting a jack on it
                 // would land a microphone on top of whatever was already
@@ -8202,6 +8429,79 @@ impl App {
             }
             InTarget::NoCapture => self.set_active_capture(None),
         }
+    }
+
+    /// Whether picking channel `ch` would take an input **off** the tab rather
+    /// than add to it — the case worth a question.
+    ///
+    /// Adding a second jack to a mono capture tab makes it stereo and takes
+    /// nothing away, so that one goes straight through; landing on a tab that
+    /// already has both, or switching it to a different jack, replaces what was
+    /// there. Cancelling is not a way back for the tab that is gone.
+    fn input_change_needs_asking(
+        &self,
+        ch: usize,
+        how: Assign,
+        current: Option<(usize, usize)>,
+    ) -> bool {
+        // The question has already been asked and answered — this is the
+        // answer coming back through.
+        if let Some(ModalKind::InputConfirm(..)) = self.modal.as_ref().map(|m| m.kind) {
+            return false;
+        }
+        let Some(pair) = current else {
+            return false;
+        };
+        // Taking a jack off — the right button, or Enter on a jack the tab
+        // already has — is what the gesture plainly says it is, and so is the
+        // NO CAPTURE row. What gets asked about is the other direction: a jack
+        // the tab was not listening to, landing on a tab that was already
+        // listening to something.
+        !channels_of(pair).contains(&ch) && how != Assign::Off
+    }
+
+    /// Put the pick on hold behind a yes/no dialogue.
+    fn ask_before_input_change(&mut self, row: usize, how: Assign) {
+        let tab = self.active_slot + 1;
+        let has = self
+            .in_targets()
+            .into_iter()
+            .nth(row)
+            .map(|(_, r)| r.name)
+            .unwrap_or_default();
+        let now = self
+            .slots
+            .get(self.active_slot)
+            .and_then(|s| s.in_pair)
+            .map(|p| {
+                channels_of(p)
+                    .iter()
+                    .map(|c| {
+                        self.in_ports
+                            .get(*c)
+                            .cloned()
+                            .unwrap_or_else(|| format!("in {}", c + 1))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            })
+            .unwrap_or_default();
+        let items = vec![
+            i18n::t("REPLACE IT").to_string(),
+            i18n::t("KEEP WHAT IS THERE").to_string(),
+        ];
+        let mut modal = Modal::new(
+            ModalKind::InputConfirm(row, how),
+            views::modal::ListModal::new(
+                format!("{} {tab} \u{00B7} {}", i18n::t("TAB"), i18n::t("INPUT")),
+                items,
+            ),
+        );
+        modal.list.note = format!("  {now}  \u{2192}  {}", has.trim());
+        // On the safe answer, like the quit dialogue: Enter on a question
+        // nobody read must not be what takes the microphone off.
+        modal.list.cursor = 1;
+        self.modal = Some(modal);
     }
 
     /// Enter (or a left click) on an IN row.
@@ -8266,6 +8566,9 @@ impl App {
         let Some(slot) = self.slots.get_mut(idx) else {
             return;
         };
+        // A jack landing on a tab that had none: level it like every other
+        // source, once there is something to measure.
+        slot.awaiting_trim = pair.is_some() && slot.in_pair.is_none();
         slot.in_pair = pair;
         if let Some(ref mut engine) = self.audio_engine {
             engine.set_slot_in(idx, pair);
@@ -8494,6 +8797,20 @@ impl App {
         // hiccup, it is a rack this machine cannot render at this block size —
         // and the fix is one setting, so say it rather than leaving it to be
         // deduced from microseconds.
+        // **A debug build is not a slow machine.** `cargo run` without
+        // `--release` renders the same SF2 tab twelve times dearer — measured
+        // at 96 kHz/128: 0.05 ms a block optimised against 0.6 ms unoptimised,
+        // which is the whole budget spent on one tab. It sounds exactly like a
+        // rack that is too big for the machine, and it was diagnosed as one
+        // once already.
+        if over > blocks / 20 && cfg!(debug_assertions) {
+            eprintln!(
+                "choz[{}]: …and this is a debug build, which renders roughly ten times \
+                 dearer than a release one. Run `cargo run --release --bin choz` before \
+                 reading anything above as a limit of this machine.",
+                std::process::id(),
+            );
+        }
         if over > blocks / 20 {
             let frames = self
                 .audio_engine
@@ -9494,6 +9811,15 @@ impl App {
     fn edit_seq(&mut self, edit: SeqEdit) {
         let slot_index = self.active_slot;
         let mut out = Vec::new();
+        // A sequencer on another tab that is already running its own clock: the
+        // one this tab's has to fall in step with when it starts. Taken before
+        // the borrow below, and only for the start — see [`Seq::play_with`].
+        let leader = self
+            .slots
+            .iter()
+            .enumerate()
+            .find(|(i, s)| *i != slot_index && s.seq.is_running_free())
+            .map(|(_, s)| s.seq.clone());
         let Some(slot) = self.slots.get_mut(slot_index) else {
             return;
         };
@@ -9505,7 +9831,10 @@ impl App {
                     seq.stop(&mut out);
                 }
             }
-            SeqEdit::Play => seq.toggle_play(&mut out),
+            SeqEdit::Play => match (seq.running(), leader.as_ref()) {
+                (false, Some(other)) => seq.play_with(other),
+                _ => seq.toggle_play(&mut out),
+            },
             SeqEdit::Rec => seq.toggle_rec(),
             SeqEdit::Chain => {
                 let part = seq.settings.part;
@@ -10038,6 +10367,43 @@ impl App {
         );
     }
 
+    /// Level a tab that has just been given a live input.
+    ///
+    /// Every other source is trimmed on the way in: the engine plays it a
+    /// middle C, measures what came out and sets the fader so the tab sits
+    /// where the rest of the rack sits. A microphone cannot be probed — there
+    /// is nothing to play it — so it used to arrive at whatever gain the
+    /// converter felt like, which for a headset is *loud*: the H340 came back
+    /// louder than everything choz was making, and the only way down was to
+    /// know that `VOL` needed pulling.
+    ///
+    /// So the measurement waits for the player instead: the first thing that
+    /// arrives above the floor is what the fader is set from. Once, and it is
+    /// announced in the log like the probe is — from there the level is the
+    /// player's.
+    fn poll_capture_trim(&mut self) {
+        let waiting: Vec<usize> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.awaiting_trim && s.in_pair.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        for tab in waiting {
+            // The tab's own meter, which is published **after** its FX chain:
+            // what is levelled is the sound the tab makes, not the sound going
+            // into it.
+            let (_, rms) = choz_engine::meter::slot_levels().read(tab);
+            if rms < TRIM_FLOOR {
+                continue;
+            }
+            if let Some(s) = self.slots.get_mut(tab) {
+                s.awaiting_trim = false;
+            }
+            self.auto_trim(tab);
+        }
+    }
+
     /// Move one side of a tab's fader, or both when the strip is linked.
     ///
     /// `delta` is in the same step the RACK's `VOL` knob uses, so a click of the
@@ -10181,7 +10547,7 @@ impl App {
     /// number is the button's identity: learn binds it to a trigger, a bound
     /// button fires that trigger, and every other program change is ignored —
     /// the controller does not get to pick the preset on its own.
-    fn apply_program_button(&mut self, program: u8) {
+    fn apply_program_button(&mut self, source: choz_engine::input::InputSource, program: u8) {
         // Only buttons (triggers) bind here; a fader target stays armed, so a
         // stray program change can't steal the binding the user is aiming at.
         if let Some(target @ LearnTarget::Trigger(_)) = self.learn {
@@ -10192,6 +10558,11 @@ impl App {
             self.end_learn();
             return;
         }
+        // Whose button this is — the same rule the CCs follow, and for the same
+        // reason: two keyboards on stage each drive their own tabs, and the tab
+        // in front only wins where it is one of the ones listening to this
+        // controller. See [`App::apply_cc`].
+        let home = self.home_tab_for(source);
         let mut fired = false;
         for (_, target) in self
             .pc_bindings
@@ -10200,7 +10571,7 @@ impl App {
             .filter(|(p, _)| *p == program)
         {
             if let LearnTarget::Trigger(action) = *target {
-                self.fire_trigger(action);
+                self.fire_trigger_on(home, action);
                 fired = true;
             }
         }
@@ -10306,8 +10677,12 @@ impl App {
                 if !slot.instr_state.is_empty() {
                     engine.set_slot_state(i, &slot.instr_state);
                 }
-                for (p, v) in slot.instr_values.iter().enumerate() {
-                    engine.set_slot_param(i, p, *v);
+                for (p, v) in knobs_over_patch(
+                    &slot.instr_params,
+                    &slot.instr_values,
+                    !slot.instr_state.is_empty(),
+                ) {
+                    engine.set_slot_param(i, p, v);
                 }
                 for (ui_fx, entry) in slot.fx_chain.iter().enumerate() {
                     if entry.state.is_empty() || !entry.enabled {
@@ -10843,6 +11218,54 @@ impl App {
         }
     }
 
+    /// The same as [`App::set_fx_param`], for a tab that is **not** in front.
+    ///
+    /// It writes the stored chain rather than the working copy (there is only
+    /// one of those, and it belongs to the active tab) and pushes the value to
+    /// that tab's engine slot. A built-in that cannot take a value live needs
+    /// its chain rebuilt, which is marked here and done once per drain — a
+    /// fader sends a hundred messages a second and a rebuild per message would
+    /// throw away every tail in the slot, a hundred times a second.
+    fn set_background_fx_param(&mut self, slot: usize, fx: usize, param: usize, value: f32) {
+        let Some(entry) = self
+            .slots
+            .get_mut(slot)
+            .and_then(|s| s.fx_chain.get_mut(fx))
+        else {
+            return;
+        };
+        let Some(p) = entry.params.get_mut(param) else {
+            return;
+        };
+        *p = value;
+        let is_mix = entry.is_mix_param(param);
+        if is_mix {
+            entry.wet = value;
+        }
+        let preset = entry.apply_preset(param);
+        let (kind, native) = (entry.kind, entry.plugin.is_none());
+        let idx = if is_mix {
+            choz_engine::FX_MIX_PARAM
+        } else {
+            param
+        };
+        // The engine numbers only the units that are switched on, exactly as
+        // [`App::engine_fx_index`] does for the tab in front.
+        let engine_fx = self.slots.get(slot).and_then(|s| {
+            s.fx_chain
+                .get(fx)?
+                .enabled
+                .then(|| s.fx_chain[..fx].iter().filter(|e| e.enabled).count())
+        });
+        if let (Some(engine_fx), Some(engine)) = (engine_fx, self.audio_engine.as_mut()) {
+            engine.set_fx_param(slot, engine_fx, idx, value);
+        }
+        let needs_rebuild = preset || (native && !source::AudioFxEntry::takes_live_params(kind));
+        if needs_rebuild && !self.fx_dirty_slots.contains(&slot) {
+            self.fx_dirty_slots.push(slot);
+        }
+    }
+
     fn set_live_fx_param(&mut self, fx_idx: usize, param: usize, value: f32) {
         let Some(engine_fx) = self.engine_fx_index(fx_idx) else {
             return;
@@ -10893,6 +11316,28 @@ impl App {
             return None;
         }
         Some(self.fx_chain[..fx_idx].iter().filter(|e| e.enabled).count())
+    }
+
+    /// Push a **background** tab's stored chain to its engine slot.
+    ///
+    /// The active tab's rebuild goes through [`App::rebuild_fx`], which also
+    /// hands the looper's takes over and keeps the working copy in step; a tab
+    /// that is not in front has neither, so this is the whole of it.
+    fn rebuild_slot_fx(&mut self, slot: usize) {
+        if slot == self.active_slot {
+            self.rebuild_fx();
+            return;
+        }
+        let Some(specs) = self
+            .slots
+            .get(slot)
+            .map(|s| s.fx_chain.iter().map(|e| e.to_spec()).collect::<Vec<_>>())
+        else {
+            return;
+        };
+        if let Some(ref mut engine) = self.audio_engine {
+            engine.set_slot_fx(slot, specs);
+        }
     }
 
     /// Push the active slot's FX chain to its engine slot.
@@ -11156,6 +11601,22 @@ impl App {
         self.refresh_modal();
     }
 
+    /// Whether row `row` of the open picker is already on the instrument,
+    /// because the audition put it there.
+    ///
+    /// Loading a patch costs the note under the player's hand: a plugin clears
+    /// the voices it finds when one lands (Surge XT does — measured, the note
+    /// started right before a restore never sounds, the next one does). So
+    /// choosing the row that has been sounding for the last second must not
+    /// hand the plugin the same patch a second time. Picking a *different* row,
+    /// or the same row in a picker opened since, still loads it — which is what
+    /// makes re-picking a patch the way back from a sound tweaked past saving.
+    fn already_auditioned(&self, row: usize) -> bool {
+        self.preset_audition
+            .as_ref()
+            .is_some_and(|a| a.played == Some(row))
+    }
+
     fn poll_preset_audition(&mut self) {
         // Both pickers that list patches: BANK/PRESET, and the one a SOUNDS
         // button opens to be told what to hold. Choosing what a bank button
@@ -11288,9 +11749,13 @@ impl App {
         let mut routed = Vec::new();
         let mut expression = Vec::new();
         // Program numbers — the buttons on a controller keyboard. They act on
-        // the rack (via learn bindings), not on the slot's preset, so the input
-        // routing doesn't matter here.
-        let mut programs: Vec<u8> = Vec::new();
+        // the rack through learn bindings rather than on a slot's preset, but
+        // **which** rack control they act on depends on where they came from:
+        // a button on the Keystation recalls a sound on the Keystation's tab,
+        // not on whichever tab happens to be in front. That is why the source
+        // travels with the number (it used to be thrown away here, and the
+        // buttons on one keyboard drove the other keyboard's tab).
+        let mut programs: Vec<(choz_engine::input::InputSource, u8)> = Vec::new();
         // Only the last one of the drain matters: a tempo reading supersedes
         // the one before it, and START after STOP is where it ended up.
         let mut clock: Option<midi::ClockMsg> = None;
@@ -11341,7 +11806,7 @@ impl App {
                         clock = Some(msg);
                     }
                 }
-                midi::InputEvent::Program(p) => programs.push(p.program),
+                midi::InputEvent::Program(p) => programs.push((p.source, p.program)),
                 midi::InputEvent::Control(c) => controls.push(c),
             }
         }
@@ -11402,8 +11867,8 @@ impl App {
             }
         }
 
-        for program in programs {
-            self.apply_program_button(program);
+        for (source, program) in programs {
+            self.apply_program_button(source, program);
         }
         // A CC reaching the instrument does not stop it from also driving a
         // MIDI-learn binding: the same sustain pedal can hold notes *and* be
@@ -11418,6 +11883,9 @@ impl App {
         if self.fx_dirty {
             self.fx_dirty = false;
             self.rebuild_fx();
+        }
+        for slot in std::mem::take(&mut self.fx_dirty_slots) {
+            self.rebuild_slot_fx(slot);
         }
     }
 
@@ -11977,6 +12445,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Screen>>, app: &mut App) -> 
         app.poll_preset_list();
         app.poll_instr_readback();
         app.poll_preset_audition();
+        app.poll_capture_trim();
         app.poll_plugin_touch();
         app.poll_health();
         app.tick_automation();
@@ -12305,6 +12774,52 @@ fn handle_modal_key(app: &mut App, key: KeyCode) {
         harmonics_key(app, key);
         return;
     }
+    // The two plugin pickers are lists of hundreds. Typing searches them as
+    // the letters arrive; Esc gives the list back before it closes the modal.
+    // Every printable key belongs to the search once it is open, which is why
+    // the rescan the letter `r` used to do is F5 here.
+    if matches!(kind, ModalKind::Source | ModalKind::AddFx) {
+        let typed = match key {
+            KeyCode::Char(c) if !c.is_control() => Some(c),
+            _ => None,
+        };
+        if let Some(c) = typed {
+            if let Some(m) = app.modal.as_mut() {
+                m.search.get_or_insert_with(String::new).push(c);
+                m.list.cursor = 0;
+                m.list.scroll = 0;
+                // A search that lands in the sidebar shows nothing: the results
+                // are in the list, so that is where the cursor has to be.
+                m.list.sidebar_focused = false;
+            }
+            app.refresh_modal();
+            return;
+        }
+        if key == KeyCode::Backspace {
+            if let Some(m) = app.modal.as_mut() {
+                match m.search.as_mut() {
+                    Some(q) if !q.is_empty() => {
+                        q.pop();
+                    }
+                    // Backspacing past the start is the way out of the search.
+                    _ => m.search = None,
+                }
+                m.list.cursor = 0;
+                m.list.scroll = 0;
+            }
+            app.refresh_modal();
+            return;
+        }
+        if key == KeyCode::Esc && app.modal.as_ref().is_some_and(|m| m.search.is_some()) {
+            if let Some(m) = app.modal.as_mut() {
+                m.search = None;
+                m.list.cursor = 0;
+                m.list.scroll = 0;
+            }
+            app.refresh_modal();
+            return;
+        }
+    }
     match key {
         KeyCode::Esc => {
             app.close_modal();
@@ -12472,8 +12987,9 @@ fn handle_modal_key(app: &mut App, key: KeyCode) {
             app.close_modal();
             return;
         }
-        // Rescan plugins from the SOURCE / ADD FX pickers.
-        KeyCode::Char('r') if matches!(kind, ModalKind::Source | ModalKind::AddFx) => {
+        // Rescan plugins from the SOURCE / ADD FX pickers. **F5, not `r`**:
+        // the letters are the search box in these two.
+        KeyCode::F(5) if matches!(kind, ModalKind::Source | ModalKind::AddFx) => {
             app.discover_synths(true);
             if let Some(m) = app.modal.as_mut() {
                 m.sources.clear();
@@ -12760,6 +13276,38 @@ fn is_placeholder(name: &str) -> bool {
         .unwrap_or(n)
         .trim();
     rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Which knob positions to push on top of a patch that was just restored.
+///
+/// `patched` says a state blob went in first. Then only what differs from the
+/// parameter's own default is sent: the patch moved every parameter, while
+/// what a tab carries for a hosted plugin is a snapshot of the *defaults*,
+/// read off a scan instance when the plugin was loaded and never read back for
+/// a format that cannot be asked (every one but LV2's OSC synths). Pushing that
+/// list back wholesale undoes the patch it was just handed — a SOUNDS button
+/// holding Surge XT's `Butter` recalled the blob and then flattened it back to
+/// the init patch. Surge publishes 774 parameters, which is also more than the
+/// engine's command ring holds, so the flood costs whatever else was in flight
+/// with it, notes included.
+///
+/// A knob the player actually moved differs from its default, and still lands.
+fn knobs_over_patch(
+    params: &[choz_engine::PluginParam],
+    values: &[f32],
+    patched: bool,
+) -> Vec<(usize, f32)> {
+    values
+        .iter()
+        .enumerate()
+        .filter(|(i, v)| {
+            !patched
+                || !params
+                    .get(*i)
+                    .is_some_and(|p| (p.normalised(p.default) as f32 - **v).abs() <= f32::EPSILON)
+        })
+        .map(|(i, v)| (i, *v))
+        .collect()
 }
 
 fn slot_label(source: &AudioSource) -> String {
@@ -13250,7 +13798,6 @@ enum MouseAction {
     /// Step the active tab's MIDI channel (MULTI mode).
     ChannelStep(i8),
     OpenPresetPicker,
-    OpenLearnPicker,
     /// What opens the selected effect, and — the harmoniser's — which
     /// keyboard its chord comes from.
     OpenFxGate,
@@ -13382,7 +13929,6 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                             RackButton::Channel => MouseAction::ChannelStep(1),
                             RackButton::Source => MouseAction::OpenSourcePicker,
                             RackButton::Preset => MouseAction::OpenPresetPicker,
-                            RackButton::Learn => MouseAction::OpenLearnPicker,
                             RackButton::PitchToMidi => MouseAction::TogglePitchToMidi,
                             RackButton::PitchMix => MouseAction::PitchMixCycle,
                             RackButton::Gui => MouseAction::ToggleEditor,
@@ -13791,7 +14337,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         }
         // The cluster the TRANSPORT panel turned into. Each button is one
         // rect, so the click is the same code the panel's were.
-        let (transport, rec, loop_r, clock, panic) = {
+        let (transport, rec, loop_r, clock, panic, learn) = {
             let l = app.layout.borrow();
             (
                 l.transport_rect,
@@ -13799,8 +14345,22 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                 l.loop_rect,
                 l.clock_rect,
                 l.panic_rect,
+                l.learn_rect,
             )
         };
+        if learn.is_some_and(|r| r.contains(pos)) {
+            // Armed already: the click is the way to disarm without binding
+            // something by accident.
+            // Armed already: the click disarms. Otherwise it puts the `?`
+            // pointer up — point at a control (a tab, a knob, a button) and
+            // move the CC that should drive it. The list is still there for
+            // what has no place on screen: MENU \u{2192} MIDI LEARN.
+            match app.learn_pick || app.learn.is_some() {
+                true => app.end_learn(),
+                false => app.start_learn_pick(),
+            }
+            return;
+        }
         if transport.is_some_and(|r| r.contains(pos)) {
             toggle_play(app);
             return;
@@ -14041,7 +14601,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             app.rack_focus = RackFocus::Fx;
         }
         MouseAction::OpenPresetPicker => app.open_preset_modal(),
-        MouseAction::OpenLearnPicker => app.start_learn_pick(),
         MouseAction::ToggleEditor => app.toggle_editor(None),
         MouseAction::OpenHarmonics => app.open_harmonics_modal(),
         MouseAction::ToggleFxEditor => app.toggle_editor(Some(app.fx_slot)),
@@ -14071,15 +14630,28 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             app.automation.clear(None);
             app.automation.recording = false;
         }
-        // An empty button has nothing to recall, so it asks what to hold;
-        // a filled one plays, which is the gesture that has to survive a stage.
+        // An empty button has nothing to recall, so it asks what to hold; a
+        // filled one plays, which is the gesture that has to survive a stage.
+        //
+        // …and pressing the one that is **already playing** opens the picker on
+        // it. Recalling the sound that is already on the tab does nothing, so
+        // that press was the one gesture on the panel with no meaning; it is
+        // now how a button is given a different patch without hunting for the
+        // right mouse button. Every other button still recalls on one press,
+        // and a footswitch or a CC always recalls — a dialogue that opens
+        // itself mid-set is the thing this must never do.
         MouseAction::SoundRecall(i) => {
-            match app
+            let (empty, playing) = app
                 .slots
                 .get(app.active_slot)
-                .and_then(|s| s.sounds.get(i))
-                .is_some_and(|s| s.is_empty())
-            {
+                .map(|s| {
+                    (
+                        s.sounds.get(i).is_none_or(|x| x.is_empty()),
+                        s.sound_at == Some(i),
+                    )
+                })
+                .unwrap_or((true, false));
+            match empty || playing {
                 true => app.open_sound_assign_modal(i),
                 false => app.recall_sound(app.active_slot, i),
             }
@@ -15210,6 +15782,7 @@ fn compute_layout(
 /// when the window is narrow all read off the same id.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BarId {
+    Learn,
     Met,
     MetMenu,
     Mode,
@@ -15295,7 +15868,23 @@ fn draw_menu_bar(f: &mut Frame, app: &App, area: Rect) {
         _ => Color::Rgb(150, 155, 165),
     };
 
+    let learning = app.learn.is_some() || app.learn_pick;
     let mut items: Vec<(BarId, Vec<Span>)> = vec![
+        (
+            BarId::Learn,
+            vec![Span::styled(
+                match learning {
+                    true => format!(" \u{25CF} {} ", i18n::t("LEARN")),
+                    false => format!(" \u{25CB} {} ", i18n::t("LEARN")),
+                },
+                match learning {
+                    // Armed is a state the player has to see from across a
+                    // room: the next CC that arrives is going somewhere.
+                    true => bold(Color::Black, WARN),
+                    false => off,
+                },
+            )],
+        ),
         (
             BarId::Met,
             vec![Span::styled(
@@ -15387,6 +15976,7 @@ fn draw_menu_bar(f: &mut Frame, app: &App, area: Rect) {
     let available = area.width.saturating_sub(x - area.x);
     for id in [
         BarId::Panic,
+        BarId::Learn,
         BarId::Clk,
         BarId::Loop,
         BarId::Rec,
@@ -15411,6 +16001,7 @@ fn draw_menu_bar(f: &mut Frame, app: &App, area: Rect) {
     layout.loop_rect = None;
     layout.clock_rect = None;
     layout.panic_rect = None;
+    layout.learn_rect = None;
     if total > 0 && total + 2 <= available {
         let mut bx = area.x + area.width - total - 1;
         for (id, spans) in items {
@@ -15429,6 +16020,7 @@ fn draw_menu_bar(f: &mut Frame, app: &App, area: Rect) {
                 BarId::Loop => layout.loop_rect = Some(r),
                 BarId::Clk => layout.clock_rect = Some(r),
                 BarId::Panic => layout.panic_rect = Some(r),
+                BarId::Learn => layout.learn_rect = Some(r),
                 BarId::Dsp => {}
             }
             bx += w;
@@ -15695,6 +16287,47 @@ fn draw_modal_shadow(f: &mut Frame, modal: Rect, screen: Rect) {
 
 #[cfg(test)]
 mod tests {
+
+    /// The knobs the rack draws are the knobs the processor has.
+    ///
+    /// Two lists describe every built-in — [`crate::source::fx_param_descs`]
+    /// for the panel and the project file, `params()` for the host and for the
+    /// exported plugin — and nothing but this test keeps them the same list. A
+    /// name in the wrong place is a knob that moves something else.
+    #[test]
+    fn every_built_in_names_its_knobs_the_same_way_twice() {
+        use crate::source::{fx_param_descs, ALL_FX_KINDS};
+        use choz_engine::fx_chain::build_processor;
+
+        let mut wrong = Vec::new();
+        for kind in ALL_FX_KINDS {
+            let descs = fx_param_descs(*kind);
+            let values: Vec<f32> = descs.iter().map(|d| d.default).collect();
+            let Some(proc) = build_processor(kind.id(), &values, 48_000) else {
+                panic!("{} is in the list and cannot be built", kind.id());
+            };
+            let published = proc.params();
+            // A processor that publishes nothing is one the rack drives by
+            // rebuilding it; there is no second list to drift from.
+            if published.is_empty() {
+                continue;
+            }
+            let ours: Vec<String> = descs.iter().map(|d| d.name.to_string()).collect();
+            let theirs: Vec<String> = published.iter().map(|p| p.name.to_string()).collect();
+            // The rack abbreviates where a cell is narrow — `Thresh` for
+            // `Threshold` — so one name being the start of the other is the
+            // same knob. Anything else is a knob in the wrong place.
+            let same = ours.len() == theirs.len()
+                && ours
+                    .iter()
+                    .zip(&theirs)
+                    .all(|(a, b)| a.starts_with(b.as_str()) || b.starts_with(a.as_str()));
+            if !same {
+                wrong.push(format!("{}: rack {ours:?} vs processor {theirs:?}", kind.id()));
+            }
+        }
+        assert!(wrong.is_empty(), "the two lists have drifted:\n  {}", wrong.join("\n  "));
+    }
 
     /// **No built-in may be a gain stage.** Every effect, on the knob positions
     /// the rack gives a freshly added one, against a bus-level signal.
@@ -16653,7 +17286,7 @@ mod tests {
         assert_eq!(app.fx_chain[1].params[0], 1.0);
 
         // Select FX 1 and the same fader now drives it instead.
-        app.fire_trigger(TriggerAction::FxSelect(0));
+        app.fire_trigger_on(app.active_slot, TriggerAction::FxSelect(0));
         let held = app.fx_chain[1].params[0];
         app.feed_cc(7, 64);
         assert!((app.fx_chain[0].params[0] - 64.0 / 127.0).abs() < 1e-6);
@@ -17013,6 +17646,132 @@ mod tests {
         let before = values.clone();
         read_back(&params, &mut values, &|i| (i == 0).then_some(32.0), None);
         assert_eq!(values, before);
+    }
+
+    /// A SOUNDS button that is already the one playing opens its picker when it
+    /// is pressed again — and opens it **on the patch it holds**, so replacing
+    /// a sound starts from the sound being replaced.
+    ///
+    /// Recalling what is already on the tab did nothing, so that press was the
+    /// one gesture on the panel with no meaning. Every other button still
+    /// recalls on a single press: that one has to survive a stage.
+    #[test]
+    fn pressing_the_sound_that_is_playing_offers_to_replace_it() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.push_slot(AudioSource::Plugin {
+            id: "zyn".into(),
+            format: "LV2".into(),
+            name: "ZynAddSubFX".into(),
+        });
+        app.source = app.slots[0].source.clone();
+        let entry = |name: &str| choz_engine::PresetEntry {
+            name: name.to_string(),
+            category: "Bass".to_string(),
+            key: name.to_string(),
+        };
+        app.slots[0].plugin_presets = vec![entry("Sub"), entry("Twang"), entry("Reed")];
+        while app.slots[0].sounds.len() < 2 {
+            app.add_sound_slot(0);
+        }
+        // Button 1 holds the second patch, button 2 holds the first.
+        app.slots[0].preset_cursor = 1;
+        app.save_sound(0, 0);
+        app.slots[0].preset_cursor = 0;
+        app.save_sound(0, 1);
+        app.slots[0].sound_at = None;
+
+        let mut term = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let rect_of = |app: &App, i: usize| {
+            app.layout
+                .borrow()
+                .rack
+                .buttons
+                .iter()
+                .find(|(b, _)| *b == views::fx_chain_panel::RackButton::Sound(i))
+                .map(|(_, r)| *r)
+                .expect("the rack draws a rect per sound button")
+        };
+
+        // First press: it plays, and no dialogue opens over the set.
+        let one = rect_of(&app, 0);
+        click(&mut app, one.x + 1, one.y);
+        assert_eq!(app.slots[0].sound_at, Some(0), "it recalled");
+        assert!(app.modal.is_none(), "and nothing opened");
+
+        // A different button still recalls on one press.
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let two = rect_of(&app, 1);
+        click(&mut app, two.x + 1, two.y);
+        assert_eq!(app.slots[0].sound_at, Some(1));
+        assert!(app.modal.is_none(), "the other button plays, it does not ask");
+
+        // Pressing the one that is playing opens the picker, on what it holds.
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let two = rect_of(&app, 1);
+        click(&mut app, two.x + 1, two.y);
+        let m = app.modal.as_ref().expect("the picker opened");
+        assert_eq!(m.kind, ModalKind::SoundAssign(1));
+        assert_eq!(
+            m.list.cursor, 1,
+            "row 0 is the live patch, so the held one is row 1: {:?}",
+            m.list.items
+        );
+        assert!(
+            m.list.note.contains("Sub") || m.list.note.contains(&m.list.items[1]),
+            "the note says what the button holds: {:?}",
+            m.list.note
+        );
+    }
+
+    /// The picker opened on a button whose patch the tab is **not** playing
+    /// still loads what is chosen.
+    ///
+    /// It opens on the row the button holds, which is where the audition would
+    /// normally have put the tab — but the right button opens it from anywhere,
+    /// and taking "the cursor is on it" for "the tab is on it" would skip the
+    /// load and save whatever happened to be playing back onto the button.
+    #[test]
+    fn a_picker_opened_cold_does_not_claim_the_tab_is_on_that_patch() {
+        let _g = ui_guard();
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.push_slot(AudioSource::Plugin {
+            id: "zyn".into(),
+            format: "LV2".into(),
+            name: "ZynAddSubFX".into(),
+        });
+        app.source = app.slots[0].source.clone();
+        let entry = |name: &str| choz_engine::PresetEntry {
+            name: name.to_string(),
+            category: "Bass".to_string(),
+            key: name.to_string(),
+        };
+        app.slots[0].plugin_presets = vec![entry("Sub"), entry("Twang")];
+        app.slots[0].preset_cursor = 1;
+        app.save_sound(0, 0);
+
+        // Recalled: the tab really is on it, so the row it opens on is playing.
+        app.slots[0].sound_at = Some(0);
+        app.open_sound_assign_modal(0);
+        let cursor = app.modal.as_ref().unwrap().list.cursor;
+        assert_eq!(cursor, 2, "row 0 is the live patch, so patch 1 is row 2");
+        assert!(app.already_auditioned(cursor), "the tab is on that patch");
+        app.close_modal();
+
+        // Opened cold — the tab has moved on to another sound since.
+        app.slots[0].sound_at = Some(1);
+        app.open_sound_assign_modal(0);
+        let cursor = app.modal.as_ref().unwrap().list.cursor;
+        assert_eq!(cursor, 2, "it still opens on what the button holds");
+        assert!(
+            !app.already_auditioned(cursor),
+            "…but choosing it has to load it"
+        );
     }
 
     /// The two dialogues that list a tab's patches are **one picker**: the BANK
@@ -18604,7 +19363,6 @@ mod tests {
                         RackButton::Channel
                             | RackButton::Source
                             | RackButton::Preset
-                            | RackButton::Learn
                             | RackButton::PitchToMidi
                             | RackButton::Gui
                             | RackButton::Sandbox
@@ -18814,7 +19572,7 @@ mod tests {
         );
 
         // Firing the toggle really flips the FX.
-        app.fire_trigger(TriggerAction::FxToggle);
+        app.fire_trigger_on(app.active_slot, TriggerAction::FxToggle);
         assert!(!app.fx_chain[0].enabled);
     }
 
@@ -19758,7 +20516,7 @@ mod tests {
         app.active_slot = 1;
 
         // …and an unbound program change selects a tab, like a live rig.
-        app.apply_program_button(2);
+        app.apply_program_button(midi, 2);
         assert_eq!(app.active_slot, 2);
 
         // MULTI: the channel decides, and the active tab is irrelevant.
@@ -19789,7 +20547,7 @@ mod tests {
         );
 
         // And a program change no longer steals a tab: they all sound anyway.
-        app.apply_program_button(0);
+        app.apply_program_button(midi, 0);
         assert_eq!(app.active_slot, 1);
     }
 
@@ -23416,9 +24174,11 @@ mod tests {
 
         // On an input tab the picks build its pair up instead of opening more
         // tabs: one jack is mono, a second makes it stereo, and Enter again
-        // takes it off.
+        // takes it off. A jack the tab was not listening to is asked about
+        // first — see `taking_an_input_off_a_tab_asks_first`.
         let ch3 = row_of(&app, 2);
         app.in_select(ch3);
+        answer_input_question(&mut app);
         assert_eq!(app.slots[1].in_pair, Some((1, 2)));
         assert_eq!(
             app.slots.len(),
@@ -24178,6 +24938,18 @@ mod tests {
             column: x,
             row: y,
             modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    /// Say REPLACE IT to the question an input pick raises, for the tests that
+    /// are about the routing rather than about the dialogue.
+    fn answer_input_question(app: &mut App) {
+        if let Some(m) = app.modal.as_mut() {
+            if matches!(m.kind, ModalKind::InputConfirm(..)) {
+                m.list.cursor = 0;
+                app.modal_select();
+                app.close_modal();
+            }
         }
     }
 
@@ -25049,6 +25821,341 @@ mod tests {
         assert_eq!(app.slots[0].octave_sound[5], Some(1), "and keeps the paint");
     }
 
+    /// Choosing the row that has been sounding must not hand the plugin the
+    /// same patch again — that load costs the note under the hand.
+    #[test]
+    fn the_row_that_was_auditioned_is_not_loaded_twice() {
+        let mut app = App::new();
+        assert!(!app.already_auditioned(3), "nothing is playing yet");
+        app.preset_audition = Some(PresetAudition {
+            was: 0,
+            row: 3,
+            at: Instant::now(),
+            played: Some(3),
+        });
+        assert!(app.already_auditioned(3), "row 3 is on the instrument");
+        assert!(!app.already_auditioned(4), "row 4 is not");
+    }
+
+    /// Typing in the two plugin pickers narrows them as the letters arrive,
+    /// and Esc gives the whole list back before it closes anything.
+    #[test]
+    fn typing_in_the_fx_picker_searches_it() {
+        let mut app = App::new();
+        app.open_add_fx_modal();
+        let all = app.fx_menu_rows().len();
+        assert!(all > 20, "the whole catalogue is there to start with");
+
+        for c in "pitch".chars() {
+            handle_modal_key(&mut app, KeyCode::Char(c));
+        }
+        let rows = app.fx_menu_rows();
+        assert!(!rows.is_empty(), "PITCH SHIFT is in there");
+        assert!(
+            rows.iter()
+                .all(|(_, label)| label.to_lowercase().contains("pitch")),
+            "every row matches what was typed: {rows:?}"
+        );
+
+        // Backspacing to nothing, then Esc, is the way back out.
+        handle_modal_key(&mut app, KeyCode::Backspace);
+        assert_eq!(app.fx_menu_rows().len(), rows.len(), "'pitc' still matches");
+        handle_modal_key(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_some(), "Esc clears the search, it does not close");
+        assert_eq!(app.fx_menu_rows().len(), all, "and the list is whole again");
+        handle_modal_key(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_none(), "a second Esc closes the picker");
+    }
+
+    /// A live input is levelled like every other source — once there is
+    /// something to level it from, because a microphone cannot be probed.
+    #[test]
+    fn a_jack_on_a_tab_is_levelled_from_what_arrives() {
+        let mut app = App::new();
+        app.push_slot(AudioSource::Midi);
+        app.active_slot = 0;
+        assert!(!app.slots[0].awaiting_trim, "a tab with no jack waits for nothing");
+
+        app.set_active_capture(Some((0, 0)));
+        assert!(app.slots[0].awaiting_trim, "armed by the jack landing on it");
+
+        // Nothing arriving yet: the fader is left alone, and it stays armed.
+        choz_engine::meter::slot_levels().reset(0);
+        app.slots[0].gain = 1.0;
+        app.poll_capture_trim();
+        assert!(app.slots[0].awaiting_trim, "still nothing to measure");
+        assert_eq!(app.slots[0].gain, 1.0);
+
+        // A hot microphone arrives: the fader comes down to where the rest of
+        // the rack sits, and the tab stops asking.
+        let loud: Vec<f32> = (0..512)
+            .map(|i| (i as f32 * 0.05).sin() * 0.9)
+            .flat_map(|v| [v, v])
+            .collect();
+        choz_engine::meter::slot_levels().publish(0, &loud);
+        app.poll_capture_trim();
+        assert!(!app.slots[0].awaiting_trim, "measured once, and only once");
+        assert!(
+            app.slots[0].gain < 0.5,
+            "a loud input was not brought down: {}",
+            app.slots[0].gain
+        );
+
+        // …and it is not measured again behind the player's back.
+        let before = app.slots[0].gain;
+        app.slots[0].gain = 1.5;
+        app.poll_capture_trim();
+        assert_eq!(app.slots[0].gain, 1.5, "the level is the player's from here");
+        assert!(before < 1.5);
+    }
+
+    /// The Keystation's **buttons** recall sounds on the Keystation's tab.
+    ///
+    /// They send program change, not CC, and that path used to throw the source
+    /// away on the way in — so a button on one keyboard recalled a sound on
+    /// whatever tab the other keyboard had left in front, and the tab the
+    /// button belonged to could not be reached at all.
+    #[test]
+    fn a_controllers_buttons_recall_sounds_on_its_own_tab() {
+        use choz_engine::input::InputSource;
+        let mut app = App::new();
+        app.midi_connected = vec!["Keystation Pro 88".into(), "KeyStep 32".into()];
+        let (station, step) = (InputSource::Midi(0), InputSource::Midi(1));
+
+        app.push_slot(AudioSource::Midi);
+        app.push_slot(AudioSource::Midi);
+        app.slots[0].input = Some(InputRef::Midi("Keystation Pro 88".into()));
+        app.slots[1].input = Some(InputRef::Midi("KeyStep 32".into()));
+        // Both tabs have a sound on button 1, and neither is playing it.
+        for tab in 0..2 {
+            app.slots[tab].sounds[0] = SavedSound {
+                name: format!("tab {}", tab + 1),
+                state: b"a patch".to_vec(),
+                values: Vec::new(),
+                preset: 0,
+            };
+        }
+        app.pc_bindings
+            .push((7, LearnTarget::Trigger(TriggerAction::SoundRecall(0))));
+
+        // Playing the KeyStep's tab, the Keystation's button recalls on tab 1.
+        app.active_slot = 1;
+        app.apply_program_button(station, 7);
+        assert_eq!(
+            app.slots[0].sound_at,
+            Some(0),
+            "the Keystation's own tab answered its button"
+        );
+        assert_eq!(app.slots[1].sound_at, None, "and the tab in front did not");
+        assert_eq!(app.active_slot, 1, "nothing switched tabs either");
+
+        // The KeyStep's own button recalls on the tab in front, which is its.
+        app.apply_program_button(step, 7);
+        assert_eq!(app.slots[1].sound_at, Some(0));
+
+        // A third tab on the Keystation takes the buttons over while it is the
+        // one being played — the same rule the knobs follow.
+        app.push_slot(AudioSource::Midi);
+        app.slots[2].input = Some(InputRef::Midi("Keystation Pro 88".into()));
+        app.slots[2].sounds[0] = SavedSound {
+            name: "tab 3".into(),
+            state: b"a patch".to_vec(),
+            values: Vec::new(),
+            preset: 0,
+        };
+        app.active_slot = 2;
+        app.apply_program_button(station, 7);
+        assert_eq!(app.slots[2].sound_at, Some(0), "the tab in front owns it");
+    }
+
+    /// Two keyboards, two tabs: the one that is not on screen keeps answering
+    /// its own controller's knobs — and a third tab on the *same* keyboard
+    /// takes them over while it is the one being played.
+    #[test]
+    fn a_background_tab_still_answers_its_own_keyboard() {
+        use choz_engine::input::InputSource;
+        let mut app = App::new();
+        app.midi_connected = vec!["Keystation Pro 88".into(), "KeyStep 32".into()];
+        let (station, step) = (InputSource::Midi(0), InputSource::Midi(1));
+
+        // Tab 1: the Keystation, with a delay on it. Tab 2: the KeyStep.
+        app.push_slot(AudioSource::Midi);
+        app.push_slot(AudioSource::Midi);
+        app.slots[0].input = Some(InputRef::Midi("Keystation Pro 88".into()));
+        app.slots[1].input = Some(InputRef::Midi("KeyStep 32".into()));
+        // Tab 1's own chain, stored: the working copy belongs to whichever tab
+        // is in front, which is the whole point of this test.
+        app.slots[0]
+            .fx_chain
+            .push(AudioFxEntry::new(source::AudioFxKind::Delay));
+
+        // A knob on the Keystation drives the delay's first parameter.
+        app.cc_bindings.push(CcBinding {
+            source: Some(InputRef::Midi("Keystation Pro 88".into())),
+            cc: 21,
+            target: LearnTarget::FxParam {
+                slot: 0,
+                fx: 0,
+                param: 0,
+            },
+        });
+
+        // Playing the KeyStep's tab, the Keystation's knob still moves the
+        // delay on its own tab.
+        app.active_slot = 1;
+        app.apply_cc(station, 0, 21, 127);
+        assert_eq!(
+            app.slots[0].fx_chain[0].params[0], 1.0,
+            "the background tab's effect followed its own keyboard"
+        );
+
+        // The KeyStep's own CC 21 is not bound to anything, and moves nothing.
+        app.apply_cc(step, 0, 21, 0);
+        assert_eq!(app.slots[0].fx_chain[0].params[0], 1.0);
+
+        // A third tab on the Keystation: while it is the one being played, the
+        // keyboard belongs to it, and the older tab's binding stands still.
+        app.push_slot(AudioSource::Midi);
+        app.slots[2].input = Some(InputRef::Midi("Keystation Pro 88".into()));
+        app.active_slot = 2;
+        app.apply_cc(station, 0, 21, 0);
+        assert_eq!(
+            app.slots[0].fx_chain[0].params[0], 1.0,
+            "the port has one owner at a time, and it is the tab in front"
+        );
+    }
+
+    /// LEARN belongs to the rack, not to the tab in front: it is drawn in the
+    /// top-right cluster, it arms the pointer, and a rack tab is one of the
+    /// things the pointer can bind.
+    #[test]
+    fn learn_sits_in_the_top_bar_and_can_bind_a_tab() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.push_slot(AudioSource::Midi);
+        app.push_slot(AudioSource::Midi);
+
+        let mut term = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let learn = app
+            .layout
+            .borrow()
+            .learn_rect
+            .expect("LEARN is on the menu bar");
+        assert_eq!(learn.y, 0, "the top bar, not the rack");
+
+        // Clicking it arms the pointer; clicking it again disarms.
+        click(&mut app, learn.x + 1, learn.y);
+        assert!(app.learn_pick, "armed");
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        click(&mut app, learn.x + 1, learn.y);
+        assert!(!app.learn_pick && app.learn.is_none(), "disarmed");
+
+        // Armed, pointing at the second tab binds *that tab*, not a control of
+        // the tab in front.
+        let tab = app
+            .layout
+            .borrow()
+            .rack
+            .tabs
+            .iter()
+            .find(|(i, _)| *i == 1)
+            .map(|(_, r)| *r)
+            .expect("the rack draws a rect per tab");
+        assert_eq!(
+            app.learn_target_at((tab.x, tab.y).into()),
+            Some(LearnTarget::Trigger(TriggerAction::TabSelect(1))),
+        );
+    }
+
+    /// A tab that already has a jack on it does not lose it to a mis-click:
+    /// the pick waits behind a question, and only the answer moves it.
+    #[test]
+    fn taking_an_input_off_a_tab_asks_first() {
+        let mut app = App::new();
+        app.push_slot(AudioSource::Midi);
+        app.active_slot = 0;
+        app.in_ports = vec!["mic L".into(), "mic R".into(), "line".into()];
+        // A tab listening to a stereo pair: the next jack has to displace one.
+        app.slots[0].in_pair = Some((0, 1));
+
+        let row = app
+            .in_targets()
+            .iter()
+            .position(|(t, _)| *t == InTarget::Channel(2))
+            .expect("the third jack has a row");
+        app.in_select(row);
+        assert_eq!(
+            app.slots[0].in_pair,
+            Some((0, 1)),
+            "nothing moved while the question is open"
+        );
+        assert!(
+            matches!(
+                app.modal.as_ref().map(|m| m.kind),
+                Some(ModalKind::InputConfirm(..))
+            ),
+            "and the question is what is on screen"
+        );
+
+        // KEEP WHAT IS THERE is where the cursor opens, and it changes nothing.
+        assert_eq!(app.modal.as_ref().unwrap().list.cursor, 1);
+        app.modal_select();
+        app.close_modal();
+        assert_eq!(app.slots[0].in_pair, Some((0, 1)), "kept");
+
+        // Asked again and answered REPLACE IT, the jack lands.
+        app.in_select(row);
+        if let Some(m) = app.modal.as_mut() {
+            m.list.cursor = 0;
+        }
+        app.modal_select();
+        app.close_modal();
+        assert!(
+            app.slots[0]
+                .in_pair
+                .is_some_and(|p| channels_of(p).contains(&2)),
+            "the answer is what moves it, got {:?}",
+            app.slots[0].in_pair
+        );
+    }
+
+    /// A recalled patch moves every parameter itself. What choz carries for a
+    /// hosted plugin is the defaults it read at load time, so pushing the whole
+    /// list back on top would undo the patch — which is what silenced a Surge XT
+    /// tab whose SOUNDS button held `Butter`.
+    #[test]
+    fn a_patch_is_not_flattened_by_the_knobs_that_never_moved() {
+        let param = |default: f64| choz_engine::PluginParam {
+            id: 0,
+            name: String::new(),
+            min: 0.0,
+            max: 1.0,
+            default,
+            steps: 0,
+            unit: None,
+            points: Vec::new(),
+            group: None,
+        };
+        let params = vec![param(0.5), param(0.5), param(0.0)];
+        let values = vec![0.5, 0.9, 0.0];
+
+        // With a patch under them, only the knob that was actually moved.
+        assert_eq!(
+            knobs_over_patch(&params, &values, true),
+            vec![(1, 0.9)],
+            "the rest is what the patch already set"
+        );
+        // Without one, the tab's own values are all there is.
+        assert_eq!(
+            knobs_over_patch(&params, &values, false),
+            vec![(0, 0.5), (1, 0.9), (2, 0.0)]
+        );
+    }
+
     /// The sound buttons: save what the tab is playing, get it back with one
     /// press, and split the keyboard so an octave brings its own.
     #[test]
@@ -25108,7 +26215,7 @@ mod tests {
             "the picker offers the sound buttons"
         );
         app.modal = None;
-        app.fire_trigger(TriggerAction::SoundRecall(1));
+        app.fire_trigger_on(app.active_slot, TriggerAction::SoundRecall(1));
         assert_eq!(app.slots[0].sound_at, Some(1), "the trigger recalls it");
 
         // The split: octave 5 plays sound 1, and a note there brings it back.

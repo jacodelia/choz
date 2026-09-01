@@ -230,11 +230,15 @@ impl Sf2Synth {
     pub fn load(path: &Path, bank: u8, preset: u8, sample_rate: u32) -> Result<Self> {
         use oxisynth::{MidiEvent, SoundFont, Synth, SynthDescriptor};
 
-        // 0.2 is oxisynth's (and FluidSynth's) default for a reason: a voice
-        // peaks around -6 dBFS on its own, so anything above ~0.3 clips as soon
-        // as a chord is held — measured at 1.0 a four-note chord already hit
-        // 1.15 and a two-handed one 2.7. Loudness belongs to the slot's VOL,
-        // which has a fader; clipping inside the synth has no way back.
+        // **Measured, not guessed.** `examples/level_probe` renders C4 at
+        // velocity 100 and a four-note chord through each source and reports
+        // dBFS. At oxisynth's own default of 0.2 a SoundFont sat ~14 dB under
+        // every hosted plugin — FluidR3 at -26.7 dBFS peak against Surge XT's
+        // -13.5 and synthv1's -5.2 — which is the rack sounding broken when a
+        // tab is switched. 0.5 puts it ~6 dB under Surge and still leaves a
+        // two-handed sustained chord under full scale (see the level test).
+        // The rest belongs to the slot's VOL and the `Volume` knob, which both
+        // have a way back; clipping does not.
         // **Polyphony is a CPU budget, not a musical limit.** oxisynth's
         // default is 256 voices, and a SoundFont preset commonly layers two or
         // three per key — so a hand on the keyboard with the sustain pedal down
@@ -249,7 +253,7 @@ impl Sf2Synth {
         const POLYPHONY: u16 = 64;
         let desc = SynthDescriptor {
             sample_rate: sample_rate as f32,
-            gain: 0.2,
+            gain: 0.5,
             polyphony: POLYPHONY,
             ..Default::default()
         };
@@ -627,6 +631,36 @@ mod tests {
                 "a zone and the tab's own sound differ by {db:+.1} dB (CC sent: {after_cc})"
             );
         }
+    }
+
+    /// **A SoundFont is in the same league as a hosted plugin.**
+    ///
+    /// Reported as "the SF2 tabs are much quieter than the plugin ones".
+    /// `examples/level_probe` measured the gap at ~14 dB with oxisynth's own
+    /// default gain of 0.2: FluidR3 peaked at -26.7 dBFS against Surge XT's
+    /// -13.5 and synthv1's -5.2, on the same note at the same velocity. The
+    /// band is wide on purpose — a preset's own level varies by several dB —
+    /// but it fails on the side that started this, a SoundFont too quiet to
+    /// sit beside a plugin. The ceiling is [`a_held_chord_leaves_headroom`].
+    #[test]
+    fn a_soundfont_is_as_loud_as_a_hosted_plugin() {
+        let path = std::path::Path::new("/usr/share/sounds/sf2/FluidR3_GM.sf2");
+        if !path.exists() {
+            return; // ponytail: no bundled SF2 to test against, skip rather than fail.
+        }
+        let mut s = Sf2Synth::load(path, 0, 0, 48_000).expect("load SF2");
+        for n in [60, 64, 67, 72] {
+            s.note_on(n, 100);
+        }
+        let mut loudest = 0.0f32;
+        for _ in 0..90 {
+            loudest = loudest.max(peak(&mut s, 1024));
+        }
+        let db = 20.0 * loudest.max(1e-9).log10();
+        assert!(
+            (-16.0..-4.0).contains(&db),
+            "a four-note chord peaks at {db:.1} dBFS, out of the band a plugin sits in"
+        );
     }
 
     /// **A split has to layer, not choose.**

@@ -5,14 +5,14 @@ día por día, con los porqués y lo último arriba; cómo encajan las piezas, e
 [architecture.md](architecture.md); las dos auditorías, en
 [fx-audit.md](fx-audit.md). Este documento se poda cada vez que un punto se
 cierra, para que lo que quede sea sólo lo que queda: se podó entero el
-2026-08-19, el 2026-08-29 y el 2026-08-31, y las tres veces lo que decía "hecho"
-se fue al changelog.
+2026-08-19, el 2026-08-29, el 2026-08-31 y el 2026-09-01, y las cuatro veces lo
+que decía "hecho" se fue al changelog.
 
-**Hoy no falta nada pedido.** Lo que queda son dos cosas sin cerrar —una
-decisión de diseño y un fallo intermitente sin explicar—, dos decisiones de no
-hacer, y las notas para el que retome.
+**Hoy no falta nada pedido.** Lo que queda son tres cosas sin cerrar —un test
+que no existe, una decisión de diseño y un fallo intermitente sin explicar—, dos
+decisiones de no hacer, y las notas para el que retome.
 
-Última actualización: 2026-08-31 (1.3.5 publicada).
+Última actualización: 2026-09-01 (1.3.6 publicada).
 
 ## Estado en una línea
 
@@ -23,9 +23,10 @@ jack del grafo) y por ALSA/PulseAudio/PipeWire (un dispositivo de captura
 elegible en Settings), así que también es un multiefecto; hay tres capas contra
 el código ajeno que revienta —escaneo fuera de proceso, cuarentena y sandbox—;
 hay transporte propio con compás, automatización contra ese reloj, `A→M` (audio
-a notas), AutoTune, un arpegiador y un secuenciador por tab; 46 efectos propios
-(**la suite está completa y auditada**: se apilan sin pasarse de escala, su
-dry/wet es una sola ley, y los 46 publican su lista entera de mandos), que
+a notas), AutoTune, un arpegiador y un secuenciador por tab —y **dos tabs con
+secuenciador arrancan en el mismo groove**, con o sin transporte—; 56 efectos
+propios (**la suite está completa y auditada**: se apilan sin pasarse de escala,
+su dry/wet es una sola ley, y los 56 publican su lista entera de mandos), que
 además se publican como un `.clap` —los dos artifacts incluidos— para usarlos en
 cualquier otro host; un looper multipista con sus tiras de canal, exportación a
 WAV y **tomas que el proyecto guarda** —resampleadas si el equipo cambió de
@@ -33,7 +34,10 @@ frecuencia—; un patch de Max se importa hasta donde se puede, diciendo qué no
 main **estéreo** y cuatro subgrupos; una tab guarda sus sonidos en botones —que
 se asignan desde el mismo modal de bank/preset— y puede partir el teclado entre
 ellos; y un efecto puede abrirse con el bombo de otra tab —por su nivel o por
-las notas que se le tocan—, con el clock, o con el tap del metrónomo. El MIXER
+las notas que se le tocan—, con el clock, o con el tap del metrónomo. **Dos
+teclados tocan a la vez**: los mandos y los botones de cada uno siguen moviendo
+lo suyo cuando la otra tab está adelante, y una tercera tab en el mismo puerto
+se los queda mientras es la que se toca. El MIXER
 se maneja entero desde el teclado, grupos y main incluidos, y cada strip lleva
 su `O M S` bajo el fader. Los mandos de un plugin se agrupan por lo que el
 plugin dice —las unidades de VST3, el módulo de CLAP— y los que tienen
@@ -44,8 +48,8 @@ otro host. Un plugin que guarda sus controles fuera de sus puertos
 —ZynAddSubFX— se maneja por su propio servidor OSC: mandos con nombre, los
 armónicos del oscilador, su ventana real, y los mandos leyendo lo que el plugin
 tiene. **La 1.0.0 está publicada y sus paquetes verificados; la
-1.3.5 es este árbol.**
-820 tests, `clippy --workspace --all-targets -D warnings` limpio.
+1.3.6 es este árbol.**
+850 tests, `clippy --workspace --all-targets -D warnings` limpio.
 
 Las comprobaciones con hardware delante quedaron dichas en los gotchas, que es
 donde se van a leer.
@@ -66,6 +70,26 @@ Las dos auditorías —la de DSP y la de guardado— viven enteras en
 sección 6 tiene lo único que se midió y se decidió **no** arreglar (el peine del
 shifter de voces), y la 7 lo que hay que saber antes de tocar el guardado de un
 efecto. No se repiten acá.
+
+### 0 · Nada comprueba que un `process_block` no alloca (abierto el 2026-09-01)
+
+**Falta un test, no una decisión.**
+
+La regla está escrita en [fx-audit.md](fx-audit.md) —"sin allocations en
+`process_block`"— y se rompió sin que nadie se enterara: tres de los diez
+efectos nuevos copiaban el bloque con `buf.to_vec()` para filtrarlo, y la suite
+entera pasaba en verde. Lo cazó la lectura del diff antes de publicar, que es
+exactamente el mecanismo que no escala.
+
+Lo que haría falta es un allocador de test que cuente asignaciones y un test que
+corra cada built-in un bloque con el contador armado. `std::alloc::System`
+envuelto en un `GlobalAlloc` propio detrás de un `#[cfg(test)]` es la forma
+barata; el detalle feo es que el contador es global al proceso y el harness
+corre en paralelo, así que hay que tomarlo con el mismo candado que el resto de
+los globales (`crate::test_locks`).
+
+Hasta entonces: **el patrón está en la sección 8 de fx-audit**, y copiarlo es lo
+que hay.
 
 ### 1 · El CC 7 que llega al SoundFont (abierto desde el 2026-08-31)
 
@@ -369,7 +393,7 @@ contra una habitación.
   propósito y se alarga con un patch real delante; un `.pd` necesita `adc~`
   **y** `dac~`; el dispositivo de audio no cambia solo **nunca**; JSFX no
   existe en choz.
-- **Lo que se instala con choz**: sus 46 efectos **y los dos artifacts** —el
+- **Lo que se instala con choz**: sus 56 efectos **y los dos artifacts** —el
   arpegiador y el secuenciador— como un solo `.clap` de 48 plugins (`~/.clap`
   desde el instalador, `/usr/lib/clap` desde los paquetes), los wallpapers en
   `share/choz/wallpapers` —una instalación nueva abre con el que trae— y

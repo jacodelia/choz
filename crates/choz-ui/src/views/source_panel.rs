@@ -162,15 +162,18 @@ pub fn draw_input_panel(
         } else {
             "\u{00B7}"
         };
+        // **Every input reads the same.** They used to be dimmed when choz was
+        // not listening to them, which put two colours on one list of things
+        // that are all equally available — and the greyed ones read as broken
+        // or missing rather than as off. The tick against the dot says which
+        // is which, and it says it in one place instead of two.
         let style = if focused && i == input_cursor {
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
-        } else if row.connected {
-            Style::default().fg(ui_text())
         } else {
-            Style::default().fg(Color::Rgb(110, 115, 125))
+            Style::default().fg(ui_text())
         };
         let bound = match row.bound_tab {
             Some(t) => format!(" \u{2192} tab {}", t + 1),

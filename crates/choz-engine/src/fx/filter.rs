@@ -20,6 +20,11 @@ pub enum SvfMode {
     Highpass,
     Bandpass,
     Notch,
+    /// Everything through, phase turned. Nobody asks for one as an effect; a
+    /// Linkwitz-Riley crossover needs one on the band that skips a split, or
+    /// the bands come back together out of phase — see
+    /// [`super::multiband::MultibandCompressor`].
+    Allpass,
 }
 
 /// Stereo State Variable Filter.
@@ -106,6 +111,7 @@ impl Svf {
             SvfMode::Highpass => x - self.k * v1 - v2,
             SvfMode::Bandpass => v1,
             SvfMode::Notch => x - self.k * v1,
+            SvfMode::Allpass => x - 2.0 * self.k * v1,
         }
     }
 }
