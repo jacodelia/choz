@@ -133,7 +133,7 @@ impl FxProcessor for DeEsser {
         low.copy_from_slice(buf);
         self.band.process_block(low, sample_rate);
         let thr = 10f32.powf(self.threshold_db / 20.0);
-        for (i, frame) in buf.chunks_exact_mut(2).enumerate() {
+        for (i, frame) in buf.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             for (ch, s) in frame.iter_mut().enumerate() {
                 let hi = *s - self.low[i * 2 + ch];
                 let level = hi.abs();

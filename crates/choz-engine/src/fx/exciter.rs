@@ -137,7 +137,7 @@ impl FxProcessor for Exciter {
         }
         self.band[..n].copy_from_slice(buf);
         self.split.process(&mut self.band[..n], sample_rate);
-        for (i, frame) in buf.chunks_exact_mut(2).enumerate() {
+        for (i, frame) in buf.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             for (ch, s) in frame.iter_mut().enumerate() {
                 let dry = *s;
                 let high = self.band[i * 2 + ch];
@@ -247,7 +247,7 @@ impl FxProcessor for BassEnhancer {
             *s = harmonics(*s, drive, even) * amount * 0.5;
         }
         self.guard.process(work, sample_rate);
-        for (i, frame) in buf.chunks_exact_mut(2).enumerate() {
+        for (i, frame) in buf.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             for (ch, s) in frame.iter_mut().enumerate() {
                 let dry = *s;
                 *s = dry + self.wet * self.added[i * 2 + ch];
@@ -280,7 +280,7 @@ mod tests {
 
     /// Energy at `hz`, by correlating against a sine and a cosine of it.
     fn energy_at(buf: &[f32], hz: f32, sr: u32) -> f32 {
-        let mono: Vec<f32> = buf.chunks_exact(2).map(|f| f[0]).collect();
+        let mono: Vec<f32> = buf.as_chunks::<2>().0.iter().map(|f| f[0]).collect();
         let half = mono.len() / 2;
         let tail = &mono[half..];
         let (mut re, mut im) = (0.0f32, 0.0f32);

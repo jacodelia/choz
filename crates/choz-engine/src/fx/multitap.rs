@@ -146,7 +146,7 @@ impl FxProcessor for MultiTapDelay {
         let sr = sample_rate.max(8000) as f32;
         self.sample_rate = sr;
         let cap = self.line[0].capacity() as f32 - 4.0;
-        for frame in buf.chunks_exact_mut(2) {
+        for frame in buf.as_chunks_mut::<2>().0 {
             let dry = [frame[0], frame[1]];
             let mut wet = [0.0f32; 2];
             // The last tap is the one that feeds back, so the whole figure
@@ -208,7 +208,7 @@ mod tests {
         buf[1] = 1.0;
         fx.process_block(&mut buf, sr);
 
-        let mono: Vec<f32> = buf.chunks_exact(2).map(|f| f[0]).collect();
+        let mono: Vec<f32> = buf.as_chunks::<2>().0.iter().map(|f| f[0]).collect();
         for (n, ms) in [25.0, 50.0, 75.0, 100.0].iter().enumerate() {
             let at = (ms * 0.001 * sr as f32) as usize;
             let window = &mono[at - 4..at + 4];

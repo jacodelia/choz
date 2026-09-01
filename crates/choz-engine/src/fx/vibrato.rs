@@ -87,7 +87,7 @@ impl choz_ports::FxProcessor for Vibrato {
         let sr = self.sample_rate;
         let centre = CENTRE_MS * 0.001 * sr;
         let swing = self.depth * MAX_DEPTH_MS * 0.001 * sr;
-        for frame in buf.chunks_exact_mut(2) {
+        for frame in buf.as_chunks_mut::<2>().0 {
             let lfo = self.lfo.tick(self.wave, self.rate_hz, sr, self.spread);
             for (ch, s) in frame.iter_mut().enumerate() {
                 let dry = *s;
@@ -135,7 +135,12 @@ mod tests {
                 })
                 .collect();
             fx.process_block(&mut buf, sr);
-            let tail: Vec<f32> = buf[buf.len() / 2..].chunks_exact(2).map(|f| f[0]).collect();
+            let tail: Vec<f32> = buf[buf.len() / 2..]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|f| f[0])
+                .collect();
             let mut gaps = Vec::new();
             let mut last = None;
             for (i, w) in tail.windows(2).enumerate() {

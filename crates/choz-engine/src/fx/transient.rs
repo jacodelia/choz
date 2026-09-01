@@ -105,7 +105,7 @@ impl FxProcessor for TransientShaper {
         if (sr - self.sample_rate).abs() > f32::EPSILON {
             self.refresh(sr);
         }
-        for frame in buf.chunks_exact_mut(2) {
+        for frame in buf.as_chunks_mut::<2>().0 {
             for (ch, s) in frame.iter_mut().enumerate() {
                 let dry = *s;
                 let level = dry.abs();

@@ -257,7 +257,7 @@ impl FxProcessor for MultibandCompressor {
         mid_buf[..n].copy_from_slice(&hi_buf[..n]);
         self.hi_lp.process(&mut mid_buf[..n], sample_rate);
         self.hi_hp.process(&mut hi_buf[..n], sample_rate);
-        for (i, frame) in buf.chunks_exact_mut(2).enumerate() {
+        for (i, frame) in buf.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             for (ch, s) in frame.iter_mut().enumerate() {
                 let dry = *s;
                 let lo = self.split[0][i * 2 + ch];

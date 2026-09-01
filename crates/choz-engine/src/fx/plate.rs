@@ -235,7 +235,7 @@ impl FxProcessor for PlateReverb {
         // a plate ringing on one note, and it costs an interpolated read per
         // sample per all-pass. The damping does the same job for a fraction of
         // it — this is a plate, not a museum piece.
-        for frame in buf.chunks_exact_mut(2) {
+        for frame in buf.as_chunks_mut::<2>().0 {
             let dry = [frame[0], frame[1]];
             let mono = (dry[0] + dry[1]) * 0.5;
             self.pre.write(mono);
@@ -330,7 +330,9 @@ mod tests {
         );
 
         let diff: f32 = buf[..sr as usize]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|f| (f[0] - f[1]).abs())
             .sum();
         assert!(diff > 1.0, "both channels came out the same: {diff}");
