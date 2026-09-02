@@ -26,11 +26,7 @@ lleva lo que falta —nada de lo ya hecho— y
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
 
-## [1.3.7] — 2026-09-02
-
-**Segunda tanda sobre la misma etiqueta.** La 1.3.7 se publicó el 2026-09-01;
-todo lo que sigue se le sumó al día siguiente y la etiqueta se movió al commit
-que lo trae. Lo del día de la publicación está más abajo, bajo su propia fecha.
+## [1.3.8] — 2026-09-02
 
 ### El gate mueve un mando, no sólo el dry/wet
 
@@ -305,7 +301,7 @@ intacto: sólo se recorta `dígitos:dígitos`.
   —compartido, no copiado— con su reflejo y la onda, en una caja de 78 × 26
   centrada.
 
-## [1.3.7] — 2026-09-01 (la publicación original)
+## [1.3.7] — 2026-09-01
 
 Cuatro defectos del mismo rig —una Keystation Pro 88 y una KeyStep 32, una tab
 cada una— y el hilo de todos: **una identidad que no identificaba**. Un botón

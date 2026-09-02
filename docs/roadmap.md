@@ -12,7 +12,7 @@ que decía "hecho" se fue al changelog.
 que no existe, una decisión de diseño y un fallo intermitente sin explicar—, dos
 decisiones de no hacer, y las notas para el que retome.
 
-Última actualización: 2026-09-02 (1.3.7 republicada sobre la misma etiqueta).
+Última actualización: 2026-09-02 (1.3.8 publicada).
 
 ## Estado en una línea
 
@@ -55,7 +55,7 @@ otro host. Un plugin que guarda sus controles fuera de sus puertos
 —ZynAddSubFX— se maneja por su propio servidor OSC: mandos con nombre, los
 armónicos del oscilador, su ventana real, y los mandos leyendo lo que el plugin
 tiene. **La 1.0.0 está publicada y sus paquetes verificados; la
-1.3.7 es este árbol.**
+1.3.8 es este árbol.**
 866 tests, `clippy --workspace --all-targets -D warnings` limpio.
 
 Las comprobaciones con hardware delante quedaron dichas en los gotchas, que es
