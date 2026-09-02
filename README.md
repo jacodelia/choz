@@ -292,7 +292,8 @@ headroom for plugin DSP at small buffer sizes.
 | `l` / `k` | MIXER | link the strip's two channels / pick which side the arrows move |
 | `C` | rack (FX) | which keyboard the selected effect takes its chord from |
 | `v` | rack | split the keyboard: which saved sound each octave plays |
-| `c` | rack (FX) | gate the selected effect from another tab — its level, or the notes played into it |
+| `c` | rack (FX) | gate the selected effect from another tab — its level or the notes played into it, moving the effect's dry/wet or one named knob |
+| `/` | rack (instrument) | find a knob by name, on a plugin whose list runs to hundreds |
 | `n` / `N` | rack, MIXER | level the tab / the whole rack again, from what it has played since it was loaded |
 | `c` / `r` | IN drawer | connect-disconnect a port / rescan inputs |
 
@@ -312,7 +313,7 @@ choz/                      11 crates, version 1.3.6
 │   │   ├── fx/             56 built-in DSP effects
 │   │   ├── chord.rs        The chord being held, for the harmoniser's MIDI in
 │   │   ├── feedback.rs     Catches a microphone that starts to howl
-│   │   ├── maxpat.rs       Reads a Max/MSP patch and says what can be kept
+│   │   ├── maxpat.rs       Reads a Max/MSP patch and says what can be kept (no menu entry opens it)
 │   │   ├── sources.rs      WAV, SF2 (oxisynth)
 │   │   ├── sfz.rs          SFZ parser + 32-voice sampler
 │   │   ├── paths.rs        Per-format search paths, Carla-style

@@ -12,7 +12,7 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **853 tests** con harness en todo el workspace (754 entre `choz-engine` y `choz-ui`) + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **866 tests** con harness en todo el workspace (766 entre `choz-engine` y `choz-ui`) + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio.
 - **56 efectos propios**, publicados también como un `.clap` con los dos artifacts.
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
@@ -25,6 +25,281 @@ lleva lo que falta —nada de lo ya hecho— y
   `choz-engine::test_locks` tiene un candado por global; en `choz-ui` el par es
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
+
+## [1.3.8] — 2026-09-02
+
+### El gate mueve un mando, no sólo el dry/wet
+
+Pedido como "sidechain: que el bombo de una tab module un parámetro de un efecto
+de otra". La auditoría previa dijo lo importante: **la modulación entre canales
+ya estaba**, y se llama GATE. `GateSource` lleva el nivel de otra tab —o sus
+notas, o el clock, el metrónomo, el secuenciador—, `Gated` la sigue con un
+seguidor de envolvente (ataque instantáneo, release exponencial, umbral,
+profundidad, OPEN/DUCK), el orden de render pone las tabs-fuente primero para
+que el nivel sea el del mismo bloque, y el wrapper envuelve cualquier
+procesador, built-in o plugin hosteado.
+
+Lo que faltaba era **un destino**: `Gated::process_block` sólo sabía llamar
+`set_mix`. Por eso el bombo abriendo el reverb ya funcionaba —el mix del reverb
+*es* lo que el gate movía— y el bombo abriendo el cutoff de un auto-filter no
+existía. Ahora `GateSpec` lleva `param: Option<usize>`: `None` es el mix, que es
+lo de siempre, y `Some(i)` es el mando `i` del efecto.
+
+**Los dos destinos se mueven distinto, a propósito.** En el mix, el mando que
+puso el usuario es el techo y el gate le quita: eso es "este efecto está sólo
+cuando pega el bombo". En un mando, el knob es **donde descansa** y el gate lo
+empuja desde ahí —hacia arriba en OPEN, hacia abajo en DUCK— y lo suelta de
+vuelta al soltar: que es lo que una envolvente sobre un cutoff siempre quiso
+decir. Un gate en reposo no cambia nada; a profundidad plena llega al extremo
+del recorrido del mando, no a una fracción de él.
+
+Tres detalles que hacían falta para que no se sintiera roto:
+
+- **Girar el mando que el gate maneja mueve el reposo**, no la salida —igual que
+  girar el dry/wet siempre movió el `base_wet`—. Sin eso, el bloque siguiente
+  devolvía el knob a donde estaba y el mando parecía muerto.
+- **De dónde sale ese reposo**: del propio spec, en el momento de construir la
+  cadena, que es el único lado que lo sabe antes de entregarla al hilo de audio.
+- **Con el gate sobre un mando, el dry/wet vuelve a ser del usuario** y pasa
+  derecho al procesador.
+
+El caso pedido por su nombre —el bombo de la tab 3 moviendo el `Rate` del AUTO
+FILTER de la tab 1, con su propio DEPTH como techo— tiene su test.
+
+Nada de esto necesitó arquitectura nueva: `set_param` **ya se llamaba desde el
+hilo de audio** (`apply_commands`, y CLAP lo encola RT-safe) y los mandos ya son
+0..1 normalizados, así que el mapeo no necesita saber de rangos por efecto. El
+cambio son tres archivos: el destino en `fx_chain.rs`, una fila `TARGET` en el
+modal GATE —MIX o el mando por el nombre que dibuja el panel— y un campo con
+`default` en el `Gate` de disco, así que **un proyecto viejo abre apuntando al
+mix**, que es lo que hacía.
+
+Sigue sin haber ruta de **audio** entre canales, y ningún formato de plugin
+recibe sidechain: CLAP crea los puertos extra y los deja en silencio, VST3 sólo
+activa el bus de entrada 0, y LV2/VST2/LADSPA/DSSI reciben la señal principal en
+todos sus puertos de entrada. Queda dicho en el roadmap.
+
+### El SEQ dibujaba cuatro tiempos en cualquier compás
+
+Reportado: "7/8 siempre dibuja los 4 tiempos". Así era. La grilla partía las
+celdas y numeraba los tiempos **cada cuatro**, dijera lo que dijera el compás:
+un dibujo de un 4/4 encima de un patrón que el secuenciador estaba tocando en
+siete. El bucle sí duraba lo que debía —`bar_steps()` lee el compás desde
+siempre—, era la lectura del compás lo que mentía.
+
+Un tiempo es la unidad del propio compás leída al largo del paso: una corchea
+en 7/8, que a 1/16 son dos celdas. Ahora la regla cuenta esos, y en un compás de
+un solo paso por tiempo ya no separa celda por celda —eso no es una grilla, es
+una lista.
+
+**Y la agrupación se dibuja.** Un 7/8 contado 3+2+2 —la agrupación que el
+metrónomo ya acentuaba— corta la grilla donde cortan los grupos, y el número del
+tiempo que abre grupo va en el color del acento:
+
+```
+    1·2·3· 4·5· 6·7·
+ A  ······ ···· ····
+```
+
+### El compás del SEQ: pulsos, unidad y agrupación por separado
+
+El botón `7/8` abría una lista con la docena de compases que a alguien se le
+ocurrieron. Ahora abre **tres filas que se giran**, las mismas que lleva el menú
+del metrónomo y sobre el mismo transporte —hay un solo compás en este programa—:
+`BEATS` 1..32, `UNIT`, y `GROUPING`, que se recorre con las agrupaciones que
+*caben* en ese compás (`musical_groupings`, ya existía para el click). Una cuarta
+fila dice a cuánto sale eso en la grilla: `STEPS 2 × 14`.
+
+`←→`, la rueda y Enter/Esc se comportan como en el diálogo del gate.
+
+### Un CC aprendido dejaba de mover el efecto al seleccionar otro
+
+Reportado como "asigné un knob del Keystation al auto filter de la tab 2 y el
+MIDI learn no lo asignó — audita que cada opción del FX chain se pueda asignar".
+
+La asignación se hacía y se guardaba. Lo que no ocurría era el movimiento:
+`apply_target_on` abandonaba salvo que el efecto nombrado fuera **el
+seleccionado en el panel**, así que en cuanto el jugador clickeaba otro efecto
+de la cadena el knob aprendido dejaba de hacer nada. Además silenciaba las
+lanes de automatización grabadas sobre cualquier unidad que no fuera la
+seleccionada, y contradecía a la rama de al lado, donde una tab que ni siquiera
+está adelante mueve sus efectos perfectamente.
+
+Ahora **el binding nombra la unidad y la unidad se mueve**. Donde la selección
+sigue decidiendo es en el único caso para el que se escribió aquella regla: un
+mismo CC enseñado a **varias** unidades de una tab —el mismo fader moviendo
+`1:REVERB Room` y `2:TUBE Drive`—, y esa pregunta se hace ahora en `apply_cc`,
+que es el único lugar que ve que hay algo que elegir.
+
+La auditoría pedida quedó como test: recorre **los cincuenta y pico
+built-ins**, comprueba que cada mando que el rack dibuja está en la lista de
+LEARN para su tab y su unidad, y que un CC aprendido sobre él lo mueve con el
+panel mostrando *otro* efecto — que es donde el jugador lo deja.
+
+### El GATE se corría de lo elegido al aceptar
+
+Reportado como "elegí el target Rate y al abrir de nuevo la configuración
+aparece Shape — fijate si hay un problema de asignación de id".
+
+No era un id: el número guardado y el nombre siempre coincidieron, y sobreviven
+cerrar y reabrir — está comprobado en un test. Era **Enter**. El diálogo
+avanzaba la fila bajo el cursor al pulsarlo, como hace el menú del metrónomo,
+así que aceptar la elección la corría a la siguiente: Rate → Depth, y → Shape
+al segundo Enter. Lo mismo pasaba con el botón SELECT y con el segundo click
+sobre una fila.
+
+Ese menú es una hoja de ajustes, no una lista de opciones: **cada fila se gira,
+ninguna se elige**. Las mueven `←→` y la rueda —aplicándose y oyéndose al
+momento, que es como se cablea un gate— y Enter ahora cierra, como Esc. El pie
+del diálogo lo dice.
+
+### El modal del GATE: cada fila, su lista
+
+Pedido después de que TARGET creciera hasta la lista entera de parámetros de un
+plugin: doscientas respuestas no son algo que se camine con una flecha.
+
+SOURCE, TARGET y MODE abren ahora **su propia lista** encima del diálogo —con
+`OFF` y `MIX` en cabeza, que es lo que significa "sin gate" y "el dry/wet"— y al
+elegir vuelven al diálogo, sobre la fila desde la que se abrieron. Las tres
+llevan `▸` para decir cuál de los dos gestos toman.
+
+DEPTH, THRESHOLD y RELEASE se giran en el sitio con `←→` y **con la rueda**, que
+es la otra mitad del pedido: el guard que decide qué modales tratan la rueda
+como valor sólo nombraba al metrónomo, así que sobre el gate la rueda no hacía
+nada y la rama que sí nombraba a `FxGate` era inalcanzable.
+
+De paso: tocar cualquier fila que no sea SOURCE ahora **enciende** el gate. Con
+el gate apagado, elegir un knob o girar la profundidad se descartaba en
+silencio.
+
+### Buscar un mando por su nombre, en la caja del instrumento
+
+Pedido: "buscar un label de un knob dentro de un plugin escribiendo, al costado
+del paginador, como ya funciona el buscador del source o de FX".
+
+Es el problema que dejó la auditoría de labels: los nombres que choz muestra
+**son** los del plugin —`getParameterInfo().title`, verificado contra Surge XT—
+pero Surge publica 774 parámetros y su `A Filter 1 Cutoff` es el número 319, o
+sea veintiséis pantallas de paginador. Lo que se veía en la primera página eran
+los `Send FX N Return` de verdad.
+
+Ahora `/` sobre la caja INSTRUMENT —o el botón `⌕` que aparece junto a `◀ ▶`—
+abre la búsqueda: las letras se dibujan en el mismo borde, el cursor salta al
+primer mando cuyo nombre las contenga, y `↓`/`↑` (o Tab) caminan las
+coincidencias sin cerrarla — un plugin tiene cuatro `Cutoff` y el segundo suele
+ser el que se buscaba. Enter deja el mando encontrado, Esc y borrar hasta el
+principio la cierran. Mientras está abierta **el teclado es suyo**: una búsqueda
+que deja pasar la `q` es una búsqueda que cierra choz.
+
+Como mover el cursor ya pagina la caja, nada de esto necesita saber en qué
+página está un mando. El botón sólo aparece cuando hay más de una página: en un
+SoundFont, cuyos trece mandos entran enteros, no hay nada que buscar.
+
+**Busca por palabras, no por subcadena, y la sección cuenta como parte del
+nombre.** Reportado enseguida: "la ventana de Surge XT dice Cutoff y el buscador
+no lo encuentra". Su lista tiene cuatro —`A Filter 1 Cutoff` y sus vecinos,
+bajo la sección `A Filters`— y `cutoff` a secas los encuentra; lo que no
+encontraba nada era `filter cutoff`, que es lo que uno escribe después de leer
+la ventana del plugin, porque esas dos palabras no están juntas en ningún
+nombre que Surge publique. Ahora cada palabra tiene que aparecer en alguna
+parte y el orden es asunto del que escribe. Hay un test contra el propio Surge
+XT instalado, que se saltea si no está.
+
+Y la caja dice **cuántas coincidencias hay** — `⌕ cuto█ 2/4` —: sin ese número,
+una palabra que el plugin no usa se ve exactamente igual que un cursor que se
+movió fuera de pantalla, que es de donde salió el reporte.
+
+### El PLAY del rack tocaba el primer paso dos veces
+
+Reportado como "cuando presiono play en el transport se duplica el sonido de un
+instrumento con secuenciador; con el play del secuenciador suena bien".
+
+Y así era, por una carrera de un bloque: el transport lo pone en marcha **el
+hilo de audio**, un bloque después de que se pulsa el botón. En ese hueco el
+secuenciador no encontraba grilla que contar, corría su propio reloj y disparaba
+el primer paso; después llegaba la grilla y disparaba el mismo paso otra vez.
+Dos golpes separados por un milisegundo en el downbeat de cada patrón — que es
+exactamente lo que se oye como un instrumento doblado. El PLAY de la caja nunca
+lo hizo porque ahí no hay nadie más contando.
+
+Ahora: **arrancado por el transport, contado por el transport**
+(`Seq::play_on_transport`). Su propio PLAY sigue corriendo libre hasta que
+aparezca una grilla, que es lo que siempre hizo.
+
+### El PLAY del transport es rojo
+
+Pedido. Es el interruptor que pone en marcha el rack entero —cada secuenciador,
+cada delay sincronizado, la automatización— y es el que no se puede confundir
+con el PLAY de una tab.
+
+### Los banks de amsynth, que en DSSI no cambiaban nada
+
+Reportado como "en VST2 los banks de amsynth funcionan, en DSSI no". Y era
+cierto: el picker mostraba **3712 programas en 29 banks** —los que el plugin
+declara por `get_program`— y elegir uno no cambiaba una nota.
+
+Medido fuera de la interfaz, sobre el plugin desnudo: `select_program` se
+llamaba, amsynth la respondía sin quejarse, y ni tocaba los valores de sus
+puertos de control ni cambiaba lo que sonaba. Un bank select más un program
+change en su entrada de eventos sí lo cambia — que es exactamente lo que hace
+su build VST2.
+
+Ninguna de las dos mitades es incorrecta según el formato, así que **choz manda
+las dos**: la llamada DSSI para los plugins que la implementan, y el
+`CC0/CC32 + program change` para los que sólo escuchan ahí. Un plugin que ya
+actuó sobre la llamada recibe un program change pidiéndole el programa en el
+que ya está. Vale para el picker y para el program change que llega de un
+controlador, que pasan por el mismo lugar.
+
+**Había un test que decía cubrir esto y no lo cubría.**
+`dssi_instruments_sound_and_switch_programs` comparaba dos tomas con
+`assert_ne!` sobre las muestras crudas y pasaba en verde con amsynth ignorando
+el picker por completo: lo que medía era la **primera** nota de la instancia
+—envolventes frías— contra una posterior, y eso difiere aunque el programa no
+cambie. Ahora tira la primera nota, mide el piso de ruido tocando el mismo
+programa dos veces —hexter arranca cada nota en fase libre y no se repite, así
+que ahí la comprobación se saltea diciéndolo—, compara la **forma de onda**
+normalizada en vez del nivel, y pregunta por varios programas en vez de apostar
+a un par: a qué números responde un plugin es asunto suyo, y amsynth publica
+29 × 128 y contesta unas decenas.
+
+### Los tabs mudos de un proyecto abierto hoy
+
+Reportado como "abrí el proyecto, están los tabs, no suena ninguno". No era el
+audio: el proyecto guardaba el puerto MIDI con la dirección ALSA pegada al final
+—`Keystation Pro 88:Keystation Pro 88 MIDI 1 40:0`— y esa dirección es un número
+de cliente que se reparte por orden de enchufe. Un suspend, un hub que se
+resetea, un cable que va y viene, y el mismo teclado vuelve como `20:0`: el
+ruteo comparaba el nombre **entero**, ninguna tab reclamaba las notas, y el rack
+quedaba completo y mudo sin nada en pantalla que lo dijera.
+
+`port_key()` recorta esa dirección y `InputRef::same_port()` es la comparación
+que usan ahora el ruteo de notas, `tab_listens_to`, `tabs_on_input`,
+`bound_tab`, el canal compartido, las fuentes de MIDI-learn —CC y program
+change, que morían igual tras el replug— y la lista de entradas apagadas. Un
+nombre que casualmente termine en algo con dos puntos (`"Bus 1:2 out"`) queda
+intacto: sólo se recorta `dígitos:dígitos`.
+
+### Menú y ventanas
+
+- **File → New project**, primero del menú: vacía el rack, los CC/PC aprendidos
+  y la automatización, y olvida el archivo. Los ajustes de la máquina —placa,
+  rutas de plugins, tema, idioma— no son del proyecto y no se tocan. Con trabajo
+  sin guardar pregunta antes, con las mismas tres respuestas que la salida y el
+  cursor en la que conserva.
+- **Se fueron del menú File**: Open WAV, Open SF2 e Import Max patch. El camino
+  del import de Max quedaba sin entrada, así que se fue entero (el lector
+  `choz_engine::maxpat` sigue donde estaba).
+- **Settings**: el tab THEME se parte en Desktop y Palette por la misma barra
+  lateral que usa AUDIO —los ocho controles de escritorio ya no viven encima de
+  372 esquemas—, hay una fila `Palette ‹ nombre ›` que cicla y aplica en vivo, la
+  rueda sobre una fila con valor **es** el valor (sobre una lista sigue
+  scrolleando), las etiquetas y los valores se alinean en dos columnas en todos
+  los tabs, la fila bajo el puntero se sombrea, y la caja es **una sola medida**
+  para todos los tabs: 84 × 82 %.
+- **About**: fuera la imagen de gradiente; ahora dibuja el logo del splash
+  —compartido, no copiado— con su reflejo y la onda, en una caja de 78 × 26
+  centrada.
 
 ## [1.3.7] — 2026-09-01
 

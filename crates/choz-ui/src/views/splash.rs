@@ -20,7 +20,7 @@ const LOGO: &[&str] = &[
     "  ╚██████╗  ██║  ██║ ╚██████╔╝  ███████╗",
     "   ╚═════╝  ╚═╝  ╚═╝  ╚═════╝  ╚══════╝",
 ];
-const LOGO_LINES: usize = LOGO.len();
+pub const LOGO_LINES: usize = LOGO.len();
 
 /// Splash animation state.
 pub struct SplashState {
@@ -97,65 +97,16 @@ pub fn draw_splash(f: &mut Frame, state: &SplashState, area: Rect) {
         .split(inner);
 
     // ─── Logo ──────────────────────────────────────────────────────────
-    let logo_tick = state.tick / 3;
-    let mut logo_lines: Vec<Line> = Vec::new();
-    for logo_line in LOGO.iter() {
-        let mut spans: Vec<Span> = Vec::new();
-        for (ci, ch) in logo_line.chars().enumerate() {
-            if ch == ' ' {
-                spans.push(Span::raw(" "));
-            } else {
-                let grad_idx = ((ci as u64 + logo_tick) % 12) as usize;
-                let color = SPLASH_GRADIENT[grad_idx];
-                let pulse = (state.tick % 16) < 8;
-                let c = if pulse {
-                    Color::Rgb(
-                        color_to_u8(color, 0).saturating_add(20),
-                        color_to_u8(color, 1).saturating_add(20),
-                        color_to_u8(color, 2).saturating_add(20),
-                    )
-                } else {
-                    color
-                };
-                spans.push(Span::styled(
-                    ch.to_string(),
-                    Style::default().fg(c).add_modifier(Modifier::BOLD),
-                ));
-            }
-        }
-        logo_lines.push(Line::from(spans));
-    }
     f.render_widget(
-        Paragraph::new(logo_lines).style(Style::default().bg(PANEL_BG)),
+        Paragraph::new(logo_lines(state.tick)).style(Style::default().bg(PANEL_BG)),
         chunks[0],
     );
 
     // ─── Reflection ─────────────────────────────────────────────────────
     // The logo again, upside down and fading: two rows of "this is a screen with
     // something on it" instead of two rows of nothing.
-    let mut mirror: Vec<Line> = Vec::new();
-    for (i, logo_line) in LOGO.iter().rev().take(LOGO_LINES / 2).enumerate() {
-        let fade = 1.0 - (i as f32 + 1.0) / (LOGO_LINES as f32 / 2.0 + 1.0);
-        let spans: Vec<Span> = logo_line
-            .chars()
-            .enumerate()
-            .map(|(ci, ch)| {
-                if ch == ' ' {
-                    return Span::raw(" ");
-                }
-                let color = SPLASH_GRADIENT[((ci as u64 + logo_tick) % 12) as usize];
-                let dim = Color::Rgb(
-                    (color_to_u8(color, 0) as f32 * fade * 0.45) as u8,
-                    (color_to_u8(color, 1) as f32 * fade * 0.45) as u8,
-                    (color_to_u8(color, 2) as f32 * fade * 0.45) as u8,
-                );
-                Span::styled(ch.to_string(), Style::default().fg(dim))
-            })
-            .collect();
-        mirror.push(Line::from(spans));
-    }
     f.render_widget(
-        Paragraph::new(mirror).style(Style::default().bg(PANEL_BG)),
+        Paragraph::new(logo_reflection(state.tick)).style(Style::default().bg(PANEL_BG)),
         chunks[1],
     );
 
@@ -184,7 +135,7 @@ pub fn draw_splash(f: &mut Frame, state: &SplashState, area: Rect) {
     // and the sweep is the same clock as the logo's.
     let mut badges: Vec<Span> = vec![Span::raw("  ")];
     for (i, name) in FORMATS.iter().enumerate() {
-        let lit = (logo_tick as usize % (FORMATS.len() * 2)) == i;
+        let lit = ((state.tick / 3) as usize % (FORMATS.len() * 2)) == i;
         let style = if lit {
             Style::default()
                 .fg(Color::Black)
@@ -268,6 +219,71 @@ pub fn draw_splash(f: &mut Frame, state: &SplashState, area: Rect) {
     );
 }
 
+/// The block logo as gradient spans. `tick` moves the gradient and the pulse;
+/// the About box passes a fixed one, the splash its own, so both draw the same
+/// logo and only one of them animates.
+pub fn logo_lines(tick: u64) -> Vec<Line<'static>> {
+    let logo_tick = tick / 3;
+    LOGO.iter()
+        .map(|logo_line| {
+            let spans: Vec<Span> = logo_line
+                .chars()
+                .enumerate()
+                .map(|(ci, ch)| {
+                    if ch == ' ' {
+                        return Span::raw(" ");
+                    }
+                    let color = SPLASH_GRADIENT[((ci as u64 + logo_tick) % 12) as usize];
+                    let c = if (tick % 16) < 8 {
+                        Color::Rgb(
+                            color_to_u8(color, 0).saturating_add(20),
+                            color_to_u8(color, 1).saturating_add(20),
+                            color_to_u8(color, 2).saturating_add(20),
+                        )
+                    } else {
+                        color
+                    };
+                    Span::styled(
+                        ch.to_string(),
+                        Style::default().fg(c).add_modifier(Modifier::BOLD),
+                    )
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// The logo mirrored and fading, half as many rows as the logo itself.
+pub fn logo_reflection(tick: u64) -> Vec<Line<'static>> {
+    let logo_tick = tick / 3;
+    LOGO.iter()
+        .rev()
+        .take(LOGO_LINES / 2)
+        .enumerate()
+        .map(|(i, logo_line)| {
+            let fade = 1.0 - (i as f32 + 1.0) / (LOGO_LINES as f32 / 2.0 + 1.0);
+            let spans: Vec<Span> = logo_line
+                .chars()
+                .enumerate()
+                .map(|(ci, ch)| {
+                    if ch == ' ' {
+                        return Span::raw(" ");
+                    }
+                    let color = SPLASH_GRADIENT[((ci as u64 + logo_tick) % 12) as usize];
+                    let dim = Color::Rgb(
+                        (color_to_u8(color, 0) as f32 * fade * 0.45) as u8,
+                        (color_to_u8(color, 1) as f32 * fade * 0.45) as u8,
+                        (color_to_u8(color, 2) as f32 * fade * 0.45) as u8,
+                    );
+                    Span::styled(ch.to_string(), Style::default().fg(dim))
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect()
+}
+
 /// The formats choz hosts, which is the short answer to what it is.
 const FORMATS: [&str; 6] = ["CLAP", "LV2", "VST2", "VST3", "LADSPA", "DSSI"];
 
@@ -348,6 +364,16 @@ mod tests {
         assert!(splash_wave(3, 40)
             .chars()
             .all(|c| ('\u{2581}'..='\u{2588}').contains(&c)));
+    }
+
+    /// The About box draws this logo in a 78-column popup: if the art grows past
+    /// its inner width, About clips it instead of wrapping and the word reads
+    /// "cho".
+    #[test]
+    fn the_logo_fits_the_about_box() {
+        assert_eq!(logo_lines(0).len(), LOGO_LINES);
+        assert_eq!(logo_reflection(0).len(), LOGO_LINES / 2);
+        assert!(LOGO.iter().all(|l| l.chars().count() <= 54));
     }
 
     /// The box is 24 rows; the content used to be eleven of them. What fills the

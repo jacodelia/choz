@@ -174,21 +174,54 @@ fn dssi_instruments_sound_and_switch_programs() {
                 );
             }
 
-            // Two programs, same note: the audio has to differ, which is only
-            // true if the request crossed into the audio thread and was
+            // Picking a program has to change what comes out — the only thing
+            // that says the request crossed into the audio thread and was
             // selected there.
+            //
+            // **This is where amsynth's DSSI build was caught**: 3712 programs
+            // listed, `select_program` answered without complaint, and not a
+            // note of difference in what it played. Three things this has to
+            // get right, all of them learned the hard way:
+            //
+            // 1. **Throw the first note away.** The first note an instance
+            //    plays comes out of cold envelopes, and comparing it against
+            //    any later note reads as a difference the program did not make.
+            //    Comparing raw buffers with `assert_ne!` passed on a plugin
+            //    that was ignoring the picker entirely.
+            // 2. **Measure the noise floor.** hexter starts every note on a
+            //    free phase and never repeats itself, so on that plugin there
+            //    is nothing to compare against and the check is skipped.
+            // 3. **Ask about several programs, not a chosen pair.** Which
+            //    program numbers a plugin answers to is its own business —
+            //    amsynth publishes 29 banks of 128 and answers a few dozen —
+            //    so one audible change out of a handful is the whole claim:
+            //    the picker is wired to the instrument.
             browser.load(&list[0].key);
-            let first = render_note(&mut inst, &info.label);
-            browser.load(&list[list.len() / 2].key);
-            let other = render_note(&mut inst, &info.label);
-            assert_ne!(
-                first,
-                other,
-                "{}: '{}' and '{}' render the same audio",
-                info.label,
-                list[0].name,
-                list[list.len() / 2].name
-            );
+            let _warm = render_note(&mut inst, &info.label);
+            let base = render_note(&mut inst, &info.label);
+            let noise = difference(&base, &render_note(&mut inst, &info.label));
+            if base.iter().any(|s| s.abs() > 1e-4) && noise <= 0.05 {
+                let candidates: Vec<String> = [1, 2, 4, 8, list.len() / 4, list.len() / 2]
+                    .into_iter()
+                    .filter(|i| *i < list.len())
+                    .map(|i| list[i].key.clone())
+                    .collect();
+                let heard = candidates.iter().any(|key| {
+                    browser.load(key);
+                    difference(&base, &render_note(&mut inst, &info.label)) > 0.05
+                });
+                assert!(
+                    heard,
+                    "{}: none of {candidates:?} changed a note of what '{}' plays \u{2014} \
+                     the picker is full and the plugin is not listening",
+                    info.label, list[0].name
+                );
+            } else if noise > 0.05 {
+                eprintln!(
+                    "{}: does not repeat itself ({noise:.3}); its programs cannot be compared",
+                    info.label
+                );
+            }
             // Garbage keys are ignored, not fatal.
             browser.load("not:a:program");
             browser.load("");
@@ -235,6 +268,23 @@ fn render_note(inst: &mut DssiInstrument, label: &str) -> Vec<f32> {
         inst.render(&mut buf, SR);
     }
     captured
+}
+
+/// How different two takes are, as a fraction of how loud they are: zero is
+/// the same waveform. Levels are no good for this — two patches can be equally
+/// loud, and a plugin's own voice state drifts by a fraction of a percent
+/// between two takes of the same one, which is enough to look like a change.
+fn difference(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let diff: f64 = (0..n).map(|i| (a[i] - b[i]).abs() as f64).sum();
+    let level: f64 = (0..n).map(|i| a[i].abs().max(b[i].abs()) as f64).sum();
+    match level > 1e-6 {
+        true => (diff / level) as f32,
+        false => 0.0,
+    }
 }
 
 /// A port whose positions have names comes back with them.

@@ -12,7 +12,7 @@ que decía "hecho" se fue al changelog.
 que no existe, una decisión de diseño y un fallo intermitente sin explicar—, dos
 decisiones de no hacer, y las notas para el que retome.
 
-Última actualización: 2026-09-01 (1.3.7 publicada).
+Última actualización: 2026-09-02 (1.3.8 publicada).
 
 ## Estado en una línea
 
@@ -30,11 +30,17 @@ su dry/wet es una sola ley, y los 56 publican su lista entera de mandos), que
 además se publican como un `.clap` —los dos artifacts incluidos— para usarlos en
 cualquier otro host; un looper multipista con sus tiras de canal, exportación a
 WAV y **tomas que el proyecto guarda** —resampleadas si el equipo cambió de
-frecuencia—; un patch de Max se importa hasta donde se puede, diciendo qué no; hay guardia de acople en la entrada; el mixer tiene un
+frecuencia—; hay guardia de acople en la entrada; el mixer tiene un
 main **estéreo** y cuatro subgrupos; una tab guarda sus sonidos en botones —que
 se asignan desde el mismo modal de bank/preset— y puede partir el teclado entre
 ellos; y un efecto puede abrirse con el bombo de otra tab —por su nivel o por
-las notas que se le tocan—, con el clock, o con el tap del metrónomo. **Dos
+las notas que se le tocan—, con el clock, o con el tap del metrónomo, **moviendo
+su dry/wet o el mando que se le diga** —el bombo abriendo un cutoff, que es lo
+que todo el mundo llama sidechain—. El secuenciador **dibuja el compás que
+toca**, agrupación incluida (7/8 contado 3+2+2), y sus pulsos, unidad y
+agrupación se ponen por separado como en el metrónomo. La caja del instrumento
+**busca un mando por su nombre**, que es la única forma de encontrar el `Cutoff`
+de un plugin con 774 parámetros. **Dos
 teclados tocan a la vez**: los mandos y los botones de cada uno siguen moviendo
 lo suyo cuando la otra tab está adelante, los botones de un teclado se pueden
 asignar a la tab del otro —y siguen funcionando desde cualquiera de las dos—, y
@@ -49,8 +55,8 @@ otro host. Un plugin que guarda sus controles fuera de sus puertos
 —ZynAddSubFX— se maneja por su propio servidor OSC: mandos con nombre, los
 armónicos del oscilador, su ventana real, y los mandos leyendo lo que el plugin
 tiene. **La 1.0.0 está publicada y sus paquetes verificados; la
-1.3.7 es este árbol.**
-853 tests, `clippy --workspace --all-targets -D warnings` limpio.
+1.3.8 es este árbol.**
+866 tests, `clippy --workspace --all-targets -D warnings` limpio.
 
 Las comprobaciones con hardware delante quedaron dichas en los gotchas, que es
 donde se van a leer.
@@ -59,10 +65,11 @@ donde se van a leer.
 
 ## Pendiente
 
-**Ningún punto pedido, ningún borde, ninguna auditoría abierta.** Todo lo que se
-pidió está hecho y contado día por día en el [changelog](../CHANGELOG.md). Lo
-que queda son **dos cosas sin cerrar** —una decisión que no es mía y un fallo
-que no supe reproducir— y después las dos piezas que se decidió no hacer. Un
+**Ningún borde abierto.** Todo lo que se pidió está hecho y contado día por día
+en el [changelog](../CHANGELOG.md). Lo que queda son **tres cosas sin cerrar**
+—un test que no existe, una decisión que no es mía y un fallo que no supe
+reproducir—, los bordes que el sidechain deja fuera, y después las dos piezas
+que se decidió no hacer. Un
 punto que se cierra sale de aquí: este documento es lo que queda, no lo que
 hubo.
 
@@ -121,7 +128,35 @@ Las dos salidas, para el que retome:
 | **Como está** | Baja el SoundFont hasta el próximo cambio de sonido, y después vuelve solo. |
 | **Filtrando el CC 7** | No hace nada hasta que se lo aprende; aprendido, mueve lo que se le haya atado (el VOL de la tab, lo natural). |
 
-### 2 · `cargo test --workspace` falla de a varios, de tanto en tanto
+### 2 · Sidechain: lo que quedó fuera del gate (2026-09-02)
+
+El gate **ya mueve un mando** además del dry/wet — está contado en el
+[changelog](../CHANGELOG.md). Lo que sigue sin existir, dicho aquí para que no
+se vuelva a auditar desde cero:
+
+- **No hay ruta de audio entre canales.** La entrada de una tab son jacks de
+  captura (`set_slot_in`), la salida va a main o a uno de los cuatro grupos, y
+  los grupos son gain/mute/par de salida: sin FX y sin retornos. Lo que cruza
+  entre tabs es **nivel**, no señal.
+- **Ningún formato de plugin recibe sidechain.** CLAP crea los puertos extra
+  para que el layout coincida y los deja en silencio
+  (`clap/host.rs:481, 920`), VST3 sólo activa el bus de entrada 0
+  (`vst3/host.rs:1051`), y LV2/VST2/LADSPA/DSSI reciben la señal principal en
+  todos sus puertos de entrada. Un compresor externo con detector propio no se
+  puede alimentar desde otra tab; el gate de choz sí hace ducking sobre él.
+- **La modulación es por bloque** (2,7–5 ms), que alcanza para cutoff, feedback
+  o drive. Para algo más rápido tendría que suavizar el efecto de destino —
+  `fx/smooth.rs` existe y varios ya lo usan.
+- **Un mando, un gate.** Cada efecto tiene un `GateSpec`, así que el bombo puede
+  mover el cutoff *o* el mix de ese efecto, no los dos a la vez. Dos destinos
+  pedirían una lista donde hoy hay un campo; nadie lo pidió.
+
+Nota de nombres, que sigue en pie: `fx/sidechain.rs::SidechainDuck` se llama
+"sidechain" y no tiene entrada externa —LFO interno o un `trigger()` que **no
+llama nadie** en todo el árbol—, mientras que lo que sí hace sidechain se llama
+GATE.
+
+### 3 · `cargo test --workspace` falla de a varios, de tanto en tanto
 
 **Visto dos veces, sin explicar y sin nombres**: una corrida con **14** tests de
 `choz-engine` fallando de golpe y otra con **7**. Las dos veces la corrida
