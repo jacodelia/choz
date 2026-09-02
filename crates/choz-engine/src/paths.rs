@@ -381,12 +381,20 @@ pub fn scan_path(path: &Path, format: PluginFormat) -> Vec<FoundPlugin> {
         return vec![FoundPlugin {
             format,
             name: stem(path),
+            id: path_id(path),
             path: path.to_path_buf(),
-            id: String::new(),
             is_instrument: matches!(format, PluginFormat::Sf2 | PluginFormat::Sfz),
         }];
     }
     scan_dir(path, format)
+}
+
+/// What a file-based "plugin" is known by. There is no id inside an SFZ, an
+/// SF2 or a Pd patch, and an **empty** id is not an identity: a rack that
+/// remembers its instrument by id reopened with whichever of them the scan
+/// listed first. The path is the file, which is what these are loaded by.
+pub fn path_id(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 
 fn scan_into(
@@ -414,8 +422,8 @@ fn scan_into(
             out.push(FoundPlugin {
                 format,
                 name: stem(&path),
+                id: path_id(&path),
                 path,
-                id: String::new(),
                 is_instrument: matches!(format, PluginFormat::Sf2 | PluginFormat::Sfz),
             });
         } else if is_dir {

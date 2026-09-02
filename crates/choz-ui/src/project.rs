@@ -47,6 +47,15 @@ pub struct ProgramBinding {
     pub target: crate::LearnTarget,
     #[serde(default)]
     pub label: String,
+    /// Which controller's button it is, `"MIDI:<port>"` / `"OSC"`. Absent in
+    /// projects written before buttons knew, which means "any controller".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The tab the button was learned on. Absent in projects written before a
+    /// button could be assigned to a tab other than the one its keyboard plays;
+    /// absent means "whichever tab this controller speaks for".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab: Option<usize>,
 }
 
 /// The desk's own strips: four subgroups and the main.
@@ -498,6 +507,8 @@ mod tests {
                 program: 3,
                 target: crate::LearnTarget::Trigger(crate::TriggerAction::SoundRecall(1)),
                 label: "tab 1 \u{00b7} SOUND 2".into(),
+                source: Some("MIDI:Keystation".into()),
+                tab: Some(0),
             }],
             rack: vec![Slot {
                 sounds: Vec::new(),
