@@ -67,6 +67,8 @@ struct UiFeatures {
     /// Sample rate, in a box the options array points at.
     _sample_rate: Box<f32>,
     _options: Vec<LV2_Options_Option>,
+    /// `ui:resize` callback struct, in a box the feature array points at.
+    _resize: Box<LV2UI_Resize>,
     _feats: Vec<LV2_Feature>,
     ptrs: Vec<*const LV2_Feature>,
 }
@@ -91,6 +93,9 @@ pub struct Lv2Editor {
     /// `None` while closed. The mutex serialises open/idle/close, all of which
     /// arrive on the editor thread, and makes a double `close()` harmless.
     ui: Mutex<Option<UiInstance>>,
+    /// Size the UI last asked for through `ui:resize`, packed `(w << 32) | h`;
+    /// 0 until it asks. Cleared before each `instantiate`, read back by `open`.
+    resize: std::sync::atomic::AtomicU64,
     /// Kept mapped for the process's life, like the DSP libraries: a UI can
     /// leave threads or atexit handlers behind, and unmapping under them
     /// crashes inside the loader.
@@ -140,6 +145,7 @@ impl Lv2Editor {
             instance: instance as usize,
             open: std::sync::atomic::AtomicBool::new(false),
             ui: Mutex::new(None),
+            resize: std::sync::atomic::AtomicU64::new(0),
             _lib: lib,
         }))
     }
@@ -201,8 +207,53 @@ unsafe extern "C" fn write_control(
     }
 }
 
+/// `ui:resize` — the UI asking its embedding window to change size. choz's
+/// window lives on the editor thread, so this just records the request for
+/// `open()` to hand back; brummer10's UIs call it once from inside
+/// `instantiate`, and calling *anything* valid here is what stops the crash.
+unsafe extern "C" fn ui_resize(handle: *mut c_void, width: i32, height: i32) -> i32 {
+    let Some(packed) = pack_size(width, height) else {
+        return 1;
+    };
+    if handle.is_null() {
+        return 1;
+    }
+    // SAFETY: the handle is the &Lv2Editor set as this feature's data, which
+    // owns the UI instance and so outlives the call.
+    let editor = unsafe { &*(handle as *const Lv2Editor) };
+    editor
+        .resize
+        .store(packed, std::sync::atomic::Ordering::Relaxed);
+    0
+}
+
+/// A `ui:resize` request as one `u64`, or `None` for a size choz can't use (a
+/// non-positive dimension, or one past what its window sizing takes as `u16`).
+fn pack_size(width: i32, height: i32) -> Option<u64> {
+    let w = u16::try_from(width).ok()?;
+    let h = u16::try_from(height).ok()?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some(((w as u64) << 32) | h as u64)
+}
+
+/// Inverse of [`pack_size`]; `0` (never a valid packed size) means "unset".
+fn unpack_size(packed: u64) -> Option<(u16, u16)> {
+    match packed {
+        0 => None,
+        p => Some(((p >> 32) as u16, p as u16)),
+    }
+}
+
 impl UiFeatures {
-    fn new(parent: u64, map: &LV2_URID_Map, sample_rate: u32, instance: usize) -> Box<Self> {
+    fn new(
+        parent: u64,
+        map: &LV2_URID_Map,
+        sample_rate: u32,
+        instance: usize,
+        controller: *mut c_void,
+    ) -> Box<Self> {
         let uris: Vec<CString> = [
             LV2_UI_PARENT_URI,
             LV2_URID_MAP_URI,
@@ -210,6 +261,7 @@ impl UiFeatures {
             LV2_OPTIONS_URI,
             LV2_UI_SHOW_INTERFACE_URI,
             LV2_INSTANCE_ACCESS_URI,
+            LV2_UI_RESIZE_URI,
         ]
         .iter()
         .map(|u| CString::new(*u).expect("static URI"))
@@ -230,6 +282,10 @@ impl UiFeatures {
         let rate_key = intern(LV2_PARAM_SAMPLE_RATE_URI);
         let float_urid = intern(LV2_ATOM_FLOAT_URI);
         let sample_rate = Box::new(sample_rate as f32);
+        let resize = Box::new(LV2UI_Resize {
+            handle: controller,
+            ui_resize: Some(ui_resize),
+        });
 
         let options = vec![
             LV2_Options_Option {
@@ -256,6 +312,7 @@ impl UiFeatures {
             _map: map,
             _sample_rate: sample_rate,
             _options: options,
+            _resize: resize,
             _feats: Vec::new(),
             ptrs: Vec::new(),
         });
@@ -289,6 +346,10 @@ impl UiFeatures {
                 uri: me._uris[5].as_ptr(),
                 data: instance as *mut c_void,
             },
+            LV2_Feature {
+                uri: me._uris[6].as_ptr(),
+                data: &*me._resize as *const LV2UI_Resize as *mut c_void,
+            },
         ];
         me.ptrs = me._feats.iter().map(|f| f as *const LV2_Feature).collect();
         me.ptrs.push(std::ptr::null());
@@ -309,7 +370,14 @@ impl PluginEditor for Lv2Editor {
         // A UI that owns its window has nothing to embed into; handing it a
         // parent is how one ends up drawing into a window nobody mapped.
         let parent = if self.info.owns_window { 0 } else { parent };
-        let features = UiFeatures::new(parent, &map, self.sample_rate, self.instance);
+        let features = UiFeatures::new(
+            parent,
+            &map,
+            self.sample_rate,
+            self.instance,
+            self as *const Lv2Editor as *mut c_void,
+        );
+        self.resize.store(0, std::sync::atomic::Ordering::Relaxed);
         let mut widget: LV2UI_Widget = std::ptr::null_mut();
 
         // SAFETY: every pointer is owned by `features`/`self` and outlives the
@@ -366,10 +434,11 @@ impl PluginEditor for Lv2Editor {
             show,
             _features: features,
         });
-        // An X11UI parents itself into the window we gave it and reports no size
-        // of its own; the editor thread keeps its default and the plugin resizes
-        // through the window manager if it wants to.
-        None
+        // An X11UI parents itself into the window we gave it; a UI that wants a
+        // particular size asks for it through `ui:resize` during `instantiate`
+        // (brummer10's do), and that request is what we hand back so the editor
+        // thread can size its window to match.
+        unpack_size(self.resize.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     fn idle(&self) {
@@ -414,5 +483,24 @@ impl PluginEditor for Lv2Editor {
                 cleanup(ui.handle);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pack_size, unpack_size};
+
+    #[test]
+    fn resize_round_trips_and_rejects_junk() {
+        // 0 is the "no request yet" sentinel `open()` reads back.
+        assert_eq!(unpack_size(0), None);
+        // A real request survives the pack into the atomic and back.
+        let packed = pack_size(1024, 640).expect("valid size");
+        assert_ne!(packed, 0);
+        assert_eq!(unpack_size(packed), Some((1024, 640)));
+        // Sizes choz's `u16` window sizing can't take are refused, not wrapped.
+        assert_eq!(pack_size(0, 480), None);
+        assert_eq!(pack_size(800, -1), None);
+        assert_eq!(pack_size(70_000, 480), None);
     }
 }
