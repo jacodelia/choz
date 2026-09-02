@@ -32,10 +32,10 @@ impl MenuKind {
 
     /// Widest item label — used to size the dropdown.
     ///
-    /// Measured on the **translated** label, in characters: "Import Max
-    /// patch…" is shorter than "Importer un patch Max…", and sizing from the
-    /// English would clip the French. Characters, not bytes, or every accent
-    /// would widen the box by one.
+    /// Measured on the **translated** label, in characters: "Save project as…"
+    /// is shorter than "Guardar proyecto como…", and sizing from the English
+    /// would clip the Spanish. Characters, not bytes, or every accent would
+    /// widen the box by one.
     pub fn width(self) -> u16 {
         let w = self
             .items()
@@ -76,27 +76,22 @@ impl MenuItem {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
     None,
-    OpenWav,
-    OpenSf2,
+    NewProject,
     Quit,
     PluginPaths,
     RescanPlugins,
     SaveProject,
     SaveProjectAs,
     LoadProject,
-    ImportMax,
     About,
 }
 
 static FILE_MENU: &[MenuItem] = &[
-    MenuItem::item("Open WAV\u{2026}", "", MenuAction::OpenWav),
-    MenuItem::item("Open SF2\u{2026}", "", MenuAction::OpenSf2),
+    MenuItem::item("New project", "", MenuAction::NewProject),
     MenuItem::sep(),
     MenuItem::item("Save project", "", MenuAction::SaveProject),
     MenuItem::item("Save project as\u{2026}", "", MenuAction::SaveProjectAs),
     MenuItem::item("Open project\u{2026}", "", MenuAction::LoadProject),
-    MenuItem::sep(),
-    MenuItem::item("Import Max patch\u{2026}", "", MenuAction::ImportMax),
     MenuItem::sep(),
     MenuItem::item("Quit", "q", MenuAction::Quit),
 ];

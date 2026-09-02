@@ -401,6 +401,10 @@ pub enum GateSource {
 pub struct Gate {
     /// What drives it: a tab's index, or one of the clock sources by name.
     pub source: GateSource,
+    /// Which knob it moves, by index. Absent — which is every project written
+    /// before a gate could move one — is the effect's dry/wet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub param: Option<usize>,
     /// `true` ducks instead of opening.
     pub duck: bool,
     pub depth: f32,

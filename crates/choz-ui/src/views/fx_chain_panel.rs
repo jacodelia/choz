@@ -103,6 +103,10 @@ pub enum RackButton {
     /// how the rest are reached.
     InstrPagePrev,
     InstrPageNext,
+    /// Type a few letters and land on the knob that has them in its name. A
+    /// plugin with eight hundred parameters is a plugin whose `Cutoff` is
+    /// twenty-six pages in, and paging to it is not finding it.
+    InstrSearch,
     /// Put the instrument's own knobs back where the file opened them. Drawn
     /// only for a SoundFont, whose knobs are choz's own generator offsets and
     /// whose "default" therefore means something exact — the SF2 as written.
@@ -651,6 +655,8 @@ fn line_width(spans: &[Span]) -> u16 {
 }
 
 pub const BTN_RESET: &str = " RESET ";
+/// Opens the knob search on the instrument box.
+pub const BTN_SEARCH: &str = " \u{2315} ";
 pub const BTN_PREV: &str = " \u{25C0} ";
 pub const BTN_NEXT: &str = " \u{25B6} ";
 
@@ -1211,9 +1217,25 @@ fn draw_seq_box(
     let grid = block.inner(area);
     f.render_widget(block, area);
 
-    // Where a step's cell starts, counting the gap after every fourth one —
-    // the beat, which is the only thing that makes sixteen cells readable.
-    let cell_x = |step: usize| grid.x + SEQ_LABEL_W + step as u16 + (step / 4) as u16;
+    // Where the grid breaks, and what the ruler counts.
+    //
+    // **The bar, not four cells.** The gaps and the beat numbers used to fall
+    // every fourth step whatever the signature was, so 7/8 was drawn as four
+    // beats of four — a picture of a bar the sequencer was not playing. A beat
+    // is the signature's own unit read at the step length (an eighth in 7/8,
+    // two cells at 1/16), and where a bar is *grouped* — 3+2+2, as the click
+    // accents it — the break follows the groups instead.
+    let beat = seq.beat.max(1);
+    let stops = &seq.stops;
+    let breaks = |step: usize| step > 0 && stops.contains(&step);
+    // At one cell to a beat a gap between every pair of cells is not a grid any
+    // more, so the ruler carries the beat and the cells stay together.
+    let gapped = beat >= 2 || stops.len() < seq.bar;
+    let gaps_before = |step: usize| match gapped {
+        true => stops.iter().filter(|s| **s > 0 && **s <= step).count() as u16,
+        false => 0,
+    };
+    let cell_x = |step: usize| grid.x + SEQ_LABEL_W + step as u16 + gaps_before(step);
 
     // The ruler: the beat numbers, and the playhead over them.
     let mut ruler: Vec<Span> = vec![Span::styled(
@@ -1221,20 +1243,32 @@ fn draw_seq_box(
         Style::default().fg(LABEL),
     )];
     for step in 0..STEPS {
-        if step % 4 == 0 && step > 0 {
+        if gapped && breaks(step) {
             ruler.push(Span::raw(" "));
         }
         let here = seq.playing && seq.step == step;
+        // The beat this step is on, counted from the start of the bar — which
+        // is what a player reads to find "the three of the second bar".
+        let on_beat = step.is_multiple_of(beat);
+        let starts_group = stops.contains(&step);
         ruler.push(Span::styled(
             if step >= seq.bar {
                 " ".to_string()
-            } else if step % 4 == 0 {
-                (step / 4 + 1).to_string()
+            } else if on_beat {
+                // Two digits do not fit a cell: past nine the beat is marked
+                // rather than numbered, which is all a long bar needs.
+                match step / beat + 1 {
+                    n @ 1..=9 => n.to_string(),
+                    _ => "\u{00B7}".to_string(),
+                }
             } else {
                 "\u{00B7}".to_string()
             },
             if here {
                 Style::default().fg(Color::Black).bg(SEL)
+            } else if starts_group && step > 0 {
+                // Where a group starts — the accent the click plays.
+                Style::default().fg(HEADER).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(LABEL)
             },
@@ -1259,7 +1293,7 @@ fn draw_seq_box(
             .seq_tracks
             .push((track, Rect::new(grid.x, row_y, SEQ_LABEL_W, 1)));
         for step in 0..STEPS {
-            if step % 4 == 0 && step > 0 {
+            if gapped && breaks(step) {
                 spans.push(Span::raw(" "));
             }
             let on = s.step_on(track, step);
@@ -1348,6 +1382,9 @@ pub fn draw_fx_chain_panel(
     // Whether to offer RESET on the instrument box — see
     // [`RackButton::InstrReset`].
     instr_reset: bool,
+    // The knob search, when it is open: the letters, which match it is on, and
+    // how many there are. `None` draws the button that opens it.
+    instr_search: Option<(&str, usize, usize)>,
     // `(trim, gate)` of the tab's audio input, or `None` when it plays its own
     // instrument and there is nothing coming in to trim.
     in_trim: Option<(f32, f32)>,
@@ -1844,7 +1881,7 @@ pub fn draw_fx_chain_panel(
             &mut layout,
             RackButton::SeqOn,
             t("SEQ"),
-            seq.is_some_and(|v| v.settings.on),
+            seq.as_ref().is_some_and(|v| v.settings.on),
             false,
             gen_tab == GenTab::Seq,
         );
@@ -2109,7 +2146,7 @@ pub fn draw_fx_chain_panel(
     //
     // Above the instrument: the sequencer makes the notes, the instrument plays
     // them. Reading the panel downwards is reading the signal in order.
-    let seq_focused = gen_tab == GenTab::Seq && seq.is_some_and(|v| v.focused);
+    let seq_focused = gen_tab == GenTab::Seq && seq.as_ref().is_some_and(|v| v.focused);
     if let (GenTab::Seq, Some(view)) = (gen_tab, seq) {
         y = draw_seq_box(f, inner, y, view, focused, bg, btn_style, &mut layout);
     }
@@ -2217,7 +2254,17 @@ pub fn draw_fx_chain_panel(
         if instr_reset {
             edge.push((RackButton::InstrReset, BTN_RESET));
         }
-        if rects.len() < instr_params.len() {
+        // Beside the pager, because it is the other way through the same list:
+        // one walks it, this one jumps.
+        let search = match instr_search {
+            // The count, because a search that matched nothing has to say so:
+            // without it a word the plugin does not use looks exactly like a
+            // cursor that moved somewhere off screen.
+            Some((q, at, n)) => format!(" \u{2315} {q}\u{2588} {at}/{n} "),
+            None => BTN_SEARCH.to_string(),
+        };
+        if rects.len() < instr_params.len() || instr_search.is_some() {
+            edge.push((RackButton::InstrSearch, &search));
             edge.push((RackButton::InstrPagePrev, BTN_PREV));
             edge.push((RackButton::InstrPageNext, BTN_NEXT));
         }
@@ -2234,7 +2281,17 @@ pub fn draw_fx_chain_panel(
                 for (btn, text) in edge {
                     let bw = Span::raw(text).width() as u16;
                     let rect = Rect::new(x, y, bw, 1);
-                    f.render_widget(Paragraph::new(Span::styled(text, btn_style)), rect);
+                    // The search wears the accent while it is taking letters:
+                    // every key is going into it and nowhere else, which is
+                    // the one thing the player has to be able to see.
+                    let style = match btn == RackButton::InstrSearch && instr_search.is_some() {
+                        true => Style::default()
+                            .fg(Color::Black)
+                            .bg(ON_COLOUR)
+                            .add_modifier(Modifier::BOLD),
+                        false => btn_style,
+                    };
+                    f.render_widget(Paragraph::new(Span::styled(text, style)), rect);
                     layout.buttons.push((btn, rect));
                     x += bw;
                 }
@@ -3660,6 +3717,10 @@ mod tests {
     #[test]
     fn the_looper_draws_a_strip_a_channel_and_pages_the_rest() {
         use ratatui::{backend::TestBackend, Terminal};
+
+        // It reads the labels off the screen, so it cannot run while another
+        // test has the interface in Spanish: "CHANNEL 4" is "CANAL 4" there.
+        let _g = super::super::theme::ui_guard();
 
         /// Wide enough for the spelled-out tier in any language the table has.
         const CH_STRIP: u16 = 30;

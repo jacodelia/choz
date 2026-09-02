@@ -43,10 +43,10 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Margin, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame, Terminal,
 };
 
@@ -67,6 +67,24 @@ enum InputRef {
 }
 
 impl InputRef {
+    /// Whether two references name the same **port**, ignoring the ALSA address
+    /// midir puts on the end of the name.
+    ///
+    /// A port is spelled `"Keystation Pro 88:Keystation Pro 88 MIDI 1 20:0"`,
+    /// and that trailing `20:0` is a client number handed out in plug order: it
+    /// changes every time the device re-enumerates — a suspend, a hub reset, a
+    /// cable pulled and put back. A project written when the keyboard was
+    /// `40:0` then bound its tabs to a port that no longer exists by that name,
+    /// and the rack came up complete, silent, and with nothing on screen to say
+    /// why. The address is *where* the port is, not *which* port it is.
+    fn same_port(&self, other: &InputRef) -> bool {
+        match (self, other) {
+            (InputRef::Midi(a), InputRef::Midi(b)) => port_key(a) == port_key(b),
+            (InputRef::Osc, InputRef::Osc) => true,
+            _ => false,
+        }
+    }
+
     fn kind(&self) -> &'static str {
         match self {
             InputRef::Midi(_) => "MIDI",
@@ -499,8 +517,6 @@ struct ScanJob {
 enum SeqPick {
     /// How long a step is.
     Quant,
-    /// The transport's time signature, which is what a bar of a part is long.
-    TimeSig,
     /// Which of the eight parts is being edited.
     Part,
 }
@@ -539,8 +555,15 @@ enum ModalKind {
     /// Where the transport's tempo comes from: choz's own clock, any port that
     /// sends one, or one named device.
     Clock,
+    /// The sequencer's metre: beats, unit and grouping, as three rows that are
+    /// turned rather than a menu of the signatures somebody thought of. The
+    /// same three the metronome's own menu carries, on the same transport —
+    /// there is one bar in this program.
+    SeqMeter,
     /// Wire the selected effect to another tab's level: the gate.
     FxGate,
+    /// One row of the gate dialogue as a list of its own.
+    GateChoice(usize),
     /// Which saved sound each octave of the keyboard plays.
     Split,
     /// Which note one sequencer lane plays: `(track, the note it had)`.
@@ -577,6 +600,8 @@ enum ModalKind {
     ArpChoice,
     /// The way out with work that is not on disk: save, leave anyway, or stay.
     QuitConfirm,
+    /// The same question before an empty rack replaces one nobody saved.
+    NewConfirm,
     /// "This tab already listens to something" — the input about to be taken
     /// off it, and the one about to land. `(row, how)` is the pick being held.
     InputConfirm(usize, Assign),
@@ -587,10 +612,6 @@ enum ModalKind {
     /// waveform, an oscillator's mode. Any plugin whose format reports the
     /// names of a parameter's steps gets one.
     InstrChoice,
-    /// Pick a Max/MSP patch to import into the active tab's chain.
-    ImportMax,
-    /// What that import kept, and — the half that matters — what it could not.
-    MaxReport,
     /// The positions of one **named** FX parameter — a preset, a key, a scale,
     /// a mode. Stepping through eighteen Winamp presets with an arrow key is a
     /// list pretending to be a knob; this is the list.
@@ -604,6 +625,10 @@ const SETTINGS_TABS: &[&str] = &["AUDIO", "THEME", "LANGUAGE"];
 enum ThemeRow {
     /// Index into [`settings::THEMES`].
     Scheme(usize),
+    /// The scheme by name, cycled in place with `←`/`→` (or the wheel) so a
+    /// palette can be tried without walking a list of several hundred. Enter
+    /// opens that list, on the scheme currently worn.
+    Palette,
     /// Cycle terminal default → flat colour of the current scheme.
     Background,
     /// Stretch ↔ tile, only present while an image is set.
@@ -674,6 +699,21 @@ const AUDIO_SECTIONS: &[&str] = &["Engine", "Plugin Paths", "OSC"];
 const SEC_ENGINE: usize = 0;
 const SEC_PATHS: usize = 1;
 const SEC_OSC: usize = 2;
+
+/// The THEME tab's own two halves, down the same sidebar the AUDIO tab uses:
+/// what the desktop looks like, and which palette everything is drawn in. They
+/// were one list with headers, which put the eight desktop controls above
+/// several hundred scheme rows and made "scroll" the main gesture of the tab.
+const THEME_SECTIONS: &[&str] = &["Desktop", "Palette"];
+const THEME_SEC_DESKTOP: usize = 0;
+const THEME_SEC_PALETTE: usize = 1;
+
+/// One settings row: a fixed label column, then the value. Every tab formats
+/// through this, so the values line up in one column whichever section is
+/// showing — the thing that made the old modal hard to read at a glance.
+fn setting_row(label: &str, value: impl std::fmt::Display) -> String {
+    format!("  {label:<16}  {value}")
+}
 
 /// Bank Select MSB/LSB. Never a MIDI-learn source: it only ever precedes a
 /// program change.
@@ -1644,8 +1684,6 @@ struct App {
     /// The running plugin rescan, if any. `Some` also means "the progress
     /// modal is up" — there is no separate flag to keep in step.
     scan: Option<ScanJob>,
-    /// Pre-rendered logo image protocol (ratatui-image), built at startup.
-    logo: Option<ratatui_image::protocol::Protocol>,
     /// Notes sounding right now and **the slots their note-on went to**.
     ///
     /// Routing is resolved per event and depends on which tab is active: the
@@ -1672,6 +1710,13 @@ struct App {
     /// Last messages seen on any input, oldest first — what the MIDI monitor
     /// shows. Capped at [`MIDI_LOG_MAX`]; older entries fall off the front.
     midi_log: std::collections::VecDeque<midi::InputEvent>,
+    /// Letters typed into the instrument's knob search, when it is open.
+    ///
+    /// A plugin with eight hundred parameters has its `Cutoff` twenty-six
+    /// pages in, and paging to it is not finding it. Lives on the app rather
+    /// than in a modal because the box it filters is the rack's own — the same
+    /// place the letters are typed and the same place the answer lands.
+    instr_search: Option<String>,
     /// Cursor into the input list.
     input_cursor: usize,
     /// Side drawers: IN (left, note inputs) and OUT (right, audio devices).
@@ -1849,7 +1894,6 @@ impl App {
             about_open: false,
             preset_audition: None,
             scan: None,
-            logo: logo::build_logo(),
             active_notes: Vec::new(),
             note_tx,
             note_rx,
@@ -1863,6 +1907,7 @@ impl App {
             midi_scan_at: Instant::now(),
             midi_log: std::collections::VecDeque::new(),
             input_cursor: 0,
+            instr_search: None,
             in_open: false,
             out_open: false,
             out_devices: Vec::new(),
@@ -2371,14 +2416,6 @@ impl App {
                     .position(|d| *d == s.div)
                     .unwrap_or(0),
             ),
-            SeqPick::TimeSig => {
-                let now = choz_ports::transport().time_signature();
-                (
-                    i18n::t("TIME SIGNATURE").to_string(),
-                    TIME_SIGS.iter().map(|(n, d)| format!("{n}/{d}")).collect(),
-                    TIME_SIGS.iter().position(|t| *t == now).unwrap_or(0),
-                )
-            }
             // Each part says how much is written in it: picking one blind, out
             // of eight that all look alike, is what the letters alone were.
             SeqPick::Part => (
@@ -2418,19 +2455,6 @@ impl App {
                 if let Some(slot) = self.slots.get_mut(self.active_slot) {
                     slot.seq.settings.div = div;
                 }
-            }
-            SeqPick::TimeSig => {
-                let Some(&(num, den)) = TIME_SIGS.get(i) else {
-                    return;
-                };
-                let t = choz_ports::transport();
-                t.set_time_signature(num, den);
-                // The old grouping counted a different bar; keeping it would
-                // accent beats that are no longer there. Same rule the
-                // metronome's own picker follows.
-                choz_engine::metronome::metronome().set_groups(&[]);
-                self.ui.audio.time_sig = (num, den);
-                self.ui.save();
             }
             SeqPick::Part => {
                 if let Some(slot) = self.slots.get_mut(self.active_slot) {
@@ -3057,9 +3081,16 @@ impl App {
         if self.fx_chain.get(self.fx_slot).is_none() {
             return;
         }
-        let modal = Modal::new(
+        let mut modal = Modal::new(
             ModalKind::FxGate,
             views::modal::ListModal::new(i18n::t("GATE"), Vec::new()),
+        );
+        // What moves a row and what leaves. Written here because the rows are
+        // values: nothing on them is picked, everything is turned.
+        modal.list.note = format!(
+            "  \u{2190}\u{2192} / {}  \u{00B7}  Enter \u{25B8}  \u{00B7}  Esc {}",
+            i18n::t("wheel"),
+            i18n::t("close"),
         );
         self.modal = Some(modal);
         self.refresh_modal();
@@ -3075,13 +3106,225 @@ impl App {
             None => i18n::t("OFF").to_string(),
             Some(g) => self.gate_source_label(g.source),
         };
+        // `\u{25B8}` on the three that open a list of their own, so the row says
+        // which of the two gestures it takes: picked from a list, or turned.
         vec![
-            format!("  {:<12} {}", i18n::t("SOURCE"), source),
-            format!("  {:<12} {}", i18n::t("MODE"), g.mode.label()),
+            format!("  {:<12} {} \u{25B8}", i18n::t("SOURCE"), source),
+            format!(
+                "  {:<12} {} \u{25B8}",
+                i18n::t("TARGET"),
+                self.gate_target_label(entry, g)
+            ),
+            format!("  {:<12} {} \u{25B8}", i18n::t("MODE"), g.mode.label()),
             format!("  {:<12} {:>3.0}%", i18n::t("DEPTH"), g.depth * 100.0),
             format!("  {:<12} {:>4.2}", i18n::t("THRESHOLD"), g.threshold),
             format!("  {:<12} {:>4.0} ms", i18n::t("RELEASE"), g.release_ms),
         ]
+    }
+
+    /// The sequencer's metre dialogue: the bar it counts, and how it is
+    /// grouped.
+    ///
+    /// Opened from the box's `7/8` button, which used to open a list of the
+    /// dozen signatures somebody thought of. 5/8 and 7/4 exist; so does a 7/8
+    /// counted 3+2+2, which is the whole reason the grouping is here and not
+    /// only on the click.
+    fn open_seq_meter(&mut self) {
+        let mut modal = Modal::new(
+            ModalKind::SeqMeter,
+            views::modal::ListModal::new(
+                format!("{} \u{00B7} {}", i18n::t("SEQ"), i18n::t("TIME SIGNATURE")),
+                Vec::new(),
+            ),
+        );
+        modal.list.note = format!(
+            "  \u{2190}\u{2192} / {}  \u{00B7}  Enter / Esc {}",
+            i18n::t("wheel"),
+            i18n::t("close"),
+        );
+        self.modal = Some(modal);
+        self.refresh_modal();
+    }
+
+    fn seq_meter_rows(&self) -> Vec<String> {
+        let (num, den) = choz_ports::transport().time_signature();
+        let steps = self
+            .slots
+            .get(self.active_slot)
+            .map(|s| s.seq.settings.steps_per_beat())
+            .unwrap_or(1);
+        vec![
+            format!("  {:<12} {num:>5}", i18n::t("BEATS")),
+            format!("  {:<12} {den:>5}", i18n::t("UNIT")),
+            format!("  {:<12} {}", i18n::t("GROUPING"), grouping_label(num)),
+            // What the two above come to on the grid, which is the question
+            // the player actually has: how many cells is a beat.
+            format!(
+                "  {:<12} {} \u{00D7} {}",
+                i18n::t("STEPS"),
+                steps,
+                self.slots
+                    .get(self.active_slot)
+                    .map(|s| s.seq.settings.bar_steps())
+                    .unwrap_or(0)
+            ),
+        ]
+    }
+
+    /// Move one of those rows. The same arithmetic the metronome's menu does,
+    /// on the same transport — there is one bar in this program.
+    fn step_seq_meter_row(&mut self, i: usize, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        let t = choz_ports::transport();
+        let m = choz_engine::metronome::metronome();
+        let (num, den) = t.time_signature();
+        match i {
+            0 | 1 => {
+                let (n, d) = match i {
+                    0 => ((num as isize - 1 + delta).rem_euclid(32) as u16 + 1, den),
+                    _ => {
+                        let at = UNITS.iter().position(|u| *u == den).unwrap_or(2);
+                        (
+                            num,
+                            UNITS[(at as isize + delta).rem_euclid(UNITS.len() as isize) as usize],
+                        )
+                    }
+                };
+                t.set_time_signature(n, d);
+                // The old grouping counted a different bar; keeping it would
+                // accent beats that are no longer there.
+                m.set_groups(&[]);
+                self.ui.audio.time_sig = (n, d);
+                self.ui.save();
+            }
+            2 => {
+                let all = choz_engine::metronome::musical_groupings(num.min(255) as u8);
+                let now = m.groups();
+                let at = all.iter().position(|g| *g == now).unwrap_or(0) as isize;
+                let next = &all[(at + delta).rem_euclid(all.len() as isize) as usize];
+                m.set_groups(match next.len() {
+                    // The ungrouped bar is stored as no grouping at all.
+                    1 => &[],
+                    _ => next.as_slice(),
+                });
+            }
+            _ => return,
+        }
+        self.refresh_modal();
+    }
+
+    /// The rows of the gate dialogue that are a **list**, and what is in each.
+    ///
+    /// Three of the six are a choice out of many: what drives the gate (every
+    /// tab twice, plus the three clocks), which knob it moves (a plugin's whole
+    /// parameter list), and the two modes. Stepping those with an arrow key is
+    /// what the arrows are for when there are four answers and hopeless when
+    /// there are two hundred — so each opens as a list of its own, on top of
+    /// the dialogue, and comes back to it.
+    ///
+    /// `(title, items, the one it is on now)`. `None` for the three rows that
+    /// are values and are turned rather than picked.
+    fn gate_choice_rows(&self, row: usize) -> Option<(String, Vec<String>, usize)> {
+        let entry = self.fx_chain.get(self.fx_slot)?;
+        let g = entry.gate.unwrap_or_default();
+        let on = entry.gate.is_some();
+        match row {
+            0 => {
+                let mut items = vec![i18n::t("OFF").to_string()];
+                items.extend(
+                    Self::gate_sources(self.slots.len())
+                        .into_iter()
+                        .map(|s| self.gate_source_label(s)),
+                );
+                let at = match on {
+                    true => Self::gate_sources(self.slots.len())
+                        .iter()
+                        .position(|s| *s == g.source)
+                        .map(|i| i + 1)
+                        .unwrap_or(0),
+                    false => 0,
+                };
+                Some((i18n::t("SOURCE").to_string(), items, at))
+            }
+            1 => {
+                let mut items = vec![i18n::t("MIX").to_string()];
+                items.extend(entry.param_descs().iter().map(|d| d.name.to_string()));
+                Some((
+                    i18n::t("TARGET").to_string(),
+                    items,
+                    g.param.map(|i| i + 1).unwrap_or(0),
+                ))
+            }
+            2 => {
+                let all = choz_engine::fx_chain::GateMode::ALL;
+                Some((
+                    i18n::t("MODE").to_string(),
+                    all.iter().map(|m| m.label().to_string()).collect(),
+                    all.iter().position(|m| *m == g.mode).unwrap_or(0),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Open that list over the gate dialogue. Returns whether there was one.
+    fn open_gate_choice(&mut self, row: usize) -> bool {
+        let Some((title, items, cursor)) = self.gate_choice_rows(row) else {
+            return false;
+        };
+        let mut modal = Modal::new(
+            ModalKind::GateChoice(row),
+            views::modal::ListModal::new(format!("{} \u{00B7} {title}", i18n::t("GATE")), items),
+        );
+        modal.list.cursor = cursor;
+        self.modal = Some(modal);
+        self.refresh_modal();
+        true
+    }
+
+    /// Apply what was picked out of one of those lists, and go back to the
+    /// dialogue it was opened from — which is where the player was.
+    fn apply_gate_choice(&mut self, row: usize, i: usize) {
+        let Some(entry) = self.fx_chain.get(self.fx_slot) else {
+            return;
+        };
+        let mut g = entry.gate.unwrap_or_default();
+        let mut on = entry.gate.is_some();
+        match row {
+            0 => {
+                let sources = Self::gate_sources(self.slots.len());
+                on = i > 0;
+                if let Some(source) = i.checked_sub(1).and_then(|k| sources.get(k)) {
+                    g.source = *source;
+                }
+            }
+            // Row 0 of the list is the dry/wet, which is what `None` means.
+            1 => g.param = i.checked_sub(1),
+            2 => {
+                if let Some(mode) = choz_engine::fx_chain::GateMode::ALL.get(i) {
+                    g.mode = *mode;
+                }
+            }
+            _ => return,
+        }
+        // Every row but the source arms the gate: picking a knob for it to move
+        // is asking for a gate, and a setting that lands on an effect with none
+        // is a gesture that quietly does nothing.
+        if row > 0 {
+            on = true;
+        }
+        if let Some(entry) = self.fx_chain.get_mut(self.fx_slot) {
+            entry.gate = on.then_some(g);
+        }
+        // A gate is built into the chain, so it takes a rebuild — the same one
+        // a knob that is not live takes.
+        self.rebuild_fx();
+        self.open_fx_gate_modal();
+        if let Some(m) = self.modal.as_mut() {
+            m.list.cursor = row;
+        }
     }
 
     /// Move row `i` of that dialogue by `delta`, the way the metronome's menu
@@ -3114,14 +3357,26 @@ impl App {
                     g.source = sources[(next - 1) as usize];
                 }
             }
+            // The mix first, then every knob the effect has, then back to the
+            // mix. The mix is where it starts because it is the destination
+            // that means the same thing on all of them.
             1 => {
+                let n = entry.param_descs().len() as isize;
+                let at = match g.param {
+                    None => 0,
+                    Some(i) => i as isize + 1,
+                };
+                let next = (at + delta).rem_euclid(n + 1);
+                g.param = (next > 0).then(|| (next - 1) as usize);
+            }
+            2 => {
                 let all = choz_engine::fx_chain::GateMode::ALL;
                 let at = all.iter().position(|m| *m == g.mode).unwrap_or(0) as isize;
                 g.mode = all[(at + delta).rem_euclid(all.len() as isize) as usize];
             }
-            2 => g.depth = (g.depth + 0.1 * delta as f32).clamp(0.0, 1.0),
-            3 => g.threshold = (g.threshold + 0.05 * delta as f32).clamp(0.05, 1.0),
-            4 => g.release_ms = (g.release_ms + 20.0 * delta as f32).clamp(20.0, 2000.0),
+            3 => g.depth = (g.depth + 0.1 * delta as f32).clamp(0.0, 1.0),
+            4 => g.threshold = (g.threshold + 0.05 * delta as f32).clamp(0.05, 1.0),
+            5 => g.release_ms = (g.release_ms + 20.0 * delta as f32).clamp(20.0, 2000.0),
             _ => return,
         }
         if let Some(entry) = self.fx_chain.get_mut(self.fx_slot) {
@@ -3142,6 +3397,23 @@ impl App {
             .chain((0..tabs).map(GateSource::Note))
             .chain([GateSource::Clock, GateSource::Metronome, GateSource::Seq])
             .collect()
+    }
+
+    /// What the gate is moving: the effect's dry/wet, or one of its knobs by
+    /// the name the panel draws it under.
+    fn gate_target_label(
+        &self,
+        entry: &AudioFxEntry,
+        g: choz_engine::fx_chain::GateSpec,
+    ) -> String {
+        match g.param {
+            None => i18n::t("MIX").to_string(),
+            Some(i) => entry
+                .param_descs()
+                .get(i)
+                .map(|d| d.name.to_string())
+                .unwrap_or_else(|| format!("p{}", i + 1)),
+        }
     }
 
     /// What a gate source is called on the panel and in its picker.
@@ -4814,36 +5086,72 @@ impl App {
         }
     }
 
-    /// The THEME tab: a colour scheme picker, then the desktop background.
-    ///
-    /// The two halves are separated by a header row, the same trick the plugin
-    /// paths list uses: headers are labels, not options.
-    /// The rows and what each one does, built together.
+    /// Which half of the THEME tab is showing: Desktop or Palette.
+    fn theme_section(&self) -> usize {
+        match self.settings_tab() == TAB_THEME {
+            true => self.modal.as_ref().map_or(THEME_SEC_DESKTOP, |m| {
+                m.list.sidebar_cursor.min(THEME_SECTIONS.len() - 1)
+            }),
+            false => THEME_SEC_DESKTOP,
+        }
+    }
+
+    /// The rows of the THEME tab's current section and what each one does.
     ///
     /// One list rather than two functions doing the same arithmetic from
-    /// opposite ends: with the schemes now numbering in the hundreds, an index
-    /// map maintained by hand is a bug waiting for the next row to be inserted.
-    ///
-    /// The desktop controls come **first**. They used to sit under the scheme
-    /// list, which was fine with eleven schemes and unreachable with 372.
+    /// opposite ends: an index map maintained by hand is a bug waiting for the
+    /// next row to be inserted, and the desktop half grows and shrinks with
+    /// what the background is.
     fn theme_layout(&self) -> Vec<(String, Option<ThemeRow>)> {
-        let mut rows: Vec<(String, Option<ThemeRow>)> =
-            Vec::with_capacity(settings::THEMES.len() + 8);
-        rows.push(("DESKTOP".to_string(), None));
+        self.theme_layout_of(self.theme_section())
+    }
+
+    fn theme_layout_of(&self, section: usize) -> Vec<(String, Option<ThemeRow>)> {
+        if section == THEME_SEC_PALETTE {
+            return settings::THEMES
+                .iter()
+                .enumerate()
+                .map(|(k, t)| {
+                    let active =
+                        t.text == self.ui.text_color && Some(t.border) == self.ui.border_color;
+                    let mark = if active { "\u{25CF}" } else { "\u{25CB}" };
+                    let swatch = "\u{2588}\u{2588}";
+                    (
+                        format!(
+                            "  {mark} {:<24} {swatch} text  {swatch} frame  {}",
+                            t.name,
+                            match t.desktop {
+                                Some(_) => format!("{swatch} desktop"),
+                                None => "   (terminal)".to_string(),
+                            }
+                        ),
+                        Some(ThemeRow::Scheme(k)),
+                    )
+                })
+                .collect();
+        }
+
+        let mut rows: Vec<(String, Option<ThemeRow>)> = Vec::with_capacity(8);
+        // The palette by name, first: cycling it here applies at once, which is
+        // the whole question a theme picker answers.
         rows.push((
-            format!("  {:<18} {}", "Background", self.ui.background.label()),
+            setting_row(
+                "Palette",
+                format!("\u{2039} {} \u{203A}", self.ui.theme_name),
+            ),
+            Some(ThemeRow::Palette),
+        ));
+        rows.push((
+            setting_row("Background", self.ui.background.label()),
             Some(ThemeRow::Background),
         ));
         if let settings::Background::Image { fit, .. } = &self.ui.background {
-            rows.push((
-                format!("  {:<18} {}   (Enter cycles)", "Fit", fit.label()),
-                Some(ThemeRow::Fit),
-            ));
+            rows.push((setting_row("Fit", fit.label()), Some(ThemeRow::Fit)));
         }
-        // The panel wash: every section — IN/OUT, RACK, FX, the
-        // monitor — gets the same colour at the same strength, so the desktop
-        // reads through all of them equally. Absent on the terminal's own
-        // background, which choz cannot read and therefore cannot blend with.
+        // The panel wash: every section — IN/OUT, RACK, FX, the monitor — gets
+        // the same colour at the same strength, so the desktop reads through
+        // all of them equally. Absent on the terminal's own background, which
+        // choz cannot read and therefore cannot blend with.
         if !matches!(self.ui.background, settings::Background::Terminal) {
             // A slider, because the useful value is "as much as it takes to read
             // the knobs" and that is judged by eye, not typed.
@@ -4853,57 +5161,26 @@ impl App {
                 .chain(std::iter::repeat_n('\u{2591}', TINT_BAR_WIDTH - filled))
                 .collect();
             rows.push((
-                format!(
-                    "  {:<18} {bar} {pct:>3}%   (\u{2190}\u{2192})",
-                    "Panel opacity"
-                ),
+                setting_row("Panel opacity", format!("{bar} {pct:>3}%")),
                 Some(ThemeRow::Tint),
             ));
             rows.push((
-                format!(
-                    "  {:<18} {}   (\u{2190}\u{2192})",
-                    "Panel colour",
-                    self.ui.panel_tint_label()
-                ),
+                setting_row("Panel colour", self.ui.panel_tint_label()),
                 Some(ThemeRow::PanelColor),
             ));
         }
         rows.push((
-            format!("  {:<18} {}", "Pick an image...", "Enter opens the browser"),
+            setting_row("Background image", "Enter / BROWSE picks one"),
             Some(ThemeRow::PickImage),
         ));
         rows.push((
-            format!(
-                "  {:<18} {}",
-                "Clear background", "back to the terminal's own"
-            ),
+            setting_row("Clear background", "back to the terminal's own"),
             Some(ThemeRow::Clear),
         ));
         rows.push((
-            format!(
-                "  {:<18} {}",
-                "Apply and close", "keeps theme and background"
-            ),
+            setting_row("Apply and close", "keeps theme and background"),
             Some(ThemeRow::Done),
         ));
-
-        rows.push(("COLOUR SCHEME".to_string(), None));
-        for (k, t) in settings::THEMES.iter().enumerate() {
-            let active = t.text == self.ui.text_color && Some(t.border) == self.ui.border_color;
-            let mark = if active { "\u{25CF}" } else { "\u{25CB}" };
-            let swatch = "\u{2588}\u{2588}";
-            rows.push((
-                format!(
-                    "  {mark} {:<24} {swatch} text  {swatch} frame  {}",
-                    t.name,
-                    match t.desktop {
-                        Some(_) => format!("{swatch} desktop"),
-                        None => "   (terminal)".to_string(),
-                    }
-                ),
-                Some(ThemeRow::Scheme(k)),
-            ));
-        }
         rows
     }
 
@@ -4929,6 +5206,26 @@ impl App {
             return false;
         };
         match row {
+            // Enter on the name jumps to the list, standing on the scheme now
+            // worn: browsing several hundred starts where you are, not at the
+            // top.
+            ThemeRow::Palette => {
+                let at = settings::THEMES
+                    .iter()
+                    .position(|t| t.name == self.ui.theme_name)
+                    .unwrap_or(0);
+                if let Some(m) = self.modal.as_mut() {
+                    m.list.sidebar_cursor = THEME_SEC_PALETTE;
+                    m.list.sidebar_focused = false;
+                    m.list.cursor = at;
+                    m.list.scroll = 0;
+                }
+                self.refresh_modal();
+                if let Some(m) = self.modal.as_mut() {
+                    m.list.cursor = at.min(m.list.items.len().saturating_sub(1));
+                }
+                return false;
+            }
             ThemeRow::Scheme(k) => {
                 if let Some(theme) = settings::THEMES.get(k) {
                     self.ui.apply_theme(theme);
@@ -4990,6 +5287,74 @@ impl App {
         false
     }
 
+    /// Step the colour scheme by `delta` and wear it at once: the palette row
+    /// is judged by what the screen looks like, not by its name.
+    fn step_palette(&mut self, delta: isize) {
+        let n = settings::THEMES.len() as isize;
+        if n == 0 {
+            return;
+        }
+        let now = settings::THEMES
+            .iter()
+            .position(|t| t.name == self.ui.theme_name)
+            .unwrap_or(0) as isize;
+        let next = (((now + delta) % n) + n) % n;
+        if let Some(theme) = settings::THEMES.get(next as usize) {
+            self.ui.apply_theme(theme);
+        }
+        self.apply_ui_settings();
+    }
+
+    /// `←`/`→` — and the wheel — on a THEME row. True when the row took it,
+    /// which is what keeps those keys from falling through to the tab chips.
+    fn theme_value_step(&mut self, delta: isize) -> bool {
+        if self.settings_tab() != TAB_THEME {
+            return false;
+        }
+        let cursor = self.modal.as_ref().map_or(0, |m| m.list.cursor);
+        match self.theme_row(cursor) {
+            Some(ThemeRow::Palette) => self.step_palette(delta),
+            Some(ThemeRow::Tint) => self.step_tint(delta as i16 * TINT_STEP as i16),
+            Some(ThemeRow::PanelColor) => {
+                self.ui.step_panel_tint(delta as i32);
+                self.ui.save();
+                self.apply_ui_settings();
+            }
+            // Two-state rows: either direction is the other state, which is
+            // what a wheel over a switch should do.
+            Some(ThemeRow::Background) | Some(ThemeRow::Fit) => {
+                self.theme_select(cursor);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// The wheel over a Settings row: the value under the pointer, when that
+    /// row has one, and otherwise `false` so the list scrolls as usual.
+    fn settings_wheel(&mut self, row: usize, delta: isize) -> bool {
+        if self.modal.as_ref().map(|m| m.kind) != Some(ModalKind::PluginPaths) {
+            return false;
+        }
+        if let Some(m) = self.modal.as_mut() {
+            if m.list.sidebar_focused || row >= m.list.items.len() {
+                return false;
+            }
+            m.list.cursor = row;
+        }
+        let key = match delta > 0 {
+            true => KeyCode::Right,
+            false => KeyCode::Left,
+        };
+        match self.settings_tab() {
+            TAB_THEME => self.theme_value_step(delta),
+            // Engine and OSC rows are values; the plugin paths are a list, and
+            // a wheel over a list scrolls it.
+            TAB_AUDIO if self.audio_section() != SEC_PATHS => self.audio_settings_key(key),
+            _ => false,
+        }
+    }
+
     /// Move the panel opacity by `delta` percent and apply it at once, so the
     /// slider is judged against the real screen.
     ///
@@ -5027,6 +5392,143 @@ impl App {
         ));
         self.modal = Some(modal);
         self.refresh_modal();
+    }
+
+    /// Start typing a knob's name on the instrument box.
+    ///
+    /// The box's other way through a long list is the pager, one screen at a
+    /// time; on Surge XT's 774 parameters `A Filter 1 Cutoff` is twenty-six
+    /// screens in. This is the same list, jumped rather than walked — the
+    /// search the SOURCE and ADD FX pickers already have, on the one list that
+    /// is not in a picker.
+    fn open_instr_search(&mut self) {
+        if self.instr_knob_count() == 0 {
+            return;
+        }
+        self.rack_focus = RackFocus::Instrument;
+        self.instr_search = Some(String::new());
+    }
+
+    /// Every knob the typed words point at, in list order.
+    ///
+    /// **Words, not a substring, and the section counts as part of the name.**
+    /// Surge XT calls its knob `A Filter 1 Cutoff` and files it under
+    /// `A Filters`; a player who saw `Cutoff` on the plugin's own window and
+    /// typed `filter cutoff` — the obvious thing to type — matched nothing at
+    /// all with a plain `contains`, because those two words are not next to
+    /// each other in any name the plugin publishes. Each word has to appear
+    /// somewhere; the order is the player's business.
+    ///
+    /// Case is ignored: nobody types `Filter 1 Cutoff` with the capitals right.
+    fn instr_search_hits(&self, query: &str) -> Vec<usize> {
+        let words: Vec<String> = query.split_whitespace().map(|w| w.to_lowercase()).collect();
+        if words.is_empty() {
+            return Vec::new();
+        }
+        let Some(s) = self.slots.get(self.active_slot) else {
+            return Vec::new();
+        };
+        s.instr_params
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                let hay = match &p.group {
+                    Some(g) => format!("{g} {}", p.name).to_lowercase(),
+                    None => p.name.to_lowercase(),
+                };
+                words.iter().all(|w| hay.contains(w.as_str()))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// What the search box shows: the letters, and **how many knobs they
+    /// match** — `0` for a word the plugin does not use, which is the answer a
+    /// player needs to see rather than a cursor that quietly did not move.
+    fn instr_search_label(&self) -> Option<(String, usize, usize)> {
+        let query = self.instr_search.clone()?;
+        let hits = self.instr_search_hits(&query);
+        let at = hits
+            .iter()
+            .position(|i| *i == self.instr_param)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        Some((query, at, hits.len()))
+    }
+
+    /// Put the cursor on the `delta`-th match from where it is: `0` is the
+    /// first match at or after the cursor, which is what a letter typed into
+    /// the box asks for, and `±1` walks the matches with the arrows.
+    ///
+    /// The box draws whichever segment the cursor is in, so moving it *is*
+    /// paging: nothing here has to know which page a knob is on.
+    fn jump_to_instr_match(&mut self, delta: isize) {
+        let Some(query) = self.instr_search.clone() else {
+            return;
+        };
+        let hits = self.instr_search_hits(&query);
+        if hits.is_empty() {
+            return;
+        }
+        let at = hits.iter().position(|i| *i >= self.instr_param);
+        let next = match (delta, at) {
+            (0, Some(i)) => i,
+            (0, None) => 0,
+            // Walking the matches: from the one the cursor is on, or from the
+            // one it would land on next.
+            (d, _) => {
+                let here = hits
+                    .iter()
+                    .position(|i| *i == self.instr_param)
+                    .map(|i| i as isize)
+                    .unwrap_or(at.map(|i| i as isize).unwrap_or(0) - (d > 0) as isize);
+                (here + d).rem_euclid(hits.len() as isize) as usize
+            }
+        };
+        self.instr_param = hits[next];
+        self.clamp_instr_cursor();
+    }
+
+    /// A key while the knob search is open. Everything goes into it until it is
+    /// closed — a search that lets `q` through is a search that quits choz.
+    fn instr_search_key(&mut self, key: KeyCode) -> bool {
+        let Some(mut query) = self.instr_search.take() else {
+            return false;
+        };
+        match key {
+            KeyCode::Esc | KeyCode::Enter => return true,
+            KeyCode::Char(c) if !c.is_control() => {
+                query.push(c);
+                self.instr_search = Some(query);
+                self.jump_to_instr_match(0);
+                return true;
+            }
+            KeyCode::Backspace => {
+                // Backspacing past the start is the way out, the same as it is
+                // in the pickers.
+                if query.pop().is_none() {
+                    return true;
+                }
+            }
+            // The matches, one at a time, without leaving the search: a plugin
+            // has four `Cutoff`s and the second one is usually the one meant.
+            KeyCode::Down | KeyCode::Tab | KeyCode::Right => {
+                self.instr_search = Some(query);
+                self.jump_to_instr_match(1);
+                return true;
+            }
+            KeyCode::Up | KeyCode::BackTab | KeyCode::Left => {
+                self.instr_search = Some(query);
+                self.jump_to_instr_match(-1);
+                return true;
+            }
+            // Anything else is swallowed rather than acted on: while this is
+            // open the keyboard belongs to it.
+            _ => {}
+        }
+        self.instr_search = Some(query);
+        self.jump_to_instr_match(0);
+        true
     }
 
     /// Which AUDIO sub-category is showing (Engine / Plugin Paths / OSC).
@@ -5076,29 +5578,23 @@ impl App {
             },
         };
         let mut rows = vec![
-            format!("  {:>14}  {}", "Backend", backend),
-            format!("  {:>14}  {}", "Device", device),
-            format!("  {:>14}  {}", "Input", input),
-            format!(
-                "  {:>14}  {} Hz",
+            setting_row("Backend", backend),
+            setting_row("Device", device),
+            setting_row("Input", input),
+            setting_row(
                 "Sample rate",
-                pending(a.sample_rate, running.map(|r| r.0))
+                format!("{} Hz", pending(a.sample_rate, running.map(|r| r.0))),
             ),
-            format!(
-                "  {:>14}  {} samples",
+            setting_row(
                 "Buffer size",
-                pending(a.buffer_size, running.map(|r| r.1))
+                format!("{} samples", pending(a.buffer_size, running.map(|r| r.1))),
             ),
             // The host clock every tempo-synced plugin reads. Shown from the
             // transport itself, which is the thing plugins actually see.
-            format!(
-                "  {:>14}  {:.1} BPM",
-                "Tempo",
-                choz_ports::transport().bpm()
-            ),
+            setting_row("Tempo", format!("{:.1} BPM", choz_ports::transport().bpm())),
             {
                 let (num, den) = choz_ports::transport().time_signature();
-                format!("  {:>14}  {num}/{den}", "Time signature")
+                setting_row("Time signature", format!("{num}/{den}"))
             },
             // What it is doing right now, not just whether it is armed: a
             // guard that has caught something is the one thing worth seeing
@@ -5110,44 +5606,41 @@ impl App {
                     (true, false) => "ON".to_string(),
                     (true, true) => format!("ON  (holding {db:.0} dB)"),
                 };
-                format!("  {:>14}  {state}", "Feedback guard")
+                setting_row("Feedback guard", state)
             },
             // choz only builds oxisynth; the row exists so the setting matches
             // seqterm's file, not to pretend there is a choice.
-            format!(
-                "  {:>14}  {} (only engine built in)",
-                "SF2 engine", a.sf2_engine
+            setting_row(
+                "SF2 engine",
+                format!("{} (only engine built in)", a.sf2_engine),
             ),
-            format!("  {:>14}  {:.1} ms", "Latency", a.latency_ms()),
+            setting_row("Latency", format!("{:.1} ms", a.latency_ms())),
         ];
         // Backend-specific extras, read-only (edit them in the config file).
         match a.backend.to_uppercase().as_str() {
-            "ALSA" => rows.push(format!(
-                "  {:>14}  {}",
+            "ALSA" => rows.push(setting_row(
                 "ALSA hw dev",
                 if a.alsa_hw_device.is_empty() {
                     "(default)"
                 } else {
                     &a.alsa_hw_device
-                }
+                },
             )),
-            "JACK" => rows.push(format!(
-                "  {:>14}  {}",
+            "JACK" => rows.push(setting_row(
                 "JACK server",
                 if a.jack_server_name.is_empty() {
                     "(default)"
                 } else {
                     &a.jack_server_name
-                }
+                },
             )),
-            _ => rows.push(format!(
-                "  {:>14}  {}",
+            _ => rows.push(setting_row(
                 "PW quantum",
                 if a.pipewire_quantum == 0 {
                     "system".to_string()
                 } else {
                     a.pipewire_quantum.to_string()
-                }
+                },
             )),
         }
         rows
@@ -5169,27 +5662,18 @@ impl App {
             None => "\u{25CB} stopped".to_string(),
         };
         vec![
-            format!(
-                "  {:>12}  {}",
-                "Enable OSC",
-                if o.enabled { "On" } else { "Off" }
-            ),
-            format!("  {:>12}  {mode}", "Port mode"),
-            format!(
-                "  {:>12}  {}",
-                "UDP port",
-                port_field(2, o.udp_port.to_string())
-            ),
-            format!(
-                "  {:>12}  {}",
+            setting_row("Enable OSC", if o.enabled { "On" } else { "Off" }),
+            setting_row("Port mode", mode),
+            setting_row("UDP port", port_field(2, o.udp_port.to_string())),
+            setting_row(
                 "TCP port",
                 port_field(
                     3,
-                    format!("{}  (stored — the server is UDP-only)", o.tcp_port)
-                )
+                    format!("{}  (stored — the server is UDP-only)", o.tcp_port),
+                ),
             ),
             String::new(),
-            format!("  {:>12}  {live}", "server"),
+            setting_row("server", live),
         ]
     }
 
@@ -5796,6 +6280,7 @@ impl App {
             ModalKind::Metronome => self.metronome_rows(),
             ModalKind::Clock => self.clock_rows().into_iter().map(|(_, l)| l).collect(),
             ModalKind::FxGate => self.fx_gate_rows(),
+            ModalKind::SeqMeter => self.seq_meter_rows(),
             ModalKind::ChordInput => self
                 .chord_input_rows()
                 .into_iter()
@@ -5830,12 +6315,13 @@ impl App {
             | ModalKind::ArpChoice
             | ModalKind::InputConfirm(..)
             | ModalKind::QuitConfirm
+            | ModalKind::NewConfirm
             | ModalKind::MixerDest(_)
             | ModalKind::SeqChoice(_)
             | ModalKind::LoopQuant(_)
+            // Built when it opened, out of the row it is choosing for.
+            | ModalKind::GateChoice(_)
             | ModalKind::InstrChoice => return,
-            // Built when the import ran; there is nothing to re-read.
-            ModalKind::MaxReport => return,
             ModalKind::Learn => {
                 let targets = self.modal.as_ref().unwrap().targets.clone();
                 targets
@@ -5940,8 +6426,7 @@ impl App {
             ModalKind::AddPath
             | ModalKind::LoopExport
             | ModalKind::SaveProject
-            | ModalKind::LoadProject
-            | ModalKind::ImportMax => self
+            | ModalKind::LoadProject => self
                 .modal
                 .as_ref()
                 .unwrap()
@@ -5991,38 +6476,59 @@ impl App {
             );
             // The AUDIO tab splits into Engine / Plugin Paths / OSC down the
             // side, the way seqterm's AUDIO SETTINGS does.
-            let sidebar: Vec<(String, usize)> = if tab == TAB_AUDIO {
-                title = format!("{title} \u{00B7} {}", AUDIO_SECTIONS[section.min(2)]);
-                AUDIO_SECTIONS
-                    .iter()
-                    .enumerate()
-                    .map(|(i, name)| {
-                        let n = match i {
-                            SEC_ENGINE => ENGINE_ROWS.len(),
-                            SEC_PATHS => self.plugin_paths.all_enabled().len(),
-                            _ => OSC_ROWS.len(),
-                        };
-                        (name.to_string(), n)
-                    })
-                    .collect()
-            } else {
-                Vec::new()
+            let sidebar: Vec<(String, usize)> = match tab {
+                TAB_AUDIO => {
+                    title = format!("{title} \u{00B7} {}", AUDIO_SECTIONS[section.min(2)]);
+                    AUDIO_SECTIONS
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| {
+                            let n = match i {
+                                SEC_ENGINE => ENGINE_ROWS.len(),
+                                SEC_PATHS => self.plugin_paths.all_enabled().len(),
+                                _ => OSC_ROWS.len(),
+                            };
+                            (name.to_string(), n)
+                        })
+                        .collect()
+                }
+                // The THEME tab splits the same way: the desktop controls stay
+                // in reach whichever end of several hundred schemes the list is
+                // scrolled to.
+                TAB_THEME => {
+                    let sec = self.theme_section();
+                    title = format!("{title} \u{00B7} {}", THEME_SECTIONS[sec]);
+                    vec![
+                        (
+                            THEME_SECTIONS[THEME_SEC_DESKTOP].to_string(),
+                            self.theme_layout_of(THEME_SEC_DESKTOP).len(),
+                        ),
+                        (
+                            THEME_SECTIONS[THEME_SEC_PALETTE].to_string(),
+                            settings::THEMES.len(),
+                        ),
+                    ]
+                }
+                _ => Vec::new(),
             };
             let (note, actions) = match (tab, section) {
                 (TAB_AUDIO, SEC_ENGINE) => (
-                    "  \u{2190}\u{2192}=change  \u{00B7}  backend, sample rate and buffer apply on the next start"
+                    "  \u{2190}\u{2192} / wheel change  \u{00B7}  backend, sample rate and buffer apply on the next start"
                         .to_string(),
                     Vec::new(),
                 ),
                 (TAB_AUDIO, SEC_OSC) => (
-                    "  \u{2190}\u{2192}=change  Enter=toggle / type a port  \u{00B7}  applies immediately"
+                    "  \u{2190}\u{2192} / wheel change  \u{00B7}  Enter toggles or types a port  \u{00B7}  applies immediately"
                         .to_string(),
                     Vec::new(),
                 ),
                 (TAB_THEME, _) => (
-                    "  Enter / SELECT applies the colour to text and borders, and closes"
+                    "  \u{2190}\u{2192} / wheel change  \u{00B7}  Enter applies  \u{00B7}  every change is live and saved"
                         .to_string(),
-                    Vec::new(),
+                    vec![
+                        (i18n::t("BROWSE").to_string(), 'b'),
+                        (i18n::t("CLEAR").to_string(), 'd'),
+                    ],
                 ),
                 (TAB_LANG, _) => (
                     "  Enter / SELECT switches the interface language and closes".to_string(),
@@ -6296,11 +6802,23 @@ impl App {
             // Every bar is already on the instrument as it moves; Enter is how
             // the view is left.
             ModalKind::Harmonics => true,
-            ModalKind::FxGate => {
-                self.step_fx_gate_row(i, 1);
-                // Stays open, like the metronome's: wiring a gate is done by
-                // hearing it, and closing after each step would make that four
-                // round trips.
+            // **Enter closes; it does not step.** This dialogue is a sheet of
+            // settings, not a list of choices: every row is already moved by
+            // `\u{2190}\u{2192}` and by the wheel, and each move is applied and heard at
+            // once. Enter used to step the row under the cursor as the
+            // metronome's menu does, so a player who picked `Rate` and pressed
+            // Enter to accept it walked the target on to `Depth`, and to
+            // `Shape` if they pressed it again — the setting drifting away from
+            // what they had just chosen, with nothing on screen to say why.
+            // Enter opens the row's own list where it has one — the source,
+            // the target knob, the mode — and closes on the three that are
+            // values, which are turned with `\u{2190}\u{2192}` and the wheel. It must never
+            // *step* a row: accepting `Rate` used to walk it on to `Depth`.
+            ModalKind::FxGate => !self.open_gate_choice(i),
+            // Rows that are turned, not picked: Enter accepts and leaves.
+            ModalKind::SeqMeter => true,
+            ModalKind::GateChoice(row) => {
+                self.apply_gate_choice(row, i);
                 false
             }
             ModalKind::Learn => {
@@ -6342,6 +6860,24 @@ impl App {
                         self.quit = self.modal.is_none() && !self.project_is_dirty();
                     }
                     1 => self.quit = true,
+                    _ => {}
+                }
+                true
+            }
+            ModalKind::NewConfirm => {
+                match i {
+                    // Same order as the way out, and the same rule: only start
+                    // over once the work is actually on disk. An unnamed
+                    // project opens the name prompt, and clearing the rack
+                    // while that is up is the loss this question exists for.
+                    0 => {
+                        self.modal = None;
+                        self.save_project();
+                        if self.modal.is_none() && !self.project_is_dirty() {
+                            self.new_project();
+                        }
+                    }
+                    1 => self.new_project(),
                     _ => {}
                 }
                 true
@@ -6495,32 +7031,6 @@ impl App {
                     None => true,
                 }
             }
-            ModalKind::ImportMax => {
-                let picked = self.modal.as_mut().and_then(|m| {
-                    let b = m.browser.as_mut()?;
-                    b.cursor = i;
-                    b.select()
-                });
-                match picked {
-                    Some(file_browser::Action::EnterDir(d)) => {
-                        if let Some(b) = self.modal.as_mut().and_then(|m| m.browser.as_mut()) {
-                            b.set_dir(d);
-                        }
-                        self.refresh_modal();
-                        false
-                    }
-                    Some(file_browser::Action::PickFile(file)) => {
-                        self.import_maxpat(&file);
-                        // The report replaces this modal rather than closing it:
-                        // what an import could **not** do is the half worth
-                        // reading, and a log line is not where anybody looks.
-                        false
-                    }
-                    None => true,
-                }
-            }
-            // Nothing to select: it is a list of what happened.
-            ModalKind::MaxReport => true,
             ModalKind::SaveProject => {
                 // While the name is being typed the list is only a backdrop:
                 // a stray click must not re-pick the directory under it. The
@@ -6843,6 +7353,7 @@ impl App {
                             loops: Vec::new(),
                             gate: e.gate.map(|g| project::Gate {
                                 source: project::GateSource::from_engine(g.source),
+                                param: g.param,
                                 duck: g.mode == choz_engine::fx_chain::GateMode::Duck,
                                 depth: g.depth,
                                 threshold: g.threshold,
@@ -7245,6 +7756,7 @@ impl App {
                     entry.chord_port = f.chord_port.clone();
                     entry.gate = f.gate.as_ref().map(|g| choz_engine::fx_chain::GateSpec {
                         source: g.source.to_engine(),
+                        param: g.param,
                         mode: match g.duck {
                             true => choz_engine::fx_chain::GateMode::Duck,
                             false => choz_engine::fx_chain::GateMode::Open,
@@ -7473,80 +7985,6 @@ impl App {
         self.refresh_modal();
     }
 
-    /// File > Import Max patch: pick the `.maxpat`, then keep what can be kept.
-    fn open_import_max(&mut self) {
-        let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let mut modal = Modal::new(
-            ModalKind::ImportMax,
-            views::modal::ListModal::new("IMPORT MAX PATCH", Vec::new()),
-        );
-        modal.browser = Some(file_browser::FileBrowser::open(&start, &["maxpat"]));
-        modal.list.note =
-            "  Max cannot be run here - what has an equivalent is kept, the rest is named"
-                .to_string();
-        self.modal = Some(modal);
-        self.refresh_modal();
-    }
-
-    /// Read a Max patch into the active tab's FX chain, then show what happened.
-    ///
-    /// **There is no Max runtime**, here or anywhere embeddable, so this is an
-    /// import and not a host: the objects with a real equivalent among choz's
-    /// own effects become effects, and every object without one is named. A
-    /// patch that comes back as two effects and nine names is telling the
-    /// truth about itself.
-    fn import_maxpat(&mut self, path: &std::path::Path) {
-        let import = match choz_engine::maxpat::read_maxpat(path) {
-            Ok(import) => import,
-            Err(e) => {
-                eprintln!("choz: {}: {e}", path.display());
-                self.modal = None;
-                return;
-            }
-        };
-        let mut lines: Vec<String> = Vec::new();
-        let mut added = 0usize;
-        let mut over = 0usize;
-        for spec in &import.chain {
-            let Some(kind) = source::AudioFxKind::from_id(&spec.kind) else {
-                continue;
-            };
-            if self.fx_chain.len() >= source::MAX_FX {
-                over += 1;
-                continue;
-            }
-            self.fx_chain.push(AudioFxEntry::new(kind));
-            added += 1;
-            lines.push(format!("  + {}", kind.label()));
-        }
-        if added > 0 {
-            self.rebuild_fx();
-        }
-        if over > 0 {
-            lines.push(format!(
-                "  \u{00B7} {over} more did not fit: a chain holds {}",
-                source::MAX_FX
-            ));
-        }
-        for object in &import.dropped {
-            lines.push(format!("  \u{2014} no equivalent: {object}"));
-        }
-        if !import.followed_cords {
-            lines.push("  \u{00B7} read in file order: no adc~ or plugin~ to follow".to_string());
-        }
-        if lines.is_empty() {
-            lines.push("  nothing in this patch has an equivalent here".to_string());
-        }
-        eprintln!("choz: {}", import.summary());
-
-        let mut modal = Modal::new(
-            ModalKind::MaxReport,
-            views::modal::ListModal::new(format!("IMPORTED {}", import.name), lines),
-        );
-        modal.list.note = "  Max patches are not run here; this is what could be kept".to_string();
-        self.modal = Some(modal);
-    }
-
     fn load_project_from(&mut self, path: &std::path::Path) {
         match project::Project::load(path) {
             Ok(p) => {
@@ -7576,6 +8014,58 @@ impl App {
             // saved rather than nagging.
             None => false,
         }
+    }
+
+    /// File \u{2192} New project: an empty rack, and no file to save it back
+    /// to.
+    ///
+    /// The machine's own settings — devices, plugin paths, colours, language —
+    /// are not the project's and stay exactly as they are. What goes is the
+    /// rack, what the controllers were taught about it, and the automation
+    /// recorded against it.
+    fn new_project(&mut self) {
+        while !self.slots.is_empty() {
+            self.remove_slot(self.slots.len() - 1);
+        }
+        self.cc_bindings.clear();
+        self.pc_bindings.clear();
+        self.automation = automation::Automation::default();
+        self.project_file = None;
+        self.active_slot = 0;
+        self.focus = Focus::FxChain;
+        self.modal = None;
+        // The baseline for "is there anything to lose": an empty rack nobody
+        // has touched yet is not unsaved work, and asking about it on the way
+        // out is the nag that makes the question ignorable.
+        self.saved_project = Some(self.project_snapshot());
+    }
+
+    /// File \u{2192} New project, asking first when there is something to lose.
+    fn request_new_project(&mut self) {
+        if !self.project_is_dirty() {
+            self.new_project();
+            return;
+        }
+        if self.modal.is_some() {
+            self.close_modal();
+        }
+        let items = vec![
+            i18n::t("SAVE AND START A NEW ONE").to_string(),
+            i18n::t("DISCARD AND START A NEW ONE").to_string(),
+            i18n::t("CANCEL").to_string(),
+        ];
+        let mut modal = Modal::new(
+            ModalKind::NewConfirm,
+            views::modal::ListModal::new(i18n::t("UNSAVED PROJECT").to_string(), items),
+        );
+        modal.list.note = match self.project_file.as_ref() {
+            Some(f) => format!("  {}", f.display()),
+            None => format!("  {}", i18n::t("this project has never been saved")),
+        };
+        // On the safe answer, like the way out: Enter on a dialogue nobody read
+        // must not be the thing that throws the rack away.
+        modal.list.cursor = 0;
+        self.modal = Some(modal);
     }
 
     /// The way out. Asks first when there is something to lose.
@@ -8072,7 +8562,13 @@ impl App {
     /// configurations of it, a tab on another keyboard is not.
     fn tab_listens_to(&self, tab: usize, source: choz_engine::input::InputSource) -> bool {
         let from = self.source_ref(source);
-        from.is_some() && self.slots.get(tab).and_then(|s| s.input.as_ref()) == from.as_ref()
+        from.is_some()
+            && self
+                .slots
+                .get(tab)
+                .and_then(|s| s.input.as_ref())
+                .zip(from.as_ref())
+                .is_some_and(|(a, b)| a.same_port(b))
     }
 
     /// Every tab bound to `input`, in tab order.
@@ -8080,7 +8576,7 @@ impl App {
         self.slots
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.input.as_ref() == Some(input))
+            .filter(|(_, s)| s.input.as_ref().is_some_and(|i| i.same_port(input)))
             .map(|(i, _)| i)
             .collect()
     }
@@ -8142,7 +8638,8 @@ impl App {
             // both sending CC 1 are two bindings, not one being overwritten.
             let from = self.source_ref(source);
             self.cc_bindings.retain(|b| {
-                (b.cc != cc || b.source != from || coexists(&b.target)) && b.target != target
+                (b.cc != cc || !same_source(&b.source, &from) || coexists(&b.target))
+                    && b.target != target
             });
             self.cc_bindings.push(CcBinding {
                 source: from,
@@ -8171,7 +8668,7 @@ impl App {
             }
             // A binding with no source is from before they had one (or from the
             // QWERTY piano): it answers anything, as it always did.
-            if binding.source.is_some() && binding.source != from {
+            if binding.source.is_some() && !same_source(&binding.source, &from) {
                 continue;
             }
             if let (Some(slot), Some(owners)) = (target_slot(&binding.target), owners.as_ref()) {
@@ -8179,6 +8676,23 @@ impl App {
                 // One tab on the port (or a tab elsewhere) is not a conflict —
                 // the binding already names what it moves.
                 if owners.len() > 1 && owners.contains(&slot) && !playing.contains(&slot) {
+                    continue;
+                }
+            }
+            // One CC taught to two units of the same tab is the one case where
+            // the selection decides: the same fader drives 1:REVERB Room *and*
+            // 2:TUBE Drive, and the unit on the panel is the one it moves.
+            // Asked here because this is the only place that can see both
+            // bindings; with a single binding there is no choice to make and
+            // the unit it names moves — which is what a player who learned one
+            // knob expects, whatever they click next.
+            if let Some((slot, fx)) = fx_scope(&binding.target) {
+                let rivals = self.cc_bindings.iter().filter(|b| {
+                    b.cc == cc
+                        && fx_scope(&b.target).is_some_and(|(s, f)| s == slot && f != fx)
+                        && (b.source.is_none() || same_source(&b.source, &from))
+                });
+                if rivals.count() > 0 && slot == self.active_slot && fx != self.fx_slot {
                     continue;
                 }
             }
@@ -8277,11 +8791,20 @@ impl App {
                     self.set_background_fx_param(slot, fx, param, v);
                     return;
                 }
-                if fx != self.fx_slot {
-                    // The selected FX unit owns the fader; the same CC bound
-                    // to another unit stays quiet until that unit is picked.
-                    return;
-                }
+                // **The binding names the unit, so the unit moves** — whether
+                // or not the panel happens to be showing it.
+                //
+                // This used to bail unless `fx` was the selected unit, which is
+                // what made a learned CC stop working the moment the player
+                // clicked another effect in the chain: the knob was assigned,
+                // the assignment was saved, and nothing moved. It also silenced
+                // automation lanes recorded on any unit but the selected one,
+                // and it disagreed with the branch above, where a tab that is
+                // not even in front moves its effects perfectly well.
+                //
+                // Where the selection still decides is one CC learned onto
+                // *several* units of one tab — see [`App::apply_cc`], which is
+                // the only place that can see there is a choice to make.
                 self.set_fx_param(fx, param, v);
             }
         }
@@ -8365,7 +8888,10 @@ impl App {
 
     fn input_is_connected(&self, input: &InputRef) -> bool {
         match input {
-            InputRef::Midi(name) => !self.midi_disabled.contains(name),
+            InputRef::Midi(name) => !self
+                .midi_disabled
+                .iter()
+                .any(|n| port_key(n) == port_key(name)),
             InputRef::Osc => self.osc_port.is_some(),
         }
     }
@@ -8374,7 +8900,7 @@ impl App {
     fn bound_tab(&self, input: &InputRef) -> Option<usize> {
         self.slots
             .iter()
-            .position(|s| s.input.as_ref() == Some(input))
+            .position(|s| s.input.as_ref().is_some_and(|i| i.same_port(input)))
     }
 
     /// Every row of the IN drawer: the note inputs first, then the audio
@@ -8786,7 +9312,11 @@ impl App {
         };
         match input {
             InputRef::Midi(name) => {
-                match self.midi_disabled.iter().position(|n| *n == name) {
+                match self
+                    .midi_disabled
+                    .iter()
+                    .position(|n| port_key(n) == port_key(&name))
+                {
                     Some(i) => {
                         self.midi_disabled.remove(i);
                     }
@@ -9246,7 +9776,9 @@ impl App {
             .slots
             .iter()
             .enumerate()
-            .filter(|(i, s)| *i != self.active_slot && s.input.as_ref() == Some(input))
+            .filter(|(i, s)| {
+                *i != self.active_slot && s.input.as_ref().is_some_and(|x| x.same_port(input))
+            })
             .count();
         (shared > 0).then_some(slot.channel)
     }
@@ -10216,7 +10748,11 @@ impl App {
             }
             let mut events = Vec::new();
             if playing {
-                slot.seq.play();
+                // Started by the transport, so counted by it — see
+                // [`choz_engine::seq::Seq::play_on_transport`]: its own clock
+                // in the gap before the first audio block fired the downbeat a
+                // second time, which is heard as the tab doubling.
+                slot.seq.play_on_transport();
             } else {
                 slot.seq.stop(&mut events);
             }
@@ -10704,7 +11240,9 @@ impl App {
             let tab = Some(self.active_slot);
             let from = self.source_ref(source);
             self.pc_bindings.retain(|b| {
-                b.tab != tab || b.source != from || (b.program != program && b.target != target)
+                b.tab != tab
+                    || !same_source(&b.source, &from)
+                    || (b.program != program && b.target != target)
             });
             self.pc_bindings.push(PcBinding {
                 program,
@@ -10725,7 +11263,9 @@ impl App {
             .iter()
             // A binding from before buttons knew their controller answers
             // anything, as it always did.
-            .filter(|b| b.program == program && (b.source.is_none() || b.source == from))
+            .filter(|b| {
+                b.program == program && (b.source.is_none() || same_source(&b.source, &from))
+            })
             .cloned()
             .collect();
         // The tab in front answers first, so a button learned twice on one
@@ -12660,6 +13200,19 @@ fn handle_key(app: &mut App, key: KeyCode) {
         app.end_learn();
         return;
     }
+    // The knob search owns the keyboard while it is open, and it is opened
+    // from the rack rather than from a modal — so it is asked first, before
+    // `q` quits and before the letters mean what they mean everywhere else.
+    if app.instr_search.is_some() {
+        // A modal opened over it (with the mouse, since the keyboard is the
+        // search's while it is up) leaves a search nobody can type into: it
+        // closes rather than sitting lit on the box's edge.
+        match app.modal.is_some() {
+            true => app.instr_search = None,
+            false if app.instr_search_key(key) => return,
+            false => {}
+        }
+    }
     if key == KeyCode::Char('q') && app.modal.is_none() {
         app.request_quit();
         return;
@@ -13024,6 +13577,16 @@ fn handle_modal_key(app: &mut App, key: KeyCode) {
                 m.list.move_cursor(10);
             }
         }
+        // A THEME row that holds a value owns the arrows: the palette, the
+        // wash and its colour change in place. Only rows without one fall
+        // through to the panes and the tab chips.
+        KeyCode::Left | KeyCode::Right
+            if kind == ModalKind::PluginPaths
+                && app
+                    .modal
+                    .as_ref()
+                    .is_some_and(|m| m.list.filter == TAB_THEME && !m.list.sidebar_focused)
+                && app.theme_value_step(if key == KeyCode::Right { 1 } else { -1 }) => {}
         // In a modal with a sidebar the arrows move between the two panes.
         KeyCode::Left | KeyCode::Right
             if app
@@ -13051,39 +13614,14 @@ fn handle_modal_key(app: &mut App, key: KeyCode) {
                 m.list.sidebar_cursor = 0;
             }
         }
-        // The tint slider owns the arrows while the cursor is on it; without
-        // this they would flip to the next Settings tab, which is what the rest
-        // of the rows want.
-        KeyCode::Left | KeyCode::Right
-            if kind == ModalKind::PluginPaths
-                && app
-                    .modal
-                    .as_ref()
-                    .is_some_and(|m| m.list.filter == TAB_THEME)
-                && matches!(
-                    app.theme_row(cursor),
-                    Some(ThemeRow::Tint) | Some(ThemeRow::PanelColor)
-                ) =>
-        {
-            let up = key == KeyCode::Right;
-            if app.theme_row(cursor) == Some(ThemeRow::Tint) {
-                app.step_tint(if up {
-                    TINT_STEP as i16
-                } else {
-                    -(TINT_STEP as i16)
-                });
-            } else {
-                app.ui.step_panel_tint(if up { 1 } else { -1 });
-                app.ui.save();
-                app.apply_ui_settings();
-                app.refresh_modal();
-            }
-        }
         // The metronome's rows are values, not choices: the arrows move them
         // either way, and the menu stays open so the change can be heard.
         KeyCode::Left | KeyCode::Right if kind == ModalKind::Metronome => {
             app.step_metronome_row(cursor, if key == KeyCode::Right { 1 } else { -1 });
             app.refresh_modal();
+        }
+        KeyCode::Left | KeyCode::Right if kind == ModalKind::SeqMeter => {
+            app.step_seq_meter_row(cursor, if key == KeyCode::Right { 1 } else { -1 });
         }
         KeyCode::Left | KeyCode::Right if kind == ModalKind::FxGate => {
             app.step_fx_gate_row(cursor, if key == KeyCode::Right { 1 } else { -1 });
@@ -13133,6 +13671,17 @@ fn handle_modal_key(app: &mut App, key: KeyCode) {
                 app.close_modal();
                 app.focus = Focus::FxChain;
             }
+            return;
+        }
+        // The THEME tab's two buttons, which the mouse presses by sending the
+        // key they stand for.
+        KeyCode::Char('b') if kind == ModalKind::PluginPaths && app.settings_tab() == TAB_THEME => {
+            app.open_wallpaper_browser();
+            return;
+        }
+        KeyCode::Char('d') if kind == ModalKind::PluginPaths && app.settings_tab() == TAB_THEME => {
+            app.ui.background = settings::Background::Terminal;
+            app.apply_ui_settings();
             return;
         }
         // Take the rack out of the project and leave the settings alone.
@@ -13352,7 +13901,7 @@ fn note_targets(
     let bound: Vec<usize> = bindings
         .iter()
         .enumerate()
-        .filter(|(_, b)| **b == Some(&input))
+        .filter(|(_, b)| b.is_some_and(|b| b.same_port(&input)))
         .map(|(i, _)| i)
         .collect();
     // Several tabs on one port are alternative configurations of it, not a
@@ -13395,6 +13944,32 @@ fn file_label(path: &std::path::Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+/// A MIDI port name without the trailing ALSA address — see
+/// [`InputRef::same_port`], which is the only reason this exists.
+///
+/// The address is the last word and looks like `20:0`; anything else at the end
+/// is part of the name and is left alone.
+fn port_key(name: &str) -> &str {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+    match name.rsplit_once(' ') {
+        Some((head, addr)) => match addr.split_once(':') {
+            Some((client, port)) if digits(client) && digits(port) => head,
+            _ => name,
+        },
+        None => name,
+    }
+}
+
+/// Whether two learn sources are the same controller. `None` is "any", which is
+/// what a binding written before sources were recorded means.
+fn same_source(a: &Option<InputRef>, b: &Option<InputRef>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.same_port(b),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// `"MIDI:<port>"` / `"OSC"` back into an [`InputRef`]. The one spelling, used
@@ -13644,12 +14219,13 @@ fn handle_fx_keys(app: &mut App, key: KeyCode) {
         KeyCode::Char('d') if app.rack_focus == RackFocus::Seq => {
             app.open_seq_choice(SeqPick::Quant)
         }
-        KeyCode::Char('t') if app.rack_focus == RackFocus::Seq => {
-            app.open_seq_choice(SeqPick::TimeSig)
-        }
+        KeyCode::Char('t') if app.rack_focus == RackFocus::Seq => app.open_seq_meter(),
         KeyCode::Char('p') if app.rack_focus == RackFocus::Seq => {
             app.open_seq_choice(SeqPick::Part)
         }
+        // Type a knob's name instead of paging to it. `/` because that is what
+        // it is everywhere else, and only on the box it filters.
+        KeyCode::Char('/') if app.rack_focus == RackFocus::Instrument => app.open_instr_search(),
         // Parameters of the tab's own instrument: a plugin's list, or the
         // SoundFont's reverb / chorus switches.
         KeyCode::Char('p') => app.open_instr_modal(),
@@ -13974,6 +14550,10 @@ enum MouseAction {
     PresetStep(isize),
     /// Page the instrument's knob box, taking the CCs learned on it along.
     InstrPage(isize),
+    /// Start typing a knob's name on the instrument box.
+    InstrSearch,
+    /// Open the sequencer's metre dialogue.
+    SeqMeter,
     /// Step the active tab's MIDI channel (MULTI mode).
     ChannelStep(i8),
     OpenPresetPicker,
@@ -14120,6 +14700,7 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                             RackButton::PresetNext => MouseAction::PresetStep(1),
                             RackButton::InstrPagePrev => MouseAction::InstrPage(-1),
                             RackButton::InstrReset => MouseAction::InstrReset,
+                            RackButton::InstrSearch => MouseAction::InstrSearch,
                             RackButton::InstrPageNext => MouseAction::InstrPage(1),
                             RackButton::ArpOn => {
                                 MouseAction::GenTab(views::fx_chain_panel::GenTab::Arp)
@@ -14152,7 +14733,7 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                             // times to reach H is not one.
                             RackButton::SeqPart => MouseAction::SeqPick(SeqPick::Part),
                             RackButton::SeqQuant => MouseAction::SeqPick(SeqPick::Quant),
-                            RackButton::SeqTimeSig => MouseAction::SeqPick(SeqPick::TimeSig),
+                            RackButton::SeqTimeSig => MouseAction::SeqMeter,
                             RackButton::SeqChain => MouseAction::SeqEdit(SeqEdit::Chain),
                             RackButton::SeqErase => MouseAction::SeqEdit(SeqEdit::Erase),
                         };
@@ -14441,14 +15022,12 @@ fn apply_menu_action(app: &mut App, action: menu::MenuAction) {
     use menu::MenuAction as A;
     match action {
         A::None => {}
-        A::OpenWav => app.open_browser_modal(&["wav"]),
-        A::OpenSf2 => app.open_browser_modal(&["sf2", "sf3"]),
+        A::NewProject => app.request_new_project(),
         A::Quit => app.request_quit(),
         A::PluginPaths => app.open_paths_modal(),
         A::SaveProject => app.save_project(),
         A::SaveProjectAs => app.open_save_project(),
         A::LoadProject => app.open_load_project(),
-        A::ImportMax => app.open_import_max(),
         A::RescanPlugins => app.start_rescan(),
         A::About => app.about_open = true,
     }
@@ -14756,6 +15335,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         }
         MouseAction::PresetStep(d) => app.step_preset(d),
         MouseAction::InstrPage(d) => app.page_instr(d),
+        MouseAction::InstrSearch => app.open_instr_search(),
+        MouseAction::SeqMeter => app.open_seq_meter(),
         MouseAction::ArpEdit(edit) => app.edit_arp(edit),
         MouseAction::SeqEdit(edit) => app.edit_seq(edit),
         MouseAction::SeqPick(pick) => app.open_seq_choice(pick),
@@ -15100,12 +15681,22 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                 };
                 match app.modal.as_ref().map(|m| m.kind) {
                     Some(ModalKind::FxGate) => app.step_fx_gate_row(row, delta),
+                    Some(ModalKind::SeqMeter) => app.step_seq_meter_row(row, delta),
                     _ => app.step_metronome_row(row, delta),
                 }
                 app.refresh_modal();
             }
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+            // Over a Settings row that holds a value, the wheel *is* the value:
+            // the gesture everybody tries first on a backend or a slider. Rows
+            // without one (the plugin paths, the scheme list) scroll as usual.
+            if let Some(&(row, _)) = rects.rows.iter().find(|(_, r)| r.contains(pos)) {
+                if app.settings_wheel(row, if up { 1 } else { -1 }) {
+                    return;
+                }
+            }
             if rects.list.is_some_and(|r| r.contains(pos))
                 || rects.scrollbar.is_some_and(|r| r.contains(pos))
             {
@@ -15543,6 +16134,9 @@ fn ui(f: &mut Frame, app: &mut App) {
         app.instr_param,
         app.rack_focus == RackFocus::Instrument,
         matches!(app.source, AudioSource::Sf2 { .. }),
+        app.instr_search_label()
+            .as_ref()
+            .map(|(q, at, n)| (q.as_str(), *at, *n)),
         app.in_trim_state(),
         at_view,
         app.slots
@@ -15758,7 +16352,16 @@ fn ui(f: &mut Frame, app: &mut App) {
         // The modal owns its scroll state, so it draws from a &mut borrow and
         // stores its hit rects where the mouse handler can find them.
         let mut modal = app.modal.take().unwrap();
-        let pct = (70, 70);
+        // The pointer, so the row under it lights up before it is clicked.
+        modal.list.hover = Some(app.mouse);
+        // Settings is the densest modal in the app — a sidebar, a label column
+        // and a value column — and at 70% the values were being cut off mid
+        // word. One size for every tab and section: a box that resized itself
+        // to what it held moved the rows under the pointer on each click.
+        let pct = match modal.kind {
+            ModalKind::PluginPaths => (84, 82),
+            _ => (70, 70),
+        };
         let rects = views::modal::draw_list_modal(f, &mut modal.list, area, pct);
         app.layout.borrow_mut().modal_rects = rects;
         app.modal = Some(modal);
@@ -15841,7 +16444,10 @@ fn ui(f: &mut Frame, app: &mut App) {
         false => "",
     };
     let head = format!(
-        " choz v0.1 | {} backend | RACK: {} | FX: {} | {play_icon} {play_state} | ",
+        " {} | {} backend | RACK: {} | FX: {} | {play_icon} {play_state} | ",
+        // The same one line the binary answers `--version` with: the status bar
+        // said `v0.1` from the first commit to 1.3.6.
+        version_line(),
         backend_label,
         app.active_tab_label(),
         app.fx_chain.len(),
@@ -16090,7 +16696,11 @@ fn draw_menu_bar(f: &mut Frame, app: &App, area: Rect) {
                     false => " \u{25A0} OFF ".to_string(),
                 },
                 match app.playing {
-                    true => bold(Color::Black, OK),
+                    // Red, asked for: this is the switch that sets the whole
+                    // rack going — every sequencer, every synced delay, the
+                    // automation — and it is the one nobody may confuse with a
+                    // tab's own PLAY.
+                    true => bold(Color::Black, ERR),
                     false => off,
                 },
             )],
@@ -16367,7 +16977,18 @@ fn draw_about(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Clear, area);
     f.render_widget(Block::default().style(Style::default().bg(BACKDROP)), area);
 
-    let popup = centered_rect(55, 65, area);
+    // Sized to what is on it — logo, its reflection, and eleven lines of text —
+    // rather than to a percentage that cuts the logo in half on a short window.
+    let popup = {
+        let w = 78.min(area.width);
+        let h = 26.min(area.height);
+        Rect::new(
+            area.x + area.width.saturating_sub(w) / 2,
+            area.y + area.height.saturating_sub(h) / 2,
+            w,
+            h,
+        )
+    };
     draw_modal_shadow(f, popup, area);
     f.render_widget(Clear, popup);
     let block = Block::default()
@@ -16390,40 +17011,101 @@ fn draw_about(f: &mut Frame, app: &App, area: Rect) {
     );
     app.layout.borrow_mut().about_close_rect = Some(Rect::new(close_x, popup.y, 3, 1));
 
-    // Logo image (ratatui-image) fills the top; text below.
+    // The same logo the splash draws, not a rainbow banner that said nothing
+    // about choz. Frozen at one tick: About is not redrawn on a timer, and a
+    // gradient that only moves when the mouse does looks broken.
+    let logo = views::splash::LOGO_LINES as u16;
+    // Centred as a block: the box is bigger than what is on it, and all of the
+    // slack falling below the last line reads as a box that failed to fill.
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(6)])
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(logo),
+            Constraint::Length(logo / 2),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(11),
+            Constraint::Min(0),
+        ])
         .split(inner);
-    if let Some(ref protocol) = app.logo {
-        f.render_widget(ratatui_image::Image::new(protocol), rows[0]);
-    } else {
-        f.render_widget(
-            Paragraph::new("choz").style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-            rows[0],
-        );
-    }
+    f.render_widget(
+        Paragraph::new(views::splash::logo_lines(0)).alignment(Alignment::Center),
+        rows[1],
+    );
+    f.render_widget(
+        Paragraph::new(views::splash::logo_reflection(0)).alignment(Alignment::Center),
+        rows[2],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            views::splash::splash_wave(0, rows[3].width as usize),
+            Style::default().fg(ACCENT),
+        ))),
+        rows[3],
+    );
+    // Everything here is **read, not written down**: the version, the formats,
+    // the number of built-ins and what the engine is actually running. An
+    // About box with a hand-typed version says "v0.1" three years later, which
+    // is what this one said.
+    let formats: Vec<&str> = choz_engine::PluginFormat::ALL
+        .iter()
+        .map(|f| f.label())
+        .collect();
+    let engine = match app.audio_engine.as_ref() {
+        Some(e) => format!(
+            "{} · {} Hz · {} {}",
+            e.backend.label(),
+            e.sample_rate,
+            app.slots.len(),
+            match app.slots.len() {
+                1 => "tab",
+                _ => "tabs",
+            }
+        ),
+        None => "no audio engine".to_string(),
+    };
+    let bold = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
     let text = vec![
+        Line::from(Span::styled(version_line(), bold)),
         Line::from(Span::styled(
-            "choz v0.1",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            "Terminal audio plugin host — Carla for the terminal.",
+            env!("CARGO_PKG_DESCRIPTION"),
             Style::default().fg(DIM),
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "FX chain · WAV/SF2 · CLAP · MIDI",
+            formats.join(" · "),
             Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "{} built-in effects, also a CLAP bundle · {} plugin{} scanned",
+                ALL_FX_KINDS.len(),
+                app.plugins.len(),
+                match app.plugins.len() {
+                    1 => "",
+                    _ => "s",
+                },
+            ),
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(engine, Style::default().fg(ACCENT))),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("MIT · {}", env!("CARGO_PKG_REPOSITORY")),
+            Style::default().fg(DIM),
         )),
         Line::from(Span::styled("Esc / [×] to close", Style::default().fg(DIM))),
     ];
     f.render_widget(
-        Paragraph::new(text).style(views::theme::panel_style()),
-        rows[1].inner(Margin {
+        // Wrapped: the list of formats is wider than this box on an 80-column
+        // terminal, and a truncated line here reads as "choz hosts five".
+        Paragraph::new(text)
+            .wrap(Wrap { trim: true })
+            .style(views::theme::panel_style()),
+        rows[5].inner(Margin {
             vertical: 0,
             horizontal: 1,
         }),
@@ -16466,6 +17148,84 @@ fn draw_modal_shadow(f: &mut Frame, modal: Rect, screen: Rect) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every knob of every effect can be learned, and answers its CC.
+    ///
+    /// The audit this was asked for: a knob of the Keystation assigned to the
+    /// auto filter on tab 2 did nothing. It was not the picker — every effect
+    /// offers every knob it draws — it was that a learned CC only moved the
+    /// **selected** unit of the tab in front, so clicking another effect in the
+    /// chain silenced the assignment that had just been made.
+    ///
+    /// Walks all fifty-odd built-ins rather than the one that was reported:
+    /// what is under test is the wiring from the picker's list to the value,
+    /// and that is the same wiring for every one of them.
+    #[test]
+    fn every_knob_of_every_effect_can_be_learned_and_answers_its_cc() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        // The reported rig: the effect lives on tab 2.
+        app.active_slot = 1;
+
+        let mut missing = Vec::new();
+        let mut deaf = Vec::new();
+        for kind in source::ALL_FX_KINDS {
+            app.fx_chain = vec![
+                // A first effect, so the one under test is **not** the one the
+                // panel starts on: that is the case that was broken.
+                source::AudioFxEntry::new(source::AudioFxKind::Delay),
+                source::AudioFxEntry::new(*kind),
+            ];
+            app.fx_slot = 0;
+            let params = app.fx_chain[1].param_descs().len();
+
+            // Every knob it draws is on the LEARN list, for this tab and unit.
+            app.open_learn_modal();
+            let targets = app.modal.as_ref().unwrap().targets.clone();
+            app.close_modal();
+            for param in 0..params {
+                let want = LearnTarget::FxParam {
+                    slot: 1,
+                    fx: 1,
+                    param,
+                };
+                if !targets.contains(&want) {
+                    missing.push(format!("{}: knob {param} is not offered", kind.id()));
+                }
+            }
+
+            // And a CC learned onto one moves it, with the panel showing the
+            // *other* effect — which is where the player leaves it.
+            for param in 0..params {
+                let before = app.fx_chain[1].params[param];
+                app.learn = Some(LearnTarget::FxParam {
+                    slot: 1,
+                    fx: 1,
+                    param,
+                });
+                app.feed_cc(20, 127);
+                app.feed_cc(20, if before > 0.5 { 0 } else { 127 });
+                if (app.fx_chain[1].params[param] - before).abs() < 1e-6 {
+                    deaf.push(format!("{}: knob {param} did not move", kind.id()));
+                }
+                app.cc_bindings.clear();
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "not on the LEARN list:\n  {}",
+            missing.join("\n  ")
+        );
+        assert!(
+            deaf.is_empty(),
+            "learned and silent:\n  {}",
+            deaf.join("\n  ")
+        );
+    }
 
     /// The knobs the rack draws are the knobs the processor has.
     ///
@@ -16875,6 +17635,9 @@ mod tests {
                 app.instr_param,
                 app.rack_focus == RackFocus::Instrument,
                 matches!(app.source, AudioSource::Sf2 { .. }),
+                app.instr_search_label()
+                    .as_ref()
+                    .map(|(q, at, n)| (q.as_str(), *at, *n)),
                 app.in_trim_state(),
                 None,
                 crate::arp::ArpView::default(),
@@ -18428,6 +19191,9 @@ mod tests {
                 app.instr_param,
                 app.rack_focus == RackFocus::Instrument,
                 matches!(app.source, AudioSource::Sf2 { .. }),
+                app.instr_search_label()
+                    .as_ref()
+                    .map(|(q, at, n)| (q.as_str(), *at, *n)),
                 app.in_trim_state(),
                 None,
                 app.slots
@@ -19298,12 +20064,18 @@ mod tests {
         choose(&mut app, "1/8");
         assert_eq!(app.slots[0].seq.settings.div, arp::TimeDiv::Eighth);
 
-        // The metre is what a bar of the pattern is long, so picking one moves
-        // the loop: 3/4 at 1/8 is six steps.
+        // The metre is what a bar of the pattern is long, so setting one moves
+        // the loop: 3/4 at 1/8 is six steps. Three rows rather than a menu of
+        // signatures — 5/8 and 7/4 exist, and the grouping is a row of its own.
         press(&mut app, B::SeqTimeSig);
-        choose(&mut app, "3/4");
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::SeqMeter)
+        );
+        app.step_seq_meter_row(0, -1); // BEATS: 4 → 3
         assert_eq!(choz_ports::transport().time_signature(), (3, 4));
         assert_eq!(app.slots[0].seq.settings.bar_steps(), 6);
+        handle_modal_key(&mut app, KeyCode::Esc);
 
         // The part list says how much is written in each, and picking one
         // switches to it.
@@ -19854,18 +20626,34 @@ mod tests {
         // set *before* the rows are read, or the indices are off by two.
         app.ui.background = settings::Background::Terminal;
 
-        // Theme tab: the desktop controls first, then the scheme list — which
-        // runs to hundreds of rows, so anything below it is unreachable.
+        // Theme tab: the desktop controls are their own section, so the scheme
+        // list — hundreds of rows — never buries them.
         app.modal.as_mut().unwrap().list.filter = TAB_THEME;
         app.refresh_modal();
         let items = app.modal.as_ref().unwrap().list.items.clone();
-        assert_eq!(items[0], "DESKTOP", "headers label the two halves");
-        let schemes = items
-            .iter()
-            .position(|i| i == "COLOUR SCHEME")
-            .expect("second header");
         assert!(
-            items[schemes + 1].contains("choz (default)"),
+            items[0].contains("Palette"),
+            "the scheme by name first: {items:?}"
+        );
+        assert_eq!(
+            app.modal
+                .as_ref()
+                .unwrap()
+                .list
+                .sidebar
+                .iter()
+                .map(|(l, _)| l.clone())
+                .collect::<Vec<_>>(),
+            vec!["Desktop", "Palette"],
+            "the tab's two halves are the sidebar"
+        );
+
+        // The Palette section is the list itself, one scheme a row.
+        app.modal.as_mut().unwrap().list.sidebar_cursor = THEME_SEC_PALETTE;
+        app.refresh_modal();
+        let items = app.modal.as_ref().unwrap().list.items.clone();
+        assert!(
+            items[0].contains("choz (default)"),
             "choz's own themes lead"
         );
         assert!(
@@ -19874,9 +20662,9 @@ mod tests {
             items.len()
         );
 
-        // The row right after the first scheme is the second one.
+        // The second row is the second scheme.
         let theme = &settings::THEMES[1];
-        app.modal.as_mut().unwrap().list.cursor = schemes + 2;
+        app.modal.as_mut().unwrap().list.cursor = 1;
         assert!(
             !app.modal_select(),
             "the modal stays open so several can be tried"
@@ -19894,19 +20682,13 @@ mod tests {
             app.ui.background,
             settings::Background::Color(theme.desktop.unwrap())
         );
-        // The marker moves to the chosen row. The scheme block itself moved:
-        // picking a desktop colour added the wash rows above it, so the header
-        // has to be found again rather than remembered.
+        // The marker moves to the chosen row.
         app.refresh_modal();
         let items = app.modal.as_ref().unwrap().list.items.clone();
-        let schemes = items
-            .iter()
-            .position(|i| i == "COLOUR SCHEME")
-            .expect("second header");
-        assert!(items[schemes + 2].contains('\u{25CF}'));
+        assert!(items[1].contains('\u{25CF}'));
 
         // Back to a scheme without a desktop: the background goes with it.
-        app.modal.as_mut().unwrap().list.cursor = schemes + 1;
+        app.modal.as_mut().unwrap().list.cursor = 0;
         app.modal_select();
         assert_eq!(app.ui.background, settings::Background::Terminal);
 
@@ -19930,6 +20712,119 @@ mod tests {
             i18n::t("THEME")
         );
         // `_restore` puts English (and the default colour) back on the way out.
+    }
+
+    /// The Settings box is the same box on every tab: a modal that resized
+    /// itself to its contents moved the row under the pointer on each click.
+    #[test]
+    fn the_settings_modal_is_one_size_whatever_it_is_showing() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.open_paths_modal();
+
+        let mut seen: Vec<(usize, usize, Rect)> = Vec::new();
+        for (tab, sec) in [
+            (TAB_AUDIO, SEC_ENGINE),
+            (TAB_AUDIO, SEC_PATHS),
+            (TAB_AUDIO, SEC_OSC),
+            (TAB_THEME, THEME_SEC_DESKTOP),
+            (TAB_THEME, THEME_SEC_PALETTE),
+            (TAB_LANG, 0),
+        ] {
+            {
+                let m = &mut app.modal.as_mut().unwrap().list;
+                m.filter = tab;
+                m.sidebar_cursor = sec;
+                m.sidebar_focused = false;
+                m.cursor = 0;
+            }
+            app.refresh_modal();
+            let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            term.draw(|f| ui(f, &mut app)).unwrap();
+            let rect = app
+                .layout
+                .borrow()
+                .modal_rects
+                .area
+                .expect("the box is drawn");
+            seen.push((tab, sec, rect));
+        }
+        let (_, _, first) = seen[0];
+        for (tab, sec, rect) in &seen {
+            assert_eq!(
+                *rect, first,
+                "tab {tab} section {sec} drew a different box: {rect:?} vs {first:?}"
+            );
+        }
+    }
+
+    /// Settings a mouse can drive: over a row that holds a value the wheel *is*
+    /// the value, and over a list it still scrolls.
+    ///
+    /// The palette is the row this matters most on — the alternative is walking
+    /// several hundred scheme rows to see what each one looks like.
+    #[test]
+    fn the_wheel_changes_the_value_under_it_and_scrolls_everywhere_else() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.open_paths_modal();
+        {
+            let m = &mut app.modal.as_mut().unwrap().list;
+            m.filter = TAB_THEME;
+            m.sidebar_focused = false;
+        }
+        app.refresh_modal();
+
+        // The first Desktop row is the palette, and the wheel wears the next
+        // scheme at once — the screen itself is the preview.
+        assert_eq!(app.theme_row(0), Some(ThemeRow::Palette));
+        let before = app.ui.theme_name.clone();
+        assert!(app.settings_wheel(0, 1), "the palette row took the wheel");
+        assert_ne!(app.ui.theme_name, before, "and moved on");
+        assert_eq!(views::theme::text(), app.ui.color(), "applied, not queued");
+        assert!(app.settings_wheel(0, -1));
+        assert_eq!(app.ui.theme_name, before, "and back again");
+
+        // Enter on it opens the Palette half, standing on the scheme worn.
+        app.modal.as_mut().unwrap().list.cursor = 0;
+        assert!(!app.modal_select(), "it moves, it does not close");
+        assert_eq!(app.theme_section(), THEME_SEC_PALETTE);
+        assert_eq!(
+            app.theme_row(app.modal.as_ref().unwrap().list.cursor),
+            Some(ThemeRow::Scheme(
+                settings::THEMES
+                    .iter()
+                    .position(|t| t.name == before)
+                    .unwrap()
+            )),
+            "on the one being worn, not at the top"
+        );
+
+        // An engine row is a value too.
+        {
+            let m = &mut app.modal.as_mut().unwrap().list;
+            m.filter = TAB_AUDIO;
+            m.sidebar_cursor = SEC_ENGINE;
+            m.sidebar_focused = false;
+        }
+        app.refresh_modal();
+        let backend = app.ui.audio.backend.clone();
+        assert!(app.settings_wheel(0, 1), "the backend row took the wheel");
+        assert_ne!(app.ui.audio.backend, backend);
+
+        // The plugin paths are a list: there the wheel scrolls, as it does
+        // everywhere else in the app.
+        app.modal.as_mut().unwrap().list.sidebar_cursor = SEC_PATHS;
+        app.refresh_modal();
+        assert!(
+            !app.settings_wheel(1, 1),
+            "a list scrolls, it does not edit"
+        );
     }
 
     /// The desktop rows: toggle a flat colour, pick an image through the file
@@ -20059,16 +20954,22 @@ mod tests {
                 .unwrap_or_else(|| panic!("no row for {want:?}"))
         };
 
-        // 1. Tick Obsidian. The modal stays open — it is a checkbox, not a door.
+        // 1. Tick Obsidian, in the Palette half. The modal stays open — it is a
+        //    checkbox, not a door.
         let obsidian = settings::THEMES
             .iter()
             .position(|t| t.name == "Obsidian")
             .unwrap();
+        app.modal.as_mut().unwrap().list.sidebar_cursor = THEME_SEC_PALETTE;
+        app.refresh_modal();
         app.modal.as_mut().unwrap().list.cursor = row_of(&app, ThemeRow::Scheme(obsidian));
         assert!(!app.modal_select(), "picking a scheme keeps the modal open");
         assert_eq!(app.ui.text_color, settings::THEMES[obsidian].text);
 
-        // 2. Pick a wallpaper. Back on the theme tab afterwards.
+        // 2. Pick a wallpaper, from the Desktop half. Back on the theme tab
+        //    afterwards.
+        app.modal.as_mut().unwrap().list.sidebar_cursor = THEME_SEC_DESKTOP;
+        app.refresh_modal();
         app.modal.as_mut().unwrap().list.cursor = row_of(&app, ThemeRow::PickImage);
         app.modal_select();
         assert_eq!(app.modal.as_ref().unwrap().kind, ModalKind::Wallpaper);
@@ -20117,6 +21018,7 @@ mod tests {
         // Re-ticking the theme afterwards must not throw the wallpaper away.
         app.open_paths_modal();
         app.modal.as_mut().unwrap().list.filter = TAB_THEME;
+        app.modal.as_mut().unwrap().list.sidebar_cursor = THEME_SEC_PALETTE;
         app.refresh_modal();
         app.modal.as_mut().unwrap().list.cursor = row_of(&app, ThemeRow::Scheme(obsidian));
         app.modal_select();
@@ -23952,51 +24854,6 @@ mod tests {
         chord.clear();
     }
 
-    /// A Max patch imports into the chain, and the report names what it could
-    /// not bring — which is the half of an import that is worth reading.
-    #[test]
-    fn a_max_patch_imports_what_it_can_and_names_what_it_cannot() {
-        let dir = std::env::temp_dir().join("choz-ui-maxpat");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let patch = dir.join("guitar.maxpat");
-        std::fs::write(
-            &patch,
-            r#"{"patcher":{"boxes":[
-                {"box":{"id":"obj-1","maxclass":"newobj","text":"adc~"}},
-                {"box":{"id":"obj-2","maxclass":"newobj","text":"overdrive~"}},
-                {"box":{"id":"obj-3","maxclass":"newobj","text":"gizmo~ 2048"}},
-                {"box":{"id":"obj-4","maxclass":"newobj","text":"freeverb~"}},
-                {"box":{"id":"obj-5","maxclass":"newobj","text":"dac~"}}
-            ],"lines":[
-                {"patchline":{"source":["obj-1",0],"destination":["obj-2",0]}},
-                {"patchline":{"source":["obj-2",0],"destination":["obj-3",0]}},
-                {"patchline":{"source":["obj-3",0],"destination":["obj-4",0]}},
-                {"patchline":{"source":["obj-4",0],"destination":["obj-5",0]}}
-            ]}}"#,
-        )
-        .unwrap();
-
-        let mut app = App::new();
-        app.slots.push(RackSlot::new(AudioSource::Midi));
-        app.active_slot = 0;
-        app.import_maxpat(&patch);
-
-        let kinds: Vec<&str> = app.fx_chain.iter().map(|e| e.kind.label()).collect();
-        assert_eq!(kinds, vec!["SATURATOR", "REVERB"], "in signal order");
-
-        let modal = app.modal.as_ref().expect("the report opens by itself");
-        assert_eq!(modal.kind, ModalKind::MaxReport);
-        let report = modal.list.items.join("\n");
-        assert!(
-            report.contains("gizmo~"),
-            "it names what it dropped:\n{report}"
-        );
-        assert!(report.contains("SATURATOR"), "and what it kept:\n{report}");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// The feedback guard is a switch in Settings and a reading in the IN
     /// drawer, and both say the same thing.
     ///
@@ -25720,16 +26577,50 @@ mod tests {
 
         // Back to the drums, then the rest of the dialogue.
         app.step_fx_gate_row(0, 1);
+
+        // TARGET: the mix first — the destination that means the same thing on
+        // every effect — and then this effect's own knobs by name, which is the
+        // kick opening a cutoff rather than the whole filter.
+        assert_eq!(
+            app.fx_chain[0].gate.unwrap().param,
+            None,
+            "the mix by default"
+        );
+        assert!(
+            app.fx_gate_rows()[1].contains(i18n::t("MIX")),
+            "and it says so: {}",
+            app.fx_gate_rows()[1]
+        );
         app.step_fx_gate_row(1, 1);
+        assert_eq!(
+            app.fx_chain[0].gate.unwrap().param,
+            Some(0),
+            "the first knob of the auto-filter, which is its cutoff"
+        );
+        let name = app.fx_chain[0].param_descs()[0].name.to_string();
+        assert!(
+            app.fx_gate_rows()[1].contains(&name),
+            "named as the panel draws it: {}",
+            app.fx_gate_rows()[1]
+        );
+        app.step_fx_gate_row(1, -1);
+        assert_eq!(
+            app.fx_chain[0].gate.unwrap().param,
+            None,
+            "and back to the mix, which is where it started"
+        );
+        app.step_fx_gate_row(1, 1);
+
+        app.step_fx_gate_row(2, 1);
         assert_eq!(
             app.fx_chain[0].gate.map(|g| g.mode),
             Some(choz_engine::fx_chain::GateMode::Duck),
             "MODE flips between opening and ducking"
         );
         let before = app.fx_chain[0].gate.unwrap().threshold;
-        app.step_fx_gate_row(3, -1);
+        app.step_fx_gate_row(4, -1);
         assert!(app.fx_chain[0].gate.unwrap().threshold < before);
-        app.step_fx_gate_row(4, 1);
+        app.step_fx_gate_row(5, 1);
         assert!(app.fx_chain[0].gate.unwrap().release_ms > 120.0);
 
         // The spec the engine is handed carries it, and so does the project.
@@ -25741,6 +26632,461 @@ mod tests {
         let restored = fresh.slots[1].fx_chain[0].gate.expect("read back");
         assert_eq!(restored.source, GateSource::Tab(0));
         assert_eq!(restored.mode, choz_engine::fx_chain::GateMode::Duck);
+        assert_eq!(
+            restored.param,
+            Some(0),
+            "and which knob it moves, or the wiring comes back pointing at the mix"
+        );
+    }
+
+    /// The knob search, against the plugin that made it necessary.
+    ///
+    /// Reported as "Surge XT's window says Cutoff and the search does not find
+    /// it". Its list has four of them — `A Filter 1 Cutoff` and its three
+    /// neighbours, filed under `A Filters` — so the words a player is likely to
+    /// type after reading the plugin's own window have to reach them: `cutoff`
+    /// on its own, and `filter cutoff`, whose two words are next to each other
+    /// in no name Surge publishes.
+    ///
+    /// Skips when Surge XT is not installed, like every other test that hosts
+    /// what happens to be on this machine.
+    #[test]
+    fn surge_xts_cutoff_is_reachable_by_typing() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        let path = std::path::Path::new("/usr/lib/vst3/Surge XT.vst3");
+        if !path.exists() {
+            eprintln!("no Surge XT installed; skipping");
+            return;
+        }
+        let params = choz_engine::read_plugin_params(choz_engine::PluginFormat::Vst3, path, "");
+        if params.is_empty() {
+            eprintln!("Surge XT published no parameters; skipping");
+            return;
+        }
+        let mut app = App::new();
+        app.splash_done = true;
+        // On tab 2, as it was reported.
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: "surge".into(),
+            format: "VST3".into(),
+            name: "Surge XT".into(),
+        }));
+        app.active_slot = 1;
+        app.slots[1].instr_values = vec![0.5; params.len()];
+        app.slots[1].instr_params = params;
+        app.rack_focus = RackFocus::Instrument;
+
+        for query in ["cutoff", "filter cutoff", "cutoff filter", "CUTOFF"] {
+            app.open_instr_search();
+            for c in query.chars() {
+                handle_key(&mut app, KeyCode::Char(c));
+            }
+            let name = app.slots[1].instr_params[app.instr_param].name.clone();
+            assert!(
+                name.to_lowercase().contains("cutoff"),
+                "{query:?} landed on {name:?}"
+            );
+            handle_key(&mut app, KeyCode::Esc);
+            app.instr_param = 0;
+        }
+    }
+
+    /// The sequencer draws the bar it is actually playing, and the metre is
+    /// three rows rather than a menu of signatures.
+    ///
+    /// Reported as "7/8 always draws four beats". It did: the grid broke every
+    /// fourth cell and numbered the beats every fourth cell, whatever the
+    /// signature said — a picture of a 4/4 over a pattern the sequencer was
+    /// playing in seven. A beat is the signature's own unit read at the step
+    /// length: an eighth in 7/8, which at 1/16 is two cells.
+    #[test]
+    fn the_sequencer_draws_the_bar_it_plays_and_the_metre_is_editable() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.slots[0].seq.settings.on = true;
+        app.slots[0].seq.settings.div = arp::TimeDiv::Sixteenth;
+        let t = choz_ports::transport();
+        choz_engine::metronome::metronome().set_groups(&[]);
+
+        // 4/4 at 1/16: four cells to a beat, sixteen to the bar — what it
+        // always drew, and still does.
+        t.set_time_signature(4, 4);
+        let view = app.slots[0].seq.view();
+        assert_eq!(view.beat, 4);
+        assert_eq!(view.bar, 16);
+        assert_eq!(view.stops, vec![0, 4, 8, 12], "one stop per beat");
+
+        // 7/8 at 1/16: **two** cells to a beat and fourteen to the bar. Seven
+        // beats, not four.
+        t.set_time_signature(7, 8);
+        let view = app.slots[0].seq.view();
+        assert_eq!(view.beat, 2, "an eighth is two sixteenths");
+        assert_eq!(view.bar, 14);
+        assert_eq!(view.stops, vec![0, 2, 4, 6, 8, 10, 12], "seven beats");
+
+        // Grouped 3+2+2, as the click accents it: the grid breaks where the
+        // groups do.
+        choz_engine::metronome::metronome().set_groups(&[3, 2, 2]);
+        let view = app.slots[0].seq.view();
+        assert_eq!(view.stops, vec![0, 6, 10], "3+2+2 of two cells each");
+
+        // And that is what it draws: seven beats, cut 3+2+2, with the two
+        // cells past the end of the bar left blank.
+        app.rack_focus = RackFocus::Seq;
+        app.gen_tab = views::fx_chain_panel::GenTab::Seq;
+        let (screen, _) = render_rack(&mut app, 120, 44);
+        assert!(
+            screen.contains("1\u{00B7}2\u{00B7}3\u{00B7} 4\u{00B7}5\u{00B7} 6\u{00B7}7\u{00B7}"),
+            "the ruler counts the bar it plays:\n{screen}"
+        );
+        // The metre dialogue: beats, unit and grouping, each turned in place.
+        app.open_seq_meter();
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::SeqMeter)
+        );
+        assert!(app.seq_meter_rows()[0].contains('7'), "BEATS says seven");
+        assert!(app.seq_meter_rows()[1].contains('8'), "UNIT says eight");
+        assert!(
+            app.seq_meter_rows()[2].contains("3+2+2"),
+            "GROUPING says how it is counted: {}",
+            app.seq_meter_rows()[2]
+        );
+        app.step_seq_meter_row(0, 1);
+        assert_eq!(choz_ports::transport().time_signature(), (8, 8));
+        assert!(
+            choz_engine::metronome::metronome().groups().is_empty(),
+            "a grouping that counted seven does not survive an eighth beat"
+        );
+        app.step_seq_meter_row(1, 1);
+        let (num, den) = choz_ports::transport().time_signature();
+        assert_eq!(num, 8);
+        assert_ne!(den, 8, "UNIT moves on its own");
+        // Enter accepts and leaves; the rows are turned, not picked.
+        assert!(app.modal_select());
+
+        t.set_time_signature(4, 4);
+        choz_engine::metronome::metronome().set_groups(&[]);
+    }
+
+    /// Typing a knob's name lands on it, on the box that draws the knobs.
+    ///
+    /// The case it exists for: Surge XT publishes 774 parameters and its
+    /// `Cutoff` is twenty-six pages in, so the pager is not a way of finding
+    /// anything. Same gesture as the SOURCE and ADD FX pickers, on the one
+    /// list that is not in a picker.
+    #[test]
+    fn a_knob_is_found_by_typing_its_name() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        // A plugin's parameter list, shaped like the ones that need this:
+        // hundreds of them, with the wanted knob a long way down.
+        let name_of = |i: usize| match i {
+            300 => "A Filter 1 Cutoff".to_string(),
+            301 => "A Filter 1 Resonance".to_string(),
+            520 => "B Filter 1 Cutoff".to_string(),
+            _ => format!("Send FX {i} Return"),
+        };
+        app.slots[0].instr_params = (0..600)
+            .map(|i| choz_engine::PluginParam {
+                group: None,
+                id: i as u32,
+                name: name_of(i),
+                min: 0.0,
+                max: 1.0,
+                default: 0.0,
+                steps: 0,
+                unit: None,
+                points: Vec::new(),
+            })
+            .collect();
+        app.slots[0].instr_values = vec![0.5; 600];
+        app.rack_focus = RackFocus::Instrument;
+
+        // `/` opens it, and every key after that belongs to it — including the
+        // `q` that quits choz from anywhere else.
+        handle_key(&mut app, KeyCode::Char('/'));
+        assert_eq!(app.instr_search.as_deref(), Some(""));
+        for c in "cutoff".chars() {
+            handle_key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.instr_param, 300, "it landed on the first Cutoff");
+        assert!(!app.quit, "a `q` typed into a search does not quit");
+
+        // The matches walk without leaving the search: a plugin has four
+        // Cutoffs and the second is usually the one meant.
+        handle_key(&mut app, KeyCode::Down);
+        assert_eq!(app.instr_param, 520);
+        handle_key(&mut app, KeyCode::Down);
+        assert_eq!(app.instr_param, 300, "and it wraps");
+
+        // Backspacing narrows back; past the start it closes.
+        handle_key(&mut app, KeyCode::Backspace);
+        assert_eq!(app.instr_search.as_deref(), Some("cutof"));
+        for _ in 0..6 {
+            handle_key(&mut app, KeyCode::Backspace);
+        }
+        assert!(app.instr_search.is_none(), "backspacing out closes it");
+
+        // Enter keeps the knob it found; Esc leaves too.
+        app.open_instr_search();
+        for c in "resonance".chars() {
+            handle_key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.instr_param, 301);
+        handle_key(&mut app, KeyCode::Enter);
+        assert!(app.instr_search.is_none());
+        assert_eq!(app.instr_param, 301, "the cursor stays where it was found");
+
+        // A name nothing has leaves the cursor alone rather than jumping to 0.
+        app.open_instr_search();
+        for c in "zzz".chars() {
+            handle_key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.instr_param, 301);
+        handle_key(&mut app, KeyCode::Esc);
+
+        // The button that opens it is drawn on the box's own edge, and what is
+        // being typed is drawn in its place.
+        app.open_instr_search();
+        for c in "cuto".chars() {
+            handle_key(&mut app, KeyCode::Char(c));
+        }
+        let (screen, rack) = render_rack(&mut app, 140, 40);
+        assert!(
+            screen.contains("\u{2315} cuto"),
+            "the letters are on the box's edge:\n{screen}"
+        );
+        assert!(
+            screen.contains("2/2"),
+            "and how many knobs they match, so a word the plugin does not use \
+             cannot be mistaken for a cursor that moved off screen:\n{screen}"
+        );
+
+        // Words in any order, and the section counts as part of the name: what
+        // a player types after reading `Cutoff` off the plugin's own window is
+        // "filter cutoff", and those two words are next to each other in no
+        // name Surge XT publishes.
+        app.instr_search = None;
+        app.slots[0].instr_params[300].group = Some("A Filters".into());
+        app.open_instr_search();
+        for c in "filters cutoff".chars() {
+            handle_key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.instr_param, 300, "both words, in the player's order");
+        assert_eq!(app.instr_search_hits("cutoff filters").len(), 1);
+        handle_key(&mut app, KeyCode::Esc);
+        assert!(
+            rack.buttons
+                .iter()
+                .any(|(b, _)| *b == views::fx_chain_panel::RackButton::InstrSearch),
+            "the search sits beside the pager"
+        );
+    }
+
+    /// Each of the gate's list rows opens as a list, and its three values take
+    /// the wheel.
+    ///
+    /// Asked for after the target row grew a plugin's whole parameter list
+    /// behind it: two hundred answers is not something to step through with an
+    /// arrow key. SOURCE, TARGET and MODE open on top of the dialogue and come
+    /// back to it; DEPTH, THRESHOLD and RELEASE are turned in place.
+    #[test]
+    fn each_gate_row_opens_its_own_list_and_the_values_take_the_wheel() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        app.fx_chain
+            .push(source::AudioFxEntry::new(source::AudioFxKind::AutoFilter));
+        app.fx_slot = 0;
+        app.open_fx_gate_modal();
+
+        // TARGET opens the effect's own knobs, with the mix in front of them.
+        if let Some(m) = app.modal.as_mut() {
+            m.list.cursor = 1;
+        }
+        assert!(!app.modal_select(), "it opens a list, it does not close");
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::GateChoice(1))
+        );
+        let items = app.modal.as_ref().unwrap().list.items.clone();
+        assert_eq!(items[0], i18n::t("MIX"), "the dry/wet leads");
+        let rate = items
+            .iter()
+            .position(|i| i == "Rate")
+            .expect("the auto filter's Rate is on the list");
+
+        // Picking one applies it and hands the dialogue back, on the row it
+        // was opened from.
+        app.modal.as_mut().unwrap().list.cursor = rate;
+        app.modal_select();
+        assert_eq!(app.modal.as_ref().map(|m| m.kind), Some(ModalKind::FxGate));
+        assert_eq!(app.modal.as_ref().unwrap().list.cursor, 1, "back on TARGET");
+        assert_eq!(app.fx_chain[0].gate.unwrap().param, Some(rate - 1));
+
+        // SOURCE the same way: OFF first, then every tab and every clock.
+        app.modal.as_mut().unwrap().list.cursor = 0;
+        app.modal_select();
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::GateChoice(0))
+        );
+        assert_eq!(app.modal.as_ref().unwrap().list.items[0], i18n::t("OFF"));
+        app.modal.as_mut().unwrap().list.cursor = 2; // OFF, tab 1, tab 2
+        app.modal_select();
+        assert_eq!(
+            app.fx_chain[0].gate.map(|g| g.source),
+            Some(choz_engine::fx_chain::GateSource::Tab(1))
+        );
+
+        // The three value rows take the wheel — which is what the mouse over a
+        // row that is not a list has to do.
+        let depth = app.fx_chain[0].gate.unwrap().depth;
+        let release = app.fx_chain[0].gate.unwrap().release_ms;
+        let threshold = app.fx_chain[0].gate.unwrap().threshold;
+        // Down, because DEPTH opens at the top of its range.
+        app.step_fx_gate_row(3, -1);
+        app.step_fx_gate_row(4, -1);
+        app.step_fx_gate_row(5, -1);
+        assert!(app.fx_chain[0].gate.unwrap().depth < depth);
+        assert!(app.fx_chain[0].gate.unwrap().threshold < threshold);
+        assert!(app.fx_chain[0].gate.unwrap().release_ms < release);
+        app.step_fx_gate_row(3, 1);
+        assert_eq!(app.fx_chain[0].gate.unwrap().depth, depth, "and back up");
+
+        // …and Enter on one of them closes rather than opening anything.
+        app.modal.as_mut().unwrap().list.cursor = 3;
+        assert!(app.modal_select(), "a value row has no list to open");
+    }
+
+    /// What the GATE dialogue is set to is what it says next time it opens.
+    ///
+    /// Reported as "I picked Rate and it came back as Shape". Not an index
+    /// mismatch — the stored number and the name always agreed — but Enter:
+    /// this dialogue used to step the row under the cursor the way the
+    /// metronome's menu does, so accepting a choice walked it on to the next
+    /// one, twice if the player pressed Enter twice. Every row here is turned,
+    /// not picked; Enter closes.
+    #[test]
+    fn the_gate_keeps_the_target_that_was_chosen() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        app.fx_chain
+            .push(source::AudioFxEntry::new(source::AudioFxKind::AutoFilter));
+        app.fx_slot = 0;
+
+        app.open_fx_gate_modal();
+        app.step_fx_gate_row(0, 1);
+        // MIX → Freq → Res → Mode → Rate.
+        for _ in 0..4 {
+            app.step_fx_gate_row(1, 1);
+        }
+        let rate = app.fx_chain[0].gate.unwrap().param;
+        assert!(app.fx_gate_rows()[1].contains("Rate"), "picked Rate");
+
+        // Enter on that row opens its list — and moves nothing on the way.
+        if let Some(m) = app.modal.as_mut() {
+            m.list.cursor = 1;
+        }
+        assert!(!app.modal_select(), "Enter opens the target list");
+        assert_eq!(
+            app.fx_chain[0].gate.unwrap().param,
+            rate,
+            "and changes nothing by opening it"
+        );
+        app.close_modal();
+
+        // And it is still Rate when it opens again.
+        app.open_fx_gate_modal();
+        assert_eq!(app.fx_chain[0].gate.unwrap().param, rate);
+        assert!(
+            app.fx_gate_rows()[1].contains("Rate"),
+            "reopened on: {}",
+            app.fx_gate_rows()[1]
+        );
+
+        // The arrows are what move it, and they still do.
+        app.step_fx_gate_row(1, 1);
+        assert!(app.fx_gate_rows()[1].contains("Depth"));
+    }
+
+    /// The case the GATE dialogue was asked for by name: a drum tab driving
+    /// **one knob** of an effect on another tab.
+    ///
+    /// Tab 3 is a kick, tab 1 has an AUTO FILTER, and what the kick moves is
+    /// its `Rate` — not the effect's dry/wet, which is all a gate could reach
+    /// before. DEPTH is how far the kick is allowed to push it.
+    #[test]
+    fn a_gate_can_be_pointed_at_one_knob_of_the_effect() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        let mut app = App::new();
+        app.splash_done = true;
+        for _ in 0..3 {
+            app.slots.push(RackSlot::new(AudioSource::Midi));
+        }
+        // Tab 1 is the one being filtered; tab 3 is the kick.
+        app.active_slot = 0;
+        app.fx_chain
+            .push(source::AudioFxEntry::new(source::AudioFxKind::AutoFilter));
+        app.fx_slot = 0;
+        app.open_fx_gate_modal();
+
+        // SOURCE walks off → tab 1 → tab 2 → tab 3.
+        for _ in 0..3 {
+            app.step_fx_gate_row(0, 1);
+        }
+        assert_eq!(
+            app.fx_chain[0].gate.map(|g| g.source),
+            Some(choz_engine::fx_chain::GateSource::Tab(2)),
+            "the kick on tab 3"
+        );
+
+        // TARGET walks MIX → Freq → Res → Mode → Rate.
+        let rate = app.fx_chain[0]
+            .param_descs()
+            .iter()
+            .position(|d| d.name == "Rate")
+            .expect("the auto filter has a Rate knob");
+        for _ in 0..=rate {
+            app.step_fx_gate_row(1, 1);
+        }
+        assert_eq!(app.fx_chain[0].gate.unwrap().param, Some(rate));
+        assert!(
+            app.fx_gate_rows()[1].contains("Rate"),
+            "the row says which knob: {}",
+            app.fx_gate_rows()[1]
+        );
+
+        // DEPTH is the ceiling on how far the kick pushes it.
+        app.step_fx_gate_row(3, -3);
+        let depth = app.fx_chain[0].gate.unwrap().depth;
+        assert!(depth < 1.0 && depth > 0.0, "a depth of its own: {depth}");
+
+        // And that is what the engine is handed.
+        let spec = app.fx_chain[0].to_spec();
+        let gate = spec.gate.expect("the spec carries it");
+        assert_eq!(gate.param, Some(rate));
+        assert_eq!(gate.depth, depth);
+        assert_eq!(gate.source, choz_engine::fx_chain::GateSource::Tab(2));
     }
 
     /// The split is painted with the pointer: a chip picks the sound, the left
@@ -25893,6 +27239,117 @@ mod tests {
         // nothing — which is exactly the reading somebody opens it for.
         app.in_open = true;
         assert_eq!(app.capture_mask(), u64::MAX);
+    }
+
+    /// A keyboard that came back on another ALSA client number is the same
+    /// keyboard: the rack keeps answering it.
+    ///
+    /// This is the bug where a project opened complete and silent. midir spells
+    /// a port `"… MIDI 1 40:0"`, that number is handed out in plug order, and a
+    /// suspend or a re-plug made it `20:0` — so every tab was bound to a port
+    /// name nothing on the machine had any more.
+    #[test]
+    fn a_replugged_keyboard_keeps_its_tabs() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.splash_done = true;
+        let saved = "Keystation Pro 88:Keystation Pro 88 MIDI 1 40:0";
+        let live = "Keystation Pro 88:Keystation Pro 88 MIDI 1 20:0";
+        let other = "Arturia KeyStep 32:Arturia KeyStep 32 MIDI 1 16:0";
+        assert_eq!(
+            port_key(saved),
+            port_key(live),
+            "the address is not part of which port it is"
+        );
+        assert_ne!(port_key(saved), port_key(other), "but the name still is");
+        // A name that merely ends in something colon-shaped keeps it.
+        assert_eq!(port_key("Bus 1:2 out"), "Bus 1:2 out");
+
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.slots[0].input = Some(InputRef::Midi(saved.to_string()));
+        app.slots[1].input = Some(InputRef::Midi(other.to_string()));
+        // What the machine actually has plugged in now.
+        app.midi_connected = vec![live.to_string(), other.to_string()];
+
+        use choz_engine::input::InputSource;
+        assert_eq!(
+            app.note_targets(InputSource::Midi(0)),
+            vec![0],
+            "the keyboard still plays its tab"
+        );
+        assert_eq!(app.note_targets(InputSource::Midi(1)), vec![1]);
+
+        // And what was learned from it still answers it.
+        app.cc_bindings.push(CcBinding {
+            source: Some(InputRef::Midi(saved.to_string())),
+            cc: 7,
+            target: LearnTarget::Gain(0),
+            tab: Some(0),
+        });
+        app.slots[0].gain = 0.1;
+        app.apply_cc(InputSource::Midi(0), 0, 7, 127);
+        assert!(
+            app.slots[0].gain > 0.1,
+            "a CC learned before the re-plug still moves the fader"
+        );
+    }
+
+    /// File \u{2192} New project empties the rack, and asks first when there is
+    /// work to lose — the same question, and the same safe default, as the way
+    /// out.
+    #[test]
+    fn a_new_project_empties_the_rack_and_asks_about_unsaved_work() {
+        let _g = ui_guard();
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.saved_project = Some(app.project_snapshot());
+
+        // An untouched session starts over without a word.
+        apply_menu_action(&mut app, menu::MenuAction::NewProject);
+        assert!(app.modal.is_none(), "nothing to lose, nothing to ask");
+
+        // A rack somebody built is work: the question comes up, standing on
+        // the answer that keeps it.
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.cc_bindings.push(CcBinding {
+            source: None,
+            cc: 7,
+            target: LearnTarget::Gain(0),
+            tab: None,
+        });
+        apply_menu_action(&mut app, menu::MenuAction::NewProject);
+        let modal = app.modal.as_ref().expect("it asked");
+        assert_eq!(modal.kind, ModalKind::NewConfirm);
+        assert_eq!(modal.list.items.len(), 3, "save, discard, stay");
+        assert_eq!(modal.list.cursor, 0, "on the answer that keeps the work");
+
+        // CANCEL keeps the rack exactly as it was.
+        if let Some(m) = app.modal.as_mut() {
+            m.list.cursor = 2;
+        }
+        assert!(app.modal_select());
+        app.close_modal();
+        assert_eq!(app.slots.len(), 1, "CANCEL is not a way out either");
+
+        // Discarding empties the rack and forgets the file it came from.
+        app.project_file = Some(std::path::PathBuf::from("/tmp/whatever.yml"));
+        apply_menu_action(&mut app, menu::MenuAction::NewProject);
+        if let Some(m) = app.modal.as_mut() {
+            m.list.cursor = 1;
+        }
+        app.modal_select();
+        assert!(app.slots.is_empty(), "the rack is empty");
+        assert!(
+            app.cc_bindings.is_empty(),
+            "and so is what was learned on it"
+        );
+        assert!(
+            app.project_file.is_none(),
+            "there is nowhere to save it back to"
+        );
+        assert!(!app.project_is_dirty(), "an empty rack is not unsaved work");
     }
 
     /// The way out asks about work that is not on disk — and only then.
@@ -26247,6 +27704,45 @@ mod tests {
         app.active_slot = 2;
         app.apply_program_button(station, 7);
         assert_eq!(app.slots[2].sound_at, Some(0), "the tab in front owns it");
+    }
+
+    /// ABOUT reads what choz *is* rather than what somebody typed once: the
+    /// version came from a literal that said `v0.1` at 1.3.6.
+    #[test]
+    fn about_shows_the_version_it_was_built_as() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.about_open = true;
+        app.plugins.push(choz_engine::FoundPlugin {
+            format: choz_engine::PluginFormat::Sfz,
+            id: "/lib/Saw.sfz".into(),
+            name: "Saw".into(),
+            path: "/lib/Saw.sfz".into(),
+            is_instrument: true,
+        });
+
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let screen: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(
+            screen.contains(&version_line()),
+            "the real version:\n{screen}"
+        );
+        assert!(!screen.contains("v0.1"), "and not a written-down one");
+        assert!(
+            screen.contains(&format!("{} built-in effects", ALL_FX_KINDS.len())),
+            "the built-ins are counted, not quoted:\n{screen}"
+        );
+        assert!(screen.contains("1 plugin scanned"), "{screen}");
+        assert!(screen.contains("VST3"), "the formats it hosts:\n{screen}");
     }
 
     /// A VST3 tab reopens as the plugin it was, not as whichever VST3 the scan

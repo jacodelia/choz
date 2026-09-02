@@ -437,6 +437,21 @@ fn build(
     Ok(inst)
 }
 
+/// A DSSI `(bank, program)` as the three MIDI messages that ask for it: bank
+/// select MSB, bank select LSB, program change.
+///
+/// DSSI banks are a full 32-bit number and MIDI's are 14 bits in two halves,
+/// so the low seven go in the LSB and the next seven in the MSB — which is
+/// what every plugin that reads bank selects expects. Anything above that
+/// cannot be asked for this way and is left to `select_program`.
+fn program_msgs(bank: u32, program: u32) -> [[u8; 3]; 3] {
+    [
+        [0xB0, 0, ((bank >> 7) & 0x7F) as u8],
+        [0xB0, 32, (bank & 0x7F) as u8],
+        [0xC0, (program & 0x7F) as u8, 0],
+    ]
+}
+
 /// The programs a DSSI plugin declares, asked for one by one until it stops
 /// answering. Non-RT: it happens once, at load.
 ///
@@ -541,6 +556,41 @@ impl Instance {
         }
     }
 
+    /// Ask the plugin for one of its programs, **both** ways the format offers.
+    ///
+    /// `select_program` is the DSSI call and some plugins implement it; others
+    /// list their programs, answer the call without complaint, and go on
+    /// playing exactly what they were playing. amsynth's DSSI build is one of
+    /// those — 3712 programs listed, 29 banks, and a `select_program` that
+    /// changes not a note — while a bank select plus a program change on its
+    /// event input switches it as its VST2 build does. Neither half is wrong
+    /// per the spec, so a host that only asks one way gets whichever half the
+    /// plugin happened to implement.
+    ///
+    /// Sending both is safe: a plugin that acted on the call sees a program
+    /// change asking for the program it is already on.
+    fn apply_program(&mut self, bank: u32, program: u32) {
+        if !self.dssi.is_null() {
+            if let Some(select) = unsafe { (*self.dssi).select_program } {
+                unsafe {
+                    select(
+                        self.handle,
+                        bank as std::os::raw::c_ulong,
+                        program as std::os::raw::c_ulong,
+                    )
+                };
+            }
+        }
+        // In front of whatever else this block carries: a note that arrives
+        // with the program change belongs to the program being asked for.
+        for (i, msg) in program_msgs(bank, program).into_iter().enumerate() {
+            if self.pending_midi.len() < MAX_PENDING_MIDI {
+                self.pending_midi
+                    .insert(i.min(self.pending_midi.len()), msg);
+            }
+        }
+    }
+
     fn queue_midi(&mut self, bytes: [u8; 3]) {
         if self.pending_midi.len() < MAX_PENDING_MIDI {
             self.pending_midi.push(bytes);
@@ -584,11 +634,9 @@ impl Instance {
             let req = self.program_request.load(Ordering::Relaxed);
             if req & PROGRAM_REQUESTED != 0 {
                 self.program_request.store(0, Ordering::Relaxed);
-                if let Some(select) = unsafe { (*self.dssi).select_program } {
-                    let bank = ((req >> 32) & 0x7FFF_FFFF) as std::os::raw::c_ulong;
-                    let program = (req & 0xFFFF_FFFF) as std::os::raw::c_ulong;
-                    unsafe { select(self.handle, bank, program) };
-                }
+                let bank = ((req >> 32) & 0x7FFF_FFFF) as u32;
+                let program = (req & 0xFFFF_FFFF) as u32;
+                self.apply_program(bank, program);
             }
             self.events.clear();
             for msg in &self.pending_midi {
@@ -873,20 +921,10 @@ impl AudioSource for DssiInstrument {
     }
 
     fn program_change(&mut self, bank: u8, preset: u8) {
-        // DSSI has its own program call, and it is not an RT-safe one for every
-        // plugin — but it is what the format offers, and the alternative is no
-        // program change at all.
-        if !self.inst.dssi.is_null() {
-            if let Some(select) = unsafe { (*self.inst.dssi).select_program } {
-                unsafe {
-                    select(
-                        self.inst.handle,
-                        bank as std::os::raw::c_ulong,
-                        preset as std::os::raw::c_ulong,
-                    )
-                };
-            }
-        }
+        // The same two ways the picker uses — see [`Instance::apply_program`]:
+        // the DSSI call for the plugins that implement it, and the program
+        // change on the event input for the ones that only listen there.
+        self.inst.apply_program(bank as u32, preset as u32);
     }
 
     fn set_param(&mut self, index: usize, value: f32) {
@@ -924,4 +962,32 @@ fn keep_loaded(lib: &Arc<Library>) {
 unsafe extern "C" {
     #[link_name = "free"]
     fn libc_free(p: *mut std::os::raw::c_void);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::program_msgs;
+
+    /// A DSSI bank is a 32-bit number and MIDI's is two seven-bit halves, so
+    /// the split has to be the one every plugin expects — the low seven in the
+    /// LSB. Getting it backwards asks for bank 128 when the picker said 1,
+    /// which is a program change that lands nowhere.
+    #[test]
+    fn a_bank_and_a_program_become_the_three_midi_messages_that_ask_for_them() {
+        assert_eq!(
+            program_msgs(0, 0),
+            [[0xB0, 0, 0], [0xB0, 32, 0], [0xC0, 0, 0]]
+        );
+        assert_eq!(
+            program_msgs(5, 3),
+            [[0xB0, 0, 0], [0xB0, 32, 5], [0xC0, 3, 0]],
+            "amsynth's bank 5, program 3"
+        );
+        // Past 127 the bank spills into the MSB, which is what the second half
+        // of the pair is for.
+        assert_eq!(
+            program_msgs(130, 127),
+            [[0xB0, 0, 1], [0xB0, 32, 2], [0xC0, 127, 0]]
+        );
+    }
 }

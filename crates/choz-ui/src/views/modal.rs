@@ -51,7 +51,14 @@ pub struct ListModal {
     pub sidebar_cursor: usize,
     /// Whether the arrows drive the sidebar rather than the list.
     pub sidebar_focused: bool,
+    /// Where the pointer is, so the row under it can say so before it is
+    /// clicked. `None` on a modal drawn without a mouse position.
+    pub hover: Option<(u16, u16)>,
 }
+
+/// The row the pointer is over, which is a shade of the selection rather than a
+/// second highlight: two equally loud rows would be two cursors.
+const HOVER_BG: Color = Color::Rgb(38, 46, 60);
 
 impl ListModal {
     pub fn new(title: impl Into<String>, items: Vec<String>) -> Self {
@@ -475,9 +482,13 @@ pub fn draw_list_modal(
             let rect = Rect::new(content.x, y + i as u16, sw, 1);
             rects.sidebar.push((i, rect));
             let sel = i == m.sidebar_cursor;
+            let hovered = m
+                .hover
+                .is_some_and(|(x, y)| rect.contains(ratatui::layout::Position::new(x, y)));
             let (bg, fg) = match (sel, m.sidebar_focused) {
                 (true, true) => (ACCENT, Color::Black),
                 (true, false) => (Color::Rgb(30, 38, 50), WARN),
+                _ if hovered => (HOVER_BG, text()),
                 _ => (PANEL_BG, HINT),
             };
             let text = format!(
@@ -535,11 +546,14 @@ pub fn draw_list_modal(
         let rect = Rect::new(list_area.x, y + (i - m.scroll) as u16, list_area.width, 1);
         rects.rows.push((i, rect));
         let sel = i == m.cursor;
+        let hovered = m
+            .hover
+            .is_some_and(|(x, y)| rect.contains(ratatui::layout::Position::new(x, y)));
         let (bg, fg) = if sel {
             (ACCENT, Color::Black)
         } else {
             (
-                PANEL_BG,
+                if hovered { HOVER_BG } else { PANEL_BG },
                 m.colours.get(i).copied().flatten().unwrap_or_else(text),
             )
         };
@@ -644,13 +658,21 @@ pub fn draw_list_modal(
     } else {
         bx + 1
     };
-    if hint_x < content.x + content.width {
+    // The keyboard hint takes what is left of the button row, and says less
+    // when less fits: a hint cut off mid-word is worse than a shorter one.
+    let room = (content.x + content.width).saturating_sub(hint_x) as usize;
+    if let Some(hint) = [
+        "\u{2191}\u{2193} move  \u{00B7}  wheel scroll  \u{00B7}  Enter select  \u{00B7}  Esc close",
+        "\u{2191}\u{2193} move  \u{00B7}  Enter select  \u{00B7}  Esc close",
+        "Enter select  \u{00B7}  Esc close",
+        "Esc close",
+    ]
+    .into_iter()
+    .find(|h| h.chars().count() <= room)
+    {
         f.render_widget(
-            Paragraph::new(Span::styled(
-                "\u{2191}\u{2193}=move  wheel=scroll  Enter=select  Esc=cancel",
-                Style::default().fg(DIM),
-            ))
-            .style(super::theme::panel_style()),
+            Paragraph::new(Span::styled(hint, Style::default().fg(DIM)))
+                .style(super::theme::panel_style()),
             Rect::new(hint_x, btn_y, content.x + content.width - hint_x, 1),
         );
     }

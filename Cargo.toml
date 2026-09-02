@@ -6,6 +6,7 @@ members = ["crates/choz-ports", "crates/choz-engine", "crates/choz-plugin-clap",
 version = "1.3.7"
 edition = "2021"
 description = "A terminal-based audio plugin host — like Carla for the terminal"
+repository = "https://github.com/jacodelia/choz"
 
 [workspace.dependencies]
 anyhow = "1"

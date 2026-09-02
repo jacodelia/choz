@@ -3,6 +3,7 @@ name = "choz-ui"
 version.workspace = true
 edition.workspace = true
 description.workspace = true
+repository.workspace = true
 license = "MIT"
 
 [[bin]]

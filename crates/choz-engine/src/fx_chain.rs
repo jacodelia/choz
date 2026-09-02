@@ -127,6 +127,21 @@ impl GateSource {
 pub struct GateSpec {
     /// What drives this: another tab, the clock, or the metronome's tap.
     pub source: GateSource,
+    /// What it moves: the effect's dry/wet (`None`, which is every gate written
+    /// before this existed) or one of its parameters, by index.
+    ///
+    /// The mix is the destination that works on all fifty-six effects and on
+    /// every hosted plugin without knowing anything about them. A parameter is
+    /// the one somebody asks for by name — the kick opening a *cutoff*, not the
+    /// whole wah — and it is the same envelope arriving at a different setter.
+    ///
+    /// **The two move differently, on purpose.** On the mix, the knob the user
+    /// set is the ceiling and the gate takes away from it: that is what "this
+    /// effect is only there when the kick hits" means. On a parameter the knob
+    /// is where it *rests*, and the gate pushes it away from there — a filter
+    /// that opens on the hit and falls back to where it was left, which is what
+    /// an envelope on a cutoff has always done.
+    pub param: Option<usize>,
     pub mode: GateMode,
     /// How much of the effect the gate is allowed to move, 0..1. At 0 it does
     /// nothing; at 1 the effect is entirely the gate's.
@@ -163,6 +178,7 @@ impl Default for GateSpec {
     fn default() -> Self {
         Self {
             source: GateSource::Tab(0),
+            param: None,
             mode: GateMode::default(),
             depth: 1.0,
             threshold: 0.5,
@@ -668,6 +684,10 @@ struct Gated {
     gate: GateSpec,
     /// The mix the user set, which is what the gate moves *from*.
     base_wet: f32,
+    /// The same for the parameter it drives, when it drives one: where the knob
+    /// rests, which is where the modulation is measured from and where it falls
+    /// back to.
+    base_param: f32,
     /// The follower's state, 0..1. Rises to the source at once and falls by
     /// the release time — the shape of a gate, not of a filter.
     env: f32,
@@ -699,10 +719,27 @@ impl fx::FxProcessor for Gated {
         // the user put it, so a gate at half depth is an effect that breathes
         // rather than one that switches.
         let d = self.gate.depth.clamp(0.0, 1.0);
-        let wet = self.base_wet * (1.0 - d + d * g);
-        if (wet - self.sent).abs() > 1e-4 {
-            self.inner.set_mix(wet);
-            self.sent = wet;
+        let (value, target) = match self.gate.param {
+            // The knob rests where it was left and the modulation pushes it
+            // towards one end of its own travel — up on OPEN, down on DUCK —
+            // so a gate at rest changes nothing and one at full depth reaches
+            // the end of the range rather than some fraction of it.
+            Some(index) => {
+                let base = self.base_param.clamp(0.0, 1.0);
+                let v = match self.gate.mode {
+                    GateMode::Open => base + d * self.env * (1.0 - base),
+                    GateMode::Duck => base - d * self.env * base,
+                };
+                (v.clamp(0.0, 1.0), Some(index))
+            }
+            None => (self.base_wet * (1.0 - d + d * g), None),
+        };
+        if (value - self.sent).abs() > 1e-4 {
+            match target {
+                Some(index) => self.inner.set_param(index, value),
+                None => self.inner.set_mix(value),
+            }
+            self.sent = value;
         }
         self.inner.process_block(buf, sample_rate);
     }
@@ -715,8 +752,14 @@ impl fx::FxProcessor for Gated {
 
     /// The user moving the dry/wet moves what the gate works from, not the
     /// gate's own output — otherwise the next block would overwrite the move.
+    ///
+    /// With the gate on a parameter the mix is nobody's but the user's, so it
+    /// goes straight through as well as being remembered.
     fn set_mix(&mut self, wet: f32) {
         self.base_wet = wet.clamp(0.0, 1.0);
+        if self.gate.param.is_some() {
+            self.inner.set_mix(self.base_wet);
+        }
     }
 
     fn name(&self) -> &str {
@@ -727,7 +770,16 @@ impl fx::FxProcessor for Gated {
         self.inner.params()
     }
 
+    /// The knob the gate drives is the same one: turning it moves where the
+    /// modulation rests, exactly as turning the dry/wet does. Without this the
+    /// next block would put the old resting place back and the knob would look
+    /// broken.
     fn set_param(&mut self, index: usize, value: f32) {
+        if self.gate.param == Some(index) {
+            self.base_param = value.clamp(0.0, 1.0);
+            self.sent = -1.0;
+            return;
+        }
         self.inner.set_param(index, value);
     }
 
@@ -902,6 +954,7 @@ pub fn gated(
         inner,
         gate,
         base_wet,
+        base_param: 0.0,
         env: 0.0,
         sent: -1.0,
     })
@@ -963,6 +1016,13 @@ pub fn build_chain_from_specs(
             let proc: Box<dyn fx::FxProcessor> = match s.gate {
                 Some(gate) => Box::new(Gated {
                     inner: proc,
+                    // Where the driven knob was left, which the spec is the
+                    // only place that knows: the processor was just built from
+                    // it and is about to be handed to the audio thread.
+                    base_param: gate
+                        .param
+                        .and_then(|i| s.params.get(i).copied())
+                        .unwrap_or(0.0),
                     gate,
                     base_wet: s.wet,
                     env: 0.0,
@@ -1027,6 +1087,88 @@ mod tests {
             played.level()
         );
         notes.reset_all();
+    }
+
+    /// A gate can move a **knob** and not only the dry/wet: the kick opening a
+    /// filter's cutoff, which is the case the mix could never cover.
+    ///
+    /// The mix destination answers "how much of this effect is there"; a
+    /// parameter answers "where is this control right now", and the second one
+    /// is what an envelope on a cutoff has always meant. Both are the same
+    /// follower arriving at a different setter — see [`GateSpec::param`].
+    #[test]
+    fn a_gate_can_move_a_parameter_and_not_only_the_mix() {
+        const SOURCE: usize = 7;
+        const CUTOFF: usize = 0; // Auto Filter's "Freq"
+        let levels = crate::meter::slot_levels();
+        levels.reset(SOURCE);
+
+        let spec = |gate: Option<GateSpec>| FxSpec {
+            kind: "autofilter".to_string(),
+            enabled: true,
+            wet: 1.0,
+            // Resting halfway up its own travel, so the modulation has room to
+            // move in either direction.
+            params: vec![0.5],
+            plugin: None,
+            gate,
+            loops: Vec::new(),
+            loop_frames: 0,
+        };
+        let gate = GateSpec {
+            source: GateSource::Tab(SOURCE),
+            param: Some(CUTOFF),
+            mode: GateMode::Open,
+            depth: 1.0,
+            threshold: 0.5,
+            release_ms: 120.0,
+        };
+        let cutoff = |chain: &[Box<dyn fx::FxProcessor>]| chain[0].params()[CUTOFF].value;
+        let mut block = vec![0.0f32; 256];
+
+        // Nothing on the source tab: the knob stays where the user left it.
+        let mut chain = build_chain_from_specs(&[spec(Some(gate))], 48_000, 128);
+        chain[0].process_block(&mut block, 48_000);
+        let resting = cutoff(&chain);
+        assert!(
+            (resting - 0.5).abs() < 0.02,
+            "a silent source moves nothing: {resting}"
+        );
+
+        // A hit on the source tab pushes it up towards the top of its range.
+        levels.publish(SOURCE, &vec![0.9f32; 256]);
+        chain[0].process_block(&mut block, 48_000);
+        let open = cutoff(&chain);
+        assert!(open > resting + 0.3, "the hit opens the filter: {open}");
+
+        // And it falls back to where the knob is, not to zero.
+        levels.reset(SOURCE);
+        for _ in 0..200 {
+            chain[0].process_block(&mut block, 48_000);
+        }
+        let back = cutoff(&chain);
+        assert!(
+            (back - 0.5).abs() < 0.05,
+            "it releases back to the resting knob, not to silence: {back}"
+        );
+
+        // The same gate with no parameter is the old behaviour, untouched: it
+        // moves the mix and leaves every knob alone.
+        levels.publish(SOURCE, &vec![0.9f32; 256]);
+        let mut mixed = build_chain_from_specs(
+            &[spec(Some(GateSpec {
+                param: None,
+                ..gate
+            }))],
+            48_000,
+            128,
+        );
+        mixed[0].process_block(&mut block, 48_000);
+        assert!(
+            (cutoff(&mixed) - 0.5).abs() < 0.02,
+            "a gate on the mix does not touch the knobs"
+        );
+        levels.reset(SOURCE);
     }
 
     /// The dry/wet law, checked on **every** built-in at once: a wet of zero
@@ -1159,12 +1301,14 @@ mod tests {
             inner: Box::new(Silencer { wet: 1.0 }),
             gate: GateSpec {
                 source: GateSource::Tab(drums),
+                param: None,
                 mode: GateMode::Open,
                 depth: 1.0,
                 threshold: 0.5,
                 release_ms: 20.0,
             },
             base_wet: 1.0,
+            base_param: 0.0,
             env: 0.0,
             sent: -1.0,
         };

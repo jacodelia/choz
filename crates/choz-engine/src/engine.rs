@@ -4626,6 +4626,7 @@ mod tests {
             plugin: None,
             gate: Some(GateSpec {
                 source,
+                param: None,
                 mode: GateMode::Open,
                 depth: 1.0,
                 threshold: 0.5,
@@ -4691,6 +4692,7 @@ mod tests {
                     Box::new(Silencer { wet: 1.0 }),
                     crate::fx_chain::GateSpec {
                         source: crate::fx_chain::GateSource::Tab(1),
+                        param: None,
                         mode: crate::fx_chain::GateMode::Open,
                         depth: 1.0,
                         threshold: 0.5,

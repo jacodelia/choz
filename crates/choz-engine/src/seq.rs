@@ -184,6 +184,53 @@ impl SeqSettings {
         steps.clamp(1, STEPS)
     }
 
+    /// How many steps one **beat** of the bar is, at this sequencer's
+    /// resolution.
+    ///
+    /// The grid used to draw its gaps and its beat numbers every four cells,
+    /// which is right for 4/4 at 1/16 and wrong for everything else: 7/8 at
+    /// 1/16 is fourteen steps of which every *second* one starts a beat, and
+    /// the box drew four beats of four however the bar was counted. The beat
+    /// is the signature's own unit — an eighth in 7/8 — read at the step
+    /// length.
+    pub fn steps_per_beat(&self) -> usize {
+        let (_, den) = choz_ports::transport().time_signature();
+        let beat_quarters = 4.0 / den.max(1) as f32;
+        let steps = (beat_quarters / self.div.quarters()).round();
+        (steps.max(1.0) as usize).min(STEPS)
+    }
+
+    /// Where each group of the bar starts, in steps.
+    ///
+    /// `groups` is the metronome's own grouping — 3+2+2 for a 7/8 counted the
+    /// way a Balkan tune counts it — in **beats**, which is how the click
+    /// stores it. An empty (or ill-fitting) grouping leaves one stop per beat,
+    /// which is the even bar.
+    pub fn group_stops(&self, groups: &[u8]) -> Vec<usize> {
+        let (num, _) = choz_ports::transport().time_signature();
+        let per_beat = self.steps_per_beat();
+        let fits =
+            !groups.is_empty() && groups.iter().map(|g| *g as u16).sum::<u16>() == num.max(1);
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        match fits {
+            true => {
+                for g in groups {
+                    out.push(at);
+                    at += *g as usize * per_beat;
+                }
+            }
+            false => {
+                while at < self.bar_steps() {
+                    out.push(at);
+                    at += per_beat;
+                }
+            }
+        }
+        out.retain(|s| *s < STEPS);
+        out
+    }
+
     pub fn step_on(&self, track: usize, step: usize) -> bool {
         self.parts[self.part.min(PARTS - 1)][track.min(TRACKS - 1)] & (1 << step.min(STEPS - 1))
             != 0
@@ -225,6 +272,9 @@ pub struct Seq {
     /// The transport step last fired while following one, so the same one is
     /// never played twice.
     grid: Option<i64>,
+    /// Started by the transport, so it counts nothing of its own — see
+    /// [`Seq::play_on_transport`]. Not saved: it says what started this run.
+    follow: bool,
     /// xorshift, so RANDOM and PROB are a sequence rather than a surprise —
     /// the same generator the arpeggiator's `Random` mode runs on.
     rng: u32,
@@ -262,6 +312,7 @@ impl Default for Seq {
             off_at: None,
             sounding: Vec::new(),
             grid: None,
+            follow: false,
             // Any seed but zero: xorshift started at zero stays there, and a
             // PROB knob that never fires is worse than one that is not here.
             rng: 0x9E37_79B9,
@@ -273,7 +324,7 @@ impl Default for Seq {
 
 /// The snapshot the panel draws from. `Copy`-cheap except for the song, which
 /// is borrowed.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SeqView<'a> {
     pub settings: &'a SeqSettings,
     pub playing: bool,
@@ -284,6 +335,12 @@ pub struct SeqView<'a> {
     /// How many of the sixteen cells are inside the bar — see
     /// [`SeqSettings::bar_steps`]. The rest are drawn, and never played.
     pub bar: usize,
+    /// Steps to a beat — see [`SeqSettings::steps_per_beat`]. What the ruler
+    /// numbers and where the grid breaks.
+    pub beat: usize,
+    /// Where each group of the bar starts, in steps — see
+    /// [`SeqSettings::group_stops`]. One per beat on an even bar.
+    pub stops: Vec<usize>,
     /// Whether the arrows are on this box at all.
     pub focused: bool,
 }
@@ -314,6 +371,10 @@ impl Seq {
             step: self.step,
             cursor: self.cursor,
             bar: self.settings.bar_steps(),
+            beat: self.settings.steps_per_beat(),
+            stops: self
+                .settings
+                .group_stops(&crate::metronome::metronome().groups()),
             focused: false,
         }
     }
@@ -325,6 +386,7 @@ impl Seq {
             self.settings.on = true;
         }
         self.playing = true;
+        self.follow = false;
         // One before the top: the clock fires the step *after* this one, so
         // starting at 0 would skip the downbeat — the one step a pattern is
         // most likely to have something on.
@@ -335,6 +397,25 @@ impl Seq {
         if let Some(first) = self.settings.song.first() {
             self.settings.part = (*first).min(PARTS - 1);
         }
+    }
+
+    /// Start as a **follower of the transport**: no clock of its own.
+    ///
+    /// The rack's PLAY starts every sequencer that is switched on, and the
+    /// transport it starts is set rolling by the audio thread — one block
+    /// later. In that gap [`Self::tick`] found no grid to count, ran the
+    /// sequencer's own clock and fired the first step; the grid then arrived
+    /// and fired the same step again. Two hits a millisecond apart on the
+    /// downbeat of every pattern, which is heard as the instrument doubling —
+    /// and which the box's own PLAY never did, because nothing else was
+    /// counting.
+    ///
+    /// So: started by the transport, counted by the transport. Its own PLAY is
+    /// still [`Self::play`] and still runs free until a grid appears.
+    pub fn play_on_transport(&mut self) {
+        self.play();
+        self.follow = true;
+        self.next_step = None;
     }
 
     /// Start **in step with a sequencer that is already running**.
@@ -373,6 +454,7 @@ impl Seq {
     /// armed writes the next thing played into a pattern nobody was looking at.
     pub fn stop(&mut self, out: &mut Vec<ArpEvent>) {
         self.playing = false;
+        self.follow = false;
         self.rec = false;
         self.step = 0;
         self.song_pos = 0;
@@ -588,6 +670,11 @@ impl Seq {
             self.fire(step, now, out);
             return;
         }
+        // Started by the transport and the transport has not begun to roll:
+        // wait for it. Counting time here is what doubled the first step.
+        if self.follow {
+            return;
+        }
         // Its own clock: a step is due when enough time has gone by.
         self.grid = None;
         let Some(due) = self.next_step else {
@@ -791,6 +878,72 @@ mod tests {
         seq.settings.step_on(track, step)
     }
 
+    /// The rack's PLAY starts a pattern **once**.
+    ///
+    /// The bug: the transport is set rolling by the audio thread, one block
+    /// after the button is pressed. In that gap the sequencer found no grid to
+    /// count, ran its own clock and fired the downbeat; the grid then arrived
+    /// and fired the same step again. Two hits a millisecond apart on the
+    /// first step of every pattern — heard as the instrument doubling, and
+    /// only when starting from the rack's PLAY, because the box's own PLAY
+    /// leaves the transport alone and nothing else is counting.
+    #[test]
+    fn the_transports_play_fires_the_first_step_once() {
+        let _g = crate::test_locks::transport();
+        let t = choz_ports::transport();
+        t.set_playing(false);
+        t.set_position_beats(0.0);
+
+        let mut seq = Seq::new(SeqSettings {
+            on: true,
+            ..Default::default()
+        });
+        seq.toggle_step(0, 0);
+        // What the rack's PLAY does.
+        seq.play_on_transport();
+
+        let now = Instant::now();
+        let mut out = Vec::new();
+        // Ticks before the audio thread has flagged the transport: the gap the
+        // bug lived in. Nothing may come out of them.
+        for i in 0..40 {
+            seq.tick(now + Duration::from_millis(i), &mut out);
+        }
+        assert!(
+            out.is_empty(),
+            "a sequencer the transport started must wait for it: {out:?}"
+        );
+
+        // The transport rolls, and the downbeat plays — once.
+        t.set_playing(true);
+        for i in 40..80 {
+            seq.tick(now + Duration::from_millis(i), &mut out);
+        }
+        let ons = out
+            .iter()
+            .filter(|e| matches!(e, ArpEvent::On { .. }))
+            .count();
+        assert_eq!(ons, 1, "the first step sounded {ons} times");
+
+        // And its own PLAY still runs free, which is what a box with no
+        // transport under it has always done.
+        t.set_playing(false);
+        let mut alone = Seq::new(SeqSettings {
+            on: true,
+            ..Default::default()
+        });
+        alone.toggle_step(0, 0);
+        alone.play();
+        let mut free = Vec::new();
+        for i in 0..40 {
+            alone.tick(now + Duration::from_millis(i), &mut free);
+        }
+        assert!(
+            free.iter().any(|e| matches!(e, ArpEvent::On { .. })),
+            "the box's own PLAY has no transport to wait for"
+        );
+    }
+
     /// Two tabs, two patterns, one groove: the second sequencer to start lands
     /// on the first one's step boundary instead of starting its own clock
     /// where the key happened to be pressed.
@@ -839,11 +992,7 @@ mod tests {
             second.tick(now, &mut b);
             let hit = |v: &Vec<ArpEvent>| v.iter().any(|e| matches!(e, ArpEvent::On { .. }));
             if hit(&a) || hit(&b) {
-                assert_eq!(
-                    hit(&a),
-                    hit(&b),
-                    "one of them fired on its own at tick {i}"
-                );
+                assert_eq!(hit(&a), hit(&b), "one of them fired on its own at tick {i}");
                 fired = (fired.0 + hit(&a) as usize, fired.1 + hit(&b) as usize);
             }
         }
