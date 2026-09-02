@@ -68,7 +68,7 @@ impl UridStore {
             next: 1,
         }
     }
-    fn intern(&mut self, uri: &str) -> u32 {
+    pub(crate) fn intern(&mut self, uri: &str) -> u32 {
         if let Some(&id) = self.map.get(uri) {
             return id;
         }
@@ -91,17 +91,12 @@ unsafe extern "C" fn urid_map_fn(handle: LV2_URID_Map_Handle, uri: *const c_char
     store.lock().intern(&s)
 }
 
-/// One URID store shared by every plugin *UI*, kept for the process's life.
-///
-/// A UI only maps URIs for its own bookkeeping — choz exchanges plain floats
-/// with it, never atoms — so it does not need to agree with the DSP instance's
-/// numbering. A `static` keeps the handle valid for as long as any window can
-/// still call in, which a per-instance store would not.
-static UI_URIDS: std::sync::OnceLock<Arc<Mutex<UridStore>>> = std::sync::OnceLock::new();
-
-/// An `LV2_URID_Map` over [`UI_URIDS`], for a UI's feature array.
-pub(crate) fn shared_urid_map() -> LV2_URID_Map {
-    let store = UI_URIDS.get_or_init(|| Arc::new(Mutex::new(UridStore::new())));
+/// An `LV2_URID_Map` over one instance's store, for that instance's UI feature
+/// array. The UI must share the DSP instance's numbering: a `patch:Set` the UI
+/// writes carries mapped URIDs (the property, `atom:Path`, …) that the plugin
+/// then reads back through its own map. The caller keeps the `Arc` alive for as
+/// long as the window can still call in.
+pub(crate) fn instance_urid_map(store: &Arc<Mutex<UridStore>>) -> LV2_URID_Map {
     LV2_URID_Map {
         handle: Arc::as_ptr(store) as *mut c_void,
         map: Some(urid_map_fn),
@@ -436,9 +431,15 @@ struct Lv2Instance {
     audio_in: Vec<usize>,   // port indices
     audio_out: Vec<usize>,  // port indices
     atom_in: Option<usize>, // first MIDI atom input port index
-    atom_out: Vec<usize>,   // atom output port indices (need capacity reset)
+    /// Atom input port that carries `patch:Set` (a file parameter). The MIDI
+    /// port when the plugin has only one atom-in; a distinct port when it keeps
+    /// them apart; `atom_in` when there is no separate one.
+    patch_in: Option<usize>,
+    atom_out: Vec<usize>, // atom output port indices (need capacity reset)
     /// MIDI queued via `send_midi`, drained into the atom sequence each `process`.
     pending_midi: Vec<[u8; 3]>,
+    /// `patch:Set` atoms from the UI, drained into `patch_in` each `process`.
+    patch_queue: editor::PatchQueue,
     activated: bool,
     /// Handed to the plugin's own window so it can move control ports. Emptied
     /// in `Drop`, so a window still open when the slot goes away stops writing.
@@ -478,46 +479,85 @@ impl Lv2Instance {
         }
     }
 
-    /// Write the queued MIDI as an `LV2_Atom_Sequence` into the MIDI input port.
-    fn write_midi_sequence(&mut self) {
-        let Some(idx) = self.atom_in else { return };
+    /// Fill the plugin's atom input port(s) before `run()`: `time:Position` and
+    /// queued MIDI into the MIDI/control port, and any `patch:Set` the UI sent
+    /// (a file parameter such as the Neural Amp Modeler's model) into whichever
+    /// port carries it. One `LV2_Atom_Sequence` per distinct port.
+    fn write_input_sequence(&mut self) {
+        let midi_target = self.atom_in;
+        let patch_target = self.patch_in;
+        if let Some(idx) = midi_target {
+            // When the plugin has a single atom input, the patch events ride in
+            // this same sequence.
+            self.write_seq(idx, true, patch_target == midi_target);
+        }
+        if let Some(idx) = patch_target.filter(|_| patch_target != midi_target) {
+            self.write_seq(idx, false, true);
+        }
+    }
+
+    /// Write one `LV2_Atom_Sequence` into `atom_bufs[idx]`. `time_midi` adds the
+    /// transport position and the queued MIDI; `patch` drains `patch_queue` in
+    /// as events. Each patch entry is already a complete atom.
+    fn write_seq(&mut self, idx: usize, time_midi: bool, patch: bool) {
         let midi_urid = self.features.midi_urid;
+        let sequence_urid = self.features.sequence_urid;
         let time = self.features.time;
+        // Take the queue before borrowing the buffer; `try_lock` keeps the
+        // audio thread from ever blocking on a UI-thread push.
+        let patch_msgs: Vec<Vec<u8>> = if patch {
+            self.patch_queue
+                .try_lock()
+                .map(|mut q| std::mem::take(&mut *q))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         let buf = &mut self.atom_bufs[idx];
         if buf.len() < std::mem::size_of::<LV2_Atom_Sequence>() {
             return;
         }
-        // Sequence header: atom.size will be filled after writing events.
+        // Sequence header: atom.size is filled after the events are written.
         let mut write = std::mem::size_of::<LV2_Atom_Sequence>();
-        // The clock goes first, at frame 0: LV2 has no host callback for it, so
-        // a tempo-synced plugin reads it out of this same sequence.
-        write += write_time_position(&mut buf[write..], time);
-        for msg in &self.pending_midi {
-            let ev_hdr = std::mem::size_of::<LV2_Atom_Event>();
-            let needed = pad8(ev_hdr + 3);
-            if write + needed > buf.len() {
-                break;
+
+        if time_midi {
+            // The clock goes first, at frame 0: LV2 has no host callback for it,
+            // so a tempo-synced plugin reads it out of this same sequence.
+            write += write_time_position(&mut buf[write..], time);
+            for msg in &self.pending_midi {
+                let ev_hdr = std::mem::size_of::<LV2_Atom_Event>();
+                let needed = pad8(ev_hdr + 3);
+                if write + needed > buf.len() {
+                    break;
+                }
+                let ev = LV2_Atom_Event {
+                    frames: 0,
+                    body: LV2_Atom {
+                        size: 3,
+                        type_: midi_urid,
+                    },
+                };
+                let ev_bytes =
+                    unsafe { std::slice::from_raw_parts(&ev as *const _ as *const u8, ev_hdr) };
+                buf[write..write + ev_hdr].copy_from_slice(ev_bytes);
+                buf[write + ev_hdr..write + ev_hdr + 3].copy_from_slice(&msg[..3]);
+                write += needed;
             }
-            let ev = LV2_Atom_Event {
-                frames: 0,
-                body: LV2_Atom {
-                    size: 3,
-                    type_: midi_urid,
-                },
-            };
-            // Copy event header.
-            let ev_bytes =
-                unsafe { std::slice::from_raw_parts(&ev as *const _ as *const u8, ev_hdr) };
-            buf[write..write + ev_hdr].copy_from_slice(ev_bytes);
-            // Copy 3 MIDI bytes after the header.
-            buf[write + ev_hdr..write + ev_hdr + 3].copy_from_slice(&msg[..3]);
-            write += needed;
         }
+
+        for msg in &patch_msgs {
+            match push_atom_event(buf, write, msg) {
+                Some(next) => write = next,
+                None => continue,
+            }
+        }
+
         let body_size = (write - std::mem::size_of::<LV2_Atom>()) as u32;
         let seq = LV2_Atom_Sequence {
             atom: LV2_Atom {
                 size: body_size,
-                type_: self.features.sequence_urid,
+                type_: sequence_urid,
             },
             body: LV2_Atom_Sequence_Body { unit: 0, pad: 0 },
         };
@@ -528,7 +568,9 @@ impl Lv2Instance {
             )
         };
         buf[..seq_bytes.len()].copy_from_slice(seq_bytes);
-        self.pending_midi.clear();
+        if time_midi {
+            self.pending_midi.clear();
+        }
     }
 
     /// Reset atom OUTPUT ports to an empty Chunk with full available capacity,
@@ -601,7 +643,7 @@ impl Lv2Instance {
                 *v = 0.0;
             }
         }
-        self.write_midi_sequence();
+        self.write_input_sequence();
         self.reset_atom_outputs();
         self.run(frames);
 
@@ -807,6 +849,17 @@ fn build_instance(
         }
     }
 
+    // The port that takes `patch:Set`: a distinct non-MIDI atom input if the
+    // plugin has one (the Neural Amp Modeler's port 0), otherwise the MIDI port
+    // it shares everything through, otherwise the first atom input at all.
+    let patch_in = info
+        .ports
+        .iter()
+        .filter(|p| p.kind == PortKind::AtomInput)
+        .map(|p| p.index as usize)
+        .find(|&i| Some(i) != atom_in)
+        .or(atom_in);
+
     // Instantiate the plugin.
     let handle = unsafe {
         let instantiate = (*descriptor)
@@ -850,8 +903,10 @@ fn build_instance(
         audio_in,
         audio_out,
         atom_in,
+        patch_in,
         atom_out,
         pending_midi: Vec::with_capacity(MAX_PENDING_MIDI),
+        patch_queue: Arc::new(Mutex::new(Vec::new())),
         activated: false,
         controls: Arc::new(Mutex::new(None)),
         state: Arc::new(Mutex::new(Some(state::StateCell {
@@ -1098,7 +1153,7 @@ impl Lv2Instance {
                 };
             }
         }
-        self.write_midi_sequence();
+        self.write_input_sequence();
         self.reset_atom_outputs();
         self.run(frames);
 
@@ -1284,6 +1339,8 @@ fn build_editor(inst: &Lv2Instance, sample_rate: u32) -> BuiltEditor {
         &inst.info.uri,
         &inst.info.bundle_dir,
         Arc::clone(&inst.controls),
+        Arc::clone(&inst.patch_queue),
+        Arc::clone(&inst.features._store),
         sample_rate,
         inst.handle,
     ) else {
@@ -1479,6 +1536,21 @@ impl FxProcessor for Lv2Effect {
 }
 
 // ─── The clock, as LV2 wants it ─────────────────────────────────────────────
+
+/// Append one already-formed atom `msg` as a frame-0 event at `write` in `buf`
+/// (`{ i64 frames = 0 }{ msg }`, padded to eight). Returns the new write cursor,
+/// or `None` if `msg` is too small to be an atom or the event will not fit —
+/// either way `buf` is left as it was.
+fn push_atom_event(buf: &mut [u8], write: usize, msg: &[u8]) -> Option<usize> {
+    const FRAMES: usize = std::mem::size_of::<i64>();
+    let needed = pad8(FRAMES + msg.len());
+    if msg.len() < std::mem::size_of::<LV2_Atom>() || write + needed > buf.len() {
+        return None;
+    }
+    buf[write..write + FRAMES].copy_from_slice(&0i64.to_ne_bytes());
+    buf[write + FRAMES..write + FRAMES + msg.len()].copy_from_slice(msg);
+    Some(write + needed)
+}
 
 /// Write choz's transport into `out` as one `time:Position` object at frame 0.
 ///
@@ -1720,5 +1792,50 @@ mod transport_tests {
         clock.set_time_signature(4, 4);
         clock.set_bpm(choz_ports::Transport::DEFAULT_BPM);
         clock.rewind();
+    }
+}
+
+#[cfg(test)]
+mod patch_tests {
+    use super::*;
+
+    /// A `patch:Set` the UI wrote arrives as a finished atom; choz only has to
+    /// frame it as a sequence event. Read it back the way the plugin will.
+    #[test]
+    fn a_patch_atom_is_framed_as_a_frame_zero_event() {
+        // Stand-in for the UI's atom: an 8-byte header + 12 bytes of body.
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&12u32.to_ne_bytes()); // size
+        msg.extend_from_slice(&99u32.to_ne_bytes()); // type
+        msg.extend_from_slice(b"model.nam\0\0\0"); // body (12 bytes)
+
+        let mut buf = vec![0u8; 128];
+        // Pretend a sequence header already sits at the front.
+        let start = std::mem::size_of::<LV2_Atom_Sequence>();
+        let next = push_atom_event(&mut buf, start, &msg).expect("fits");
+
+        // Cursor advanced by the padded event size.
+        assert_eq!(next, start + pad8(std::mem::size_of::<i64>() + msg.len()));
+        assert!(next.is_multiple_of(8), "atoms stay eight-byte aligned");
+
+        // Frame count first, then the atom verbatim.
+        let ev: LV2_Atom_Event =
+            unsafe { std::ptr::read_unaligned(buf.as_ptr().add(start) as *const _) };
+        assert_eq!(ev.frames, 0);
+        assert_eq!(ev.body.size, 12);
+        assert_eq!(ev.body.type_, 99);
+        let body_at = start + std::mem::size_of::<i64>() + std::mem::size_of::<LV2_Atom>();
+        assert_eq!(&buf[body_at..body_at + 12], b"model.nam\0\0\0");
+    }
+
+    #[test]
+    fn a_bad_or_oversized_atom_is_refused_not_half_written() {
+        let mut buf = vec![0u8; 32];
+        // Shorter than an atom header.
+        assert_eq!(push_atom_event(&mut buf, 0, &[1, 2, 3]), None);
+        // Larger than the room left.
+        let big = vec![0u8; 40];
+        assert_eq!(push_atom_event(&mut buf, 0, &big), None);
+        assert!(buf.iter().all(|b| *b == 0), "nothing was written");
     }
 }

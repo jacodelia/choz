@@ -39,6 +39,16 @@ pub struct ControlsCell {
     pub len: usize,
 }
 
+/// Atom messages (`patch:Set`, …) the UI wrote through `atom:eventTransfer`,
+/// waiting to be folded into the plugin's control atom-input sequence on the
+/// audio thread. Each entry is one complete atom (`{header}{body}`). Bounded:
+/// the producer drops when it is full, since these come from user clicks.
+pub type PatchQueue = Arc<Mutex<Vec<Vec<u8>>>>;
+
+/// Cap on [`PatchQueue`] depth. A file-load is one message; a handful of
+/// queued ones is already more than a person can click.
+pub(crate) const MAX_PATCH_MSGS: usize = 32;
+
 // SAFETY: the pointer is only dereferenced under the mutex. Writing an f32 that
 // the audio thread reads is the same racy-but-benign store every LV2 host does
 // for control ports — the port protocol is "latest value wins".
@@ -78,6 +88,16 @@ pub struct Lv2Editor {
     plugin_uri: CString,
     bundle_path: CString,
     controls: SharedControls,
+    /// Atom writes from the UI (`patch:Set` for a file parameter), drained on
+    /// the audio thread into the plugin's control atom-input port.
+    patch: PatchQueue,
+    /// `atom:eventTransfer` in the instance's URID map — the `format` value the
+    /// UI passes to `write_control` for an atom rather than a float.
+    event_transfer_urid: u32,
+    /// The instance's URID store, so the map handed to the UI stays alive as
+    /// long as a window can call in. Shared with the DSP side on purpose: the
+    /// URIDs inside a `patch:Set` have to mean the same thing to both.
+    _urids: Arc<Mutex<crate::UridStore>>,
     /// The last control port the UI wrote, and the value it wrote — the plain
     /// one, in the port's own units. Read by MIDI learn and by the UI keeping
     /// its knobs in step with the plugin's window.
@@ -117,11 +137,14 @@ impl Lv2Editor {
     /// Load the UI binary and get it ready to open. `None` if the library or
     /// its descriptor is not usable — the caller then reports no editor at all,
     /// so the button never offers a window that cannot appear.
-    pub fn load(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load(
         info: &Lv2UiInfo,
         plugin_uri: &str,
         bundle_dir: &std::path::Path,
         controls: SharedControls,
+        patch: PatchQueue,
+        urids: Arc<Mutex<crate::UridStore>>,
         sample_rate: u32,
         instance: LV2_Handle,
     ) -> Option<Arc<Self>> {
@@ -129,6 +152,7 @@ impl Lv2Editor {
         crate::keep_loaded(&lib);
         // Check the descriptor exists now rather than on the click.
         descriptor_for(&lib, &info.uri)?;
+        let event_transfer_urid = urids.lock().intern(LV2_ATOM_EVENT_TRANSFER_URI);
 
         // LV2 wants the bundle path with its trailing slash.
         let mut bundle = bundle_dir.to_string_lossy().into_owned();
@@ -140,6 +164,9 @@ impl Lv2Editor {
             plugin_uri: CString::new(plugin_uri).ok()?,
             bundle_path: CString::new(bundle).ok()?,
             controls,
+            patch,
+            event_transfer_urid,
+            _urids: urids,
             touched: Arc::default(),
             sample_rate,
             instance: instance as usize,
@@ -179,8 +206,11 @@ fn descriptor_for(lib: &Library, uri: &str) -> Option<*const LV2UI_Descriptor> {
 /// What the UI calls to move a control. The controller is the `Lv2Editor`, so
 /// the write lands in the same array the audio thread reads.
 ///
-/// Only the default (float) port protocol is handled: `format == 0`. Anything
-/// else is an atom-based protocol for a port choz does not expose as a knob.
+/// `format == 0` is the plain float protocol — one control port value.
+/// `format == atom:eventTransfer` is a whole atom (a `patch:Set` for a file
+/// parameter, e.g. the Neural Amp Modeler's model): it is queued verbatim for
+/// the audio thread to fold into the plugin's control atom-input port. Any
+/// other protocol is one choz does not speak; it is dropped.
 unsafe extern "C" fn write_control(
     controller: LV2UI_Controller,
     port_index: u32,
@@ -188,12 +218,30 @@ unsafe extern "C" fn write_control(
     format: u32,
     buffer: *const c_void,
 ) {
-    if controller.is_null() || buffer.is_null() || format != 0 || buffer_size as usize != 4 {
+    if controller.is_null() || buffer.is_null() {
         return;
     }
     // SAFETY: the controller is the &Lv2Editor passed to `instantiate`, which
     // outlives the UI instance (it owns it).
     let editor = unsafe { &*(controller as *const Lv2Editor) };
+
+    if format == editor.event_transfer_urid && format != 0 {
+        // The buffer is a complete atom: `{ LV2_Atom header }{ body }`.
+        if (buffer_size as usize) < std::mem::size_of::<LV2_Atom>() {
+            return;
+        }
+        let bytes =
+            unsafe { std::slice::from_raw_parts(buffer as *const u8, buffer_size as usize) };
+        let mut q = editor.patch.lock();
+        if q.len() < MAX_PATCH_MSGS {
+            q.push(bytes.to_vec());
+        }
+        return;
+    }
+
+    if format != 0 || buffer_size as usize != 4 {
+        return;
+    }
     let value = unsafe { std::ptr::read_unaligned(buffer as *const f32) };
     if !value.is_finite() {
         return;
@@ -366,7 +414,7 @@ impl PluginEditor for Lv2Editor {
         let descriptor = descriptor_for(&self._lib, &self.info.uri)?;
         let instantiate = unsafe { (*descriptor).instantiate }?;
 
-        let map = crate::shared_urid_map();
+        let map = crate::instance_urid_map(&self._urids);
         // A UI that owns its window has nothing to embed into; handing it a
         // parent is how one ends up drawing into a window nobody mapped.
         let parent = if self.info.owns_window { 0 } else { parent };
