@@ -240,6 +240,21 @@ pub const LV2_UI_SHOW_INTERFACE_URI: &str = "http://lv2plug.in/ns/extensions/ui#
 /// own window (Yoshimi's FLTK one) requires to show anything at all.
 pub const LV2_INSTANCE_ACCESS_URI: &str = "http://lv2plug.in/ns/ext/instance-access";
 
+/// `ui:resize`: the host callback a UI calls to size its embedding window.
+/// brummer10's UIs (Neural Amp Modeler) read this feature's data into an
+/// uninitialised field and call through it unconditionally — omit the feature
+/// and the UI segfaults on garbage instead of skipping the call — so choz
+/// always supplies it.
+pub const LV2_UI_RESIZE_URI: &str = "http://lv2plug.in/ns/extensions/ui#resize";
+
+#[repr(C)]
+pub struct LV2UI_Resize {
+    pub handle: *mut c_void,
+    /// `ui_resize(handle, width, height)` — returns 0 on success.
+    pub ui_resize:
+        Option<unsafe extern "C" fn(handle: *mut c_void, width: i32, height: i32) -> i32>,
+}
+
 /// The symbol every UI binary exports: `const LV2UI_Descriptor* lv2ui_descriptor(uint32_t)`.
 pub const LV2UI_DESCRIPTOR_SYM: &[u8] = b"lv2ui_descriptor";
 
