@@ -931,6 +931,19 @@ Discovery for every other format is filesystem-only:
   today: every format in `PluginFormat` is hosted. The branch stays for the day a
   new one is added.
 
+**`FoundPlugin.id` is an identity, and every entry has one.** A project
+remembers its instrument by id, so an id that repeats is a tab that reopens as
+somebody else: CLAP has its reverse-DNS id, LV2 its URI, LADSPA/DSSI their label
+and VST2 its `unique_id`, but VST3 (whose class UID the factory scan does not
+hand over) and the file-based entries (SF2, SFZ, Pd) had **none** — every one of
+them carried `String::new()`, and the first VST3 on the machine answered for all
+of them. They are keyed by their bundle/file path now
+(`paths::path_id`), which is what those formats are loaded by anyway. A LADSPA
+label is unique only inside its `.so`, so the project's lookup asks for id
+**and** path first, then id, then the name in the same format, then the path —
+which is also how a project written before any of this (an empty id, and a path
+copied from whichever plugin the empty id matched) still finds its plugin.
+
 There is one plugin path and it is this one: the per-format crates plus
 `paths.rs`. The earlier `registry.rs` / `scanner.rs` / `plugin_types.rs` — 563
 lines of stubs behind `#[allow(dead_code)]`, reached only by a field nothing
@@ -1302,8 +1315,11 @@ keypress that asked for it: the interface froze with the picker still on screen
 and nothing to explain it. Anything the user can click now *promises* the load —
 `App::pending_load` plus the name to show — the frame draws with a `Loading …`
 box over everything, and the run loop calls `App::run_pending_load` immediately
-after that draw. A project load still calls `load_synth` directly: there is no
-frame to wait for in the middle of rebuilding a rack.
+after that draw. **Opening a project goes through the same promise**
+(`PendingLoad::Project`) and is the slowest of all — rebuilding the rack is
+every instrument in the set, one after another. Inside that rebuild the loads
+are direct calls (`load_synth`): there is no frame to wait for in the middle of
+it, which is why the box says the project's name and not each plugin's.
 
 ### The desktop, and why it is two paths
 

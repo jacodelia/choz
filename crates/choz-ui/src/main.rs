@@ -80,6 +80,15 @@ impl InputRef {
             InputRef::Osc => "OSC",
         }
     }
+
+    /// How a project spells it, the way a tab's own input is written.
+    /// [`parse_input_ref`] reads it back.
+    fn as_key(&self) -> String {
+        match self {
+            InputRef::Midi(name) => format!("MIDI:{name}"),
+            InputRef::Osc => "OSC".to_string(),
+        }
+    }
 }
 
 /// One MIDI-learn assignment: which controller, which CC, what it moves.
@@ -93,6 +102,28 @@ struct CcBinding {
     source: Option<InputRef>,
     cc: u8,
     target: LearnTarget,
+    /// The tab that was in front when it was learned. A button on one keyboard
+    /// can be assigned to another keyboard's tab — see [`App::button_tab_for`],
+    /// which is the only thing that reads this. `None` is a binding from before
+    /// they recorded it.
+    tab: Option<usize>,
+}
+
+/// A controller button that sends program change, and the tab it was learned
+/// on. Two tabs can hold the same button number: the Keystation's buttons 1-4
+/// recall on its own tab, and its buttons can *also* be assigned to the tab a
+/// second keyboard plays — see [`App::button_tab_for`].
+#[derive(Clone, Debug, PartialEq)]
+struct PcBinding {
+    program: u8,
+    target: LearnTarget,
+    /// Which controller's button it is. Two keyboards both send program 7, and
+    /// without this the KeyStep's button would recall what the Keystation's was
+    /// assigned to — the same reason [`CcBinding`] carries one. `None` answers
+    /// anything, which is what a project written before this says.
+    source: Option<InputRef>,
+    /// `None` is a binding from a project written before the tab was recorded.
+    tab: Option<usize>,
 }
 
 /// A sound the player put on a button: everything that makes this tab sound
@@ -315,6 +346,9 @@ enum PendingLoad {
     /// Deferred for the same reason an instrument is: a hosted effect is a
     /// plugin, and instantiating one blocks this thread for as long as it likes.
     Fx(usize),
+    /// A project picked in OPEN PROJECT. The slowest load of all: it rebuilds
+    /// the whole rack, so it is every instrument in the set one after another.
+    Project(std::path::PathBuf),
 }
 
 /// Which half of a strip a level change is aimed at.
@@ -1719,7 +1753,7 @@ struct App {
     cc_bindings: Vec<CcBinding>,
     /// Same, for controller buttons that send program change: program number ->
     /// the rack button it presses.
-    pc_bindings: Vec<(u8, LearnTarget)>,
+    pc_bindings: Vec<PcBinding>,
     /// A MIDI/OSC-driven FX parameter changed and the chain has to be rebuilt.
     /// Coalesced: one rebuild per input drain, never one per message.
     fx_dirty: bool,
@@ -3416,16 +3450,16 @@ impl App {
             }
         }
         // A SoundFont's sound *is* its program, and that is a message rather
-        // than a blob. Only for the tab on screen: `apply_selected_preset`
-        // speaks for the active one, and a footswitch recalls the sound of the
-        // tab being played — which is that one.
-        if tab == self.active_slot
-            && self
-                .slots
-                .get(tab)
-                .is_some_and(|s| !s.presets.is_empty() && s.preset_cursor < s.presets.len())
+        // than a blob — so it is sent for whichever tab the button belongs to,
+        // in front or not. A rig with two keyboards changes the bank of the tab
+        // that is *not* being looked at, which is the whole point of the second
+        // keyboard.
+        if self
+            .slots
+            .get(tab)
+            .is_some_and(|s| !s.presets.is_empty() && s.preset_cursor < s.presets.len())
         {
-            self.apply_selected_preset();
+            self.apply_preset_on(tab);
         }
     }
 
@@ -5820,8 +5854,8 @@ impl App {
                             .or_else(|| {
                                 self.pc_bindings
                                     .iter()
-                                    .find(|(_, b)| b == t)
-                                    .map(|(p, _)| format!("   [PC {p}]"))
+                                    .find(|b| b.target == *t)
+                                    .map(|b| format!("   [PC {}]", b.program))
                             })
                             .unwrap_or_default();
                         format!("{}{}", self.learn_label(t), bound)
@@ -6452,7 +6486,10 @@ impl App {
                         false
                     }
                     Some(file_browser::Action::PickFile(file)) => {
-                        self.load_project_from(&file);
+                        // Closed first, then loaded on the next frame: the
+                        // modal has to be off the screen the "loading" box is
+                        // drawn on.
+                        self.request_load_project(file);
                         true
                     }
                     None => true,
@@ -6832,7 +6869,7 @@ impl App {
                         LearnTarget::Trigger(_)
                         | LearnTarget::BusGain(_)
                         | LearnTarget::MainGain { .. }
-                        | LearnTarget::MainPan => idx == self.active_slot,
+                        | LearnTarget::MainPan => b.tab.unwrap_or(self.active_slot) == idx,
                     })
                     .map(|b| project::Binding {
                         cc: b.cc,
@@ -6840,10 +6877,7 @@ impl App {
                         label: self.learn_label(&b.target),
                         // Which controller it was learned from, written the way
                         // a tab's own input is.
-                        source: b.source.as_ref().map(|i| match i {
-                            InputRef::Midi(name) => format!("MIDI:{name}"),
-                            InputRef::Osc => "OSC".to_string(),
-                        }),
+                        source: b.source.as_ref().map(InputRef::as_key),
                     })
                     .collect();
                 project::Slot {
@@ -6915,10 +6949,12 @@ impl App {
             program_change: self
                 .pc_bindings
                 .iter()
-                .map(|(program, target)| project::ProgramBinding {
-                    program: *program,
-                    target: *target,
-                    label: self.learn_label(target),
+                .map(|b| project::ProgramBinding {
+                    program: b.program,
+                    target: b.target,
+                    label: self.learn_label(&b.target),
+                    source: b.source.as_ref().map(InputRef::as_key),
+                    tab: b.tab,
                 })
                 .collect(),
             buses: project::Buses {
@@ -7137,7 +7173,12 @@ impl App {
         self.cc_bindings.clear();
         self.pc_bindings.clear();
         for b in &p.program_change {
-            self.pc_bindings.push((b.program, b.target));
+            self.pc_bindings.push(PcBinding {
+                program: b.program,
+                target: b.target,
+                source: b.source.as_deref().and_then(parse_input_ref),
+                tab: b.tab,
+            });
         }
 
         for (idx, slot) in p.rack.iter().enumerate() {
@@ -7266,6 +7307,10 @@ impl App {
                     source: b.source.as_deref().and_then(parse_input_ref),
                     cc: b.cc,
                     target: b.target,
+                    // A binding is filed under the tab it belongs to, so the
+                    // tab it was learned on comes back with it — no field in
+                    // the file, and old projects load the way they always did.
+                    tab: Some(idx),
                 });
             }
         }
@@ -7310,9 +7355,47 @@ impl App {
             },
             "plugin" => {
                 let id = instr.id.clone().unwrap_or_default();
-                match self.synths.iter().find(|s| s.id == id) {
+                // The id first, then the name, then where it lived. A VST3
+                // saved before they had an id at all wrote an empty one — and
+                // an empty id used to match the first VST3 in the list, which
+                // is how a tab with Surge XT reopened playing something else.
+                match self
+                    .synths
+                    .iter()
+                    // Id **and** where it lived first: a LADSPA/DSSI label is
+                    // unique inside its `.so`, not across a machine.
+                    .find(|s| {
+                        !s.id.is_empty()
+                            && s.id == id
+                            && instr.path.as_ref().is_some_and(|p| s.path == *p)
+                    })
+                    .or_else(|| self.synths.iter().find(|s| !s.id.is_empty() && s.id == id))
+                    .or_else(|| {
+                        // The same name in another format is another plugin:
+                        // the extension of where it lived says which one, and
+                        // that much every project has always written.
+                        let ext = instr
+                            .path
+                            .as_deref()
+                            .and_then(|p| p.extension())
+                            .map(|e| e.to_ascii_lowercase());
+                        let name = instr.name.as_ref()?;
+                        self.synths
+                            .iter()
+                            .find(|s| {
+                                s.name == *name
+                                    && s.path.extension().map(|e| e.to_ascii_lowercase()) == ext
+                            })
+                            .or_else(|| self.synths.iter().find(|s| s.name == *name))
+                    })
+                    .or_else(|| {
+                        instr
+                            .path
+                            .as_ref()
+                            .and_then(|p| self.synths.iter().find(|s| s.path == *p))
+                    }) {
                     Some(entry) => AudioSource::Plugin {
-                        id,
+                        id: entry.id.clone(),
                         format: entry.format.label().to_string(),
                         name: entry.name.clone(),
                     },
@@ -7334,7 +7417,15 @@ impl App {
                     .fx_plugins
                     .iter()
                     .find(|p| p.id == *id && p.path == *path)
-                    .or_else(|| self.fx_plugins.iter().find(|p| p.id == *id))
+                    .or_else(|| {
+                        self.fx_plugins
+                            .iter()
+                            .find(|p| !p.id.is_empty() && p.id == *id)
+                    })
+                    // A VST3, an SFZ or a Pd patch saved before those had an id
+                    // wrote an empty one, and an empty id is not an identity —
+                    // the file is where it lived.
+                    .or_else(|| self.fx_plugins.iter().find(|p| p.path == *path))
                 else {
                     eprintln!("choz: FX plugin {id} is not installed");
                     return None;
@@ -7947,6 +8038,43 @@ impl App {
         }
     }
 
+    /// Which tab a **button** press belongs to: the tab it was learned on,
+    /// unless the tab in front listens to the very controller that sent it —
+    /// then the tab in front wins, and a third tab on the Keystation takes the
+    /// Keystation's buttons over while it is the one being played.
+    ///
+    /// That is the difference between the two keyboards on a stand. The
+    /// Keystation's buttons 1-4 were learned on its own tab and recall there
+    /// whatever is in front; its buttons can *also* be assigned to the KeyStep's
+    /// tab, and those fire on the KeyStep's tab, because that tab is not on the
+    /// Keystation and has no claim to re-map them.
+    fn button_tab_for(
+        &self,
+        source: choz_engine::input::InputSource,
+        learned: Option<usize>,
+    ) -> usize {
+        let taken_over = |tab: usize| {
+            // Both on this keyboard: two configurations of one controller, and
+            // the one being played wins. A tab on *another* keyboard keeps the
+            // buttons that were assigned to it, whatever is in front.
+            self.tab_listens_to(tab, source) && self.tab_listens_to(self.active_slot, source)
+        };
+        match learned {
+            Some(tab) if tab < self.slots.len() && !taken_over(tab) => tab,
+            // No tab recorded (a project from before this) — the rack's own
+            // rule speaks for the controller.
+            _ => self.home_tab_for(source),
+        }
+    }
+
+    /// Whether `tab` is listening to `source`. The question a button asks
+    /// before it re-maps: two tabs on one keyboard are alternative
+    /// configurations of it, a tab on another keyboard is not.
+    fn tab_listens_to(&self, tab: usize, source: choz_engine::input::InputSource) -> bool {
+        let from = self.source_ref(source);
+        from.is_some() && self.slots.get(tab).and_then(|s| s.input.as_ref()) == from.as_ref()
+    }
+
     /// Every tab bound to `input`, in tab order.
     fn tabs_on_input(&self, input: &InputRef) -> Vec<usize> {
         self.slots
@@ -8020,6 +8148,7 @@ impl App {
                 source: from,
                 cc,
                 target,
+                tab: Some(self.active_slot),
             });
             eprintln!("choz: CC {cc} -> {}", self.learn_label(&target));
             // Assignment done: back to the normal pointer and event flow.
@@ -8036,7 +8165,6 @@ impl App {
         // active tab. Only consulted when the port really is shared.
         let owners = from.as_ref().map(|i| self.tabs_on_input(i));
         let playing = self.targets_for(source, channel);
-        let home = self.home_tab_for(source);
         for binding in self.cc_bindings.clone() {
             if binding.cc != cc {
                 continue;
@@ -8054,8 +8182,10 @@ impl App {
                     continue;
                 }
             }
-            // Whose message this is — see [`App::home_tab_for`].
-            self.apply_target_on(home, binding.target, v, rising);
+            // Whose message this is — see [`App::button_tab_for`]. Only a
+            // trigger reads it: every other target names its own tab.
+            let tab = self.button_tab_for(source, binding.tab);
+            self.apply_target_on(tab, binding.target, v, rising);
         }
     }
 
@@ -8704,12 +8834,16 @@ impl App {
     }
 
     fn request_load_source(&mut self, path: std::path::PathBuf) {
-        self.loading = Some(
-            path.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string()),
-        );
+        self.loading = Some(file_label(&path));
         self.pending_load = Some(PendingLoad::Source(path));
+    }
+
+    /// Same for a project. A set is every instrument in it, loaded one after
+    /// another on this thread — the one place where "nothing is moving" lasts
+    /// longest, and the one that had nothing on screen while it did.
+    fn request_load_project(&mut self, path: std::path::PathBuf) {
+        self.loading = Some(file_label(&path));
+        self.pending_load = Some(PendingLoad::Project(path));
     }
 
     /// Say in the log when the audio thread could not keep up.
@@ -8872,6 +9006,7 @@ impl App {
             Some(PendingLoad::Synth(i)) => self.load_synth(i),
             Some(PendingLoad::Source(p)) => self.load_source(p),
             Some(PendingLoad::Fx(i)) => self.add_fx_at(i),
+            Some(PendingLoad::Project(p)) => self.load_project_from(&p),
             None => return,
         }
         self.loading = None;
@@ -10492,7 +10627,16 @@ impl App {
 
     /// Apply the preset under the active slot's cursor (SF2 program change).
     fn apply_selected_preset(&mut self) {
-        let idx = self.active_slot;
+        self.apply_preset_on(self.active_slot)
+    }
+
+    /// The same, for the tab a message belongs to, which is not always the one
+    /// on screen: the Keystation's buttons change the SoundFont's bank on their
+    /// own tab while the KeyStep's tab is in front. Only the *working copy* is
+    /// the active tab's — the program is a message to that tab's engine slot,
+    /// and the slot is there whether or not it is being looked at.
+    fn apply_preset_on(&mut self, idx: usize) {
+        let active = idx == self.active_slot;
         let Some(slot) = self.slots.get_mut(idx) else {
             return;
         };
@@ -10537,7 +10681,9 @@ impl App {
             },
             other => other.clone(),
         };
-        self.source = slot.source.clone();
+        if active {
+            self.source = slot.source.clone();
+        }
         if let Some(ref mut engine) = self.audio_engine {
             engine.set_slot_program(idx, p.bank, p.preset);
         }
@@ -10551,27 +10697,52 @@ impl App {
         // Only buttons (triggers) bind here; a fader target stays armed, so a
         // stray program change can't steal the binding the user is aiming at.
         if let Some(target @ LearnTarget::Trigger(_)) = self.learn {
-            self.pc_bindings
-                .retain(|(p, t)| *p != program && *t != target);
-            self.pc_bindings.push((program, target));
+            // A binding evicts an old one only **on the same tab**: the same
+            // button can recall a sound on the Keystation's tab and another on
+            // the KeyStep's, which is a rig with two keyboards and one set of
+            // buttons.
+            let tab = Some(self.active_slot);
+            let from = self.source_ref(source);
+            self.pc_bindings.retain(|b| {
+                b.tab != tab || b.source != from || (b.program != program && b.target != target)
+            });
+            self.pc_bindings.push(PcBinding {
+                program,
+                target,
+                source: from,
+                tab,
+            });
             eprintln!("choz: PC {program} -> {}", self.learn_label(&target));
             self.end_learn();
             return;
         }
         // Whose button this is — the same rule the CCs follow, and for the same
-        // reason: two keyboards on stage each drive their own tabs, and the tab
-        // in front only wins where it is one of the ones listening to this
-        // controller. See [`App::apply_cc`].
-        let home = self.home_tab_for(source);
-        let mut fired = false;
-        for (_, target) in self
+        // reason: two keyboards on stage each drive their own tabs. See
+        // [`App::button_tab_for`].
+        let from = self.source_ref(source);
+        let mut matches: Vec<PcBinding> = self
             .pc_bindings
-            .clone()
             .iter()
-            .filter(|(p, _)| *p == program)
-        {
-            if let LearnTarget::Trigger(action) = *target {
-                self.fire_trigger_on(home, action);
+            // A binding from before buttons knew their controller answers
+            // anything, as it always did.
+            .filter(|b| b.program == program && (b.source.is_none() || b.source == from))
+            .cloned()
+            .collect();
+        // The tab in front answers first, so a button learned twice on one
+        // keyboard recalls what the tab being played has on it.
+        matches.sort_by_key(|b| b.tab != Some(self.active_slot));
+        let mut fired = false;
+        let mut done: Vec<usize> = Vec::new();
+        for b in matches {
+            if let LearnTarget::Trigger(action) = b.target {
+                let tab = self.button_tab_for(source, b.tab);
+                // One press is one sound per tab: two bindings that resolve to
+                // the same tab are the same button learned twice on it.
+                if done.contains(&tab) {
+                    continue;
+                }
+                done.push(tab);
+                self.fire_trigger_on(tab, action);
                 fired = true;
             }
         }
@@ -13216,6 +13387,14 @@ fn note_targets(
         }];
     }
     bound
+}
+
+/// What a file is called on screen while it loads: its name, or the whole path
+/// when it has none.
+fn file_label(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// `"MIDI:<port>"` / `"OSC"` back into an [`InputRef`]. The one spelling, used
@@ -16323,10 +16502,17 @@ mod tests {
                     .zip(&theirs)
                     .all(|(a, b)| a.starts_with(b.as_str()) || b.starts_with(a.as_str()));
             if !same {
-                wrong.push(format!("{}: rack {ours:?} vs processor {theirs:?}", kind.id()));
+                wrong.push(format!(
+                    "{}: rack {ours:?} vs processor {theirs:?}",
+                    kind.id()
+                ));
             }
         }
-        assert!(wrong.is_empty(), "the two lists have drifted:\n  {}", wrong.join("\n  "));
+        assert!(
+            wrong.is_empty(),
+            "the two lists have drifted:\n  {}",
+            wrong.join("\n  ")
+        );
     }
 
     /// **No built-in may be a gain stage.** Every effect, on the knob positions
@@ -17309,6 +17495,7 @@ mod tests {
             source: None,
             cc: 74,
             target: LearnTarget::Gain(0),
+            tab: None,
         });
 
         app.note_tx
@@ -17447,7 +17634,12 @@ mod tests {
         press(&mut app, 13);
         assert_eq!(
             app.pc_bindings,
-            vec![(13, LearnTarget::Trigger(TriggerAction::PresetNext))]
+            vec![PcBinding {
+                program: 13,
+                target: LearnTarget::Trigger(TriggerAction::PresetNext),
+                source: None,
+                tab: Some(0),
+            }]
         );
         assert_eq!(app.learn, None);
         assert_eq!(
@@ -17708,7 +17900,10 @@ mod tests {
         let two = rect_of(&app, 1);
         click(&mut app, two.x + 1, two.y);
         assert_eq!(app.slots[0].sound_at, Some(1));
-        assert!(app.modal.is_none(), "the other button plays, it does not ask");
+        assert!(
+            app.modal.is_none(),
+            "the other button plays, it does not ask"
+        );
 
         // Pressing the one that is playing opens the picker, on what it holds.
         term.draw(|f| ui(f, &mut app)).unwrap();
@@ -21172,6 +21367,7 @@ mod tests {
             source: None,
             cc: 74,
             target: LearnTarget::Gain(0),
+            tab: None,
         });
 
         let saved = app.project_snapshot();
@@ -21223,6 +21419,7 @@ mod tests {
             source: None,
             cc: 74,
             target: LearnTarget::Gain(0),
+            tab: None,
         });
         app.midi_disabled.push("Midi Through".into());
 
@@ -24999,6 +25196,68 @@ mod tests {
         assert!(app.loading.is_none());
     }
 
+    /// Opening a project is the longest load choz does — it rebuilds the rack,
+    /// which is every instrument in the set — so it waits for the frame that
+    /// says so, exactly like picking one plugin does.
+    #[test]
+    fn opening_a_project_says_so_on_screen_before_it_blocks_the_thread() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.splash_done = true;
+
+        let dir = std::env::temp_dir().join(format!("choz_open_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("saturday night.yml");
+        std::fs::write(
+            &file,
+            serde_yaml::to_string(&app.project_snapshot()).unwrap(),
+        )
+        .unwrap();
+
+        app.open_load_project();
+        if let Some(b) = app.modal.as_mut().and_then(|m| m.browser.as_mut()) {
+            b.set_dir(dir.clone());
+        }
+        app.refresh_modal();
+        let row = app
+            .modal
+            .as_ref()
+            .unwrap()
+            .list
+            .items
+            .iter()
+            .position(|i| i.contains("saturday night"))
+            .expect("the project is not in the browser");
+        app.modal.as_mut().unwrap().list.cursor = row;
+        assert!(app.modal_select(), "picking a file closes the modal");
+        app.close_modal();
+
+        assert!(app.pending_load.is_some(), "the load is only promised");
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let screen: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            screen.contains("saturday night.yml"),
+            "the project being opened is on screen:\n{screen}"
+        );
+
+        // What it promised is this file. Running it is `load_project_from`,
+        // which has its own test — and rebuilding a rack here would build an
+        // engine and leave the process's audio globals to the next test.
+        assert!(
+            matches!(app.pending_load, Some(PendingLoad::Project(ref p)) if *p == file),
+            "{:?}",
+            app.pending_load
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The metronome: a switch on the menu bar beside LIVE/MULTI, and a menu
     /// under it for tempo, time signature, sound and level. The click itself is
     /// made in the audio callback off the transport's tempo, so it and a
@@ -25861,7 +26120,10 @@ mod tests {
         handle_modal_key(&mut app, KeyCode::Backspace);
         assert_eq!(app.fx_menu_rows().len(), rows.len(), "'pitc' still matches");
         handle_modal_key(&mut app, KeyCode::Esc);
-        assert!(app.modal.is_some(), "Esc clears the search, it does not close");
+        assert!(
+            app.modal.is_some(),
+            "Esc clears the search, it does not close"
+        );
         assert_eq!(app.fx_menu_rows().len(), all, "and the list is whole again");
         handle_modal_key(&mut app, KeyCode::Esc);
         assert!(app.modal.is_none(), "a second Esc closes the picker");
@@ -25874,10 +26136,16 @@ mod tests {
         let mut app = App::new();
         app.push_slot(AudioSource::Midi);
         app.active_slot = 0;
-        assert!(!app.slots[0].awaiting_trim, "a tab with no jack waits for nothing");
+        assert!(
+            !app.slots[0].awaiting_trim,
+            "a tab with no jack waits for nothing"
+        );
 
         app.set_active_capture(Some((0, 0)));
-        assert!(app.slots[0].awaiting_trim, "armed by the jack landing on it");
+        assert!(
+            app.slots[0].awaiting_trim,
+            "armed by the jack landing on it"
+        );
 
         // Nothing arriving yet: the fader is left alone, and it stays armed.
         choz_engine::meter::slot_levels().reset(0);
@@ -25905,7 +26173,10 @@ mod tests {
         let before = app.slots[0].gain;
         app.slots[0].gain = 1.5;
         app.poll_capture_trim();
-        assert_eq!(app.slots[0].gain, 1.5, "the level is the player's from here");
+        assert_eq!(
+            app.slots[0].gain, 1.5,
+            "the level is the player's from here"
+        );
         assert!(before < 1.5);
     }
 
@@ -25935,8 +26206,12 @@ mod tests {
                 preset: 0,
             };
         }
-        app.pc_bindings
-            .push((7, LearnTarget::Trigger(TriggerAction::SoundRecall(0))));
+        app.pc_bindings.push(PcBinding {
+            program: 7,
+            target: LearnTarget::Trigger(TriggerAction::SoundRecall(0)),
+            source: Some(InputRef::Midi("Keystation Pro 88".into())),
+            tab: Some(0),
+        });
 
         // Playing the KeyStep's tab, the Keystation's button recalls on tab 1.
         app.active_slot = 1;
@@ -25949,12 +26224,187 @@ mod tests {
         assert_eq!(app.slots[1].sound_at, None, "and the tab in front did not");
         assert_eq!(app.active_slot, 1, "nothing switched tabs either");
 
-        // The KeyStep's own button recalls on the tab in front, which is its.
+        // The KeyStep's own button 7 is a different button: it is not the
+        // Keystation's, so the Keystation's binding does not answer it.
+        app.apply_program_button(step, 7);
+        assert_eq!(app.slots[1].sound_at, None, "not this keyboard's button");
+        // Learned on the KeyStep's tab from the KeyStep, it recalls there.
+        app.learn = Some(LearnTarget::Trigger(TriggerAction::SoundRecall(0)));
+        app.apply_program_button(step, 7);
         app.apply_program_button(step, 7);
         assert_eq!(app.slots[1].sound_at, Some(0));
 
         // A third tab on the Keystation takes the buttons over while it is the
         // one being played — the same rule the knobs follow.
+        app.push_slot(AudioSource::Midi);
+        app.slots[2].input = Some(InputRef::Midi("Keystation Pro 88".into()));
+        app.slots[2].sounds[0] = SavedSound {
+            name: "tab 3".into(),
+            state: b"a patch".to_vec(),
+            values: Vec::new(),
+            preset: 0,
+        };
+        app.active_slot = 2;
+        app.apply_program_button(station, 7);
+        assert_eq!(app.slots[2].sound_at, Some(0), "the tab in front owns it");
+    }
+
+    /// A VST3 tab reopens as the plugin it was, not as whichever VST3 the scan
+    /// listed first. Projects written before VST3s had an id at all saved an
+    /// empty one, and an empty id matched everything.
+    #[test]
+    fn a_vst3_tab_reopens_as_the_plugin_it_was() {
+        use choz_engine::PluginFormat;
+        let mut app = App::new();
+        app.synths = vec![
+            SynthEntry {
+                id: "/usr/lib/vst3/Kars.vst3".into(),
+                format: PluginFormat::Vst3,
+                name: "Kars".into(),
+                path: "/usr/lib/vst3/Kars.vst3".into(),
+            },
+            SynthEntry {
+                id: "/usr/lib/vst3/Surge XT.vst3".into(),
+                format: PluginFormat::Vst3,
+                name: "Surge XT".into(),
+                path: "/usr/lib/vst3/Surge XT.vst3".into(),
+            },
+            // The same name in another format is another plugin.
+            SynthEntry {
+                id: "org.surge-synth-team.surge-xt".into(),
+                format: PluginFormat::Clap,
+                name: "Surge XT".into(),
+                path: "/usr/lib/clap/Surge XT.clap".into(),
+            },
+        ];
+
+        let instr = |id: &str, path: &str| project::Instrument {
+            kind: "plugin".into(),
+            path: Some(path.into()),
+            id: Some(id.into()),
+            name: Some("Surge XT".into()),
+            bank: None,
+            preset: None,
+            params: Vec::new(),
+            state: String::new(),
+            bank_dir: None,
+            config: Vec::new(),
+        };
+
+        // The file this fixes: an empty id, and a path left over from the
+        // wrong plugin. The name and the format are what is left to go on.
+        let got = app.project_source(&instr("", "/usr/lib/vst3/Kars.vst3"), 1);
+        assert_eq!(
+            got,
+            AudioSource::Plugin {
+                id: "/usr/lib/vst3/Surge XT.vst3".into(),
+                format: "VST3".into(),
+                name: "Surge XT".into(),
+            },
+            "the VST3 named in the tab, not the first VST3 on the machine"
+        );
+
+        // And a project written now names it outright.
+        let got = app.project_source(
+            &instr("/usr/lib/vst3/Surge XT.vst3", "/usr/lib/vst3/Surge XT.vst3"),
+            1,
+        );
+        assert!(matches!(got, AudioSource::Plugin { ref id, .. } if id.ends_with("Surge XT.vst3")));
+    }
+
+    /// One keyboard's buttons, assigned to the *other* keyboard's tab. The rig:
+    /// tab 1 is the Keystation with a SoundFont, tab 2 is the KeyStep with a
+    /// plugin — and the Keystation's buttons 5-7 were learned while tab 2 was in
+    /// front, so they recall tab 2's sounds. Only a tab that is *on* the
+    /// Keystation takes those buttons back.
+    #[test]
+    fn a_button_can_be_learned_for_the_other_keyboards_tab() {
+        use choz_engine::input::InputSource;
+        let mut app = App::new();
+        app.midi_connected = vec!["Keystation Pro 88".into(), "KeyStep 32".into()];
+        let station = InputSource::Midi(0);
+
+        app.push_slot(AudioSource::Midi);
+        app.push_slot(AudioSource::Midi);
+        app.slots[0].input = Some(InputRef::Midi("Keystation Pro 88".into()));
+        app.slots[1].input = Some(InputRef::Midi("KeyStep 32".into()));
+        for tab in 0..2 {
+            for sound in 0..2 {
+                app.slots[tab].sounds[sound] = SavedSound {
+                    name: format!("tab {} sound {}", tab + 1, sound + 1),
+                    state: b"a patch".to_vec(),
+                    values: Vec::new(),
+                    preset: 0,
+                };
+            }
+        }
+
+        // Button 7 learned on tab 1, button 8 learned on tab 2 — both pressed on
+        // the Keystation, which is the only keyboard with buttons.
+        app.active_slot = 0;
+        app.learn = Some(LearnTarget::Trigger(TriggerAction::SoundRecall(0)));
+        app.apply_program_button(station, 7);
+        app.active_slot = 1;
+        app.learn = Some(LearnTarget::Trigger(TriggerAction::SoundRecall(1)));
+        app.apply_program_button(station, 8);
+        assert_eq!(
+            app.pc_bindings.len(),
+            2,
+            "two tabs, two bindings, one cable"
+        );
+
+        // Tab 1 is a SoundFont, and its sounds are programs rather than blobs:
+        // the button has to send the program for a tab that is not in front,
+        // which is the only thing a bank change *is*.
+        app.slots[0].presets = vec![
+            sources::Sf2Preset {
+                bank: 0,
+                preset: 0,
+                name: "one".into(),
+            },
+            sources::Sf2Preset {
+                bank: 0,
+                preset: 9,
+                name: "two".into(),
+            },
+        ];
+        app.slots[0].source = AudioSource::Sf2 {
+            path: "/nowhere.sf2".into(),
+            bank: 0,
+            preset: 0,
+        };
+        app.slots[0].sounds[0].preset = 1;
+        app.slots[0].sounds[0].state = Vec::new();
+
+        // Tab 2 in front. Tab 2 is not on the Keystation, so each button fires
+        // where it was learned: 8 on tab 2, 7 still on tab 1.
+        app.apply_program_button(station, 8);
+        assert_eq!(app.slots[1].sound_at, Some(1), "the tab it was learned on");
+        assert_eq!(app.slots[0].sound_at, None);
+        app.apply_program_button(station, 7);
+        assert_eq!(app.slots[0].sound_at, Some(0), "and tab 1 keeps its own");
+        assert!(
+            matches!(app.slots[0].source, AudioSource::Sf2 { preset: 9, .. }),
+            "the background tab's SoundFont changed bank, not only its cursor"
+        );
+
+        // Tab 1 in front: both mappings still reach their own tab. Tab 2 is on
+        // the KeyStep, so the button assigned to it is not the Keystation's to
+        // take back — the player changes the other tab's sound from here.
+        app.slots[0].sound_at = None;
+        app.slots[1].sound_at = None;
+        app.active_slot = 0;
+        app.apply_program_button(station, 8);
+        assert_eq!(app.slots[1].sound_at, Some(1), "tab 2 keeps its own button");
+        assert_eq!(
+            app.slots[0].sound_at, None,
+            "the tab in front did not take it"
+        );
+        app.apply_program_button(station, 7);
+        assert_eq!(app.slots[0].sound_at, Some(0), "and tab 1 answers its own");
+
+        // A third tab on the *Keystation* is a second configuration of that
+        // keyboard, so it does take its buttons over while it is being played.
         app.push_slot(AudioSource::Midi);
         app.slots[2].input = Some(InputRef::Midi("Keystation Pro 88".into()));
         app.slots[2].sounds[0] = SavedSound {
@@ -25998,6 +26448,7 @@ mod tests {
                 fx: 0,
                 param: 0,
             },
+            tab: Some(0),
         });
 
         // Playing the KeyStep's tab, the Keystation's knob still moves the
@@ -26269,8 +26720,12 @@ mod tests {
         app.push_slot(AudioSource::Midi);
         app.slots[0].channel = ANY_CHANNEL;
         app.slots[0].sound_at = Some(1);
-        app.pc_bindings
-            .push((7, LearnTarget::Trigger(TriggerAction::SoundRecall(1))));
+        app.pc_bindings.push(PcBinding {
+            program: 7,
+            target: LearnTarget::Trigger(TriggerAction::SoundRecall(1)),
+            source: None,
+            tab: Some(0),
+        });
         app.ui.rack_mode = settings::RackMode::Multi;
         t.set_bpm(137.0);
         t.set_time_signature(7, 8);
@@ -26304,7 +26759,12 @@ mod tests {
         assert_eq!(fresh.ui.rack_mode, settings::RackMode::Multi);
         assert_eq!(
             fresh.pc_bindings,
-            vec![(7, LearnTarget::Trigger(TriggerAction::SoundRecall(1)))]
+            vec![PcBinding {
+                program: 7,
+                target: LearnTarget::Trigger(TriggerAction::SoundRecall(1)),
+                source: None,
+                tab: Some(0),
+            }]
         );
         assert_eq!(fresh.slots[0].channel, ANY_CHANNEL, "ANY stays ANY");
         assert_eq!(fresh.slots[0].sound_at, Some(1));

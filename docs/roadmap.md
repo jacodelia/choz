@@ -12,7 +12,7 @@ que decía "hecho" se fue al changelog.
 que no existe, una decisión de diseño y un fallo intermitente sin explicar—, dos
 decisiones de no hacer, y las notas para el que retome.
 
-Última actualización: 2026-09-01 (1.3.6 publicada).
+Última actualización: 2026-09-01 (1.3.7 publicada).
 
 ## Estado en una línea
 
@@ -36,8 +36,9 @@ se asignan desde el mismo modal de bank/preset— y puede partir el teclado entr
 ellos; y un efecto puede abrirse con el bombo de otra tab —por su nivel o por
 las notas que se le tocan—, con el clock, o con el tap del metrónomo. **Dos
 teclados tocan a la vez**: los mandos y los botones de cada uno siguen moviendo
-lo suyo cuando la otra tab está adelante, y una tercera tab en el mismo puerto
-se los queda mientras es la que se toca. El MIXER
+lo suyo cuando la otra tab está adelante, los botones de un teclado se pueden
+asignar a la tab del otro —y siguen funcionando desde cualquiera de las dos—, y
+una tercera tab en el mismo puerto se los queda mientras es la que se toca. El MIXER
 se maneja entero desde el teclado, grupos y main incluidos, y cada strip lleva
 su `O M S` bajo el fader. Los mandos de un plugin se agrupan por lo que el
 plugin dice —las unidades de VST3, el módulo de CLAP— y los que tienen
@@ -48,8 +49,8 @@ otro host. Un plugin que guarda sus controles fuera de sus puertos
 —ZynAddSubFX— se maneja por su propio servidor OSC: mandos con nombre, los
 armónicos del oscilador, su ventana real, y los mandos leyendo lo que el plugin
 tiene. **La 1.0.0 está publicada y sus paquetes verificados; la
-1.3.6 es este árbol.**
-850 tests, `clippy --workspace --all-targets -D warnings` limpio.
+1.3.7 es este árbol.**
+853 tests, `clippy --workspace --all-targets -D warnings` limpio.
 
 Las comprobaciones con hardware delante quedaron dichas en los gotchas, que es
 donde se van a leer.

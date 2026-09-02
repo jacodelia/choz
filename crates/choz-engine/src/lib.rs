@@ -339,8 +339,8 @@ pub fn scan_one(format: PluginFormat, dir: &std::path::Path) -> Vec<FoundPlugin>
             .map(|p| FoundPlugin {
                 format: PluginFormat::Vst3,
                 name: p.name,
+                id: paths::path_id(&p.path),
                 path: p.path,
-                id: String::new(),
                 is_instrument: p.is_instrument,
             })
             .collect(),
@@ -405,8 +405,8 @@ fn scan_item(format: PluginFormat, path: &std::path::Path) -> Vec<FoundPlugin> {
             vec![FoundPlugin {
                 format: PluginFormat::Vst3,
                 name: p.name,
+                id: paths::path_id(&p.path),
                 path: p.path,
-                id: String::new(),
                 is_instrument: p.is_instrument,
             }]
         }

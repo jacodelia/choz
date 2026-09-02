@@ -12,7 +12,7 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **850 tests** con harness en todo el workspace (751 entre `choz-engine` y `choz-ui`) + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **853 tests** con harness en todo el workspace (754 entre `choz-engine` y `choz-ui`) + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio.
 - **56 efectos propios**, publicados también como un `.clap` con los dos artifacts.
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
@@ -25,6 +25,87 @@ lleva lo que falta —nada de lo ya hecho— y
   `choz-engine::test_locks` tiene un candado por global; en `choz-ui` el par es
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
+
+## [1.3.7] — 2026-09-01
+
+Cuatro defectos del mismo rig —una Keystation Pro 88 y una KeyStep 32, una tab
+cada una— y el hilo de todos: **una identidad que no identificaba**. Un botón
+que no sabía de qué teclado venía ni para qué tab era; un plugin que no sabía
+cuál era.
+
+### Los botones de un teclado, en la tab del otro
+
+Reportado en dos pasos. Primero: los botones de la Keystation asignados a la tab
+2 (la del KeyStep) no hacían nada. Después, ya arreglado eso: desde la tab 2 ya
+no se podía cambiar de banco en la tab 1.
+
+`PcBinding` era `(u8, LearnTarget)`. Sin fuente y sin tab, un botón sólo podía
+disparar donde `home_tab_for` dijera —la tab del teclado que lo mandó—, así que
+asignarlo a la tab de *otro* teclado era imposible por construcción, y el
+programa 7 del KeyStep disparaba lo que se había aprendido con la Keystation.
+Ahora guarda las dos cosas, como `CcBinding` ya guardaba la fuente:
+
+```rust
+struct PcBinding { program: u8, target: LearnTarget, source: Option<InputRef>, tab: Option<usize> }
+```
+
+Y una sola regla las usa, `App::button_tab_for`: **el botón dispara en la tab en
+que se aprendió, salvo que la tab de adelante escuche ese mismo teclado** — ahí
+gana la de adelante, porque dos tabs en un puerto son dos configuraciones del
+mismo controlador y la que se está tocando manda. Una tercera tab en la
+Keystation se queda sus botones mientras es la que se toca; la tab del KeyStep
+conserva los suyos esté quien esté adelante. Los mandos (`FxParam`) no cambian:
+el binding ya nombraba su tab. El learn tampoco pisa el binding de otra tab, así
+que un mismo botón puede recuperar un sonido en cada una.
+
+### El banco de una tab de atrás se movía sin sonar
+
+Con eso arreglado, el botón disparaba y **no pasaba nada audible**. La causa no
+estaba en el ruteo: `recall_sound` mandaba el program change del SoundFont sólo
+`if tab == self.active_slot`. La tab de atrás movía su `preset_cursor` y su
+`sound_at` —la interfaz lo mostraba— y el motor nunca se enteraba.
+
+`apply_selected_preset` es ahora `apply_preset_on(tab)`: el program va al slot
+del motor de la tab que sea, y sólo la copia de trabajo (`self.source`) sigue
+siendo de la tab de adelante. Arregla también el split por octavas de una tab
+que no está en pantalla, que salía por el mismo sitio.
+
+### Un VST3 que abría como otro VST3
+
+El proyecto del día tenía la tab 2 con Surge XT y no sonaba. En el YAML:
+
+```yaml
+instrument: {kind: plugin, path: /usr/lib/vst3/Kars.vst3, id: '', name: Surge XT}
+```
+
+**Todos los VST3 se escaneaban con `id: String::new()`**, y una tab recuerda su
+instrumento por id. Al guardar, `synths.find(|s| s.id == "")` devolvió el primer
+VST3 de la máquina y escribió *su* ruta; al abrir, el mismo empate cargó Kars. Los
+70 KB de estado y los 774 valores de Surge se le aplicaban a otro plugin.
+
+Auditados los seis formatos más los de archivo: CLAP tiene su id reverse-DNS,
+LV2 su URI, LADSPA/DSSI su label, VST2 su `unique_id`; **VST3, SF2, SFZ y Pd no
+tenían ninguno**. Ahora se identifican por su ruta (`paths::path_id`), que es
+por lo que se cargan igual. Y como un label de LADSPA es único dentro de su
+`.so` y no en la máquina, la búsqueda del proyecto pide id **y** ruta primero,
+después id, después el nombre en el mismo formato, y por último la ruta — con lo
+que un proyecto viejo (id vacío, ruta del plugin equivocado) encuentra el suyo
+por nombre y se corrige solo al guardar.
+
+### Abrir un proyecto ya dice que está cargando
+
+Reconstruir el rack instancia cada instrumento del set en el hilo de la
+interfaz. Era la carga más larga de choz y la única sin la caja `Loading …` que
+un plugin suelto ya tenía: `PendingLoad::Project` promete el trabajo, el frame
+dibuja el nombre del archivo y recién entonces se abre.
+
+### Notas
+
+- `sudo install -m755 target/release/choz /usr/bin/choz` — el binario del
+  paquete es el mismo árbol, pero `strip`eado: un `??` en `gdb` no es un build
+  viejo. Se confirma por las cadenas del binario, no por la fecha del archivo.
+- Formato de proyecto: `program_change[].source` y `program_change[].tab`,
+  ambos `#[serde(default)]`. Un proyecto sin ellos se comporta como antes.
 
 ## [1.3.6] — 2026-09-01
 
