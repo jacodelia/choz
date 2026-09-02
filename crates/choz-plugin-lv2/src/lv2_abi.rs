@@ -79,6 +79,11 @@ pub struct LV2_URID_Unmap {
 pub const LV2_ATOM_SEQUENCE_URI: &str = "http://lv2plug.in/ns/ext/atom#Sequence";
 pub const LV2_ATOM_CHUNK_URI: &str = "http://lv2plug.in/ns/ext/atom#Chunk";
 pub const LV2_MIDI_EVENT_URI: &str = "http://lv2plug.in/ns/ext/midi#MidiEvent";
+/// `atom:eventTransfer` — the UI port protocol for a whole atom (as opposed to
+/// the bare `float` of protocol 0). A UI writes a `patch:Set` through it to move
+/// a file-path parameter like the Neural Amp Modeler's model; the value the UI
+/// passes as `format` is this URI mapped through the instance's URID map.
+pub const LV2_ATOM_EVENT_TRANSFER_URI: &str = "http://lv2plug.in/ns/ext/atom#eventTransfer";
 
 /// `LV2_Atom` — header common to every atom (`{ size, type }`).
 #[repr(C)]
