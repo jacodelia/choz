@@ -90,7 +90,13 @@ impl FxProcessor for DeEsser {
 
     fn params(&self) -> Vec<FxParam> {
         vec![
-            FxParam::new("Freq", (self.freq_hz - 3000.0) / 12000.0, 3000.0, 15000.0, "Hz"),
+            FxParam::new(
+                "Freq",
+                (self.freq_hz - 3000.0) / 12000.0,
+                3000.0,
+                15000.0,
+                "Hz",
+            ),
             FxParam::new(
                 "Thresh",
                 (self.threshold_db + 60.0) / 60.0,
@@ -137,7 +143,11 @@ impl FxProcessor for DeEsser {
             for (ch, s) in frame.iter_mut().enumerate() {
                 let hi = *s - self.low[i * 2 + ch];
                 let level = hi.abs();
-                let coeff = if level > self.env[ch] { self.atk } else { self.rel };
+                let coeff = if level > self.env[ch] {
+                    self.atk
+                } else {
+                    self.rel
+                };
                 self.env[ch] = level + coeff * (self.env[ch] - level);
                 // 4:1 above the threshold, in linear terms: the gain is what
                 // the band has to be multiplied by to sit a quarter of the way

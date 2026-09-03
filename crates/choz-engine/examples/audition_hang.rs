@@ -25,7 +25,10 @@ fn main() {
     println!("slot {slot}, state handle: {}", engine.slot_has_state(slot));
     let files = choz_engine::preset_files::list_bank(std::path::Path::new(&dir));
     println!("{} patches", files.len());
-    let take: usize = std::env::var("TAKE").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+    let take: usize = std::env::var("TAKE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(usize::MAX);
     for (n, p) in files.iter().take(take).enumerate() {
         let Ok(blob) = choz_engine::preset_files::read_state_key(&p.key) else {
             continue;

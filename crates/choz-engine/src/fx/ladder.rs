@@ -77,7 +77,11 @@ impl MoogLadder {
     /// The integrator coefficient for the cutoff the smoother is on now.
     #[inline]
     fn g(&self) -> f32 {
-        let hz = self.cutoff.value().exp2().clamp(20.0, self.sample_rate * 0.45);
+        let hz = self
+            .cutoff
+            .value()
+            .exp2()
+            .clamp(20.0, self.sample_rate * 0.45);
         (PI * hz / self.sample_rate).tan()
     }
 }

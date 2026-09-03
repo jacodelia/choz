@@ -64,6 +64,10 @@ use views::theme::*;
 enum InputRef {
     Midi(String),
     Osc,
+    /// choz's own JACK MIDI input, `choz:midi_in`. A DAW on the same graph
+    /// publishes its MIDI as JACK ports, which never appear as ALSA sequencer
+    /// clients — this is the only way a tab can be played from one.
+    Jack,
 }
 
 impl InputRef {
@@ -81,6 +85,7 @@ impl InputRef {
         match (self, other) {
             (InputRef::Midi(a), InputRef::Midi(b)) => port_key(a) == port_key(b),
             (InputRef::Osc, InputRef::Osc) => true,
+            (InputRef::Jack, InputRef::Jack) => true,
             _ => false,
         }
     }
@@ -89,6 +94,7 @@ impl InputRef {
         match self {
             InputRef::Midi(_) => "MIDI",
             InputRef::Osc => "OSC",
+            InputRef::Jack => "JACK",
         }
     }
 
@@ -96,6 +102,7 @@ impl InputRef {
         match self {
             InputRef::Midi(n) => n,
             InputRef::Osc => "OSC",
+            InputRef::Jack => choz_engine::MIDI_IN_PORT,
         }
     }
 
@@ -105,6 +112,7 @@ impl InputRef {
         match self {
             InputRef::Midi(name) => format!("MIDI:{name}"),
             InputRef::Osc => "OSC".to_string(),
+            InputRef::Jack => "JACK".to_string(),
         }
     }
 }
@@ -892,6 +900,70 @@ fn main_balance(pan: f32) -> (f32, f32) {
     let p = pan.clamp(-1.0, 1.0);
     ((1.0 - p).min(1.0), (1.0 + p).min(1.0))
 }
+
+/// The output channels direct out `d` occupies, counting from the first one
+/// past the sink's own. Adjacent and in order: a direct out is a stereo pair of
+/// ports, and the pair is what another application patches into.
+fn direct_pair(base: usize, d: usize) -> (usize, usize) {
+    (base + d * 2, base + d * 2 + 1)
+}
+
+/// Which direct out `pair` is, or `None` when it is not one of them — a tab on
+/// the interface's own channels, or one split across a direct out and something
+/// else, which is a routing the `O` button cannot have made.
+///
+/// Both widths count: `(p, p + 1)` is a stereo tab on its pair and `(p, p)` is
+/// a mono one summed onto the first port of that same pair.
+fn direct_index(base: usize, pairs: usize, pair: (usize, usize)) -> Option<usize> {
+    let d = pair.0.checked_sub(base)? / 2;
+    if d >= pairs {
+        return None;
+    }
+    let (l, r) = direct_pair(base, d);
+    (pair == (l, r) || pair == (l, l)).then_some(d)
+}
+
+/// How many output channels the OUT drawer lists: the sink's own, and then one
+/// pair for each tab that has a direct out of its own.
+///
+/// An empty rack lists none of them — a row for a pair nobody owns is a route
+/// nothing can take. Capped by the pairs the client actually registered, so a
+/// rack with more tabs than direct outs lists the ones that have one and stops.
+fn listed_channels(channels: usize, direct_base: usize, pairs: usize, tabs: usize) -> usize {
+    channels.min(direct_base + tabs.min(pairs) * 2)
+}
+
+/// The tab a direct-out channel belongs to and which side of its pair it is
+/// (`0` left, `1` right), or `None` for one of the sink's own channels.
+fn direct_side(ch: usize, direct_base: usize) -> Option<(usize, usize)> {
+    let d = ch.checked_sub(direct_base)?;
+    Some((d / 2, d % 2))
+}
+
+/// Whether a built-in effect can pull a mono signal's two sides apart.
+///
+/// By category, because that is the distinction the categories already draw: a
+/// reverb's tail, a modulator's spread, a pan and a ping-pong delay all exist to
+/// make the sides differ, while a compressor, an EQ or a distortion do the same
+/// thing to each of them. Texture and a hosted plugin count as widening because
+/// nothing here can know what they do — the safe answer for a routing question
+/// is the wider one.
+fn widens(fx: &AudioFxEntry) -> bool {
+    use source::FxCategory as C;
+    if fx.plugin.is_some() {
+        return true;
+    }
+    matches!(
+        fx.kind.category(),
+        C::Delay | C::Reverb | C::Modulation | C::Spatial | C::Texture | C::Pitch | C::Other
+    )
+}
+
+/// What a strip's destination cell says for each direct out. Fixed strings
+/// because the cell is two characters wide and `MixerStrip::dest` is a
+/// `&'static str` — one per [`choz_engine::MAX_DIRECT_PAIRS`].
+const DIRECT_LABELS: [&str; choz_engine::MAX_DIRECT_PAIRS] =
+    ["D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8"];
 
 /// The rack tab a target moves, or `None` for the rack-wide buttons.
 fn target_slot(t: &LearnTarget) -> Option<usize> {
@@ -1792,7 +1864,12 @@ struct App {
     learn_pick: bool,
     /// Same pointer gesture, for choosing which parameter this tab's notes
     /// drive. One click, one target — there is no CC to wait for afterwards.
-    /// Last known mouse position, only tracked while `learn_pick` is on.
+    /// Last known mouse position, tracked on every mouse event.
+    ///
+    /// Two things read it: the learn pointer, which draws a `?` where the hand
+    /// is, and [`App::instr_tooltip`], which needs to know what the hand is
+    /// resting on. It used to be written only while learn was armed, which made
+    /// it a lie the rest of the time.
     mouse: (u16, u16),
     /// MIDI-learn bindings: CC number -> the rack control it drives.
     cc_bindings: Vec<CcBinding>,
@@ -2383,16 +2460,191 @@ impl App {
         let StripRef::Tab(tab) = self.strip_ref(strip) else {
             return;
         };
-        let items: Vec<String> = (0..=choz_engine::BUSES)
+        let mut items: Vec<String> = (0..=choz_engine::BUSES)
             .map(|i| choz_engine::Dest::from_index(i).label().to_string())
             .collect();
-        let here = self.slots.get(tab).map(|s| s.dest.index()).unwrap_or(0);
+        // …and then off the desk entirely: **this tab's** direct out. One each,
+        // at a fixed place — tab 1 owns the first pair, tab 2 the second — so
+        // two tabs can never be offered the same ports, which is what a shared
+        // list of them did. The main fader only ever touches the first pair, so
+        // a tab on its direct out is off the master mix by construction: it
+        // leaves choz through JACK ports with nothing on the other end, for
+        // Ardour (or anything else) to patch into.
+        let has_direct = tab < self.direct_pairs();
+        if has_direct {
+            let (base, _) = self.direct_range();
+            let (l, r) = self.direct_pair_for(tab);
+            items.push(format!(
+                "{} {}  \u{2192} out_{}{}",
+                i18n::t("DIRECT"),
+                tab + 1,
+                l + 1,
+                match r == l {
+                    // A mono tab lands on one port, not on two copies of
+                    // itself: what a DAW wants to record off a guitar is one
+                    // track. See `App::tab_is_mono`.
+                    true => format!(" ({})", i18n::t("MONO")),
+                    false => format!("/{}", r + 1),
+                }
+            ));
+            let _ = base;
+        }
+        let here = match self.slots.get(tab).and_then(|s| self.direct_of(s)) {
+            Some(_) => choz_engine::BUSES + 1,
+            None => self
+                .slots
+                .get(tab)
+                .map(|s| s.dest.index())
+                .unwrap_or(0)
+                .min(choz_engine::BUSES),
+        };
+        let last = items.len().saturating_sub(1);
         let mut modal = Modal::new(
             ModalKind::MixerDest(strip),
             views::modal::ListModal::new(format!("{} \u{00B7} {}", i18n::t("OUT"), tab + 1), items),
         );
-        modal.list.cursor = here.min(choz_engine::BUSES);
+        modal.list.cursor = here.min(last);
         self.modal = Some(modal);
+    }
+
+    /// First output channel that is a direct out, and how many pairs there are.
+    /// `(base, 0)` on a backend that has none, which is every cpal one.
+    fn direct_range(&self) -> (usize, usize) {
+        let Some(e) = self.audio_engine.as_ref() else {
+            return (2, 0);
+        };
+        let base = e.direct_base();
+        (base, e.output_channels().saturating_sub(base) / 2)
+    }
+
+    fn direct_pairs(&self) -> usize {
+        self.direct_range().1
+    }
+
+    /// Which direct pair this tab is on, if it is on one.
+    fn direct_of(&self, slot: &RackSlot) -> Option<usize> {
+        let (base, pairs) = self.direct_range();
+        // Only a tab going straight out is on a direct pair: one summed into a
+        // group is the group's, and the group owns where it lands.
+        if !matches!(slot.dest, choz_engine::Dest::Direct) {
+            return None;
+        }
+        direct_index(base, pairs, slot.out_pair)
+    }
+
+    /// The output channels tab `tab`'s direct out occupies.
+    ///
+    /// The **place** is fixed by the tab's own index and never moves; only the
+    /// **width** depends on what the tab is. A mono tab gets the same channel
+    /// on both sides, which the engine sums into one port — so a guitar is one
+    /// track in the DAW rather than two identical ones — and the second port of
+    /// its pair stays registered and silent. Silent rather than reclaimed on
+    /// purpose: packing the pairs would move every tab above this one the
+    /// moment a reverb made it stereo, and a port that moves under a live patch
+    /// is the one thing this feature must not do.
+    fn direct_pair_for(&self, tab: usize) -> (usize, usize) {
+        let (base, _) = self.direct_range();
+        let (l, r) = direct_pair(base, tab);
+        match self.tab_is_mono(tab) {
+            true => (l, l),
+            false => (l, r),
+        }
+    }
+
+    /// Whether tab `tab` is mono all the way through: a mono jack in, and
+    /// nothing in its chain that could pull the two sides apart.
+    ///
+    /// A microphone or a guitar arrives on **one** capture channel — choz holds
+    /// that as `(ch, ch)`, the same signal on both sides — and stays that way
+    /// through a compressor, an EQ or a distortion, which do the same thing to
+    /// each side. It stops being mono the moment something in the chain has a
+    /// reason to make the sides differ: a reverb's tail, a chorus's spread, a
+    /// pan, a ping-pong delay. A hosted plugin counts as stereo because nothing
+    /// here can know what it does.
+    ///
+    /// Only *enabled* effects count — a bypassed reverb is not in the engine's
+    /// chain at all.
+    fn tab_is_mono(&self, tab: usize) -> bool {
+        let Some(slot) = self.slots.get(tab) else {
+            return false;
+        };
+        // An instrument is stereo until proven otherwise; this is about a jack.
+        if !slot.in_pair.is_some_and(|(l, r)| l == r) {
+            return false;
+        }
+        // The active tab's chain is the working copy, not the one persisted on
+        // the slot — reading the slot's here would answer with the chain as it
+        // was before the effect that just triggered this.
+        let chain = match tab == self.active_slot {
+            true => &self.fx_chain,
+            false => &slot.fx_chain,
+        };
+        !chain.iter().filter(|e| e.enabled).any(widens)
+    }
+
+    /// Send tab `tab` out of its own direct out, off the master mix.
+    fn set_tab_direct(&mut self, tab: usize) {
+        if tab >= self.direct_pairs() {
+            eprintln!(
+                "choz: tab {} has no direct out \u{2014} raise the count in Settings \u{25B8} Engine",
+                tab + 1
+            );
+            return;
+        }
+        self.with_mix(tab, |s| s.dest = choz_engine::Dest::Direct);
+        let pair = self.direct_pair_for(tab);
+        if let Some(slot) = self.slots.get_mut(tab) {
+            slot.out_pair = pair;
+        }
+        if let Some(ref mut engine) = self.audio_engine {
+            engine.set_slot_out(tab, pair.0, pair.1);
+        }
+    }
+
+    /// Re-measure a tab already on its direct out, after something that could
+    /// have changed its width — an effect added, removed or switched.
+    ///
+    /// The place never moves, so this only ever widens a mono tab to both of
+    /// its own ports or narrows it back; no other tab is touched.
+    fn refresh_tab_direct(&mut self, tab: usize) {
+        if self
+            .slots
+            .get(tab)
+            .and_then(|s| self.direct_of(s))
+            .is_none()
+        {
+            return;
+        }
+        let pair = self.direct_pair_for(tab);
+        if self.slots.get(tab).map(|s| s.out_pair) == Some(pair) {
+            return;
+        }
+        if let Some(slot) = self.slots.get_mut(tab) {
+            slot.out_pair = pair;
+        }
+        if let Some(ref mut engine) = self.audio_engine {
+            engine.set_slot_out(tab, pair.0, pair.1);
+        }
+    }
+
+    /// Put a tab that was on a direct out back on the main pair. Sending it to
+    /// `OUT` or to a group has to mean the master mix again — otherwise "OUT"
+    /// would still be the port Ardour is listening to.
+    fn clear_tab_direct(&mut self, tab: usize) {
+        if self
+            .slots
+            .get(tab)
+            .and_then(|s| self.direct_of(s))
+            .is_none()
+        {
+            return;
+        }
+        if let Some(slot) = self.slots.get_mut(tab) {
+            slot.out_pair = (0, 1);
+        }
+        if let Some(ref mut engine) = self.audio_engine {
+            engine.set_slot_out(tab, 0, 1);
+        }
     }
 
     /// Open one of the sequencer's lists. Every named value on its box opens
@@ -2558,15 +2810,36 @@ impl App {
             .map(|e| e.output_channels())
             .unwrap_or(2);
         let active = self.slots.get(self.active_slot).map(|s| s.out_pair);
+        let (direct_base, pairs) = self.direct_range();
+        // The direct outs are **listed** for the tabs that exist, not for every
+        // pair the client registered.
+        //
+        // The ports themselves are fixed — tab 1 always owns the first pair, so
+        // nothing a person patched in Ardour moves when the rack changes — but
+        // a row for a pair no tab owns is a route nothing can take, and an
+        // empty rack showed eight of them. Close a tab and its pair leaves the
+        // list; open one and its own comes back, in the same place it had.
+        let listed = listed_channels(channels, direct_base, pairs, self.slots.len());
+        // …and a mono tab's pair is one row, not two. Its second port stays
+        // registered so nothing a person patched ever moves, but it carries
+        // nothing and is not a route: the drawer says the same thing about the
+        // tab that the MIXER's single fader does. Give the tab a reverb and the
+        // row for its right-hand side appears, in both places at once.
+        let shown: Vec<usize> = (0..listed)
+            .filter(|ch| match direct_side(*ch, direct_base) {
+                Some((tab, 1)) => !self.tab_is_mono(tab),
+                _ => true,
+            })
+            .collect();
         rows.push((
             OutTarget::None,
             OutRow {
-                label: format!("CHANNELS ({channels})"),
+                label: format!("CHANNELS ({})", shown.len()),
                 mark: ' ',
                 header: true,
             },
         ));
-        for ch in 0..channels {
+        for ch in shown {
             // Which tabs already play out of this channel, so the routing of
             // the whole rack is visible at a glance.
             let tabs: Vec<String> = self
@@ -2582,10 +2855,30 @@ impl App {
                 format!("  \u{2190} tab {}", tabs.join(","))
             };
             let role = side_label(active, ch);
+            // Past the sink's own channels are the ports choz registers and
+            // leaves unwired: say so, or they read as an interface with more
+            // outputs than it has.
+            let direct = match direct_side(ch, direct_base) {
+                // One pair per tab, so the number on the label is the tab that
+                // owns it — not a running count of ports, which said nothing
+                // about whose they were. A mono tab has one row and it is not a
+                // side of anything, so it is named for what it is.
+                Some((tab, side)) => format!(
+                    "  {} {}{}",
+                    i18n::t("DIRECT"),
+                    tab + 1,
+                    match (side, self.tab_is_mono(tab)) {
+                        (_, true) => format!(" ({})", i18n::t("MONO")),
+                        (0, false) => " L".to_string(),
+                        (_, false) => " R".to_string(),
+                    }
+                ),
+                None => String::new(),
+            };
             rows.push((
                 OutTarget::Channel(ch),
                 OutRow {
-                    label: format!("{}{role}{used}", ch + 1),
+                    label: format!("{}{direct}{role}{used}", ch + 1),
                     mark: if role.is_empty() {
                         '\u{00B7}'
                     } else {
@@ -2602,7 +2895,7 @@ impl App {
         rows.push((
             OutTarget::None,
             OutRow {
-                label: format!("MIDI OUT ({})", self.midi_out_ports.len()),
+                label: format!("MIDI OUT ({})", self.midi_out_targets().len()),
                 mark: ' ',
                 header: true,
             },
@@ -2611,7 +2904,7 @@ impl App {
             .slots
             .get(self.active_slot)
             .and_then(|s| s.midi_out.clone());
-        for (i, name) in self.midi_out_ports.iter().enumerate() {
+        for (i, name) in self.midi_out_targets().iter().enumerate() {
             let on = bound.as_deref() == Some(name.as_str());
             // Which tabs already play to it, the way the channel rows do.
             let tabs: Vec<String> = self
@@ -2659,7 +2952,7 @@ impl App {
             // Routing is per rack tab: the channel applies to the active one.
             OutTarget::Channel(ch) => self.set_active_out(ch, how),
             OutTarget::MidiOut(i) => {
-                let Some(name) = self.midi_out_ports.get(i).cloned() else {
+                let Some(name) = self.midi_out_targets().get(i).cloned() else {
                     return;
                 };
                 let idx = self.active_slot;
@@ -3485,6 +3778,25 @@ impl App {
                 ),
             ),
         ];
+        // The graph's own port, when there is a client to have one on: a DAW's
+        // clock is a JACK port and never appears among the ALSA ones below, so
+        // without this row it could not be chosen at all.
+        if self
+            .audio_engine
+            .as_ref()
+            .is_some_and(|e| e.has_jack_midi())
+        {
+            let src = settings::ClockSource::Port(choz_engine::MIDI_IN_PORT.to_string());
+            rows.push((
+                src.clone(),
+                format!(
+                    "  {} {}  \u{2190} {}",
+                    mark(&src),
+                    choz_engine::MIDI_IN_PORT,
+                    i18n::t("PATCH A DAW HERE")
+                ),
+            ));
+        }
         // Only ports choz is actually listening to: a device that is not
         // connected cannot send a clock, and offering it as the master is
         // offering silence.
@@ -4833,6 +5145,43 @@ impl App {
             0 => 0,
             n => self.instr_param.min(n - 1),
         };
+    }
+
+    /// The full name of the instrument parameter the pointer is resting on,
+    /// and the cell it is resting in — `None` when the hand is somewhere else,
+    /// or on a name the cell already shows whole.
+    ///
+    /// A plugin's parameter names are longer than thirteen columns and the knob
+    /// box says so with an ellipsis: "Filter 1 Cutoff" is drawn "Filter 1 C…",
+    /// and three of those in a row are three knobs nobody can tell apart. The
+    /// pointer is how you ask which is which without moving anything — reading
+    /// a knob must not cost a click, because a click on a knob is a value
+    /// change.
+    ///
+    /// The **whole** name, section included: the box draws the section once as
+    /// its title and the short name in the cell, so the part this adds back is
+    /// exactly the part the cell could not say.
+    fn instr_tooltip(&self) -> Option<(String, Rect)> {
+        // Nothing hovers under a modal, a menu or the plugin picker: they are
+        // drawn over the box, and a tooltip for what is underneath is a tooltip
+        // about something the hand is not on.
+        if self.modal.is_some() || self.menu.is_some() || self.about_open {
+            return None;
+        }
+        let pos: ratatui::layout::Position = self.mouse.into();
+        let (pi, rect) = {
+            let layout = self.layout.borrow();
+            *layout
+                .rack
+                .instr_knobs
+                .iter()
+                .find(|(_, r)| r.contains(pos))?
+        };
+        let slot = self.slots.get(self.active_slot)?;
+        let name = slot.instr_params.get(pi)?.name.clone();
+        // Only when the cell could not show it. The width is the cell's own —
+        // what the box had to fit the label into.
+        (name.chars().count() > rect.width as usize).then_some((name, rect))
     }
 
     /// How many knobs that box has, for cursor movement.
@@ -6884,8 +7233,15 @@ impl App {
             }
             ModalKind::MixerDest(strip) => {
                 if let StripRef::Tab(t) = self.strip_ref(strip) {
-                    let dest = choz_engine::Dest::from_index(i.min(choz_engine::BUSES));
-                    self.with_mix(t, |s| s.dest = dest);
+                    match i.checked_sub(choz_engine::BUSES + 1) {
+                        // Past the groups: this tab's own direct out.
+                        Some(_) => self.set_tab_direct(t),
+                        None => {
+                            let dest = choz_engine::Dest::from_index(i);
+                            self.clear_tab_direct(t);
+                            self.with_mix(t, |s| s.dest = dest);
+                        }
+                    }
                 }
                 true
             }
@@ -7393,10 +7749,11 @@ impl App {
                     .collect();
                 project::Slot {
                     channel: slot.channel,
-                    input: slot.input.as_ref().map(|i| match i {
-                        InputRef::Midi(name) => format!("MIDI:{name}"),
-                        InputRef::Osc => "OSC".to_string(),
-                    }),
+                    // One spelling, `InputRef::as_key`, which `parse_input_ref`
+                    // reads back — this used to write its own copy of it, which
+                    // is how a new kind of input gets saved by one side and not
+                    // the other.
+                    input: slot.input.as_ref().map(InputRef::as_key),
                     instrument,
                     mixer: project::Mixer {
                         pitch_to_midi: slot.pitch_to_midi,
@@ -8463,22 +8820,8 @@ impl App {
             }
             TriggerAction::LoopExport => self.open_loop_export(),
             TriggerAction::FxToggle => self.toggle_fx_enabled(),
-            TriggerAction::FxMoveLeft => {
-                if self.fx_slot > 0 {
-                    self.fx_chain.swap(self.fx_slot, self.fx_slot - 1);
-                    self.fx_slot -= 1;
-                    self.fx_param = 0;
-                    self.rebuild_fx();
-                }
-            }
-            TriggerAction::FxMoveRight => {
-                if self.fx_slot + 1 < self.fx_chain.len() {
-                    self.fx_chain.swap(self.fx_slot, self.fx_slot + 1);
-                    self.fx_slot += 1;
-                    self.fx_param = 0;
-                    self.rebuild_fx();
-                }
-            }
+            TriggerAction::FxMoveLeft => self.move_fx(-1),
+            TriggerAction::FxMoveRight => self.move_fx(1),
             TriggerAction::FxSelect(i) => {
                 if i < self.fx_chain.len() {
                     self.fx_slot = i;
@@ -8506,6 +8849,7 @@ impl App {
         match source {
             S::Midi(i) => self.midi_connected.get(i).cloned().map(InputRef::Midi),
             S::Osc => Some(InputRef::Osc),
+            S::Jack => Some(InputRef::Jack),
             S::Keyboard => None,
         }
     }
@@ -8883,7 +9227,35 @@ impl App {
             .map(InputRef::Midi)
             .collect();
         list.push(InputRef::Osc);
+        // Last, and only when there is a client to have it on: a graph port is
+        // not a device somebody plugged in, and it should not push the
+        // keyboards down the list.
+        if self.jack_midi() {
+            list.push(InputRef::Jack);
+        }
         list
+    }
+
+    /// Every MIDI destination a tab can be pointed at: the hardware ports ALSA
+    /// knows about, and then choz's own port on the graph.
+    ///
+    /// Last, and only while the client exists — same rule the input list
+    /// follows, so the numbering of the hardware ports never shifts under a
+    /// project that named one of them.
+    fn midi_out_targets(&self) -> Vec<String> {
+        let mut ports = self.midi_out_ports.clone();
+        if self.jack_midi() {
+            ports.push(choz_engine::MIDI_OUT_PORT.to_string());
+        }
+        ports
+    }
+
+    /// Whether choz's own JACK MIDI ports exist — the native client is the only
+    /// backend that has them.
+    fn jack_midi(&self) -> bool {
+        self.audio_engine
+            .as_ref()
+            .is_some_and(|e| e.has_jack_midi())
     }
 
     fn input_is_connected(&self, input: &InputRef) -> bool {
@@ -8893,6 +9265,9 @@ impl App {
                 .iter()
                 .any(|n| port_key(n) == port_key(name)),
             InputRef::Osc => self.osc_port.is_some(),
+            // It exists exactly as long as the client does, and `input_list`
+            // only offers it while that is true.
+            InputRef::Jack => self.jack_midi(),
         }
     }
 
@@ -9229,6 +9604,9 @@ impl App {
         if let Some(ref mut engine) = self.audio_engine {
             engine.set_slot_in(idx, pair);
         }
+        // A tab that went from one jack to two (or the other way) changed width,
+        // and its direct out follows.
+        self.refresh_tab_direct(idx);
         // What the graph has to carry changed with it.
         self.push_capture_wiring();
     }
@@ -9326,6 +9704,10 @@ impl App {
             }
             // OSC has a single listener bound at startup; nothing to toggle.
             InputRef::Osc => eprintln!("choz: OSC listener is always on when it could bind"),
+            InputRef::Jack => eprintln!(
+                "choz: {} is always there while the JACK client is \u{2014} patch it in the graph",
+                choz_engine::MIDI_IN_PORT
+            ),
         }
     }
 
@@ -9863,6 +10245,16 @@ impl App {
         };
         // Channel 0 is the rack's "any", which is not a channel to send on.
         let wire = channel.saturating_sub(1).min(15);
+        // choz's own port is not one ALSA can open: it is a port on the client
+        // choz already has, and the message goes out of the audio callback.
+        if port == choz_engine::MIDI_OUT_PORT {
+            let status = if on { 0x90 } else { 0x80 } | wire;
+            let bytes = [status, note & 0x7F, if on { vel & 0x7F } else { 0 }];
+            if let Some(ref mut engine) = self.audio_engine {
+                engine.send_jack_midi(bytes);
+            }
+            return;
+        }
         if let Some(out) = self.midi_out(&port) {
             if on {
                 out.note_on(wire, note, vel);
@@ -9889,6 +10281,15 @@ impl App {
     fn silence_midi_outs(&mut self) {
         for out in self.midi_outs.values_mut() {
             out.all_notes_off(0);
+        }
+        // The graph's port has no open connection to walk: send CC 123 on every
+        // channel, because choz does not track what it left sounding out there
+        // and a note held by a tab that just changed destination is nobody
+        // else's to end.
+        if let Some(ref mut engine) = self.audio_engine {
+            for ch in 0..16u8 {
+                engine.send_jack_midi([0xB0 | ch, 123, 0]);
+            }
         }
     }
 
@@ -9951,6 +10352,7 @@ impl App {
                 choz_engine::input::InputSource::Midi(i) => {
                     self.midi_connected.get(i).is_some_and(|n| n == want)
                 }
+                choz_engine::input::InputSource::Jack => want == choz_engine::MIDI_IN_PORT,
                 _ => false,
             },
         }
@@ -11098,7 +11500,10 @@ impl App {
     /// Put one side of a tab's fader at `value` (0..1 of the range), or both
     /// when the strip is linked — what a click on the track means.
     fn set_gain_side(&mut self, tab: usize, side: MixSide, value: f32) {
-        let linked = self.slots.get(tab).is_some_and(|s| s.link);
+        // A mono tab is linked whether or not the flag says so: it has one
+        // channel, and a `GainR` arriving from a stale click or a learned CC
+        // must move it rather than a side it does not have.
+        let linked = self.slots.get(tab).is_some_and(|s| s.link) || self.tab_is_mono(tab);
         let v = value.clamp(0.0, 1.0) * views::fx_chain_panel::MAX_GAIN;
         self.with_mix(tab, |s| match (linked, side) {
             (true, _) | (_, MixSide::Both) => {
@@ -11113,6 +11518,10 @@ impl App {
     /// Tie a strip's two sides together, or let them go. Linking takes the
     /// louder of the two, because the quiet side was the one being trimmed.
     fn toggle_link(&mut self, tab: usize) {
+        // Nothing to unlink on one channel.
+        if self.tab_is_mono(tab) {
+            return;
+        }
         let Some(s) = self.slots.get(tab) else {
             return;
         };
@@ -11702,8 +12111,15 @@ impl App {
                 kind: StripKind::Tab,
                 label: slot_label(&s.source),
                 gain: s.gain,
-                gain_r: if s.link { s.gain } else { s.gain_r },
-                link: s.link,
+                // A mono tab has one level, whatever a project written before
+                // it was one left in the other field: there is no second
+                // channel for it to belong to.
+                gain_r: match self.tab_is_mono(i) || s.link {
+                    true => s.gain,
+                    false => s.gain_r,
+                },
+                mono: self.tab_is_mono(i),
+                link: s.link || self.tab_is_mono(i),
                 pan: s.pan,
                 mute: s.mute,
                 solo: s.solo,
@@ -11722,7 +12138,13 @@ impl App {
                         MixSide::Right => views::midi_monitor::MixerSide::Right,
                         MixSide::Both => views::midi_monitor::MixerSide::Both,
                     }),
-                dest: Some(s.dest.label()),
+                // `D1`…`D8` for a tab that has left the desk: the cell says
+                // where it goes, and "OUT" would be a lie once it is out of the
+                // master mix.
+                dest: Some(match self.direct_of(s) {
+                    Some(d) => DIRECT_LABELS[d.min(DIRECT_LABELS.len() - 1)],
+                    None => s.dest.label(),
+                }),
             })
             .collect();
         // Then the desk's own: the four groups and the main, in the order they
@@ -11730,6 +12152,9 @@ impl App {
         for (i, b) in self.buses.iter().enumerate() {
             strips.push(MixerStrip {
                 kind: StripKind::Bus,
+                // A group is a sum and draws as one fader by its kind, so this
+                // has nothing to add.
+                mono: false,
                 label: choz_engine::Dest::Bus(i).label().to_string(),
                 gain: b.gain,
                 gain_r: b.gain,
@@ -11755,6 +12180,8 @@ impl App {
         }
         strips.push(MixerStrip {
             kind: StripKind::Main,
+            // The main is a stereo output whatever is feeding it.
+            mono: false,
             label: "MAIN".to_string(),
             gain: self.main.gain,
             gain_r: match self.main.link {
@@ -11987,6 +12414,92 @@ impl App {
         }
     }
 
+    /// Follow the active tab's FX through a change of position: `remap` says
+    /// where the effect at each index went, or `None` for one that is gone.
+    ///
+    /// Everything a *player* set that names an effect by its place in the chain
+    /// has to move with it — the MIDI-learn bindings above all. Reordering the
+    /// rack used to leave a learned CC pointing at whatever slid into that
+    /// slot, which reads as "I moved the auto-filter and lost my MIDI": the
+    /// fader was still bound, only to the wrong effect. Everything an effect
+    /// carries *itself* (its gate, its chord port, its takes) already travels
+    /// with the entry and needs nothing here.
+    fn remap_fx_indices(&mut self, remap: impl Fn(usize) -> Option<usize>) {
+        let slot = self.active_slot;
+        let follow = |t: &mut LearnTarget| match t {
+            LearnTarget::FxParam { slot: s, fx, .. } if *s == slot => match remap(*fx) {
+                Some(to) => {
+                    *fx = to;
+                    true
+                }
+                // A binding whose effect is gone is dropped, not moved: a fader
+                // that silently drives the next effect along is worse than one
+                // that does nothing.
+                None => false,
+            },
+            _ => true,
+        };
+        self.cc_bindings.retain_mut(|b| follow(&mut b.target));
+        self.pc_bindings.retain_mut(|b| follow(&mut b.target));
+        // A learn that is waiting for its CC names a place too.
+        if let Some(t) = self.learn.as_mut() {
+            if !follow(t) {
+                self.learn = None;
+            }
+        }
+        // The open plugin window is keyed by the same index; without this the
+        // `[GUI]` button on the effect that moved opens a second window instead
+        // of closing the one already up.
+        if let Some(ed) = self.editor.as_mut() {
+            if ed.key.0 == slot {
+                if let Some(fx) = ed.key.1 {
+                    ed.key.1 = remap(fx);
+                }
+            }
+        }
+    }
+
+    /// Move the selected effect one place along the chain, `dir` being -1 or 1.
+    fn move_fx(&mut self, dir: isize) {
+        let from = self.fx_slot;
+        let Some(to) = from
+            .checked_add_signed(dir)
+            .filter(|i| *i < self.fx_chain.len())
+        else {
+            return;
+        };
+        self.fx_chain.swap(from, to);
+        self.remap_fx_indices(|i| {
+            Some(match i {
+                i if i == from => to,
+                i if i == to => from,
+                i => i,
+            })
+        });
+        self.fx_slot = to;
+        self.fx_param = 0;
+        self.rebuild_fx();
+    }
+
+    /// Remove the selected effect, shifting what came after it down.
+    fn delete_fx(&mut self) {
+        if self.fx_slot >= self.fx_chain.len() {
+            return;
+        }
+        let gone = self.fx_slot;
+        self.fx_chain.remove(gone);
+        self.remap_fx_indices(move |i| match i.cmp(&gone) {
+            std::cmp::Ordering::Less => Some(i),
+            std::cmp::Ordering::Equal => None,
+            std::cmp::Ordering::Greater => Some(i - 1),
+        });
+        if self.fx_slot >= self.fx_chain.len() && self.fx_slot > 0 {
+            self.fx_slot -= 1;
+        }
+        self.fx_param = 0;
+        self.rebuild_fx();
+    }
+
     /// Switch the selected effect off, or back on.
     ///
     /// One place, because switching a **looper** off destroys its deck: a
@@ -12061,6 +12574,10 @@ impl App {
             let specs: Vec<FxSpec> = self.fx_chain.iter().map(|e| e.to_spec()).collect();
             engine.set_slot_fx(idx, specs);
         }
+        // The chain is what decides whether a mono jack still comes out mono,
+        // so a tab on its direct out is re-measured here: adding a reverb to a
+        // guitar opens its second port, removing it closes it again.
+        self.refresh_tab_direct(idx);
         // **Handed over once.** The takes a project carries are for the first
         // chain built after it opens; from there the deck carries itself across
         // a rebuild. Keeping them on the entry meant every later rebuild
@@ -12442,6 +12959,28 @@ impl App {
     /// needed), control messages are applied like the equivalent UI action.
     /// Performance data that rides along with the notes: pedals and wheels.
     /// Resolved to slots before the engine borrow, like the notes themselves.
+    /// Move whatever arrived on `choz:midi_in` into the same stream the
+    /// hardware ports feed.
+    ///
+    /// One path, on purpose: the monitor's log, the picker and
+    /// [`App::clock_follows`] then treat a DAW on the graph exactly like a
+    /// keyboard on a DIN cable, and nothing downstream — routing, MIDI learn,
+    /// the multi-timbral channel split — has to know there are two kinds of
+    /// MIDI input.
+    fn poll_jack_midi(&mut self) {
+        let Some(engine) = self.audio_engine.as_mut() else {
+            return;
+        };
+        // Bounded by the ring the callback pushes into, so this cannot spin.
+        let mut events = Vec::new();
+        while let Some(event) = engine.poll_jack_midi() {
+            events.push(event);
+        }
+        for event in events {
+            let _ = self.note_tx.send(event);
+        }
+    }
+
     fn drain_midi(&mut self) {
         enum Expr {
             Cc(u8, u8),
@@ -13111,6 +13650,10 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Screen>>, app: &mut App) -> 
                 // graph. Forcing is what made every other application on the
                 // machine sound resampled while choz was running.
                 eng.set_force_quantum(audio.pipewire_quantum);
+                // Registered with the client, so it has to be known before it
+                // opens: the spare ports a tab is sent out of when it leaves
+                // the master mix.
+                eng.set_direct_pairs(audio.direct_tabs);
                 if eng.start().is_ok() {
                     app.audio_engine = Some(eng);
                     app.connect_midi();
@@ -13124,13 +13667,32 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Screen>>, app: &mut App) -> 
                     app.apply_osc_settings();
                     app.discover_synths(false);
                     app.refresh_in_ports();
+                    // Opening a file named on the command line — which is what
+                    // double-clicking a project in a file manager is — rebuilds
+                    // the whole rack on this thread, and it used to do it
+                    // behind the splash with nothing saying what was going on.
+                    // The "loading" box goes up first, on a frame of its own,
+                    // the same as picking a project from the browser does.
+                    //
+                    // `ui` draws the splash and returns early until
+                    // `splash_done`, so the splash has to end here rather than
+                    // a few frames later, or the box is drawn under it.
+                    if cli.project.is_some() || cli.file.is_some() {
+                        app.splash_done = true;
+                    }
                     // A project rebuilds the whole rack, so it goes first and a
                     // file argument still lands on the tab that ends up active.
                     if let Some(path) = cli.project {
+                        app.loading = Some(file_label(&path));
+                        terminal.draw(|f| ui(f, app))?;
                         app.load_project_from(&path);
+                        app.loading = None;
                     }
                     if let Some(path) = cli.file {
+                        app.loading = Some(file_label(&path));
+                        terminal.draw(|f| ui(f, app))?;
                         app.load_source(path);
+                        app.loading = None;
                     }
                 }
             }
@@ -13146,6 +13708,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Screen>>, app: &mut App) -> 
         handle_events(app)?;
         app.poll_scan();
         app.poll_midi_hotplug();
+        app.poll_jack_midi();
         app.drain_midi();
         app.tick_arps();
         app.tick_seqs();
@@ -13893,6 +14456,7 @@ fn note_targets(
             };
         }
         S::Osc => InputRef::Osc,
+        S::Jack => InputRef::Jack,
         S::Midi(i) => match midi_connected.get(i) {
             Some(name) => InputRef::Midi(name.clone()),
             None => return Vec::new(),
@@ -13978,6 +14542,7 @@ fn parse_input_ref(text: &str) -> Option<InputRef> {
     match text.strip_prefix("MIDI:") {
         Some(name) => Some(InputRef::Midi(name.to_string())),
         None if text == "OSC" => Some(InputRef::Osc),
+        None if text == "JACK" => Some(InputRef::Jack),
         None => None,
     }
 }
@@ -14316,13 +14881,7 @@ fn handle_fx_keys(app: &mut App, key: KeyCode) {
         // instrument picker and `c` is the gate, so this is the shifted one:
         // it belongs to the same effect the gate does.
         KeyCode::Char('C') if !app.fx_chain.is_empty() => app.open_chord_input_modal(),
-        KeyCode::Char('d') if !app.fx_chain.is_empty() => {
-            app.fx_chain.remove(app.fx_slot);
-            if app.fx_slot >= app.fx_chain.len() && app.fx_slot > 0 {
-                app.fx_slot -= 1;
-            }
-            app.rebuild_fx();
-        }
+        KeyCode::Char('d') if !app.fx_chain.is_empty() => app.delete_fx(),
         _ => {}
     }
 }
@@ -15036,10 +15595,12 @@ fn apply_menu_action(app: &mut App, action: menu::MenuAction) {
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     let pos: ratatui::layout::Position = (mouse.column, mouse.row).into();
     let left = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
+    // Every event, not only the clicks: `EnableMouseCapture` turns on any-motion
+    // reporting, and a hover has to know where the hand is without one.
+    app.mouse = (mouse.column, mouse.row);
 
     // ── MIDI learn pointer ─────────────────────────────────────────────────
     if app.learn_pick {
-        app.mouse = (mouse.column, mouse.row);
         if left {
             match app.learn_target_at(pos) {
                 // Picked: keep the `?` pointer up (choz is now listening for a
@@ -15272,31 +15833,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         MouseAction::ChannelStep(d) => app.step_channel(d),
         MouseAction::FxAdd => app.open_add_fx_modal(),
         MouseAction::FxToggle => app.toggle_fx_enabled(),
-        MouseAction::FxDelete => {
-            if !app.fx_chain.is_empty() {
-                app.fx_chain.remove(app.fx_slot);
-                if app.fx_slot >= app.fx_chain.len() && app.fx_slot > 0 {
-                    app.fx_slot -= 1;
-                }
-                app.rebuild_fx();
-            }
-        }
-        MouseAction::FxMoveLeft => {
-            if app.fx_slot > 0 {
-                app.fx_chain.swap(app.fx_slot, app.fx_slot - 1);
-                app.fx_slot -= 1;
-                app.fx_param = 0;
-                app.rebuild_fx();
-            }
-        }
-        MouseAction::FxMoveRight => {
-            if app.fx_slot + 1 < app.fx_chain.len() {
-                app.fx_chain.swap(app.fx_slot, app.fx_slot + 1);
-                app.fx_slot += 1;
-                app.fx_param = 0;
-                app.rebuild_fx();
-            }
-        }
+        MouseAction::FxDelete => app.delete_fx(),
+        MouseAction::FxMoveLeft => app.move_fx(-1),
+        MouseAction::FxMoveRight => app.move_fx(1),
         MouseAction::ToggleInDrawer => app.toggle_in_drawer(),
         MouseAction::ToggleOutDrawer => app.toggle_out_drawer(),
         MouseAction::OutputDevice(i) => {
@@ -16389,6 +16928,13 @@ fn ui(f: &mut Frame, app: &mut App) {
         }
     }
 
+    // The name under the pointer, when the cell it is in could not say it all.
+    // Above the panels and below every dialogue: `instr_tooltip` already
+    // refuses while one is open.
+    if let Some((name, cell)) = app.instr_tooltip() {
+        draw_tooltip(f, &name, cell, area);
+    }
+
     // Dropdown + About draw on top of everything.
     if let Some(ref m) = app.menu {
         draw_menu_dropdown(f, app, *m, menubar_area);
@@ -16886,6 +17432,41 @@ fn draw_menu_dropdown(f: &mut Frame, app: &App, state: menu::MenuState, menubar_
 /// ponytail: a box and a name, no spinner. Nothing can animate it — the thread
 /// that would tick it is the thread doing the loading — and a frozen spinner
 /// says less than a sentence that was true when it was drawn.
+/// One line of text in a bordered box beside `cell`, for a label the cell was
+/// too narrow to show whole.
+///
+/// Below the cell when there is room and above it otherwise, and pulled back
+/// inside `area` on the right — a tooltip that runs off the screen answers
+/// nothing. Drawn over whatever is there, because that is what it is for.
+fn draw_tooltip(f: &mut Frame, text: &str, cell: Rect, area: Rect) {
+    let w = (text.chars().count() as u16 + 2).min(area.width);
+    if w < 3 || area.height < 3 {
+        return;
+    }
+    let x = cell.x.min(area.x + area.width.saturating_sub(w));
+    // Under the cell, unless that is off the bottom.
+    let below = cell.y + cell.height;
+    let y = match below + 3 <= area.y + area.height {
+        true => below,
+        false => cell.y.saturating_sub(3).max(area.y),
+    };
+    let rect = Rect::new(x, y, w, 3);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .style(views::theme::overlay_style());
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            text.to_string(),
+            Style::default().fg(HEADER),
+        ))),
+        inner,
+    );
+}
+
 fn draw_loading(f: &mut Frame, name: &str, area: Rect) {
     let text = format!(" {} {name}\u{2026} ", i18n::t("Loading"));
     let w = (text.chars().count() as u16 + 4).min(area.width);
@@ -22238,6 +22819,67 @@ mod tests {
         assert_eq!(p.audio.backend, "JACK");
     }
 
+    /// A learned CC names the effect it was learned on, not the place that
+    /// effect happened to be sitting in: reordering the chain used to hand the
+    /// binding to whatever slid into the slot, and deleting an effect handed it
+    /// to the one after.
+    #[test]
+    fn moving_an_fx_carries_its_midi_bindings() {
+        let _g = ui_guard();
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.fx_chain = vec![
+            source::AudioFxEntry::new(source::AudioFxKind::AutoFilter),
+            source::AudioFxEntry::new(source::AudioFxKind::Delay),
+            source::AudioFxEntry::new(source::AudioFxKind::Reverb),
+        ];
+        let bind = |app: &mut App, cc: u8, fx: usize| {
+            app.cc_bindings.push(CcBinding {
+                source: None,
+                cc,
+                target: LearnTarget::FxParam {
+                    slot: 0,
+                    fx,
+                    param: 0,
+                },
+                tab: Some(0),
+            });
+        };
+        bind(&mut app, 20, 0);
+        bind(&mut app, 21, 1);
+        bind(&mut app, 22, 2);
+        let fx_of = |app: &App, cc: u8| {
+            app.cc_bindings
+                .iter()
+                .find(|b| b.cc == cc)
+                .map(|b| match b.target {
+                    LearnTarget::FxParam { fx, .. } => fx,
+                    _ => unreachable!(),
+                })
+        };
+
+        // The auto-filter moves one place along; its CC goes with it, and so
+        // does the delay's, which moved the other way to make room.
+        app.fx_slot = 0;
+        app.move_fx(1);
+        assert_eq!(app.fx_chain[1].kind, source::AudioFxKind::AutoFilter);
+        assert_eq!(app.fx_slot, 1, "the selection follows the effect");
+        assert_eq!(fx_of(&app, 20), Some(1), "the auto-filter's CC followed it");
+        assert_eq!(fx_of(&app, 21), Some(0), "the delay's did too");
+        assert_eq!(fx_of(&app, 22), Some(2), "the reverb's did not move");
+
+        // Deleting the delay drops only its binding; the two above it shift.
+        app.fx_slot = 0;
+        app.delete_fx();
+        assert_eq!(
+            fx_of(&app, 21),
+            None,
+            "a deleted effect takes its CC with it"
+        );
+        assert_eq!(fx_of(&app, 20), Some(0), "the auto-filter shifted down");
+        assert_eq!(fx_of(&app, 22), Some(1), "and so did the reverb");
+    }
+
     /// And it loads back: a saved project rebuilds the same rack, knobs, mixer,
     /// routing and MIDI-learn bindings.
     #[test]
@@ -25369,6 +26011,86 @@ mod tests {
         assert_eq!(app.slots[0].midi_out.as_deref(), Some("Synth B"));
     }
 
+    /// choz's own JACK ports are a MIDI cable to anything else on the graph:
+    /// notes in from a DAW's track, notes out to its recorder. They are saved
+    /// and read back like any other port, and — unlike a hardware one — they
+    /// are only offered while the client that carries them exists.
+    #[test]
+    fn the_graphs_midi_ports_are_an_input_and_a_destination_like_any_other() {
+        use choz_engine::input::InputSource as S;
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.midi_ports = vec!["Keystation".to_string()];
+        app.midi_out_ports = vec!["Synth A".to_string()];
+
+        // No engine, no client, no ports: the lists are the hardware's alone.
+        assert!(!app.jack_midi());
+        assert!(!app.input_list().contains(&InputRef::Jack));
+        assert_eq!(app.midi_out_targets(), vec!["Synth A".to_string()]);
+
+        // A note arriving on the graph's port names it, so it routes to the tab
+        // bound to it exactly as a keyboard's would.
+        assert_eq!(app.source_ref(S::Jack), Some(InputRef::Jack));
+        let bindings = vec![Some(&InputRef::Jack)];
+        assert_eq!(
+            note_targets(&bindings, &[0], &[], 0, S::Jack, 0),
+            vec![0],
+            "the tab pointed at the graph plays what the graph sends"
+        );
+        assert!(
+            note_targets(&bindings, &[0], &[], 0, S::Osc, 0).is_empty(),
+            "and nothing else reaches it"
+        );
+
+        // It survives a save: one spelling, written and read by the same pair.
+        let key = InputRef::Jack.as_key();
+        assert_eq!(key, "JACK");
+        assert_eq!(parse_input_ref(&key), Some(InputRef::Jack));
+        // …and is still told apart from the others.
+        assert!(!InputRef::Jack.same_port(&InputRef::Osc));
+        assert!(InputRef::Jack.same_port(&InputRef::Jack));
+    }
+
+    /// A DAW on the same JACK/PipeWire graph publishes its clock as a **JACK**
+    /// port, which never appears as an ALSA sequencer client — so choz's own
+    /// `clock_in` is the only way to reach it. It is chosen and followed the
+    /// same way a hardware port is, and choosing a different master has to shut
+    /// it out like any other.
+    #[test]
+    fn the_graphs_own_clock_port_is_a_master_like_any_other() {
+        use choz_engine::input::InputSource as S;
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.midi_connected = vec!["Groovebox".to_string()];
+
+        // Nothing is followed until it is asked for, the graph included.
+        app.ui.clock_source = settings::ClockSource::Internal;
+        assert!(!app.clock_follows(S::Jack));
+
+        // Named: the graph's clock, and only it.
+        app.ui.clock_source = settings::ClockSource::Port(choz_engine::MIDI_IN_PORT.to_string());
+        assert!(app.clock_follows(S::Jack), "the DAW on the graph is master");
+        assert!(
+            !app.clock_follows(S::Midi(0)),
+            "the drum machine on the DIN cable is not"
+        );
+
+        // …and the other way round: a hardware master shuts the graph out.
+        app.ui.clock_source = settings::ClockSource::Port("Groovebox".to_string());
+        assert!(app.clock_follows(S::Midi(0)));
+        assert!(!app.clock_follows(S::Jack));
+
+        // ANY still means any, which is what a rig with one sender wants.
+        app.ui.clock_source = settings::ClockSource::Any;
+        assert!(app.clock_follows(S::Jack));
+        assert!(app.clock_follows(S::Midi(0)));
+
+        // The clock is only one of the things that port carries: it names a
+        // controller like any other, so a CC arriving on it can be learned onto
+        // a fader — see the port's own test.
+        assert_eq!(app.source_ref(S::Jack), Some(InputRef::Jack));
+    }
+
     /// An outside MIDI clock moves choz's transport — but only when it was
     /// asked to. A port that sends clock all day must not take the tempo over
     /// the moment it is plugged in.
@@ -26377,6 +27099,248 @@ mod tests {
         handle_key(&mut app, KeyCode::F(8));
         assert_eq!(app.automation.recording, !armed, "F8 arms and disarms");
         handle_key(&mut app, KeyCode::F(9));
+    }
+
+    /// The OUT drawer lists the direct outs the rack actually has tabs for.
+    ///
+    /// The ports never move — tab 1 always owns the first pair, so an Ardour
+    /// patch survives the rack changing shape — but listing a pair no tab owns
+    /// offered a route nothing could take, and an empty rack offered eight.
+    #[test]
+    fn the_out_drawer_lists_a_direct_pair_per_tab_and_none_without_one() {
+        // A stereo sink with four direct pairs registered behind it.
+        let (channels, base, pairs) = (10, 2, 4);
+        assert_eq!(
+            listed_channels(channels, base, pairs, 0),
+            2,
+            "an empty rack lists the sink's own channels and nothing else"
+        );
+        assert_eq!(
+            listed_channels(channels, base, pairs, 1),
+            4,
+            "one tab, one pair"
+        );
+        assert_eq!(listed_channels(channels, base, pairs, 3), 8, "three tabs");
+        assert_eq!(
+            listed_channels(channels, base, pairs, 9),
+            10,
+            "more tabs than pairs stops at the pairs that exist"
+        );
+        // A backend with no direct outs at all (cpal): the sink, whatever the
+        // rack looks like.
+        assert_eq!(listed_channels(2, 2, 0, 5), 2);
+        // And an interface's own channels are never hidden by this.
+        assert_eq!(listed_channels(20, 12, 4, 0), 12, "the UMC1820's twelve");
+
+        // Which tab a listed channel belongs to, and which side of its pair.
+        // A mono tab's second side is the row the drawer drops.
+        assert_eq!(direct_side(1, 2), None, "the sink's own second channel");
+        assert_eq!(direct_side(2, 2), Some((0, 0)), "tab 1, left");
+        assert_eq!(direct_side(3, 2), Some((0, 1)), "tab 1, right");
+        assert_eq!(direct_side(4, 2), Some((1, 0)), "tab 2, left");
+        assert_eq!(direct_side(13, 12), Some((0, 1)), "past a twelve-out sink");
+    }
+
+    /// A plugin parameter whose name the cell cannot show is named by the
+    /// pointer resting on it.
+    ///
+    /// A knob box is thirteen columns wide and a plugin's names are not: three
+    /// of them drawn as "Filter 1 C\u{2026}" are three knobs nobody can tell
+    /// apart. Reading one must not cost a click, because a click on a knob is
+    /// a value change.
+    #[test]
+    fn a_long_plugin_parameter_names_itself_under_the_pointer() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            format: "VST2".into(),
+            id: "test:one".into(),
+            name: "Tyrell".into(),
+        }));
+        let param = |name: &str| choz_engine::PluginParam {
+            id: 0,
+            name: name.into(),
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+            ..Default::default()
+        };
+        app.slots[0].instr_params = vec![param("Osc"), param("Filter 1 Cutoff Frequency")];
+        app.slots[0].instr_values = vec![0.2, 0.6];
+        app.source = app.slots[0].source.clone();
+
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let knobs = app.layout.borrow().rack.instr_knobs.clone();
+        assert_eq!(knobs.len(), 2, "the box drew both knobs");
+        let cell = |pi: usize| knobs.iter().find(|(i, _)| *i == pi).expect("knob").1;
+
+        // Nothing hovered, nothing to say.
+        assert!(app.instr_tooltip().is_none(), "the pointer is nowhere");
+
+        // A short name the cell already shows whole earns no tooltip.
+        let short = cell(0);
+        app.mouse = (short.x, short.y);
+        assert!(
+            app.instr_tooltip().is_none(),
+            "\"Osc\" fits: saying it twice is noise"
+        );
+
+        // A long one does, and it comes back whole.
+        let long = cell(1);
+        app.mouse = (long.x, long.y);
+        let (name, at) = app.instr_tooltip().expect("the long name is offered");
+        assert_eq!(name, "Filter 1 Cutoff Frequency");
+        assert_eq!(at, long, "placed at the cell the hand is on");
+
+        // A dialogue over the box owns the screen: what is underneath is not
+        // what the hand is on.
+        app.about_open = true;
+        assert!(app.instr_tooltip().is_none());
+        app.about_open = false;
+        assert!(app.instr_tooltip().is_some());
+
+        // And it is drawn where it was promised.
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let screen: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            screen.contains("Filter 1 Cutoff Frequency"),
+            "the whole name is on the screen:\n{screen}"
+        );
+    }
+
+    /// A mono tab is one fader on the MIXER, not two.
+    ///
+    /// A headset microphone arrives on one capture channel, and drawing a left
+    /// and a right for it offered two sides of a signal that has neither — and
+    /// let them be set apart, which is a balance control over nothing.
+    #[test]
+    fn a_mono_tab_is_one_fader_on_the_mixer() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+
+        // A jack on one channel: one fader, the two levels tied together.
+        app.slots[0].in_pair = Some((4, 4));
+        app.slots[0].gain = 0.8;
+        app.slots[0].gain_r = 0.2;
+        app.slots[0].link = false;
+        let strip = &app.mixer_strips()[0];
+        assert!(strip.mono, "one jack is one channel");
+        assert!(strip.link, "which leaves nothing to unlink");
+        assert_eq!(
+            strip.gain_r, strip.gain,
+            "the stale second level does not survive as a side"
+        );
+
+        // The right half cannot be moved on its own, whatever sends it.
+        app.set_gain_side(0, MixSide::Right, 0.5);
+        assert_eq!(
+            app.slots[0].gain, app.slots[0].gain_r,
+            "a mono tab moves as one"
+        );
+        // …and the link cannot be broken to get around it.
+        app.toggle_link(0);
+        assert!(app.mixer_strips()[0].link);
+
+        // Two jacks, and it is a stereo strip again.
+        app.slots[0].in_pair = Some((4, 5));
+        assert!(!app.mixer_strips()[0].mono);
+        // An effect that pulls the sides apart does the same to one jack.
+        app.slots[0].in_pair = Some((4, 4));
+        app.fx_chain = vec![source::AudioFxEntry::new(source::AudioFxKind::Reverb)];
+        app.slots[0].fx_chain = app.fx_chain.clone();
+        assert!(!app.mixer_strips()[0].mono, "a reverb makes it stereo");
+    }
+
+    /// One direct out per tab, at a fixed place, as wide as the tab is.
+    ///
+    /// Two tabs offered the same pair is the bug this shape fixes — the menu
+    /// used to list the whole pool on every strip, so tab 1 and tab 2 both
+    /// picked "DIRECT 1" and landed on the same two ports. The place now comes
+    /// from the tab's own index and cannot collide; only the width moves, and
+    /// only within the tab's own pair.
+    #[test]
+    fn each_tab_owns_one_direct_out_as_wide_as_the_tab_is() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+
+        // Fixed places, one pair each, past a stereo sink's own two channels.
+        assert_eq!(direct_pair(2, 0), (2, 3), "tab 1");
+        assert_eq!(direct_pair(2, 1), (4, 5), "tab 2");
+        // Both widths of a tab's own pair read back as that tab's direct out…
+        assert_eq!(direct_index(2, 2, (2, 3)), Some(0), "tab 1, stereo");
+        assert_eq!(direct_index(2, 2, (2, 2)), Some(0), "tab 1, mono");
+        assert_eq!(direct_index(2, 2, (4, 4)), Some(1), "tab 2, mono");
+        // …and nothing else does.
+        assert_eq!(direct_index(2, 2, (0, 1)), None, "the main pair");
+        assert_eq!(direct_index(2, 2, (3, 3)), None, "not where a pair starts");
+        assert_eq!(direct_index(2, 2, (6, 7)), None, "past the last tab");
+
+        // A jack on one channel is mono, and stays mono through an EQ or a
+        // compressor: they do the same thing to each side.
+        app.active_slot = 1;
+        app.slots[0].in_pair = Some((4, 4));
+        app.slots[0].fx_chain = vec![
+            source::AudioFxEntry::new(source::AudioFxKind::Compressor),
+            source::AudioFxEntry::new(source::AudioFxKind::ParamEq),
+        ];
+        assert!(app.tab_is_mono(0), "a guitar through a compressor is mono");
+
+        // A reverb is there to make the sides differ, so it is not.
+        app.slots[0]
+            .fx_chain
+            .push(source::AudioFxEntry::new(source::AudioFxKind::Reverb));
+        assert!(!app.tab_is_mono(0), "a reverb tail is stereo");
+        // …unless it is switched off, which takes it out of the engine's chain.
+        app.slots[0].fx_chain.last_mut().unwrap().enabled = false;
+        assert!(app.tab_is_mono(0), "a bypassed reverb is not in the chain");
+
+        // Two jacks is stereo whatever the chain does with them.
+        app.slots[0].in_pair = Some((4, 5));
+        assert!(!app.tab_is_mono(0));
+        // And an instrument is not a jack: this is a question about capture.
+        app.slots[0].in_pair = None;
+        assert!(!app.tab_is_mono(0));
+    }
+
+    /// A tab sent to a direct out leaves the master mix: the main fader only
+    /// ever touches the first pair, so "off master" and "out of a port of its
+    /// own" are the same routing. The `O` button is where it is chosen, and
+    /// sending the tab back to `OUT` has to mean the main pair again — not the
+    /// port Ardour is still listening to.
+    #[test]
+    fn a_direct_out_is_a_pair_past_the_sinks_own_channels() {
+        // Two pairs past a stereo sink: channels 2,3 and 4,5.
+        assert_eq!(direct_pair(2, 0), (2, 3));
+        assert_eq!(direct_pair(2, 1), (4, 5));
+        // …and back, only for a pair that is one of them.
+        assert_eq!(direct_index(2, 2, (2, 3)), Some(0));
+        assert_eq!(direct_index(2, 2, (4, 5)), Some(1));
+        assert_eq!(direct_index(2, 2, (0, 1)), None, "the main pair is not one");
+        assert_eq!(direct_index(2, 2, (6, 7)), None, "past the last pair");
+        assert_eq!(
+            direct_index(2, 2, (2, 5)),
+            None,
+            "a pair split across two direct outs is not one of them"
+        );
+        // An eight-output interface pushes them up, not over its channels.
+        assert_eq!(direct_pair(8, 0), (8, 9));
+        assert_eq!(direct_index(8, 1, (8, 9)), Some(0));
+        assert_eq!(direct_index(8, 1, (2, 3)), None, "still the interface's");
     }
 
     /// The MIXER carries the desk, not only the tabs: four groups and a main

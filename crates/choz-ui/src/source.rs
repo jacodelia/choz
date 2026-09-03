@@ -222,15 +222,13 @@ impl AudioFxKind {
         match self {
             Delay | GranDelay | ReverseDelay | SpaceEcho | MultiTapDelay => FxCategory::Delay,
             Reverb | Shimmer | PlateReverb => FxCategory::Reverb,
-            Compressor | Limiter | Gate | Expander | SidechainDuck | DeEsser
-            | TransientShaper | MultibandComp => FxCategory::Dynamics,
+            Compressor | Limiter | Gate | Expander | SidechainDuck | DeEsser | TransientShaper
+            | MultibandComp => FxCategory::Dynamics,
             ParamEq | GraphicEq | Filter | FilterBank | Isolator | MoogLadder => {
                 FxCategory::EqFilter
             }
             Chorus | Flanger | Phaser | Tremolo | AutoPan | AutoFilter | FreqShifter | RingMod
-            | Vibrato => {
-                FxCategory::Modulation
-            }
+            | Vibrato => FxCategory::Modulation,
             BitCrusher | Vinyl | Cassette | SoftClip | Saturator | WaveShaper | TubeSat
             | AmberFang | VelvetFuzz | Exciter | BassEnhancer => FxCategory::Distortion,
             Widener | Pan => FxCategory::Spatial,
@@ -768,11 +766,8 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
 
     /// Both halves open in the middle, which is the only value a shaper added
     /// to a chain may start on: anything else reshapes the take on insert.
-    static TRANSIENT: &[FxParamDesc] = &[
-        pd!("Attack", 0.50),
-        pd!("Sustain", 0.50),
-        pd!("Wet", 1.00),
-    ];
+    static TRANSIENT: &[FxParamDesc] =
+        &[pd!("Attack", 0.50), pd!("Sustain", 0.50), pd!("Wet", 1.00)];
 
     static MULTIBAND: &[FxParamDesc] = &[
         pd!("LoXover", 0.33),
@@ -808,8 +803,7 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
     /// Centred knobs: `Semi` and `Fine` open at no shift, which is the only
     /// value an effect added to a chain may start on — anything else retunes
     /// the tab the moment it is added.
-    static PITCHSHIFT: &[FxParamDesc] =
-        &[pd!("Semi", 0.50), pd!("Fine", 0.50), pd!("Wet", 1.00)];
+    static PITCHSHIFT: &[FxParamDesc] = &[pd!("Semi", 0.50), pd!("Fine", 0.50), pd!("Wet", 1.00)];
 
     static SHIMMER: &[FxParamDesc] = &[
         pd!("Size", 0.85),

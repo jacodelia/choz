@@ -7,7 +7,7 @@
 //!
 //! `cargo run --release -p choz-engine --example alias_probe`
 
-use choz_engine::fx::{Carrier, FreqShift, FxProcessor, VoiceShifter, Vocoder};
+use choz_engine::fx::{Carrier, FreqShift, FxProcessor, Vocoder, VoiceShifter};
 
 const SR: f32 = 48_000.0;
 const N: usize = 8192;
@@ -35,13 +35,20 @@ fn spectrum(x: &[f32]) -> Vec<f32> {
 /// loudest bin, against the loudest bin.
 fn artifacts_db(x: &[f32]) -> (f32, f32) {
     let sp = spectrum(x);
-    let (peak_k, peak) = sp
-        .iter()
-        .enumerate()
-        .skip(2)
-        .fold((0usize, 0.0f32), |(bk, bv), (k, &v)| {
-            if v > bv { (k, v) } else { (bk, bv) }
-        });
+    let (peak_k, peak) =
+        sp.iter()
+            .enumerate()
+            .skip(2)
+            .fold(
+                (0usize, 0.0f32),
+                |(bk, bv), (k, &v)| {
+                    if v > bv {
+                        (k, v)
+                    } else {
+                        (bk, bv)
+                    }
+                },
+            );
     let skirt = 6;
     let rest: f32 = sp
         .iter()
@@ -108,7 +115,9 @@ fn main() {
             sh.set_semitones(semis);
             let out: Vec<f32> = tone(hz, N * 4).iter().map(|&x| sh.process(x)).collect();
             let (at, db) = artifacts_db(&out[N * 3..]);
-            println!("  {hz:>6.0} Hz {semis:>4.0} st -> tone at {at:>7.0} Hz, artifacts {db:>6.1} dB");
+            println!(
+                "  {hz:>6.0} Hz {semis:>4.0} st -> tone at {at:>7.0} Hz, artifacts {db:>6.1} dB"
+            );
         }
     }
 
@@ -121,7 +130,10 @@ fn main() {
         let out: Vec<f32> = tone(hz, N * 4).iter().map(|&x| sh.process(x)).collect();
         let tail = &out[N * 3..];
         let rms = (tail.iter().map(|s| s * s).sum::<f32>() / tail.len() as f32).sqrt();
-        println!("  {hz:>6.0} Hz -> {:>6.2} dB", 20.0 * (rms / 0.3536).log10());
+        println!(
+            "  {hz:>6.0} Hz -> {:>6.2} dB",
+            20.0 * (rms / 0.3536).log10()
+        );
     }
 
     println!("== vocoder carrier ==");

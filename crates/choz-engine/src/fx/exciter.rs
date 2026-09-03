@@ -107,7 +107,13 @@ impl FxProcessor for Exciter {
 
     fn params(&self) -> Vec<FxParam> {
         vec![
-            FxParam::new("Freq", (self.freq_hz - 1000.0) / 9000.0, 1000.0, 10000.0, "Hz"),
+            FxParam::new(
+                "Freq",
+                (self.freq_hz - 1000.0) / 9000.0,
+                1000.0,
+                10000.0,
+                "Hz",
+            ),
             FxParam::new("Drive", (self.drive - 1.0) / 9.0, 1.0, 10.0, "x"),
             FxParam::new("Blend", self.even, 0.0, 1.0, ""),
             FxParam::new("Amount", self.amount, 0.0, 1.0, ""),
