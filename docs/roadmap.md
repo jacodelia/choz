@@ -12,7 +12,7 @@ que decía "hecho" se fue al changelog.
 que no existe, una decisión de diseño y un fallo intermitente sin explicar—, dos
 decisiones de no hacer, y las notas para el que retome.
 
-Última actualización: 2026-09-02 (1.3.8 publicada).
+Última actualización: 2026-09-03 (1.3.9 publicada).
 
 ## Estado en una línea
 
@@ -54,9 +54,15 @@ de los `.rdf` que se instalan junto al plugin, que es de donde las lee cualquier
 otro host. Un plugin que guarda sus controles fuera de sus puertos
 —ZynAddSubFX— se maneja por su propio servidor OSC: mandos con nombre, los
 armónicos del oscilador, su ventana real, y los mandos leyendo lo que el plugin
-tiene. **La 1.0.0 está publicada y sus paquetes verificados; la
-1.3.8 es este árbol.**
-866 tests, `clippy --workspace --all-targets -D warnings` limpio.
+tiene. choz **habla MIDI por el grafo**, no
+sólo por ALSA: `choz:midi_in` y `choz:midi_out` son dos puertos del cliente JACK
+que ya tenía, así que un DAW del mismo grafo toca una tab, le manda el clock y
+recibe lo que el arpegiador saca —sin a2jmidid, que puentea en el sentido
+contrario—. Una tab puede **salir del master por un puerto propio**, uno por tab
+en un lugar fijo y del ancho que la tab tenga, que es lo que Ardour graba pista
+por pista. **La 1.0.0 está publicada y sus paquetes verificados; la
+1.3.9 es este árbol.**
+878 tests, `clippy --workspace --all-targets -D warnings` limpio.
 
 Las comprobaciones con hardware delante quedaron dichas en los gotchas, que es
 donde se van a leer.

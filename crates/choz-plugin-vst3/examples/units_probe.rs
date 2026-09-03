@@ -12,10 +12,7 @@ fn main() {
     for info in &found {
         let params = choz_plugin_vst3::read_params(&info.path, &info.name);
         let named = params.iter().filter(|p| p.group.is_some()).count();
-        let mut groups: Vec<&str> = params
-            .iter()
-            .filter_map(|p| p.group.as_deref())
-            .collect();
+        let mut groups: Vec<&str> = params.iter().filter_map(|p| p.group.as_deref()).collect();
         groups.sort_unstable();
         groups.dedup();
         println!(

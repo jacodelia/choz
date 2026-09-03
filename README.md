@@ -10,12 +10,22 @@ Built with Rust, ratatui and cpal. Provides a TUI for managing note inputs, inst
 
 ## Status
 
-**1.3.6.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
+**1.3.9.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
 LADSPA, DSSI, VST2, VST3 and Pure Data patches are really hosted** — instruments
 and audio effects, with their own parameters and their own windows — choz's own
 56 effects and both artifacts — the arpeggiator and the step sequencer — are
 published as CLAP plugins for other hosts, and choz installs as a
 `.deb`, an `.rpm` or a script, with an entry in the desktop menu.
+
+choz is a **citizen of the JACK/PipeWire graph**, not only of ALSA:
+`choz:midi_in` and `choz:midi_out` are ports on the client it already had, so a
+DAW on the same graph plays a rack tab, sends it the clock and receives what the
+arpeggiator puts out — no `a2jmidid`, which bridges the other way. And a tab can
+**leave the master mix through a port of its own**: one direct out per tab, at a
+fixed place and as wide as the tab is, which is what a DAW records track by
+track. A mono jack stays one channel all the way through — one fader on the
+mixer, one port on the graph — until something in its chain has a reason to pull
+the two sides apart.
 
 ### Plugin formats
 
@@ -354,7 +364,7 @@ ring so they are freed off the RT thread.
 
 | | |
 |---|---|
-| choz | **1.3.6** |
+| choz | **1.3.9** |
 | Rust edition | 2021 (`choz-plugin-lv2` is 2024) |
 | Toolchain tested | rustc 1.97.1 |
 | Platform | Linux. ALSA/JACK/PipeWire. Released for x86-64, aarch64 and armv7 |
@@ -366,15 +376,15 @@ See [`CHANGELOG.md`](CHANGELOG.md) for what has landed so far.
 ## Tests
 
 ```bash
-cargo test --workspace              # 850 tests
+cargo test --workspace              # 878 tests
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 | Crate | Tests | Covers |
 |---|---|---|
-| `choz-engine` | 444 | 56 FX processors, mixer, sources, SFZ parser, preset files and where a plugin keeps them, the transport and the metronome, the looper deck and its takes on disk, plugin paths, scan cache, quarantine, sandbox, OSC socket |
-| `choz-ui` | 307 | Rack layout, parameter controls, modals, mouse hit-testing, MIDI learn (including the knob box paging under it), the mixer strips, note routing in both modes, project save/load, i18n, themes, background rendering, drawing at every terminal size, the installer script |
-| `choz-plugin-lv2` | 30 | TTL parsing, hosting installed effects, `worker#schedule`, X11 editor discovery, state round-trip |
+| `choz-engine` | 446 | 56 FX processors, mixer, sources, SFZ parser, preset files and where a plugin keeps them, the transport and the metronome, the looper deck and its takes on disk, plugin paths, scan cache, quarantine, sandbox, OSC socket |
+| `choz-ui` | 328 | Rack layout, parameter controls, modals, mouse hit-testing, MIDI learn (including the knob box paging under it), the mixer strips, note routing in both modes, project save/load, i18n, themes, background rendering, drawing at every terminal size, the installer script |
+| `choz-plugin-lv2` | 34 | TTL parsing, hosting installed effects, `worker#schedule`, X11 editor discovery, state round-trip, `patch:Set` atoms from the UI |
 | `choz-plugin-ladspa` | 14 | LADSPA + DSSI descriptors and runtime, step names from the `.rdf` sidecar |
 | `choz-plugin-clap` | 13 | Effect and instrument runtime against installed plugins, window feed |
 | `choz-plugin-clap-export` | 9 | The bundle choz publishes: catalogue, parameters, a real host loading it |

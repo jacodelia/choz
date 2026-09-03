@@ -29,7 +29,11 @@ pub mod sf2_patch;
 pub mod sfz;
 pub mod sources;
 
-pub use engine::{AudioBackend, AudioEngine, Dest, BUSES};
+pub use engine::{AudioBackend, AudioEngine, Dest, BUSES, DEFAULT_DIRECT_PAIRS, MAX_DIRECT_PAIRS};
+/// The MIDI ports on choz's own JACK client. Re-exported because the interface
+/// names them in the CLOCK, IN and MIDI OUT pickers, and the module behind them
+/// is private.
+pub use jack_backend::{MIDI_IN_PORT, MIDI_OUT_PORT};
 
 /// Parameter index that means "choz's own dry/wet" in
 /// [`AudioEngine::set_fx_param`], rather than one of the processor's params.

@@ -79,6 +79,11 @@ pub struct LV2_URID_Unmap {
 pub const LV2_ATOM_SEQUENCE_URI: &str = "http://lv2plug.in/ns/ext/atom#Sequence";
 pub const LV2_ATOM_CHUNK_URI: &str = "http://lv2plug.in/ns/ext/atom#Chunk";
 pub const LV2_MIDI_EVENT_URI: &str = "http://lv2plug.in/ns/ext/midi#MidiEvent";
+/// `atom:eventTransfer` — the UI port protocol for a whole atom (as opposed to
+/// the bare `float` of protocol 0). A UI writes a `patch:Set` through it to move
+/// a file-path parameter like the Neural Amp Modeler's model; the value the UI
+/// passes as `format` is this URI mapped through the instance's URID map.
+pub const LV2_ATOM_EVENT_TRANSFER_URI: &str = "http://lv2plug.in/ns/ext/atom#eventTransfer";
 
 /// `LV2_Atom` — header common to every atom (`{ size, type }`).
 #[repr(C)]
@@ -239,6 +244,21 @@ pub const LV2_UI_SHOW_INTERFACE_URI: &str = "http://lv2plug.in/ns/extensions/ui#
 /// `instance-access`: the live plugin handle, which a UI that *is* the plugin's
 /// own window (Yoshimi's FLTK one) requires to show anything at all.
 pub const LV2_INSTANCE_ACCESS_URI: &str = "http://lv2plug.in/ns/ext/instance-access";
+
+/// `ui:resize`: the host callback a UI calls to size its embedding window.
+/// brummer10's UIs (Neural Amp Modeler) read this feature's data into an
+/// uninitialised field and call through it unconditionally — omit the feature
+/// and the UI segfaults on garbage instead of skipping the call — so choz
+/// always supplies it.
+pub const LV2_UI_RESIZE_URI: &str = "http://lv2plug.in/ns/extensions/ui#resize";
+
+#[repr(C)]
+pub struct LV2UI_Resize {
+    pub handle: *mut c_void,
+    /// `ui_resize(handle, width, height)` — returns 0 on success.
+    pub ui_resize:
+        Option<unsafe extern "C" fn(handle: *mut c_void, width: i32, height: i32) -> i32>,
+}
 
 /// The symbol every UI binary exports: `const LV2UI_Descriptor* lv2ui_descriptor(uint32_t)`.
 pub const LV2UI_DESCRIPTOR_SYM: &[u8] = b"lv2ui_descriptor";

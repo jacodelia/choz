@@ -39,6 +39,16 @@ pub struct ControlsCell {
     pub len: usize,
 }
 
+/// Atom messages (`patch:Set`, …) the UI wrote through `atom:eventTransfer`,
+/// waiting to be folded into the plugin's control atom-input sequence on the
+/// audio thread. Each entry is one complete atom (`{header}{body}`). Bounded:
+/// the producer drops when it is full, since these come from user clicks.
+pub type PatchQueue = Arc<Mutex<Vec<Vec<u8>>>>;
+
+/// Cap on [`PatchQueue`] depth. A file-load is one message; a handful of
+/// queued ones is already more than a person can click.
+pub(crate) const MAX_PATCH_MSGS: usize = 32;
+
 // SAFETY: the pointer is only dereferenced under the mutex. Writing an f32 that
 // the audio thread reads is the same racy-but-benign store every LV2 host does
 // for control ports — the port protocol is "latest value wins".
@@ -67,6 +77,8 @@ struct UiFeatures {
     /// Sample rate, in a box the options array points at.
     _sample_rate: Box<f32>,
     _options: Vec<LV2_Options_Option>,
+    /// `ui:resize` callback struct, in a box the feature array points at.
+    _resize: Box<LV2UI_Resize>,
     _feats: Vec<LV2_Feature>,
     ptrs: Vec<*const LV2_Feature>,
 }
@@ -76,6 +88,16 @@ pub struct Lv2Editor {
     plugin_uri: CString,
     bundle_path: CString,
     controls: SharedControls,
+    /// Atom writes from the UI (`patch:Set` for a file parameter), drained on
+    /// the audio thread into the plugin's control atom-input port.
+    patch: PatchQueue,
+    /// `atom:eventTransfer` in the instance's URID map — the `format` value the
+    /// UI passes to `write_control` for an atom rather than a float.
+    event_transfer_urid: u32,
+    /// The instance's URID store, so the map handed to the UI stays alive as
+    /// long as a window can call in. Shared with the DSP side on purpose: the
+    /// URIDs inside a `patch:Set` have to mean the same thing to both.
+    _urids: Arc<Mutex<crate::UridStore>>,
     /// The last control port the UI wrote, and the value it wrote — the plain
     /// one, in the port's own units. Read by MIDI learn and by the UI keeping
     /// its knobs in step with the plugin's window.
@@ -91,6 +113,9 @@ pub struct Lv2Editor {
     /// `None` while closed. The mutex serialises open/idle/close, all of which
     /// arrive on the editor thread, and makes a double `close()` harmless.
     ui: Mutex<Option<UiInstance>>,
+    /// Size the UI last asked for through `ui:resize`, packed `(w << 32) | h`;
+    /// 0 until it asks. Cleared before each `instantiate`, read back by `open`.
+    resize: std::sync::atomic::AtomicU64,
     /// Kept mapped for the process's life, like the DSP libraries: a UI can
     /// leave threads or atexit handlers behind, and unmapping under them
     /// crashes inside the loader.
@@ -112,11 +137,14 @@ impl Lv2Editor {
     /// Load the UI binary and get it ready to open. `None` if the library or
     /// its descriptor is not usable — the caller then reports no editor at all,
     /// so the button never offers a window that cannot appear.
-    pub fn load(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load(
         info: &Lv2UiInfo,
         plugin_uri: &str,
         bundle_dir: &std::path::Path,
         controls: SharedControls,
+        patch: PatchQueue,
+        urids: Arc<Mutex<crate::UridStore>>,
         sample_rate: u32,
         instance: LV2_Handle,
     ) -> Option<Arc<Self>> {
@@ -124,6 +152,7 @@ impl Lv2Editor {
         crate::keep_loaded(&lib);
         // Check the descriptor exists now rather than on the click.
         descriptor_for(&lib, &info.uri)?;
+        let event_transfer_urid = urids.lock().intern(LV2_ATOM_EVENT_TRANSFER_URI);
 
         // LV2 wants the bundle path with its trailing slash.
         let mut bundle = bundle_dir.to_string_lossy().into_owned();
@@ -135,11 +164,15 @@ impl Lv2Editor {
             plugin_uri: CString::new(plugin_uri).ok()?,
             bundle_path: CString::new(bundle).ok()?,
             controls,
+            patch,
+            event_transfer_urid,
+            _urids: urids,
             touched: Arc::default(),
             sample_rate,
             instance: instance as usize,
             open: std::sync::atomic::AtomicBool::new(false),
             ui: Mutex::new(None),
+            resize: std::sync::atomic::AtomicU64::new(0),
             _lib: lib,
         }))
     }
@@ -173,8 +206,11 @@ fn descriptor_for(lib: &Library, uri: &str) -> Option<*const LV2UI_Descriptor> {
 /// What the UI calls to move a control. The controller is the `Lv2Editor`, so
 /// the write lands in the same array the audio thread reads.
 ///
-/// Only the default (float) port protocol is handled: `format == 0`. Anything
-/// else is an atom-based protocol for a port choz does not expose as a knob.
+/// `format == 0` is the plain float protocol — one control port value.
+/// `format == atom:eventTransfer` is a whole atom (a `patch:Set` for a file
+/// parameter, e.g. the Neural Amp Modeler's model): it is queued verbatim for
+/// the audio thread to fold into the plugin's control atom-input port. Any
+/// other protocol is one choz does not speak; it is dropped.
 unsafe extern "C" fn write_control(
     controller: LV2UI_Controller,
     port_index: u32,
@@ -182,12 +218,30 @@ unsafe extern "C" fn write_control(
     format: u32,
     buffer: *const c_void,
 ) {
-    if controller.is_null() || buffer.is_null() || format != 0 || buffer_size as usize != 4 {
+    if controller.is_null() || buffer.is_null() {
         return;
     }
     // SAFETY: the controller is the &Lv2Editor passed to `instantiate`, which
     // outlives the UI instance (it owns it).
     let editor = unsafe { &*(controller as *const Lv2Editor) };
+
+    if format == editor.event_transfer_urid && format != 0 {
+        // The buffer is a complete atom: `{ LV2_Atom header }{ body }`.
+        if (buffer_size as usize) < std::mem::size_of::<LV2_Atom>() {
+            return;
+        }
+        let bytes =
+            unsafe { std::slice::from_raw_parts(buffer as *const u8, buffer_size as usize) };
+        let mut q = editor.patch.lock();
+        if q.len() < MAX_PATCH_MSGS {
+            q.push(bytes.to_vec());
+        }
+        return;
+    }
+
+    if format != 0 || buffer_size as usize != 4 {
+        return;
+    }
     let value = unsafe { std::ptr::read_unaligned(buffer as *const f32) };
     if !value.is_finite() {
         return;
@@ -201,8 +255,53 @@ unsafe extern "C" fn write_control(
     }
 }
 
+/// `ui:resize` — the UI asking its embedding window to change size. choz's
+/// window lives on the editor thread, so this just records the request for
+/// `open()` to hand back; brummer10's UIs call it once from inside
+/// `instantiate`, and calling *anything* valid here is what stops the crash.
+unsafe extern "C" fn ui_resize(handle: *mut c_void, width: i32, height: i32) -> i32 {
+    let Some(packed) = pack_size(width, height) else {
+        return 1;
+    };
+    if handle.is_null() {
+        return 1;
+    }
+    // SAFETY: the handle is the &Lv2Editor set as this feature's data, which
+    // owns the UI instance and so outlives the call.
+    let editor = unsafe { &*(handle as *const Lv2Editor) };
+    editor
+        .resize
+        .store(packed, std::sync::atomic::Ordering::Relaxed);
+    0
+}
+
+/// A `ui:resize` request as one `u64`, or `None` for a size choz can't use (a
+/// non-positive dimension, or one past what its window sizing takes as `u16`).
+fn pack_size(width: i32, height: i32) -> Option<u64> {
+    let w = u16::try_from(width).ok()?;
+    let h = u16::try_from(height).ok()?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some(((w as u64) << 32) | h as u64)
+}
+
+/// Inverse of [`pack_size`]; `0` (never a valid packed size) means "unset".
+fn unpack_size(packed: u64) -> Option<(u16, u16)> {
+    match packed {
+        0 => None,
+        p => Some(((p >> 32) as u16, p as u16)),
+    }
+}
+
 impl UiFeatures {
-    fn new(parent: u64, map: &LV2_URID_Map, sample_rate: u32, instance: usize) -> Box<Self> {
+    fn new(
+        parent: u64,
+        map: &LV2_URID_Map,
+        sample_rate: u32,
+        instance: usize,
+        controller: *mut c_void,
+    ) -> Box<Self> {
         let uris: Vec<CString> = [
             LV2_UI_PARENT_URI,
             LV2_URID_MAP_URI,
@@ -210,6 +309,7 @@ impl UiFeatures {
             LV2_OPTIONS_URI,
             LV2_UI_SHOW_INTERFACE_URI,
             LV2_INSTANCE_ACCESS_URI,
+            LV2_UI_RESIZE_URI,
         ]
         .iter()
         .map(|u| CString::new(*u).expect("static URI"))
@@ -230,6 +330,10 @@ impl UiFeatures {
         let rate_key = intern(LV2_PARAM_SAMPLE_RATE_URI);
         let float_urid = intern(LV2_ATOM_FLOAT_URI);
         let sample_rate = Box::new(sample_rate as f32);
+        let resize = Box::new(LV2UI_Resize {
+            handle: controller,
+            ui_resize: Some(ui_resize),
+        });
 
         let options = vec![
             LV2_Options_Option {
@@ -256,6 +360,7 @@ impl UiFeatures {
             _map: map,
             _sample_rate: sample_rate,
             _options: options,
+            _resize: resize,
             _feats: Vec::new(),
             ptrs: Vec::new(),
         });
@@ -289,6 +394,10 @@ impl UiFeatures {
                 uri: me._uris[5].as_ptr(),
                 data: instance as *mut c_void,
             },
+            LV2_Feature {
+                uri: me._uris[6].as_ptr(),
+                data: &*me._resize as *const LV2UI_Resize as *mut c_void,
+            },
         ];
         me.ptrs = me._feats.iter().map(|f| f as *const LV2_Feature).collect();
         me.ptrs.push(std::ptr::null());
@@ -305,11 +414,18 @@ impl PluginEditor for Lv2Editor {
         let descriptor = descriptor_for(&self._lib, &self.info.uri)?;
         let instantiate = unsafe { (*descriptor).instantiate }?;
 
-        let map = crate::shared_urid_map();
+        let map = crate::instance_urid_map(&self._urids);
         // A UI that owns its window has nothing to embed into; handing it a
         // parent is how one ends up drawing into a window nobody mapped.
         let parent = if self.info.owns_window { 0 } else { parent };
-        let features = UiFeatures::new(parent, &map, self.sample_rate, self.instance);
+        let features = UiFeatures::new(
+            parent,
+            &map,
+            self.sample_rate,
+            self.instance,
+            self as *const Lv2Editor as *mut c_void,
+        );
+        self.resize.store(0, std::sync::atomic::Ordering::Relaxed);
         let mut widget: LV2UI_Widget = std::ptr::null_mut();
 
         // SAFETY: every pointer is owned by `features`/`self` and outlives the
@@ -366,10 +482,11 @@ impl PluginEditor for Lv2Editor {
             show,
             _features: features,
         });
-        // An X11UI parents itself into the window we gave it and reports no size
-        // of its own; the editor thread keeps its default and the plugin resizes
-        // through the window manager if it wants to.
-        None
+        // An X11UI parents itself into the window we gave it; a UI that wants a
+        // particular size asks for it through `ui:resize` during `instantiate`
+        // (brummer10's do), and that request is what we hand back so the editor
+        // thread can size its window to match.
+        unpack_size(self.resize.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     fn idle(&self) {
@@ -414,5 +531,24 @@ impl PluginEditor for Lv2Editor {
                 cleanup(ui.handle);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pack_size, unpack_size};
+
+    #[test]
+    fn resize_round_trips_and_rejects_junk() {
+        // 0 is the "no request yet" sentinel `open()` reads back.
+        assert_eq!(unpack_size(0), None);
+        // A real request survives the pack into the atomic and back.
+        let packed = pack_size(1024, 640).expect("valid size");
+        assert_ne!(packed, 0);
+        assert_eq!(unpack_size(packed), Some((1024, 640)));
+        // Sizes choz's `u16` window sizing can't take are refused, not wrapped.
+        assert_eq!(pack_size(0, 480), None);
+        assert_eq!(pack_size(800, -1), None);
+        assert_eq!(pack_size(70_000, 480), None);
     }
 }

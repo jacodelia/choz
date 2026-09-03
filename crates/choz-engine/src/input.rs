@@ -11,6 +11,15 @@ pub enum InputSource {
     Midi(usize),
     /// The OSC listener.
     Osc,
+    /// choz's own JACK MIDI input port, `choz:midi_in`.
+    ///
+    /// The graph's MIDI, not ALSA's: a DAW on the same JACK/PipeWire graph
+    /// publishes its ports to JACK, and they never appear as ALSA sequencer
+    /// clients — so the hardware inputs cannot see them at all. One port on the
+    /// client choz already has is the whole of it: patch a DAW's track output
+    /// into it and it plays a rack tab, patch its *MIDI Clock out* and choz
+    /// follows the session.
+    Jack,
     /// The computer keyboard (QWERTY piano). Always plays the active rack tab.
     Keyboard,
 }

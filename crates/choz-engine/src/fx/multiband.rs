@@ -50,7 +50,11 @@ impl Band {
     #[inline]
     fn gain(&mut self, ch: usize, x: f32) -> f32 {
         let level = x.abs();
-        let coeff = if level > self.env[ch] { self.atk } else { self.rel };
+        let coeff = if level > self.env[ch] {
+            self.atk
+        } else {
+            self.rel
+        };
         self.env[ch] = level + coeff * (self.env[ch] - level);
         let db = 20.0 * self.env[ch].max(1e-9).log10();
         let over = db - self.threshold_db;
@@ -139,11 +143,7 @@ impl MultibandCompressor {
             low_hz: 200.0,
             high_hz: 3000.0,
             bands: [Band::new(-24.0), Band::new(-18.0), Band::new(-18.0)],
-            split: [
-                vec![0.0; SCRATCH],
-                vec![0.0; SCRATCH],
-                vec![0.0; SCRATCH],
-            ],
+            split: [vec![0.0; SCRATCH], vec![0.0; SCRATCH], vec![0.0; SCRATCH]],
             attack_ms: 10.0,
             release_ms: 120.0,
             wet: 1.0,
@@ -179,7 +179,13 @@ impl FxProcessor for MultibandCompressor {
         let ratio = |i: usize| (self.bands[i].ratio - 1.0) / 19.0;
         vec![
             FxParam::new("LoXover", (self.low_hz - 50.0) / 450.0, 50.0, 500.0, "Hz"),
-            FxParam::new("HiXover", (self.high_hz - 1000.0) / 9000.0, 1000.0, 10000.0, "Hz"),
+            FxParam::new(
+                "HiXover",
+                (self.high_hz - 1000.0) / 9000.0,
+                1000.0,
+                10000.0,
+                "Hz",
+            ),
             FxParam::new("Lo Thr", thr(0), -60.0, 0.0, "dB"),
             FxParam::new("Lo Ratio", ratio(0), 1.0, 20.0, ":1"),
             FxParam::new("Mid Thr", thr(1), -60.0, 0.0, "dB"),
@@ -187,7 +193,13 @@ impl FxProcessor for MultibandCompressor {
             FxParam::new("Hi Thr", thr(2), -60.0, 0.0, "dB"),
             FxParam::new("Hi Ratio", ratio(2), 1.0, 20.0, ":1"),
             FxParam::new("Attack", (self.attack_ms - 0.5) / 99.5, 0.5, 100.0, "ms"),
-            FxParam::new("Release", (self.release_ms - 20.0) / 980.0, 20.0, 1000.0, "ms"),
+            FxParam::new(
+                "Release",
+                (self.release_ms - 20.0) / 980.0,
+                20.0,
+                1000.0,
+                "ms",
+            ),
             FxParam::new("Makeup", self.bands[0].makeup_db / 24.0, 0.0, 24.0, "dB"),
             FxParam::new("Wet", self.wet, 0.0, 1.0, ""),
         ]

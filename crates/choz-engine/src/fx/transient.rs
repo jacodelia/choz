@@ -164,7 +164,9 @@ mod tests {
     }
 
     fn peak(buf: &[f32], from: usize, to: usize) -> f32 {
-        buf[from * 2..to * 2].iter().fold(0.0f32, |m, s| m.max(s.abs()))
+        buf[from * 2..to * 2]
+            .iter()
+            .fold(0.0f32, |m, s| m.max(s.abs()))
     }
 
     #[test]

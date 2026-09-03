@@ -106,21 +106,21 @@ pub use vocoder::Vocoder;
 pub use expander::Expander;
 pub use pan::Pan;
 // Creative time/texture
-pub use pedal::{AmberFang, VelvetFuzz};
-pub use protocosmos::Protocosmos;
-pub use reverse::ReverseDelay;
 pub use deesser::DeEsser;
 pub use exciter::{BassEnhancer, Exciter};
 pub use ladder::MoogLadder;
 pub use multiband::MultibandCompressor;
 pub use multitap::MultiTapDelay;
-pub use transient::TransientShaper;
+pub use pedal::{AmberFang, VelvetFuzz};
 pub use pitch_shift::PitchShifter;
 pub use plate::PlateReverb;
-pub use vibrato::Vibrato;
+pub use protocosmos::Protocosmos;
+pub use reverse::ReverseDelay;
 pub use shift::VoiceShifter;
 pub use shimmer::ShimmerReverb;
 pub use space_echo::SpaceEcho;
+pub use transient::TransientShaper;
+pub use vibrato::Vibrato;
 pub use z5_texture::{Z5Meter, Z5Texture, Z5_WAVE_BINS};
 
 // The FX processor trait and param descriptor live in `choz-ports`; re-exported

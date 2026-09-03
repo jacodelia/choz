@@ -214,6 +214,26 @@ pub struct AudioSettings {
     /// that is off because the file predates it is a guard nobody has.
     #[serde(default = "default_true")]
     pub feedback_guard: bool,
+    /// How many rack tabs get a **direct out**: a pair of JACK output ports
+    /// choz registers past the ones wired to the sink and deliberately leaves
+    /// unconnected.
+    ///
+    /// A tab sent to its direct out is off the master mix — the main fader only
+    /// ever touches the first pair — and comes out of ports another
+    /// application patches into, which is how a single tab reaches Ardour to be
+    /// recorded or processed on its own.
+    ///
+    /// **One pair per tab, at a fixed place.** Tab 1 owns the first pair, tab 2
+    /// the second, and so on for as many tabs as this allows. They do not move:
+    /// a layout that shifted when a tab changed shape would break the patch in
+    /// Ardour that the whole feature exists for. Native JACK only — a cpal
+    /// device has no spare ports to offer.
+    #[serde(default = "default_direct_tabs")]
+    pub direct_tabs: usize,
+}
+
+fn default_direct_tabs() -> usize {
+    choz_engine::DEFAULT_DIRECT_PAIRS
 }
 
 fn default_true() -> bool {
@@ -248,6 +268,7 @@ impl Default for AudioSettings {
             bpm: default_bpm(),
             time_sig: default_time_sig(),
             feedback_guard: true,
+            direct_tabs: default_direct_tabs(),
         }
     }
 }

@@ -42,10 +42,26 @@ impl MultiTapDelay {
             // Opens as a pattern rather than as four heads in the same place:
             // four taps all at `Time` is one tap four times as loud.
             taps: [
-                Tap { frac: 0.25, level: 0.8, pan: -0.7 },
-                Tap { frac: 0.50, level: 0.6, pan: 0.7 },
-                Tap { frac: 0.75, level: 0.45, pan: -0.4 },
-                Tap { frac: 1.00, level: 0.35, pan: 0.4 },
+                Tap {
+                    frac: 0.25,
+                    level: 0.8,
+                    pan: -0.7,
+                },
+                Tap {
+                    frac: 0.50,
+                    level: 0.6,
+                    pan: 0.7,
+                },
+                Tap {
+                    frac: 0.75,
+                    level: 0.45,
+                    pan: -0.4,
+                },
+                Tap {
+                    frac: 1.00,
+                    level: 0.35,
+                    pan: 0.4,
+                },
             ],
             time_ms: 500.0,
             feedback: 0.25,
@@ -167,9 +183,7 @@ impl FxProcessor for MultiTapDelay {
                 }
             }
             for ch in 0..2 {
-                self.line[ch].write(super::delay_line::safe(
-                    dry[ch] + last[ch] * self.feedback,
-                ));
+                self.line[ch].write(super::delay_line::safe(dry[ch] + last[ch] * self.feedback));
                 frame[ch] = dry[ch] + self.wet * (wet[ch] - dry[ch]);
             }
         }

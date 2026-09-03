@@ -418,8 +418,29 @@ pub struct AudioEngine {
     /// a host that grabs the microphone on start-up is a host nobody asked.
     wants_input: bool,
     /// Device output channels the running backend gives us. 2 on cpal; the
-    /// interface's real count on the native JACK client.
+    /// interface's real count on the native JACK client, **plus** the direct
+    /// outs below — every channel a tab can be routed to.
     out_channels: usize,
+    /// How many of those are the sink's own, and so the first channel index a
+    /// direct out lives at. Everything from here up is a port choz registers
+    /// and deliberately leaves unwired, for another application to take.
+    sink_channels: usize,
+    /// The two ends of choz's own JACK MIDI ports: what the process callback
+    /// read off `choz:midi_in`, and what it should send from `choz:midi_out`.
+    /// `None` on every backend that is not the native client, which is the same
+    /// thing as "there are no such ports".
+    #[allow(clippy::type_complexity)]
+    jack_midi: Option<(
+        rtrb::Consumer<crate::input::InputEvent>,
+        rtrb::Producer<[u8; 3]>,
+    )>,
+    /// Stereo pairs of unwired output ports to register past the sink's own.
+    ///
+    /// A tab routed to one leaves the master mix entirely — the main fader only
+    /// ever touches channels 1 and 2 — and comes out of a JACK port with
+    /// nothing on the other end, which is what a DAW patches into to record or
+    /// process that tab on its own. Zero registers none.
+    direct_pairs: usize,
     /// How many of our output ports actually reached a sink. Zero means choz
     /// is computing a mix that goes nowhere — silence that looks exactly like
     /// a broken effect, so the interface says it out loud.
@@ -461,6 +482,16 @@ struct RtEndpoints {
 /// ponytail: flat and fixed-size, because both are what makes it allocation-free
 /// on the audio thread; a bus that feeds another bus is a different feature.
 pub const BUSES: usize = 4;
+
+/// How many tabs get a direct out when nothing says otherwise — one pair each.
+/// Four covers a rack sent to a DAW track by track without asking anybody to
+/// think about it, and eight idle JACK ports cost nothing in a graph that
+/// already has hundreds.
+pub const DEFAULT_DIRECT_PAIRS: usize = 4;
+
+/// Ceiling on them. The client's port count is capped at 32 either way; this
+/// keeps the sink's own channels from being crowded out by a silly number.
+pub const MAX_DIRECT_PAIRS: usize = 8;
 
 /// Where a tab's (or the click's) audio goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -716,7 +747,10 @@ impl AudioEngine {
             input_device: None,
             wants_input: false,
             force_quantum: 0,
+            jack_midi: None,
             out_channels: 2,
+            sink_channels: 2,
+            direct_pairs: DEFAULT_DIRECT_PAIRS,
             out_wired: 0,
             in_channels: 0,
             input_ports: Vec::new(),
@@ -785,7 +819,10 @@ impl AudioEngine {
         self._stream = Some(BackendHandle::Cpal(stream));
         self._input_stream = in_stream;
         self.backend = backend;
+        // cpal has no MIDI of any kind, so the ports go with the client.
+        self.jack_midi = None;
         self.out_channels = 2;
+        self.sink_channels = 2;
         self.in_channels = ins;
         self.input_ports = self.cpal_input_labels(ins);
         self.output_device = match (backend, wanted) {
@@ -845,18 +882,32 @@ impl AudioEngine {
         let _ = sink_ins;
         let capture = crate::jack_backend::all_capture_ports();
         let ins = capture.len();
+        // The sink's own channels, and the direct outs past them. `connect`
+        // zips our ports against the sink's, so the extras are left unwired
+        // without it having to know they exist.
+        let sink_outs = outs.max(2);
+        let outs = self.ports_for(sink_outs);
 
         let ep = self
             .rt_endpoints
             .take()
             .context("audio engine already started")?;
-        let state = self.new_rt_state(ep, outs.max(2), ins, None);
+        let state = self.new_rt_state(ep, outs, ins, None);
 
-        match crate::jack_backend::start(sink.as_deref(), &capture, outs.max(2), state) {
-            Ok((handle, channels, wired)) => {
+        match crate::jack_backend::start(sink.as_deref(), &capture, outs, state) {
+            Ok(started) => {
+                let crate::jack_backend::Started {
+                    handle,
+                    channels,
+                    wiring: wired,
+                    midi_rx,
+                    midi_tx,
+                } = started;
                 self._stream = Some(BackendHandle::Jack(Box::new(handle)));
                 self.backend = AudioBackend::Jack;
+                self.jack_midi = Some((midi_rx, midi_tx));
                 self.out_channels = channels;
+                self.sink_channels = sink_outs.min(channels);
                 self.in_channels = ins;
                 self.input_ports = capture;
                 // A fresh client is wired the way `start` left it, whatever was
@@ -889,7 +940,8 @@ impl AudioEngine {
     /// Rebuild the native client on `sink` with `outs`/`ins` ports. Every slot
     /// is lost (they live in the old client's RT state), which is why the
     /// caller is told to reload the rack.
-    fn restart_jack_native(&mut self, sink: Option<&str>, outs: usize) -> Result<()> {
+    fn restart_jack_native(&mut self, sink: Option<&str>, sink_outs: usize) -> Result<()> {
+        let outs = self.ports_for(sink_outs);
         // The graph is re-read here rather than passed in: a card that came or
         // went since the last client is exactly what a restart is for.
         let capture = crate::jack_backend::all_capture_ports();
@@ -903,7 +955,13 @@ impl AudioEngine {
         // the graph would rename the second one. If the new client then fails
         // to open there is no audio until the next attempt — the error says so.
         self._stream = None;
-        let (handle, channels, wired) = crate::jack_backend::start(sink, &capture, outs, state)
+        let crate::jack_backend::Started {
+            handle,
+            channels,
+            wiring: wired,
+            midi_rx,
+            midi_tx,
+        } = crate::jack_backend::start(sink, &capture, outs, state)
             .context("cannot reopen the JACK client")?;
 
         self.cmd_tx = cmd_tx;
@@ -924,7 +982,9 @@ impl AudioEngine {
         self.fx_loopers.clear();
         self.fx_latency.clear();
         self._stream = Some(BackendHandle::Jack(Box::new(handle)));
+        self.jack_midi = Some((midi_rx, midi_tx));
         self.out_channels = channels;
+        self.sink_channels = sink_outs.min(channels);
         self.in_channels = ins;
         self.input_ports = capture;
         self.out_wired = wired.as_ref().map(|(_, n)| *n).unwrap_or(0);
@@ -1103,7 +1163,7 @@ impl AudioEngine {
         // `output_device` stays empty until someone picks one. Reconnect to
         // whatever we are wired to now.
         let sink = self.output_device.clone().or_else(jack_current_sink);
-        self.restart_jack_native(sink.as_deref(), self.out_channels)
+        self.restart_jack_native(sink.as_deref(), self.sink_channels)
             .map(|()| true)
     }
 
@@ -1123,7 +1183,7 @@ impl AudioEngine {
                 let outs = outs.max(2);
                 // Inputs do not depend on the sink any more — they are the
                 // whole graph's — so only the output count can force a rebuild.
-                if outs == self.out_channels {
+                if outs == self.sink_channels {
                     jack_route_to(name, crate::jack_backend::CLIENT_NAME)?;
                     self.output_device = Some(name.to_string());
                     return Ok(false);
@@ -1184,7 +1244,11 @@ impl AudioEngine {
         // Drops the previous streams (and its slots).
         self._stream = Some(BackendHandle::Cpal(stream));
         self._input_stream = in_stream;
+        self.jack_midi = None;
+        // cpal opens a device, not a graph: there are no spare ports to hand
+        // anybody, so the direct outs simply do not exist on this backend.
         self.out_channels = 2;
+        self.sink_channels = 2;
         self.in_channels = ins;
         self.input_ports = self.cpal_input_labels(ins);
         self.cmd_tx = cmd_tx;
@@ -1666,10 +1730,53 @@ impl AudioEngine {
         self.send(EngineCommand::SetSlotFx { slot, fx });
     }
 
-    /// Device output channels the running backend exposes. 2 on cpal; the
-    /// interface's real count under the native JACK client.
+    /// Every output channel a tab can be routed to: the sink's own plus the
+    /// direct outs. 2 on cpal, which has neither.
     pub fn output_channels(&self) -> usize {
         self.out_channels
+    }
+
+    /// First channel index that is a **direct out** — a registered port left
+    /// unwired for another application to take. Equal to
+    /// [`Self::output_channels`] when there are none, so `base..channels` is
+    /// the direct range whether or not any exist.
+    pub fn direct_base(&self) -> usize {
+        self.sink_channels.min(self.out_channels)
+    }
+
+    /// The next event read off `choz:midi_in`, or `None` when the graph has
+    /// sent nothing since the last call. Drained by the UI loop into the same
+    /// stream the ALSA ports feed, so both reach the rack by one path.
+    pub fn poll_jack_midi(&mut self) -> Option<crate::input::InputEvent> {
+        self.jack_midi.as_mut()?.0.pop().ok()
+    }
+
+    /// Queue one message for `choz:midi_out`. `false` when there is no port to
+    /// send it from, or when the ring is full — which is the graph not running,
+    /// not a message worth waiting on the audio thread for.
+    pub fn send_jack_midi(&mut self, bytes: [u8; 3]) -> bool {
+        self.jack_midi
+            .as_mut()
+            .is_some_and(|(_, tx)| tx.push(bytes).is_ok())
+    }
+
+    /// Whether choz's own MIDI ports exist at all — the native JACK client is
+    /// the only backend that has them, so this is what the CLOCK, IN and MIDI
+    /// OUT pickers ask before offering them.
+    pub fn has_jack_midi(&self) -> bool {
+        self.jack_midi.is_some()
+    }
+
+    /// How many direct-out pairs to register on the next client. Applied when
+    /// the stream is (re)opened, so it is set before `start`.
+    pub fn set_direct_pairs(&mut self, pairs: usize) {
+        self.direct_pairs = pairs.min(MAX_DIRECT_PAIRS);
+    }
+
+    /// Total output ports for a sink of `outs` channels: its own, and the
+    /// direct pairs past them.
+    fn ports_for(&self, outs: usize) -> usize {
+        outs + self.direct_pairs * 2
     }
 
     /// Device input channels available as slot sources (native JACK only).

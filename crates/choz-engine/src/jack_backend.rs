@@ -7,23 +7,59 @@
 //! second pass, but the backend already carries their audio into the slots.
 
 use anyhow::{Context, Result};
-use jack::{AsyncClient, AudioIn, AudioOut, Client, ClientOptions, Control, Port, ProcessScope};
+use jack::{
+    AsyncClient, AudioIn, AudioOut, Client, ClientOptions, Control, MidiIn, MidiOut, Port,
+    ProcessScope, RawMidi,
+};
 
 use crate::engine::RtState;
+use crate::input::{InputEvent, InputSource};
+use crate::midi::ClockCounter;
 
 /// JACK client name choz registers under. Also what shows up in Carla/qpwgraph.
 pub const CLIENT_NAME: &str = "choz";
+
+/// The MIDI input port on that client, as the graph publishes it.
+///
+/// Everything a DIN cable carries: notes, controllers, program changes, bend
+/// and the clock. Patch a DAW's MIDI output here and it plays a rack tab; patch
+/// its clock output here and choz follows the session. This is also the name
+/// the CLOCK and IN pickers save, so a project remembers "the graph" as
+/// precisely as it remembers a hardware port.
+pub const MIDI_IN_PORT: &str = "choz:midi_in";
+
+/// The MIDI output port on that client. A tab pointed at it plays a synth (or
+/// records into a DAW) that lives on the graph rather than on a cable —
+/// arpeggiator included, which is what the whole MIDI-out path exists for.
+pub const MIDI_OUT_PORT: &str = "choz:midi_out";
 
 /// Ceiling on ports we register per direction. Interfaces above this are still
 /// usable, just not to their last channels.
 /// ponytail: a constant, not a setting — nothing here has more than 32 jacks.
 pub(crate) const MAX_PORTS: usize = 32;
 
+/// Events the process callback hands the UI thread, and messages it takes back.
+/// Deep enough for a chord and a controller sweep inside one block; the rings
+/// exist to keep the callback lock-free, not to buffer.
+const MIDI_RING: usize = 256;
+
 /// The RT side: the shared engine state plus this client's ports.
 pub struct JackRt {
     state: RtState,
     out: Vec<Port<AudioOut>>,
     inp: Vec<Port<AudioIn>>,
+    /// The graph's MIDI in: another application's notes, controllers and clock.
+    midi_in: Port<MidiIn>,
+    /// The graph's MIDI out: what a tab pointed at `choz:midi_out` plays.
+    midi_out: Port<MidiOut>,
+    /// Counts the input port's pulses here, where the timestamps are the
+    /// graph's own frame numbers — the same reason the ALSA ports count theirs
+    /// inside their callback rather than in the UI loop.
+    counter: ClockCounter,
+    /// That port's last Bank Select MSB, which a program change travels with.
+    bank: u8,
+    midi_tx: rtrb::Producer<InputEvent>,
+    midi_rx: rtrb::Consumer<[u8; 3]>,
 }
 
 impl jack::ProcessHandler for JackRt {
@@ -49,8 +85,67 @@ impl jack::ProcessHandler for JackRt {
                 None => buf[..n].fill(0.0),
             }
         }
+        self.read_midi(ps);
+        self.write_midi(ps);
         crate::engine::publish_load(started, cpu_started, frames, self.state.sample_rate);
         Control::Continue
+    }
+}
+
+impl JackRt {
+    /// Turn this block's MIDI input into events for the UI thread.
+    ///
+    /// The clock is counted here and everything else goes through
+    /// [`crate::midi::event_of`], the same translation the ALSA ports use — so
+    /// a note from a DAW on the graph and a note from a keyboard on a cable
+    /// arrive as the same event and route by the same rules.
+    ///
+    /// The stamp is the event's own position in the graph's timeline —
+    /// `last_frame_time` plus its offset inside the block — converted to
+    /// microseconds, the unit [`ClockCounter`] measures a tempo in. Taking the
+    /// block's start for every event instead would quantise the pulses to the
+    /// buffer and read as tempo jitter of the buffer's length.
+    fn read_midi(&mut self, ps: &ProcessScope) {
+        let sr = self.state.sample_rate.max(1) as u64;
+        let base = ps.last_frame_time() as u64;
+        for ev in self.midi_in.iter(ps) {
+            let frame = base + ev.time as u64;
+            let stamp = frame.saturating_mul(1_000_000) / sr;
+            // Dropped rather than blocked: a full ring means nothing is
+            // draining it, and an audio callback waiting on the UI thread is a
+            // dropout.
+            if let Some(msg) = self.counter.feed(ev.bytes, stamp) {
+                let _ = self.midi_tx.push(InputEvent::Clock(InputSource::Jack, msg));
+                continue;
+            }
+            if let Some(event) = crate::midi::event_of(ev.bytes, InputSource::Jack, &mut self.bank)
+            {
+                let _ = self.midi_tx.push(event);
+            }
+        }
+    }
+
+    /// Send whatever the UI queued for the graph, all at the top of the block.
+    ///
+    /// Frame 0 rather than a computed offset: choz's MIDI out is played live —
+    /// a key, an arpeggiator step — and by the time it is queued the moment it
+    /// belonged to has already gone past. Spreading it inside the block would
+    /// be inventing a timestamp, not preserving one.
+    fn write_midi(&mut self, ps: &ProcessScope) {
+        let mut writer = self.midi_out.writer(ps);
+        while let Ok(bytes) = self.midi_rx.pop() {
+            // A note-off that will not fit is a note left sounding, so a full
+            // buffer stops the drain and keeps the rest queued for next block.
+            if writer
+                .write(&RawMidi {
+                    time: 0,
+                    bytes: &bytes,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
     }
 }
 
@@ -212,6 +307,18 @@ pub fn set_capture_wiring(client: &Client, capture: &[String], wanted: u64) {
     }
 }
 
+/// What [`start`] hands back: the live client, how many output ports it got,
+/// where they were wired, and the two ends of choz's own MIDI ports.
+pub struct Started {
+    pub handle: Handle,
+    pub channels: usize,
+    pub wiring: Wiring,
+    /// Events read off `choz:midi_in` by the process callback.
+    pub midi_rx: rtrb::Consumer<InputEvent>,
+    /// Messages for `choz:midi_out`, written at the top of the next block.
+    pub midi_tx: rtrb::Producer<[u8; 3]>,
+}
+
 /// and start processing. Returns the live client, the number of output ports
 /// registered, and — when a sink was asked for — which one the audio actually
 /// ended up going to and how many of our ports reached it.
@@ -223,7 +330,7 @@ pub fn start(
     capture: &[String],
     outs: usize,
     state: RtState,
-) -> Result<(Handle, usize, Wiring)> {
+) -> Result<Started> {
     let ins = capture.len();
     let (client, _status) = Client::new(CLIENT_NAME, ClientOptions::NO_START_SERVER)
         .context("cannot reach the JACK graph (is PipeWire's JACK layer installed?)")?;
@@ -240,11 +347,38 @@ pub fn start(
         .collect::<Result<_, _>>()
         .context("cannot register JACK input ports")?;
 
+    // MIDI on the graph, both ways. This is the whole reason they exist: a DAW
+    // publishes its MIDI as JACK ports, which never appear as ALSA sequencer
+    // clients and so cannot be reached through the hardware inputs at all.
+    // Nothing is auto-connected to either: what talks to choz is a patch the
+    // user makes, not a guess choz makes for them.
+    let midi_in = client
+        .register_port("midi_in", MidiIn)
+        .context("cannot register the JACK MIDI input port")?;
+    let midi_out = client
+        .register_port("midi_out", MidiOut)
+        .context("cannot register the JACK MIDI output port")?;
+
     let our_outs: Vec<String> = out.iter().filter_map(|p| p.name().ok()).collect();
     let our_ins: Vec<String> = inp.iter().filter_map(|p| p.name().ok()).collect();
 
+    let (midi_tx, midi_rx) = rtrb::RingBuffer::new(MIDI_RING);
+    let (out_tx, out_rx) = rtrb::RingBuffer::new(MIDI_RING);
     let handle = client
-        .activate_async((), JackRt { state, out, inp })
+        .activate_async(
+            (),
+            JackRt {
+                state,
+                out,
+                inp,
+                midi_in,
+                midi_out,
+                counter: ClockCounter::default(),
+                bank: 0,
+                midi_tx,
+                midi_rx: out_rx,
+            },
+        )
         .map_err(|e| anyhow::anyhow!("cannot activate the JACK client: {e}"))?;
 
     // Wiring happens after activation: ports only exist in the graph once the
@@ -277,7 +411,13 @@ pub fn start(
             capture.len()
         );
     }
-    Ok((handle, outs, wired_to))
+    Ok(Started {
+        handle,
+        channels: outs,
+        wiring: wired_to,
+        midi_rx,
+        midi_tx: out_tx,
+    })
 }
 
 /// Wire our outputs to `sink`, channel for channel: `out_1` → the sink's first

@@ -120,6 +120,7 @@ fn source_label(source: InputSource, ports: &[String]) -> String {
             .map(|n| n.chars().take(14).collect())
             .unwrap_or_else(|| format!("port {i}")),
         InputSource::Osc => "OSC".to_string(),
+        InputSource::Jack => choz_engine::MIDI_IN_PORT.to_string(),
         InputSource::Keyboard => "keyboard".to_string(),
     }
 }
@@ -634,8 +635,9 @@ fn key_colour(mode: KeyColor, key: &KeyLit) -> Color {
             Some(InputSource::Midi(i)) => hue_of(i as u32 + 9),
             Some(InputSource::Osc) => hue_of(8),
             // choz's own: the QWERTY piano and what `A→M` heard. They came from
-            // no port, and saying so is the point of this mode.
-            Some(InputSource::Keyboard) | None => DIM,
+            // no port, and saying so is the point of this mode. The graph's
+            // clock port joins them — it carries no notes, so it lights no key.
+            Some(InputSource::Keyboard) | Some(InputSource::Jack) | None => DIM,
         },
         KeyColor::Velocity => {
             let (r, g, b) = theme::rgb_of(theme::text());
@@ -1366,6 +1368,10 @@ pub struct MixerStrip {
     /// itself in its own colour, so a strip says whether it is making any
     /// sound at all without a second column of meters beside it.
     pub level: f32,
+    /// One channel all the way through: a jack on one capture channel, and
+    /// nothing in the chain that could pull two sides apart. Drawn as one
+    /// fader, like a group — there is no left and right to set apart.
+    pub mono: bool,
     /// Where a tab sums — `OUT`, or the letter of a group. `None` on the
     /// group and main strips, which are where things sum *to*.
     pub dest: Option<&'static str>,
@@ -1526,7 +1532,12 @@ fn draw_strip(f: &mut Frame, area: Rect, tab: usize, st: &MixerStrip) -> Vec<Mix
         // A group is already a sum: one fader, the full width, and none of the
         // link machinery below. The **main** is not — it is a stereo output,
         // and it gets the same two faders a tab does.
-        if st.kind == StripKind::Bus {
+        //
+        // A **mono tab** takes the same shape, and for the same reason: a
+        // microphone on one jack has one channel, and drawing it as two was
+        // offering a left and a right of a signal that has neither. It gets a
+        // tab's own colour, because it is one.
+        if st.kind == StripKind::Bus || st.mono {
             // The same fader a tab's side gets, centred in the strip. Filling
             // the whole width made the groups read as a different, heavier kind
             // of control than the faders either side of them, which is exactly
@@ -1537,13 +1548,14 @@ fn draw_strip(f: &mut Frame, area: Rect, tab: usize, st: &MixerStrip) -> Vec<Mix
                 f,
                 bar,
                 st.gain,
-                match (st.mute, st.side.is_some()) {
-                    (true, _) => DIM,
-                    // Lit when the MIXER's keyboard is on this group, the same
+                match (st.mute, st.side.is_some(), st.kind) {
+                    (true, _, _) => DIM,
+                    // Lit when the MIXER's keyboard is on this strip, the same
                     // way a tab's fader lights: a cursor nobody can see is a
                     // cursor that cannot be moved on purpose.
-                    (false, true) => ACCENT,
-                    (false, false) => HEADER,
+                    (false, true, _) => ACCENT,
+                    (false, false, StripKind::Bus) => HEADER,
+                    (false, false, _) => colour,
                 },
                 st.level,
             );
@@ -2294,6 +2306,7 @@ mod tests {
             label: "X".to_string(),
             gain: 0.0,
             gain_r: 0.0,
+            mono: false,
             link: true,
             pan: 0.0,
             mute: false,
@@ -2347,6 +2360,7 @@ mod tests {
             label: "X".to_string(),
             gain: 1.0,
             gain_r: 1.0,
+            mono: false,
             link: true,
             pan,
             mute: false,
@@ -2425,6 +2439,7 @@ mod tests {
                     label: format!("Synth{i}"),
                     gain: 1.0,
                     gain_r: 1.0,
+                    mono: false,
                     link: true,
                     pan: 0.0,
                     mute: false,

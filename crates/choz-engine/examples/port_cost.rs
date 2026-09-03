@@ -30,7 +30,11 @@ fn cpu_of(pid: u32) -> Option<f64> {
 
 fn server_pid() -> Option<u32> {
     for name in ["pipewire", "jackd", "jackdbus"] {
-        let out = std::process::Command::new("pgrep").arg("-x").arg(name).output().ok()?;
+        let out = std::process::Command::new("pgrep")
+            .arg("-x")
+            .arg(name)
+            .output()
+            .ok()?;
         if let Some(first) = String::from_utf8_lossy(&out.stdout).lines().next() {
             if let Ok(pid) = first.trim().parse() {
                 return Some(pid);
@@ -55,22 +59,32 @@ fn main() -> anyhow::Result<()> {
         let client = match open {
             0 => None,
             n => {
-                let (c, _) = jack::Client::new("choz-port-cost", jack::ClientOptions::NO_START_SERVER)?;
+                let (c, _) =
+                    jack::Client::new("choz-port-cost", jack::ClientOptions::NO_START_SERVER)?;
                 let ins: Vec<jack::Port<jack::AudioIn>> = (0..n)
                     .map(|i| c.register_port(&format!("in_{}", i + 1), jack::AudioIn))
                     .collect::<Result<_, _>>()?;
                 let names: Vec<String> = ins.iter().filter_map(|p| p.name().ok()).collect();
                 // A client that does nothing per block: what is being measured
                 // is the graph moving buffers, not our DSP.
-                let active = c.activate_async((), jack::ClosureProcessHandler::new(
-                    move |_: &jack::Client, _: &jack::ProcessScope| jack::Control::Continue,
-                ))?;
+                let active = c.activate_async(
+                    (),
+                    jack::ClosureProcessHandler::new(
+                        move |_: &jack::Client, _: &jack::ProcessScope| jack::Control::Continue,
+                    ),
+                )?;
                 if wire {
-                    let sources = active
-                        .as_client()
-                        .ports(None, Some("32 bit float mono audio"), jack::PortFlags::IS_OUTPUT);
+                    let sources = active.as_client().ports(
+                        None,
+                        Some("32 bit float mono audio"),
+                        jack::PortFlags::IS_OUTPUT,
+                    );
                     let mut wired = 0;
-                    for (from, ours) in sources.iter().filter(|p| p.contains("capture")).zip(names.iter()) {
+                    for (from, ours) in sources
+                        .iter()
+                        .filter(|p| p.contains("capture"))
+                        .zip(names.iter())
+                    {
                         if active.as_client().connect_ports_by_name(from, ours).is_ok() {
                             wired += 1;
                         }

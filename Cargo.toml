@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/choz-ports", "crates/choz-engine", "crates/choz-plugin-clap", "crates/choz-plugin-lv2", "crates/choz-plugin-ladspa", "crates/choz-plugin-vst2", "crates/choz-plugin-vst3", "crates/choz-plugin-sandbox", "crates/choz-plugin-pd", "crates/choz-plugin-clap-export", "crates/choz-ui"]
 
 [workspace.package]
-version = "1.3.8"
+version = "1.3.9"
 edition = "2021"
 description = "A terminal-based audio plugin host — like Carla for the terminal"
 repository = "https://github.com/jacodelia/choz"

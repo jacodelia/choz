@@ -12,19 +12,191 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **866 tests** con harness en todo el workspace (766 entre `choz-engine` y `choz-ui`) + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **878 tests** con harness en todo el workspace (774 entre `choz-engine` y `choz-ui`) + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio.
 - **56 efectos propios**, publicados también como un `.clap` con los dos artifacts.
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
 - `cargo test --workspace` necesita `--no-fail-fast`: uno de los binarios con
   `harness = false` no reconoce los argumentos que cargo le pasa y aborta la
   corrida. Por crate (`-p choz-engine -p choz-ui`) va entero.
+- `cargo test -p choz-plugin-lv2 --test lv2_runtime` **se cuelga** en
+  `bundle_presets_are_listed_and_applied` en la máquina de desarrollo (spam de
+  `Sending key 'state' to UI failed, out of space`). Verificado contra `02a60bf`:
+  **es previo**, no lo trajo la 1.3.9. La suite de lib de ese crate (16 tests) va
+  entera; el resto del workspace se corre con `--exclude choz-plugin-lv2`.
 - **Un test que falla "a veces" es un global del proceso**, no un bug del código
   que prueba: el harness corre los tests de un crate en paralelo, y el
   transporte, los medidores y `capture_health` son singletons a propósito.
   `choz-engine::test_locks` tiene un candado por global; en `choz-ui` el par es
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
+
+## [1.3.9] — 2026-09-03
+
+### choz habla MIDI por el grafo, no sólo por ALSA
+
+Pedido como "audita si es posible tener MIDI Clock de otros programas como
+Ardour". La auditoría dijo que la **decodificación ya estaba entera**:
+`ClockCounter` cuenta los 0xF8 promediando sobre una negra, entiende
+START/CONTINUE/STOP, `ClockSource` elige entre interno, cualquiera y un puerto
+con nombre, y `apply_midi_clock` mueve el transporte. midir no filtra nada.
+
+El problema no era el código, era **el cable**. choz leía MIDI sólo por ALSA
+seq; Ardour corre sobre PipeWire y publica `ardour:MIDI Clock out` como puerto
+**JACK**. `aconnect -l` lo confirma: en ALSA seq no aparece ningún cliente JACK.
+choz no podía verlo, y a2jmidid tampoco lo resuelve —puentea ALSA→JACK, que es
+justo el sentido contrario al que hacía falta.
+
+El arreglo son **dos puertos en el cliente JACK que choz ya tenía**:
+
+- `choz:midi_in` lleva todo lo que lleva un cable DIN: notas, controladores,
+  program change, bend y el clock. Es una entrada más en el drawer IN, se
+  guarda en el proyecto como `JACK`, y una tab apuntada a ella se toca desde
+  una pista de Ardour.
+- `choz:midi_out` es un destino más en la sección MIDI OUT: el arpegiador
+  llegando a un sintetizador del grafo, o a la grabadora del DAW.
+
+Tres detalles que hacían falta para que no se sintiera pegado con cinta:
+
+- **El clock se cuenta dentro del callback de audio**, con el timestamp propio
+  del evento (`last_frame_time` + su offset en el bloque) pasado a
+  microsegundos. Tomar el arranque del bloque para todos cuantizaría los pulsos
+  al buffer y se leería como jitter de tempo del largo del buffer.
+- **Una sola traducción, dos puertos.** `midi::event_of` es ahora la única
+  función que convierte un mensaje crudo en el evento que se manda, y la usan
+  el callback de ALSA y el de JACK: una nota de un DAW y una nota de un teclado
+  se vuelven el mismo evento por las mismas reglas, y rutean igual. El callback
+  de ALSA pasó de cuarenta líneas de `match` a dos.
+- **Los rings no bloquean.** Lo que no entra se descarta: un ring lleno es que
+  nadie lo está drenando, y un callback de audio esperando al hilo de UI es un
+  dropout. La única excepción es la salida, donde un mensaje que no entra corta
+  el drenaje y queda encolado —un note-off perdido es una nota colgada.
+
+Verificado contra Ardour corriendo: `ardour:MIDI Clock out → choz:midi_in` y
+`choz:midi_out → ardour:MIDI Clock in` se enlazan, y `choz:midi_out` llega al
+hardware por el Midi-Bridge de PipeWire, que es lo que a2jmidid daba en ese
+sentido.
+
+### Una tab puede salir del master por un puerto propio
+
+Pedido como "un switch para apagar la mezcla a master y que una tab pueda salir
+a un canal directo de salida disponible, para procesar el audio en Ardour". El
+ruteo por tab ya existía —`out_pair` apunta a cualquier par de canales y el
+fader main sólo toca los dos primeros—, así que "fuera del master" ya era una
+posición del ruteo. Lo que faltaba era **a dónde salir**: con un sink estéreo,
+choz registraba exactamente dos puertos y no había ningún canal libre que darle
+a nadie.
+
+Ahora el cliente registra `canales_del_sink + 2 × direct_tabs` puertos y deja
+los de más **sin conectar**. `connect` ya hacía zip contra los puertos del sink,
+así que los extra se quedan solos sin que tenga que enterarse de que existen.
+
+**Un direct por tab, en un lugar fijo.** La tab 1 es siempre el primer par, la
+2 el segundo. El botón `O` de cada strip ofrece el suyo y ninguno más —listar
+el pool entero en cada strip hacía que dos tabs eligieran "DIRECT 1" y cayeran
+en los mismos dos puertos, que es el bug que esto cierra. El lugar no se mueve
+nunca: un layout que se corriera cuando el rack cambia de forma rompería el
+patch en Ardour que es la razón de ser de todo esto.
+
+**Y del ancho que la tab tenga.** Una tab mono —un jack de captura en un solo
+canal, y nada en la cadena que pueda separar los lados— rutea a un solo puerto:
+lo que un DAW quiere grabar de una guitarra es una pista, no dos idénticas. Se
+vuelve estéreo en cuanto algo de la cadena tiene motivo para que los lados
+difieran: la cola de un reverb, el spread de un chorus, un pan, un delay
+ping-pong, o cualquier plugin hosteado —nada acá puede saber qué hace un
+plugin, y ante una pregunta de ruteo la respuesta segura es la ancha. Un efecto
+en bypass no cuenta: no está en la cadena del motor. Se re-mide sola cuando la
+cadena o el jack cambian.
+
+El drawer OUT dice lo mismo: lista un par por tab que exista —el rack vacío no
+muestra ninguno, porque una fila para un par que nadie tiene es una ruta que
+nadie puede tomar— y una sola fila para una tab mono, con el número de la tab
+dueña en la etiqueta.
+
+### Una tab mono es un fader, no dos
+
+El MIXER seguía dibujando L, R y el link para toda tab. Un micrófono en un jack
+tiene un canal, y dibujarlo como dos ofrecía un lado izquierdo y uno derecho de
+una señal que no tiene ninguno —y dejaba separarlos, que es un balance sobre
+nada. Toma la misma forma que un grupo, que ya era un fader sin link, con el
+color de tab porque lo es. `set_gain_side` trata la tab mono como linkeada
+siempre, así un `GainR` que llegue de un click viejo o de un CC aprendido la
+mueve entera en vez de un lado que no existe.
+
+El H340 aparte: PipeWire publica ese headset con perfil `analog-stereo`, o sea
+el micrófono mono duplicado en dos canales. choz lista los puertos que hay en
+el grafo y no puede saber que son el mismo micrófono —en una interfaz de verdad
+dos canales adyacentes son dos entradas distintas—. Eligiendo **una** fila la
+tab abre en `(ch, ch)` y es mono de punta a punta.
+
+### El nombre de un mando que la celda no puede decir
+
+Una caja de mandos tiene trece columnas y los nombres de un plugin no: tres
+mandos dibujados `Filter 1 C…` son tres mandos que nadie distingue. Ahora el
+puntero apoyado sobre uno lo nombra entero, con la sección incluida —que es
+justo la parte que la celda no podía decir—. Leer un mando no puede costar un
+click, porque un click sobre un mando es un cambio de valor. `EnableMouseCapture`
+ya encendía el reporte de movimiento; lo que faltaba era que la posición del
+ratón se guardara siempre y no sólo mientras el learn estaba armado.
+
+### La ventana de un plugin del tamaño que el plugin tiene
+
+Reportado como "la GUI de Nekobi es más grande de lo que es". `strings
+Nekobi_ui.so | grep ui#resize` no devuelve nada: esa UI **nunca** pide tamaño,
+así que la ventana se quedaba en el 600×400 de reserva. La auditoría por
+formato dio esto:
+
+| formato | tamaño al abrir | redimensionado posterior |
+|---|---|---|
+| CLAP | `gui.get_size()` | `request_resize` se guardaba y nunca se leía |
+| VST3 | `IPlugView::getSize()` | `resizeView` aceptaba y no movía la ventana |
+| VST2 | `effEditGetRect` | ninguno |
+| LV2 | sólo `ui:resize` | sólo se leía al abrir |
+
+Los dos huecos los tapa **un mecanismo, en la ventana X11 y no por formato**: si
+el plugin no pide tamaño se lee la geometría de la ventana hija que parenteó
+dentro de la nuestra —que es donde vive su tamaño real—, y el bucle sigue los
+cambios de esa hija cada ~300 ms. Todo toolkit redimensiona la ventana en la que
+dibuja, venga el pedido de CLAP, de VST3 o de LV2. Sólo sigue *cambios*, nunca
+una diferencia a secas: una ventana que el usuario agrandó a mano se queda donde
+la puso.
+
+### Mover un efecto ya no pierde el MIDI
+
+Reportado como "moví el autofilter en la cadena y perdí el ruteo MIDI". Los
+bindings guardan `LearnTarget::FxParam { slot, fx, param }`, y `fx` es la
+**posición** en la cadena, no la identidad: al reordenar, el CC quedaba
+apuntando al efecto que ocupó el hueco. No era del autofilter —afectaba a los 56
+por igual—, así que el arreglo es uno solo y está donde todos pasan.
+
+`remap_fx_indices` mueve con el efecto todo lo que lo nombra por su lugar: los
+`cc_bindings`, los `pc_bindings`, el learn pendiente y la key de la ventana del
+plugin abierta. Lo que el efecto lleva dentro —su gate, su chord port, sus
+tomas— ya viajaba en la entry. Borrar un efecto tira su binding en vez de
+cedérselo al siguiente: un fader que calladamente maneja otra cosa es peor que
+uno que no hace nada. De paso, mover y borrar estaban duplicados en tres sitios
+—tecla, ratón y trigger MIDI— y ninguno remapeaba: ahora son una línea cada uno.
+
+### La caja de "cargando" al abrir un proyecto desde el escritorio
+
+Doble click sobre un `.choz.yml` en el gestor de archivos lanza `choz
+proyecto.yml`, y ese camino llamaba `load_project_from` directo dentro del
+bloque del splash, bloqueando el hilo mientras reconstruye el rack entero. `ui`
+dibuja el splash y hace `return` temprano mientras `!splash_done`, así que ni
+con `loading` puesto se habría visto. Ahora el splash termina ahí y cada carga
+dibuja **un frame propio** antes de bloquear, igual que abrir un proyecto desde
+el navegador.
+
+### LV2: los atoms de la UI llegan al plugin
+
+Merge del PR #5. La UI de un plugin LV2 puede escribir un `patch:Set` por
+`atom:eventTransfer` —así se mueve un parámetro de tipo archivo, como el modelo
+del Neural Amp Modeler—, y hasta ahora choz sólo entendía el protocolo de float.
+Ahora la UI comparte el **URID store de la instancia** en vez de uno global de
+proceso, que es obligatorio para que un `patch:Set` signifique lo mismo de los
+dos lados, y los atoms se pliegan en el puerto de entrada del plugin en el hilo
+de audio. Se suma `ui:resize` como feature: las UIs de brummer10 la leen sin
+comprobar y sin ella se caen.
 
 ## [1.3.8] — 2026-09-02
 

@@ -19,16 +19,26 @@ fn connected_to_us() -> usize {
 
 /// utime + stime of the audio server, in seconds.
 fn server_cpu() -> f64 {
-    let Ok(out) = std::process::Command::new("pgrep").arg("-x").arg("pipewire").output() else {
+    let Ok(out) = std::process::Command::new("pgrep")
+        .arg("-x")
+        .arg("pipewire")
+        .output()
+    else {
         return 0.0;
     };
-    let Some(pid) = String::from_utf8_lossy(&out.stdout).lines().next().map(str::to_string) else {
+    let Some(pid) = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .map(str::to_string)
+    else {
         return 0.0;
     };
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", pid.trim())) else {
         return 0.0;
     };
-    let Some(rest) = stat.rsplit_once(") ") else { return 0.0 };
+    let Some(rest) = stat.rsplit_once(") ") else {
+        return 0.0;
+    };
     let f: Vec<&str> = rest.1.split_whitespace().collect();
     let ticks: f64 = f.get(11).and_then(|v| v.parse().ok()).unwrap_or(0.0)
         + f.get(12).and_then(|v| v.parse().ok()).unwrap_or(0.0);
@@ -77,6 +87,9 @@ fn main() -> anyhow::Result<()> {
     std::thread::sleep(std::time::Duration::from_millis(500));
     let pair = graph_cost(8);
     println!("\neverything wired: {all:.2} % of a core");
-    println!("one pair wired:   {pair:.2} % of a core   ({:+.2})", pair - all);
+    println!(
+        "one pair wired:   {pair:.2} % of a core   ({:+.2})",
+        pair - all
+    );
     Ok(())
 }

@@ -137,8 +137,7 @@ mod tests {
             let n = sr as usize; // one second
             let mut buf: Vec<f32> = (0..n)
                 .flat_map(|i| {
-                    let v =
-                        (std::f32::consts::TAU * 220.0 * i as f32 / sr as f32).sin() * 0.5;
+                    let v = (std::f32::consts::TAU * 220.0 * i as f32 / sr as f32).sin() * 0.5;
                     [v, v]
                 })
                 .collect();

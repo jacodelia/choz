@@ -86,46 +86,8 @@ pub fn connect_inputs(
                     let _ = txc.send(InputEvent::Clock(source, msg));
                     return;
                 }
-                match parse(data) {
-                    Some(Msg::Note {
-                        channel,
-                        on,
-                        note,
-                        vel,
-                    }) => {
-                        let _ = txc.send(InputEvent::Note(NoteMsg {
-                            source,
-                            channel,
-                            on,
-                            note,
-                            vel,
-                        }));
-                    }
-                    // Control changes drive MIDI-learn bindings (rack faders)
-                    // and reach the instrument, which is what makes the pedals
-                    // and the modulation wheel work.
-                    Some(Msg::Cc { channel, cc, value }) => {
-                        if cc == 0 {
-                            bank = value;
-                        }
-                        let _ = txc.send(InputEvent::Cc(CcMsg {
-                            source,
-                            channel,
-                            cc,
-                            value,
-                        }));
-                    }
-                    Some(Msg::Program { program }) => {
-                        let _ = txc.send(InputEvent::Program(ProgramMsg {
-                            source,
-                            bank,
-                            program,
-                        }));
-                    }
-                    Some(Msg::Bend { value }) => {
-                        let _ = txc.send(InputEvent::Bend(BendMsg { source, value }));
-                    }
-                    None => {}
+                if let Some(event) = event_of(data, source, &mut bank) {
+                    let _ = txc.send(event);
                 }
             },
             (),
@@ -239,7 +201,7 @@ impl std::fmt::Debug for MidiOut {
 /// because a single pulse carries every bit of jitter the cable and the sender
 /// have between them.
 #[derive(Default)]
-struct ClockCounter {
+pub(crate) struct ClockCounter {
     /// Pulses since the reading, and when that run started (microseconds, the
     /// port's own clock).
     pulses: u32,
@@ -253,7 +215,7 @@ impl ClockCounter {
     /// Feed a raw message. `Some` when it was a clock byte worth passing on;
     /// `None` for a pulse that is still being counted, and for anything that is
     /// not the clock at all.
-    fn feed(&mut self, data: &[u8], stamp: u64) -> Option<ClockMsg> {
+    pub(crate) fn feed(&mut self, data: &[u8], stamp: u64) -> Option<ClockMsg> {
         match data.first().copied()? {
             // A run of pulses is only a tempo once there is a quarter of it.
             0xF8 => {
@@ -323,6 +285,55 @@ enum Msg {
     Program {
         program: u8,
     },
+}
+
+/// One raw MIDI message as the event it becomes, tagged with where it came
+/// from. `None` for anything choz has no use for, the clock included — that is
+/// counted by [`ClockCounter`], which needs the port's own timestamp and so
+/// cannot be folded in here.
+///
+/// `bank` is the port's last Bank Select MSB, kept by the caller because it
+/// belongs to the *port*: the pair arrives as its own CC just before the
+/// program change and has to travel with it.
+///
+/// **One translation, two ports.** The ALSA callback above and choz's own JACK
+/// MIDI input both come through here, so a note from a DAW on the graph and a
+/// note from a keyboard on a DIN cable become the same event by the same rules.
+pub(crate) fn event_of(data: &[u8], source: InputSource, bank: &mut u8) -> Option<InputEvent> {
+    match parse(data)? {
+        Msg::Note {
+            channel,
+            on,
+            note,
+            vel,
+        } => Some(InputEvent::Note(NoteMsg {
+            source,
+            channel,
+            on,
+            note,
+            vel,
+        })),
+        // Control changes drive MIDI-learn bindings (rack faders) and reach the
+        // instrument, which is what makes the pedals and the modulation wheel
+        // work.
+        Msg::Cc { channel, cc, value } => {
+            if cc == 0 {
+                *bank = value;
+            }
+            Some(InputEvent::Cc(CcMsg {
+                source,
+                channel,
+                cc,
+                value,
+            }))
+        }
+        Msg::Program { program } => Some(InputEvent::Program(ProgramMsg {
+            source,
+            bank: *bank,
+            program,
+        })),
+        Msg::Bend { value } => Some(InputEvent::Bend(BendMsg { source, value })),
+    }
 }
 
 /// Parse a raw MIDI message. Note-on with velocity 0 is the conventional

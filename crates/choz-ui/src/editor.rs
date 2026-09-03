@@ -197,6 +197,41 @@ mod x11 {
         let _ = conn.configure_window(win, &ConfigureWindowAux::new().x(x).y(y));
     }
 
+    /// The UI's window as it is right now, with no waiting: what the polling
+    /// half of [`run`] compares against to notice a plugin that resized itself.
+    fn current_child_size<C: Connection>(conn: &C, win: u32) -> Option<(u16, u16)> {
+        let child = conn
+            .query_tree(win)
+            .ok()?
+            .reply()
+            .ok()?
+            .children
+            .first()
+            .copied()?;
+        let g = conn.get_geometry(child).ok()?.reply().ok()?;
+        (g.width > 1 && g.height > 1).then_some((g.width, g.height))
+    }
+
+    /// Size of the window the UI parented into ours, which for a toolkit that
+    /// never calls `ui:resize` is the only place its real size exists.
+    ///
+    /// Retried for a moment: a UI is free to create its window from its first
+    /// idle rather than from `instantiate`, and a child that is not there yet
+    /// looks exactly like one that will never come. `None` when nothing
+    /// appears — the caller then keeps the fallback, which is what choz did
+    /// for every plugin before this.
+    fn child_size<C: Connection>(conn: &C, win: u32) -> Option<(u16, u16)> {
+        for _ in 0..10 {
+            // A toolkit that has made its window but not yet sized it reports
+            // 1×1, which `current_child_size` refuses; wait for the real one.
+            if let Some(size) = current_child_size(conn, win) {
+                return Some(size);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+
     pub fn run(handle: &EditorHandle, close: &AtomicBool, title: &str) -> anyhow::Result<()> {
         let (conn, screen_num) = x11rb::connect(None)?;
         let screen = &conn.setup().roots[screen_num];
@@ -244,7 +279,15 @@ mod x11 {
         conn.flush()?;
 
         // The parent handle a plugin expects on Linux is the X11 window XID.
-        if let Some((rw, rh)) = handle.open(win as u64) {
+        //
+        // The size comes from the plugin if it asked for one through
+        // `ui:resize`, and otherwise from the window it just parented into
+        // ours: a UI that never asks (Nekobi and the rest of DPF's, which
+        // declare `ui:noUserResize` and simply make a window of the size they
+        // are) was left sitting in the 600×400 fallback with a border of empty
+        // desktop around it.
+        let asked = handle.open(win as u64);
+        if let Some((rw, rh)) = asked.or_else(|| child_size(&conn, win)) {
             (w, h) = (rw, rh);
             conn.configure_window(
                 win,
@@ -256,6 +299,17 @@ mod x11 {
             conn.flush()?;
         }
 
+        // What the UI's own window measured last time we looked, so a plugin
+        // that grows *after* it opened is followed — CLAP's `request_resize`,
+        // VST3's `resizeView` and LV2's `ui:resize` all arrive on a thread that
+        // is not this one, and every one of them ends with the toolkit resizing
+        // the window it drew into. Watching that window is one mechanism for
+        // all four formats instead of a channel per format.
+        //
+        // Only a *change* is followed, never a mere difference: a window the
+        // user dragged bigger must stay where they put it.
+        let mut last_child = (w, h);
+        let mut since_look = 0u8;
         while !close.load(Ordering::Relaxed) {
             while let Some(event) = conn.poll_for_event()? {
                 if let Event::ClientMessage(cm) = event {
@@ -265,6 +319,20 @@ mod x11 {
                 }
             }
             handle.idle();
+            since_look += 1;
+            if since_look >= 10 {
+                since_look = 0;
+                if let Some(size) = current_child_size(&conn, win) {
+                    if size != last_child {
+                        last_child = size;
+                        (w, h) = size;
+                        conn.configure_window(
+                            win,
+                            &ConfigureWindowAux::new().width(w as u32).height(h as u32),
+                        )?;
+                    }
+                }
+            }
             conn.flush()?;
             std::thread::sleep(Duration::from_millis(30));
         }
