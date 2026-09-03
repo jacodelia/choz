@@ -21,9 +21,10 @@ lleva lo que falta —nada de lo ya hecho— y
   corrida. Por crate (`-p choz-engine -p choz-ui`) va entero.
 - `cargo test -p choz-plugin-lv2 --test lv2_runtime` **se cuelga** en
   `bundle_presets_are_listed_and_applied` en la máquina de desarrollo (spam de
-  `Sending key 'state' to UI failed, out of space`). Verificado contra `02a60bf`:
-  **es previo**, no lo trajo la 1.3.9. La suite de lib de ese crate (16 tests) va
-  entera; el resto del workspace se corre con `--exclude choz-plugin-lv2`.
+  `Sending key 'state' to UI failed, out of space`). **En CI pasa entero** (17
+  tests), así que es un plugin LV2 instalado acá y no el test: verificado además
+  contra `02a60bf`, es previo. Localmente el resto del workspace se corre con
+  `--exclude choz-plugin-lv2`.
 - **Un test que falla "a veces" es un global del proceso**, no un bug del código
   que prueba: el harness corre los tests de un crate en paralelo, y el
   transporte, los medidores y `capture_health` son singletons a propósito.

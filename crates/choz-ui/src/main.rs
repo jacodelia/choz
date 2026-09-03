@@ -26164,6 +26164,12 @@ mod tests {
     #[test]
     fn tapping_four_times_sets_the_tempo() {
         use views::fx_chain_panel::RackButton as B;
+        // The tempo it lands on is the **transport's**, which every other test
+        // shares — and this is the one test that writes it from the wall clock,
+        // so it cannot know what it is about to write. Without the lock it put
+        // whatever the taps came out at under a test that had just set 120 and
+        // was drawing it, which is a failure in the other test's name.
+        let _g = ui_guard();
         let mut app = App::new();
         app.slots.push(RackSlot::new(AudioSource::Midi));
         app.edit_arp(ArpEdit::Toggle);
