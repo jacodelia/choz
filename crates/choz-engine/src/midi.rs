@@ -9,14 +9,19 @@ pub use crate::input::{BendMsg, CcMsg, ClockMsg, InputEvent, InputSource, NoteMs
 
 /// All available MIDI **input** port names (what devices we can listen to).
 pub fn list_input_ports() -> Vec<String> {
-    match midir::MidiInput::new("choz-scan-in") {
-        Ok(m) => m
-            .ports()
-            .iter()
-            .filter_map(|p| m.port_name(p).ok())
-            .collect(),
-        Err(_) => Vec::new(),
+    // choz's own published port leads the list, because that is where
+    // `connect_inputs` puts it — and being *in* the list is what gives it a row
+    // under MENU → MIDI IN to switch off. Named unconditionally on unix: the
+    // row has to exist for the port to be switched back *on* after it was
+    // switched off, and switched off is exactly when it is not open.
+    let mut ports = match cfg!(unix) {
+        true => vec![VIRTUAL_IN_PORT.to_string()],
+        false => Vec::new(),
+    };
+    if let Ok(m) = midir::MidiInput::new("choz-scan-in") {
+        ports.extend(m.ports().iter().filter_map(|p| m.port_name(p).ok()));
     }
+    ports
 }
 
 /// All available MIDI **output** port names: what a tab can play *to*.
@@ -42,6 +47,20 @@ pub fn connect_inputs(
 ) -> (Vec<String>, Vec<midir::MidiInputConnection<()>>) {
     let mut names = Vec::new();
     let mut conns = Vec::new();
+
+    // choz's own port, first in the list and therefore always
+    // `InputSource::Midi(0)` — see [`open_virtual_input`], which is why the
+    // callback it made can keep sending that index for the life of the process.
+    match is_disabled(VIRTUAL_IN_PORT, disabled) {
+        // Switched off means *gone*: a port left open while the hardware takes
+        // index 0 would keep sending events tagged as somebody else's keyboard.
+        true => drop(VIRTUAL.lock().map(|mut v| v.take())),
+        false => {
+            if open_virtual_input(tx.clone()) {
+                names.push(VIRTUAL_IN_PORT.to_string());
+            }
+        }
+    }
 
     let Ok(scan) = midir::MidiInput::new("choz-scan") else {
         return (names, conns);
@@ -100,6 +119,74 @@ pub fn connect_inputs(
         }
     }
     (names, conns)
+}
+
+/// The name of the sequencer port choz publishes for other programs to play.
+///
+/// ALSA's sequencer only lets a program *subscribe to* ports that already
+/// exist, and a DAW's MIDI output is not one of them: REAPER opens the devices
+/// it was told to and publishes nothing anybody else can send to. So choz
+/// publishes the port instead — the DAW picks "choz MIDI IN" out of its device
+/// list, and the sequence plays a rack tab with no loopback module, no
+/// `a2jmidid`, and no JACK graph.
+pub const VIRTUAL_IN_PORT: &str = "choz MIDI IN";
+
+/// The port itself, opened once and kept for the life of the process.
+///
+/// **Not re-opened by a reconnect.** [`connect_inputs`] runs again whenever a
+/// controller is plugged in or out, and a virtual port that was destroyed and
+/// remade there would drop the DAW's subscription every time somebody touched
+/// a USB cable — silently, because nothing on either side reports it.
+static VIRTUAL: std::sync::Mutex<Option<midir::MidiInputConnection<()>>> =
+    std::sync::Mutex::new(None);
+
+/// Open it if it is not open yet. `true` once there is a port to name.
+fn open_virtual_input(tx: flume::Sender<InputEvent>) -> bool {
+    #[cfg(unix)]
+    {
+        use midir::os::unix::VirtualInput;
+        let Ok(mut held) = VIRTUAL.lock() else {
+            return false;
+        };
+        if held.is_some() {
+            return true;
+        }
+        let Ok(mi) = midir::MidiInput::new("choz") else {
+            return false;
+        };
+        // Index 0, fixed: this port is the first entry of every list
+        // `connect_inputs` returns, and it outlives all of them.
+        let source = InputSource::Midi(0);
+        let mut bank = 0u8;
+        let mut clock = ClockCounter::default();
+        match mi.create_virtual(
+            VIRTUAL_IN_PORT,
+            move |ts, data, _| {
+                if let Some(msg) = clock.feed(data, ts) {
+                    let _ = tx.send(InputEvent::Clock(source, msg));
+                    return;
+                }
+                if let Some(event) = event_of(data, source, &mut bank) {
+                    let _ = tx.send(event);
+                }
+            },
+            (),
+        ) {
+            Ok(c) => {
+                *held = Some(c);
+                true
+            }
+            Err(e) => {
+                eprintln!("choz: cannot publish '{VIRTUAL_IN_PORT}': {e}");
+                false
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tx;
+        false
+    }
 }
 
 /// Is this port switched off? midir names a port `"Client:Port n:m"`, so the
@@ -546,5 +633,72 @@ mod tests {
             Some(Msg::Bend { value: 8192 }),
             "channel is ignored"
         );
+    }
+
+    /// The port choz publishes: other programs must be able to *find* it, and
+    /// it must be the first name `connect_inputs` returns — the callback sends
+    /// `InputSource::Midi(0)` for the life of the process.
+    /// The two tests below open and close the *same* process-wide port, so
+    /// they cannot run at once.
+    static PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn the_virtual_port_is_published_and_comes_first() {
+        let _g = PORT.lock().unwrap_or_else(|e| e.into_inner());
+        // No sequencer in this environment (a container without snd-seq):
+        // there is nothing to publish a port on, and nothing to assert.
+        if midir::MidiOutput::new("choz-test").is_err() {
+            return;
+        }
+        let (tx, _rx) = flume::unbounded();
+        let (names, _conns) = connect_inputs(tx, &[]);
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some(VIRTUAL_IN_PORT),
+            "{names:?}"
+        );
+        // And a DAW sees it as somewhere to send: it is an output target from
+        // the other side of the wire.
+        let out = midir::MidiOutput::new("choz-test").unwrap();
+        let seen: Vec<String> = out
+            .ports()
+            .iter()
+            .filter_map(|p| out.port_name(p).ok())
+            .collect();
+        assert!(
+            seen.iter().any(|n| n.contains(VIRTUAL_IN_PORT)),
+            "the published port is not on the sequencer: {seen:?}"
+        );
+    }
+
+    /// Switched off under MENU → MIDI IN, the port goes away. It has to: its
+    /// callback tags everything `InputSource::Midi(0)`, and index 0 belongs to
+    /// the first hardware port the moment choz stops naming its own.
+    #[test]
+    fn a_disabled_virtual_port_is_closed_not_just_hidden() {
+        let _g = PORT.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(scan) = midir::MidiOutput::new("choz-test-off") else {
+            return;
+        };
+        let (tx, _rx) = flume::unbounded();
+        let off = [VIRTUAL_IN_PORT.to_string()];
+        let (names, _conns) = connect_inputs(tx.clone(), &off);
+        assert!(
+            !names.iter().any(|n| n == VIRTUAL_IN_PORT),
+            "a disabled port is still named: {names:?}"
+        );
+        let seen: Vec<String> = scan
+            .ports()
+            .iter()
+            .filter_map(|p| scan.port_name(p).ok())
+            .collect();
+        assert!(
+            !seen.iter().any(|n| n.contains(VIRTUAL_IN_PORT)),
+            "the port is still on the sequencer: {seen:?}"
+        );
+
+        // And switching it back on publishes it again.
+        let (names, _conns) = connect_inputs(tx, &[]);
+        assert_eq!(names.first().map(String::as_str), Some(VIRTUAL_IN_PORT));
     }
 }
