@@ -1459,6 +1459,8 @@ struct UiLayout {
     /// menu bar just left of LIVE/MULTI.
     met_rect: Option<Rect>,
     met_menu_rect: Option<Rect>,
+    /// TAP, left of the metronome: four taps set the transport's tempo.
+    met_tap_rect: Option<Rect>,
     /// The LIVE/MULTI switch in the top-right corner of the menu bar.
     mode_switch_rect: Option<Rect>,
     /// The transport's on/off button, right of the mode switch on the menu bar.
@@ -1892,6 +1894,8 @@ struct App {
     audio_engine: Option<engine::AudioEngine>,
 
     playing: bool,
+    /// The last few clicks on TAP, for the tempo they imply.
+    met_taps: Vec<Instant>,
     /// Recorded parameter moves, played back against the transport.
     automation: automation::Automation,
     /// When the health of the audio thread was last reported, and what the
@@ -2024,6 +2028,7 @@ impl App {
             osc: None,
             audio_engine: None,
             playing: false,
+            met_taps: Vec::new(),
             automation: automation::Automation::default(),
             health_at: Instant::now(),
             health_seen: (0, 0, 0),
@@ -15707,10 +15712,19 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             app.panic();
             return;
         }
-        let (met, met_menu) = {
+        let (met, met_menu, met_tap) = {
             let l = app.layout.borrow();
-            (l.met_rect, l.met_menu_rect)
+            (l.met_rect, l.met_menu_rect, l.met_tap_rect)
         };
+        if met_tap.is_some_and(|r| r.contains(pos)) {
+            choz_engine::arp::tap_tempo(&mut app.met_taps, Instant::now());
+            // A full count of four is somebody counting a band in: the click
+            // they were counting for goes on by itself.
+            if app.met_taps.len() >= 4 {
+                choz_engine::metronome::metronome().set_on(true);
+            }
+            return;
+        }
         if met.is_some_and(|r| r.contains(pos)) {
             app.toggle_metronome();
             return;
@@ -17114,6 +17128,7 @@ fn compute_layout(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BarId {
     Learn,
+    MetTap,
     Met,
     MetMenu,
     Mode,
@@ -17213,6 +17228,21 @@ fn draw_menu_bar(f: &mut Frame, app: &App, area: Rect) {
                     // room: the next CC that arrives is going somewhere.
                     true => bold(Color::Black, WARN),
                     false => off,
+                },
+            )],
+        ),
+        (
+            BarId::MetTap,
+            vec![Span::styled(
+                " TAP ".to_string(),
+                // Lit for a moment on each tap: tapping a tempo is a gesture
+                // with no other feedback, and a button that never moves cannot
+                // say whether the click landed.
+                match app.met_taps.last() {
+                    Some(t) if t.elapsed() < Duration::from_millis(150) => {
+                        bold(Color::Black, WARN)
+                    }
+                    _ => met_style,
                 },
             )],
         ),
@@ -17317,6 +17347,7 @@ fn draw_menu_bar(f: &mut Frame, app: &App, area: Rect) {
         BarId::Rec,
         BarId::Dsp,
         BarId::MetMenu,
+        BarId::MetTap,
         BarId::Met,
         BarId::Play,
     ] {
@@ -17330,6 +17361,7 @@ fn draw_menu_bar(f: &mut Frame, app: &App, area: Rect) {
     let mut layout = app.layout.borrow_mut();
     layout.met_rect = None;
     layout.met_menu_rect = None;
+    layout.met_tap_rect = None;
     layout.mode_switch_rect = None;
     layout.transport_rect = None;
     layout.rec_rect = None;
@@ -17349,6 +17381,7 @@ fn draw_menu_bar(f: &mut Frame, app: &App, area: Rect) {
             match id {
                 BarId::Met => layout.met_rect = Some(r),
                 BarId::MetMenu => layout.met_menu_rect = Some(r),
+                BarId::MetTap => layout.met_tap_rect = Some(r),
                 BarId::Mode => layout.mode_switch_rect = Some(r),
                 BarId::Play => layout.transport_rect = Some(r),
                 BarId::Rec => layout.rec_rect = Some(r),
@@ -25444,6 +25477,10 @@ mod tests {
     #[test]
     fn the_harmonizer_follows_the_keyboard_only_when_it_is_asked_to() {
         use views::midi_monitor::Converted;
+        // The chord is a global, and the test that pins it to one keyboard
+        // writes the same one under this lock: without it here the two race and
+        // whichever ran second read the other's notes.
+        let _g = ui_guard();
         let chord = choz_engine::chord::chord();
         chord.clear();
 
@@ -26197,6 +26234,38 @@ mod tests {
         }
         let bpm = choz_ports::transport().bpm();
         assert!(bpm > 120.0, "tapping did not move the tempo: {bpm}");
+        choz_ports::transport().set_bpm(120.0);
+    }
+
+    /// The same tap, on the menu bar: a rack with no arpeggiator still needs a
+    /// tempo it can play in.
+    #[test]
+    fn the_menu_bar_tap_sets_the_tempo() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let tap = app.layout.borrow().met_tap_rect.expect("TAP button");
+        let met = app.layout.borrow().met_rect.unwrap();
+        assert!(tap.x + tap.width <= met.x, "TAP sits left of the metronome");
+
+        let m = choz_engine::metronome::metronome();
+        m.set_on(false);
+        for _ in 0..4 {
+            click(&mut app, tap.x + 1, tap.y);
+        }
+        let bpm = choz_ports::transport().bpm();
+        assert!(bpm > 120.0, "tapping did not move the tempo: {bpm}");
+        assert!(m.on(), "counting four in starts the click");
+
+        // The lit frame itself is not asserted: the wallpaper wash rewrites
+        // every background in the buffer, so the cell says nothing about the
+        // style it was drawn with.
+
+        m.set_on(false);
         choz_ports::transport().set_bpm(120.0);
     }
 

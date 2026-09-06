@@ -486,40 +486,46 @@ impl Arp {
     /// does not throw it; a gap longer than two seconds starts a new count,
     /// because that was somebody stopping rather than playing very slowly.
     pub fn tap(&mut self, now: Instant) {
-        const MAX_TAPS: usize = 4;
-        if self
-            .taps
-            .last()
-            .is_some_and(|t| now.saturating_duration_since(*t) > Duration::from_secs(2))
-        {
-            self.taps.clear();
-        }
-        self.taps.push(now);
-        if self.taps.len() > MAX_TAPS {
-            self.taps.remove(0);
-        }
-        if self.taps.len() < 2 {
-            return;
-        }
-        let total = self
-            .taps
-            .last()
-            .unwrap()
-            .saturating_duration_since(self.taps[0])
-            .as_secs_f32();
-        let intervals = (self.taps.len() - 1) as f32;
-        if total <= 0.0 {
-            return;
-        }
-        // Taps are quarter notes, whatever the division is: that is what a tap
-        // tempo means on every box that has one.
-        let bpm = (60.0 / (total / intervals)).clamp(MIN_BPM, MAX_BPM);
-        // There is one clock, and this is somebody asking *it* to go faster:
-        // writing a number the arpeggiator is not counting at would be a tap
-        // that does nothing.
-        choz_ports::transport().set_bpm(bpm);
+        tap_tempo(&mut self.taps, now)
     }
+}
 
+/// The tap itself, over whatever list of taps the caller keeps: the
+/// arpeggiator's, and the metronome button's on the menu bar.
+pub fn tap_tempo(taps: &mut Vec<Instant>, now: Instant) {
+    const MAX_TAPS: usize = 4;
+    if taps
+        .last()
+        .is_some_and(|t| now.saturating_duration_since(*t) > Duration::from_secs(2))
+    {
+        taps.clear();
+    }
+    taps.push(now);
+    if taps.len() > MAX_TAPS {
+        taps.remove(0);
+    }
+    if taps.len() < 2 {
+        return;
+    }
+    let total = taps
+        .last()
+        .unwrap()
+        .saturating_duration_since(taps[0])
+        .as_secs_f32();
+    let intervals = (taps.len() - 1) as f32;
+    if total <= 0.0 {
+        return;
+    }
+    // Taps are quarter notes, whatever the division is: that is what a tap
+    // tempo means on every box that has one.
+    let bpm = (60.0 / (total / intervals)).clamp(MIN_BPM, MAX_BPM);
+    // There is one clock, and this is somebody asking *it* to go faster:
+    // writing a number the arpeggiator is not counting at would be a tap
+    // that does nothing.
+    choz_ports::transport().set_bpm(bpm);
+}
+
+impl Arp {
     /// Stop whatever is sounding. `PANIC`, and switching the arpeggiator off.
     pub fn silence(&mut self, out: &mut Vec<ArpEvent>) {
         self.release(out);
