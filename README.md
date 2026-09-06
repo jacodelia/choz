@@ -10,7 +10,7 @@ Built with Rust, ratatui and cpal. Provides a TUI for managing note inputs, inst
 
 ## Status
 
-**1.3.9.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
+**1.3.10.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
 LADSPA, DSSI, VST2, VST3 and Pure Data patches are really hosted** — instruments
 and audio effects, with their own parameters and their own windows — choz's own
 56 effects and both artifacts — the arpeggiator and the step sequencer — are
@@ -20,7 +20,9 @@ published as CLAP plugins for other hosts, and choz installs as a
 choz is a **citizen of the JACK/PipeWire graph**, not only of ALSA:
 `choz:midi_in` and `choz:midi_out` are ports on the client it already had, so a
 DAW on the same graph plays a rack tab, sends it the clock and receives what the
-arpeggiator puts out — no `a2jmidid`, which bridges the other way. And a tab can
+arpeggiator puts out — no `a2jmidid`, which bridges the other way. On ALSA it
+**publishes a port of its own**, `choz MIDI IN`: a DAW picks it out of its MIDI
+output list and plays a tab with no loopback module and no graph at all. And a tab can
 **leave the master mix through a port of its own**: one direct out per tab, at a
 fixed place and as wide as the tab is, which is what a DAW records track by
 track. A mono jack stays one channel all the way through — one fader on the
@@ -364,7 +366,7 @@ ring so they are freed off the RT thread.
 
 | | |
 |---|---|
-| choz | **1.3.9** |
+| choz | **1.3.10** |
 | Rust edition | 2021 (`choz-plugin-lv2` is 2024) |
 | Toolchain tested | rustc 1.97.1 |
 | Platform | Linux. ALSA/JACK/PipeWire. Released for x86-64, aarch64 and armv7 |

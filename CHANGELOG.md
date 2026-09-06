@@ -12,7 +12,7 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **878 tests** con harness en todo el workspace (774 entre `choz-engine` y `choz-ui`) + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **881 tests** con harness en todo el workspace (777 entre `choz-engine` y `choz-ui`) + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio.
 - **56 efectos propios**, publicados también como un `.clap` con los dos artifacts.
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
@@ -31,6 +31,62 @@ lleva lo que falta —nada de lo ya hecho— y
   `choz-engine::test_locks` tiene un candado por global; en `choz-ui` el par es
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
+
+## [1.3.10] — 2026-09-05
+
+### choz publica su propio puerto MIDI en ALSA
+
+Pedido desde un flujo concreto: una secuencia MIDI en REAPER que suene en choz
+—con su VST y sus efectos— y vuelva a REAPER como audio. La mitad del audio ya
+estaba (`choz:out_*` en el grafo, un direct out por tab), y la del MIDI por JACK
+también. Faltaba el caso de quien no quiere levantar el grafo para el MIDI: en
+ALSA seq **un programa sólo puede suscribirse a puertos que ya existen**, y la
+salida MIDI de un DAW no es uno —REAPER abre los dispositivos que le dijeron y
+no publica nada a lo que otro pueda mandarle.
+
+Así que ahora **el puerto lo publica choz**: `choz MIDI IN`, un puerto
+escribible del cliente ALSA `choz`. El DAW lo elige de su lista de salidas y
+toca una tab. Sin `snd-virmidi`, sin `a2jmidid`, sin grafo.
+
+- **Se abre una vez y vive lo que vive el proceso.** `connect_inputs` se vuelve
+  a correr cada vez que se enchufa o desenchufa un controlador, y un puerto
+  virtual recreado ahí le cortaría la suscripción al DAW cada vez que alguien
+  toca un cable USB —en silencio, porque ningún lado lo reporta.
+- **Es siempre el primero de la lista**, o sea `InputSource::Midi(0)` fijo: el
+  callback puede quedarse con ese índice para siempre porque el nombre encabeza
+  todas las listas que `connect_inputs` devuelve.
+- **Apagarlo desde MENU → MIDI IN lo cierra de verdad.** Dejarlo abierto
+  mientras el hardware toma el índice 0 haría que sus eventos llegaran
+  etiquetados como los del teclado de otro.
+- Pasa por el mismo `event_of` y el mismo `ClockCounter` que todo lo demás, así
+  que también sigue el MIDI Clock del DAW.
+
+El flujo completo queda: `REAPER → choz MIDI IN` (ALSA) → rack con el
+instrumento y los efectos → `choz:out_1/2 → REAPER` (JACK/PipeWire). El MIDI ya
+no necesita el grafo; el audio sí.
+
+### TAP en la barra, al lado del metrónomo
+
+Un botón `TAP` a la izquierda de `MET`: cuatro clicks marcan el tempo del
+transporte. La cuenta es la misma del arpegiador —promedio de los últimos
+cuatro intervalos, un hueco de más de dos segundos empieza de nuevo—, que dejó
+de ser un método de `Arp` para ser `arp::tap_tempo` sobre la lista que le pase
+quien la llame; el arpegiador es ahora uno de los dos que la llaman.
+
+- **Se ilumina en cada golpe** (150 ms, y la interfaz dibuja cada 33 ms):
+  marcar un tempo es un gesto sin otra devolución, y un botón que no se mueve no
+  dice si el click entró.
+- **A los cuatro golpes el metrónomo arranca solo.** Contar cuatro es contar
+  para entrar, y el click que se estaba contando es el que se quiere oír.
+
+### Un test que fallaba a veces
+
+`the_harmonizer_follows_the_keyboard_only_when_it_is_asked_to` escribía el
+acorde global sin tomar `ui_guard()`, y
+`the_chord_comes_from_the_keyboard_that_was_picked` lo escribe bajo ese mismo
+candado: corriendo en paralelo, el segundo leía las notas del primero. El
+candado que faltaba, nada más —el caso de manual del "un test que falla a veces
+es un global del proceso".
 
 ## [1.3.9] — 2026-09-03
 

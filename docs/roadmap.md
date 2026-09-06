@@ -12,7 +12,7 @@ que decía "hecho" se fue al changelog.
 que no existe, una decisión de diseño y un fallo intermitente sin explicar—, dos
 decisiones de no hacer, y las notas para el que retome.
 
-Última actualización: 2026-09-03 (1.3.9 publicada).
+Última actualización: 2026-09-05 (1.3.10 publicada).
 
 ## Estado en una línea
 
@@ -58,11 +58,12 @@ tiene. choz **habla MIDI por el grafo**, no
 sólo por ALSA: `choz:midi_in` y `choz:midi_out` son dos puertos del cliente JACK
 que ya tenía, así que un DAW del mismo grafo toca una tab, le manda el clock y
 recibe lo que el arpegiador saca —sin a2jmidid, que puentea en el sentido
-contrario—. Una tab puede **salir del master por un puerto propio**, uno por tab
-en un lugar fijo y del ancho que la tab tenga, que es lo que Ardour graba pista
-por pista. **La 1.0.0 está publicada y sus paquetes verificados; la
-1.3.9 es este árbol.**
-878 tests, `clippy --workspace --all-targets -D warnings` limpio.
+contrario—, y en ALSA publica un puerto propio, `choz MIDI IN`, para el DAW que
+no quiere levantar el grafo sólo por el MIDI. Una tab puede **salir del master
+por un puerto propio**, uno por tab en un lugar fijo y del ancho que la tab
+tenga, que es lo que Ardour graba pista por pista. **La 1.0.0 está publicada y
+sus paquetes verificados; la 1.3.10 es este árbol.**
+881 tests, `clippy --workspace --all-targets -D warnings` limpio.
 
 Las comprobaciones con hardware delante quedaron dichas en los gotchas, que es
 donde se van a leer.
