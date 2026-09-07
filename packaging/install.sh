@@ -70,6 +70,7 @@ remove_installed() {
         fi
     done
     [ -f "$CLAP_DIR/choz.clap" ] && rm -f "$CLAP_DIR/choz.clap"
+    [ -f "$CLAP_DIR/choz-rack.clap" ] && rm -f "$CLAP_DIR/choz-rack.clap"
     [ -f "$BIN_DIR/choz-pd-host" ] && rm -f "$BIN_DIR/choz-pd-host"
     [ -d "$WALLPAPER_DIR" ] && rm -rf "$WALLPAPER_DIR"
     for f in "$BIN_DIR/choz-launcher" "$APP_DIR/choz.desktop" \
@@ -240,6 +241,21 @@ if [ "$WITH_CLAP" -eq 1 ]; then
         say "installed choz's 45 effects into $CLAP_DIR/choz.clap"
     else
         say "note: no CLAP bundle to install (no cargo and none shipped) — skipping"
+    fi
+
+    # And choz itself, as an instrument: the whole rack on a DAW track, with
+    # sixteen stereo outs so each tab lands on its own. Same rules as above.
+    rack="$HERE/../target/release/libchoz_clap.so"
+    [ -f "$rack" ] || rack="$HERE/libchoz_clap.so"
+    if [ ! -f "$rack" ] && [ -f "$HERE/../Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
+        say "building choz itself as a CLAP instrument…"
+        ( cd "$HERE/.." && cargo build --release -p choz-clap )
+        rack="$HERE/../target/release/libchoz_clap.so"
+    fi
+    if [ -f "$rack" ]; then
+        mkdir -p "$CLAP_DIR"
+        install -m 644 "$rack" "$CLAP_DIR/choz-rack.clap"
+        say "installed choz itself into $CLAP_DIR/choz-rack.clap"
     fi
 fi
 

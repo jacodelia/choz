@@ -305,9 +305,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "choz-clap"
+version = "1.3.10"
+dependencies = [
+ "anyhow",
+ "choz-engine",
+ "choz-plugin-clap",
+ "choz-ui",
+ "clap-sys",
+ "ratatui",
+ "rtrb",
+ "x11rb",
+]
+
+[[package]]
 name = "choz-engine"
 version = "1.3.10"
 dependencies = [
+ "alsa",
  "anyhow",
  "choz-plugin-clap",
  "choz-plugin-ladspa",
@@ -437,7 +452,6 @@ dependencies = [
  "flume",
  "image",
  "libc",
- "midir",
  "ratatui",
  "ratatui-image",
  "serde",

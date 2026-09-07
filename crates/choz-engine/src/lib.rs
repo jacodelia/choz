@@ -29,7 +29,9 @@ pub mod sf2_patch;
 pub mod sfz;
 pub mod sources;
 
-pub use engine::{AudioBackend, AudioEngine, Dest, BUSES, DEFAULT_DIRECT_PAIRS, MAX_DIRECT_PAIRS};
+pub use engine::{
+    AudioBackend, AudioEngine, Dest, EmbeddedRt, BUSES, DEFAULT_DIRECT_PAIRS, MAX_DIRECT_PAIRS,
+};
 /// The MIDI ports on choz's own JACK client. Re-exported because the interface
 /// names them in the CLOCK, IN and MIDI OUT pickers, and the module behind them
 /// is private.
@@ -42,6 +44,29 @@ pub use fx_chain::FxSpec;
 pub use param_shape::ParamShape;
 
 pub use paths::{FoundPlugin, PluginFormat, PluginPaths, SearchDir};
+
+/// Set when choz is running as something other than its own binary — a plugin
+/// inside a DAW, or a test harness.
+///
+/// **Three things here re-run `current_exe`**: the scan worker, the crash probe
+/// and the out-of-process plugin sandbox. That is right for the `choz` command,
+/// which answers those flags at startup. It is *wrong* embedded, where
+/// `current_exe` is the host: re-running it starts a second copy of the DAW,
+/// which opens its own windows and takes the audio device. The existing
+/// fallbacks all cost one failed spawn to discover that — and one failed spawn
+/// is exactly the thing that must not happen.
+static EMBEDDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Say that this process is not the choz binary, before anything scans.
+pub fn set_embedded() {
+    EMBEDDED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether spawning a child of this executable would start something that is
+/// not a choz worker.
+pub fn is_embedded() -> bool {
+    EMBEDDED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Scan every enabled directory of every format in `paths`.
 ///
@@ -208,7 +233,8 @@ fn scan_dir_out_of_process(
 fn worker_available() -> bool {
     static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OK.get_or_init(|| {
-        if is_worker() {
+        // Embedded, the probe below would start another copy of the host.
+        if is_worker() || is_embedded() {
             return false;
         }
         let Ok(exe) = std::env::current_exe() else {

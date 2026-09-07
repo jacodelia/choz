@@ -6,6 +6,12 @@ description.workspace = true
 repository.workspace = true
 license = "MIT"
 
+# The interface as a library, so a plugin can embed the same rack and the same
+# panels; `src/main.rs` is the command, and it is four lines long.
+[lib]
+name = "choz_ui"
+path = "src/lib.rs"
+
 [[bin]]
 name = "choz"
 path = "src/main.rs"
@@ -177,7 +183,6 @@ crossterm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 flume.workspace = true
-midir.workspace = true
 libc = "0.2"
 ratatui-image = "8"
 # Already in the tree via ratatui-image; used directly for the kitty wallpaper.
