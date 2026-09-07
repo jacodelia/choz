@@ -239,6 +239,12 @@ pub fn set_forced(format: PluginFormat, path: &Path, id: &str, on: bool) {
 /// rack. `CHOZ_SANDBOX_GUI=1` brings the old behaviour back for whoever would
 /// rather pay the process than the crash.
 pub fn wants_sandbox(format: PluginFormat, path: &Path, id: &str) -> bool {
+    // Embedded there is no sandbox to be had: the child would be the host, not
+    // a plugin runner. A crashy plugin takes the DAW down with it, which is the
+    // same deal every other plugin in that session already has.
+    if crate::is_embedded() {
+        return false;
+    }
     if forced(format, path, id) {
         return true;
     }
@@ -269,8 +275,12 @@ fn read_stage(written: &str) -> (&str, bool) {
 
 fn probe(format: PluginFormat, path: &Path, id: &str) -> Report {
     // A worker never probes: it *is* the probe, or the sandbox that already
-    // knows what it is loading.
-    if crate::is_worker() || NOT_A_WORKER.load(std::sync::atomic::Ordering::Relaxed) {
+    // knows what it is loading. Neither does an embedded choz: the child it
+    // would spawn is another copy of the host.
+    if crate::is_worker()
+        || crate::is_embedded()
+        || NOT_A_WORKER.load(std::sync::atomic::Ordering::Relaxed)
+    {
         return Report::default();
     }
     let Ok(exe) = std::env::current_exe() else {

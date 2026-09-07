@@ -12,7 +12,7 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **881 tests** con harness en todo el workspace (777 entre `choz-engine` y `choz-ui`) + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **894 tests** con harness en todo el workspace (780 entre `choz-engine` y `choz-ui`) + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio.
 - **56 efectos propios**, publicados también como un `.clap` con los dos artifacts.
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
@@ -31,6 +31,107 @@ lleva lo que falta —nada de lo ya hecho— y
   `choz-engine::test_locks` tiene un candado por global; en `choz-ui` el par es
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
+
+## [1.3.11] — 2026-09-07
+
+### La entrada MIDI deja midir y habla el secuenciador ALSA
+
+Salió de un cuelgue con el log delante. Intentando conectar Ardour y REAPER a
+choz, la TUI se congeló sin escribir una línea. Dos sesiones antes, el log sí
+tenía el motivo:
+
+```
+thread 'midir ALSA input handler (port 'choz-in-conn')' panicked at
+  midir-0.10.4/src/backend/alsa/mod.rs:919:43:
+called `Option::unwrap()` on a `None` value
+thread 'main' panicked at midir-0.10.4/src/backend/alsa/mod.rs:494:21:
+Error when joining ALSA thread: ...
+```
+
+La línea 919 es `ev.get_time().unwrap()`, y `get_time` devuelve `None` cuando el
+evento **no** trae el flag `SND_SEQ_TIME_STAMP_REAL` —o sea, timestamp en
+*ticks*, que es lo que mandan Ardour y REAPER. midir pide timestamping real en
+su puerto, pero el kernel sólo reescribe el stamp si la queue del puerto sigue
+viva; el evento en ticks pasa crudo y el `unwrap` mata el hilo lector. Después
+`MidiInputConnection::close` hace `thread.join()` desde la UI: si el hilo ya
+murió, panic en `main`; si quedó bloqueado, **join para siempre** —una TUI
+congelada sin nada en el log, que es exactamente lo que se vio.
+
+El arreglo no es taparlo donde apareció. midir le da a cada puerto abierto su
+cliente, su queue y su hilo, y cerrar uno lo *joinea*. Ahora:
+
+- **Un cliente, dos puertos, un hilo** que no se para nunca: `choz MIDI IN` (el
+  publicado) y `in`, donde caen las suscripciones.
+- **Reconectar es re-suscribir desde afuera**, con un cliente de control
+  efímero —lo mismo que hace `aconnect`. Sin `join` que colgar.
+- **choz pone el timestamp al llegar**, contra su propio reloj monótono. Sin
+  queue por puerto no hay evento cuya queue se murió, que era el origen.
+- Apagar el puerto publicado desde MENU → MIDI IN lo **borra** igual que antes.
+  Como sólo el hilo dueño puede borrar un puerto propio en ALSA, se lo despierta
+  con un evento `Usr0` —un tipo privado del secuenciador, imposible de confundir
+  con algo que venga de un cable— y se espera su acuse con timeout de 500 ms: un
+  lector caído no cuelga la UI.
+
+La salida MIDI sigue en midir, que nunca lee y nunca fue el problema. Test de
+regresión: se manda una nota directa (stamp en ticks, el evento exacto del
+crash) al puerto publicado y se exige que llegue como `InputEvent::Note`.
+
+**Un test que busca un puerto por nombre en todo el secuenciador está mal
+escrito.** `cargo test --workspace` levanta varios binarios a la vez y cada
+proceso abre su cliente `choz`; el assert veía el puerto del *otro* proceso.
+Ahora se pregunta por el client id propio.
+
+### El modal de entrada sabe armar un estéreo
+
+Tercera fila en TAB · INPUT, entre reemplazar y no tocar nada: **ADD AS THE R
+SIDE** deja en L lo que la tab ya escuchaba y pone el jack elegido en R. No usa
+`assign_channel` justamente porque ésa es una cola de dos —el jack nuevo empuja
+al más viejo, que es lo correcto para ir picando jacks y exactamente lo
+equivocado cuando el que querés a la derecha es el par del que ya está a la
+izquierda.
+
+### choz se carga entero dentro de un DAW, como CLAP
+
+Pedido con el artículo de Kontakt delante: sus dieciséis salidas ruteadas a
+pistas separadas de REAPER, pero en CLAP y no en VST. `choz-rack.clap` es el
+rack completo en una pista del DAW.
+
+- **Dieciséis pares estéreo de salida.** Poné una tab en el par 4 del rack y
+  sale por la cuarta salida del host, en su propia pista. El ruteo por tab ya
+  existía (`set_slot_out`); lo que faltaba era un lugar donde esos pares
+  aterrizaran sin patchbay.
+- **Un par de entrada**: el audio de la pista llega como `host:in_1`/`in_2`, así
+  que el rack embebido es también cadena de efectos y no sólo instrumento.
+- **Note port** de entrada. Las notas cruzan del hilo de audio al principal por
+  un ring `rtrb` —el mismo cruce que ya hace el puerto MIDI JACK de choz.
+- **El rack viaja con la sesión**: el `state` del plugin es el mismo YAML que un
+  archivo de proyecto.
+- **Ventana propia.** `ui()` ya dibujaba contra cualquier backend de ratatui, así
+  que hay uno que guarda las celdas y una ventana X11 que las pinta con una
+  fuente core (`-misc-fixed`, `image_text16` dibuja glifo y fondo en un request).
+  Teclado **y mouse** —los faders, los botones del rack y cada fila de los
+  drawers se clickean; una ventana que sólo tomara teclas sería media interfaz.
+
+Tres piezas nuevas debajo: `AudioEngine::start_embedded` devuelve el estado RT
+para que lo maneje el llamador —`RtState::render` nunca supo del dispositivo—,
+`choz-ui` pasa a ser lib + bin (`main.rs` son cuatro líneas), y `choz_ui::embed`
+es la superficie mínima que el plugin necesita.
+
+**Nada acá puede re-ejecutar `current_exe`.** Embebido eso es el DAW: el worker
+de escaneo, el probe de crashes y el sandbox de plugins arrancarían una segunda
+copia del host, con sus ventanas y su reclamo sobre la placa. Los tres
+descubrían por su cuenta que el binario no es un worker, **pagando un spawn
+fallido** —y ese spawn es justo lo que no puede pasar. Ahora hay un interruptor
+explícito (`choz_engine::set_embedded`) que se tira antes de que nada escanee.
+
+### Sabido y no resuelto
+
+- **Una instancia por proceso.** El transporte, los medidores y el lector del
+  secuenciador son singletons a propósito. Dos instancias del plugin en un DAW
+  comparten los tres, y la segunda en cablearse se queda con el MIDI de la
+  primera. Hacerlos por-instancia es tocar el motor, no este crate.
+- **La ventana necesita el plugin activado**: el rack se construye en `activate`,
+  que es el primer momento en que se conoce el sample rate.
 
 ## [1.3.10] — 2026-09-05
 

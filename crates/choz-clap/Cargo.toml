@@ -1,0 +1,33 @@
+[package]
+name = "choz-clap"
+version.workspace = true
+edition.workspace = true
+description = "choz itself, as a CLAP instrument: the whole rack inside a DAW, one stereo out per tab."
+
+[lib]
+# cdylib is the `.clap` itself; rlib so the ABI can be exercised by a test in
+# this process, without a DAW and without dlopen.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The raw CLAP ABI, the same way `choz-plugin-clap-export` writes it: the entry
+# point, a factory and a handful of extensions is the whole surface.
+clap-sys = "0.5"
+# The interface, as a library. A plugin is choz with the card, the terminal and
+# the command line taken away — see `choz_ui::embed`.
+choz-ui = { path = "../choz-ui" }
+choz-engine.workspace = true
+# The host writes MIDI on its audio thread and the rack reads it on the main
+# one, which is the crossing choz's own JACK MIDI port already makes this way.
+rtrb.workspace = true
+# The panels draw through a ratatui backend; this crate provides one that keeps
+# the cells instead of writing escape sequences — see `grid`.
+ratatui.workspace = true
+# The plugin's own window. The same protocol crate choz already embeds plugin
+# editors with, so nothing new is linked.
+x11rb = "0.13"
+anyhow.workspace = true
+
+[dev-dependencies]
+# The test loads this bundle the way a DAW does: choz's own CLAP host.
+choz-plugin-clap.workspace = true

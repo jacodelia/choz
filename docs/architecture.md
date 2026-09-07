@@ -69,7 +69,13 @@ choz is a Cargo **workspace** of nine crates (modelled on seqterm's
   Every host crate exposes the same shape — `scan_directory`, `read_params`, an
   instrument (`AudioSource`) and an effect (`FxProcessor`) — so the engine treats
   any plugin like anything else. None of them is behind a feature flag.
-- **`choz-ui`** — the ratatui TUI binary (`choz`). Depends on `choz-engine`.
+- **`choz-ui`** — the interface, as a **library** plus a four-line `choz`
+  binary. The split is what lets a plugin embed the same rack and the same
+  panels; `choz_ui::embed` is the surface it uses. Depends on `choz-engine`.
+- **`choz-clap`** — choz *itself* as a CLAP instrument: the whole rack inside
+  somebody else's host, sixteen stereo outs, an X11 window drawing the same
+  `ui()` through a cell-grid ratatui backend. See "Into a host: choz as a
+  plugin" below.
 
 ```
 choz/
@@ -135,9 +141,16 @@ choz/
 │   │   └── src/
 │   │       ├── shm.rs           # POSIX shared memory (shm_open + mmap, unlinked early)
 │   │       └── bridge.rs        # The block-exchange protocol, testable on a Vec<u8>
+│   ├── choz-clap/
+│   │   └── src/
+│   │       ├── lib.rs           # The CLAP ABI: 16 stereo outs, notes, state, gui
+│   │       ├── grid.rs          # A ratatui backend that keeps cells, not escapes
+│   │       └── gui.rs           # The X11 window that paints them, keys and pointer
 │   └── choz-ui/
 │       └── src/
-│           ├── main.rs          # App state, event loop, UI, mouse/keyboard, modals
+│           ├── lib.rs           # App state, event loop, UI, mouse/keyboard, modals
+│           ├── main.rs          # The `choz` command: four lines calling `run()`
+│           ├── embed.rs         # The surface a plugin drives the same rack through
 │           ├── editor.rs        # X11 window thread hosting a plugin's own GUI
 │           ├── source.rs        # Instrument model, AudioFxKind, FxCategory, param descs
 │           ├── project.rs       # choz-project.yml save model (serde_yaml)
@@ -459,6 +472,35 @@ there: the rows drew, the clicks did nothing.
 `ponytail:` a slot's `in_pair` indexes that flat list, so unplugging a card
 shifts what a saved project points at. Names in the project would fix it; a
 rescan is the honest workaround until someone hits it.
+
+### Into a host: choz as a plugin
+
+`choz-clap` is the third CLAP direction. `choz-plugin-clap` is choz *loading*
+somebody's plugin; `choz-plugin-clap-export` publishes choz's effects one at a
+time; this one publishes **the rack**.
+
+It works because two seams already existed and neither knew about plugins:
+
+- `RtState::render` never knew about the device. It fills one buffer per output
+  channel and the backends copy; `AudioEngine::start_embedded` hands that state
+  to the caller instead of to a stream, and the host's `process` drives it.
+  Sixteen stereo pairs out, so a tab routed with `set_slot_out` lands on its own
+  track in the DAW.
+- `ui()` never knew about the terminal. It draws through any ratatui backend —
+  the tests use `TestBackend` — so the plugin has one that keeps the cells, and
+  an X11 window paints them with a core font.
+
+What runs where is the split choz already had: the interface half on the host's
+main thread (a 16 ms CLAP timer, or `on_main_thread` where the host runs no
+timers), the RT half in `process` and nowhere else, and the same command ring
+between them that a sound card imposes. The host's notes cross on an `rtrb`
+ring, the way choz's own JACK MIDI port already crosses.
+
+**Nothing in an embedded choz may re-run `current_exe`.** The scan worker, the
+crash probe and the plugin sandbox all spawn a child of this executable, which
+is right for the `choz` command and wrong inside a DAW — there the child is
+another copy of the host. `choz_engine::set_embedded` is thrown before anything
+scans, and all three consult it.
 
 ### Out of choz: the CLAP bundle
 

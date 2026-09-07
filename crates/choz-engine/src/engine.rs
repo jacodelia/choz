@@ -321,6 +321,10 @@ const CMD_RING: usize = 512;
 pub enum AudioBackend {
     Alsa,
     Jack,
+    /// No backend at all: the rack is inside somebody else's host, which calls
+    /// it with a block and takes the audio back. See
+    /// [`AudioEngine::start_embedded`].
+    Embedded,
 }
 
 impl AudioBackend {
@@ -328,6 +332,7 @@ impl AudioBackend {
         match self {
             AudioBackend::Alsa => "ALSA",
             AudioBackend::Jack => "JACK",
+            AudioBackend::Embedded => "HOST",
         }
     }
 }
@@ -554,6 +559,62 @@ impl Default for Bus {
 }
 
 /// State owned by the real-time audio callback. No locks, no allocation.
+/// The rack with the host holding the clock: what [`AudioEngine::start_embedded`]
+/// hands back.
+///
+/// It owns the RT state the way a backend's callback owns it, and for the same
+/// reason nothing else may touch it: every method here is called from the
+/// host's audio thread and none of them allocate. The `AudioEngine` it came
+/// from stays on the other side of the command ring, edited from wherever the
+/// interface runs, exactly as it is with a device.
+pub struct EmbeddedRt {
+    rt: RtState,
+}
+
+impl EmbeddedRt {
+    /// Render one block. Drains whatever the interface queued since the last
+    /// one, sounds every slot, and leaves the result in [`Self::output`].
+    ///
+    /// Never hand it more frames than the `max_frames` the engine was started
+    /// with: the buffers were sized once, and `render` writes what fits.
+    ///
+    /// The same three steps every backend's callback takes, in the same order —
+    /// see `audio_callback`. The load meter is published here too: a rack
+    /// running out of time inside a DAW is worth the same report as one running
+    /// out of time on its own, and it is the only place the block can be timed.
+    /// There is no `drain_capture`: an embedded rack is handed its input
+    /// directly through [`Self::capture_mut`], with no second clock to cross.
+    pub fn render(&mut self, frames: usize) {
+        let started = std::time::Instant::now();
+        let cpu_started = crate::meter::cpu_micros();
+        let frames = frames.min(self.max_frames());
+        self.rt.apply_commands();
+        self.rt.render(frames);
+        publish_load(started, cpu_started, frames, self.rt.sample_rate);
+    }
+
+    /// The largest block this rack was built for.
+    pub fn max_frames(&self) -> usize {
+        self.rt.mix.first().map(Vec::len).unwrap_or(0)
+    }
+
+    /// One rendered output channel. Pairs are `(2 * n, 2 * n + 1)`, so an
+    /// embedded rack's *n*-th stereo out is two calls.
+    pub fn output(&self, channel: usize) -> &[f32] {
+        self.rt.mix.get(channel).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Where the host writes one channel of live input **before** `render`.
+    /// Empty when the rack was started with no inputs.
+    pub fn capture_mut(&mut self, channel: usize) -> &mut [f32] {
+        self.rt
+            .capture
+            .get_mut(channel)
+            .map(Vec::as_mut_slice)
+            .unwrap_or(&mut [])
+    }
+}
+
 pub(crate) struct RtState {
     pub(crate) playing: Arc<AtomicBool>,
     pub(crate) cmd_rx: rtrb::Consumer<EngineCommand>,
@@ -844,6 +905,57 @@ impl AudioEngine {
             self.output_device.as_deref().unwrap_or("default"),
         );
         Ok(())
+    }
+
+    /// Start with **no device at all**: the caller drives the rack itself.
+    ///
+    /// This is what choz is inside somebody else's host. A plugin has no
+    /// stream to open and no card to pick — the DAW calls it with a block of
+    /// frames and expects the audio back — so instead of a backend this hands
+    /// the RT state straight to the caller, who calls [`EmbeddedRt::render`]
+    /// once per block. Everything else about the engine is unchanged: slots
+    /// are still added and edited through the same command ring, because the
+    /// ring is what the RT side reads, not the backend.
+    ///
+    /// `outs` is the number of output *channels*, so a Kontakt-style sixteen
+    /// stereo pairs is `32`. `ins` is how many channels the host will write
+    /// into [`EmbeddedRt::capture_mut`] before each block. `max_frames` is the
+    /// largest block the host may ask for, which sizes every buffer once —
+    /// nothing here allocates again.
+    pub fn start_embedded(
+        &mut self,
+        outs: usize,
+        ins: usize,
+        max_frames: u32,
+    ) -> Result<EmbeddedRt> {
+        choz_ports::transport().set_sample_rate(self.sample_rate);
+        // `new_rt_state` sizes its buffers off `buffer_size`, and in a plugin
+        // the host's largest block is the only number that matters.
+        self.buffer_size = max_frames;
+        let ep = self
+            .rt_endpoints
+            .take()
+            .context("audio engine already started")?;
+        let outs = outs.max(2);
+        let rt = self.new_rt_state(ep, outs, ins, None);
+        self._stream = None;
+        self.backend = AudioBackend::Embedded;
+        // No graph, so no ports choz can publish and nothing to wire: a host
+        // that wants MIDI out of an embedded rack sends it back through its own
+        // graph, not through a client of ours.
+        self.jack_midi = None;
+        self.out_channels = outs;
+        // Every pair is a real output here — there is no sink whose channels
+        // stop partway and leave the rest as direct outs.
+        self.sink_channels = outs;
+        self.in_channels = ins;
+        // Named for what it is, so the IN drawer reads `host:in_1` rather than
+        // pointing at a card that is not there: embedded, the live audio a tab
+        // can listen to is whatever the DAW puts on the track.
+        self.input_device = (ins > 0).then(|| "host".to_string());
+        self.input_ports = self.cpal_input_labels(ins);
+        self.output_device = None;
+        Ok(EmbeddedRt { rt })
     }
 
     /// Open the native JACK client: one port per device channel, wired to the
@@ -3720,6 +3832,64 @@ mod tests {
     /// to overwrite what it was given — a plugin with nothing to play may add
     /// to it or leave it alone. Either way the input would leak out next to the
     /// synth, which is the one thing this mode exists to prevent.
+    /// The rack with no device under it: [`AudioEngine::start_embedded`] hands
+    /// back the RT state, and a block rendered through it lands on the pair the
+    /// tab was routed to and nowhere else.
+    ///
+    /// That routing *is* the feature. Sixteen stereo pairs on a plugin are what
+    /// puts each tab on its own track in the host, the way a sampler's
+    /// individual outs do — and a tab whose audio also leaked into the main
+    /// pair would be heard twice.
+    #[test]
+    fn an_embedded_rack_puts_each_tab_on_its_own_pair() {
+        let _clock = crate::test_locks::transport();
+        let _meter = crate::test_locks::meter();
+
+        /// Something loud enough to find, with no file behind it.
+        struct Tone;
+        impl AudioSource for Tone {
+            fn render(&mut self, out: &mut [f32], _sr: u32) -> usize {
+                out.fill(0.5);
+                out.len() / 2
+            }
+            fn plays_on_transport_stop(&self) -> bool {
+                true
+            }
+        }
+
+        // Sixteen stereo pairs, the shape a host sees.
+        let mut engine = AudioEngine::new(48_000, 64);
+        let mut rt = engine
+            .start_embedded(32, 0, 64)
+            .expect("an embedded rack needs no device");
+        assert_eq!(engine.output_channels(), 32);
+        assert_eq!(rt.max_frames(), 8192, "buffers are sized once, generously");
+
+        assert_eq!(engine.add_slot(Box::new(Tone)), Some(0));
+        // Pair 3 is channels 6 and 7 — the fourth stereo out.
+        engine.set_slot_out(0, 6, 7);
+        engine.set_playing(true);
+        rt.render(64);
+
+        // Centre-panned, so both sides come back down the equal-power law.
+        let want = 0.5 * 0.5f32.sqrt();
+        assert!(
+            rt.output(6)[..64].iter().all(|s| (*s - want).abs() < 1e-6),
+            "the tab did not reach its own pair: {:?}",
+            &rt.output(6)[..8]
+        );
+        assert!(
+            rt.output(7)[..64].iter().all(|s| (*s - want).abs() < 1e-6),
+            "only half of the pair carried it: {:?}",
+            &rt.output(7)[..8]
+        );
+        assert!(
+            rt.output(0)[..64].iter().all(|s| s.abs() < 1e-6),
+            "and it leaked into the main pair: {:?}",
+            &rt.output(0)[..8]
+        );
+    }
+
     #[test]
     fn audio_to_midi_does_not_leak_the_input() {
         // Shares the process-wide transport: `render` advances it.

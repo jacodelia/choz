@@ -1,25 +1,178 @@
-//! Hardware MIDI input via midir.
+//! MIDI input, straight off the ALSA sequencer.
 //!
-//! The midir callback runs on its own thread, so it can't touch the engine's
-//! single-producer note ring directly. It forwards parsed note events over a
-//! `flume` channel; the UI loop drains that channel and calls `engine.note_on`
-//! (the sole producer of the RT note ring).
+//! The reader thread can't touch the engine's single-producer note ring, so it
+//! forwards parsed events over a `flume` channel; the UI loop drains that
+//! channel and calls `engine.note_on` (the sole producer of the RT note ring).
+//!
+//! **Why not midir.** midir gives every open port its own sequencer client, its
+//! own queue and its own thread, and closing one *joins* that thread from the
+//! UI. choz hit both ends of that. An event the kernel left stamped in ticks —
+//! which is what Ardour and REAPER send — panics midir's reader on an `unwrap`
+//! of the timestamp, and the join that follows either panics in turn or waits
+//! forever on a thread that will never answer: a frozen TUI with nothing in the
+//! log. Here there is one client and one thread, the thread is never stopped,
+//! and reconnecting is a subscription change made from outside — exactly what
+//! `aconnect` does. Output still goes through midir, which never reads.
 
 pub use crate::input::{BendMsg, CcMsg, ClockMsg, InputEvent, InputSource, NoteMsg, ProgramMsg};
+
+use alsa::seq::{
+    Addr, ClientIter, EventType, MidiEvent, PortCap, PortIter, PortSubscribe, PortType, Seq,
+};
+use std::collections::HashMap;
+use std::ffi::CString;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+/// The name of the sequencer port choz publishes for other programs to play.
+///
+/// ALSA's sequencer only lets a program *subscribe to* ports that already
+/// exist, and a DAW's MIDI output is not one of them: REAPER opens the devices
+/// it was told to and publishes nothing anybody else can send to. So choz
+/// publishes the port instead — the DAW picks "choz MIDI IN" out of its device
+/// list, and the sequence plays a rack tab with no loopback module, no
+/// `a2jmidid`, and no JACK graph.
+///
+/// **Created and deleted only by the MENU → MIDI IN switch**, never by a
+/// reconnect. A port destroyed and remade every time somebody touches a USB
+/// cable would drop the DAW's subscription with it, silently, because nothing
+/// on either side reports that.
+pub const VIRTUAL_IN_PORT: &str = "choz MIDI IN";
+
+/// The reader thread's client and the port it never gives up: choz's own end
+/// of every subscription [`connect_inputs`] makes. The published port comes and
+/// goes with the MENU → MIDI IN switch, so it lives in [`Routes::published`].
+#[derive(Clone, Copy)]
+struct Ports {
+    client: i32,
+    hw: i32,
+}
+
+/// Started at the first connect, never stopped. `None` when this machine has no
+/// sequencer to open (a container without `snd-seq`), which is not an error —
+/// choz runs, it just has nothing to listen to.
+static READER: OnceLock<Option<Ports>> = OnceLock::new();
+
+/// Everything the reader thread needs to place what it reads. Rewritten whole
+/// by every [`connect_inputs`], which is the only thing that ever moves.
+struct Routes {
+    /// Where parsed events go. Taken from the latest [`connect_inputs`] rather
+    /// than from the one that started the thread, so the reader can never hold
+    /// a channel whose other end has been dropped.
+    sink: Option<flume::Sender<InputEvent>>,
+    /// The entry [`VIRTUAL_IN_PORT`] belongs to, or `None` while it is
+    /// switched off.
+    virt: Option<usize>,
+    /// The published port's number while it exists, written by the reader —
+    /// the only thread allowed to create or delete it, because ALSA lets no
+    /// other client touch a port's existence.
+    published: Option<i32>,
+    /// One entry per subscribed sender. `InputSource::Midi(i)` indexes the name
+    /// list `connect_inputs` returned, and this is what keeps the two aligned.
+    ///
+    /// ponytail: a Vec scanned start to finish, not a map — it holds one entry
+    /// per plugged-in controller, and the scan happens once per MIDI message.
+    hw: Vec<(Addr, usize)>,
+}
+
+static ROUTES: Mutex<Routes> = Mutex::new(Routes {
+    sink: None,
+    virt: None,
+    published: None,
+    hw: Vec::new(),
+});
+
+/// Whether [`VIRTUAL_IN_PORT`] should be on the sequencer at all. Outside
+/// [`ROUTES`] on purpose: [`poke`] waits for the reader to act on it, and the
+/// reader needs that lock to do so.
+static VIRT_WANTED: AtomicBool = AtomicBool::new(true);
+
+/// The reader saying it has read [`VIRT_WANTED`] and done what it says.
+///
+/// ponytail: one slot, and a poke drains it before sending — a queue of acks
+/// would only ever be answering a question nobody is still asking.
+fn ack() -> &'static (flume::Sender<()>, flume::Receiver<()>) {
+    static ACK: OnceLock<(flume::Sender<()>, flume::Receiver<()>)> = OnceLock::new();
+    ACK.get_or_init(|| flume::bounded(1))
+}
+
+/// Wake the reader and wait for it to publish or unpublish the port.
+///
+/// The reader sits blocked in `event_input`, so the way to reach it is to send
+/// it an event. `Usr0` is a sequencer-private type that cannot come off a MIDI
+/// cable, which is what makes it unmistakable at the other end.
+fn poke(ctl: &Seq, ports: Ports) {
+    let Ok(port) = ctl.create_simple_port(
+        c"poke",
+        PortCap::READ,
+        PortType::MIDI_GENERIC | PortType::APPLICATION,
+    ) else {
+        return;
+    };
+    while ack().1.try_recv().is_ok() {}
+    let mut ev = alsa::seq::Event::new(EventType::Usr0, &[0u8; 12]);
+    ev.set_source(port);
+    ev.set_dest(Addr {
+        client: ports.client,
+        port: ports.hw,
+    });
+    ev.set_direct();
+    if ctl.event_output_direct(&mut ev).is_err() {
+        return;
+    }
+    // Bounded: a reader that has stopped must not take the UI down with it. The
+    // port list is redrawn either way, and one that is a beat stale is a far
+    // smaller problem than a rack that stops answering the keyboard.
+    let _ = ack().1.recv_timeout(std::time::Duration::from_millis(500));
+}
+
+/// A sequencer client that only looks and wires. Opening one is cheap, and the
+/// subscriptions it makes outlive it — `aconnect` exits too.
+fn control_client(name: &str) -> Option<Seq> {
+    let seq = Seq::open(None, None, true).ok()?;
+    let _ = seq.set_client_name(&CString::new(name).ok()?);
+    Some(seq)
+}
+
+/// Every port on the machine that can *send* MIDI, with the name choz shows.
+///
+/// The name keeps midir's shape — `"Client:Port n:m"` — because that is what
+/// the saved "switched off" list has in it.
+fn sources(seq: &Seq) -> Vec<(Addr, String)> {
+    ClientIter::new(seq)
+        .flat_map(|c| PortIter::new(seq, c.get_client()))
+        .filter(|p| {
+            p.get_type()
+                .intersects(PortType::MIDI_GENERIC | PortType::SYNTH | PortType::APPLICATION)
+        })
+        .filter(|p| {
+            p.get_capability()
+                .contains(PortCap::READ | PortCap::SUBS_READ)
+        })
+        .filter_map(|p| {
+            let client = seq.get_any_client_info(p.get_client()).ok()?;
+            let name = format!(
+                "{}:{} {}:{}",
+                client.get_name().ok()?,
+                p.get_name().ok()?,
+                p.get_client(),
+                p.get_port()
+            );
+            Some((p.addr(), name))
+        })
+        .collect()
+}
 
 /// All available MIDI **input** port names (what devices we can listen to).
 pub fn list_input_ports() -> Vec<String> {
     // choz's own published port leads the list, because that is where
     // `connect_inputs` puts it — and being *in* the list is what gives it a row
-    // under MENU → MIDI IN to switch off. Named unconditionally on unix: the
-    // row has to exist for the port to be switched back *on* after it was
-    // switched off, and switched off is exactly when it is not open.
-    let mut ports = match cfg!(unix) {
-        true => vec![VIRTUAL_IN_PORT.to_string()],
-        false => Vec::new(),
-    };
-    if let Ok(m) = midir::MidiInput::new("choz-scan-in") {
-        ports.extend(m.ports().iter().filter_map(|p| m.port_name(p).ok()));
+    // under MENU → MIDI IN to switch off. Named unconditionally: the row has to
+    // exist for the port to be switched back *on* after it was switched off.
+    let mut ports = vec![VIRTUAL_IN_PORT.to_string()];
+    if let Some(seq) = control_client("choz-scan") {
+        // choz's own two ports are write-only, so they are not in here twice.
+        ports.extend(sources(&seq).into_iter().map(|(_, name)| name));
     }
     ports
 }
@@ -36,162 +189,235 @@ pub fn list_output_ports() -> Vec<String> {
     }
 }
 
-/// Connect to every MIDI input port except those named in `disabled`, so any
+/// Subscribe to every MIDI input port except those named in `disabled`, so any
 /// plugged-in controller drives the synth (Carla-style — no manual wiring
-/// needed). Returns the connected port names and their live connections (which
-/// must be kept alive). Each port needs its own `MidiInput` because `connect`
-/// consumes it.
-pub fn connect_inputs(
-    tx: flume::Sender<InputEvent>,
-    disabled: &[String],
-) -> (Vec<String>, Vec<midir::MidiInputConnection<()>>) {
-    let mut names = Vec::new();
-    let mut conns = Vec::new();
+/// needed). Returns the connected port names, which `InputSource::Midi(i)`
+/// indexes into.
+///
+/// Nothing here is a handle the caller has to hold on to: the reader thread
+/// owns the only client that matters and outlives every call. Calling it again
+/// is how a port is switched off — the subscription goes, the thread stays.
+pub fn connect_inputs(tx: flume::Sender<InputEvent>, disabled: &[String]) -> Vec<String> {
+    // Set before the reader is even started, so its first look is the right
+    // one and a choz that opens with the port switched off never publishes it.
+    let publish = !is_disabled(VIRTUAL_IN_PORT, disabled);
+    let toggled = VIRT_WANTED.swap(publish, Ordering::Relaxed) != publish;
 
-    // choz's own port, first in the list and therefore always
-    // `InputSource::Midi(0)` — see [`open_virtual_input`], which is why the
-    // callback it made can keep sending that index for the life of the process.
-    match is_disabled(VIRTUAL_IN_PORT, disabled) {
-        // Switched off means *gone*: a port left open while the hardware takes
-        // index 0 would keep sending events tagged as somebody else's keyboard.
-        true => drop(VIRTUAL.lock().map(|mut v| v.take())),
-        false => {
-            if open_virtual_input(tx.clone()) {
-                names.push(VIRTUAL_IN_PORT.to_string());
-            }
-        }
-    }
-
-    let Ok(scan) = midir::MidiInput::new("choz-scan") else {
-        return (names, conns);
+    let Some(ports) = reader() else {
+        return Vec::new();
     };
-    let wanted: Vec<String> = scan
-        .ports()
-        .iter()
-        .filter_map(|p| scan.port_name(p).ok())
-        .filter(|n| !is_disabled(n, disabled))
-        .collect();
-
-    for want in wanted {
-        // Fresh MidiInput per port; re-find the port by name on this instance.
-        let Ok(mi) = midir::MidiInput::new("choz-in") else {
-            continue;
-        };
-        let Some(port) = mi
-            .ports()
-            .into_iter()
-            .find(|p| mi.port_name(p).as_deref() == Ok(want.as_str()))
-        else {
-            continue;
-        };
-        let txc = tx.clone();
-        // Bank Select arrives as its own CC just before the program change, so
-        // the port's last MSB is remembered here to travel with it. ponytail:
-        // MSB only — SF2 banks are 0..128 and the LSB is what this keyboard
-        // (and most others) always leaves at 0.
-        let mut bank = 0u8;
-        // The clock is counted here rather than upstream: this callback is
-        // handed the port's own timestamp, and it is the last place that number
-        // is honest — a pulse read from a UI loop has that loop's jitter in it.
-        let mut clock = ClockCounter::default();
-        // Each connection tags its events with its index in `names`, which is
-        // the list the caller gets back — so index ↔ port name stay aligned.
-        let source = InputSource::Midi(names.len());
-        match mi.connect(
-            &port,
-            "choz-in-conn",
-            move |_ts, data, _| {
-                if let Some(msg) = clock.feed(data, _ts) {
-                    let _ = txc.send(InputEvent::Clock(source, msg));
-                    return;
-                }
-                if let Some(event) = event_of(data, source, &mut bank) {
-                    let _ = txc.send(event);
-                }
-            },
-            (),
-        ) {
-            Ok(c) => {
-                names.push(want);
-                conns.push(c);
-            }
-            Err(e) => eprintln!("choz: MIDI connect '{want}' failed: {e}"),
-        }
+    let Some(ctl) = control_client("choz-wire") else {
+        return Vec::new();
+    };
+    // Before the lock, never under it: acting on the switch is the reader's
+    // job, and the reader needs that lock to say it has.
+    if toggled {
+        poke(&ctl, ports);
     }
-    (names, conns)
+    let dest = Addr {
+        client: ports.client,
+        port: ports.hw,
+    };
+    let Ok(mut routes) = ROUTES.lock() else {
+        return Vec::new();
+    };
+    routes.sink = Some(tx);
+
+    // Drop what the last call wired: a port switched off, or unplugged, has to
+    // stop arriving. Unsubscribing a port that is already gone fails, which is
+    // the outcome we wanted anyway.
+    for (addr, _) in routes.hw.drain(..) {
+        let _ = ctl.unsubscribe_port(addr, dest);
+    }
+
+    let mut names = Vec::new();
+    // choz's own port, first in the list when it is on — and the index stored
+    // here is what the reader tags its events with, so the two cannot drift.
+    routes.virt = match publish {
+        false => None,
+        true => {
+            names.push(VIRTUAL_IN_PORT.to_string());
+            Some(0)
+        }
+    };
+
+    for (addr, name) in sources(&ctl) {
+        if addr.client == ports.client || is_disabled(&name, disabled) {
+            continue;
+        }
+        let Ok(sub) = PortSubscribe::empty() else {
+            continue;
+        };
+        sub.set_sender(addr);
+        sub.set_dest(dest);
+        if let Err(e) = ctl.subscribe_port(&sub) {
+            eprintln!("choz: MIDI subscribe '{name}' failed: {e}");
+            continue;
+        }
+        routes.hw.push((addr, names.len()));
+        names.push(name);
+    }
+    names
 }
 
-/// The name of the sequencer port choz publishes for other programs to play.
-///
-/// ALSA's sequencer only lets a program *subscribe to* ports that already
-/// exist, and a DAW's MIDI output is not one of them: REAPER opens the devices
-/// it was told to and publishes nothing anybody else can send to. So choz
-/// publishes the port instead — the DAW picks "choz MIDI IN" out of its device
-/// list, and the sequence plays a rack tab with no loopback module, no
-/// `a2jmidid`, and no JACK graph.
-pub const VIRTUAL_IN_PORT: &str = "choz MIDI IN";
+/// The client every input arrives on, opened once for the life of the process.
+fn reader() -> Option<Ports> {
+    *READER.get_or_init(|| {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("choz MIDI in".into())
+            .spawn(move || run(ready_tx))
+            .ok()?;
+        // The ports have to exist before the caller can wire anything to them.
+        ready_rx.recv().ok()?
+    })
+}
 
-/// The port itself, opened once and kept for the life of the process.
-///
-/// **Not re-opened by a reconnect.** [`connect_inputs`] runs again whenever a
-/// controller is plugged in or out, and a virtual port that was destroyed and
-/// remade there would drop the DAW's subscription every time somebody touched
-/// a USB cable — silently, because nothing on either side reports it.
-static VIRTUAL: std::sync::Mutex<Option<midir::MidiInputConnection<()>>> =
-    std::sync::Mutex::new(None);
+/// The client and the port the reader always has.
+fn open_ports() -> Option<(Seq, Ports)> {
+    // Blocking: this thread has nothing to do but wait for the next event.
+    let seq = Seq::open(None, None, false).ok()?;
+    let _ = seq.set_client_name(&CString::new("choz").ok()?);
+    // SUBS_WRITE because the wiring is done by a *different* client (see
+    // `connect_inputs`), and the kernel only lets a third party subscribe to a
+    // port that says it accepts subscriptions.
+    let hw = seq
+        .create_simple_port(
+            c"in",
+            PortCap::WRITE | PortCap::SUBS_WRITE,
+            PortType::MIDI_GENERIC | PortType::APPLICATION,
+        )
+        .ok()?;
+    let client = seq.client_id().ok()?;
+    Some((seq, Ports { client, hw }))
+}
 
-/// Open it if it is not open yet. `true` once there is a port to name.
-fn open_virtual_input(tx: flume::Sender<InputEvent>) -> bool {
-    #[cfg(unix)]
-    {
-        use midir::os::unix::VirtualInput;
-        let Ok(mut held) = VIRTUAL.lock() else {
-            return false;
-        };
-        if held.is_some() {
-            return true;
+/// Publish or unpublish [`VIRTUAL_IN_PORT`] to match the switch, and record
+/// where it ended up. Runs on the reader thread and nowhere else: ALSA lets
+/// only the owning client create or delete one of its ports.
+///
+/// Switched off the port is **gone**, not merely ignored. A port left on the
+/// sequencer while choz drops what arrives on it is a DAW playing into silence
+/// with nothing to show for it — the switch has to be visible from the other
+/// side of the wire.
+fn republish(seq: &Seq, published: Option<i32>) -> Option<i32> {
+    let published = match (VIRT_WANTED.load(Ordering::Relaxed), published) {
+        (true, None) => CString::new(VIRTUAL_IN_PORT).ok().and_then(|name| {
+            seq.create_simple_port(
+                &name,
+                PortCap::WRITE | PortCap::SUBS_WRITE,
+                PortType::MIDI_GENERIC | PortType::APPLICATION,
+            )
+            .ok()
+        }),
+        (false, Some(port)) => {
+            let _ = seq.delete_port(port);
+            None
         }
-        let Ok(mi) = midir::MidiInput::new("choz") else {
-            return false;
-        };
-        // Index 0, fixed: this port is the first entry of every list
-        // `connect_inputs` returns, and it outlives all of them.
-        let source = InputSource::Midi(0);
-        let mut bank = 0u8;
-        let mut clock = ClockCounter::default();
-        match mi.create_virtual(
-            VIRTUAL_IN_PORT,
-            move |ts, data, _| {
-                if let Some(msg) = clock.feed(data, ts) {
-                    let _ = tx.send(InputEvent::Clock(source, msg));
-                    return;
-                }
-                if let Some(event) = event_of(data, source, &mut bank) {
-                    let _ = tx.send(event);
-                }
-            },
-            (),
-        ) {
-            Ok(c) => {
-                *held = Some(c);
-                true
-            }
+        (_, unchanged) => unchanged,
+    };
+    if let Ok(mut routes) = ROUTES.lock() {
+        routes.published = published;
+    }
+    published
+}
+
+/// Read the sequencer until the process ends.
+fn run(ready: std::sync::mpsc::Sender<Option<Ports>>) {
+    let Some((seq, ports)) = open_ports() else {
+        let _ = ready.send(None);
+        return;
+    };
+    let _ = ready.send(Some(ports));
+
+    let Ok(coder) = MidiEvent::new(0) else { return };
+    // Full status byte on every message: `parse` reads one message at a time
+    // and has no running status to carry between them.
+    coder.enable_running_status(false);
+
+    // Per sender: its last Bank Select MSB, and its clock. Both belong to the
+    // *port* rather than to the note — see `event_of` and `ClockCounter`.
+    let mut state: HashMap<Addr, (u8, ClockCounter)> = HashMap::new();
+    // ponytail: choz stamps arrivals off its own monotonic clock rather than
+    // asking ALSA to stamp them. Asking means a queue per port, and an event
+    // whose queue is gone keeps the sender's tick stamp — the exact event midir
+    // unwrapped on. One thread hop of jitter, averaged over 24 pulses.
+    let start = std::time::Instant::now();
+    let mut published = republish(&seq, None);
+    let mut input = seq.input();
+    loop {
+        let mut ev = match input.event_input() {
+            Ok(ev) => ev,
+            // The input buffer overran, or the wait was interrupted: the
+            // sequencer is still there, so read the next one.
+            Err(e) if matches!(e.errno(), libc::ENOSPC | libc::EAGAIN | libc::EINTR) => continue,
             Err(e) => {
-                eprintln!("choz: cannot publish '{VIRTUAL_IN_PORT}': {e}");
-                false
+                eprintln!("choz: MIDI reader stopped: {e}");
+                return;
             }
+        };
+        // `connect_inputs` asking for the published port to appear or go away
+        // — the one thing only this thread can do. It waits for the answer, so
+        // the answer goes out even when nothing had to change.
+        if ev.get_type() == EventType::Usr0 {
+            published = republish(&seq, published);
+            let _ = ack().0.try_send(());
+            continue;
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tx;
-        false
+        // A subscription coming or going is the sequencer talking about itself.
+        if matches!(
+            ev.get_type(),
+            EventType::PortSubscribed | EventType::PortUnsubscribed
+        ) {
+            continue;
+        }
+        let sender = ev.get_source();
+        // One look at the routing per message, and the channel comes out of the
+        // same look: a reconnect swaps both at once, under this lock.
+        let (index, sink) = {
+            let Ok(routes) = ROUTES.lock() else { continue };
+            let index = match Some(ev.get_dest().port) == published {
+                // `None` is the published port switched off under MENU → MIDI
+                // IN; on the other side, a sender wired by somebody else or
+                // unwired a moment ago. Neither is ours to forward.
+                true => routes.virt,
+                false => routes
+                    .hw
+                    .iter()
+                    .find(|(addr, _)| *addr == sender)
+                    .map(|(_, index)| *index),
+            };
+            match (index, routes.sink.clone()) {
+                (Some(index), Some(sink)) => (index, sink),
+                _ => continue,
+            }
+        };
+        let mut buf = [0u8; 12];
+        // Sysex is longer than the buffer and comes back as an error: choz has
+        // no use for it, and this is where it stops.
+        let Ok(len) = coder.decode(&mut buf, &mut ev) else {
+            continue;
+        };
+        let data = &buf[..len];
+        let stamp = start.elapsed().as_micros() as u64;
+        let source = InputSource::Midi(index);
+        let (bank, clock) = state.entry(sender).or_default();
+        // The clock is counted here rather than upstream: this is the last
+        // place the timestamp is honest — a pulse read from a UI loop has that
+        // loop's jitter in it.
+        if let Some(msg) = clock.feed(data, stamp) {
+            let _ = sink.send(InputEvent::Clock(source, msg));
+            continue;
+        }
+        if let Some(event) = event_of(data, source, bank) {
+            let _ = sink.send(event);
+        }
     }
 }
 
-/// Is this port switched off? midir names a port `"Client:Port n:m"`, so the
-/// saved `"Midi Through"` never matched the full name and the loopback port
-/// stayed connected. A saved entry disables the whole client when it names one.
+/// Is this port switched off? A port is named `"Client:Port n:m"`, so the saved
+/// `"Midi Through"` never matched the full name and the loopback port stayed
+/// connected. A saved entry disables the whole client when it names one.
 fn is_disabled(port: &str, disabled: &[String]) -> bool {
     disabled
         .iter()
@@ -386,7 +612,7 @@ enum Msg {
 /// **One translation, two ports.** The ALSA callback above and choz's own JACK
 /// MIDI input both come through here, so a note from a DAW on the graph and a
 /// note from a keyboard on a DIN cable become the same event by the same rules.
-pub(crate) fn event_of(data: &[u8], source: InputSource, bank: &mut u8) -> Option<InputEvent> {
+pub fn event_of(data: &[u8], source: InputSource, bank: &mut u8) -> Option<InputEvent> {
     match parse(data)? {
         Msg::Note {
             channel,
@@ -635,11 +861,25 @@ mod tests {
         );
     }
 
+    /// The name of every port choz's own reader client has on the sequencer.
+    ///
+    /// Matching on the port name alone is not enough: `cargo test` runs several
+    /// binaries at once, each with a sequencer client of its own called `choz`,
+    /// and one of them holding the published port says nothing about this one.
+    fn our_ports(client: i32) -> Vec<String> {
+        let Some(seq) = control_client("choz-test-scan") else {
+            return Vec::new();
+        };
+        PortIter::new(&seq, client)
+            .filter_map(|p| p.get_name().ok().map(str::to_string))
+            .collect()
+    }
+
     /// The port choz publishes: other programs must be able to *find* it, and
-    /// it must be the first name `connect_inputs` returns — the callback sends
-    /// `InputSource::Midi(0)` for the life of the process.
-    /// The two tests below open and close the *same* process-wide port, so
-    /// they cannot run at once.
+    /// it must be the first name `connect_inputs` returns — that index is what
+    /// the reader tags everything arriving on it with.
+    /// The two tests below rewire the *same* process-wide client, so they
+    /// cannot run at once.
     static PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -647,58 +887,114 @@ mod tests {
         let _g = PORT.lock().unwrap_or_else(|e| e.into_inner());
         // No sequencer in this environment (a container without snd-seq):
         // there is nothing to publish a port on, and nothing to assert.
-        if midir::MidiOutput::new("choz-test").is_err() {
+        if control_client("choz-test").is_none() {
             return;
         }
         let (tx, _rx) = flume::unbounded();
-        let (names, _conns) = connect_inputs(tx, &[]);
+        let names = connect_inputs(tx, &[]);
         assert_eq!(
             names.first().map(String::as_str),
             Some(VIRTUAL_IN_PORT),
             "{names:?}"
         );
-        // And a DAW sees it as somewhere to send: it is an output target from
-        // the other side of the wire.
-        let out = midir::MidiOutput::new("choz-test").unwrap();
-        let seen: Vec<String> = out
-            .ports()
-            .iter()
-            .filter_map(|p| out.port_name(p).ok())
-            .collect();
+        // And a DAW sees it as somewhere to send: it is really on the
+        // sequencer, under this process's own client.
+        let Some(ports) = *READER.get().expect("the reader is up") else {
+            return;
+        };
+        let seen = our_ports(ports.client);
         assert!(
-            seen.iter().any(|n| n.contains(VIRTUAL_IN_PORT)),
+            seen.iter().any(|n| n == VIRTUAL_IN_PORT),
             "the published port is not on the sequencer: {seen:?}"
         );
     }
 
-    /// Switched off under MENU → MIDI IN, the port goes away. It has to: its
-    /// callback tags everything `InputSource::Midi(0)`, and index 0 belongs to
-    /// the first hardware port the moment choz stops naming its own.
+    /// Switched off under MENU → MIDI IN, the port goes away. It has to be
+    /// visible from the other side of the wire: a port still on the sequencer
+    /// is a DAW playing into a rack that has stopped listening, with nothing
+    /// anywhere to say so.
     #[test]
     fn a_disabled_virtual_port_is_closed_not_just_hidden() {
         let _g = PORT.lock().unwrap_or_else(|e| e.into_inner());
-        let Ok(scan) = midir::MidiOutput::new("choz-test-off") else {
+        if control_client("choz-test-off").is_none() {
             return;
-        };
+        }
         let (tx, _rx) = flume::unbounded();
         let off = [VIRTUAL_IN_PORT.to_string()];
-        let (names, _conns) = connect_inputs(tx.clone(), &off);
+        let names = connect_inputs(tx.clone(), &off);
         assert!(
             !names.iter().any(|n| n == VIRTUAL_IN_PORT),
             "a disabled port is still named: {names:?}"
         );
-        let seen: Vec<String> = scan
-            .ports()
-            .iter()
-            .filter_map(|p| scan.port_name(p).ok())
-            .collect();
+        assert_eq!(
+            ROUTES.lock().unwrap().virt,
+            None,
+            "a disabled port still has an index to tag events with"
+        );
+        let Some(ports) = *READER.get().expect("the reader is up") else {
+            return;
+        };
+        let seen = our_ports(ports.client);
         assert!(
-            !seen.iter().any(|n| n.contains(VIRTUAL_IN_PORT)),
+            !seen.iter().any(|n| n == VIRTUAL_IN_PORT),
             "the port is still on the sequencer: {seen:?}"
         );
 
-        // And switching it back on publishes it again.
-        let (names, _conns) = connect_inputs(tx, &[]);
+        // And switching it back on names it first again.
+        let names = connect_inputs(tx, &[]);
         assert_eq!(names.first().map(String::as_str), Some(VIRTUAL_IN_PORT));
+        assert_eq!(ROUTES.lock().unwrap().virt, Some(0));
+    }
+
+    /// The bug this whole module exists for: a note sent to the published port
+    /// with **no real-time stamp** on it — which is what Ardour and REAPER
+    /// send, and what midir unwrapped a `None` out of, killing its reader
+    /// thread and then hanging the UI on the join that followed. A plain
+    /// direct event is stamped in ticks, so this is that event exactly.
+    #[test]
+    fn a_note_with_no_real_timestamp_arrives_instead_of_killing_the_reader() {
+        let _g = PORT.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(daw) = control_client("choz-test-daw") else {
+            return;
+        };
+        let (tx, rx) = flume::unbounded();
+        assert!(connect_inputs(tx, &[]).contains(&VIRTUAL_IN_PORT.to_string()));
+        let Some(ports) = *READER.get().expect("the reader is up") else {
+            return;
+        };
+        let published = ROUTES.lock().unwrap().published.expect("the port is up");
+        let Ok(out) = daw.create_simple_port(
+            c"out",
+            PortCap::READ | PortCap::SUBS_READ,
+            PortType::MIDI_GENERIC | PortType::APPLICATION,
+        ) else {
+            return;
+        };
+
+        let mut ev = alsa::seq::Event::new(
+            EventType::Noteon,
+            &alsa::seq::EvNote {
+                channel: 0,
+                note: 60,
+                velocity: 100,
+                off_velocity: 0,
+                duration: 0,
+            },
+        );
+        ev.set_source(out);
+        ev.set_dest(Addr {
+            client: ports.client,
+            port: published,
+        });
+        ev.set_direct();
+        daw.event_output_direct(&mut ev).expect("send");
+
+        match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(InputEvent::Note(n)) => {
+                assert_eq!((n.note, n.on, n.vel), (60, true, 100));
+                assert_eq!(n.source, InputSource::Midi(0));
+            }
+            other => panic!("the reader dropped the note: {other:?}"),
+        }
     }
 }

@@ -30,6 +30,7 @@ serde_json.workspace = true
 cpal.workspace = true
 jack.workspace = true
 midir.workspace = true
+alsa.workspace = true
 
 # Custom harness: this test re-runs itself as a plugin-scan worker, so it must
 # answer `scan_worker_main` before libtest would eat the arguments.
