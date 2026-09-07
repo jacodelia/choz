@@ -10,7 +10,7 @@ Built with Rust, ratatui and cpal. Provides a TUI for managing note inputs, inst
 
 ## Status
 
-**1.3.10.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
+**1.3.11.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
 LADSPA, DSSI, VST2, VST3 and Pure Data patches are really hosted** — instruments
 and audio effects, with their own parameters and their own windows — choz's own
 56 effects and both artifacts — the arpeggiator and the step sequencer — are
@@ -221,6 +221,7 @@ native binaries**: a Raspberry Pi loads plugins built for ARM, not the x86 ones.
 | What | Where | Why |
 |---|---|---|
 | `choz.clap` | `~/.clap` (script) or `/usr/lib/clap` (packages) | choz's own 56 effects plus the arpeggiator and step sequencer as note effects, usable from Bitwig, Reaper, Carla or any CLAP host. Every effect publishes its full knob list, so all of them are automatable and saveable from the host. `--no-clap` skips it. |
+| `choz-rack.clap` | the same places | **choz itself**, as a CLAP instrument: the whole rack on a track in the DAW, with its own window and **sixteen stereo outputs** — put a tab on pair 4 in the rack and it arrives on the host's fourth output, on its own track, the way a sampler's individual outs do. The track's own audio arrives as `host:in_1`/`in_2`, so a tab can process it and the rack is an effect chain too. The rack is saved with the host's session. |
 | Wallpapers | `<prefix>/share/choz/wallpapers` | A fresh install opens on the image choz ships with, and the picker starts there. |
 | `choz-pd-host` | next to `choz` | The only binary that links libpd — installed when libpd is present. |
 
@@ -340,6 +341,8 @@ choz/                      11 crates, version 1.3.6
 │   ├── choz-plugin-pd/     Pure Data patches as effects; `choz-pd-host` is the
 │   │                       only binary that links libpd (feature `pd`)
 │   ├── choz-plugin-clap-export/ choz's 56 effects + 2 artifacts, as one `.clap`
+│   ├── choz-clap/          choz *itself* as a CLAP instrument: the rack inside
+│   │                       a DAW, sixteen stereo outs, its own X11 window
 │   ├── choz-plugin-sandbox/ Shared-memory transport for out-of-process hosting
 │   │                       (audio blocks and the plugin's window)
 │   └── choz-ui/            The `choz` binary: TUI, rack, modals, drawers,
@@ -366,7 +369,7 @@ ring so they are freed off the RT thread.
 
 | | |
 |---|---|
-| choz | **1.3.10** |
+| choz | **1.3.11** |
 | Rust edition | 2021 (`choz-plugin-lv2` is 2024) |
 | Toolchain tested | rustc 1.97.1 |
 | Platform | Linux. ALSA/JACK/PipeWire. Released for x86-64, aarch64 and armv7 |
@@ -378,17 +381,18 @@ See [`CHANGELOG.md`](CHANGELOG.md) for what has landed so far.
 ## Tests
 
 ```bash
-cargo test --workspace              # 878 tests
+cargo test --workspace              # 894 tests
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 | Crate | Tests | Covers |
 |---|---|---|
-| `choz-engine` | 446 | 56 FX processors, mixer, sources, SFZ parser, preset files and where a plugin keeps them, the transport and the metronome, the looper deck and its takes on disk, plugin paths, scan cache, quarantine, sandbox, OSC socket |
-| `choz-ui` | 328 | Rack layout, parameter controls, modals, mouse hit-testing, MIDI learn (including the knob box paging under it), the mixer strips, note routing in both modes, project save/load, i18n, themes, background rendering, drawing at every terminal size, the installer script |
+| `choz-engine` | 450 | 56 FX processors, mixer, sources, SFZ parser, preset files and where a plugin keeps them, the transport and the metronome, the looper deck and its takes on disk, plugin paths, scan cache, quarantine, sandbox, OSC socket |
+| `choz-ui` | 330 | Rack layout, parameter controls, modals, mouse hit-testing, MIDI learn (including the knob box paging under it), the mixer strips, note routing in both modes, project save/load, i18n, themes, background rendering, drawing at every terminal size, the installer script |
 | `choz-plugin-lv2` | 34 | TTL parsing, hosting installed effects, `worker#schedule`, X11 editor discovery, state round-trip, `patch:Set` atoms from the UI |
 | `choz-plugin-ladspa` | 14 | LADSPA + DSSI descriptors and runtime, step names from the `.rdf` sidecar |
 | `choz-plugin-clap` | 13 | Effect and instrument runtime against installed plugins, window feed |
+| `choz-clap` | 10 | choz as an instrument: sixteen stereo outs offered to the host, the track's audio reaching the rack's input, an empty rack rendering silence, the rack saved and restored as the host's state, the X11 window with the panels drawn in it, keys, the pointer and colours crossing from X, no child of the host ever spawned, and a real host scanning the built bundle |
 | `choz-plugin-clap-export` | 9 | The bundle choz publishes: catalogue, parameters, a real host loading it |
 | `choz-plugin-vst3` | 9 | Factory info, parameter changes reaching the processor, run loop, runtime |
 | `choz-ports` | 8 | The shared types: parameter ranges, meters, the loop chunk |

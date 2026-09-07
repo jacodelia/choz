@@ -876,7 +876,7 @@ static GUI: clap_plugin_gui = clap_plugin_gui {
 const PLUGIN_ID: &str = "com.choz.rack\0";
 const PLUGIN_NAME: &[u8] = b"choz\0";
 const PLUGIN_VENDOR: &[u8] = b"choz\0";
-const PLUGIN_VERSION: &[u8] = b"1.3.10\0";
+const PLUGIN_VERSION: &[u8] = b"1.3.11\0";
 const PLUGIN_DESCRIPTION: &[u8] = b"The whole rack, one stereo output per tab, inside the host.\0";
 
 /// `instrument` and `stereo`, which is what a host filters its browser by.
