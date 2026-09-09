@@ -13,7 +13,7 @@ que no existe, una decisión de diseño y un fallo intermitente sin explicar—,
 decisiones de no hacer, y las notas para el que retome.
 
 Última actualización: 2026-09-09 (sampler de carpetas y su panel en el RACK,
-sin publicar).
+sin publicar; el arreglador, pedido y sin empezar).
 
 ## Estado en una línea
 
@@ -77,13 +77,13 @@ donde se van a leer.
 
 ## Pendiente
 
-**Ningún borde abierto.** Todo lo que se pidió está hecho y contado día por día
-en el [changelog](../CHANGELOG.md). Lo que queda son **tres cosas sin cerrar**
-—un test que no existe, una decisión que no es mía y un fallo que no supe
-reproducir—, los bordes que el sidechain deja fuera, y después las dos piezas
-que se decidió no hacer. Un
-punto que se cierra sale de aquí: este documento es lo que queda, no lo que
-hubo.
+**Ningún borde abierto de lo ya entregado.** Todo lo que se pidió está hecho y
+contado día por día en el [changelog](../CHANGELOG.md). Lo que queda son **tres
+cosas sin cerrar** —un test que no existe, una decisión que no es mía y un fallo
+que no supe reproducir—, los bordes que el sidechain deja fuera, lo que el
+sampler de carpetas todavía no hace, **el arreglador, que está pedido y sin
+empezar**, y después las dos piezas que se decidió no hacer. Un punto que se
+cierra sale de aquí: este documento es lo que queda, no lo que hubo.
 
 Las dos auditorías —la de DSP y la de guardado— viven enteras en
 [fx-audit.md](fx-audit.md), con el archivo y la línea de cada hallazgo: la
@@ -283,6 +283,136 @@ parámetros de instrumento como los de un plugin. Lo que le falta a eso:
   Son unos KB y un seek, y pasa una vez por región al construir el instrumento
   (110 veces para el violín); si alguna vez se siente, el arreglo es abrir el
   archivo una vez por instrumento y pasarlo entero.
+
+### 5 · El arreglador: una banda a partir de una progresión (pedido el 2026-09-09)
+
+**Un artefacto más, no un `seq.rs` más grande.** La idea es escribir una
+progresión y un estilo y que choz toque el resto:
+
+```text
+key = C
+style = major_blues
+
+|| I7 | IV7 | I7 | IV#7 | IV7 | IV#m7b5 | I7 VII7 | VIIb7 VI7 | IIm7 | V7 | I7 IIIb7 | II7 IIb7 ||
+```
+
+y de ahí salgan bajo, batería, comping de piano y/o guitarra, melodía y solo,
+cada uno como una parte MIDI propia. Referencia conceptual: Band-in-a-Box
+—progresión + estilo + variación = acompañamiento—, implementación nativa, sin
+copiar código, formatos ni contenido de nadie.
+
+#### Lo que dice la auditoría del secuenciador
+
+`artifacts/seq.rs` **no puede llevar esto adentro**, y conviene decirlo antes de
+empezar a escribir: un `Pattern` son 8 pistas × 16 pasos, y la altura de cada
+pista es un solo número para todo el proyecto (`SeqSettings::notes: [u8; 8]`).
+Es una grilla de carriles con una nota fija cada uno —perfecta para una batería
+o un ostinato— y no tiene dónde poner un walking bass, un voicing de cuatro
+notas ni un solo: eso necesita altura arbitraria por evento, compases
+encadenados y acordes que cambian dentro del compás. Forzarlo sería reescribir
+`Seq`, que es justamente lo que no hay que hacer.
+
+Lo que **sí** se reutiliza, porque ya es el contrato de un artefacto:
+
+- `tick(now, &mut Vec<ArpEvent>)` contra el reloj único. `ArpEvent::On/Off`
+  lleva `note`, `vel` y `at` (muestra de transporte), que es exactamente lo que
+  el arreglador tiene para decir.
+- El transporte, el swing y la división temporal ya existen y son de `Seq`/`Arp`.
+  **No** se crea otro reloj.
+- `parts` + `song: Vec<usize>` es la forma (`A A B A`) y el concepto se copia,
+  no la estructura: el arreglador tiene sus propias partes generadas.
+- La exportación CLAP: `choz-plugin-clap-export` ya publica los artefactos como
+  *note plugins* sin puertos de audio. **Los dos artefactos pasan a ser tres.**
+
+#### Punto de integración
+
+```text
+texto → parser → armonía → progresión → estilo → generadores → eventos horneados
+                                                                      ↓
+                                                        tick() los lee, no los calcula
+                                                                      ↓
+                                                    ArpEvent → slot / SF2 / CLAP host
+```
+
+`crates/choz-engine/src/artifacts/arranger/`, hermano de `arp` y `seq`. Módulos
+sólo cuando ganen su lugar: arrancar con `mod.rs` + `chord.rs` (parser y
+armonía) + `style.rs` + `generate.rs`, y separar `bass`/`drums`/`comping`
+cuando el archivo pese, no antes.
+
+**Decisión abierta: cómo salen seis partes por un puerto de notas.** Un
+artefacto vive en una pestaña y toca *un* instrumento. Las dos salidas posibles:
+un parámetro `ROLE` por instancia (bajo, batería, piano, guitarra, melodía,
+solo) con progresión, estilo y semilla compartidos —una pestaña por músico, que
+es como choz ya piensa— o un canal MIDI por rol desde una sola instancia. La
+primera encaja con el rack y con el host CLAP; la segunda es más cómoda para el
+canal 10. Hay que elegir antes de escribir el generador.
+
+#### Lo que hay que construir
+
+- **Parser tolerante**: grados romanos (`I7`, `IIm7`, `IV#m7b5`, `VIIb7`,
+  `Iø7`, `I7b9`, `I7#11`) y cifrado americano (`C7`, `F#m7b5`, `Bbmaj9`,
+  `Cm11`) en la misma gramática, `|` como compás, varios acordes por compás,
+  `-` para sostener. Sin tonalidad no hay grados romanos; con cifrado americano
+  la tonalidad sigue sirviendo de contexto para escalas y aproximaciones.
+- **Armonía**: acorde → notas del acorde → escala. Las reglas viven acá y en
+  ningún otro lado; ni el bajo ni el solo inventan teoría por su cuenta.
+- **Estilos como datos**, no como `if` dentro del generador: compás, feel,
+  swing, y un ajuste por rol (bajo, batería, comping, melodía, solo). Structs y
+  defaults en Rust primero, con la API pensada para que después se puedan leer
+  de archivo — **sin** inventar un cargador de `.toml` que hoy no existe.
+  Mínimo: `major_blues`, `minor_blues`, `jazz_swing`, `shuffle`,
+  `straight_blues`, `rock`, `funk`, `bossa`; el resto de la lista pedida
+  (latin, country, soul, reggae, bebop, walking_bass, y la tanda electrónica:
+  organic house, afro house, nu jazz, melodic/live techno, trance vocal,
+  liquid y live band d&b, neoclassical ambient, folktronica) entra sin tocar el
+  parser ni el motor, que es el punto de que los estilos sean datos.
+- **Bajo** que sepa el acorde siguiente: fundamental, notas del acorde,
+  aproximaciones cromáticas, notas de paso, anticipaciones, desplazamiento de
+  octava, pickups. `C C C C / F F F F` es el fracaso, no el MVP.
+- **Batería** con mapeo GM (36 kick, 38 snare, 42/46 hats, 49 crash, 51 ride),
+  patrón base + fills + ghost notes + densidad por estilo. Los sonidos los pone
+  el SF2, acá no se toca un sample.
+- **Comping** con voicings, inversiones y conducción de voces —`C7 (E G Bb)` →
+  `F7 (Eb A C)`, no saltos de octava— y ritmo con síncopa, no un bloque por
+  tiempo.
+- **Melodía y solo** por motivos: `A A' B A''` + fill + resolución, con
+  transposición diatónica y cromática, variación e desplazamiento rítmico,
+  aproximación al acorde siguiente. Un arpegiador con ruido encima no sirve.
+- **Humanización** determinista (velocity, timing, duración) por rol, y que
+  nunca toque la armonía.
+
+#### Reglas que no se negocian
+
+- **Determinismo por semilla**: misma progresión + estilo + semilla = mismo
+  MIDI, bit a bit. Otra semilla, otra interpretación.
+- **Todo el trabajo pesado fuera del hilo de audio**: parsear, resolver y
+  generar pasa al cargar o al mover un parámetro. `tick()` sólo lee una lista de
+  eventos ya horneada, sin allocar. Es la misma regla que ya cumplen `arp` y
+  `seq`.
+- **No genera audio.** Eventos MIDI y nada más; el instrumento —SF2 hoy, CLAP,
+  LV2 o hardware mañana— es de otro.
+- **Nada de ML ni dependencias pesadas.** El azar sólo dentro de límites
+  musicales: semilla, probabilidad, densidad, variación.
+- **`Seq` no cambia.** `SeqSettings`, `Pattern` y `ArpEvent` siguen como están.
+
+#### Por fases, y cada una entera
+
+1. Parser + resolución de grados + `major_blues` y `minor_blues` + bajo,
+   batería y piano. Con eso ya se escucha si el camino sirve.
+2. Guitarra, melodía, solo, motivos y variaciones.
+3. Estilos como datos, mapa de instrumentos por estilo y elección de programa
+   SF2 con fallback (tenor sax → alto → trompeta → piano), que **nunca** falla
+   la generación por un preset que falta: lo registra y sigue.
+4. Secciones del arreglo: partes A/B/C/D, fills, intro y final.
+
+#### Tests que tienen que existir
+
+Parser de grados y de cifrado americano; `key C + I7 = C7`, `key Bb + IV7 =
+Eb7`, `key C + VIb7 = Ab7`; varios acordes por compás; el blues menor entero;
+determinismo con semilla 42 y diferencia con 43; y las restricciones musicales
+—registro del bajo, batería en el canal de percusión, notas dentro de 0..127,
+ninguna duración negativa, partes sincronizadas y un arreglo que dura
+exactamente lo que la progresión.
 
 ## Las dos piezas que quedan fuera, por decisión
 
