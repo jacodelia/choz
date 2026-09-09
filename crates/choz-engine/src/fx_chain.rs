@@ -91,7 +91,7 @@ pub fn seq_hit() {
 
 /// The envelope of that step, on the same 0..1 scale a tab's level is read on.
 ///
-/// Same shape and length as [`crate::metronome::beat_pulse`], so a gate set up
+/// Same shape and length as [`crate::artifacts::metronome::beat_pulse`], so a gate set up
 /// against the clock reads the same wired to the sequencer.
 pub fn seq_pulse() -> f32 {
     let last = SEQ_HIT.load(std::sync::atomic::Ordering::Relaxed);
@@ -116,8 +116,8 @@ impl GateSource {
         match self {
             GateSource::Tab(i) => crate::meter::slot_levels().live(i),
             GateSource::Note(i) => crate::meter::note_levels().level(i),
-            GateSource::Metronome => crate::metronome::metronome().tap_level(),
-            GateSource::Clock => crate::metronome::beat_pulse(),
+            GateSource::Metronome => crate::artifacts::metronome::metronome().tap_level(),
+            GateSource::Clock => crate::artifacts::metronome::beat_pulse(),
             GateSource::Seq => seq_pulse(),
         }
     }
@@ -1236,7 +1236,14 @@ mod tests {
     /// not — which is the point of having both.
     #[test]
     fn the_clock_can_drive_a_gate_with_no_tab_playing() {
-        let m = crate::metronome::metronome();
+        // **The transport is one object for the whole process** and this test
+        // sets its tempo and its rate. Without the lock it was doing that
+        // underneath whichever sequencer test happened to be running beside
+        // it, and the failure landed over there — `seq`'s playhead tests
+        // failing in a full run and passing on their own, which is what the
+        // roadmap had filed as an unexplained intermittent.
+        let _clock = crate::test_locks::transport();
+        let m = crate::artifacts::metronome::metronome();
         let t = choz_ports::transport();
         t.set_sample_rate(48_000);
         t.set_bpm(120.0);

@@ -363,6 +363,11 @@ mod tests {
     /// fit the bar is ignored rather than half-applied.
     #[test]
     fn a_bar_is_accented_where_its_groups_start() {
+        // The metronome is one object for the process and its grouping is what
+        // says where a bar falls — the sequencer asks it too. Setting that
+        // without the clock lock was breaking `seq`'s bar tests from another
+        // thread, which is the intermittent the roadmap could not explain.
+        let _clock = crate::test_locks::transport();
         let m = metronome();
 
         // 7/8 counted 2+2+3: beats 0, 2 and 4 carry weight, the rest do not.

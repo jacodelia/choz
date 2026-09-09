@@ -2189,7 +2189,8 @@ impl AudioEngine {
             | crate::PluginFormat::Dssi
             | crate::PluginFormat::Vst2
             | crate::PluginFormat::Vst3
-            | crate::PluginFormat::Sfz => {
+            | crate::PluginFormat::Sfz
+            | crate::PluginFormat::Samples => {
                 Ok(self.add_slot(self.build_instrument(format, path, id)?))
             }
             _ => anyhow::bail!("{} hosting is not implemented yet", format.label()),
@@ -2241,7 +2242,8 @@ impl AudioEngine {
             | crate::PluginFormat::Dssi
             | crate::PluginFormat::Vst2
             | crate::PluginFormat::Vst3
-            | crate::PluginFormat::Sfz => {
+            | crate::PluginFormat::Sfz
+            | crate::PluginFormat::Samples => {
                 let inst = self.build_instrument(format, path, id)?;
                 self.set_slot_source(slot, inst);
                 Ok(())
@@ -3010,7 +3012,7 @@ impl RtState {
             let len = (n * 2).min(scratch.len());
             let sc = &mut scratch[..len];
             sc.fill(0.0);
-            let click = crate::metronome::metronome();
+            let click = crate::artifacts::metronome::metronome();
             click.render(sc, n, sr);
             match click.dest() {
                 Dest::Bus(b) if b < BUSES => {
@@ -3403,10 +3405,32 @@ pub fn build_instrument(
             .map(|i| Box::new(i) as Box<dyn crate::sources::AudioSource>),
         // Not a plugin at all: a text file pointing at samples, played by
         // choz's own sampler.
-        crate::PluginFormat::Sfz => match crate::sfz::SfzSampler::build(path, sr) {
+        crate::PluginFormat::Sfz => match crate::instruments::sfz::SfzSampler::build(path, sr) {
             Ok(s) => Some(Box::new(s) as Box<dyn crate::sources::AudioSource>),
             Err(e) => {
                 eprintln!("choz: SFZ {}: {e}", path.display());
+                None
+            }
+        },
+        // A folder of samples, mapped to the keyboard by what the files
+        // themselves say. Slow the first time — it may decode and analyse —
+        // and cached after that; either way it is a load, not a callback.
+        // No folder yet: the sampler goes into the tab empty and is pointed at
+        // one afterwards. That is the order the interface asks in.
+        crate::PluginFormat::Samples if id == crate::instruments::sampler::EMPTY_ID => {
+            Some(Box::new(crate::instruments::sampler::empty())
+                as Box<dyn crate::sources::AudioSource>)
+        }
+        // The id carries the layout the user chose, when they chose one — see
+        // `sampler::Mode`. The path is the folder either way.
+        crate::PluginFormat::Samples => match crate::instruments::sampler::build_with(
+            path,
+            sr,
+            crate::instruments::sampler::Mode::of_id(id),
+        ) {
+            Ok(s) => Some(Box::new(s) as Box<dyn crate::sources::AudioSource>),
+            Err(e) => {
+                eprintln!("choz: samples {}: {e}", path.display());
                 None
             }
         },
@@ -5268,7 +5292,7 @@ mod tests {
     fn the_click_goes_where_the_metronome_says() {
         let _clock = crate::test_locks::transport();
         let (mut cmd_tx, _retired, mut state) = mk_state_ch(4, 0);
-        let m = crate::metronome::metronome();
+        let m = crate::artifacts::metronome::metronome();
         m.set_on(true);
         m.set_gain(1.0);
         choz_ports::transport().set_bpm(120.0);

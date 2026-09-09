@@ -11,9 +11,23 @@ choz-plugin-sandbox.workspace = true
 # The patch *reader*, which needs no Pure Data. Running a patch is the child
 # binary's job, and that is the only thing that links libpd.
 choz-plugin-pd.workspace = true
-# SFZ samples are FLAC as often as WAV; symphonia decodes both.
+# SFZ samples are FLAC as often as WAV; symphonia decodes both. `mp3` and
+# `aiff` are here for the sample folders the smart sampler reads: Philharmonia
+# ships MP3, and half the older packs on disk are AIFF.
 libc = "0.2"
-symphonia = { version = "0.5", default-features = false, features = ["wav", "flac", "pcm"] }
+# Sample packs are distributed as one zip per instrument — Philharmonia's is —
+# and the sampler reads them where they sit rather than making the user unpack
+# 350 MB first. Only `deflate`: that is what a sample zip uses, and the other
+# codecs drag bzip2, zstd and an AES stack in for nothing.
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+symphonia = { version = "0.5", default-features = false, features = [
+    "wav",
+    "flac",
+    "pcm",
+    "mp3",
+    "aiff",
+    "adpcm",
+] }
 choz-plugin-ladspa.workspace = true
 choz-plugin-vst2.workspace = true
 choz-plugin-vst3.workspace = true

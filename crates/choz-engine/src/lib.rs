@@ -1,9 +1,9 @@
 //! choz audio engine: RT audio thread, sources, FX chain, MIDI input, and the
 //! plugin registry. Built on the RT-safe traits in `choz-ports`.
 
-/// The arpeggiator: a note generator, not an effect — see the module for
-/// why that means it cannot be an `FxProcessor`.
-pub mod arp;
+/// The note generators — arpeggiator, step sequencer, metronome. Not effects,
+/// and the module says why that means they cannot be `FxProcessor`s.
+pub mod artifacts;
 pub mod cache;
 pub mod chord;
 pub mod engine;
@@ -11,11 +11,13 @@ pub mod feedback;
 pub mod fx;
 pub mod fx_chain;
 pub mod input;
+/// The instruments choz plays without hosting anybody's plugin: SoundFonts,
+/// SFZ, and a folder of samples.
+pub mod instruments;
 mod jack_backend;
 pub mod layered;
 pub mod maxpat;
 pub mod meter;
-pub mod metronome;
 pub mod midi;
 pub mod osc;
 pub mod param_shape;
@@ -24,9 +26,6 @@ pub mod pitch;
 pub mod preset_files;
 pub mod quarantine;
 pub mod sandboxed;
-pub mod seq;
-pub mod sf2_patch;
-pub mod sfz;
 pub mod sources;
 
 pub use engine::{
@@ -465,6 +464,9 @@ pub fn read_plugin_params(
         // that carry a receive symbol, because the rest cannot be moved from
         // outside the canvas. Read from the file, so this needs no Pd.
         PluginFormat::Pd => pd_params(path),
+        // Not a plugin: choz's own sampler, whose knobs are the same six for
+        // every folder — see [`instruments::sampler::params`].
+        PluginFormat::Samples => instruments::sampler::params(),
         _ => Vec::new(),
     }
 }

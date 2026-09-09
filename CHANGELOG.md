@@ -32,6 +32,394 @@ lleva lo que falta —nada de lo ya hecho— y
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
 
+## Sin publicar
+
+### El sampler tiene panel: cargar, cortar, escuchar y verlo
+
+El sampler ya sonaba, pero desde la interfaz no había nada que tocar: la
+carpeta y el layout eran dos botones sin nombre en la fila `INSTR` y el resto
+—el punto de arranque, la envolvente, el loop— no existía. Ahora la pestaña que
+tiene el sampler trae su propio panel en el RACK:
+
+- **Botones**: `LOAD` (con la carpeta que está tocando, o vacío si todavía no
+  tiene ninguna), `CLEAR`, `▶`/`■` para escuchar sin teclado, `LOOP`, `SLICE` y
+  el layout (`AUTO`/`STRETCH`/`KIT`/`SLICE`).
+- **Dos dibujos, dos filas**: la forma del sample con el punto de arranque
+  marcado, y la envolvente que arman los knobs. Ninguno de los dos es una
+  medición: están para *ver* que el arranque cayó en silencio o que el ataque se
+  comió la nota.
+- **El scrub es el dibujo**: un clic en la forma de onda es donde empieza la
+  nota.
+
+**Los knobs son parámetros de instrumento, no controles aparte.** `START`,
+`LOOP`, `ATTACK`, `DECAY`, `SUSTAIN` y `RELEASE` salen de
+`sampler::params()` y entran por el mismo camino que los de un plugin
+(`read_plugin_params` → caja `INSTRUMENT` → `set_slot_param`), así que se
+guardan con el proyecto, se mueven con las flechas y se pueden aprender a un CC
+sin una línea de código extra. El motor los aplica en vivo: `SfzSampler` tiene
+una envolvente ADSR por voz —el release sale de donde estaba la envolvente, no
+de 1.0, así que soltar durante el ataque no sube el volumen— y un loop que sólo
+corre mientras la tecla está abajo.
+
+**`SLICE` es un layout más, no un modo aparte.** Corta el archivo más largo de
+la carpeta en 16 pedazos, uno por tecla desde C2, y cada pedazo suena a la
+velocidad grabada. No se escribe nada: las regiones ahora llevan `start`/`end`
+como fracciones del archivo y el pedazo es un rango sobre el mismo sample ya
+decodificado. Como cualquier layout, viaja en el id (`#slice`) y vuelve con el
+proyecto.
+
+### Una carpeta de samples es un instrumento: el sampler que se arma solo
+
+Apuntá choz a `~/Samples/Philharmonia/violin` y la carpeta aparece en el
+selector de instrumentos como cualquier plugin. No hay que mapear un `.wav` por
+tecla ni escribir un `.sfz`: los archivos ya dicen lo que son y esto los lee.
+
+El motor no es nuevo, y ese es el punto. `crates/choz-engine/src/sfz.rs` ya
+tenía un sampler multisample RT-safe —regiones con rango de tecla y de
+velocity, transposición por `pitch_keycenter`, robo de voces sin allocar— y
+`pitch.rs` ya tenía YIN, escrito para el conversor `A→M`. Lo que faltaba era
+todo lo de arriba: mirar una carpeta y decidir qué toca cada tecla. Eso es
+`crates/choz-engine/src/sampler/`.
+
+**El orden en que pregunta es lo que lo hace rápido.** El nombre del archivo
+primero, siempre: `violin_C4_mf_RR2.wav` dice la nota, la dinámica y la toma, y
+las dice exactas. Después las carpetas, para packs que ordenan por articulación
+en vez de nombrarla. El audio último y sólo para lo que quedó abierto —un
+decode más una detección de pitch por archivo—. Medido contra el violín entero
+de Philharmonia: **1502 archivos leídos en 24 ms, los 1502 por nombre, cero
+decodificados.**
+
+**Lo que sobra del nombre es la mejor parte.** Sacale a
+`violin_A3_15_mezzo-forte_arco-normal` la nota y la dinámica y queda
+`violin_15_arco-normal`, que nombra el *conjunto* al que ese archivo pertenece:
+arco normal, un segundo y medio. Todas las notas de ese conjunto son un
+instrumento, sus dinámicas son sus capas de velocity, y un conjunto con otro
+largo u otro arco es otro instrumento que vive en la misma carpeta. No hace
+falta ningún vocabulario de articulaciones para verlo, y por eso gana: sólo la
+Philharmonia trae `arco-normal`, `pizz-normal`, `arco-sul-ponticello`,
+`natural-harmonic` y veinte más.
+
+Cuál de los conjuntos suena se decide en tres preguntas, y el orden lo dictaron
+las 20 librerías:
+
+1. **Cuál llega a más teclas.** Un conjunto con huecos es un conjunto cuyos
+   huecos los tapa el vecino estirado.
+2. **Dentro de un décimo de eso, cuál es la nota común.** La mandolina trae
+   `normal` y `tremolo` en las mismas 39 notas; abrir en el trémolo es una
+   sorpresa cada vez.
+3. **Y de esos, cuál tiene los archivos más grandes**, que es lo mismo que decir
+   los más largos. El saxo cubre 41 notas a un cuarto de segundo y 40 a un
+   segundo y medio: por coverage estricto esa nota de más cuesta tres cuartos
+   del largo de todas las demás, y por eso la primera pregunta tiene tolerancia.
+
+Con eso, los 20 packs de Philharmonia eligen el conjunto que uno elegiría a
+mano: `violin_15_arco-normal`, `saxophone_15_normal`,
+`mandolin_very-long_normal`, `guitar_very-long_normal`.
+
+Detalles que costaron:
+
+- **Un número suelto nunca es la nota ni la toma.** Philharmonia escribe el
+  largo ahí: `violin_A4_15_forte_arco-normal` es un segundo y medio, no la
+  toma 15. Una toma tiene que estar deletreada (`RR2`, `take3`, `var1`).
+- **`mezzo-forte` se lee entero.** Partido por el guión daba `mezzo`, y
+  `mezzo-piano` caía en la misma capa que `mezzo-forte` —dos dinámicas de seis,
+  pisadas—. La dinámica se busca con el guión sacado, antes de partir el token.
+- **`short` y `long` no son articulaciones acá.** En estas librerías son el
+  *largo* de la nota (`very-long`, `15`, `025`), y el largo ya separa los
+  conjuntos por nombre. Leerlos como articulación hacía que
+  `guitar_C4_very-long_normal` saliera `Long` en vez de nota común, y una
+  carpeta tiene que abrir en la nota común.
+- **`C-1` es una nota y `-1` es su octava**, pero el guión también separa
+  `arco-normal` y `very-long`. La nota se busca antes de partir por guión; todo
+  lo demás, después.
+- **El primer token no es una dinámica.** `piano_C4_v80.wav` no está tocado a
+  velocity 48: `piano` ahí es el instrumento. Sólo el token inicial queda
+  exento, y sólo si hay más de uno.
+- **La ventana de análisis no arranca en el ataque.** Los primeros 50 ms de un
+  violín son ruido de arco y los de un piano son el martillo; un detector
+  corrido ahí devuelve el período del transitorio, que no es una nota. La
+  ventana se toma pasado el pico.
+- **Sin confianza, no hay nota.** Un bombo pasado por YIN siempre da *algún*
+  número. Por debajo de 0.55 de claridad el sample queda sin afinar.
+- **Y una nota detectada no es una nota dicha.** El bombo de Philharmonia lo
+  enseñó: YIN le encuentra período —cerca de 37 Hz, nota 25— y *no se equivoca*,
+  un bombo tiene fundamental. Pero dos golpes que dan los dos nota 25 no son el
+  multisample de nada, y estirarlos por el teclado es un kick que toca acordes.
+  La carpeta se lee como instrumento si sus notas están **dichas** en el nombre;
+  si no, tiene que parecerlo dos veces: que casi todos los archivos afinen
+  (cuatro de cada cinco) y que las notas abarquen al menos una octava. La
+  primera versión sólo miraba la octava, y la basura del detector sobre 18
+  golpes de bombo abarca más de una. Una carpeta que no pasa es un kit: un
+  archivo por tecla desde C2, cada uno a la velocidad a la que se grabó y sin
+  agrupar —no hay variantes de una nota entre las que elegir, hay sonidos
+  distintos y cada uno quiere su tecla.
+
+Los límites entre samples caen en el punto medio entre notas raíz —C3 (48) y C4
+(60) se cortan en 54—, y las capas de velocity se parten igual, entre las
+velocities que los nombres declararon. Dos archivos de la misma nota en la misma
+capa son round robin, los llame `RR` el pack o no: `SfzSampler` alterna entre
+ellos con un contador por tecla (un `[u32; 128]`, porque un mapa por nota
+allocaría en el hilo de audio la primera vez que suena una tecla nueva).
+
+Dos arreglos que se llevó puestos el camino:
+
+- **`note_off` ya no corta, hace fade.** Cortar un sample sostenido en un sample
+  arbitrario deja un escalón, y un escalón es un transitorio de banda completa:
+  cada nota soltada hacía *pop*. 15 ms de release, por debajo de lo que se nota
+  y muy por encima de la discontinuidad.
+- **`tune_cents` en la región.** El detector no sólo dice la nota, dice cuánto
+  se corre de ella; el sampler lo saca en la reproducción, así un sample grabado
+  30 cents bajo suena afinado. También parsea el opcode `tune` de SFZ, que antes
+  se ignoraba.
+
+El análisis se cachea en `$XDG_STATE_HOME/choz/samples/` por largo y mtime del
+archivo. **No hash de contenido**: hashear la librería entera para saber si hay
+que leer la librería entera es la operación que el cache existe para evitar. El
+hash se gana su lugar cuando llegue el relink, que necesita reconocer un archivo
+que se *movió*.
+
+Nada acá escribe en la carpeta de samples: ni renombra, ni mueve, ni convierte.
+Y ningún sample de Philharmonia entra al repo —los tests generan senos con
+`hound` y los borran—. Para probar contra una librería de verdad está
+`crates/choz-engine/tests/sample_folder.rs`, que se saltea solo si
+`CHOZ_SAMPLE_DIR` no está puesta:
+
+```bash
+CHOZ_SAMPLE_DIR=~/Samples/violin \
+    cargo test -p choz-engine --release --test sample_folder -- --nocapture
+```
+
+Exige lo que corresponde según lo que la carpeta resultó ser: un instrumento no
+puede dejar teclas muertas, un kit tiene que dejarlas —sus teclas son sus
+sonidos, uno por tecla, a su propia altura—.
+
+**`PluginFormat::Samples`** es el formato nuevo, y es el primero que no se
+reconoce por extensión: el *directorio* es el instrumento, y lo que decide es si
+adentro hay samples. Cae solo en el modal de rutas (`MENU → SETTINGS`), en el
+scan y en el selector, porque todos recorren `PluginFormat::ALL`. Los paths por
+defecto son `~/Samples` y `~/samples`; `CHOZ_SAMPLES_PATH` los pisa. `symphonia`
+suma `mp3`, `aiff` y `adpcm`, porque Philharmonia distribuye MP3.
+
+Lo que **no** hace todavía: una sola articulación suena a la vez (la más
+grabada de la carpeta gana, el resto queda en el mapa esperando keyswitches),
+los samples se decodifican enteros a RAM al cargar en vez de streamear, no hay
+editor manual del mapeo ni inspector de sample, y el aftertouch no está mapeado.
+
+### El metrónomo es un CLAP
+
+Tercer artefacto en el mismo bundle, al lado del arpegiador y el secuenciador:
+`org.choz.met`, "choz Metronome". No es un efecto —no procesa nada— ni un
+generador de notas: es un **instrumento** que hace audio del transporte del
+host. Cero puertos de entrada, un par estéreo de salida.
+
+Sus mandos son toda su configuración **menos las dos que el host ya tiene**:
+
+```
+On         encendido
+Level      volumen del click
+Sound      BEEP · CLICK · WOOD
+Grouping   cómo se cuenta el compás (7 como 2+2+3 o 3+2+2)
+```
+
+El tempo y el compás salen de `clap_event_transport` —un plugin que dejara
+poner un segundo tempo sería un plugin que le lleva la contra a la sesión— y el
+agrupamiento es un mando sobre la lista de maneras de contar el compás actual,
+igual que lo alcanza el panel de choz: la lista depende del numerador, así que
+un índice sobre ella es lo único que sigue significando algo cuando el compás
+cambia. Queda afuera el destino del click, que es ruteo del rack y acá no
+existe.
+
+**Un click por proceso**: el metrónomo es un singleton, como el transporte y el
+medidor, porque hay una sola salida donde poner un click. Dos instancias en un
+host son dos vistas del mismo.
+
+`Sort::is_generator` pasó a querer decir lo que dice —notas adentro, notas
+afuera, nada de audio— y los puertos salen de `Sort::audio_ports()`, que
+devuelve `(entradas, salidas)`: `(1,1)` un efecto, `(0,1)` el click, `(0,0)` los
+dos artefactos de notas. Antes "generador" era el nombre de "sin puertos de
+audio", que servía mientras los únicos dos que había no hicieran ruido.
+
+Test por el ABI: se abre por la fábrica, se comprueba que no publica entrada,
+se procesa un segundo de un compás a 120 y se exige que suene, que el mando de
+nivel cambie el pico y que apagado sea silencio exacto.
+
+### El sampler se abre desde el teclado, y el usuario decide el mapeo
+
+**El sampler se llama `choz-sampler` y está siempre en la lista de
+instrumentos**, bajo el chip CLAP, con o sin carpeta configurada. Es un instrumento que choz tiene, no algo que
+aparece cuando el directorio correcto casualmente está en una ruta de
+búsqueda — y una lista que sólo lo ofrece después de haberlo configurado es una
+lista donde nunca se configura. Elegirlo es lo que pregunta dónde están los
+samples.
+
+**Entra vacío y se llena después.** Elegirlo en la lista lo pone en la tab sin
+nada adentro: contesta las notas con silencio hasta que alguien diga dónde
+están los samples, que es la pregunta siguiente y se hace desde la tab que ya lo
+tiene. Elegirlo de nuevo en una tab que ya lo tiene *es* esa pregunta — el botón
+SOURCE abre el explorador de carpetas en vez de volver a cargarlo—, y al
+confirmar el directorio se cargan los sonidos. Es el orden en que se piensa:
+primero qué instrumento, después con qué.
+
+Y una vez que la tab está tocando una carpeta, **INSTR abre las opciones del
+sampler** en el mismo lugar donde un plugin muestra sus parámetros: qué carpeta
+y cómo se reparte en el teclado. Enter sobre la carpeta la vuelve a pedir;
+Enter sobre el mapeo lo pasa al siguiente y recarga.
+
+**SOURCE → F2** hace lo mismo desde el teclado: abre un explorador de carpetas —el mismo que ya usaban BANK y
+las rutas de plugins— apuntado a donde el usuario tenga sus samples. Una
+librería no se instala en ningún lado: está donde la persona la puso, así que
+apuntar choz a una tiene que hacerse desde donde se elige un instrumento, no
+desde una ruta tipeada en settings. El explorador arranca en la última carpeta
+de samples que se eligió.
+
+Lo que vuelve se escanea igual que escanea el scan: una carpeta con samples
+adentro es un instrumento, una carpeta de esas es un estante, y un `.zip` es
+cualquiera de las dos. Un solo instrumento entra directo en la tab —es lo que
+significa elegir una carpeta—; varios, y vuelve la lista SOURCE con el chip
+SAMPLES puesto, porque elegir entre ellos es lo siguiente que hay que hacer y la
+lista es donde eso se hace. La carpeta queda guardada en las rutas de SAMPLES,
+así que el próximo escaneo la encuentra sin que se la vuelvan a pedir. **No se
+dispara un rescan completo**: abrir los 1209 plugins de la máquina para mirar
+una carpeta es hacer esperar a alguien por nada.
+
+Un bug que se comió una versión: `adopt_samples_folder` llenaba `plugins` —lo
+que la lista muestra— pero no `synths`, que es donde el cargador busca lo que se
+eligió. Una carpeta con un solo instrumento aparecía y al elegirla no pasaba
+nada. Ahora se llenan las dos, con una entrada por mapeo, porque el mapeo es
+parte del id y esa tabla es donde tanto el cargador como un proyecto reabierto
+buscan un id.
+
+También sale de la lista **el propio choz**: instalado, sus bundles están en
+`~/.clap` como los de cualquiera y el scan los encuentra, así que el rack se
+ofrecía a cargar el rack entero en una tab de sí mismo. El plugin es para otros
+hosts; acá era un espejo contra un espejo.
+
+Los chips de SOURCE son **categorías, no formatos de archivo**: sirven para
+recortar mil instrumentos a los que vale mirar, y un chip que nadie se le
+ocurriría apretar es un chip estorbando. Se fueron `WAV` —un sample suelto se
+busca, no se filtra— y `SAMPLES`: una carpeta de samples es choz tocando un
+instrumento propio, que es lo que `CLAP` ya quiere decir para el que mira esta
+lista. Ahí aparece.
+
+**Y los chips del explorador son el mapeo**, que es la otra mitad de esto:
+
+```
+AUTO      lo que el sampler deduzca (lo de siempre)
+STRETCH   cada sample cubre las teclas de alrededor, transpuesto
+KIT       un sample por tecla, cada uno a la altura a la que se grabó
+```
+
+`AUTO` acierta con las librerías contra las que se escribió y no puede acertar
+con todas: un pack de stabs de un solo tono sin nombre **sí** está para tocarse
+por todo el teclado, y unos toms afinados no. El modo viaja pegado al id del
+instrumento —`~/Samples/toms#kit`—, que es lo que un proyecto guarda y lo que
+el rack vuelve a abrir; la ruta va aparte y sigue limpia, así que nadie intenta
+abrir un directorio llamado así.
+
+Y el kit dejó de tirar sonidos por el borde: con más samples que teclas arriba
+de C2 arranca en la tecla 0. `percussion.zip` entero leído como un solo kit son
+148 sonidos; eran 92 y ahora son 128.
+
+### `choz-engine/src` tiene carpetas para lo que hace ruido
+
+Como `fx/`, que ya tenía las 56:
+
+```
+instruments/   sfz.rs · sf2_patch.rs · sampler/     lo que suena sin ser un plugin ajeno
+artifacts/     arp.rs · seq.rs · metronome.rs       lo que genera notas sin que lo toquen
+```
+
+Nada cambió de contenido; los paths sí (`choz_engine::sfz` →
+`choz_engine::instruments::sfz`, `choz_engine::arp` →
+`choz_engine::artifacts::arp`), y `sources.rs` se queda donde está porque es el
+trait `AudioSource` además del sintetizador SF2.
+
+### El fondo no puede depender de desde dónde se arrancó choz
+
+`ui.json` guardaba `assets/wallpaper.png` **relativo**: la ruta que
+`wallpaper_dir()` devuelve cuando encuentra el checkout. Eso funciona desde la
+raíz del repo y en ningún otro lado —incluido un DAW, que arranca el plugin en
+el directorio que se le ocurra—. Ahora `wallpaper_dir()` devuelve rutas
+absolutas siempre, y al cargar los settings una ruta relativa se resuelve
+—contra el directorio actual si todavía la encuentra, contra la carpeta de
+wallpapers si no— y se guarda absoluta desde ahí. Una que no está en ningún
+lado se deja como está, en vez de apuntarla a algo que el usuario no eligió.
+
+### Dos tests escribían globales sin el candado
+
+`cargo test -p choz-engine` fallaba de a ratos en los tests del secuenciador
+—`the_playhead_wraps_on_the_bar`, `swing_lengthens_the_beat`,
+`probability_never_drops_a_written_step`—, siempre en corrida completa y nunca
+solos. Los del `seq` toman `test_locks::transport()`; el que no lo tomaba estaba
+en otro archivo:
+
+- `fx_chain::the_clock_can_drive_a_gate_with_no_tab_playing` le ponía tempo y
+  sample rate al transporte sin candado.
+- `metronome::a_bar_is_accented_where_its_groups_start` le cambiaba la
+  agrupación al metrónomo sin candado, y **el secuenciador le pregunta al
+  metrónomo dónde cae el compás**.
+
+Con los dos candados puestos la corrida completa pasó 6 de 7 veces contra
+aproximadamente una de cada dos antes. **No está cerrado**: la séptima falló, así
+que queda algún otro global sin proteger. El barrido que encontró estos dos
+—buscar tests que tocan `transport()` o `metronome()` sin
+`test_locks::transport()`— ya no encuentra ninguno, o sea que el que queda toca
+otra cosa.
+
+### Y los zips se leen donde están
+
+Las librerías no llegan como carpetas: llegan como un zip por instrumento.
+Philharmonia son 20. Pedirle a alguien que descomprima 350 MB antes de que choz
+mire la carpeta es un paso que no tiene ninguna razón —el directorio central de
+un zip lista todo lo que hay adentro y sacar una entrada es un seek y un
+inflate—.
+
+Un sample adentro de un archivo se llama de la forma obvia:
+`~/Samples/violin.zip/violin_A3_15_forte_arco-normal.mp3`. Es un path que
+ningún `open` va a aceptar y que todo el resto puede cargar sin enterarse: el
+scanner, el parser de nombres, el mapper y las regiones no saben que existen los
+zips. El único que lo desarma es `decode`, que en vez de abrir un archivo saca
+los bytes y decodifica desde memoria —la sonda, el hint y el decoder de
+symphonia son idénticos—. El cache le toma la huella al **zip**, no a la
+entrada: un zip que cambió es un zip cuyas entradas hay que volver a mirar
+todas, que es justo lo correcto.
+
+**Nada se descomprime a un cache en disco, nunca.** El diseño alternativo
+—extraer al cargar y tratarlo como carpeta— es menos código acá y cientos de
+megas del disco ajeno, en silencio, por una librería que la persona ya tiene.
+
+**Y un zip también puede ser un estante.** `percussion.zip` trae 39
+instrumentos en 39 carpetas: leído como uno solo es un kit de 148 sonidos
+peleando por 92 teclas, con 56 que se caen del borde del teclado por no tener
+dónde ir. La misma regla que ya valía para directorios ahora vale un nivel
+adentro del archivo: si los samples están sueltos arriba, el zip es el
+instrumento; si están ordenados en carpetas, cada carpeta lo es —y se la nombra
+`percussion.zip/bass drum`—.
+
+Un escaneo de `~/repo/philharmonia/all-samples` con los 20 zips sin tocar:
+**58 instrumentos en 322 ms** —19 melódicos más los 39 de percusión—. El violín
+sale igual desde el zip que desde la carpeta: 1502 samples en 13 ms,
+`violin_15_arco-normal`, 110 regiones, 49 notas, 6 capas.
+
+`zip 0.6` con `default-features = false` y sólo `deflate`: es lo que usa un zip
+de samples, y los otros códecs arrastran bzip2, zstd y una pila de AES al pedo.
+
+### Los tests de CLAP se saltean el propio choz
+
+`packaging/install.sh` deja `choz.clap` y `choz-rack.clap` en `~/.clap`, y desde
+ahí son lo primero que encuentra `effect_runtime.rs`. Hostear choz adentro de
+choz no es lo que prueba ninguno de esos tests: el rack no publica parámetros y
+arranca vacío, así que fallaba el chequeo de window feed y el de hacer ruido por
+ser exactamente lo que es. El scan de los tests ahora filtra `com.choz.*` y
+`org.choz.*`.
+
+### El MIDI monitor no se dibuja embebido
+
+Una ventana de plugin es un panel en la pantalla de otro, el host ya tiene con
+qué mirar el MIDI, y esas filas le sirven más al rack. Con `is_embedded()` el
+panel mide cero: no se dibuja, no registra rects y por lo tanto tampoco se le
+puede hacer click. En consola queda igual.
+
 ## [1.3.11] — 2026-09-07
 
 ### La entrada MIDI deja midir y habla el secuenciador ALSA

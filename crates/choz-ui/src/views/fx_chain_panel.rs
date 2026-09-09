@@ -66,6 +66,28 @@ pub const TAB_CLOSE_W: u16 = 2;
 /// Width of the `+` button that follows the last tab, in columns.
 pub const TAB_ADD_W: u16 = 3;
 
+/// Everything the RACK draws for choz's own sampler, when the tab holds one.
+///
+/// One struct rather than eight arguments: they are all one instrument's
+/// panel, and they arrive and leave together.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SamplerView<'a> {
+    /// The folder it is playing, already shortened for the button. Empty when
+    /// it has not been given one — that is what the button then says.
+    pub dir: &'a str,
+    /// The layout it is laid out with: `AUTO`, `STRETCH`, `KIT`, `SLICE`.
+    pub layout: &'a str,
+    /// Whether the audition note is being held.
+    pub playing: bool,
+    pub looping: bool,
+    /// The shape of the sample it would play, as peak levels 0..1.
+    pub peaks: &'a [f32],
+    /// The START knob, 0..1: where in the sample a note begins.
+    pub start: f32,
+    /// Attack, decay, sustain, release — normalised, as the knobs hold them.
+    pub env: [f32; 4],
+}
+
 /// Buttons on the RACK's instrument line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RackButton {
@@ -75,6 +97,23 @@ pub enum RackButton {
     Source,
     /// Open the SF2 bank/preset picker (SoundFont tabs only).
     Preset,
+    /// Point choz's own sampler at a folder of samples. Only on a tab that
+    /// holds one — it is that instrument's whole setup, so it sits where the
+    /// SoundFont's bank button sits.
+    SampleFolder,
+    /// Step that folder's layout: worked out, stretched across the keyboard,
+    /// or one sound per key.
+    SampleLayout,
+    /// Empty the sampler: the tab keeps it, the folder is forgotten.
+    SampleClear,
+    /// Audition the folder without a keyboard: hold a note, let it go.
+    SamplePlay,
+    /// Whether a held note runs round the sample instead of ending.
+    SampleLoop,
+    /// Cut the sample into a piece per key — the [`Mode::Slice`] layout, on
+    /// its own button because it is a different thing to do, not another way
+    /// of reading the folder.
+    SampleSlice,
     /// Arm MIDI learn.
     /// Listen to the tab's audio input and play its instrument from the pitch.
     PitchToMidi,
@@ -172,6 +211,9 @@ pub struct RackLayout {
     pub mute: Option<Rect>,
     pub solo: Option<Rect>,
     pub buttons: Vec<(RackButton, Rect)>,
+    /// The sampler's waveform, when the tab draws one: clicking in it is the
+    /// scrub — it says where in the sample a note starts.
+    pub sample_wave: Option<Rect>,
     /// (FX index, rect) for the chain buttons — they wrap onto further lines
     /// when the chain is wider than the panel.
     pub fx_slots: Vec<(usize, Rect)>,
@@ -520,6 +562,117 @@ pub fn bank_run(shapes: &[ParamShape], cursor: usize) -> Option<(usize, usize)> 
         to += 1;
     }
     (to - from >= BANK_MIN).then_some((from, to))
+}
+
+/// The sampler's two pictures, two rows tall: the sample on the left with its
+/// start point marked, the envelope those knobs make on the right.
+///
+/// Neither is a measurement — nobody edits a sample by counting cells. They
+/// are there so a start point that landed in silence, or an attack long enough
+/// to swallow the note, is seen rather than deduced from a number.
+fn draw_sampler_graphs(
+    f: &mut Frame,
+    inner: Rect,
+    y: u16,
+    bg: Style,
+    view: &SamplerView,
+    layout: &mut RackLayout,
+) -> u16 {
+    // Two rows, and the panel is short: a narrow one keeps its buttons.
+    if inner.width < 40 || y + 2 > inner.y + inner.height {
+        return y;
+    }
+    let label = Style::default().fg(LABEL).add_modifier(Modifier::BOLD);
+    let wave_style = Style::default().fg(KNOB);
+    let env_style = Style::default().fg(ON_COLOUR);
+    // The start marker, drawn in the waveform's own colours inverted so it is
+    // found at a glance in a full bar.
+    let mark = Style::default().fg(Color::Black).bg(ON_COLOUR);
+
+    let gap = 3u16;
+    let total = inner.width.saturating_sub(4 + gap);
+    let env_w = (total / 3).clamp(8, 24) as usize;
+    let wave_w = total.saturating_sub(env_w as u16) as usize;
+
+    // The sample, resampled to the columns there are for it. No folder yet, or
+    // a file that would not decode: a flat line, which is what it sounds like.
+    let peaks: Vec<f32> = (0..wave_w)
+        .map(|i| match view.peaks.is_empty() {
+            true => 0.0,
+            false => {
+                let from = i * view.peaks.len() / wave_w;
+                let to = ((i + 1) * view.peaks.len() / wave_w).max(from + 1);
+                view.peaks[from..to.min(view.peaks.len())]
+                    .iter()
+                    .fold(0.0f32, |m, v| m.max(*v))
+            }
+        })
+        .collect();
+    let start_at = (view.start.clamp(0.0, 1.0) * wave_w.saturating_sub(1) as f32).round() as usize;
+
+    let [a, d, sus, r] = view.env;
+    let env: Vec<f32> = (0..env_w)
+        .map(|i| {
+            // The four knobs share the picture in the proportion they are set
+            // in, so a long attack really is most of it. A quarter each when
+            // every one of them is at zero, which is the envelope that does
+            // nothing and reads as a block.
+            let total = a + d + r + 0.75;
+            let t = i as f32 / env_w.saturating_sub(1).max(1) as f32 * total;
+            if t < a {
+                return t / a.max(1e-6);
+            }
+            if t < a + d {
+                return 1.0 - (1.0 - sus) * ((t - a) / d.max(1e-6));
+            }
+            if t < a + d + 0.75 {
+                return sus;
+            }
+            sus * (1.0 - (t - a - d - 0.75) / r.max(1e-6)).max(0.0)
+        })
+        .collect();
+
+    // The whole strip is the scrub: a click in it starts the note there.
+    layout.sample_wave = Some(Rect::new(inner.x + 2, y, wave_w as u16, 2));
+
+    for (row, y) in [(0usize, y), (1, y + 1)] {
+        let mut spans = vec![Span::raw("  ")];
+        for (i, v) in peaks.iter().enumerate() {
+            let (top, bottom) = vertical_bar(*v, 1);
+            let cell = if row == 0 { top } else { bottom };
+            spans.push(match i == start_at {
+                // The start point is drawn even where the sample is silent —
+                // an empty column is still where the note begins.
+                true => Span::styled(
+                    if cell.trim().is_empty() {
+                        "\u{2595}".to_string()
+                    } else {
+                        cell
+                    },
+                    mark,
+                ),
+                false => Span::styled(cell, wave_style),
+            });
+        }
+        spans.push(Span::styled(
+            match row {
+                0 => "  ENV ".to_string(),
+                _ => "      ".to_string(),
+            },
+            label,
+        ));
+        for v in &env {
+            let (top, bottom) = vertical_bar(*v, 1);
+            spans.push(Span::styled(if row == 0 { top } else { bottom }, env_style));
+        }
+        if y < inner.y + inner.height {
+            f.render_widget(
+                Paragraph::new(Line::from(spans)).style(bg),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+        }
+    }
+    y + 2
 }
 
 /// One column of a vertical fader bank, two rows tall: `(top, bottom)`.
@@ -1352,6 +1505,9 @@ pub fn draw_fx_chain_panel(
     instrument: &str,
     // `preset` is the current bank:preset name, when the tab holds a SoundFont.
     preset: Option<&str>,
+    // The sampler's own panel, when the tab holds one. `None` for everything
+    // else, which is every other instrument choz can load.
+    sampler: Option<SamplerView>,
     // Whether the tab's instrument has a native window to open.
     has_gui: bool,
     // Whether it has a set of harmonics choz can draw.
@@ -1639,6 +1795,46 @@ pub fn draw_fx_chain_panel(
         (RackButton::Source, Some(btn(BTN_SOURCE))),
         // Bank/preset only exists while the tab holds a SoundFont.
         (RackButton::Preset, has_presets.then(|| btn(BTN_PRESET))),
+        // The sampler's two: where its samples are, and how they are laid out.
+        // A sampler with no folder yet says so rather than showing a blank —
+        // that button is the whole of what to do next.
+        (
+            RackButton::SampleFolder,
+            sampler.map(|s| match s.dir.is_empty() {
+                true => format!(" {} ", t("LOAD")),
+                false => format!(" {} {} ", t("LOAD"), truncate(s.dir, 14)),
+            }),
+        ),
+        (
+            RackButton::SampleClear,
+            sampler.map(|_| format!(" {} ", t("CLEAR"))),
+        ),
+        // Audition: the same note a key would play, held while it is lit.
+        (
+            RackButton::SamplePlay,
+            sampler.map(|s| match s.playing {
+                true => " \u{25A0} ".to_string(),
+                false => " \u{25B6} ".to_string(),
+            }),
+        ),
+        (
+            RackButton::SampleLoop,
+            sampler.map(|s| {
+                format!(
+                    " {} {} ",
+                    t("LOOP"),
+                    if s.looping { "\u{25CF}" } else { "\u{25CB}" }
+                )
+            }),
+        ),
+        (
+            RackButton::SampleSlice,
+            sampler.map(|_| format!(" {} ", t("SLICE"))),
+        ),
+        (
+            RackButton::SampleLayout,
+            sampler.map(|s| format!(" {} ", s.layout)),
+        ),
         // A guitar into a synth: only offered where there is audio coming in.
         (
             RackButton::PitchToMidi,
@@ -1693,7 +1889,18 @@ pub fn draw_fx_chain_panel(
         ),
     ] {
         let Some(text) = text else { continue };
-        let style = if btn == RackButton::Sandbox && sandbox.live {
+        let lit = match btn {
+            RackButton::SamplePlay => sampler.is_some_and(|s| s.playing),
+            RackButton::SampleLoop => sampler.is_some_and(|s| s.looping),
+            RackButton::SampleSlice => sampler.is_some_and(|s| s.layout == "SLICE"),
+            _ => false,
+        };
+        let style = if lit {
+            Style::default()
+                .fg(Color::Black)
+                .bg(ON_COLOUR)
+                .add_modifier(Modifier::BOLD)
+        } else if btn == RackButton::Sandbox && sandbox.live {
             sbx_style
         } else if btn == RackButton::PitchToMidi && pitch_to_midi == Some(true) {
             // On, and it changes what the tab does with its input, so it says so
@@ -1709,6 +1916,16 @@ pub fn draw_fx_chain_panel(
         layout.buttons.push((btn, rect));
     }
     y = instr_row.finish();
+
+    // ── The sampler's two pictures ─────────────────────────────────────────
+    //
+    // A folder of samples has no plugin window and no parameter list of its
+    // own, so what it is playing and what it is doing to it can only be read
+    // here: the shape of the sample with the start point marked in it, and the
+    // envelope those four knobs add up to.
+    if let Some(view) = sampler {
+        y = draw_sampler_graphs(f, inner, y, bg, &view, &mut layout);
+    }
 
     // ── Bank / preset line (SoundFont tabs only) ───────────────────────────
     if let Some(name) = preset {

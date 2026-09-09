@@ -176,6 +176,10 @@ static TABLE: &[Row] = &[
     ("PRESET",       ["PRESET",      "PRESET",       "PR\u{c9}R\u{c9}GLAGE", "PRESET", "PRESET",   "\u{41f}\u{420}\u{415}\u{421}\u{415}\u{422}", "\u{30d7}\u{30ea}\u{30bb}\u{30c3}\u{30c8}", "\u{9884}\u{8bbe}"]),
     ("PICK BANK",    ["ELEGIR BANCO", "ESCOLHER BANCO", "CHOISIR BANQUE", "SCEGLI BANCO", "BANK WÄHLEN", "ВЫБРАТЬ БАНК", "バンク選択", "选择音色库"]),
     ("BANK FOLDER",  ["CARPETA DEL BANCO", "PASTA DO BANCO", "DOSSIER DE BANQUE", "CARTELLA BANCO", "BANK-ORDNER", "ПАПКА БАНКА", "バンクフォルダ", "音色库文件夹"]),
+    ("PICK A FOLDER",  ["ELEGIR CARPETA", "ESCOLHER PASTA", "CHOISIR UN DOSSIER", "SCEGLI CARTELLA", "ORDNER WÄHLEN", "ВЫБРАТЬ ПАПКУ", "フォルダを選ぶ", "选择文件夹"]),
+    ("FOLDER",  ["CARPETA", "PASTA", "DOSSIER", "CARTELLA", "ORDNER", "ПАПКА", "フォルダ", "文件夹"]),
+    ("LAYOUT",  ["MAPEO", "MAPEAMENTO", "DISPOSITION", "MAPPATURA", "BELEGUNG", "РАСКЛАДКА", "配置", "映射"]),
+    ("SAMPLE FOLDER",  ["CARPETA DE SAMPLES", "PASTA DE SAMPLES", "DOSSIER D'ÉCHANTILLONS", "CARTELLA CAMPIONI", "SAMPLE-ORDNER", "ПАПКА СЭМПЛОВ", "サンプルフォルダ", "采样文件夹"]),
     ("ARP",          ["ARP",         "ARP",          "ARP",          "ARP",          "ARP",          "\u{410}\u{420}\u{41f}", "\u{30a2}\u{30eb}\u{30da}", "\u{7434}\u{97f3}"]),
     ("SENS",         ["SENS",        "SENS",         "SENS",         "SENS",         "EMPF",         "\u{427}\u{423}\u{412}", "\u{611f}\u{5ea6}", "\u{7075}\u{654f}"]),
     ("RACK ONLY",    ["SOLO RACK",   "S\u{d3} RACK",  "RACK SEUL",    "SOLO RACK",    "NUR RACK",     "\u{422}\u{41e}\u{41b}\u{42c}\u{41a}\u{41e} \u{420}\u{415}\u{419}\u{41a}", "\u{30e9}\u{30c3}\u{30af}\u{306e}\u{307f}", "\u{4ec5}\u{673a}\u{67b6}"]),
@@ -252,6 +256,9 @@ static TABLE: &[Row] = &[
     ("PAUSE", ["PAUSA", "PAUSA", "PAUSE", "PAUSA", "PAUSE", "\u{41f}\u{410}\u{423}\u{417}\u{410}", "\u{4e00}\u{6642}\u{505c}\u{6b62}", "\u{6682}\u{505c}"]),
     ("CLEAR", ["BORRAR", "LIMPAR", "EFFACER", "CANCELLA", "L\u{d6}SCHEN", "\u{421}\u{422}\u{415}\u{420}\u{415}\u{422}\u{42c}", "\u{6d88}\u{53bb}", "\u{6e05}\u{9664}"]),
     ("EXPORT LOOPS", ["EXPORTAR LOOPS", "EXPORTAR LOOPS", "EXPORTER LES BOUCLES", "ESPORTA I LOOP", "LOOPS EXPORTIEREN", "\u{42d}\u{41a}\u{421}\u{41f}\u{41e}\u{420}\u{422} \u{41b}\u{423}\u{41f}\u{41e}\u{412}", "\u{30eb}\u{30fc}\u{30d7}\u{3092}\u{66f8}\u{304d}\u{51fa}\u{3059}", "\u{5bfc}\u{51fa}\u{5faa}\u{73af}"]),
+    ("LOOP", ["BUCLE", "LOOP", "BOUCLE", "LOOP", "SCHLEIFE", "\u{41f}\u{415}\u{422}\u{41b}\u{42f}", "\u{30eb}\u{30fc}\u{30d7}", "\u{5faa}\u{73af}"]),
+    ("LOAD", ["CARGAR", "CARREGAR", "CHARGER", "CARICA", "LADEN", "\u{417}\u{410}\u{413}\u{420}\u{423}\u{417}\u{418}\u{422}\u{42c}", "\u{8aad}\u{307f}\u{8fbc}\u{307f}", "\u{52a0}\u{8f7d}"]),
+    ("SLICE", ["CORTAR", "FATIAR", "D\u{c9}COUPER", "TAGLIA", "SCHNEIDEN", "\u{41d}\u{410}\u{420}\u{415}\u{417}\u{410}\u{422}\u{42c}", "\u{30b9}\u{30e9}\u{30a4}\u{30b9}", "\u{5207}\u{7247}"]),
 ];
 
 /// The interface string for `key` in the current language.

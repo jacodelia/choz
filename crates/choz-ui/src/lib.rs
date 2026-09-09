@@ -34,7 +34,8 @@ mod views;
 /// but it is not *interface* either, and the CLAP bundle cannot carry what only
 /// the binary can see. Re-exported under the names they had, so every
 /// `crate::arp::…` in the panels reads the same as before.
-pub use choz_engine::{arp, seq};
+pub use choz_engine::artifacts::{arp, seq};
+pub use choz_engine::instruments::sampler;
 
 use choz_engine::fx_chain::FxSpec;
 use choz_engine::{engine, midi, sources};
@@ -286,6 +287,10 @@ struct RackSlot {
     /// no programs at all and keeps its 637 factory patches as `.fxp` files, so
     /// without this the tab has no bank and no way to reach any of them.
     preset_dir: Option<std::path::PathBuf>,
+    /// The shape of the sample this tab would play, as peak levels 0..1 — what
+    /// the RACK draws as a waveform. Only a sampler tab has one, and it is read
+    /// once when the folder is adopted: it means decoding a file.
+    sampler_peaks: Vec<f32>,
     /// Plugin-instrument slots only: what the plugin exposes, and the current
     /// knob positions (0..1, same order). Empty for every other source kind.
     instr_params: Vec<choz_engine::PluginParam>,
@@ -360,6 +365,7 @@ impl RackSlot {
             dssi_config: Vec::new(),
             plugin_presets: Vec::new(),
             preset_dir: None,
+            sampler_peaks: Vec::new(),
             instr_params: Vec::new(),
             instr_values: Vec::new(),
             instr_window: None,
@@ -566,6 +572,15 @@ enum ModalKind {
     PluginPaths,
     /// Directory picker that adds a path to `paths_format`.
     AddPath,
+    /// The sampler's own settings for the active tab: which folder it is
+    /// playing and how it is laid out on the keyboard. This is what INSTR
+    /// opens for a sample folder, in the place a plugin shows its parameters.
+    SamplerSetup,
+    /// Directory picker for the sampler: a folder (or a `.zip`) of samples,
+    /// scanned into an instrument on the spot. Its filter chips are the
+    /// layouts of `sampler::Mode` — whether the samples get stretched across
+    /// the keyboard or laid out one per key.
+    SamplesFolder,
     /// Directory picker for File \u{2192} Save project.
     SaveProject,
     LoadProject,
@@ -791,7 +806,7 @@ fn level_bar(v: f32) -> String {
 /// How the bar is counted, for the metronome menu: "2+2+3", or the bar itself
 /// when it is not grouped.
 fn grouping_label(num: u16) -> String {
-    let groups = choz_engine::metronome::metronome().groups();
+    let groups = choz_engine::artifacts::metronome::metronome().groups();
     let sum: u16 = groups.iter().map(|g| *g as u16).sum();
     match groups.len() {
         0 => format!("{num} (even)"),
@@ -847,6 +862,8 @@ struct SourceChoice {
 
 #[derive(Debug, Clone)]
 enum SourceAction {
+    /// choz's own sampler: ask for a folder of samples, then play it.
+    Sampler,
     Plugin {
         format: choz_engine::PluginFormat,
         /// Plugin file, or the bundle directory for LV2.
@@ -862,9 +879,31 @@ enum SourceAction {
 
 /// Formats the SOURCE picker can filter by. Only CLAP/SF2/WAV can actually be
 /// loaded today; the rest are listed so it's obvious what choz doesn't host yet.
+/// The chips over the SOURCE list. **Categories, not file formats**: what they
+/// are for is narrowing a list of a thousand instruments to the handful worth
+/// looking at, and a chip nobody would think to press is a chip in the way.
+///
+/// So there is no `WAV` — a loose sample is browsed for, not filtered to — and
+/// no `SAMPLES`: a folder of samples is choz playing an instrument of its own,
+/// which is what `CLAP` already means to somebody looking at this list.
 const SOURCE_FORMATS: &[&str] = &[
-    "ALL", "CLAP", "SF2", "WAV", "SFZ", "LV2", "VST2", "VST3", "DSSI", "LADSPA",
+    "ALL", "CLAP", "SF2", "SFZ", "LV2", "VST2", "VST3", "DSSI", "LADSPA",
 ];
+
+/// Whether a scanned plugin is one choz publishes itself: the rack
+/// (`com.choz.rack`), its effects and its artifacts (`org.choz.*`).
+fn is_our_own(id: &str) -> bool {
+    id.starts_with("com.choz.") || id.starts_with("org.choz.")
+}
+
+/// Which chip an instrument answers to. Its own format, except for a sample
+/// folder — see [`SOURCE_FORMATS`].
+fn source_chip(format: choz_engine::PluginFormat) -> &'static str {
+    match format {
+        choz_engine::PluginFormat::Samples => "CLAP",
+        other => other.label(),
+    }
+}
 
 /// A rack control a MIDI CC can drive, bound by MIDI learn — and the address an
 /// automation lane is recorded against.
@@ -1696,6 +1735,8 @@ impl HarmonicsState {
 
 struct App {
     source: AudioSource,
+    /// The note the sampler's audition button is holding, when it holds one.
+    sampler_note: Option<u8>,
     /// Every MIDI input port seen at the last scan (connected or not).
     midi_ports: Vec<String>,
     /// Decoded background image, rebuilt when the file or the terminal size
@@ -1958,6 +1999,7 @@ impl App {
         let (note_tx, note_rx) = flume::unbounded();
 
         Self {
+            sampler_note: None,
             source: AudioSource::Midi,
             midi_ports: Vec::new(),
             midi_connected: Vec::new(),
@@ -2236,6 +2278,12 @@ impl App {
             .plugins
             .iter()
             .filter(|p| p.is_instrument)
+            // **choz is not one of the instruments choz can load.** Installed,
+            // its own bundles sit in `~/.clap` like anybody else's and the scan
+            // finds them — so the rack offered to put the whole rack in a tab
+            // of itself, and the window that opened was a mirror facing a
+            // mirror. It stays out of this list; the plugin is for other hosts.
+            .filter(|p| !is_our_own(&p.id))
             .map(|p| {
                 let hosted = p.format.is_hosted();
                 let mark = if hosted {
@@ -2244,7 +2292,7 @@ impl App {
                     "  (not hosted yet)".to_string()
                 };
                 SourceChoice {
-                    fmt: p.format.label(),
+                    fmt: source_chip(p.format),
                     label: format!("{}{mark}", p.name),
                     action: match p.format {
                         // SFZ isn't a plugin, but it loads through the same
@@ -2262,6 +2310,17 @@ impl App {
                 }
             })
             .collect();
+
+        // **The sampler is always here, with or without a folder.** It is an
+        // instrument choz has, not a thing that appears once the right
+        // directory happens to be on a search path — and a list that only
+        // offers it after it has been set up is a list that never gets it set
+        // up. Picking it asks where the samples are.
+        out.push(SourceChoice {
+            fmt: source_chip(choz_engine::PluginFormat::Samples),
+            label: sampler::NAME.to_string(),
+            action: SourceAction::Sampler,
+        });
 
         for (fmt, ext, dirs) in [
             ("SF2", "sf2", sf2_dirs()),
@@ -3369,7 +3428,7 @@ impl App {
 
     /// Switch the click on or off. Also on `F6` and on the MET button.
     fn toggle_metronome(&mut self) {
-        let m = choz_engine::metronome::metronome();
+        let m = choz_engine::artifacts::metronome::metronome();
         m.set_on(!m.on());
     }
 
@@ -3484,7 +3543,7 @@ impl App {
             return;
         }
         let t = choz_ports::transport();
-        let m = choz_engine::metronome::metronome();
+        let m = choz_engine::artifacts::metronome::metronome();
         let (num, den) = t.time_signature();
         match i {
             0 | 1 => {
@@ -3506,7 +3565,7 @@ impl App {
                 self.ui.save();
             }
             2 => {
-                let all = choz_engine::metronome::musical_groupings(num.min(255) as u8);
+                let all = choz_engine::artifacts::metronome::musical_groupings(num.min(255) as u8);
                 let now = m.groups();
                 let at = all.iter().position(|g| *g == now).unwrap_or(0) as isize;
                 let next = &all[(at + delta).rem_euclid(all.len() as isize) as usize];
@@ -3830,7 +3889,7 @@ impl App {
     }
 
     fn metronome_rows(&self) -> Vec<String> {
-        let m = choz_engine::metronome::metronome();
+        let m = choz_engine::artifacts::metronome::metronome();
         let t = choz_ports::transport();
         let (num, den) = t.time_signature();
         vec![
@@ -3873,7 +3932,7 @@ impl App {
         if delta == 0 {
             return;
         }
-        let m = choz_engine::metronome::metronome();
+        let m = choz_engine::artifacts::metronome::metronome();
         let t = choz_ports::transport();
         let wrap = |at: usize, n: usize| -> usize {
             ((at as isize + delta).rem_euclid(n as isize)) as usize
@@ -3913,7 +3972,7 @@ impl App {
                 t.set_time_signature(n, d);
                 // The old grouping counted a different bar. Keeping it would
                 // accent beats that are no longer there.
-                choz_engine::metronome::metronome().set_groups(&[]);
+                choz_engine::artifacts::metronome::metronome().set_groups(&[]);
                 self.ui.audio.time_sig = (n, d);
                 self.ui.save();
             }
@@ -3922,7 +3981,7 @@ impl App {
                 // built from the signature, so it can never hold a grouping
                 // that does not fit it.
                 let (num, _) = t.time_signature();
-                let all = choz_engine::metronome::musical_groupings(num.min(255) as u8);
+                let all = choz_engine::artifacts::metronome::musical_groupings(num.min(255) as u8);
                 let now = m.groups();
                 let at = all.iter().position(|g| *g == now).unwrap_or(0);
                 let next = &all[wrap(at, all.len())];
@@ -3934,7 +3993,7 @@ impl App {
                 });
             }
             5 => {
-                let all = choz_engine::metronome::ClickStyle::ALL;
+                let all = choz_engine::artifacts::metronome::ClickStyle::ALL;
                 let at = all.iter().position(|s| *s == m.style()).unwrap_or(0);
                 m.set_style(all[wrap(at, all.len())]);
             }
@@ -5345,6 +5404,22 @@ impl App {
     /// Parameter editor for the active tab's instrument — a hosted plugin's own
     /// parameters, or a SoundFont's built-in reverb / chorus switches.
     fn open_instr_modal(&mut self) {
+        // A sample folder has no plugin parameters, but it does have the two
+        // things that decide what it plays. Same key, same place in the
+        // interface: this is where a source's own settings live.
+        if let Some((dir, mode)) = self.active_sampler() {
+            let mut modal = Modal::new(
+                ModalKind::SamplerSetup,
+                views::modal::ListModal::new(sampler::NAME.to_string(), Vec::new()),
+            );
+            modal.list.note = match dir.as_os_str().is_empty() {
+                true => format!("  {}", i18n::t("PICK A FOLDER")),
+                false => format!("  {} \u{00B7} {}", dir.display(), mode.label()),
+            };
+            self.modal = Some(modal);
+            self.refresh_modal();
+            return;
+        }
         let Some(slot) = self.slots.get(self.active_slot) else {
             return;
         };
@@ -6218,7 +6293,7 @@ impl App {
                 let n = TIME_SIGS.len() as isize;
                 let (num, den) = TIME_SIGS[(((i + step) % n + n) % n) as usize];
                 t.set_time_signature(num, den);
-                choz_engine::metronome::metronome().set_groups(&[]);
+                choz_engine::artifacts::metronome::metronome().set_groups(&[]);
                 self.ui.audio.time_sig = (num, den);
                 self.ui.save();
             }
@@ -6591,6 +6666,247 @@ impl App {
         (out, frames)
     }
 
+    /// SOURCE \u{2192} F2: point the sampler at a folder.
+    ///
+    /// A sample library is not installed anywhere — it is wherever the person
+    /// put it — so the picker starts at the last folder they pointed at, or at
+    /// home. What comes back is scanned the way the plugin scan scans:
+    /// a folder with samples in it is an instrument, a folder of those is a
+    /// shelf, and a `.zip` is either.
+    fn open_samples_folder(&mut self) {
+        let start = self
+            .plugin_paths
+            .dirs(choz_engine::PluginFormat::Samples)
+            .last()
+            .map(|d| d.path.clone())
+            .filter(|d| d.is_dir())
+            .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        let modes: Vec<&str> = choz_engine::instruments::sampler::Mode::ALL
+            .iter()
+            .map(|m| m.label())
+            .collect();
+        let mut modal = Modal::new(
+            ModalKind::SamplesFolder,
+            views::modal::ListModal::new(i18n::t("SAMPLE FOLDER"), Vec::new()).with_filters(&modes),
+        );
+        modal.browser = Some(file_browser::FileBrowser::open(
+            &start,
+            file_browser::DIR_PICK,
+        ));
+        self.modal = Some(modal);
+        self.refresh_modal();
+    }
+
+    /// Put the sampler in the active tab with nothing in it. It answers notes
+    /// with silence until it is given a folder — from INSTR, or by picking it
+    /// in SOURCE a second time.
+    fn load_empty_sampler(&mut self) {
+        let entry = SynthEntry {
+            id: sampler::EMPTY_ID.to_string(),
+            format: choz_engine::PluginFormat::Samples,
+            name: sampler::NAME.to_string(),
+            path: std::path::PathBuf::new(),
+        };
+        if !self.synths.iter().any(|s| s.id == entry.id) {
+            self.synths.push(entry.clone());
+        }
+        self.load_plugin_source(entry.format, &entry.path, &entry.id);
+    }
+
+    /// The folder and the layout of the active tab, when what it is playing is
+    /// a folder of samples. `None` for everything else.
+    fn active_sampler(&self) -> Option<(std::path::PathBuf, sampler::Mode)> {
+        let slot = self.slots.get(self.active_slot)?;
+        match &slot.source {
+            AudioSource::Plugin { id, format, .. }
+                if format == choz_engine::PluginFormat::Samples.label() =>
+            {
+                // An empty sampler holds a marker rather than a path: it has
+                // been chosen but not yet pointed anywhere.
+                let dir = match id.as_str() {
+                    sampler::EMPTY_ID => std::path::PathBuf::new(),
+                    _ => sampler::Mode::strip(id).into(),
+                };
+                Some((dir, sampler::Mode::of_id(id)))
+            }
+            _ => None,
+        }
+    }
+
+    /// The next layout round the loop: worked out, stretched, one per key.
+    fn step_sampler_mode(&mut self) {
+        let Some((_, mode)) = self.active_sampler() else {
+            return;
+        };
+        let next = sampler::Mode::ALL
+            .iter()
+            .cycle()
+            .skip_while(|m| **m != mode)
+            .nth(1)
+            .copied()
+            .unwrap_or_default();
+        self.set_sampler_mode(next);
+    }
+
+    /// Audition the folder: hold a note, or let go of the one being held.
+    ///
+    /// The same note a key sends, through the same funnel — see
+    /// [`Self::send_note`] — so the arpeggiator, MIDI OUT and the panic all
+    /// know about it. Middle C for something played across a keyboard, the
+    /// first key of the map for a kit or a set of slices, because that is
+    /// where its sounds are.
+    fn toggle_sample_preview(&mut self) {
+        let slot = self.active_slot;
+        if let Some(note) = self.sampler_note.take() {
+            self.send_note(slot, false, note, 0);
+            return;
+        }
+        let Some((_, mode)) = self.active_sampler() else {
+            return;
+        };
+        let note = match mode {
+            sampler::Mode::Kit | sampler::Mode::Slice => 36,
+            _ => 60,
+        };
+        self.sampler_note = Some(note);
+        self.send_note(slot, true, note, 100);
+    }
+
+    /// Flip one of the sampler's switch-shaped knobs — LOOP is the only one —
+    /// through the same path a knob moved by hand takes, so the engine hears
+    /// it and the project keeps it.
+    fn toggle_sampler_knob(&mut self, index: usize) {
+        let now = self
+            .slots
+            .get(self.active_slot)
+            .and_then(|s| s.instr_values.get(index).copied())
+            .unwrap_or(0.0);
+        self.set_instr_param(index, if now >= 0.5 { 0.0 } else { 1.0 });
+    }
+
+    /// Cut the folder into a piece per key, or put it back the way it was.
+    fn toggle_slice_layout(&mut self) {
+        let Some((_, mode)) = self.active_sampler() else {
+            return;
+        };
+        self.set_sampler_mode(match mode {
+            sampler::Mode::Slice => sampler::Mode::Auto,
+            _ => sampler::Mode::Slice,
+        });
+    }
+
+    /// Everything the RACK draws for a sampler tab, owned — the panel borrows
+    /// from it. `None` on every tab that is not one.
+    fn sampler_panel(&self) -> Option<SamplerPanel> {
+        let (dir, mode) = self.active_sampler()?;
+        let slot = self.slots.get(self.active_slot);
+        let knob = |i: usize| {
+            slot.and_then(|s| s.instr_values.get(i).copied())
+                .unwrap_or(0.0)
+        };
+        Some(SamplerPanel {
+            dir: match dir.as_os_str().is_empty() {
+                true => String::new(),
+                false => file_label(&dir),
+            },
+            layout: mode.label(),
+            playing: self.sampler_note.is_some(),
+            looping: knob(SAMPLER_LOOP) >= 0.5,
+            peaks: slot.map(|s| s.sampler_peaks.clone()).unwrap_or_default(),
+            start: knob(SAMPLER_START),
+            env: [knob(2), knob(3), knob(4), knob(5)],
+        })
+    }
+
+    /// Lay the same folder out the other way. The layout rides on the id, so
+    /// this is a reload of the same instrument under a different name.
+    fn set_sampler_mode(&mut self, mode: sampler::Mode) {
+        let Some((dir, _)) = self.active_sampler() else {
+            return;
+        };
+        let id = format!("{}{}", choz_engine::paths::path_id(&dir), mode.suffix());
+        self.load_plugin_source(choz_engine::PluginFormat::Samples, &dir, &id);
+    }
+
+    /// A folder the user pointed at: scan it, remember it, and play it.
+    ///
+    /// One instrument in it goes straight into the tab — that is what picking a
+    /// folder means. Several, and the SOURCE list comes back with them in it,
+    /// because choosing between them is the next thing to do and the list is
+    /// where that is done.
+    fn adopt_samples_folder(&mut self, dir: std::path::PathBuf, mode: sampler::Mode) {
+        let found = choz_engine::paths::scan_path(&dir, choz_engine::PluginFormat::Samples);
+        if found.is_empty() {
+            eprintln!("choz: no samples under {}", dir.display());
+            return;
+        }
+        // Remembered, so the next scan finds it without being asked again.
+        let known = self
+            .plugin_paths
+            .dirs(choz_engine::PluginFormat::Samples)
+            .iter()
+            .any(|d| d.path == dir);
+        if !known {
+            self.plugin_paths
+                .dirs_mut(choz_engine::PluginFormat::Samples)
+                .push(choz_engine::SearchDir {
+                    path: dir.clone(),
+                    enabled: true,
+                });
+            self.plugin_paths.save();
+        }
+        // Into the catalogue now rather than after a rescan: a rescan opens
+        // every plugin on the machine, and the person is waiting on one folder.
+        //
+        // **Both lists.** `plugins` is what the picker shows and `synths` is
+        // what the loader looks the choice up in; filling only the first is a
+        // folder that appears in the list and does nothing when it is chosen.
+        for entry in &found {
+            if !self.plugins.iter().any(|p| p.path == entry.path) {
+                self.plugins.push(entry.clone());
+            }
+            // One entry per layout, because the layout is part of the id and
+            // this table is what both the loader and a reopened project look
+            // an id up in. They are never shown: the picker reads `plugins`.
+            for mode in sampler::Mode::ALL {
+                let id = format!("{}{}", entry.id, mode.suffix());
+                if !self.synths.iter().any(|s| s.id == id) {
+                    self.synths.push(SynthEntry {
+                        id,
+                        format: entry.format,
+                        name: entry.name.clone(),
+                        path: entry.path.clone(),
+                    });
+                }
+            }
+        }
+        self.plugins.sort_by(|a, b| a.name.cmp(&b.name));
+        match found.as_slice() {
+            [only] => {
+                // The mode rides on the id, so the project reopens it this way.
+                let id = format!("{}{}", only.id, mode.suffix());
+                self.load_plugin_source(only.format, &only.path.clone(), &id);
+                self.close_modal();
+            }
+            _ => {
+                eprintln!(
+                    "choz: {} sample instruments under {}",
+                    found.len(),
+                    dir.display()
+                );
+                self.open_source_modal();
+                if let Some(m) = self.modal.as_mut() {
+                    m.list.filter = SOURCE_FORMATS
+                        .iter()
+                        .position(|f| *f == source_chip(choz_engine::PluginFormat::Samples))
+                        .unwrap_or(0);
+                }
+                self.refresh_modal();
+            }
+        }
+    }
+
     fn open_dir_picker(&mut self) {
         let start = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
@@ -6785,7 +7101,22 @@ impl App {
                 }
                 rows
             }
+            // Two rows: where the samples are, and how they sit on the
+            // keyboard. Both are one Enter away from being changed, which is
+            // the whole of what this instrument has to be told.
+            ModalKind::SamplerSetup => {
+                let (dir, mode) = self.active_sampler().unwrap_or_default();
+                let folder = match dir.as_os_str().is_empty() {
+                    true => i18n::t("PICK A FOLDER").to_string(),
+                    false => dir.display().to_string(),
+                };
+                vec![
+                    format!("{}   {folder}", i18n::t("FOLDER")),
+                    format!("{}   {}", i18n::t("LAYOUT"), mode.label()),
+                ]
+            }
             ModalKind::AddPath
+            | ModalKind::SamplesFolder
             | ModalKind::LoopExport
             | ModalKind::SaveProject
             | ModalKind::LoadProject => self
@@ -6932,6 +7263,7 @@ impl App {
                 ModalKind::Browser
                 | ModalKind::Bank
                 | ModalKind::AddPath
+                | ModalKind::SamplesFolder
                 | ModalKind::LoopExport
                 | ModalKind::SaveProject
                 | ModalKind::LoadProject,
@@ -7067,6 +7399,23 @@ impl App {
                     Some(SourceAction::Browse(ext)) => {
                         self.open_browser_modal(ext);
                         false
+                    }
+                    Some(SourceAction::Sampler) => {
+                        // **Empty first, folder second.** Picking the sampler
+                        // puts it in the tab; where the samples are is the next
+                        // question, asked from the tab that now has it. Pick it
+                        // again on a tab that already has it and that is the
+                        // question being answered.
+                        match self.active_sampler().is_some() {
+                            true => {
+                                self.open_samples_folder();
+                                false
+                            }
+                            false => {
+                                self.load_empty_sampler();
+                                true
+                            }
+                        }
                     }
                     Some(SourceAction::Unsupported(fmt)) => {
                         eprintln!("choz: {fmt} hosting is not implemented yet");
@@ -7470,6 +7819,44 @@ impl App {
                         true
                     }
                     _ => false,
+                }
+            }
+            ModalKind::SamplerSetup => {
+                match i {
+                    // The folder: ask again, from wherever it is now.
+                    0 => self.open_samples_folder(),
+                    // The layout: step to the next one and reload on it.
+                    _ => {
+                        self.step_sampler_mode();
+                        self.refresh_modal();
+                    }
+                }
+                false
+            }
+            ModalKind::SamplesFolder => {
+                let mode = self
+                    .modal
+                    .as_ref()
+                    .and_then(|m| sampler::Mode::ALL.get(m.list.filter).copied())
+                    .unwrap_or_default();
+                let picked = self.modal.as_mut().and_then(|m| {
+                    let b = m.browser.as_mut()?;
+                    b.cursor = i;
+                    b.select()
+                });
+                match picked {
+                    Some(file_browser::Action::EnterDir(d)) => {
+                        if let Some(b) = self.modal.as_mut().and_then(|m| m.browser.as_mut()) {
+                            b.set_dir(d);
+                        }
+                        self.refresh_modal();
+                        false
+                    }
+                    Some(file_browser::Action::PickFile(dir)) => {
+                        self.adopt_samples_folder(dir, mode);
+                        false
+                    }
+                    None => true,
                 }
             }
             ModalKind::AddPath => {
@@ -7885,7 +8272,7 @@ impl App {
                 }),
                 time_sig: Some(choz_ports::transport().time_signature()),
                 metronome: {
-                    let m = choz_engine::metronome::metronome();
+                    let m = choz_engine::artifacts::metronome::metronome();
                     Some(project::Metronome {
                         on: m.on(),
                         gain: m.gain(),
@@ -8012,10 +8399,10 @@ impl App {
             self.ui.audio.time_sig = t.time_signature();
         }
         if let Some(m) = &p.audio.metronome {
-            let met = choz_engine::metronome::metronome();
+            let met = choz_engine::artifacts::metronome::metronome();
             met.set_gain(m.gain);
             met.set_style(
-                choz_engine::metronome::ClickStyle::ALL
+                choz_engine::artifacts::metronome::ClickStyle::ALL
                     .into_iter()
                     .find(|s| s.label() == m.style)
                     .unwrap_or_default(),
@@ -9982,6 +10369,10 @@ impl App {
             .unwrap_or_default();
         // The instrument in this tab is about to be replaced; its window cannot
         // outlive it.
+        // A held audition note belongs to the instrument that was there.
+        if let Some(note) = self.sampler_note.take() {
+            self.send_note(slot, false, note, 0);
+        }
         self.close_editor_for(Some(slot));
         let loaded = match self.audio_engine.as_mut() {
             Some(engine) => {
@@ -10010,7 +10401,19 @@ impl App {
                     .as_ref()
                     .map(|e| e.slot_presets(slot))
                     .unwrap_or_default();
+                // The shape of what it plays, for the sampler's own picture on
+                // the RACK. One decode, here where a load is already happening
+                // — never while anything is drawing.
+                let peaks = match entry.format {
+                    choz_engine::PluginFormat::Samples if entry.id != sampler::EMPTY_ID => {
+                        sampler::representative(&entry.path)
+                            .map(|f| sampler::peaks(&f, 256))
+                            .unwrap_or_default()
+                    }
+                    _ => Vec::new(),
+                };
                 if let Some(s) = self.slots.get_mut(slot) {
+                    s.sampler_peaks = peaks;
                     s.instr_params = params;
                     s.instr_values = values;
                     s.plugin_presets = presets;
@@ -10536,7 +10939,7 @@ impl App {
             // same click the rest of the program hears, counting the same
             // transport the quantise rounds to.
             LoopBtn::Metro => {
-                let met = choz_engine::metronome::metronome();
+                let met = choz_engine::artifacts::metronome::metronome();
                 met.set_on(!met.on());
                 return;
             }
@@ -11193,7 +11596,7 @@ impl App {
             let mut events = Vec::new();
             if playing {
                 // Started by the transport, so counted by it — see
-                // [`choz_engine::seq::Seq::play_on_transport`]: its own clock
+                // [`choz_engine::artifacts::seq::Seq::play_on_transport`]: its own clock
                 // in the gap before the first audio block fired the downbeat a
                 // second time, which is heard as the tab doubling.
                 slot.seq.play_on_transport();
@@ -14313,6 +14716,12 @@ fn handle_modal_key(app: &mut App, key: KeyCode) {
             app.close_modal();
             return;
         }
+        // Point the sampler at a folder, from the picker where an instrument
+        // is chosen. **F2, not a letter**: the letters are the search box here.
+        KeyCode::F(2) if kind == ModalKind::Source => {
+            app.open_samples_folder();
+            return;
+        }
         // Rescan plugins from the SOURCE / ADD FX pickers. **F5, not `r`**:
         // the letters are the search box in these two.
         KeyCode::F(5) if matches!(kind, ModalKind::Source | ModalKind::AddFx) => {
@@ -15159,6 +15568,20 @@ enum MouseAction {
     /// Step the active tab's MIDI channel (MULTI mode).
     ChannelStep(i8),
     OpenPresetPicker,
+    /// Point the sampler at a folder, and step how that folder is laid out.
+    OpenSampleFolder,
+    StepSampleLayout,
+    /// Forget the folder: the tab keeps the sampler, empty.
+    ClearSampler,
+    /// Audition the folder without a keyboard — a note held until the button
+    /// is pressed again.
+    ToggleSamplePlay,
+    /// Whether a held note runs round the sample, and whether the folder is
+    /// cut into a piece per key.
+    ToggleSampleLoop,
+    ToggleSampleSlice,
+    /// Where in the sample a note starts, as a fraction of it: the scrub.
+    SampleScrub(f32),
     /// What opens the selected effect, and — the harmoniser's — which
     /// keyboard its chord comes from.
     OpenFxGate,
@@ -15284,12 +15707,25 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
 
             if layout.fx_chain_area.contains(pos) {
                 let rack = &layout.rack;
+                // The scrub: where in the waveform it was clicked is where the
+                // note starts. Before the buttons, because it is a strip of
+                // its own and nothing else is drawn over it.
+                if let Some(r) = rack.sample_wave.filter(|r| r.contains(pos)) {
+                    let at = (pos.x - r.x) as f32 / r.width.max(1) as f32;
+                    return MouseAction::SampleScrub(at.clamp(0.0, 1.0));
+                }
                 for &(btn, rect) in rack.buttons.iter() {
                     if rect.contains(pos) {
                         return match btn {
                             RackButton::Channel => MouseAction::ChannelStep(1),
                             RackButton::Source => MouseAction::OpenSourcePicker,
                             RackButton::Preset => MouseAction::OpenPresetPicker,
+                            RackButton::SampleFolder => MouseAction::OpenSampleFolder,
+                            RackButton::SampleLayout => MouseAction::StepSampleLayout,
+                            RackButton::SampleClear => MouseAction::ClearSampler,
+                            RackButton::SamplePlay => MouseAction::ToggleSamplePlay,
+                            RackButton::SampleLoop => MouseAction::ToggleSampleLoop,
+                            RackButton::SampleSlice => MouseAction::ToggleSampleSlice,
                             RackButton::PitchToMidi => MouseAction::TogglePitchToMidi,
                             RackButton::PitchMix => MouseAction::PitchMixCycle,
                             RackButton::Gui => MouseAction::ToggleEditor,
@@ -15755,11 +16191,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             (l.met_rect, l.met_menu_rect, l.met_tap_rect)
         };
         if met_tap.is_some_and(|r| r.contains(pos)) {
-            choz_engine::arp::tap_tempo(&mut app.met_taps, Instant::now());
+            choz_engine::artifacts::arp::tap_tempo(&mut app.met_taps, Instant::now());
             // A full count of four is somebody counting a band in: the click
             // they were counting for goes on by itself.
             if app.met_taps.len() >= 4 {
-                choz_engine::metronome::metronome().set_on(true);
+                choz_engine::artifacts::metronome::metronome().set_on(true);
             }
             return;
         }
@@ -15952,6 +16388,13 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             app.rack_focus = RackFocus::Fx;
         }
         MouseAction::OpenPresetPicker => app.open_preset_modal(),
+        MouseAction::OpenSampleFolder => app.open_samples_folder(),
+        MouseAction::StepSampleLayout => app.step_sampler_mode(),
+        MouseAction::ClearSampler => app.load_empty_sampler(),
+        MouseAction::ToggleSamplePlay => app.toggle_sample_preview(),
+        MouseAction::ToggleSampleLoop => app.toggle_sampler_knob(SAMPLER_LOOP),
+        MouseAction::ToggleSampleSlice => app.toggle_slice_layout(),
+        MouseAction::SampleScrub(at) => app.set_instr_param(SAMPLER_START, at),
         MouseAction::ToggleEditor => app.toggle_editor(None),
         MouseAction::OpenHarmonics => app.open_harmonics_modal(),
         MouseAction::ToggleFxEditor => app.toggle_editor(Some(app.fx_slot)),
@@ -16406,6 +16849,39 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
 /// Knob step of the instrument-parameter editor (left/right arrows).
 const INSTR_STEP: f32 = 0.05;
 
+/// Where the sampler's knobs sit in its own parameter list — the order
+/// [`choz_engine::instruments::sampler::params`] builds them in. The panel
+/// reaches for these two by hand; the rest are knobs like any other.
+const SAMPLER_START: usize = 0;
+const SAMPLER_LOOP: usize = 1;
+
+/// The sampler's panel, owned. [`views::fx_chain_panel::SamplerView`] borrows
+/// from one of these — the draw call cannot own its strings, and the tab
+/// cannot hand out references to values it computes.
+struct SamplerPanel {
+    dir: String,
+    layout: &'static str,
+    playing: bool,
+    looping: bool,
+    peaks: Vec<f32>,
+    start: f32,
+    env: [f32; 4],
+}
+
+impl SamplerPanel {
+    fn view(&self) -> views::fx_chain_panel::SamplerView<'_> {
+        views::fx_chain_panel::SamplerView {
+            dir: &self.dir,
+            layout: self.layout,
+            playing: self.playing,
+            looping: self.looping,
+            peaks: &self.peaks,
+            start: self.start,
+            env: self.env,
+        }
+    }
+}
+
 /// One row of the INSTRUMENT parameter list: name, control, value.
 ///
 /// The list is the long form of the same three controls the RACK's knob box
@@ -16542,7 +17018,13 @@ fn ui(f: &mut Frame, app: &mut App) {
     // The MIDI monitor takes whatever is left once the rack and the transport
     // have theirs, up to 8 rows. Below 3 (a border plus one message) it is not
     // worth the space and disappears entirely.
-    let monitor_height = monitor_rows(body.height);
+    // Embedded, it goes away entirely: a plugin window is a panel on somebody
+    // else's screen, the host has its own MIDI monitoring, and the rows are
+    // worth more to the rack than to a log nobody reads inside a DAW.
+    let monitor_height = match choz_engine::is_embedded() {
+        true => 0,
+        false => monitor_rows(body.height),
+    };
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(10), Constraint::Length(monitor_height)])
@@ -16697,6 +17179,9 @@ fn ui(f: &mut Frame, app: &mut App) {
                 .collect()
         })
         .unwrap_or_default();
+    // The sampler's own panel — its buttons, its waveform and its envelope —
+    // when the tab is holding one. Owned here because the draw call borrows it.
+    let sampler_panel = app.sampler_panel();
     let rack = views::fx_chain_panel::draw_fx_chain_panel(
         f,
         fx_chain_area,
@@ -16709,6 +17194,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         mix,
         &app.instrument_label(),
         app.active_preset_label().as_deref(),
+        sampler_panel.as_ref().map(SamplerPanel::view),
         app.has_editor(),
         app.has_harmonics(),
         app.has_fx_editor(),
@@ -16767,7 +17253,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             solo: loop_solo,
             pan: loop_pan,
             vol: loop_vol,
-            metro: choz_engine::metronome::metronome().on(),
+            metro: choz_engine::artifacts::metronome::metronome().on(),
             chans: loop_chans,
             page: app.loop_page,
             cursor: app.loop_cursor,
@@ -17231,7 +17717,7 @@ fn draw_menu_bar(f: &mut Frame, app: &App, area: Rect) {
         .bg(Color::Rgb(40, 46, 56));
     let bold = |fg: Color, bg: Color| Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
 
-    let met_on = choz_engine::metronome::metronome().on();
+    let met_on = choz_engine::artifacts::metronome::metronome().on();
     let met_style = match met_on {
         true => bold(Color::Black, Color::Rgb(230, 200, 120)),
         false => off,
@@ -18269,6 +18755,7 @@ mod tests {
                 mix,
                 &app.instrument_label(),
                 None,
+                None,
                 false,
                 false,
                 false,
@@ -18597,12 +19084,16 @@ mod tests {
             "VST3 isn't hosted yet"
         );
 
-        // Back to CLAP: the instrument is there again.
+        // Back to CLAP: the instrument is there again — beside the sampler,
+        // which is under this chip on every machine whether or not there is a
+        // sample folder anywhere.
         let clap = SOURCE_FORMATS.iter().position(|f| *f == "CLAP").unwrap();
         app.modal.as_mut().unwrap().list.filter = clap;
         app.refresh_modal();
-        assert_eq!(app.modal.as_ref().unwrap().list.items.len(), 1);
-        assert!(app.modal.as_ref().unwrap().list.items[0].contains("Example Synth"));
+        let rows = app.modal.as_ref().unwrap().list.items.clone();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("Example Synth")));
+        assert!(rows.iter().any(|r| r.contains(sampler::NAME)));
     }
 
     /// A click on a modal row selects it; clicking the same row again (or the
@@ -19807,6 +20298,7 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default();
+        let panel = app.sampler_panel();
         term.draw(|f| {
             let mix = app
                 .slots
@@ -19825,6 +20317,9 @@ mod tests {
                 mix,
                 &app.instrument_label(),
                 preset.as_deref(),
+                // The test harness draws whatever tab it built; a sampler's
+                // buttons are exercised by the tests that make one.
+                panel.as_ref().map(SamplerPanel::view),
                 app.has_editor(),
                 app.has_harmonics(),
                 app.has_fx_editor(),
@@ -23779,7 +24274,7 @@ mod tests {
     /// arrows.
     #[test]
     fn reset_puts_a_soundfont_back_the_way_it_loaded() {
-        use choz_engine::sf2_patch::{EDITS, NEUTRAL, SENDS};
+        use choz_engine::instruments::sf2_patch::{EDITS, NEUTRAL, SENDS};
         use views::fx_chain_panel::RackButton;
         let _g = ui_guard();
         let _restore = UiRestore;
@@ -23975,7 +24470,7 @@ mod tests {
     /// panel of their own.
     #[test]
     fn the_sf2_generators_are_editable_and_learnable_like_any_other_knob() {
-        use choz_engine::sf2_patch::{EDITS, NEUTRAL, SENDS};
+        use choz_engine::instruments::sf2_patch::{EDITS, NEUTRAL, SENDS};
         let _g = ui_guard();
         let _restore = UiRestore;
         let mut app = App::new();
@@ -26288,7 +26783,7 @@ mod tests {
         let met = app.layout.borrow().met_rect.unwrap();
         assert!(tap.x + tap.width <= met.x, "TAP sits left of the metronome");
 
-        let m = choz_engine::metronome::metronome();
+        let m = choz_engine::artifacts::metronome::metronome();
         m.set_on(false);
         for _ in 0..4 {
             click(&mut app, tap.x + 1, tap.y);
@@ -26955,7 +27450,7 @@ mod tests {
     #[test]
     fn the_metronome_switches_and_its_menu_steps_every_setting() {
         let _g = ui_guard();
-        let m = choz_engine::metronome::metronome();
+        let m = choz_engine::artifacts::metronome::metronome();
         m.set_on(false);
         let mut app = App::new();
         app.splash_done = true;
@@ -27786,7 +28281,7 @@ mod tests {
         app.slots[0].seq.settings.on = true;
         app.slots[0].seq.settings.div = arp::TimeDiv::Sixteenth;
         let t = choz_ports::transport();
-        choz_engine::metronome::metronome().set_groups(&[]);
+        choz_engine::artifacts::metronome::metronome().set_groups(&[]);
 
         // 4/4 at 1/16: four cells to a beat, sixteen to the bar — what it
         // always drew, and still does.
@@ -27806,7 +28301,7 @@ mod tests {
 
         // Grouped 3+2+2, as the click accents it: the grid breaks where the
         // groups do.
-        choz_engine::metronome::metronome().set_groups(&[3, 2, 2]);
+        choz_engine::artifacts::metronome::metronome().set_groups(&[3, 2, 2]);
         let view = app.slots[0].seq.view();
         assert_eq!(view.stops, vec![0, 6, 10], "3+2+2 of two cells each");
 
@@ -27835,7 +28330,9 @@ mod tests {
         app.step_seq_meter_row(0, 1);
         assert_eq!(choz_ports::transport().time_signature(), (8, 8));
         assert!(
-            choz_engine::metronome::metronome().groups().is_empty(),
+            choz_engine::artifacts::metronome::metronome()
+                .groups()
+                .is_empty(),
             "a grouping that counted seven does not survive an eighth beat"
         );
         app.step_seq_meter_row(1, 1);
@@ -27846,7 +28343,7 @@ mod tests {
         assert!(app.modal_select());
 
         t.set_time_signature(4, 4);
-        choz_engine::metronome::metronome().set_groups(&[]);
+        choz_engine::artifacts::metronome::metronome().set_groups(&[]);
     }
 
     /// Typing a knob's name lands on it, on the box that draws the knobs.
@@ -29333,7 +29830,7 @@ mod tests {
         let _restore = UiRestore;
         sandbox_state_dir();
         let t = choz_ports::transport();
-        let met = choz_engine::metronome::metronome();
+        let met = choz_engine::artifacts::metronome::metronome();
 
         let mut app = App::new();
         app.push_slot(AudioSource::Midi);
@@ -29350,7 +29847,7 @@ mod tests {
         t.set_time_signature(7, 8);
         met.set_on(true);
         met.set_gain(0.3);
-        met.set_style(choz_engine::metronome::ClickStyle::Wood);
+        met.set_style(choz_engine::artifacts::metronome::ClickStyle::Wood);
         met.set_groups(&[2, 2, 3]);
 
         // Through the file, not just through memory: a nested enum used to
@@ -29364,7 +29861,7 @@ mod tests {
         t.set_time_signature(4, 4);
         met.set_on(false);
         met.set_gain(0.5);
-        met.set_style(choz_engine::metronome::ClickStyle::Beep);
+        met.set_style(choz_engine::artifacts::metronome::ClickStyle::Beep);
         met.set_groups(&[]);
 
         let mut fresh = App::new();
@@ -29373,7 +29870,10 @@ mod tests {
         assert_eq!(t.time_signature(), (7, 8));
         assert!(met.on());
         assert_eq!(met.gain(), 0.3);
-        assert_eq!(met.style(), choz_engine::metronome::ClickStyle::Wood);
+        assert_eq!(
+            met.style(),
+            choz_engine::artifacts::metronome::ClickStyle::Wood
+        );
         assert_eq!(met.groups(), vec![2, 2, 3]);
         assert_eq!(fresh.ui.rack_mode, settings::RackMode::Multi);
         assert_eq!(
@@ -30413,5 +30913,332 @@ mod tests {
             0.0,
             "the gesture left the parameter at rest"
         );
+    }
+
+    /// F2 in the SOURCE picker opens the sampler's folder picker, with the
+    /// layouts as its chips — a sample library lives wherever the person put
+    /// it, so pointing choz at one has to be a thing you do from where you
+    /// choose an instrument, not a path typed into settings.
+    #[test]
+    fn f2_in_the_source_picker_opens_the_sample_folder_browser() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.open_source_modal();
+        assert_eq!(app.modal.as_ref().map(|m| m.kind), Some(ModalKind::Source));
+
+        handle_key(&mut app, KeyCode::F(2));
+        let modal = app.modal.as_ref().expect("the picker closed");
+        assert_eq!(modal.kind, ModalKind::SamplesFolder);
+        assert!(modal.browser.is_some(), "no directory browser");
+        assert_eq!(
+            modal.list.filters,
+            sampler::Mode::ALL
+                .iter()
+                .map(|m| m.label().to_string())
+                .collect::<Vec<_>>()
+        );
+        // AUTO is where it opens: the sampler's own reading of the folder.
+        assert_eq!(
+            sampler::Mode::ALL.get(modal.list.filter).copied(),
+            Some(sampler::Mode::Auto)
+        );
+    }
+
+    /// The chips are categories, and a folder of samples belongs under the one
+    /// a person would look in: it is choz playing its own instrument, which is
+    /// what CLAP means to somebody reading this list. There is no chip of its
+    /// own, and none for WAV either — a loose sample is browsed for.
+    #[test]
+    fn a_sample_folder_is_offered_under_the_clap_chip() {
+        let _g = ui_guard();
+        assert!(!SOURCE_FORMATS.contains(&"SAMPLES"));
+        assert!(!SOURCE_FORMATS.contains(&"WAV"));
+
+        let mut app = App::new();
+        app.plugins.push(choz_engine::FoundPlugin {
+            format: choz_engine::PluginFormat::Samples,
+            name: "violin".into(),
+            path: "/Samples/violin".into(),
+            id: "/Samples/violin".into(),
+            is_instrument: true,
+        });
+        app.open_source_modal();
+        if let Some(m) = app.modal.as_mut() {
+            m.list.filter = SOURCE_FORMATS.iter().position(|f| *f == "CLAP").unwrap();
+        }
+        assert!(
+            app.source_rows().iter().any(|c| c.label == "violin"),
+            "the folder is not under CLAP"
+        );
+        // And it still loads as what it is, not as a plugin file.
+        let violin = app
+            .source_choices()
+            .into_iter()
+            .find(|c| c.label == "violin")
+            .expect("no entry for it at all");
+        assert!(matches!(
+            violin.action,
+            SourceAction::Plugin { format, .. } if format == choz_engine::PluginFormat::Samples
+        ));
+    }
+
+    /// The sampler is an instrument choz has, not one that appears once the
+    /// right directory happens to be on a search path. A list that only offers
+    /// it after it has been set up is a list that never gets it set up — so it
+    /// is there on a machine with no sample folder anywhere, and picking it is
+    /// what asks where the samples are.
+    #[test]
+    fn the_sampler_is_always_in_the_instrument_list() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        assert!(app.plugins.is_empty(), "this test wants an empty scan");
+
+        let sampler_row = app
+            .source_choices()
+            .into_iter()
+            .find(|c| matches!(c.action, SourceAction::Sampler))
+            .expect("no sampler in the list");
+        assert_eq!(sampler_row.fmt, "CLAP");
+
+        // Choosing it puts the sampler in the tab **empty**: it is an
+        // instrument first and a folder second, and the tab is where the
+        // second question gets asked.
+        app.open_source_modal();
+        let row = app
+            .source_rows()
+            .iter()
+            .position(|c| matches!(c.action, SourceAction::Sampler))
+            .expect("not in the visible rows either");
+        if let Some(m) = app.modal.as_mut() {
+            m.list.cursor = row;
+        }
+        // `modal_select` answers whether the caller should close the modal.
+        assert!(app.modal_select(), "the picker would have stayed open");
+        assert!(
+            app.synths.iter().any(|s| s.id == sampler::EMPTY_ID),
+            "nothing was queued to load"
+        );
+
+        // With the sampler already in the tab, picking it again is how the
+        // folder gets chosen.
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: sampler::EMPTY_ID.into(),
+            format: choz_engine::PluginFormat::Samples.label().to_string(),
+            name: sampler::NAME.into(),
+        }));
+        app.active_slot = 0;
+        app.open_source_modal();
+        let row = app
+            .source_rows()
+            .iter()
+            .position(|c| matches!(c.action, SourceAction::Sampler))
+            .unwrap();
+        if let Some(m) = app.modal.as_mut() {
+            m.list.cursor = row;
+        }
+        assert!(!app.modal_select(), "it closed instead of asking");
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::SamplesFolder)
+        );
+    }
+
+    /// Once it is playing a folder, INSTR shows the sampler's own two settings
+    /// where a plugin shows its parameters: which folder, and how it is laid
+    /// out. Stepping the layout reloads the same folder the other way.
+    #[test]
+    fn instr_opens_the_samplers_own_settings() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: "/Samples/violin".into(),
+            format: choz_engine::PluginFormat::Samples.label().to_string(),
+            name: "violin".into(),
+        }));
+        app.active_slot = 0;
+        assert_eq!(
+            app.active_sampler(),
+            Some(("/Samples/violin".into(), sampler::Mode::Auto))
+        );
+
+        app.open_instr_modal();
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::SamplerSetup)
+        );
+        let rows = app.modal.as_ref().unwrap().list.items.clone();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[0].contains("/Samples/violin"));
+        assert!(rows[1].contains("AUTO"));
+
+        // The folder row asks again; the layout row steps.
+        if let Some(m) = app.modal.as_mut() {
+            m.list.cursor = 0;
+        }
+        app.modal_select();
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::SamplesFolder),
+            "the folder row did not ask for a folder"
+        );
+    }
+
+    /// The layout rides on the instrument's id, so stepping it is a reload of
+    /// the same folder under a different name — and the id is what a project
+    /// saves, which is what makes the choice survive being reopened.
+    #[test]
+    fn the_layout_steps_through_every_mode() {
+        let mut mode = sampler::Mode::Auto;
+        let mut seen = Vec::new();
+        for _ in 0..sampler::Mode::ALL.len() {
+            mode = sampler::Mode::ALL
+                .iter()
+                .cycle()
+                .skip_while(|m| **m != mode)
+                .nth(1)
+                .copied()
+                .unwrap();
+            seen.push(mode);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                sampler::Mode::Stretch,
+                sampler::Mode::Kit,
+                sampler::Mode::Slice,
+                sampler::Mode::Auto
+            ]
+        );
+    }
+
+    /// The sampler's setup is **on the rack panel**, not buried behind a key.
+    /// It has no plugin parameters, so the INSTRUMENT box never draws for it —
+    /// which left its folder and its layout with nowhere to be reached from.
+    /// They sit on the INSTR row, where a SoundFont's bank button sits.
+    #[test]
+    fn a_sampler_tab_carries_its_folder_and_layout_on_the_rack() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: sampler::EMPTY_ID.into(),
+            format: choz_engine::PluginFormat::Samples.label().to_string(),
+            name: sampler::NAME.into(),
+        }));
+        app.active_slot = 0;
+        assert!(
+            app.slots[0].instr_params.is_empty(),
+            "this is the case the INSTRUMENT box cannot cover"
+        );
+
+        let (screen, rack) = render_rack(&mut app, 120, 24);
+        for want in [i18n::t("LOAD"), i18n::t("CLEAR"), i18n::t("SLICE"), "AUTO"] {
+            assert!(screen.contains(want), "no {want} on screen:\n{screen}");
+        }
+
+        // And the buttons do what they say.
+        let rect = |want: views::fx_chain_panel::RackButton| {
+            rack.buttons
+                .iter()
+                .find(|(b, _)| *b == want)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| panic!("{want:?} is not on the panel"))
+        };
+        let folder = rect(views::fx_chain_panel::RackButton::SampleFolder);
+        click(&mut app, folder.x + 1, folder.y);
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::SamplesFolder),
+            "the folder button did not ask for a folder"
+        );
+        app.modal = None;
+
+        let layout = rect(views::fx_chain_panel::RackButton::SampleLayout);
+        click(&mut app, layout.x + 1, layout.y);
+        // Nothing to reload without an engine, but the step is what is under
+        // test: the layout the tab reports has moved on.
+        assert_eq!(
+            app.active_sampler().map(|(_, m)| m),
+            Some(sampler::Mode::Auto)
+        );
+    }
+
+    /// The rest of the sampler's panel: the buttons it was asked for, and the
+    /// waveform strip as the scrub.
+    ///
+    /// Every one of them goes through the same paths a key or a knob does —
+    /// LOOP is knob 1 and the scrub is knob 0, so they are saved with the
+    /// project and can be learned to a CC like anything else.
+    #[test]
+    fn the_sampler_buttons_play_loop_slice_and_scrub() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: "/Samples/violin".into(),
+            format: choz_engine::PluginFormat::Samples.label().to_string(),
+            name: "violin".into(),
+        }));
+        app.active_slot = 0;
+        app.slots[0].instr_params = choz_engine::instruments::sampler::params();
+        app.slots[0].instr_values = vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+
+        let (_, rack) = render_rack(&mut app, 120, 24);
+        let rect = |want: views::fx_chain_panel::RackButton| {
+            rack.buttons
+                .iter()
+                .find(|(b, _)| *b == want)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| panic!("{want:?} is not on the panel"))
+        };
+
+        // ▶ holds a note; pressing it again lets it go.
+        let play = rect(views::fx_chain_panel::RackButton::SamplePlay);
+        click(&mut app, play.x + 1, play.y);
+        assert_eq!(app.sampler_note, Some(60), "nothing was auditioned");
+        click(&mut app, play.x + 1, play.y);
+        assert_eq!(app.sampler_note, None, "the audition note was left held");
+
+        // LOOP is the sampler's second knob.
+        let looping = rect(views::fx_chain_panel::RackButton::SampleLoop);
+        click(&mut app, looping.x + 1, looping.y);
+        assert_eq!(app.slots[0].instr_values[SAMPLER_LOOP], 1.0);
+        click(&mut app, looping.x + 1, looping.y);
+        assert_eq!(app.slots[0].instr_values[SAMPLER_LOOP], 0.0);
+
+        // SLICE is a layout, so pressing it is a reload of the same folder —
+        // which needs an engine. What is checked here is that the button is
+        // wired to it; `the_layout_steps_through_every_mode` covers the rest.
+        let slice = rect(views::fx_chain_panel::RackButton::SampleSlice);
+        assert!(matches!(
+            mouse_action(
+                slice.x + 1,
+                slice.y,
+                &app.layout.borrow(),
+                MouseEventKind::Down(MouseButton::Left)
+            ),
+            MouseAction::ToggleSampleSlice
+        ));
+
+        // And a click in the waveform is the scrub: halfway along is halfway
+        // into the sample.
+        let wave = rack.sample_wave.expect("no waveform to scrub in");
+        click(&mut app, wave.x + wave.width / 2, wave.y);
+        let start = app.slots[0].instr_values[SAMPLER_START];
+        assert!(
+            (start - 0.5).abs() < 0.05,
+            "the scrub landed at {start} instead of halfway"
+        );
+
+        // CLEAR puts the empty sampler back in the tab — another reload, so
+        // the same rule as SLICE: the wiring is what is checked here.
+        let clear = rect(views::fx_chain_panel::RackButton::SampleClear);
+        assert!(matches!(
+            mouse_action(
+                clear.x + 1,
+                clear.y,
+                &app.layout.borrow(),
+                MouseEventKind::Down(MouseButton::Left)
+            ),
+            MouseAction::ClearSampler
+        ));
     }
 }

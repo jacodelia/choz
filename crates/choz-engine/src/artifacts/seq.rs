@@ -28,7 +28,7 @@
 //! upgrade path is to schedule against the grid the way `Arp::next_grid_step`
 //! does rather than to change anything here.
 
-use crate::arp::{ArpEvent, TimeDiv};
+use crate::artifacts::arp::{ArpEvent, TimeDiv};
 use std::time::{Duration, Instant};
 
 /// Tracks a part holds — the MMT-8's eight.
@@ -374,7 +374,7 @@ impl Seq {
             beat: self.settings.steps_per_beat(),
             stops: self
                 .settings
-                .group_stops(&crate::metronome::metronome().groups()),
+                .group_stops(&crate::artifacts::metronome::metronome().groups()),
             focused: false,
         }
     }

@@ -1362,6 +1362,60 @@ mod tests {
         unsafe { plugin_deactivate(plugin) };
         unsafe { plugin_destroy(plugin) };
     }
+
+    /// The window's mouse reaches the panels. Keys had a path of their own
+    /// from the first day and the pointer's was wired later, so this pins the
+    /// half that was missing: a click on the menu bar has to open a menu, the
+    /// same as it does on a terminal. A grid with nothing new under the bar
+    /// after a click is a window the user can only look at.
+    #[test]
+    fn a_click_on_the_menu_bar_opens_the_menu() {
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let _g = guard();
+        let plugin = unsafe { open() };
+        assert!(unsafe { plugin_init(plugin) });
+        assert!(unsafe { plugin_activate(plugin, 48_000.0, 32, 128) });
+
+        let inst = unsafe { Instance::of(plugin) }.unwrap();
+        let app = inst.app.as_mut().unwrap();
+        let mut terminal = Terminal::new(Grid::new(gui::COLS, gui::ROWS)).unwrap();
+        app.draw(&mut terminal).unwrap();
+
+        // The first label on the bar, found rather than named: the titles are
+        // translated, and a test that spelled "FILE" would fail in Spanish.
+        let row = |grid: &Grid, y: u16| -> String {
+            let start = y as usize * grid.width as usize;
+            grid.cells[start..start + grid.width as usize]
+                .iter()
+                .map(|c| c.symbol.as_str())
+                .collect()
+        };
+        let bar = row(terminal.backend(), 0);
+        let column = bar
+            .chars()
+            .position(|c| !c.is_whitespace())
+            .expect("the menu bar drew nothing") as u16;
+
+        let under = |grid: &Grid| -> String { (1..6).map(|y| row(grid, y)).collect() };
+        let before = under(terminal.backend());
+
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.draw(&mut terminal).unwrap();
+        assert_ne!(
+            before,
+            under(terminal.backend()),
+            "the click on the menu bar dropped no menu"
+        );
+
+        unsafe { plugin_deactivate(plugin) };
+        unsafe { plugin_destroy(plugin) };
+    }
 }
 
 /// The built `.clap` loaded the way a DAW loads it — `dlopen`, the entry

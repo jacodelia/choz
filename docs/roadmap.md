@@ -12,7 +12,7 @@ que decía "hecho" se fue al changelog.
 que no existe, una decisión de diseño y un fallo intermitente sin explicar—, dos
 decisiones de no hacer, y las notas para el que retome.
 
-Última actualización: 2026-09-07 (1.3.11 publicada).
+Última actualización: 2026-09-09 (sampler de carpetas, sin publicar).
 
 ## Estado en una línea
 
@@ -169,6 +169,24 @@ GATE.
 
 ### 3 · `cargo test --workspace` falla de a varios, de tanto en tanto
 
+**Actualización 2026-09-09: dos de los culpables encontrados y arreglados, y
+queda al menos uno.** Los tests del `seq` fallaban en corrida completa y pasaban
+solos; los del `seq` toman `test_locks::transport()`, así que el que escribía
+sin candado estaba en otro archivo —`fx_chain::the_clock_can_drive_a_gate_...`
+(tempo y sample rate) y `metronome::a_bar_is_accented_...` (la agrupación, que
+es lo que el `seq` le pregunta al metrónomo)—. Con los dos candados la corrida
+completa pasó 6 de 7 contra ~1 de cada 2 antes, así que **todavía queda algo**.
+Un barrido por tests que tocan `transport()` o `metronome()` sin el candado ya
+no devuelve nada: el que falta toca otro global. El barrido, para el que
+retome:
+
+```bash
+# tests que tocan un global del transporte sin tomar su candado
+grep -rn "test_locks::" crates/choz-engine/src | cut -d: -f1 | sort -u
+```
+
+Lo de abajo es el diagnóstico original.
+
 **Visto dos veces, sin explicar y sin nombres**: una corrida con **14** tests de
 `choz-engine` fallando de golpe y otra con **7**. Las dos veces la corrida
 siguiente pasó limpia, y por crate (`-p choz-engine`) nunca falló.
@@ -189,6 +207,49 @@ La hipótesis es la máquina cargada —el workspace corre varios binarios de te
 la vez y varios hacen `dlopen` de plugins reales, con la inicialización global
 que eso trae— pero **no está verificada**, y hasta tener los nombres no se puede
 verificar.
+
+### 4 · El sampler de carpetas: lo que la primera versión no hace (2026-09-09)
+
+**Falta código, y está acotado.** `crates/choz-engine/src/sampler/` convierte
+una carpeta de samples en un instrumento tocable —nombres, pitch de respaldo,
+zonas de tecla, capas de velocity, round robin, cache— y eso ya suena. Lo que
+quedó afuera a propósito, en el orden en que se echa de menos:
+
+- **Una articulación por vez.** La más grabada de la carpeta gana y el resto
+  queda en el mapa sin sonar. Lo que falta es el keyswitch: elegir articulación
+  por nota baja, por CC o desde la UI. Sin eso, un pack con sustain y staccato
+  juntos es medio pack.
+- **El modo es global al instrumento, no por región.** `AUTO`/`STRETCH`/`KIT`/
+  `SLICE` se eligen al abrir la carpeta y quedan en el id; no se pueden mezclar
+  dentro de un mismo instrumento ni cambiar sin volver a cargarlo.
+- **`SLICE` corta en 16 pedazos iguales**, no por transiente: un break que no
+  esté cuantizado cae entre golpes. La detección de transientes es lo que
+  falta, y `analyze::sustain_start` ya sabe encontrar uno.
+- **Los knobs del sampler son globales al instrumento**: `START`, `LOOP` y la
+  envolvente valen para todas las regiones. Por región (o por slice) hace falta
+  el editor de mapeo que sigue abajo.
+- **No hay editor del mapeo ni inspector de sample.** El panel del RACK dibuja
+  la forma de onda del sample representativo y la envolvente, pero el mapa se
+  acepta o no se acepta: no se puede corregir a mano una nota raíz mal
+  detectada, un rango, un fine tune. Es lo primero que se va a pedir la primera vez que el detector se
+  equivoque.
+- **Todo a RAM al cargar.** `SfzSampler` decodifica cada archivo cuando se
+  construye el instrumento. Para la Philharmonia entera eso es mucha memoria y
+  una espera; el streaming de disco para samples largos es la salida, y la
+  arquitectura no lo impide, pero no está.
+- **El aftertouch no está mapeado a nada**, ni channel ni poly.
+- **No hay presets `.smpreset` ni relink.** Si la librería se mueve, se
+  reescanea. El relink necesita hash de contenido, que hoy el cache no calcula
+  a propósito (ver el changelog).
+- **Sólo zip.** Un pack en `.rar`, `.7z` o `.tar.gz` hay que descomprimirlo a
+  mano. `zip` es lo que usan las librerías libres; los demás se agregan en
+  `sampler::archive` cuando aparezca uno que importe.
+- **Cada decode de una entrada reabre el zip** y relee su directorio central.
+  Son unos KB y un seek, y pasa una vez por región al construir el instrumento
+  (110 veces para el violín); si alguna vez se siente, el arreglo es abrir el
+  archivo una vez por instrumento y pasarlo entero.
+- **El drum map es alfabético.** `hat` `kick` `snare` caen en C2, C#2, D2 por
+  orden de nombre, no por el mapa GM.
 
 ## Las dos piezas que quedan fuera, por decisión
 

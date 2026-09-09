@@ -299,12 +299,12 @@ impl Sf2Synth {
 /// nobody asked for.
 ///
 /// The rest is the SoundFont editor — the envelope, the filter, the tuning and
-/// the output, from [`crate::sf2_patch::EDITS`]. They are ordinary slot
+/// the output, from [`crate::instruments::sf2_patch::EDITS`]. They are ordinary slot
 /// parameters on purpose: that is what makes them movable by mouse, by arrow
 /// key and by a learned CC, and what puts them in the project file, without a
 /// second copy of any of that machinery.
 pub fn sf2_params() -> Vec<choz_ports::PluginParam> {
-    use crate::sf2_patch::{EDITS, NEUTRAL};
+    use crate::instruments::sf2_patch::{EDITS, NEUTRAL};
     let sends = ["SF2 Reverb", "SF2 Chorus"]
         .iter()
         .map(|name| choz_ports::PluginParam {
@@ -336,7 +336,7 @@ pub fn sf2_params() -> Vec<choz_ports::PluginParam> {
 
 /// An SF2 generator number as oxisynth names it.
 ///
-/// Only the ones [`crate::sf2_patch::EDITS`] uses: the numbering is the
+/// Only the ones [`crate::instruments::sf2_patch::EDITS`] uses: the numbering is the
 /// specification's and shared, but oxisynth's enum is not `repr`-convertible
 /// from a `u16`, and a wrong transmute here would move the wrong generator.
 fn sf2_generator(gen: u16) -> Option<oxisynth::GeneratorType> {
@@ -500,13 +500,13 @@ impl AudioSource for Sf2Synth {
     }
 
     /// `0` = the SoundFont's own reverb send, `1` = its chorus send, both as
-    /// on/off; everything after them is one of [`crate::sf2_patch::EDITS`].
+    /// on/off; everything after them is one of [`crate::instruments::sf2_patch::EDITS`].
     ///
     /// RT-safe: `set_gen` writes a channel generator offset and re-derives the
     /// live voices from it. **Not** `set_chorus_params`, which rebuilds the
     /// chorus modulation table — 4.3 ms measured, an xrun every toggle.
     fn set_param(&mut self, index: usize, value: f32) {
-        if let Some((gen, offset)) = crate::sf2_patch::offset_of(index, value) {
+        if let Some((gen, offset)) = crate::instruments::sf2_patch::offset_of(index, value) {
             if let Some(g) = sf2_generator(gen) {
                 // Every zone: the editor shapes the instrument, not whichever
                 // half of the keyboard is being played at the time.
@@ -761,7 +761,7 @@ mod tests {
     /// exists: an offset is only big enough relative to what the file says.
     #[test]
     fn every_envelope_knob_changes_the_sound_in_the_direction_it_reads() {
-        use crate::sf2_patch::{NEUTRAL, SENDS};
+        use crate::instruments::sf2_patch::{NEUTRAL, SENDS};
         let path = std::path::Path::new("/usr/share/sounds/sf2/FluidR3_GM.sf2");
         if !path.exists() {
             return;

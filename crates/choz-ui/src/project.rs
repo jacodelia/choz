@@ -146,7 +146,7 @@ pub struct Audio {
     pub input_device: Option<String>,
 }
 
-/// The click as it was left. Mirrors [`choz_engine::metronome::Metronome`],
+/// The click as it was left. Mirrors [`choz_engine::artifacts::metronome::Metronome`],
 /// which holds it in atomics the audio thread reads.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Metronome {
