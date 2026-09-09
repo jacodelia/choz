@@ -12,7 +12,8 @@ que decía "hecho" se fue al changelog.
 que no existe, una decisión de diseño y un fallo intermitente sin explicar—, dos
 decisiones de no hacer, y las notas para el que retome.
 
-Última actualización: 2026-09-09 (sampler de carpetas, sin publicar).
+Última actualización: 2026-09-09 (sampler de carpetas y su panel en el RACK,
+sin publicar).
 
 ## Estado en una línea
 
@@ -210,10 +211,13 @@ verificar.
 
 ### 4 · El sampler de carpetas: lo que la primera versión no hace (2026-09-09)
 
-**Falta código, y está acotado.** `crates/choz-engine/src/sampler/` convierte
-una carpeta de samples en un instrumento tocable —nombres, pitch de respaldo,
-zonas de tecla, capas de velocity, round robin, cache— y eso ya suena. Lo que
-quedó afuera a propósito, en el orden en que se echa de menos:
+**Falta código, y está acotado.** `crates/choz-engine/src/instruments/sampler/`
+convierte una carpeta de samples en un instrumento tocable —nombres, pitch de
+respaldo, zonas de tecla, capas de velocity, round robin, cache— y el RACK ya
+le da panel propio. Lo que quedó afuera a propósito, en el orden en que se echa
+de menos:
+
+#### El mapa
 
 - **Una articulación por vez.** La más grabada de la carpeta gana y el resto
   queda en el mapa sin sonar. Lo que falta es el keyswitch: elegir articulación
@@ -222,22 +226,53 @@ quedó afuera a propósito, en el orden en que se echa de menos:
 - **El modo es global al instrumento, no por región.** `AUTO`/`STRETCH`/`KIT`/
   `SLICE` se eligen al abrir la carpeta y quedan en el id; no se pueden mezclar
   dentro de un mismo instrumento ni cambiar sin volver a cargarlo.
+- **No hay editor del mapeo ni inspector de sample.** El panel del RACK dibuja
+  la forma de onda y la envolvente, pero el mapa se acepta o no se acepta: no
+  se puede corregir a mano una nota raíz mal detectada, un rango, un fine tune.
+  Es lo primero que se va a pedir la primera vez que el detector se equivoque.
+- **El aftertouch no está mapeado a nada**, ni channel ni poly.
+- **El drum map es alfabético.** `hat` `kick` `snare` caen en C2, C#2, D2 por
+  orden de nombre, no por el mapa GM.
+
+#### El panel del RACK (2026-09-09)
+
+Los botones y los dos dibujos ya están —`LOAD`, `CLEAR`, `▶`/`■`, `LOOP`,
+`SLICE`, el layout, la forma de onda con el punto de arranque y la envolvente—
+y los knobs (`START`, `LOOP`, `ATTACK`, `DECAY`, `SUSTAIN`, `RELEASE`) son
+parámetros de instrumento como los de un plugin. Lo que le falta a eso:
+
+- **Los knobs son globales al instrumento.** `START`, `LOOP` y la envolvente
+  valen para todas las regiones a la vez. Por región —o por slice, que es donde
+  más se va a notar— hace falta el editor de mapeo de arriba.
+- **La envolvente se edita con los knobs, no con el dibujo.** El gráfico ADSR
+  es de sólo lectura: arrastrar sus vértices es lo natural y no está. El scrub
+  sí es clic sobre la forma de onda, así que el camino (rect en `RackLayout` →
+  `MouseAction` con fracción) ya está abierto.
+- **La forma de onda es la del sample representativo**, el que `map::regions`
+  pone primero, no la del que suena la tecla que se está tocando ni la del
+  slice bajo el cursor. Tampoco marca dónde caen los cortes de `SLICE`, que es
+  medio punto de tenerla.
 - **`SLICE` corta en 16 pedazos iguales**, no por transiente: un break que no
   esté cuantizado cae entre golpes. La detección de transientes es lo que
-  falta, y `analyze::sustain_start` ya sabe encontrar uno.
-- **Los knobs del sampler son globales al instrumento**: `START`, `LOOP` y la
-  envolvente valen para todas las regiones. Por región (o por slice) hace falta
-  el editor de mapeo que sigue abajo.
-- **No hay editor del mapeo ni inspector de sample.** El panel del RACK dibuja
-  la forma de onda del sample representativo y la envolvente, pero el mapa se
-  acepta o no se acepta: no se puede corregir a mano una nota raíz mal
-  detectada, un rango, un fine tune. Es lo primero que se va a pedir la primera vez que el detector se
-  equivoque.
+  falta, y `analyze::sustain_start` ya sabe encontrar uno. El número tampoco se
+  elige: `sampler::SLICES` es una constante.
+- **El `LOOP` no tiene puntos propios.** Vuelve a donde arrancó la nota (el
+  `START`) y termina donde termina el sample o el slice; no hay loop start/end
+  ni crossfade, así que un sustain que no cierre en cero chasquea.
+- **La audición toca una nota fija** —C4, o C2 en `KIT`/`SLICE`— a velocity
+  100. No se elige la tecla ni la dinámica, que es justo lo que se quiere
+  probar en un pack multisample con capas.
+- **Los picos se calculan en el hilo de la UI al cargar.** Un decode más, del
+  archivo representativo, encima del decode de todo el instrumento. Con un
+  sample largo eso se siente al abrir la carpeta; sale del `Analysis` que el
+  cache ya guarda, o se hace en el mismo paso que el resto.
+
+#### El costo de cargar
+
 - **Todo a RAM al cargar.** `SfzSampler` decodifica cada archivo cuando se
   construye el instrumento. Para la Philharmonia entera eso es mucha memoria y
   una espera; el streaming de disco para samples largos es la salida, y la
   arquitectura no lo impide, pero no está.
-- **El aftertouch no está mapeado a nada**, ni channel ni poly.
 - **No hay presets `.smpreset` ni relink.** Si la librería se mueve, se
   reescanea. El relink necesita hash de contenido, que hoy el cache no calcula
   a propósito (ver el changelog).
@@ -248,15 +283,13 @@ quedó afuera a propósito, en el orden en que se echa de menos:
   Son unos KB y un seek, y pasa una vez por región al construir el instrumento
   (110 veces para el violín); si alguna vez se siente, el arreglo es abrir el
   archivo una vez por instrumento y pasarlo entero.
-- **El drum map es alfabético.** `hat` `kick` `snare` caen en C2, C#2, D2 por
-  orden de nombre, no por el mapa GM.
 
 ## Las dos piezas que quedan fuera, por decisión
 
 ### El editor SF2 por zona (2026-08-30)
 
 Los once generadores de
-[`sf2_patch::EDITS`](../crates/choz-engine/src/sf2_patch.rs) se escriben hoy en
+[`sf2_patch::EDITS`](../crates/choz-engine/src/instruments/sf2_patch.rs) se escriben hoy en
 todos los canales a la vez (`Sf2Synth::set_param`, `for channel in 0..=ZONES`),
 así que el editor da forma al instrumento entero y no a media teclado.
 
