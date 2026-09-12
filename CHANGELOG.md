@@ -32,6 +32,28 @@ lleva lo que falta —nada de lo ya hecho— y
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
 
+## [Unreleased]
+
+### El log ya no puede llenar el disco
+
+Un plugin de batería (AVLdrums, LV2, hosteado en el mismo proceso) se quedó
+retriggereando una nota en loop. Su fluidsynth interno imprimía "Ringbuffer
+full" en cada intento fallido de robar una voz, sin ningún límite — fd 1/2 de
+choz van directo a `choz.log` por diseño (así es como el usuario ve los
+banners y warnings de los plugins que hostea), así que el log se comió 3.4 GB
+en diez minutos mientras la CPU se ahogaba y el audio de todo el sistema
+(PipeWire) empezaba a fallar por falta de tiempo real.
+
+`log::spawn_log_watchdog` revisa cada 5 segundos y trunca el archivo si pasa
+los 32 MiB. Funciona sin tocar los fd ya duplicados: ambos se abren con
+`O_APPEND`, que busca el fin de archivo en cada escritura en lugar de guardar
+un offset, así que truncar el path por debajo alcanza.
+
+No arregla el plugin que se cuelga — eso es AVLdrums, ajeno a este repo — sólo
+evita que cualquier plugin así vuelva a llenar el disco. Para ese plugin en
+particular, forzarlo a la sandbox (`x` en el rack) lo aísla del proceso
+principal.
+
 ## [1.3.11] — 2026-09-07
 
 ### La entrada MIDI deja midir y habla el secuenciador ALSA
