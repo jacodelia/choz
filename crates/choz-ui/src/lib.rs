@@ -13503,6 +13503,7 @@ pub fn run() -> Result<()> {
     // the TUI. Tell the user where it is before we grab the terminal.
     if let Some(path) = log::redirect_stderr() {
         println!("choz: logging to {}", path.display());
+        log::spawn_log_watchdog();
     }
 
     enable_raw_mode()?;
