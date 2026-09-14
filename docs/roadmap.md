@@ -5,15 +5,16 @@ día por día, con los porqués y lo último arriba; cómo encajan las piezas, e
 [architecture.md](architecture.md); las dos auditorías, en
 [fx-audit.md](fx-audit.md). Este documento se poda cada vez que un punto se
 cierra, para que lo que quede sea sólo lo que queda: se podó entero el
-2026-08-19, el 2026-08-29, el 2026-08-31 y el 2026-09-01, y las cuatro veces lo
-que decía "hecho" se fue al changelog.
+2026-08-19, el 2026-08-29, el 2026-08-31, el 2026-09-01 y el 2026-09-13, y las
+cinco veces lo que decía "hecho" se fue al changelog.
 
-**Hoy no falta nada pedido.** Lo que queda son tres cosas sin cerrar —un test
-que no existe, una decisión de diseño y un fallo intermitente sin explicar—, dos
-decisiones de no hacer, y las notas para el que retome.
+**Hoy no falta nada pedido y no queda ninguna decisión abierta.** Lo que queda
+son tres bordes —el sidechain, el sampler y el arreglador—, dos decisiones de no
+hacer, y las notas para el que retome.
 
-Última actualización: 2026-09-09 (sampler de carpetas y su panel en el RACK,
-sin publicar; el arreglador, pedido y sin empezar).
+Última actualización: 2026-09-13 — se cerraron el punto del CC 7 y casi todo lo
+que el sampler y el arreglador tenían abierto; lo cerrado está en el
+[changelog](../CHANGELOG.md).
 
 ## Estado en una línea
 
@@ -66,9 +67,15 @@ cliente y un solo hilo que nunca se para. Y choz **también se carga entero
 dentro de un DAW** como instrumento CLAP, con su ventana X11 y dieciséis
 salidas estéreo, una por tab. Una tab puede **salir del master
 por un puerto propio**, uno por tab en un lugar fijo y del ancho que la tab
-tenga, que es lo que Ardour graba pista por pista. **La 1.0.0 está publicada y
+tenga, que es lo que Ardour graba pista por pista. El sampler de carpetas
+**corta por transientes, guarda su mapa en un `.smpreset` que se edita y se
+relinkea, y cambia de articulación por keyswitch**; el arreglador **tiene forma
+—partes, intro y final—, veinticinco estilos (más los que se escriban en
+`~/.local/state/choz/styles`), su progresión se escribe dentro de la TUI y sale
+en el `.clap` como tercer artifact.** **La 1.0.0 está publicada y
 sus paquetes verificados; la 1.3.11 es este árbol.**
-881 tests, `clippy --workspace --all-targets -D warnings` limpio.
+983 tests (el workspace sin `choz-plugin-lv2`, que en esta máquina se cuelga),
+`clippy --workspace --all-targets -D warnings` limpio con `+beta`.
 
 Las comprobaciones con hardware delante quedaron dichas en los gotchas, que es
 donde se van a leer.
@@ -77,13 +84,9 @@ donde se van a leer.
 
 ## Pendiente
 
-**Ningún borde abierto de lo ya entregado.** Todo lo que se pidió está hecho y
-contado día por día en el [changelog](../CHANGELOG.md). Lo que queda son **tres
-cosas sin cerrar** —un test que no existe, una decisión que no es mía y un fallo
-que no supe reproducir—, los bordes que el sidechain deja fuera, lo que el
-sampler de carpetas todavía no hace, **el arreglador, que está pedido y sin
-empezar**, y después las dos piezas que se decidió no hacer. Un punto que se
-cierra sale de aquí: este documento es lo que queda, no lo que hubo.
+Tres bordes y dos decisiones de no hacer. Lo entregado se cuenta día por día en
+el [changelog](../CHANGELOG.md); un punto que se cierra sale de aquí, porque
+este documento es lo que queda y no lo que hubo.
 
 Las dos auditorías —la de DSP y la de guardado— viven enteras en
 [fx-audit.md](fx-audit.md), con el archivo y la línea de cada hallazgo: la
@@ -91,60 +94,10 @@ sección 6 tiene lo único que se midió y se decidió **no** arreglar (el peine
 shifter de voces), y la 7 lo que hay que saber antes de tocar el guardado de un
 efecto. No se repiten acá.
 
-### 0 · Nada comprueba que un `process_block` no alloca (abierto el 2026-09-01)
+### 1 · Sidechain: lo que queda fuera del gate (2026-09-02)
 
-**Falta un test, no una decisión.**
-
-La regla está escrita en [fx-audit.md](fx-audit.md) —"sin allocations en
-`process_block`"— y se rompió sin que nadie se enterara: tres de los diez
-efectos nuevos copiaban el bloque con `buf.to_vec()` para filtrarlo, y la suite
-entera pasaba en verde. Lo cazó la lectura del diff antes de publicar, que es
-exactamente el mecanismo que no escala.
-
-Lo que haría falta es un allocador de test que cuente asignaciones y un test que
-corra cada built-in un bloque con el contador armado. `std::alloc::System`
-envuelto en un `GlobalAlloc` propio detrás de un `#[cfg(test)]` es la forma
-barata; el detalle feo es que el contador es global al proceso y el harness
-corre en paralelo, así que hay que tomarlo con el mismo candado que el resto de
-los globales (`crate::test_locks`).
-
-Hasta entonces: **el patrón está en la sección 8 de fx-audit**, y copiarlo es lo
-que hay.
-
-### 1 · El CC 7 que llega al SoundFont (abierto desde el 2026-08-31)
-
-**Falta una decisión, no código.**
-
-`Sf2Synth::control_change` reparte cualquier CC entrante a los nueve canales de
-la tab. Con el CC 7 —volumen de canal GM— eso significa que **el slider de un
-teclado es un segundo control de volumen peleando con el fader VOL de la tab**,
-y peleando a escondidas: no se dibuja en ningún lado y no se guarda en el
-proyecto.
-
-Lo que se arregló el 2026-08-31 fue la mitad incoherente: el canal 0 se quedaba
-con el CC y las zonas volvían a 100 en el siguiente `push_split`, así que un
-sonido quedaba 15,2 dB por debajo de sus vecinos. Ahora los nueve pierden la
-pelea igual — el CC 7 dura hasta el próximo cambio de programa, en todos.
-
-Eso es coherente pero no es obviamente lo correcto. Lo que encaja con el resto
-de choz es que **el CC 7 no llegue al sintetizador**: el volumen de la tab es su
-fader, y un mando de un controlador se ata a lo que uno quiera con MIDI learn,
-como cualquier otro. Cambia comportamiento —quien hoy usa el slider de su
-teclado sobre una tab de SF2 lo perdería hasta aprenderlo— así que no se hizo
-solo.
-
-Las dos salidas, para el que retome:
-
-| | Qué pasa con el slider del teclado |
-|---|---|
-| **Como está** | Baja el SoundFont hasta el próximo cambio de sonido, y después vuelve solo. |
-| **Filtrando el CC 7** | No hace nada hasta que se lo aprende; aprendido, mueve lo que se le haya atado (el VOL de la tab, lo natural). |
-
-### 2 · Sidechain: lo que quedó fuera del gate (2026-09-02)
-
-El gate **ya mueve un mando** además del dry/wet — está contado en el
-[changelog](../CHANGELOG.md). Lo que sigue sin existir, dicho aquí para que no
-se vuelva a auditar desde cero:
+Lo que sigue sin existir, dicho aquí para que no se vuelva a auditar desde
+cero:
 
 - **No hay ruta de audio entre canales.** La entrada de una tab son jacks de
   captura (`set_slot_in`), la salida va a main o a uno de los cuatro grupos, y
@@ -168,251 +121,41 @@ Nota de nombres, que sigue en pie: `fx/sidechain.rs::SidechainDuck` se llama
 llama nadie** en todo el árbol—, mientras que lo que sí hace sidechain se llama
 GATE.
 
-### 3 · `cargo test --workspace` falla de a varios, de tanto en tanto
+### 2 · El sampler de carpetas (2026-09-13)
 
-**Actualización 2026-09-09: dos de los culpables encontrados y arreglados, y
-queda al menos uno.** Los tests del `seq` fallaban en corrida completa y pasaban
-solos; los del `seq` toman `test_locks::transport()`, así que el que escribía
-sin candado estaba en otro archivo —`fx_chain::the_clock_can_drive_a_gate_...`
-(tempo y sample rate) y `metronome::a_bar_is_accented_...` (la agrupación, que
-es lo que el `seq` le pregunta al metrónomo)—. Con los dos candados la corrida
-completa pasó 6 de 7 contra ~1 de cada 2 antes, así que **todavía queda algo**.
-Un barrido por tests que tocan `transport()` o `metronome()` sin el candado ya
-no devuelve nada: el que falta toca otro global. El barrido, para el que
-retome:
-
-```bash
-# tests que tocan un global del transporte sin tomar su candado
-grep -rn "test_locks::" crates/choz-engine/src | cut -d: -f1 | sort -u
-```
-
-Lo de abajo es el diagnóstico original.
-
-**Visto dos veces, sin explicar y sin nombres**: una corrida con **14** tests de
-`choz-engine` fallando de golpe y otra con **7**. Las dos veces la corrida
-siguiente pasó limpia, y por crate (`-p choz-engine`) nunca falló.
-
-No es ninguno de los dos flakes que sí se cerraron el 2026-08-30 —el medidor de
-AutoTune y `capture_health`—: ésos fallaban **de a uno**.
-
-**El error de método, dicho para no repetirlo**: las dos veces se pidió la lista
-de nombres corriendo `cargo test` *de nuevo*, y esa corrida pasó, así que los
-nombres se perdieron. Hay que sacarlos de la misma corrida:
-
-```bash
-cargo test --workspace > /tmp/ws.log 2>&1
-grep -E '^---- ' /tmp/ws.log      # los nombres, si falló
-```
-
-La hipótesis es la máquina cargada —el workspace corre varios binarios de test a
-la vez y varios hacen `dlopen` de plugins reales, con la inicialización global
-que eso trae— pero **no está verificada**, y hasta tener los nombres no se puede
-verificar.
-
-### 4 · El sampler de carpetas: lo que la primera versión no hace (2026-09-09)
-
-**Falta código, y está acotado.** `crates/choz-engine/src/instruments/sampler/`
-convierte una carpeta de samples en un instrumento tocable —nombres, pitch de
-respaldo, zonas de tecla, capas de velocity, round robin, cache— y el RACK ya
-le da panel propio. Lo que quedó afuera a propósito, en el orden en que se echa
-de menos:
-
-#### El mapa
-
-- **Una articulación por vez.** La más grabada de la carpeta gana y el resto
-  queda en el mapa sin sonar. Lo que falta es el keyswitch: elegir articulación
-  por nota baja, por CC o desde la UI. Sin eso, un pack con sustain y staccato
-  juntos es medio pack.
-- **El modo es global al instrumento, no por región.** `AUTO`/`STRETCH`/`KIT`/
-  `SLICE` se eligen al abrir la carpeta y quedan en el id; no se pueden mezclar
-  dentro de un mismo instrumento ni cambiar sin volver a cargarlo.
-- **No hay editor del mapeo ni inspector de sample.** El panel del RACK dibuja
-  la forma de onda y la envolvente, pero el mapa se acepta o no se acepta: no
-  se puede corregir a mano una nota raíz mal detectada, un rango, un fine tune.
-  Es lo primero que se va a pedir la primera vez que el detector se equivoque.
-- **El aftertouch no está mapeado a nada**, ni channel ni poly.
-- **El drum map es alfabético.** `hat` `kick` `snare` caen en C2, C#2, D2 por
-  orden de nombre, no por el mapa GM.
-
-#### El panel del RACK (2026-09-09)
-
-Los botones y los dos dibujos ya están —`LOAD`, `CLEAR`, `▶`/`■`, `LOOP`,
-`SLICE`, el layout, la forma de onda con el punto de arranque y la envolvente—
-y los knobs (`START`, `LOOP`, `ATTACK`, `DECAY`, `SUSTAIN`, `RELEASE`) son
-parámetros de instrumento como los de un plugin. Lo que le falta a eso:
-
-- **Los knobs son globales al instrumento.** `START`, `LOOP` y la envolvente
-  valen para todas las regiones a la vez. Por región —o por slice, que es donde
-  más se va a notar— hace falta el editor de mapeo de arriba.
-- **La envolvente se edita con los knobs, no con el dibujo.** El gráfico ADSR
-  es de sólo lectura: arrastrar sus vértices es lo natural y no está. El scrub
-  sí es clic sobre la forma de onda, así que el camino (rect en `RackLayout` →
-  `MouseAction` con fracción) ya está abierto.
-- **La forma de onda es la del sample representativo**, el que `map::regions`
-  pone primero, no la del que suena la tecla que se está tocando ni la del
-  slice bajo el cursor. Tampoco marca dónde caen los cortes de `SLICE`, que es
-  medio punto de tenerla.
-- **`SLICE` corta en 16 pedazos iguales**, no por transiente: un break que no
-  esté cuantizado cae entre golpes. La detección de transientes es lo que
-  falta, y `analyze::sustain_start` ya sabe encontrar uno. El número tampoco se
-  elige: `sampler::SLICES` es una constante.
-- **El `LOOP` no tiene puntos propios.** Vuelve a donde arrancó la nota (el
-  `START`) y termina donde termina el sample o el slice; no hay loop start/end
-  ni crossfade, así que un sustain que no cierre en cero chasquea.
-- **La audición toca una nota fija** —C4, o C2 en `KIT`/`SLICE`— a velocity
-  100. No se elige la tecla ni la dinámica, que es justo lo que se quiere
-  probar en un pack multisample con capas.
-- **Los picos se calculan en el hilo de la UI al cargar.** Un decode más, del
-  archivo representativo, encima del decode de todo el instrumento. Con un
-  sample largo eso se siente al abrir la carpeta; sale del `Analysis` que el
-  cache ya guarda, o se hace en el mismo paso que el resto.
-
-#### El costo de cargar
-
-- **Todo a RAM al cargar.** `SfzSampler` decodifica cada archivo cuando se
-  construye el instrumento. Para la Philharmonia entera eso es mucha memoria y
-  una espera; el streaming de disco para samples largos es la salida, y la
-  arquitectura no lo impide, pero no está.
-- **No hay presets `.smpreset` ni relink.** Si la librería se mueve, se
-  reescanea. El relink necesita hash de contenido, que hoy el cache no calcula
-  a propósito (ver el changelog).
+- **El streaming no tiene anillo por voz.** Una página desalojada cuesta un
+  fault en el hilo de audio (`instruments/stream.rs` lo dice de sí mismo). Para
+  que sea imposible hace falta un hilo lector con un anillo por voz y robo de
+  voz cuando el disco no llega — **con una librería de verdad delante y
+  medido**, no a ciegas.
+- **Los knobs son globales al instrumento.** `START`, `END`, `LOOP`, `LOOP ST`,
+  `LOOP END`, `XFADE` y la envolvente valen para todas las regiones a la vez. Falta
+  que vivan por región y que el editor los muestre; el `.smpreset` ya guarda
+  por región lo demás (raíz, rango, tune, start/end), así que el formato no es
+  el límite.
+- **No se pueden mezclar modos desde el editor**: "esta región sliceada y esta
+  estirada" hay que escribirlo a mano en el `.smpreset`; el modo se sigue
+  eligiendo para toda la carpeta al cargarla.
 - **Sólo zip.** Un pack en `.rar`, `.7z` o `.tar.gz` hay que descomprimirlo a
   mano. `zip` es lo que usan las librerías libres; los demás se agregan en
   `sampler::archive` cuando aparezca uno que importe.
-- **Cada decode de una entrada reabre el zip** y relee su directorio central.
-  Son unos KB y un seek, y pasa una vez por región al construir el instrumento
-  (110 veces para el violín); si alguna vez se siente, el arreglo es abrir el
-  archivo una vez por instrumento y pasarlo entero.
 
-### 5 · El arreglador: una banda a partir de una progresión (pedido el 2026-09-09)
+### 3 · El arreglador (2026-09-13)
 
-**Un artefacto más, no un `seq.rs` más grande.** La idea es escribir una
-progresión y un estilo y que choz toque el resto:
-
-```text
-key = C
-style = major_blues
-
-|| I7 | IV7 | I7 | IV#7 | IV7 | IV#m7b5 | I7 VII7 | VIIb7 VI7 | IIm7 | V7 | I7 IIIb7 | II7 IIb7 ||
-```
-
-y de ahí salgan bajo, batería, comping de piano y/o guitarra, melodía y solo,
-cada uno como una parte MIDI propia. Referencia conceptual: Band-in-a-Box
-—progresión + estilo + variación = acompañamiento—, implementación nativa, sin
-copiar código, formatos ni contenido de nadie.
-
-#### Lo que dice la auditoría del secuenciador
-
-`artifacts/seq.rs` **no puede llevar esto adentro**, y conviene decirlo antes de
-empezar a escribir: un `Pattern` son 8 pistas × 16 pasos, y la altura de cada
-pista es un solo número para todo el proyecto (`SeqSettings::notes: [u8; 8]`).
-Es una grilla de carriles con una nota fija cada uno —perfecta para una batería
-o un ostinato— y no tiene dónde poner un walking bass, un voicing de cuatro
-notas ni un solo: eso necesita altura arbitraria por evento, compases
-encadenados y acordes que cambian dentro del compás. Forzarlo sería reescribir
-`Seq`, que es justamente lo que no hay que hacer.
-
-Lo que **sí** se reutiliza, porque ya es el contrato de un artefacto:
-
-- `tick(now, &mut Vec<ArpEvent>)` contra el reloj único. `ArpEvent::On/Off`
-  lleva `note`, `vel` y `at` (muestra de transporte), que es exactamente lo que
-  el arreglador tiene para decir.
-- El transporte, el swing y la división temporal ya existen y son de `Seq`/`Arp`.
-  **No** se crea otro reloj.
-- `parts` + `song: Vec<usize>` es la forma (`A A B A`) y el concepto se copia,
-  no la estructura: el arreglador tiene sus propias partes generadas.
-- La exportación CLAP: `choz-plugin-clap-export` ya publica los artefactos como
-  *note plugins* sin puertos de audio. **Los dos artefactos pasan a ser tres.**
-
-#### Punto de integración
-
-```text
-texto → parser → armonía → progresión → estilo → generadores → eventos horneados
-                                                                      ↓
-                                                        tick() los lee, no los calcula
-                                                                      ↓
-                                                    ArpEvent → slot / SF2 / CLAP host
-```
-
-`crates/choz-engine/src/artifacts/arranger/`, hermano de `arp` y `seq`. Módulos
-sólo cuando ganen su lugar: arrancar con `mod.rs` + `chord.rs` (parser y
-armonía) + `style.rs` + `generate.rs`, y separar `bass`/`drums`/`comping`
-cuando el archivo pese, no antes.
-
-**Decisión abierta: cómo salen seis partes por un puerto de notas.** Un
-artefacto vive en una pestaña y toca *un* instrumento. Las dos salidas posibles:
-un parámetro `ROLE` por instancia (bajo, batería, piano, guitarra, melodía,
-solo) con progresión, estilo y semilla compartidos —una pestaña por músico, que
-es como choz ya piensa— o un canal MIDI por rol desde una sola instancia. La
-primera encaja con el rack y con el host CLAP; la segunda es más cómoda para el
-canal 10. Hay que elegir antes de escribir el generador.
-
-#### Lo que hay que construir
-
-- **Parser tolerante**: grados romanos (`I7`, `IIm7`, `IV#m7b5`, `VIIb7`,
-  `Iø7`, `I7b9`, `I7#11`) y cifrado americano (`C7`, `F#m7b5`, `Bbmaj9`,
-  `Cm11`) en la misma gramática, `|` como compás, varios acordes por compás,
-  `-` para sostener. Sin tonalidad no hay grados romanos; con cifrado americano
-  la tonalidad sigue sirviendo de contexto para escalas y aproximaciones.
-- **Armonía**: acorde → notas del acorde → escala. Las reglas viven acá y en
-  ningún otro lado; ni el bajo ni el solo inventan teoría por su cuenta.
-- **Estilos como datos**, no como `if` dentro del generador: compás, feel,
-  swing, y un ajuste por rol (bajo, batería, comping, melodía, solo). Structs y
-  defaults en Rust primero, con la API pensada para que después se puedan leer
-  de archivo — **sin** inventar un cargador de `.toml` que hoy no existe.
-  Mínimo: `major_blues`, `minor_blues`, `jazz_swing`, `shuffle`,
-  `straight_blues`, `rock`, `funk`, `bossa`; el resto de la lista pedida
-  (latin, country, soul, reggae, bebop, walking_bass, y la tanda electrónica:
-  organic house, afro house, nu jazz, melodic/live techno, trance vocal,
-  liquid y live band d&b, neoclassical ambient, folktronica) entra sin tocar el
-  parser ni el motor, que es el punto de que los estilos sean datos.
-- **Bajo** que sepa el acorde siguiente: fundamental, notas del acorde,
-  aproximaciones cromáticas, notas de paso, anticipaciones, desplazamiento de
-  octava, pickups. `C C C C / F F F F` es el fracaso, no el MVP.
-- **Batería** con mapeo GM (36 kick, 38 snare, 42/46 hats, 49 crash, 51 ride),
-  patrón base + fills + ghost notes + densidad por estilo. Los sonidos los pone
-  el SF2, acá no se toca un sample.
-- **Comping** con voicings, inversiones y conducción de voces —`C7 (E G Bb)` →
-  `F7 (Eb A C)`, no saltos de octava— y ritmo con síncopa, no un bloque por
-  tiempo.
-- **Melodía y solo** por motivos: `A A' B A''` + fill + resolución, con
-  transposición diatónica y cromática, variación e desplazamiento rítmico,
-  aproximación al acorde siguiente. Un arpegiador con ruido encima no sirve.
-- **Humanización** determinista (velocity, timing, duración) por rol, y que
-  nunca toque la armonía.
-
-#### Reglas que no se negocian
-
-- **Determinismo por semilla**: misma progresión + estilo + semilla = mismo
-  MIDI, bit a bit. Otra semilla, otra interpretación.
-- **Todo el trabajo pesado fuera del hilo de audio**: parsear, resolver y
-  generar pasa al cargar o al mover un parámetro. `tick()` sólo lee una lista de
-  eventos ya horneada, sin allocar. Es la misma regla que ya cumplen `arp` y
-  `seq`.
-- **No genera audio.** Eventos MIDI y nada más; el instrumento —SF2 hoy, CLAP,
-  LV2 o hardware mañana— es de otro.
-- **Nada de ML ni dependencias pesadas.** El azar sólo dentro de límites
-  musicales: semilla, probabilidad, densidad, variación.
-- **`Seq` no cambia.** `SeqSettings`, `Pattern` y `ArpEvent` siguen como están.
-
-#### Por fases, y cada una entera
-
-1. Parser + resolución de grados + `major_blues` y `minor_blues` + bajo,
-   batería y piano. Con eso ya se escucha si el camino sirve.
-2. Guitarra, melodía, solo, motivos y variaciones.
-3. Estilos como datos, mapa de instrumentos por estilo y elección de programa
-   SF2 con fallback (tenor sax → alto → trompeta → piano), que **nunca** falla
-   la generación por un preset que falta: lo registra y sigue.
-4. Secciones del arreglo: partes A/B/C/D, fills, intro y final.
-
-#### Tests que tienen que existir
-
-Parser de grados y de cifrado americano; `key C + I7 = C7`, `key Bb + IV7 =
-Eb7`, `key C + VIb7 = Ab7`; varios acordes por compás; el blues menor entero;
-determinismo con semilla 42 y diferencia con 43; y las restricciones musicales
-—registro del bajo, batería en el canal de percusión, notas dentro de 0..127,
-ninguna duración negativa, partes sincronizadas y un arreglo que dura
-exactamente lo que la progresión.
+- **Más estilos**, cuando alguien los pida: agregar uno son cuarenta números —en
+  Rust o en un `.style`—, no código.
+- **El groove de semicorcheas es medio groove.** `swing_div` empuja las
+  semicorcheas, pero los fantasmas de la batería siguen cayendo cada medio
+  tiempo: sus posiciones también tendrían que ser del estilo.
+- **Los fills no dependen del estilo.** Son cuatro tablas (`generate::FILLS`) y
+  el turnaround son dos seguidas; un fill de dos compases no cabe en esa forma.
+- **No hay humanización por rol dentro del estilo**: que el funk quiera la
+  batería clavada y el bajo suelto no se puede decir.
+- **El comping no escucha a nadie.** El solo se corre de la melodía
+  (`generate::avoid`); el piano y la guitarra se hornean solos, así que una voz
+  del comping puede caer en la nota que la melodía está tocando.
+- **La progresión no tiene repeticiones ni saltos**: `form` es una lista de
+  partes, sin `x2`, sin D.C. y sin coda. Se escribe repitiendo el nombre.
 
 ## Las dos piezas que quedan fuera, por decisión
 
@@ -461,14 +204,17 @@ Los globales del proceso son la causa de todo test que falla "a veces": el
 harness corre los tests de un crate en paralelo, y el transporte, los medidores
 y `capture_health` son singletons a propósito. `crate::test_locks` tiene **un
 candado por global**, y el que necesita dos los toma en el mismo orden que los
-demás (transporte y después medidor). En `choz-ui` el par es `ui_guard()` y
+demás (transporte y después medidor). **Tomar el candado no alcanza: hay que
+devolver el global.** El candado del transporte lo hace solo —deja el reloj
+parado, a 120, en 4/4 y en cero al tomarlo y al soltarlo—, y ése era el flake
+que fallaba de a varios: un test que renderizaba con el motor en play dejaba el
+transporte rodando, y el siguiente que contara su propio tiempo encontraba una
+grilla que seguir. Un global que se pueda ensuciar sin que nadie lo note quiere
+el mismo tratamiento. En `choz-ui` el par es `ui_guard()` y
 `UiRestore`: cargar un proyecto aplica su idioma y su color al proceso entero.
 
 Un test que lee un global para comprobar algo de *su* objeto está mal escrito:
 pregúntele al objeto. `AutoTune::reading()` existe por eso.
-
-Eso explica los flakes que **fallan de a uno**. El que falla de a varios sigue
-sin explicar — ver **Pendiente 2**.
 
 ### Y lo de siempre
 
@@ -484,8 +230,9 @@ contra una habitación.
   mandársela a los nueve: el CC 7 que se mandaba a las zonas en cada
   `push_split` y al canal 0 sólo al cargar dejaba el sonido propio de la tab
   15,2 dB por debajo en cuanto el teclado movía su slider de volumen
-  (2026-08-31). Lo que queda abierto de eso es una decisión, y está arriba, en
-  **Pendiente 1**.
+  (2026-08-31). **Desde el 2026-09-13 el CC 7 no llega al sintetizador**: el
+  volumen de una tab es su fader, y el slider de un controlador se ata con MIDI
+  learn a lo que se quiera. Los otros CC siguen yendo a los nueve.
 
 - **La ventana del shifter de voces está escrita como `2048 / 48` a propósito**
   (2026-08-28). Es tiempo, no samples, pero el número es el viejo conteo sobre
@@ -727,6 +474,12 @@ cargo test --workspace
 cargo +beta clippy --workspace --all-targets -- -D warnings
 cargo run --release --bin choz          # necesita una terminal real (tty)
 tail -f ~/.local/state/choz/choz.log    # ver errores/log en vivo
+
+# El sampler: lo que trabajó una vez y no vuelve a trabajar. Borrarlos cuesta
+# una carga lenta y nada más.
+du -sh ~/.local/state/choz/pcm          # el PCM crudo de los samples largos
+rm -rf ~/.local/state/choz/pcm          # y así se tira
+ls ~/.local/state/choz/styles/*.style   # los estilos del arreglador, si hay
 
 # lo que cuesta el detector de A→M dentro del callback (sube = xruns en TODO
 # el grafo, no sólo en choz)

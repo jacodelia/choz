@@ -157,6 +157,34 @@ pub fn read(archive: &Path, entry: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Many entries out of one archive, opened once.
+///
+/// Reading a region at a time costs a seek and the central directory again per
+/// sample — a hundred and ten times over for one violin. An instrument knows
+/// every entry it wants before it decodes any of them, so it asks for them
+/// together. Entries that are not in the archive are simply absent from the
+/// map: a missing sample is one region that does not sound, and the rest of
+/// the instrument still loads.
+pub fn read_many(archive: &Path, entries: &[String]) -> std::collections::HashMap<String, Vec<u8>> {
+    let mut out = std::collections::HashMap::with_capacity(entries.len());
+    let Ok(file) = std::fs::File::open(archive) else {
+        return out;
+    };
+    let Ok(mut zip) = zip::ZipArchive::new(std::io::BufReader::new(file)) else {
+        return out;
+    };
+    for entry in entries {
+        let Ok(mut found) = zip.by_name(entry) else {
+            continue;
+        };
+        let mut bytes = Vec::with_capacity(found.size() as usize);
+        if found.read_to_end(&mut bytes).is_ok() {
+            out.insert(entry.clone(), bytes);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

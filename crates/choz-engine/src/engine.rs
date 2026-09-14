@@ -3423,10 +3423,24 @@ pub fn build_instrument(
         }
         // The id carries the layout the user chose, when they chose one — see
         // `sampler::Mode`. The path is the folder either way.
-        crate::PluginFormat::Samples => match crate::instruments::sampler::build_with(
+        // A saved map: no scan, no analysis, no name reading — the answer was
+        // worked out once and written down. See `sampler::preset`.
+        crate::PluginFormat::Samples if crate::instruments::sampler::is_preset_id(id) => {
+            match crate::instruments::sampler::preset::read(path)
+                .and_then(|p| crate::instruments::sampler::build_preset(&p, sr))
+            {
+                Ok(s) => Some(Box::new(s) as Box<dyn crate::sources::AudioSource>),
+                Err(e) => {
+                    eprintln!("choz: preset {}: {e:#}", path.display());
+                    None
+                }
+            }
+        }
+        crate::PluginFormat::Samples => match crate::instruments::sampler::build_id(
             path,
             sr,
             crate::instruments::sampler::Mode::of_id(id),
+            crate::instruments::sampler::slices_of_id(id),
         ) {
             Ok(s) => Some(Box::new(s) as Box<dyn crate::sources::AudioSource>),
             Err(e) => {

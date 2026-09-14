@@ -14,7 +14,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 
@@ -47,6 +46,10 @@ pub struct SfzRegion {
     /// [`crate::instruments::sampler::Mode::Slice`].
     pub start: f32,
     pub end: f32,
+    /// Which articulation this region belongs to, as an index into the
+    /// instrument's list. `0` is the one an instrument that never heard of
+    /// articulations plays — which is every SFZ file and every kit.
+    pub articulation: usize,
 }
 
 impl SfzRegion {
@@ -121,6 +124,7 @@ pub fn parse_text(text: &str, base: &Path) -> Vec<SfzRegion> {
                 tune_cents: d.tune,
                 start: 0.0,
                 end: 1.0,
+                articulation: 0,
             });
         }
     };
@@ -249,12 +253,119 @@ fn note_value(s: &str) -> Option<u8> {
 
 // ─── Sample decoding ────────────────────────────────────────────────────────
 
+/// One sample's audio, from wherever it can be had most cheaply.
+///
+/// A cache already written is mapped and nothing is decoded. Otherwise the file
+/// is decoded, and if it is long enough to be worth it
+/// ([`stream::THRESHOLD_FRAMES`]) the result goes out to the raw cache and the
+/// decoded buffer is dropped — so the peak memory of building an instrument is
+/// one sample, not the library. Short ones stay in memory exactly as they were.
+fn load_pcm(
+    sample: &Path,
+    bytes: Option<Vec<u8>>,
+    sample_rate: u32,
+) -> Option<crate::instruments::stream::Pcm> {
+    use crate::instruments::stream;
+    if let Some(mapped) = stream::mapped(sample, sample_rate) {
+        return Some(mapped);
+    }
+    let pcm = match decode_from(sample, bytes, sample_rate) {
+        Ok(pcm) if !pcm.is_empty() => pcm,
+        Ok(_) => return None,
+        Err(e) => {
+            eprintln!("choz: SFZ {}: {e}", sample.display());
+            return None;
+        }
+    };
+    if pcm.len() / 2 < stream::THRESHOLD_FRAMES {
+        return Some(stream::Pcm::mem(pcm));
+    }
+    match stream::cache_and_map(sample, sample_rate, pcm) {
+        Ok(mapped) => Some(mapped),
+        // A cache that cannot be written is not a reason not to play: decode
+        // again and hold it, which is what every load did before this existed.
+        Err(e) => {
+            eprintln!("choz: sample cache {}: {e:#}", sample.display());
+            decode(sample, sample_rate).ok().map(stream::Pcm::mem)
+        }
+    }
+}
+
+/// Every archived sample of an instrument, read archive by archive.
+///
+/// Keyed by the entry name, which is unique inside one instrument: a folder
+/// inside a zip is one instrument, and two archives never share a build.
+fn archive_bytes(regions: &[SfzRegion]) -> HashMap<String, Vec<u8>> {
+    let mut wanted: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    for region in regions {
+        if let Some((archive, entry)) = crate::instruments::sampler::archive::split(&region.sample)
+        {
+            let list = wanted.entry(archive).or_default();
+            if !list.contains(&entry) {
+                list.push(entry);
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    for (archive, entries) in wanted {
+        out.extend(crate::instruments::sampler::archive::read_many(
+            &archive, &entries,
+        ));
+    }
+    out
+}
+
+/// The shortest a loop is allowed to be, in frames: about a millisecond and a
+/// half at 48 kHz.
+///
+/// Two marks dragged on top of each other is a loop a few samples long, which
+/// is not a loop — it is an oscillator at whatever frequency those samples are,
+/// running at the level of the sample and never ending. The knee below keeps it
+/// inside full scale; this keeps it from happening.
+const MIN_LOOP_FRAMES: f64 = 64.0;
+
+/// Where the soft knee starts. Under this nothing is touched at all, and the
+/// curve above it is asymptotic to full scale — so the sampler's own output
+/// cannot leave `-1..1` however many voices are in it.
+///
+/// High on purpose: a single voice of a sample normalised to full scale comes
+/// out 0.2 dB down, which is the whole price. What it is for is the sum of a
+/// chord, which is where the numbers get interesting.
+const KNEE: f32 = 0.9;
+
+/// A soft knee over [`KNEE`], so a chord that went past full scale bends
+/// instead of squaring off.
+///
+/// ponytail: a plain `tanh` above the knee, not oversampled. What it is for is
+/// the peak of a held chord, which is a slow thing; a waveshaper for *tone*
+/// would need the oversampling the utility effect does — see `fx::utility`.
+#[inline]
+fn soft_knee(x: f32) -> f32 {
+    let over = x.abs() - KNEE;
+    if over <= 0.0 {
+        return x;
+    }
+    let shaped = KNEE + (1.0 - KNEE) * (over / (1.0 - KNEE)).tanh();
+    shaped * x.signum()
+}
+
 /// Decode a sample to interleaved stereo at `target_sr`.
 ///
 /// ponytail: linear interpolation for the rate conversion, both here and in the
 /// voice. A sampler that needs better than that needs a real resampler, and
 /// that is a different piece of work.
 pub(crate) fn decode(path: &Path, target_sr: u32) -> Result<Vec<f32>> {
+    decode_from(path, None, target_sr)
+}
+
+/// The same, with the bytes already in hand — which is how an instrument built
+/// out of one zip decodes a hundred regions without opening the archive a
+/// hundred times. `None` reads the file (or the entry) itself.
+pub(crate) fn decode_from(
+    path: &Path,
+    bytes: Option<Vec<u8>>,
+    target_sr: u32,
+) -> Result<Vec<f32>> {
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::codecs::DecoderOptions;
     use symphonia::core::formats::FormatOptions;
@@ -265,8 +376,9 @@ pub(crate) fn decode(path: &Path, target_sr: u32) -> Result<Vec<f32>> {
     // A sample can live inside a zip, and then there is no file to open: the
     // bytes are pulled out of the archive and decoded from memory. Everything
     // downstream — the probe, the hint, the decoder — is identical.
-    let source: Box<dyn symphonia::core::io::MediaSource> =
-        match crate::instruments::sampler::archive::split(path) {
+    let source: Box<dyn symphonia::core::io::MediaSource> = match bytes {
+        Some(bytes) => Box::new(std::io::Cursor::new(bytes)),
+        None => match crate::instruments::sampler::archive::split(path) {
             Some((archive, entry)) => Box::new(std::io::Cursor::new(
                 crate::instruments::sampler::archive::read(&archive, &entry)?,
             )),
@@ -274,7 +386,8 @@ pub(crate) fn decode(path: &Path, target_sr: u32) -> Result<Vec<f32>> {
                 std::fs::File::open(path)
                     .with_context(|| format!("cannot open sample {}", path.display()))?,
             ),
-        };
+        },
+    };
     let mss = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -351,24 +464,27 @@ fn resample(stereo: &[f32], from: u32, to: u32) -> Vec<f32> {
 /// A region with its sample already decoded.
 struct Loaded {
     region: SfzRegion,
-    pcm: Arc<Vec<f32>>,
+    pcm: crate::instruments::stream::Pcm,
 }
 
 struct Voice {
     note: u8,
     gain: f32,
     rate: f64,
-    pcm: Arc<Vec<f32>>,
+    pcm: crate::instruments::stream::Pcm,
     /// Read head, in frames.
     pos: f64,
     /// Release envelope, 1.0 while the key is down.
     env: f32,
     /// True once the key came up: the voice fades instead of stopping dead.
     releasing: bool,
-    /// The part of the file this voice plays, in frames: where a loop goes
-    /// back to and where the sample ends for it.
-    from: f64,
+    /// Where the region ends for this voice, in frames.
     to: f64,
+    /// Where a held note turns round, in frames — the LOOP START and LOOP END
+    /// knobs read against this voice's region. Equal to `from`/`to` when
+    /// nothing was asked for.
+    loop_from: f64,
+    loop_to: f64,
     /// Seconds since the note started, and since it was released. The
     /// envelope is a function of these two and of the knobs, so a knob moved
     /// mid-note is heard on the next block.
@@ -407,7 +523,21 @@ impl Voice {
 pub struct Knobs {
     /// Where in the sample (or in the slice) a note starts, 0..1.
     pub start: f32,
+    /// …and where it stops, 0..1 of the same span. `1.0` is the end of the
+    /// region, which is what a sample with nothing said about it plays to.
+    /// At or below `start` it is ignored: a window of no length is not a
+    /// window, it is silence nobody asked for.
+    pub end: f32,
     pub looping: bool,
+    /// Where a held note goes back to and where it turns round, as fractions of
+    /// the region — **not** of the file, so a slice loops inside itself.
+    /// `loop_end` at or below `loop_start` means "to the end of the region",
+    /// which is what a loop with nothing said about it used to do.
+    pub loop_start: f32,
+    pub loop_end: f32,
+    /// How long the turn-round is faded across, in seconds. Zero is the butt
+    /// join that clicks on anything that does not close at zero.
+    pub crossfade: f32,
     /// Amplitude envelope, seconds and a level.
     pub attack: f32,
     pub decay: f32,
@@ -419,7 +549,11 @@ impl Default for Knobs {
     fn default() -> Self {
         Self {
             start: 0.0,
+            end: 1.0,
             looping: false,
+            loop_start: 0.0,
+            loop_end: 1.0,
+            crossfade: 0.0,
             attack: 0.0,
             decay: 0.0,
             sustain: 1.0,
@@ -435,6 +569,9 @@ impl Knobs {
     pub const MAX_ATTACK: f32 = 2.0;
     pub const MAX_DECAY: f32 = 4.0;
     pub const MAX_RELEASE: f32 = 4.0;
+    /// The longest turn-round fade. Past a quarter of a second it is not a
+    /// loop join any more, it is a second voice.
+    pub const MAX_CROSSFADE: f32 = 0.25;
 
     /// Take one normalised value from the rack. Index is the parameter's.
     pub fn set(&mut self, index: usize, v: f32) {
@@ -447,6 +584,12 @@ impl Knobs {
             4 => self.sustain = v,
             // Never zero: a note cut off at an arbitrary sample clicks.
             5 => self.release = (v * Self::MAX_RELEASE).max(RELEASE_SECONDS),
+            // Appended after the six that were here first, so a project saved
+            // before they existed still finds its envelope where it left it.
+            6 => self.loop_start = v,
+            7 => self.loop_end = v,
+            8 => self.crossfade = v * Self::MAX_CROSSFADE,
+            9 => self.end = v,
             _ => {}
         }
     }
@@ -470,6 +613,19 @@ pub struct SfzSampler {
     /// the audio thread the first time a new note was played.
     strikes: [u32; 128],
     knobs: Knobs,
+    /// Where the polyphony headroom got to at the end of the last block — see
+    /// [`AudioSource::render`]. `0.0` is "nothing rendered yet".
+    headroom: f32,
+    /// The ways this instrument can be played, when its pack ships more than
+    /// one — `sustain`, `staccato`, `pizzicato`. Empty otherwise, which is
+    /// every SFZ file and every kit.
+    articulations: Vec<String>,
+    /// Which of them is sounding.
+    articulation: usize,
+    /// The lowest key that selects an articulation rather than playing one.
+    /// The switches run up from here, one per articulation, below everything
+    /// the map plays — see `sampler::map::regions_with_slices`.
+    switch_base: Option<u8>,
 }
 
 impl SfzSampler {
@@ -500,6 +656,41 @@ impl SfzSampler {
             name,
             strikes: [0; 128],
             knobs: Knobs::default(),
+            headroom: 0.0,
+            articulations: Vec::new(),
+            articulation: 0,
+            switch_base: None,
+        }
+    }
+
+    /// What the keyswitches select, in the order their keys run. Empty for an
+    /// instrument with one articulation, which is nearly all of them.
+    pub fn articulations(&self) -> &[String] {
+        &self.articulations
+    }
+
+    /// Which one is playing, and the lowest key that selects one.
+    pub fn articulation(&self) -> usize {
+        self.articulation
+    }
+
+    pub fn switch_base(&self) -> Option<u8> {
+        self.switch_base
+    }
+
+    /// Name the articulations and put their switches under `base`. Called by
+    /// the folder sampler, which is the only thing that knows a pack has more
+    /// than one way of playing a note.
+    pub fn set_articulations(&mut self, names: Vec<String>, base: Option<u8>) {
+        self.articulation = 0;
+        self.switch_base = base.filter(|_| names.len() > 1);
+        self.articulations = names;
+    }
+
+    /// Pick one by hand — what the panel's button does.
+    pub fn set_articulation(&mut self, index: usize) {
+        if index < self.articulations.len().max(1) {
+            self.articulation = index;
         }
     }
 
@@ -509,19 +700,18 @@ impl SfzSampler {
     pub fn from_regions(parsed: Vec<SfzRegion>, sample_rate: u32, name: String) -> Result<Self> {
         // One decode per distinct file: regions of the same instrument share
         // samples far more often than not.
-        let mut cache: HashMap<PathBuf, Option<Arc<Vec<f32>>>> = HashMap::new();
+        let mut cache: HashMap<PathBuf, Option<crate::instruments::stream::Pcm>> = HashMap::new();
         let mut regions = Vec::new();
+        // Everything that lives inside a zip, read in one pass per archive:
+        // opening it per region is the central directory again a hundred times
+        // for one instrument.
+        let mut bytes = archive_bytes(&parsed);
         for region in parsed {
+            let entry = crate::instruments::sampler::archive::split(&region.sample)
+                .and_then(|(_, entry)| bytes.remove(&entry));
             let pcm = cache
                 .entry(region.sample.clone())
-                .or_insert_with(|| match decode(&region.sample, sample_rate) {
-                    Ok(pcm) if !pcm.is_empty() => Some(Arc::new(pcm)),
-                    Ok(_) => None,
-                    Err(e) => {
-                        eprintln!("choz: SFZ {}: {e}", region.sample.display());
-                        None
-                    }
-                })
+                .or_insert_with(|| load_pcm(&region.sample, entry, sample_rate))
                 .clone();
             if let Some(pcm) = pcm {
                 regions.push(Loaded { region, pcm });
@@ -536,6 +726,10 @@ impl SfzSampler {
             name,
             strikes: [0; 128],
             knobs: Knobs::default(),
+            headroom: 0.0,
+            articulations: Vec::new(),
+            articulation: 0,
+            switch_base: None,
         })
     }
 
@@ -555,15 +749,48 @@ impl AudioSource for SfzSampler {
         out.fill(0.0);
         let dt = 1.0 / sample_rate as f32;
         let knobs = self.knobs;
+        // How loud the sum of what is sounding is allowed to be.
+        //
+        // A chord of long notes is the case: six voices of the same sample add
+        // up to six times one note, and the tab's fader was set by a probe that
+        // played **one**. Sixteen voices of a held pad went past full scale
+        // before the fader even saw them.
+        //
+        // `1/sqrt(n)` is the equal-power answer: one note is untouched, a chord
+        // grows as the square root of what is in it — louder, which is what a
+        // chord is, and not six times louder. Smoothed over the block so a note
+        // starting is not a step in the level of everything already sounding.
+        let sounding = self.voices.iter().filter(|v| v.pos.is_finite()).count();
+        let target = 1.0 / (sounding.max(1) as f32).sqrt();
+        let from = match self.headroom {
+            // First block: start where the level already is rather than sliding
+            // up to it from nothing.
+            h if h <= 0.0 => target,
+            h => h,
+        };
+        self.headroom = target;
         for voice in &mut self.voices {
+            // Where this voice turns round, and how long the fade across the
+            // join is. A loop shorter than the fade is a loop the fade would
+            // read past the start of, so it is the fade that gives way.
+            let looping = knobs.looping && !voice.releasing;
+            let end = match looping {
+                true => voice.loop_to,
+                false => voice.to,
+            };
+            let span = (voice.loop_to - voice.loop_from).max(1.0);
+            let fade = match looping {
+                true => ((knobs.crossfade.max(0.0) as f64) * sample_rate as f64).min(span * 0.5),
+                false => 0.0,
+            };
             for f in 0..frames {
                 let i0 = voice.pos as usize;
                 // Past its end — the whole file, or the slice it was given.
-                if voice.pos >= voice.to || i0 + 1 >= voice.pcm.len() / 2 {
-                    // A held loop goes back to where it started; anything else
-                    // is finished.
-                    if knobs.looping && !voice.releasing {
-                        voice.pos = voice.from;
+                if voice.pos >= end || i0 + 1 >= voice.pcm.frames() {
+                    // A held loop goes back to where it was told to; anything
+                    // else is finished.
+                    if looping {
+                        voice.pos = voice.loop_from;
                     } else {
                         voice.pos = f64::INFINITY;
                         break;
@@ -578,9 +805,30 @@ impl AudioSource for SfzSampler {
                     break;
                 }
                 let t = (voice.pos - i0 as f64) as f32;
-                let l = voice.pcm[i0 * 2] + t * (voice.pcm[(i0 + 1) * 2] - voice.pcm[i0 * 2]);
-                let r = voice.pcm[i0 * 2 + 1]
-                    + t * (voice.pcm[(i0 + 1) * 2 + 1] - voice.pcm[i0 * 2 + 1]);
+                let (l0, r0) = voice.pcm.frame(i0);
+                let (l1, r1) = voice.pcm.frame(i0 + 1);
+                let mut l = l0 + t * (l1 - l0);
+                let mut r = r0 + t * (r1 - r0);
+                // The turn-round, faded: the last `fade` frames before the loop
+                // end are mixed with the same distance before the loop start,
+                // which is the join a sustained note needs not to click.
+                let left = end - voice.pos;
+                if fade > 0.0 && left < fade {
+                    let ahead = voice.loop_from - left;
+                    let j0 = ahead.max(0.0) as usize;
+                    if ahead >= 0.0 && j0 + 1 < voice.pcm.frames() {
+                        let u = (ahead - j0 as f64) as f32;
+                        let (al0, ar0) = voice.pcm.frame(j0);
+                        let (al1, ar1) = voice.pcm.frame(j0 + 1);
+                        let al = al0 + u * (al1 - al0);
+                        let ar = ar0 + u * (ar1 - ar0);
+                        // Equal power, so the join does not dip in the middle.
+                        let x = ((left / fade) as f32).clamp(0.0, 1.0);
+                        let (a, b) = ((x * std::f32::consts::FRAC_PI_2).sin(), (x * std::f32::consts::FRAC_PI_2).cos());
+                        l = l * a + al * b;
+                        r = r * a + ar * b;
+                    }
+                }
                 let gain = voice.gain * voice.env;
                 out[f * 2] += l * gain;
                 out[f * 2 + 1] += r * gain;
@@ -594,6 +842,23 @@ impl AudioSource for SfzSampler {
         // Finished voices go here, not in the loop above: retain never
         // allocates, so this stays RT-safe.
         self.voices.retain(|v| v.pos.is_finite());
+        // The headroom, slid across the block, and a soft knee over it.
+        //
+        // The knee is the last guard and nothing else: under `KNEE` it is
+        // exactly the signal it was given, and above it the curve bends rather
+        // than the sample squaring off. A key held down under a wide-open
+        // sustain, sixteen voices deep, cannot hard-clip the tab.
+        for f in 0..frames {
+            let t = match frames {
+                0 | 1 => 1.0,
+                n => f as f32 / (n - 1) as f32,
+            };
+            let g = from + (self.headroom - from) * t;
+            for ch in 0..2 {
+                let x = out[f * 2 + ch] * g;
+                out[f * 2 + ch] = soft_knee(x);
+            }
+        }
         frames
     }
 
@@ -609,14 +874,24 @@ impl AudioSource for SfzSampler {
             self.note_off(note);
             return;
         }
+        // A keyswitch selects and does not sound: the keys under the map are
+        // how a player says "now staccato" without letting go of anything.
+        if let Some(base) = self.switch_base {
+            let top = base as usize + self.articulations.len();
+            if (base as usize..top).contains(&(note as usize)) {
+                self.articulation = note as usize - base as usize;
+                return;
+            }
+        }
         // Every region that answers this note and velocity, and then the one
         // whose turn it is. Two takes of a note are alternatives — playing the
         // first one every time is what makes a sampled instrument sound like a
         // machine gun on a repeated note.
+        let playing = self.articulation;
         let matching = self
             .regions
             .iter()
-            .filter(|r| r.region.matches(note, velocity))
+            .filter(|r| r.region.articulation == playing && r.region.matches(note, velocity))
             .count();
         if matching == 0 {
             return;
@@ -626,7 +901,7 @@ impl AudioSource for SfzSampler {
         let Some(hit) = self
             .regions
             .iter()
-            .filter(|r| r.region.matches(note, velocity))
+            .filter(|r| r.region.articulation == playing && r.region.matches(note, velocity))
             .nth(turn)
         else {
             return;
@@ -639,20 +914,39 @@ impl AudioSource for SfzSampler {
         // The region says which part of the file it is (the whole of it,
         // unless the folder was sliced) and the START knob says where inside
         // that part the note begins.
-        let last = (hit.pcm.len() / 2).saturating_sub(1) as f64;
+        let last = hit.pcm.frames().saturating_sub(1) as f64;
         let from = (hit.region.start.clamp(0.0, 1.0) as f64 * last).min(last);
         let to = (hit.region.end.clamp(0.0, 1.0) as f64 * last).max(from);
-        let pos = from + self.knobs.start.clamp(0.0, 1.0) as f64 * (to - from);
+        // START and END are the window inside the region the key plays: the
+        // two marks the panel draws over the waveform. END at or below START is
+        // nothing said, and the note runs to the end of the region.
+        let span = to - from;
+        let pos = from + self.knobs.start.clamp(0.0, 1.0) as f64 * span;
+        let to = match self.knobs.end > self.knobs.start {
+            true => from + self.knobs.end.clamp(0.0, 1.0) as f64 * span,
+            false => to,
+        };
+        // The loop points, read against the region and not against the file: a
+        // slice loops inside itself. Nothing said — the end knob at or below
+        // the start — means "to the end of the region", which is what a loop
+        // did before it had points of its own.
+        let k = &self.knobs;
+        let loop_from = from + k.loop_start.clamp(0.0, 1.0) as f64 * (to - from);
+        let loop_to = match k.loop_end > k.loop_start {
+            true => from + k.loop_end.clamp(0.0, 1.0) as f64 * (to - from),
+            false => to,
+        };
         let mut voice = Voice {
             note,
             gain: hit.region.gain * (velocity as f32 / 127.0),
             rate: hit.region.rate_for_note(note) as f64,
-            pcm: Arc::clone(&hit.pcm),
+            pcm: hit.pcm.clone(),
             pos,
             env: 0.0,
             releasing: false,
-            from: pos,
             to,
+            loop_from,
+            loop_to: loop_to.max(loop_from + MIN_LOOP_FRAMES),
             age: 0.0,
             since_off: 0.0,
             off_env: 0.0,
@@ -761,6 +1055,7 @@ mod tests {
             tune_cents: 0.0,
             start: 0.0,
             end: 1.0,
+            articulation: 0,
         };
         assert!(r.matches(40, 100));
         assert!(!r.matches(48, 100), "above the key range");
@@ -772,7 +1067,7 @@ mod tests {
     /// The voice mixer, on a sample built by hand — no files involved.
     #[test]
     fn a_note_plays_its_sample_and_stops_at_the_end() {
-        let pcm = Arc::new(vec![0.5f32; 8]); // 4 stereo frames
+        let pcm = crate::instruments::stream::Pcm::mem(vec![0.5f32; 8]); // 4 stereo frames
         let mut s = SfzSampler {
             regions: vec![Loaded {
                 region: SfzRegion {
@@ -786,6 +1081,7 @@ mod tests {
                     tune_cents: 0.0,
                     start: 0.0,
                     end: 1.0,
+                    articulation: 0,
                 },
                 pcm,
             }],
@@ -793,6 +1089,10 @@ mod tests {
             name: "test".into(),
             strikes: [0; 128],
             knobs: Knobs::default(),
+            headroom: 0.0,
+            articulations: Vec::new(),
+            articulation: 0,
+            switch_base: None,
         };
 
         let mut buf = vec![0.0f32; 4];
@@ -833,6 +1133,7 @@ mod tests {
             tune_cents: 100.0,
             start: 0.0,
             end: 1.0,
+            articulation: 0,
         };
         // A semitone of tuning is the same as playing a semitone up.
         assert!((r.rate_for_note(60) - 2f32.powf(1.0 / 12.0)).abs() < 1e-5);
@@ -855,9 +1156,10 @@ mod tests {
                 tune_cents: 0.0,
                 start: 0.0,
                 end: 1.0,
+                articulation: 0,
             },
             // Loud enough to tell apart, long enough to survive a block.
-            pcm: Arc::new(vec![1.0f32; 64]),
+            pcm: crate::instruments::stream::Pcm::mem(vec![1.0f32; 64]),
         };
         let mut s = SfzSampler {
             // The two takes differ only in gain, which is what the test reads.
@@ -866,6 +1168,10 @@ mod tests {
             name: "test".into(),
             strikes: [0; 128],
             knobs: Knobs::default(),
+            headroom: 0.0,
+            articulations: Vec::new(),
+            articulation: 0,
+            switch_base: None,
         };
         let strike = |s: &mut SfzSampler| {
             s.all_notes_off();
@@ -901,13 +1207,18 @@ mod tests {
                     tune_cents: 0.0,
                     start: 0.0,
                     end: 1.0,
+                    articulation: 0,
                 },
-                pcm: Arc::new(pcm),
+                pcm: crate::instruments::stream::Pcm::mem(pcm),
             }],
             voices: Vec::with_capacity(MAX_VOICES),
             name: "test".into(),
             strikes: [0; 128],
             knobs: Knobs::default(),
+            headroom: 0.0,
+            articulations: Vec::new(),
+            articulation: 0,
+            switch_base: None,
         }
     }
 
@@ -1003,5 +1314,84 @@ mod tests {
         assert_eq!(s.voices.len(), 1, "the quarter was over in twenty frames");
         s.render(&mut buf, 1000);
         assert!(s.voices.is_empty(), "the slice ran past its own end");
+    }
+
+    /// **A chord of long notes does not saturate.**
+    ///
+    /// Reported from a run whose log says it: the tab's fader is set by a probe
+    /// that plays *one* note — `tab 1 trimmed to 2.00 — peaking 0.13` — and
+    /// then six held notes summed to six times what the probe measured. With
+    /// `LOOP` on there is no end to them either: they sustain until the key
+    /// comes up.
+    ///
+    /// Two things answer it, and this checks both: the sum is scaled by
+    /// `1/sqrt(voices)`, so a chord is louder than one note and nowhere near
+    /// six times louder; and the knee above it means the instrument's own
+    /// output cannot leave `-1..1` whatever is held down.
+    #[test]
+    fn a_chord_of_long_notes_does_not_saturate() {
+        let peak = |s: &mut SfzSampler, frames: usize| -> f32 {
+            let mut buf = vec![0.0f32; frames * 2];
+            s.render(&mut buf, 1000);
+            buf.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+        };
+
+        // One voice of a sample that sits at full scale: what the auto-level
+        // probe hears, and what it must keep hearing.
+        let mut one = bench(vec![1.0; 8000]);
+        one.set_param(1, 1.0); // LOOP on: long notes, no end to them
+        one.note_on(60, 127);
+        let alone = peak(&mut one, 400);
+        assert!(
+            (alone - 1.0).abs() < 0.05,
+            "one note is not itself any more: {alone}"
+        );
+
+        // Six of them, held. Without the headroom this is 6.0 and the tab's
+        // fader multiplies it.
+        let mut chord = bench(vec![1.0; 8000]);
+        chord.set_param(1, 1.0);
+        for note in [48, 52, 55, 59, 62, 67] {
+            chord.note_on(note, 127);
+        }
+        let together = peak(&mut chord, 400);
+        assert!(
+            together <= 1.0,
+            "a six-note chord left full scale: {together}"
+        );
+        assert!(
+            together > alone,
+            "a chord has to be louder than one note: {together} vs {alone}"
+        );
+        // Held, not decaying: the same a second later, and still inside.
+        let held = peak(&mut chord, 2_000);
+        assert!(held <= 1.0, "it saturated once it settled: {held}");
+
+        // …and the worst case the sampler allows: every voice it has.
+        let mut full = bench(vec![1.0; 8000]);
+        full.set_param(1, 1.0);
+        for note in 40..40 + MAX_VOICES as u8 {
+            full.note_on(note, 127);
+        }
+        let all = peak(&mut full, 400);
+        assert!(all <= 1.0, "{} voices reached {all}", MAX_VOICES);
+    }
+
+    /// Two loop marks on top of each other is not a loop: it is an oscillator
+    /// at whatever those few samples are, at the level of the sample and with
+    /// no end. The window is opened to [`MIN_LOOP_FRAMES`] instead.
+    #[test]
+    fn a_loop_cannot_be_shorter_than_a_loop() {
+        let mut s = bench(vec![1.0; 8000]);
+        s.set_param(1, 1.0); // LOOP
+        s.set_param(6, 0.5); // LOOP ST
+        s.set_param(7, 0.5001); // …and LOOP END on top of it
+        s.note_on(60, 100);
+        let voice = s.voices.first().expect("no voice");
+        assert!(
+            voice.loop_to - voice.loop_from >= MIN_LOOP_FRAMES,
+            "a {}-frame loop",
+            voice.loop_to - voice.loop_from
+        );
     }
 }

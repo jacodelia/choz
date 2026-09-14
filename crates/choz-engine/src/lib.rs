@@ -528,6 +528,81 @@ fn pd_params(path: &std::path::Path) -> Vec<PluginParam> {
         .collect()
 }
 
+/// An allocator that counts, for the one rule the audio thread has:
+/// `process_block` does not allocate.
+///
+/// The rule is written in `docs/fx-audit.md` and it broke without anybody
+/// noticing — three effects copied the block with `buf.to_vec()` to filter it
+/// and the whole suite stayed green. A reading of the diff caught it, which is
+/// exactly the mechanism that does not scale.
+#[cfg(test)]
+pub(crate) mod alloc_count {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Per **thread**, not per process. The harness runs a crate's tests in
+        /// parallel, so a global counter would be counting every other test's
+        /// allocations along with this one's — and for the same reason this
+        /// needs no lock, unlike the rest of `test_locks`.
+        ///
+        /// `None` is "not counting", which is what every other thread in the
+        /// process is doing.
+        static COUNT: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    pub(crate) struct Counting;
+
+    // SAFETY: every method hands the real work to `System` unchanged; the
+    // counter is a `Cell` of a `Copy` type in this thread's own storage.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            bump();
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            // A `Vec` that grows is an allocation like any other: this is what
+            // catches a `push` into a buffer that was not reserved.
+            bump();
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            bump();
+            unsafe { System.alloc_zeroed(layout) }
+        }
+    }
+
+    /// `try_with` rather than `with`: an allocation can happen while this
+    /// thread's TLS is being torn down, and reaching for a destroyed key from
+    /// inside the allocator would panic where nothing can catch it.
+    fn bump() {
+        let _ = COUNT.try_with(|c| {
+            if let Some(n) = c.get() {
+                c.set(Some(n + 1));
+            }
+        });
+    }
+
+    /// How many times `f` allocated, **on this thread**. Not re-entrant: one
+    /// of these at a time, which is all a test needs.
+    pub(crate) fn counted<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        COUNT.with(|c| c.set(Some(0)));
+        let out = f();
+        let n = COUNT.with(|c| c.replace(None)).unwrap_or(0);
+        (out, n)
+    }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static COUNTING_ALLOCATOR: alloc_count::Counting = alloc_count::Counting;
+
 /// Locks for the things that are global to the **process**, so tests that move
 /// them do not move them under each other.
 ///
@@ -545,8 +620,41 @@ pub(crate) mod test_locks {
     static METER: Mutex<()> = Mutex::new(());
 
     /// Held while a test moves the transport (rewind, play, tempo).
-    pub(crate) fn transport() -> MutexGuard<'static, ()> {
-        TRANSPORT.lock().unwrap_or_else(|e| e.into_inner())
+    ///
+    /// **And it puts the clock back**, both when it is taken and when it is
+    /// dropped. Holding the lock was never enough on its own: a test that set
+    /// the transport rolling and did not stop it handed the next one a clock
+    /// that was already playing, and the ones that count their own time —
+    /// every free-running `Seq` test — then found a grid to follow and played
+    /// something else. That is the flake that failed "several at a time, now
+    /// and then" and passed whenever the crate was run on its own; the leak
+    /// was `an_embedded_rack_puts_each_tab_on_its_own_pair`, which renders with
+    /// the engine playing, and the next test to be handed it was whichever one
+    /// the harness happened to start. Restoring here rather than in each test
+    /// is one place instead of forty, and the next leak is nobody's bug.
+    pub(crate) fn transport() -> TransportGuard {
+        let guard = TRANSPORT.lock().unwrap_or_else(|e| e.into_inner());
+        rewound();
+        TransportGuard(guard)
+    }
+
+    pub(crate) struct TransportGuard(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+    impl Drop for TransportGuard {
+        fn drop(&mut self) {
+            rewound();
+        }
+    }
+
+    /// The clock as a test that has not touched it should find it. The sample
+    /// rate is **not** reset: it is the device's, not the test's, and setting
+    /// it is what the engine does when a stream opens.
+    fn rewound() {
+        let t = choz_ports::transport();
+        t.set_playing(false);
+        t.set_bpm(choz_ports::Transport::DEFAULT_BPM);
+        t.set_time_signature(4, 4);
+        t.rewind();
     }
 
     /// Held while a test reads or clears a meter — the output meter, which

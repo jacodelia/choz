@@ -28,13 +28,14 @@ mod project;
 mod settings;
 mod source;
 mod spectrum;
+mod text_edit;
 mod views;
 
 /// The two note generators. They live in the engine now — a note is not audio,
 /// but it is not *interface* either, and the CLAP bundle cannot carry what only
 /// the binary can see. Re-exported under the names they had, so every
 /// `crate::arp::…` in the panels reads the same as before.
-pub use choz_engine::artifacts::{arp, seq};
+pub use choz_engine::artifacts::{arp, arranger, seq};
 pub use choz_engine::instruments::sampler;
 
 use choz_engine::fx_chain::FxSpec;
@@ -291,6 +292,21 @@ struct RackSlot {
     /// the RACK draws as a waveform. Only a sampler tab has one, and it is read
     /// once when the folder is adopted: it means decoding a file.
     sampler_peaks: Vec<f32>,
+    /// Where `SLICE` would cut that sample, as fractions of it. Read on the
+    /// same decode as the peaks, and drawn over them.
+    sampler_cuts: Vec<f32>,
+    /// What this folder can be played with, when it ships more than one way —
+    /// and the lowest key that selects one. Read when the folder is adopted.
+    sampler_arts: Vec<String>,
+    sampler_switch: Option<u8>,
+    /// Which articulation the panel says is playing.
+    ///
+    /// ponytail: what *this* sent. A keyswitch played on a real keyboard moves
+    /// the instrument and not this number; the fix is asking the source, which
+    /// means a handle across the audio thread for a label.
+    sampler_art: usize,
+    /// What the audition button plays: the key and how hard.
+    sampler_audition: (u8, u8),
     /// Plugin-instrument slots only: what the plugin exposes, and the current
     /// knob positions (0..1, same order). Empty for every other source kind.
     instr_params: Vec<choz_engine::PluginParam>,
@@ -312,6 +328,10 @@ struct RackSlot {
     /// what it plays goes through the arpeggiator when that is on: see
     /// [`crate::seq`].
     seq: seq::Seq,
+    /// This tab's arranger: a progression written out as a part. One role per
+    /// tab — a band is a tab per musician — and what it plays travels the same
+    /// road the sequencer's steps do. See [`crate::arranger`].
+    arranger: arranger::Arranger,
     /// The sounds this tab has on buttons, in button order. Four to start
     /// with, empty; `+` adds another up to [`SOUNDS_MAX`].
     sounds: Vec<SavedSound>,
@@ -366,12 +386,18 @@ impl RackSlot {
             plugin_presets: Vec::new(),
             preset_dir: None,
             sampler_peaks: Vec::new(),
+            sampler_cuts: Vec::new(),
+            sampler_arts: Vec::new(),
+            sampler_switch: None,
+            sampler_art: 0,
+            sampler_audition: (60, 100),
             instr_params: Vec::new(),
             instr_values: Vec::new(),
             instr_window: None,
             instr_state: Vec::new(),
             arp: arp::Arp::default(),
             seq: seq::Seq::default(),
+            arranger: arranger::Arranger::default(),
             sounds: vec![SavedSound::default(); SOUNDS_DEFAULT],
             sound_at: None,
             octave_sound: [None; OCTAVES],
@@ -546,6 +572,27 @@ enum SeqPick {
     Part,
 }
 
+/// One of the sampler's settings that has more than one answer, picked out of a
+/// list instead of stepped a click at a time.
+///
+/// A button that steps is fine for two positions and a guessing game for ten:
+/// `KIT` is three presses from `AUTO` and there is nothing on screen to say
+/// what the fourth press does. Every one of these opens the same list modal the
+/// sequencer's do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SamplerPick {
+    /// How the folder is laid out on the keyboard.
+    Layout,
+    /// How many pieces `SLICE` cuts into — the layout off, and the counts.
+    Slices,
+    /// Which way of playing the note, for a pack that ships more than one.
+    Articulation,
+    /// What key the audition plays.
+    Note,
+    /// …and how hard.
+    Velocity,
+}
+
 /// `views::modal::draw_list_modal`, so they share the scrollbar, the
 /// SELECT/CANCEL buttons and one set of mouse rects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -621,6 +668,17 @@ enum ModalKind {
     /// A named value of the tab's sequencer, picked from a list: the
     /// quantisation, the time signature, or the part being edited.
     SeqChoice(SeqPick),
+    /// One of the sampler's settings, out of a list — see [`SamplerPick`].
+    SamplerChoice(SamplerPick),
+    /// A progression written in a text file, for the tab's arranger.
+    ArrText,
+    /// The sampler's map, region by region: which sample, which keys, which
+    /// root, how much tune. The one place a detector's mistake can be put
+    /// right — see [`choz_engine::instruments::sampler::preset`].
+    SamplerMap,
+    /// The progression itself, in an editor: the one place in choz where text
+    /// is written rather than searched with. See [`text_edit::TextEdit`].
+    ArrEditText,
     /// Folder picker for a plugin's bank of preset **files** — the tab has an
     /// instrument that reports no programs of its own, so its patches are
     /// `.fxp` / `.vstpreset` files on disk.
@@ -1440,6 +1498,8 @@ struct Modal {
     /// so backspacing to nothing does not silently hand the keys back to the
     /// shortcuts underneath.
     search: Option<String>,
+    /// The progression being written, when this is the arranger's editor.
+    editor: Option<text_edit::TextEdit>,
     /// The octave map SPLIT was opened on, for its CANCEL button to put back.
     ///
     /// Painting is immediate — every click is heard on the instrument, which is
@@ -1458,6 +1518,7 @@ impl Modal {
             browser: None,
             fx_param: 0,
             search: None,
+            editor: None,
             split_undo: None,
         }
     }
@@ -1900,6 +1961,15 @@ struct App {
     /// the sequencer's. They are tabs, not two boxes — see
     /// [`views::fx_chain_panel::GenTab`].
     gen_tab: views::fx_chain_panel::GenTab,
+    /// Which of the arranger's controls has the arrows. Index into
+    /// [`ARR_CONTROLS`].
+    arr_control: usize,
+    /// Whether the progression editor's mark is down — see [`arr_edit_key`].
+    arr_marking: bool,
+    /// The map being edited, when the map editor is open, and which of its
+    /// four columns the arrows move.
+    sampler_map: Option<choz_engine::instruments::sampler::preset::Preset>,
+    sampler_map_col: usize,
     /// Cursor inside the arpeggiator's knob box.
     arp_param: usize,
     /// MIDI output ports as the OUT drawer lists them.
@@ -2063,6 +2133,10 @@ impl App {
             instr_param: 0,
             rack_focus: RackFocus::default(),
             gen_tab: views::fx_chain_panel::GenTab::default(),
+            arr_control: 0,
+            arr_marking: false,
+            sampler_map: None,
+            sampler_map_col: 0,
             arp_param: 0,
             midi_out_ports: midi::list_output_ports(),
             midi_outs: std::collections::HashMap::new(),
@@ -4924,6 +4998,10 @@ impl App {
             .slots
             .get(self.active_slot)
             .is_some_and(|s| s.seq.is_on());
+        let arranger = self
+            .slots
+            .get(self.active_slot)
+            .is_some_and(|s| s.arranger.is_on());
         // The two generators are tabs, so `k` walks *through* them: it brings
         // the arpeggiator up and hands it the arrows, then the sequencer, then
         // goes back to the chain. One key, and no separate gesture to remember
@@ -4941,11 +5019,20 @@ impl App {
             RackFocus::Fx | RackFocus::Loop | RackFocus::Instrument if arp => RackFocus::Arp,
             RackFocus::Fx | RackFocus::Loop | RackFocus::Instrument if seq => RackFocus::Seq,
             RackFocus::Arp if seq => RackFocus::Seq,
+            // And the arranger after the sequencer, in the order the three
+            // switches sit on their row.
+            RackFocus::Fx | RackFocus::Loop | RackFocus::Instrument | RackFocus::Arp
+                if arranger =>
+            {
+                RackFocus::Arr
+            }
+            RackFocus::Seq if arranger => RackFocus::Arr,
             _ => RackFocus::Fx,
         };
         match self.rack_focus {
             RackFocus::Arp => self.gen_tab = GenTab::Arp,
             RackFocus::Seq => self.gen_tab = GenTab::Seq,
+            RackFocus::Arr => self.gen_tab = GenTab::Arr,
             _ => {}
         }
     }
@@ -6145,7 +6232,11 @@ impl App {
     /// `None` on a format header row.
     fn path_rows(&self) -> Vec<(choz_engine::PluginFormat, Option<usize>)> {
         let mut rows = Vec::new();
-        for &fmt in choz_engine::PluginFormat::ALL {
+        // Only what is scanned. A samples directory in this list would be a
+        // library walked at every rescan — hundreds of files decoded and
+        // analysed to find out what is in them — and that is what the `LOAD`
+        // button is for.
+        for &fmt in choz_engine::PluginFormat::SCANNED {
             rows.push((fmt, None));
             for i in 0..self.plugin_paths.dirs(fmt).len() {
                 rows.push((fmt, Some(i)));
@@ -6666,6 +6757,70 @@ impl App {
         (out, frames)
     }
 
+    /// Put sample instruments in the catalogue.
+    ///
+    /// **Both lists.** `plugins` is what the picker shows and `synths` is what
+    /// the loader — and a reopened project — looks an id up in; filling only
+    /// the first is a folder that appears in the list and does nothing when it
+    /// is chosen.
+    fn register_samples(&mut self, found: &[choz_engine::FoundPlugin]) {
+        for entry in found {
+            if !self.plugins.iter().any(|p| p.path == entry.path) {
+                self.plugins.push(entry.clone());
+            }
+            // One entry per layout, because the layout is part of the id and
+            // this table is what both the loader and a reopened project look an
+            // id up in. They are never shown: the picker reads `plugins`.
+            for mode in sampler::Mode::ALL {
+                let id = format!("{}{}", entry.id, mode.suffix());
+                if !self.synths.iter().any(|s| s.id == id) {
+                    self.synths.push(SynthEntry {
+                        id,
+                        format: entry.format,
+                        name: entry.name.clone(),
+                        path: entry.path.clone(),
+                    });
+                }
+            }
+        }
+        self.plugins.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    /// Bring back the sample folders a project names.
+    ///
+    /// Samples are not scanned — they come in by `LOAD` — so a song reopened in
+    /// a fresh session has nothing in the catalogue to look its sampler tabs up
+    /// in. The project wrote down where each one lived; this reads those paths
+    /// and nothing else, which is the difference between reopening a song and
+    /// walking a library.
+    ///
+    /// A folder that has been moved or deleted is said so once and the tab
+    /// comes back empty, the same as a plugin that is not installed.
+    fn adopt_project_samples(&mut self, project: &project::Project) {
+        let mut paths: Vec<std::path::PathBuf> = project
+            .rack
+            .iter()
+            .filter(|t| t.instrument.kind == "plugin")
+            .filter_map(|t| t.instrument.path.clone())
+            .filter(|p| {
+                // Only what is already missing, and only what looks like a
+                // folder of samples: everything else is a plugin the scan
+                // knows about.
+                !self.synths.iter().any(|s| s.path == *p)
+                    && (p.is_dir() || sampler::archive::is_archive(p))
+            })
+            .collect();
+        paths.sort();
+        paths.dedup();
+        for path in paths {
+            let found = choz_engine::paths::scan_path(&path, choz_engine::PluginFormat::Samples);
+            match found.is_empty() {
+                true => eprintln!("choz: no samples under {} any more", path.display()),
+                false => self.register_samples(&found),
+            }
+        }
+    }
+
     /// SOURCE \u{2192} F2: point the sampler at a folder.
     ///
     /// A sample library is not installed anywhere — it is wherever the person
@@ -6675,10 +6830,9 @@ impl App {
     /// shelf, and a `.zip` is either.
     fn open_samples_folder(&mut self) {
         let start = self
-            .plugin_paths
-            .dirs(choz_engine::PluginFormat::Samples)
-            .last()
-            .map(|d| d.path.clone())
+            .ui
+            .samples_dir
+            .clone()
             .filter(|d| d.is_dir())
             .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
             .unwrap_or_else(|| std::path::PathBuf::from("/"));
@@ -6690,9 +6844,11 @@ impl App {
             ModalKind::SamplesFolder,
             views::modal::ListModal::new(i18n::t("SAMPLE FOLDER"), Vec::new()).with_filters(&modes),
         );
+        // A folder **or** one of the archives in it: a sample library arrives as
+        // one `.zip` per instrument, and choz reads one where it sits.
         modal.browser = Some(file_browser::FileBrowser::open(
             &start,
-            file_browser::DIR_PICK,
+            file_browser::DIR_OR_ZIP,
         ));
         self.modal = Some(modal);
         self.refresh_modal();
@@ -6762,38 +6918,510 @@ impl App {
             self.send_note(slot, false, note, 0);
             return;
         }
-        let Some((_, mode)) = self.active_sampler() else {
+        if self.active_sampler().is_none() {
+            return;
+        }
+        let (note, vel) = self
+            .slots
+            .get(slot)
+            .map(|s| s.sampler_audition)
+            .unwrap_or((60, 100));
+        self.sampler_note = Some(note);
+        self.send_note(slot, true, note, vel);
+    }
+
+    /// Redraw the panel's waveform as the shape of **what the audition would
+    /// play**, rather than of whichever file the map put first.
+    ///
+    /// One decode, on the key that asked for it: the note or the articulation
+    /// moved, so the sample under it may have. The cuts come with it, from the
+    /// same decode.
+    fn follow_sampler_sample(&mut self) {
+        let slot_index = self.active_slot;
+        let Some((dir, mode)) = self.active_sampler() else {
             return;
         };
-        let note = match mode {
-            sampler::Mode::Kit | sampler::Mode::Slice => 36,
-            _ => 60,
+        if dir.as_os_str().is_empty() {
+            return;
+        }
+        let slices = self.active_slices();
+        let Some(slot) = self.slots.get(slot_index) else {
+            return;
         };
-        self.sampler_note = Some(note);
-        self.send_note(slot, true, note, 100);
+        let (note, vel) = slot.sampler_audition;
+        let articulation = slot.sampler_art;
+        let Some((file, _, _)) =
+            sampler::sample_for(&dir, mode, slices, articulation, note, vel)
+        else {
+            return;
+        };
+        let shape = sampler::shape(&file, 256, slices);
+        if let Some(slot) = self.slots.get_mut(slot_index) {
+            slot.sampler_peaks = shape.peaks;
+            slot.sampler_cuts = match mode {
+                sampler::Mode::Slice => shape.cuts,
+                _ => Vec::new(),
+            };
+        }
     }
 
-    /// Flip one of the sampler's switch-shaped knobs — LOOP is the only one —
-    /// through the same path a knob moved by hand takes, so the engine hears
-    /// it and the project keeps it.
-    fn toggle_sampler_knob(&mut self, index: usize) {
-        let now = self
+    /// Step what the audition plays: the key by a semitone, the velocity by a
+    /// sixteenth of the range. A multisample pack with velocity layers in it is
+    /// the reason both are worth choosing — one fixed note at one fixed
+    /// dynamic hears one of its layers.
+    fn step_audition(&mut self, semitones: i16, velocity: i16) {
+        let (note, vel) = self
             .slots
             .get(self.active_slot)
-            .and_then(|s| s.instr_values.get(index).copied())
-            .unwrap_or(0.0);
-        self.set_instr_param(index, if now >= 0.5 { 0.0 } else { 1.0 });
+            .map(|s| s.sampler_audition)
+            .unwrap_or((60, 100));
+        self.set_audition(
+            Some((note as i16 + semitones).clamp(0, 127) as u8),
+            Some((vel as i16 + velocity).clamp(1, 127) as u8),
+        );
     }
 
-    /// Cut the folder into a piece per key, or put it back the way it was.
+    /// The same, said outright rather than stepped — what the lists pick.
+    ///
+    /// `None` leaves that half alone: the key and the dynamic are chosen from
+    /// two different lists.
+    fn set_audition(&mut self, note: Option<u8>, velocity: Option<u8>) {
+        let slot = self.active_slot;
+        let held = self.sampler_note;
+        if let Some(s) = self.slots.get_mut(slot) {
+            let (was_note, was_vel) = s.sampler_audition;
+            s.sampler_audition = (
+                note.unwrap_or(was_note).min(127),
+                velocity.unwrap_or(was_vel).clamp(1, 127),
+            );
+        }
+        // The picture follows the key: a multisample pack draws the sample
+        // that key plays, not the one the map listed first.
+        self.follow_sampler_sample();
+        // Held while it is stepped: let the old note go and play the new one,
+        // which is what makes stepping the key an audition rather than a
+        // setting.
+        if let Some(old) = held {
+            self.send_note(slot, false, old, 0);
+            self.sampler_note = None;
+            self.toggle_sample_preview();
+        }
+    }
+
+    /// Move the envelope by dragging its picture.
+    ///
+    /// Which stage: the drawing is attack, then decay to the sustain level,
+    /// then the sustain held, then the release — in the proportion the knobs are
+    /// set in (see the panel). Quartering it across is close enough to that to
+    /// grab the stage you meant, and far simpler than inverting the drawing.
+    ///
+    /// What the height means is what the stage is: a time for three of them and
+    /// a level for the sustain. Up is longer, because up is bigger everywhere
+    /// else on this panel.
+    fn drag_sample_env(&mut self, across: f32, height: f32) {
+        // The four envelope knobs, in the order the drawing reads.
+        const ENV: [usize; 4] = [2, 3, 4, 5];
+        let stage = ((across * 4.0) as usize).min(3);
+        // The sustain is a level; the other three are times, and a time of
+        // zero is a knob at the bottom.
+        self.set_instr_param(ENV[stage], height.clamp(0.0, 1.0));
+    }
+
+    /// Open the map editor on the active tab's sampler.
+    ///
+    /// The map comes off the folder the first time — the same scan the
+    /// instrument was built from — or out of the `.smpreset` beside it once one
+    /// has been saved, which is what makes a correction survive being reopened.
+    fn open_sampler_map(&mut self) {
+        use choz_engine::instruments::sampler::preset;
+        let Some((dir, mode)) = self.active_sampler() else {
+            return;
+        };
+        if dir.as_os_str().is_empty() {
+            return;
+        }
+        let saved = preset::path_for(&dir);
+        let map = match preset::read(&saved) {
+            Ok(p) => Some(p),
+            Err(_) => sampler::preset_of(&dir, mode, self.active_slices())
+                .map_err(|e| eprintln!("choz: {e:#}"))
+                .ok(),
+        };
+        let Some(map) = map else { return };
+        self.sampler_map = Some(map);
+        self.sampler_map_col = 0;
+        let modal = Modal::new(
+            ModalKind::SamplerMap,
+            views::modal::ListModal::new(
+                format!(
+                    "{}  \u{2014}  \u{2190}\u{2192} {}   ENTER {}   F2 {}   F3 RELINK",
+                    i18n::t("MAP"),
+                    i18n::t("EDIT"),
+                    i18n::t("COLUMN"),
+                    i18n::t("SAVE")
+                ),
+                Vec::new(),
+            ),
+        );
+        self.modal = Some(modal);
+        self.refresh_modal();
+    }
+
+    /// One row per region: which sample, which keys, which root, how much tune.
+    /// The column the arrows move is marked, because a row of four numbers with
+    /// no mark is a row nobody knows they are editing.
+    fn sampler_map_rows(&self) -> Vec<String> {
+        let Some(map) = self.sampler_map.as_ref() else {
+            return Vec::new();
+        };
+        let col = self.sampler_map_col;
+        let mark = |n: usize, text: String| -> String {
+            match n == col {
+                true => format!("[{text}]"),
+                false => format!(" {text} "),
+            }
+        };
+        map.regions
+            .iter()
+            .map(|r| {
+                let file = r
+                    .sample
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let missing = match r.sample.exists() {
+                    true => "",
+                    false => " \u{2717}",
+                };
+                format!(
+                    "{:<28}{}{}{}{}  v{:>3}\u{2013}{:<3}{}",
+                    views::fx_chain_panel::truncate(&file, 28),
+                    mark(0, format!("{:>4}", views::fx_chain_panel::note_name(r.root))),
+                    mark(1, format!("{:>4}", views::fx_chain_panel::note_name(r.lo_key))),
+                    mark(2, format!("{:>4}", views::fx_chain_panel::note_name(r.hi_key))),
+                    mark(3, format!("{:>+5.0}c", r.tune_cents)),
+                    r.lo_vel,
+                    r.hi_vel,
+                    missing
+                )
+            })
+            .collect()
+    }
+
+    /// Move the value under the cursor. One row, one column, one step — which
+    /// is the whole of editing a map.
+    fn edit_sampler_map(&mut self, delta: i32) {
+        let row = self.modal.as_ref().map(|m| m.list.cursor).unwrap_or(0);
+        let col = self.sampler_map_col;
+        if let Some(region) = self
+            .sampler_map
+            .as_mut()
+            .and_then(|m| m.regions.get_mut(row))
+        {
+            let step = |v: u8| -> u8 { (v as i32 + delta).clamp(0, 127) as u8 };
+            match col {
+                0 => region.root = step(region.root),
+                1 => {
+                    region.lo_key = step(region.lo_key).min(region.hi_key);
+                }
+                2 => {
+                    region.hi_key = step(region.hi_key).max(region.lo_key);
+                }
+                // Cents, in fives: a semitone is a hundred of them and nobody
+                // tunes a sample one cent at a time.
+                _ => region.tune_cents = (region.tune_cents + delta as f32 * 5.0).clamp(-100.0, 100.0),
+            }
+        }
+        self.refresh_modal();
+    }
+
+    /// Write the map beside the folder and play it: the tab reloads from the
+    /// preset, so what was corrected is what sounds.
+    fn save_sampler_map(&mut self) {
+        use choz_engine::instruments::sampler::preset;
+        let Some(map) = self.sampler_map.clone() else {
+            return;
+        };
+        let Some((dir, _)) = self.active_sampler() else {
+            return;
+        };
+        let path = preset::path_for(&dir);
+        if let Err(e) = preset::write(&path, &map) {
+            eprintln!("choz: {e:#}");
+            return;
+        }
+        // Into the catalogue and into the tab, by the id that says "a saved
+        // map" — the same road a folder takes, under a different name.
+        let id = format!(
+            "{}{}",
+            choz_engine::paths::path_id(&path),
+            sampler::PRESET_SUFFIX
+        );
+        if !self.synths.iter().any(|s| s.id == id) {
+            self.synths.push(SynthEntry {
+                id: id.clone(),
+                format: choz_engine::PluginFormat::Samples,
+                name: map.name.clone(),
+                path: path.clone(),
+            });
+        }
+        self.modal = None;
+        self.sampler_map = None;
+        self.load_plugin_source(choz_engine::PluginFormat::Samples, &path, &id);
+    }
+
+    /// Point the map at a library that moved: every file it cannot find is
+    /// looked for by name under the folder the tab is on.
+    fn relink_sampler_map(&mut self) {
+        use choz_engine::instruments::sampler::preset;
+        let Some((dir, _)) = self.active_sampler() else {
+            return;
+        };
+        let Some(map) = self.sampler_map.as_mut() else {
+            return;
+        };
+        let moved = preset::relink(map, &dir);
+        let missing = map.missing().len();
+        eprintln!("choz: relinked {moved} samples, {missing} still missing");
+        self.refresh_modal();
+    }
+
+    /// The next articulation round the ring, chosen the way a player does it:
+    /// by playing its keyswitch.
+    fn step_articulation(&mut self) {
+        let Some((arts, at)) = self
+            .slots
+            .get(self.active_slot)
+            .map(|s| (s.sampler_arts.len(), s.sampler_art))
+        else {
+            return;
+        };
+        if arts < 2 {
+            return;
+        }
+        self.set_articulation((at + 1) % arts);
+    }
+
+    /// One by name, out of the list — and played the way a player picks one:
+    /// with its keyswitch, so the button and a real keyboard do the same thing.
+    fn set_articulation(&mut self, next: usize) {
+        let slot = self.active_slot;
+        let Some((arts, base)) = self
+            .slots
+            .get(slot)
+            .map(|s| (s.sampler_arts.len(), s.sampler_switch))
+        else {
+            return;
+        };
+        if next >= arts {
+            return;
+        }
+        if let Some(s) = self.slots.get_mut(slot) {
+            s.sampler_art = next;
+        }
+        if let Some(base) = base {
+            let key = base.saturating_add(next as u8);
+            self.send_note(slot, true, key, 100);
+            self.send_note(slot, false, key, 0);
+        }
+        // Another articulation is another set of files: the picture is of one
+        // of them.
+        self.follow_sampler_sample();
+    }
+
+    /// Open the list for one of the sampler's settings.
+    ///
+    /// `false` when there is nothing to choose between — a pack with one
+    /// articulation, a tab with no folder — and then the button does what it
+    /// always did rather than opening an empty list.
+    fn open_sampler_choice(&mut self, pick: SamplerPick) -> bool {
+        let Some((dir, mode)) = self.active_sampler() else {
+            return false;
+        };
+        // No folder yet: there is nothing to lay out, cut or audition, and the
+        // only thing to do is LOAD. A list of answers to a question nobody can
+        // ask yet is worse than a button that does nothing.
+        if dir.as_os_str().is_empty() {
+            return false;
+        }
+        let slot = self.slots.get(self.active_slot);
+        let (title, items, cursor) = match pick {
+            SamplerPick::Layout => (
+                i18n::t("LAYOUT").to_string(),
+                sampler::Mode::ALL
+                    .iter()
+                    .map(|m| m.label().to_string())
+                    .collect::<Vec<_>>(),
+                sampler::Mode::ALL.iter().position(|m| *m == mode).unwrap_or(0),
+            ),
+            // The counts, and "not slicing" as the first row: turning it off is
+            // one of the answers, and it was the one hidden past the last count.
+            SamplerPick::Slices => {
+                let now = self.active_slices();
+                let mut items = vec![format!("{}  \u{2014}  {}", i18n::t("OFF"), sampler::Mode::Auto.label())];
+                items.extend(
+                    sampler::SLICE_CHOICES
+                        .iter()
+                        .map(|n| format!("{n} {}", i18n::t("PIECES"))),
+                );
+                let cursor = match mode == sampler::Mode::Slice {
+                    true => sampler::SLICE_CHOICES
+                        .iter()
+                        .position(|n| *n == now)
+                        .map(|i| i + 1)
+                        .unwrap_or(0),
+                    false => 0,
+                };
+                (i18n::t("SLICE").to_string(), items, cursor)
+            }
+            SamplerPick::Articulation => {
+                let names = slot.map(|s| s.sampler_arts.clone()).unwrap_or_default();
+                if names.len() < 2 {
+                    return false;
+                }
+                let at = slot.map(|s| s.sampler_art).unwrap_or(0);
+                (i18n::t("ARTICULATION").to_string(), names, at)
+            }
+            // Every key, by name, with the notes the map actually plays marked:
+            // a list of 128 rows is long, and one that says which of them make
+            // a sound is the one worth scrolling.
+            SamplerPick::Note => {
+                let (note, _) = slot.map(|s| s.sampler_audition).unwrap_or((60, 100));
+                let playable = self.sampler_playable_keys(&dir, mode);
+                let items = (0..128u8)
+                    .map(|n| {
+                        format!(
+                            "{:<5}{}",
+                            views::fx_chain_panel::note_name(n),
+                            match playable.contains(&n) {
+                                true => "\u{25CF}",
+                                false => "",
+                            }
+                        )
+                    })
+                    .collect();
+                (i18n::t("NOTE").to_string(), items, note as usize)
+            }
+            SamplerPick::Velocity => {
+                let (_, vel) = slot.map(|s| s.sampler_audition).unwrap_or((60, 100));
+                // Sixteen steps: a velocity layer is a band, not a number, and
+                // 127 rows to pick one of three layers is a list nobody reads.
+                let items = (1..=8u8)
+                    .map(|k| {
+                        let v = k * 16 - 1;
+                        format!("{v:>3}")
+                    })
+                    .collect::<Vec<_>>();
+                let cursor = ((vel as usize + 1) / 16).clamp(1, 8) - 1;
+                (i18n::t("VELOCITY").to_string(), items, cursor)
+            }
+        };
+        let mut modal = Modal::new(
+            ModalKind::SamplerChoice(pick),
+            views::modal::ListModal::new(
+                format!("{} \u{00B7} {title}", i18n::t("SAMPLER")),
+                items,
+            ),
+        );
+        modal.list.cursor = cursor;
+        self.modal = Some(modal);
+        true
+    }
+
+    /// Which keys the folder actually plays, for the audition's list to mark.
+    ///
+    /// Off the same scan the instrument was built from, which is cached — this
+    /// is a read of what is already known, not a second look at the disk.
+    fn sampler_playable_keys(
+        &self,
+        dir: &std::path::Path,
+        mode: sampler::Mode,
+    ) -> std::collections::HashSet<u8> {
+        if dir.as_os_str().is_empty() {
+            return std::collections::HashSet::new();
+        }
+        let samples = choz_engine::instruments::sampler::describe(dir);
+        choz_engine::instruments::sampler::map::regions_with_slices(
+            &samples,
+            mode,
+            self.active_slices(),
+        )
+        .iter()
+        .flat_map(|r| r.lo_key..=r.hi_key)
+        .collect()
+    }
+
+    /// Apply what was picked out of one of those lists.
+    fn apply_sampler_choice(&mut self, pick: SamplerPick, i: usize) {
+        match pick {
+            SamplerPick::Layout => {
+                if let Some(mode) = sampler::Mode::ALL.get(i).copied() {
+                    match mode {
+                        // The layout list picks SLICE at the count it is
+                        // already on, so choosing it twice is not a re-cut.
+                        sampler::Mode::Slice => self.set_sampler_slices(self.active_slices()),
+                        _ => self.set_sampler_mode(mode),
+                    }
+                }
+            }
+            SamplerPick::Slices => match i.checked_sub(1) {
+                Some(k) => {
+                    if let Some(n) = sampler::SLICE_CHOICES.get(k).copied() {
+                        self.set_sampler_slices(n);
+                    }
+                }
+                None => self.set_sampler_mode(sampler::Mode::Auto),
+            },
+            SamplerPick::Articulation => self.set_articulation(i),
+            SamplerPick::Note => {
+                let note = i.min(127) as u8;
+                self.set_audition(Some(note), None);
+            }
+            SamplerPick::Velocity => {
+                let vel = ((i as u8 + 1) * 16).saturating_sub(1).max(1);
+                self.set_audition(None, Some(vel));
+            }
+        }
+    }
+
+    /// How many pieces this tab's sampler is cutting into, off its id.
+    fn active_slices(&self) -> usize {
+        match self.slots.get(self.active_slot).map(|s| &s.source) {
+            Some(AudioSource::Plugin { id, .. }) => sampler::slices_of_id(id),
+            _ => sampler::SLICES,
+        }
+    }
+
+    /// Cut the folder into a piece per key, step how many pieces that is, or
+    /// put it back the way it was.
+    ///
+    /// One button, because the count is only a question once the answer to
+    /// "sliced?" is yes: off it slices, on it steps the count, and the last
+    /// step puts it back — which is the order a hand finds without a legend.
     fn toggle_slice_layout(&mut self) {
         let Some((_, mode)) = self.active_sampler() else {
             return;
         };
-        self.set_sampler_mode(match mode {
-            sampler::Mode::Slice => sampler::Mode::Auto,
-            _ => sampler::Mode::Slice,
-        });
+        match next_slice_step(mode, self.active_slices()) {
+            Some(n) => self.set_sampler_slices(n),
+            None => self.set_sampler_mode(sampler::Mode::Auto),
+        }
+    }
+
+    /// Re-cut the same folder into `n` pieces: the count rides on the id, so
+    /// this is the same reload the layout is.
+    ///
+    /// See [`next_slice_step`] for what the button decides.
+    fn set_sampler_slices(&mut self, n: usize) {
+        let Some((dir, _)) = self.active_sampler() else {
+            return;
+        };
+        let id = format!(
+            "{}{}",
+            choz_engine::paths::path_id(&dir),
+            sampler::slice_suffix(n)
+        );
+        self.load_plugin_source(choz_engine::PluginFormat::Samples, &dir, &id);
     }
 
     /// Everything the RACK draws for a sampler tab, owned — the panel borrows
@@ -6812,10 +7440,18 @@ impl App {
             },
             layout: mode.label(),
             playing: self.sampler_note.is_some(),
-            looping: knob(SAMPLER_LOOP) >= 0.5,
             peaks: slot.map(|s| s.sampler_peaks.clone()).unwrap_or_default(),
+            cuts: slot.map(|s| s.sampler_cuts.clone()).unwrap_or_default(),
+            slices: self.active_slices(),
             start: knob(SAMPLER_START),
+            end: knob(SAMPLER_END),
             env: [knob(2), knob(3), knob(4), knob(5)],
+            articulation: slot.and_then(|s| {
+                s.sampler_arts
+                    .get(s.sampler_art)
+                    .map(|n| (n.clone(), s.sampler_art + 1, s.sampler_arts.len()))
+            }),
+            audition: slot.map(|s| s.sampler_audition).unwrap_or((60, 100)),
         })
     }
 
@@ -6841,47 +7477,25 @@ impl App {
             eprintln!("choz: no samples under {}", dir.display());
             return;
         }
-        // Remembered, so the next scan finds it without being asked again.
-        let known = self
-            .plugin_paths
-            .dirs(choz_engine::PluginFormat::Samples)
-            .iter()
-            .any(|d| d.path == dir);
-        if !known {
-            self.plugin_paths
-                .dirs_mut(choz_engine::PluginFormat::Samples)
-                .push(choz_engine::SearchDir {
-                    path: dir.clone(),
-                    enabled: true,
-                });
-            self.plugin_paths.save();
-        }
-        // Into the catalogue now rather than after a rescan: a rescan opens
-        // every plugin on the machine, and the person is waiting on one folder.
+        // **Nothing is remembered as a search directory.** Samples are not a
+        // scanned format (`PluginFormat::SCANNED`): a library is hundreds of
+        // files that have to be decoded and analysed to say what they are, and
+        // walking one at every rescan is a cost nobody asked for. What gets
+        // into choz is what somebody pointed `LOAD` at, and the project keeps
+        // the path of whatever ended up in a tab.
         //
-        // **Both lists.** `plugins` is what the picker shows and `synths` is
-        // what the loader looks the choice up in; filling only the first is a
-        // folder that appears in the list and does nothing when it is chosen.
-        for entry in &found {
-            if !self.plugins.iter().any(|p| p.path == entry.path) {
-                self.plugins.push(entry.clone());
-            }
-            // One entry per layout, because the layout is part of the id and
-            // this table is what both the loader and a reopened project look
-            // an id up in. They are never shown: the picker reads `plugins`.
-            for mode in sampler::Mode::ALL {
-                let id = format!("{}{}", entry.id, mode.suffix());
-                if !self.synths.iter().any(|s| s.id == id) {
-                    self.synths.push(SynthEntry {
-                        id,
-                        format: entry.format,
-                        name: entry.name.clone(),
-                        path: entry.path.clone(),
-                    });
-                }
-            }
+        // What *is* remembered is where the picker was, so the next `LOAD`
+        // opens on the library instead of at `$HOME`. An archive remembers the
+        // folder it sits in — that is the shelf the next pack is on.
+        let last = match sampler::archive::is_archive(&dir) {
+            true => dir.parent().map(|p| p.to_path_buf()),
+            false => Some(dir.clone()),
+        };
+        if last != self.ui.samples_dir {
+            self.ui.samples_dir = last;
+            self.ui.save();
         }
-        self.plugins.sort_by(|a, b| a.name.cmp(&b.name));
+        self.register_samples(&found);
         match found.as_slice() {
             [only] => {
                 // The mode rides on the id, so the project reopens it this way.
@@ -6933,6 +7547,23 @@ impl App {
         // Set by the Plugin paths arm when a path is being typed, so the caret
         // row stays selected (and therefore visible) while the text changes.
         let mut edit_row: Option<usize> = None;
+        // The editor draws itself: its rows are its lines, with the caret
+        // written into the one it is on and the selection marked at its ends.
+        if kind == ModalKind::ArrEditText {
+            let rows = match self.modal.as_mut().and_then(|m| m.editor.as_mut()) {
+                Some(e) => {
+                    e.follow(MODAL_ROWS);
+                    arr_edit_rows(e)
+                }
+                None => Vec::new(),
+            };
+            if let Some(m) = self.modal.as_mut() {
+                let (line, _) = m.editor.as_ref().map(|e| e.caret()).unwrap_or((0, 0));
+                m.list.items = rows;
+                m.list.cursor = line.min(m.list.items.len().saturating_sub(1));
+            }
+            return;
+        }
         let items: Vec<String> = match kind {
             ModalKind::Source => self
                 .source_rows()
@@ -7026,7 +7657,17 @@ impl App {
                     })
                     .collect()
             }
-            ModalKind::Browser | ModalKind::Wallpaper | ModalKind::Bank => self
+            // Drawn above, before this match: its rows are its lines.
+            ModalKind::ArrEditText => Vec::new(),
+            // Built when it opens, the same as the sequencer's lists: the rows
+            // are what the tab said then, and nothing re-reads them.
+            ModalKind::SamplerChoice(_) => self
+                .modal
+                .as_ref()
+                .map(|m| m.list.items.clone())
+                .unwrap_or_default(),
+            ModalKind::SamplerMap => self.sampler_map_rows(),
+            ModalKind::Browser | ModalKind::Wallpaper | ModalKind::Bank | ModalKind::ArrText => self
                 .modal
                 .as_ref()
                 .unwrap()
@@ -7385,6 +8026,18 @@ impl App {
         };
         let i = m.list.cursor;
         match m.kind {
+            // Enter is a line break in here, and the keys get it before this
+            // ever runs — see `arr_edit_key`. Nothing to select, and closing on
+            // it would throw the chart away.
+            ModalKind::ArrEditText => false,
+            // The map is edited with the arrows and saved with F2; Enter steps
+            // which column they move, which is the one thing a list's Enter can
+            // usefully mean here.
+            ModalKind::SamplerMap => {
+                self.sampler_map_col = (self.sampler_map_col + 1) % MAP_COLUMNS;
+                self.refresh_modal();
+                false
+            }
             ModalKind::Source => {
                 let choice = self.source_rows().into_iter().nth(i);
                 match choice.map(|c| c.action) {
@@ -7544,6 +8197,10 @@ impl App {
                 self.apply_seq_choice(pick, i);
                 true
             }
+            ModalKind::SamplerChoice(pick) => {
+                self.apply_sampler_choice(pick, i);
+                true
+            }
             ModalKind::LoopQuant(track) => {
                 use choz_engine::fx::looper as deck;
                 let n = deck::Quantise::ALL.len();
@@ -7662,9 +8319,10 @@ impl App {
                 }
                 true
             }
-            ModalKind::Browser | ModalKind::Wallpaper | ModalKind::Bank => {
+            ModalKind::Browser | ModalKind::Wallpaper | ModalKind::Bank | ModalKind::ArrText => {
                 let wallpaper = m.kind == ModalKind::Wallpaper;
                 let bank = m.kind == ModalKind::Bank;
+                let progression = m.kind == ModalKind::ArrText;
                 let action = self.modal.as_mut().and_then(|m| {
                     let b = m.browser.as_mut()?;
                     b.cursor = i;
@@ -7695,6 +8353,10 @@ impl App {
                         }
                         self.refresh_modal();
                         false
+                    }
+                    Some(file_browser::Action::PickFile(path)) if progression => {
+                        self.load_arranger_text(path);
+                        true
                     }
                     Some(file_browser::Action::PickFile(path)) if bank => {
                         self.set_bank_dir(path);
@@ -8211,6 +8873,7 @@ impl App {
                     midi_out: slot.midi_out.clone(),
                     arp: slot.arp.settings,
                     seq: slot.seq.settings.clone(),
+                    arranger: slot.arranger.settings.clone(),
                 }
             })
             .collect();
@@ -8380,6 +9043,10 @@ impl App {
     /// The sound half of a project: tabs, instruments, FX, mixer, routing and
     /// MIDI-learn bindings. Nothing here touches choz's own configuration.
     fn apply_project_rack(&mut self, p: project::Project) {
+        // What the song's sampler tabs were pointed at. Samples are not
+        // scanned, so without this a reopened song would find nothing to look
+        // them up in — see [`Self::adopt_project_samples`].
+        self.adopt_project_samples(&p);
         // The lanes address slots and FX by index, so they belong to the rack
         // half of a project and travel with it.
         self.automation = p.automation.clone();
@@ -8569,6 +9236,7 @@ impl App {
             rack.channel = slot.channel.min(16);
             rack.arp = arp::Arp::new(slot.arp);
             rack.seq = seq::Seq::new(slot.seq.clone());
+            rack.arranger = arranger::Arranger::new(slot.arranger.clone());
             // A patch that is no longer on this machine is said out loud and
             // dropped, like a missing plugin: the tab loads without it rather
             // than the project failing.
@@ -10404,16 +11072,43 @@ impl App {
                 // The shape of what it plays, for the sampler's own picture on
                 // the RACK. One decode, here where a load is already happening
                 // — never while anything is drawing.
-                let peaks = match entry.format {
+                let shape = match entry.format {
                     choz_engine::PluginFormat::Samples if entry.id != sampler::EMPTY_ID => {
                         sampler::representative(&entry.path)
-                            .map(|f| sampler::peaks(&f, 256))
+                            .map(|f| {
+                                sampler::shape(&f, 256, sampler::slices_of_id(&entry.id))
+                            })
                             .unwrap_or_default()
                     }
-                    _ => Vec::new(),
+                    _ => sampler::Shape::default(),
+                };
+                // …and what it can be played with, off the same scan.
+                let arts = match entry.format {
+                    choz_engine::PluginFormat::Samples if entry.id != sampler::EMPTY_ID => {
+                        sampler::articulations(&entry.path)
+                    }
+                    _ => (Vec::new(), None),
                 };
                 if let Some(s) = self.slots.get_mut(slot) {
-                    s.sampler_peaks = peaks;
+                    s.sampler_peaks = shape.peaks;
+                    // The cuts are only a thing under SLICE: under any other
+                    // layout the file is not being cut and drawing them would
+                    // be drawing something that is not happening.
+                    s.sampler_cuts = match sampler::Mode::of_id(&entry.id) {
+                        sampler::Mode::Slice => shape.cuts,
+                        _ => Vec::new(),
+                    };
+                    let (arts, switch) = arts;
+                    s.sampler_arts = arts;
+                    s.sampler_switch = switch;
+                    s.sampler_art = 0;
+                    // A kit and a set of slices keep their sounds at the
+                    // bottom of the keyboard; anything played across one starts
+                    // at middle C.
+                    s.sampler_audition = match sampler::Mode::of_id(&entry.id) {
+                        sampler::Mode::Kit | sampler::Mode::Slice => (36, 100),
+                        _ => (60, 100),
+                    };
                     s.instr_params = params;
                     s.instr_values = values;
                     s.plugin_presets = presets;
@@ -10891,6 +11586,7 @@ impl App {
             // arpeggiated — which is not what switching one on ever means, and
             // was the one setting nothing on the panel showed.
             self.stop_seq(slot_index);
+            self.stop_arranger(slot_index);
         }
         for event in stop {
             if let arp::ArpEvent::Off { note, .. } = event {
@@ -11377,6 +12073,7 @@ impl App {
                 // The other half of the rule in `edit_arp`: a tab holds one
                 // artifact, and the one just switched on is it.
                 self.stop_arp(slot_index);
+                self.stop_arranger(slot_index);
             }
         }
         let now = std::time::Instant::now();
@@ -11397,6 +12094,7 @@ impl App {
             self.rack_focus = match tab {
                 GenTab::Arp if self.arp_on() => RackFocus::Arp,
                 GenTab::Seq if self.seq_on() => RackFocus::Seq,
+                GenTab::Arr if self.arranger_on() => RackFocus::Arr,
                 _ => RackFocus::Fx,
             };
             return;
@@ -11404,6 +12102,7 @@ impl App {
         match tab {
             GenTab::Arp => self.edit_arp(ArpEdit::Toggle),
             GenTab::Seq => self.edit_seq(SeqEdit::Toggle),
+            GenTab::Arr => self.edit_arranger(ArrEdit::Toggle),
         }
     }
 
@@ -11459,6 +12158,286 @@ impl App {
         self.slots
             .get(self.active_slot)
             .is_some_and(|s| s.seq.is_on())
+    }
+
+    /// Advance every tab's arranger and play what it asks for.
+    ///
+    /// Down the road the sequencer's steps take — through the tab's
+    /// arpeggiator when it has one, straight to the instrument when it does
+    /// not. An arranger's part is notes, and whatever a tab does to notes it
+    /// does to these.
+    fn tick_arrangers(&mut self) {
+        let now = std::time::Instant::now();
+        let mut events: Vec<(usize, arp::ArpEvent)> = Vec::new();
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            let mut out = Vec::new();
+            slot.arranger.tick(now, &mut out);
+            events.extend(out.into_iter().map(|e| (i, e)));
+        }
+        for (slot_index, event) in events {
+            self.play_seq_event(slot_index, event, now);
+        }
+    }
+
+    /// Switch a tab's arranger off and take its notes with it — the other half
+    /// of "a tab holds one artifact".
+    fn stop_arranger(&mut self, slot_index: usize) {
+        let mut out = Vec::new();
+        let Some(slot) = self.slots.get_mut(slot_index) else {
+            return;
+        };
+        if !slot.arranger.is_on() {
+            return;
+        }
+        slot.arranger.settings.on = false;
+        slot.arranger.stop(&mut out);
+        let now = std::time::Instant::now();
+        for event in out {
+            self.play_seq_event(slot_index, event, now);
+        }
+    }
+
+    /// Whether the active tab has an arranger switched on.
+    fn arranger_on(&self) -> bool {
+        self.slots
+            .get(self.active_slot)
+            .is_some_and(|s| s.arranger.is_on())
+    }
+
+    /// Do something to the active tab's arranger, and play whatever that asks
+    /// for. Same shape as [`Self::edit_seq`], and for the same reason: every
+    /// gesture that can stop it hands back the notes it had out.
+    fn edit_arranger(&mut self, edit: ArrEdit) {
+        let slot_index = self.active_slot;
+        let mut out = Vec::new();
+        if matches!(edit, ArrEdit::Text) {
+            self.open_arranger_text();
+            return;
+        }
+        let Some(slot) = self.slots.get_mut(slot_index) else {
+            return;
+        };
+        let arr = &mut slot.arranger;
+        // Whether the tab's own sound should be made to match the part it has
+        // just been given — see [`Self::fit_arranger_instrument`].
+        let mut fit = false;
+        match edit {
+            ArrEdit::Toggle => {
+                arr.settings.on = !arr.settings.on;
+                match arr.settings.on {
+                    // On is on and rolling: the box has one text and one part,
+                    // so there is nothing to set up first — and a PLAY that has
+                    // to be found before anything happens reads as broken.
+                    true => {
+                        arr.play();
+                        fit = true;
+                    }
+                    false => arr.stop(&mut out),
+                }
+            }
+            ArrEdit::Play => match arr.is_playing() {
+                true => arr.stop(&mut out),
+                false => arr.play(),
+            },
+            // The roles are a ring: a band is built by opening a tab per
+            // musician and stepping this one along.
+            ArrEdit::Role(delta) => {
+                let roles = arranger::generate::Role::ALL;
+                let at = roles
+                    .iter()
+                    .position(|r| *r == arr.settings.role)
+                    .unwrap_or(0) as isize;
+                let next = (at + delta).rem_euclid(roles.len() as isize) as usize;
+                arr.silence(&mut out);
+                arr.set_role(roles[next]);
+                fit = true;
+            }
+            // Another seed is another interpretation of the same progression,
+            // which is the one knob here that is worth turning by ear.
+            ArrEdit::Seed(delta) => {
+                let seed = (arr.settings.seed as i64 + delta as i64).clamp(1, u32::MAX as i64);
+                arr.silence(&mut out);
+                arr.set_seed(seed as u32);
+            }
+            ArrEdit::Text => {}
+        }
+        // Switching it on brings its tab up and takes the arrows, the way the
+        // sequencer's switch does — and stops the other two artifacts, because
+        // a tab plays one of them.
+        let on = self.slots.get(slot_index).is_some_and(|s| s.arranger.is_on());
+        if matches!(edit, ArrEdit::Toggle) {
+            self.rack_focus = if on { RackFocus::Arr } else { RackFocus::Fx };
+            if on {
+                self.gen_tab = views::fx_chain_panel::GenTab::Arr;
+                self.stop_arp(slot_index);
+                self.stop_seq(slot_index);
+            }
+        }
+        if fit {
+            self.fit_arranger_instrument(slot_index);
+        }
+        let now = std::time::Instant::now();
+        for event in out {
+            self.play_seq_event(slot_index, event, now);
+        }
+    }
+
+    /// Put the tab on the instrument its part is played on: the tenor for the
+    /// jazz melody, the upright for the bass, the kit for the drums.
+    ///
+    /// Only on a SoundFont tab, and only from what that SoundFont actually has
+    /// — see [`arranger::pick_program`]. A bank with none of them is left
+    /// alone and said so: a missing preset must never be the reason a band
+    /// does not play.
+    fn fit_arranger_instrument(&mut self, slot_index: usize) {
+        let Some(slot) = self.slots.get(slot_index) else {
+            return;
+        };
+        if !slot.arranger.is_on() || !matches!(slot.source, AudioSource::Sf2 { .. }) {
+            return;
+        }
+        let role = slot.arranger.settings.role;
+        let wanted = slot.arranger.style().programs(role);
+        let banks: Vec<(u8, u8)> = slot.presets.iter().map(|p| (p.bank, p.preset)).collect();
+        let at = match role {
+            // The kit is a bank, not a program: bank 128 is where every
+            // SoundFont keeps it.
+            arranger::generate::Role::Drums => banks.iter().position(|(b, _)| *b == 128),
+            _ => arranger::pick_program(&banks, wanted),
+        };
+        let Some(at) = at else {
+            eprintln!(
+                "choz: arranger {}: this SoundFont has nothing to play it on, leaving the sound alone",
+                role.name()
+            );
+            return;
+        };
+        if let Some(slot) = self.slots.get_mut(slot_index) {
+            slot.preset_cursor = at;
+        }
+        self.apply_preset_on(slot_index);
+    }
+
+    /// The arranger's controls, in the order they are drawn — what the arrows
+    /// walk and what Enter presses.
+    fn arr_controls(&self) -> usize {
+        ARR_CONTROLS.len()
+    }
+
+    fn step_arr_cursor(&mut self, delta: isize) {
+        let n = self.arr_controls() as isize;
+        self.arr_control = (self.arr_control as isize + delta).rem_euclid(n) as usize;
+    }
+
+    /// Press the control the arrows are on.
+    fn press_arr_control(&mut self) {
+        match ARR_CONTROLS.get(self.arr_control) {
+            Some(ArrControl::Play) => self.edit_arranger(ArrEdit::Play),
+            Some(ArrControl::Role) => self.edit_arranger(ArrEdit::Role(1)),
+            Some(ArrControl::Seed) => self.edit_arranger(ArrEdit::Seed(1)),
+            Some(ArrControl::Text) => self.edit_arranger(ArrEdit::Text),
+            Some(ArrControl::Edit) => self.open_arranger_edit(),
+            None => {}
+        }
+    }
+
+    /// Open the picker for a progression written in a text file.
+    ///
+    /// ponytail: a file, not a text field. There is no text entry anywhere in
+    /// this program, and writing one — a cursor, a selection, a scroll, the
+    /// keys that are already the piano — is a bigger thing than the arranger
+    /// it would serve. A progression is twelve bars of text that live better in
+    /// a file anyway; the editor in the panel is in the roadmap.
+    /// Write the progression, here, with a caret in it.
+    ///
+    /// The editor takes every printable key while it is open — which is what
+    /// keeps it out of the piano's way: the keyboard is either playing notes or
+    /// writing a chart, and the modal is what says which.
+    fn open_arranger_edit(&mut self) {
+        let text = self
+            .slots
+            .get(self.active_slot)
+            .map(|s| s.arranger.settings.text.clone())
+            .unwrap_or_default();
+        let mut modal = Modal::new(
+            ModalKind::ArrEditText,
+            views::modal::ListModal::new(
+                format!("{}  \u{2014}  ^S {}   ESC {}", i18n::t("PROGRESSION"), i18n::t("SAVE"), i18n::t("CANCEL")),
+                Vec::new(),
+            ),
+        );
+        modal.editor = Some(text_edit::TextEdit::new(&text));
+        self.modal = Some(modal);
+        self.refresh_modal();
+    }
+
+    /// Put what was written into the tab's arranger, and close.
+    ///
+    /// A text that does not read is still kept: the box says why and the last
+    /// part that did read keeps playing, which is the rule the arranger itself
+    /// follows — losing somebody's typing because a bar is half-written would
+    /// be the worse of the two.
+    fn apply_arranger_edit(&mut self) {
+        let Some(text) = self
+            .modal
+            .as_ref()
+            .filter(|m| m.kind == ModalKind::ArrEditText)
+            .and_then(|m| m.editor.as_ref())
+            .map(|e| e.text())
+        else {
+            return;
+        };
+        let slot_index = self.active_slot;
+        let mut out = Vec::new();
+        if let Some(slot) = self.slots.get_mut(slot_index) {
+            slot.arranger.silence(&mut out);
+            slot.arranger.set_text(text);
+        }
+        let now = std::time::Instant::now();
+        for event in out {
+            self.play_seq_event(slot_index, event, now);
+        }
+        self.modal = None;
+    }
+
+    fn open_arranger_text(&mut self) {
+        let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let mut modal = Modal::new(
+            ModalKind::ArrText,
+            views::modal::ListModal::new(format!("OPEN .{}", ARR_EXTS.join(" / .")), Vec::new()),
+        );
+        modal.browser = Some(file_browser::FileBrowser::open(&start, ARR_EXTS));
+        self.modal = Some(modal);
+        self.refresh_modal();
+    }
+
+    /// Read a progression file into the active tab's arranger. A file that does
+    /// not parse leaves the part that was playing alone and says so on the box
+    /// — the same rule the arranger itself follows.
+    fn load_arranger_text(&mut self, path: std::path::PathBuf) {
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            // The log, because the RACK has no status line — the same place
+            // the loop export writes its failures to.
+            Err(e) => {
+                eprintln!("choz: {}: {e}", path.display());
+                return;
+            }
+        };
+        let mut out = Vec::new();
+        let slot_index = self.active_slot;
+        if let Some(slot) = self.slots.get_mut(slot_index) {
+            slot.arranger.silence(&mut out);
+            slot.arranger.set_text(text);
+        }
+        match self.slots.get(slot_index).and_then(|s| s.arranger.error()) {
+            Some(e) => eprintln!("choz: {}: {e}", path.display()),
+            None => eprintln!("choz: progression from {}", path.display()),
+        }
+        let now = std::time::Instant::now();
+        for event in out {
+            self.play_seq_event(slot_index, event, now);
+        }
     }
 
     /// Put the cursor on a cell, and toggle it — what a click on the grid does.
@@ -13894,6 +14873,13 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
+    // The user's own styles for the arranger, if they wrote any: read once,
+    // here, because a style is data and the generators take it as given.
+    match choz_engine::artifacts::arranger::load_styles() {
+        0 => {}
+        n => eprintln!("choz: {n} styles read from {}", choz_engine::artifacts::arranger::styles_dir().display()),
+    }
+
     // `--version` and `--help` answer on stdout and stop — before the log
     // redirect below takes fd 1 away, which is where the answer would have
     // silently ended up.
@@ -14158,6 +15144,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Screen>>, app: &mut App) -> 
         app.drain_midi();
         app.tick_arps();
         app.tick_seqs();
+        app.tick_arrangers();
         app.pump_loopers();
         app.tick_notes();
         app.publish_chord();
@@ -14491,7 +15478,131 @@ fn harmonics_key(app: &mut App, key: KeyCode) {
     }
 }
 
+/// The progression editor's keys.
+///
+/// It takes **every** printable key while it is open: a chart is written with
+/// the same letters that play notes, so either the editor has the keyboard or
+/// the piano does, and the modal is what says which. `true` when the key was
+/// the editor's, which is nearly all of them.
+///
+/// Selection is a mark rather than shift-arrows because the key events here
+/// carry no modifiers (see `handle_events`): F3 drops it, the arrows stretch
+/// from it, and typing over it replaces what is between.
+fn arr_edit_key(app: &mut App, key: KeyCode) -> bool {
+    use text_edit::Move;
+    if app.modal.as_ref().map(|m| m.kind) != Some(ModalKind::ArrEditText) {
+        return false;
+    }
+    // Out and in: F2 keeps what was written, Esc leaves it as it was.
+    match key {
+        KeyCode::F(2) => {
+            app.apply_arranger_edit();
+            return true;
+        }
+        KeyCode::Esc => {
+            app.modal = None;
+            return true;
+        }
+        _ => {}
+    }
+    let Some(e) = app.modal.as_mut().and_then(|m| m.editor.as_mut()) else {
+        return false;
+    };
+    // Whether the arrows are stretching a selection: the mark is on until it
+    // is dropped again or something is typed.
+    let marking = e.selection().is_some() || app.arr_marking;
+    match key {
+        KeyCode::Char(c) if !c.is_control() => {
+            e.insert(c);
+            app.arr_marking = false;
+        }
+        KeyCode::Enter => {
+            e.newline();
+            app.arr_marking = false;
+        }
+        KeyCode::Backspace => {
+            e.backspace();
+            app.arr_marking = false;
+        }
+        KeyCode::Delete => {
+            e.delete();
+            app.arr_marking = false;
+        }
+        KeyCode::Tab => {
+            for _ in 0..2 {
+                e.insert(' ');
+            }
+            app.arr_marking = false;
+        }
+        KeyCode::Left => e.move_caret(Move::Left, marking),
+        KeyCode::Right => e.move_caret(Move::Right, marking),
+        KeyCode::Up => e.move_caret(Move::Up, marking),
+        KeyCode::Down => e.move_caret(Move::Down, marking),
+        KeyCode::Home => e.move_caret(Move::Home, marking),
+        KeyCode::End => e.move_caret(Move::End, marking),
+        KeyCode::PageUp => e.move_caret(Move::PageUp(MODAL_ROWS), marking),
+        KeyCode::PageDown => e.move_caret(Move::PageDown(MODAL_ROWS), marking),
+        // The mark: F3 starts a selection where the caret is, and F3 again
+        // drops it. F4 takes the lot.
+        KeyCode::F(3) => {
+            match app.arr_marking || e.selection().is_some() {
+                true => {
+                    e.move_caret(Move::Left, false);
+                    e.move_caret(Move::Right, false);
+                    app.arr_marking = false;
+                }
+                false => {
+                    // An empty selection that the next arrow stretches.
+                    e.move_caret(Move::Left, true);
+                    e.move_caret(Move::Right, true);
+                    app.arr_marking = true;
+                }
+            }
+        }
+        KeyCode::F(4) => {
+            e.select_all();
+            app.arr_marking = true;
+        }
+        _ => return false,
+    }
+    app.refresh_modal();
+    true
+}
+
+/// The map editor's keys: the arrows move the number under the cursor, Enter
+/// steps which number that is, F2 keeps the map and F3 goes looking for a
+/// library that moved.
+///
+/// Up and down still walk the rows, so they are left to the list underneath —
+/// only left and right are the editor's.
+fn sampler_map_key(app: &mut App, key: KeyCode) -> bool {
+    if app.modal.as_ref().map(|m| m.kind) != Some(ModalKind::SamplerMap) {
+        return false;
+    }
+    match key {
+        KeyCode::Left => app.edit_sampler_map(-1),
+        KeyCode::Right => app.edit_sampler_map(1),
+        // An octave at a time, which is how a root note is usually wrong.
+        KeyCode::PageUp => app.edit_sampler_map(12),
+        KeyCode::PageDown => app.edit_sampler_map(-12),
+        KeyCode::F(2) => app.save_sampler_map(),
+        KeyCode::F(3) => app.relink_sampler_map(),
+        KeyCode::Esc => {
+            app.modal = None;
+            app.sampler_map = None;
+        }
+        _ => return false,
+    }
+    true
+}
+
 fn handle_modal_key(app: &mut App, key: KeyCode) {
+    if arr_edit_key(app, key) {
+        return;
+    }
+    if sampler_map_key(app, key) {
+        return;
+    }
     let Some(kind) = app.modal.as_ref().map(|m| m.kind) else {
         return;
     };
@@ -15199,6 +16310,13 @@ fn handle_fx_keys(app: &mut App, key: KeyCode) {
         KeyCode::Right if app.rack_focus == RackFocus::Seq => app.edit_seq(SeqEdit::Move(0, 1)),
         KeyCode::Up if app.rack_focus == RackFocus::Seq => app.edit_seq(SeqEdit::Move(-1, 0)),
         KeyCode::Down if app.rack_focus == RackFocus::Seq => app.edit_seq(SeqEdit::Move(1, 0)),
+        // The arranger's row: the arrows walk its controls, Enter presses the
+        // one they are on. Four buttons and no grid, so there is no second
+        // axis to give up and down.
+        KeyCode::Left if app.rack_focus == RackFocus::Arr => app.step_arr_cursor(-1),
+        KeyCode::Right if app.rack_focus == RackFocus::Arr => app.step_arr_cursor(1),
+        KeyCode::Up if app.rack_focus == RackFocus::Arr => app.step_arr_cursor(-1),
+        KeyCode::Down if app.rack_focus == RackFocus::Arr => app.step_arr_cursor(1),
         KeyCode::Left if app.rack_focus == RackFocus::Arp => app.step_arp_cursor(-1),
         KeyCode::Right if app.rack_focus == RackFocus::Arp => app.step_arp_cursor(1),
         KeyCode::Up if app.rack_focus == RackFocus::Arp => {
@@ -15256,6 +16374,7 @@ fn handle_fx_keys(app: &mut App, key: KeyCode) {
         // Enter writes the step under the cursor — the one gesture the grid is
         // for.
         KeyCode::Enter if app.rack_focus == RackFocus::Seq => app.edit_seq(SeqEdit::StepAtCursor),
+        KeyCode::Enter if app.rack_focus == RackFocus::Arr => app.press_arr_control(),
         KeyCode::Enter if app.rack_focus == RackFocus::Arp => {
             // A knob with names is a list; one with two places flips — **both
             // ways**, so Enter turns the arpeggiator off as readily as on.
@@ -15489,10 +16608,107 @@ enum SeqEdit {
     Transpose(i16),
 }
 
+/// What can be done to a tab's arranger. Short on purpose: the progression is
+/// the instrument here, and it comes from a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArrEdit {
+    /// Switch the whole thing on or off. On, it rolls.
+    Toggle,
+    /// Roll, or stop and let go of what is sounding.
+    Play,
+    /// Step which musician this tab is, by `delta` roles.
+    Role(isize),
+    /// Another interpretation of the same progression.
+    Seed(i32),
+    /// Open a progression written in a text file.
+    Text,
+}
+
+/// The arranger's controls, in the order they are drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArrControl {
+    Play,
+    Role,
+    Seed,
+    Text,
+    /// Write the progression, rather than open one that was written elsewhere.
+    Edit,
+}
+
+const ARR_CONTROLS: [ArrControl; 5] = [
+    ArrControl::Play,
+    ArrControl::Role,
+    ArrControl::Seed,
+    ArrControl::Text,
+    ArrControl::Edit,
+];
+
+/// What a progression is written in. Plain text, because that is what it is.
+const ARR_EXTS: &[&str] = &["chord", "txt"];
+
+/// The columns of the map editor: root, lowest key, highest key, tune.
+const MAP_COLUMNS: usize = 4;
+
+/// How many lines of a progression are on screen at once. The modal's list is
+/// taller than this on a big terminal and shorter on a small one; what this
+/// number does is keep the caret inside the part everybody has.
+const MODAL_ROWS: usize = 12;
+
+/// One row per line of the chart, with the caret drawn into the line it is on
+/// and the selection between two marks.
+///
+/// A terminal cursor would be the other way to do it, and it is the wrong way
+/// here: the modal is a list of rows and the real cursor belongs to the
+/// terminal, which is drawing a rack behind this.
+fn arr_edit_rows(e: &text_edit::TextEdit) -> Vec<String> {
+    let (cl, cc) = e.caret();
+    let selection = e.selection();
+    e.lines()
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let mut row: Vec<char> = line.chars().collect();
+            // The ends of the selection, marked before the caret goes in so the
+            // caret is never the thing that moved them.
+            if let Some(((l0, c0), (l1, c1))) = selection {
+                if i == l1 && c1 <= row.len() {
+                    row.insert(c1, '\u{2590}');
+                }
+                if i == l0 && c0 <= row.len() {
+                    row.insert(c0, '\u{258C}');
+                }
+            }
+            if i == cl {
+                let at = (cc + usize::from(selection.is_some_and(|((l0, c0), _)| l0 == i && c0 < cc)))
+                    .min(row.len());
+                row.insert(at, '\u{2502}');
+            }
+            row.into_iter().collect()
+        })
+        .collect()
+}
+
 enum MouseAction {
     None,
     ArpEdit(ArpEdit),
     SeqEdit(SeqEdit),
+    /// Something done to the tab's arranger.
+    ArrEdit(ArrEdit),
+    /// Open the progression editor on the active tab's arranger.
+    ArrEditText,
+    /// Step what the sampler's audition plays: `(semitones, velocity)`.
+    StepAudition(i16, i16),
+    /// Step which articulation the sampler is playing.
+    StepArticulation,
+    /// Open the list for one of the sampler's settings.
+    SamplerPick(SamplerPick),
+    /// Open the sampler's map editor.
+    OpenSamplerMap,
+    /// Put the sample's END where the right button was clicked, 0..1.
+    SampleEnd(f32),
+    /// A drag inside the sampler's envelope drawing: `(across, height)`, both
+    /// 0..1.
+    SampleEnvDrag(f32, f32),
     /// One of the sequencer's lists: quantisation, time signature, part.
     SeqPick(SeqPick),
     /// A generator tab: show it, or switch it when it is the one showing.
@@ -15578,7 +16794,6 @@ enum MouseAction {
     ToggleSamplePlay,
     /// Whether a held note runs round the sample, and whether the folder is
     /// cut into a piece per key.
-    ToggleSampleLoop,
     ToggleSampleSlice,
     /// Where in the sample a note starts, as a fraction of it: the scrub.
     SampleScrub(f32),
@@ -15714,6 +16929,21 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                     let at = (pos.x - r.x) as f32 / r.width.max(1) as f32;
                     return MouseAction::SampleScrub(at.clamp(0.0, 1.0));
                 }
+                // The envelope, dragged: which stage is under the pointer comes
+                // from where across it the click landed, and how high it landed
+                // is what that stage is set to. The ADSR graph was read-only,
+                // which is the one control on this panel nobody reaches for
+                // with the arrows.
+                if let Some(r) = rack.sample_env.filter(|r| r.contains(pos)) {
+                    let x = (pos.x - r.x) as f32 / r.width.max(1) as f32;
+                    // Two rows is two levels, and a row means the middle of
+                    // what it covers: the top one is three quarters and the
+                    // bottom one a quarter. Coarse because the drawing is two
+                    // cells tall — the knobs are there for a number.
+                    let row = (pos.y - r.y) as f32;
+                    let y = 1.0 - (row + 0.5) / r.height.max(1) as f32;
+                    return MouseAction::SampleEnvDrag(x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
+                }
                 for &(btn, rect) in rack.buttons.iter() {
                     if rect.contains(pos) {
                         return match btn {
@@ -15721,11 +16951,25 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                             RackButton::Source => MouseAction::OpenSourcePicker,
                             RackButton::Preset => MouseAction::OpenPresetPicker,
                             RackButton::SampleFolder => MouseAction::OpenSampleFolder,
-                            RackButton::SampleLayout => MouseAction::StepSampleLayout,
+                            RackButton::SampleLayout => {
+                                MouseAction::SamplerPick(SamplerPick::Layout)
+                            }
                             RackButton::SampleClear => MouseAction::ClearSampler,
                             RackButton::SamplePlay => MouseAction::ToggleSamplePlay,
-                            RackButton::SampleLoop => MouseAction::ToggleSampleLoop,
-                            RackButton::SampleSlice => MouseAction::ToggleSampleSlice,
+                            // Every sampler button with more than one answer
+                            // opens its list: stepping is fine for two
+                            // positions and a guessing game for ten.
+                            RackButton::SampleSlice => {
+                                MouseAction::SamplerPick(SamplerPick::Slices)
+                            }
+                            RackButton::SampleNote => MouseAction::SamplerPick(SamplerPick::Note),
+                            RackButton::SampleVelocity => {
+                                MouseAction::SamplerPick(SamplerPick::Velocity)
+                            }
+                            RackButton::SampleArticulation => {
+                                MouseAction::SamplerPick(SamplerPick::Articulation)
+                            }
+                            RackButton::SampleMap => MouseAction::OpenSamplerMap,
                             RackButton::PitchToMidi => MouseAction::TogglePitchToMidi,
                             RackButton::PitchMix => MouseAction::PitchMixCycle,
                             RackButton::Gui => MouseAction::ToggleEditor,
@@ -15764,6 +17008,14 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                             RackButton::SeqOn => {
                                 MouseAction::GenTab(views::fx_chain_panel::GenTab::Seq)
                             }
+                            RackButton::ArrOn => {
+                                MouseAction::GenTab(views::fx_chain_panel::GenTab::Arr)
+                            }
+                            RackButton::ArrPlay => MouseAction::ArrEdit(ArrEdit::Play),
+                            RackButton::ArrRole => MouseAction::ArrEdit(ArrEdit::Role(1)),
+                            RackButton::ArrSeed => MouseAction::ArrEdit(ArrEdit::Seed(1)),
+                            RackButton::ArrText => MouseAction::ArrEdit(ArrEdit::Text),
+                            RackButton::ArrEditText => MouseAction::ArrEditText,
                             RackButton::SeqPlay => MouseAction::SeqEdit(SeqEdit::Play),
                             RackButton::SeqRec => MouseAction::SeqEdit(SeqEdit::Rec),
                             // The named ones open their list; PART among them,
@@ -15932,6 +17184,13 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                     }
                 }
             }
+            // The sample's window: the left button puts START where it was
+            // clicked, the right one puts END there. Two marks, two buttons,
+            // one strip — and no mode to be in.
+            if let Some(r) = layout.rack.sample_wave.filter(|r| r.contains(pos)) {
+                let at = (pos.x - r.x) as f32 / r.width.max(1) as f32;
+                return MouseAction::SampleEnd(at.clamp(0.0, 1.0));
+            }
             // The same gesture the drawers use, on the grid: the left button
             // writes a step, the right one takes it off. Erasing rather than
             // toggling, so dragging across a run clears it instead of
@@ -16026,10 +17285,25 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                 }
                 // The wheel over the converter's dry/wet nudges it, the way it
                 // does over every other level on this panel.
+                //
+                // …and over the sampler's buttons it steps them: the click
+                // opens the list, the wheel walks it in place. Trying one key
+                // after the next is a wheel gesture; picking C#3 out of a
+                // hundred and twenty-eight is a list.
                 for &(btn, rect) in rack.buttons.iter() {
-                    if btn == views::fx_chain_panel::RackButton::PitchMix && rect.contains(pos) {
-                        return MouseAction::PitchMixAdjust(dir * 0.05);
+                    if !rect.contains(pos) {
+                        continue;
                     }
+                    use views::fx_chain_panel::RackButton as B;
+                    return match btn {
+                        B::PitchMix => MouseAction::PitchMixAdjust(dir * 0.05),
+                        B::SampleNote => MouseAction::StepAudition(dir as i16, 0),
+                        B::SampleVelocity => MouseAction::StepAudition(0, dir as i16 * 8),
+                        B::SampleArticulation => MouseAction::StepArticulation,
+                        B::SampleLayout => MouseAction::StepSampleLayout,
+                        B::SampleSlice => MouseAction::ToggleSampleSlice,
+                        _ => continue,
+                    };
                 }
                 if rack.in_gate.is_some_and(|r| r.contains(pos)) {
                     return MouseAction::InTrim(0.0, dir * 0.05);
@@ -16368,6 +17642,26 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         MouseAction::SeqEdit(edit) => app.edit_seq(edit),
         MouseAction::SeqPick(pick) => app.open_seq_choice(pick),
         MouseAction::GenTab(tab) => app.click_gen_tab(tab),
+        MouseAction::ArrEdit(edit) => app.edit_arranger(edit),
+        MouseAction::ArrEditText => app.open_arranger_edit(),
+        MouseAction::StepAudition(note, vel) => app.step_audition(note, vel),
+        MouseAction::StepArticulation => app.step_articulation(),
+        // Nothing to choose between — one articulation, no folder — and the
+        // button does what it always did rather than opening an empty list.
+        MouseAction::SamplerPick(pick) => {
+            if !app.open_sampler_choice(pick) {
+                match pick {
+                    SamplerPick::Slices => app.toggle_slice_layout(),
+                    SamplerPick::Layout => app.step_sampler_mode(),
+                    SamplerPick::Articulation => app.step_articulation(),
+                    SamplerPick::Note => app.step_audition(1, 0),
+                    SamplerPick::Velocity => app.step_audition(0, 8),
+                }
+            }
+        }
+        MouseAction::OpenSamplerMap => app.open_sampler_map(),
+        MouseAction::SampleEnd(at) => app.set_instr_param(SAMPLER_END, at),
+        MouseAction::SampleEnvDrag(x, y) => app.drag_sample_env(x, y),
         MouseAction::SeqStep(track, step) => app.click_seq_step(track, step),
         MouseAction::SeqStepErase(track, step) => {
             if let Some(slot) = app.slots.get_mut(app.active_slot) {
@@ -16392,7 +17686,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         MouseAction::StepSampleLayout => app.step_sampler_mode(),
         MouseAction::ClearSampler => app.load_empty_sampler(),
         MouseAction::ToggleSamplePlay => app.toggle_sample_preview(),
-        MouseAction::ToggleSampleLoop => app.toggle_sampler_knob(SAMPLER_LOOP),
         MouseAction::ToggleSampleSlice => app.toggle_slice_layout(),
         MouseAction::SampleScrub(at) => app.set_instr_param(SAMPLER_START, at),
         MouseAction::ToggleEditor => app.toggle_editor(None),
@@ -16853,7 +18146,9 @@ const INSTR_STEP: f32 = 0.05;
 /// [`choz_engine::instruments::sampler::params`] builds them in. The panel
 /// reaches for these two by hand; the rest are knobs like any other.
 const SAMPLER_START: usize = 0;
-const SAMPLER_LOOP: usize = 1;
+/// Last in the list, where it was appended so an older project reads its own
+/// knobs where it left them.
+const SAMPLER_END: usize = 9;
 
 /// The sampler's panel, owned. [`views::fx_chain_panel::SamplerView`] borrows
 /// from one of these — the draw call cannot own its strings, and the tab
@@ -16861,9 +18156,17 @@ const SAMPLER_LOOP: usize = 1;
 struct SamplerPanel {
     dir: String,
     layout: &'static str,
+    /// `(name, which, of how many)` of the articulation playing, when the pack
+    /// ships more than one.
+    articulation: Option<(String, usize, usize)>,
+    /// What the audition button plays: key and velocity.
+    audition: (u8, u8),
     playing: bool,
-    looping: bool,
     peaks: Vec<f32>,
+    cuts: Vec<f32>,
+    slices: usize,
+    /// Where the key stops playing, 0..1 — the second mark on the waveform.
+    end: f32,
     start: f32,
     env: [f32; 4],
 }
@@ -16874,12 +18177,36 @@ impl SamplerPanel {
             dir: &self.dir,
             layout: self.layout,
             playing: self.playing,
-            looping: self.looping,
             peaks: &self.peaks,
+            cuts: &self.cuts,
+            articulation: self
+                .articulation
+                .as_ref()
+                .map(|(n, i, of)| (n.as_str(), *i, *of)),
+            audition: self.audition,
+            slices: self.slices,
             start: self.start,
+            end: self.end,
             env: self.env,
         }
     }
+}
+
+/// What the SLICE button does next: the count to cut into, or `None` for
+/// "stop slicing and go back to the worked-out layout".
+///
+/// Pure, because it is the whole of the button's behaviour and the reload it
+/// drives needs a scanned folder and an engine to be worth testing against.
+fn next_slice_step(mode: sampler::Mode, now: usize) -> Option<usize> {
+    if mode != sampler::Mode::Slice {
+        return Some(sampler::SLICES);
+    }
+    let at = sampler::SLICE_CHOICES
+        .iter()
+        .position(|n| *n == now)
+        .map(|i| i + 1)
+        .unwrap_or(sampler::SLICE_CHOICES.len());
+    sampler::SLICE_CHOICES.get(at).copied()
 }
 
 /// One row of the INSTRUMENT parameter list: name, control, value.
@@ -16952,6 +18279,8 @@ enum RackFocus {
     Arp,
     /// The sequencer's grid, when the tab has one switched on.
     Seq,
+    /// The arranger's row of controls, when the tab has one switched on.
+    Arr,
     /// The looper's channel strips, when the selected effect is a deck. Every
     /// button on a strip is reachable with the arrows and Enter — a looper you
     /// need a mouse for is a looper you cannot play.
@@ -17228,6 +18557,13 @@ fn ui(f: &mut Frame, app: &mut App) {
             focused: app.rack_focus == RackFocus::Seq,
             ..s.seq.view()
         }),
+        app.slots
+            .get(app.active_slot)
+            .map(|s| arranger::ArrangerView {
+                cursor: app.arr_control,
+                focused: app.rack_focus == RackFocus::Arr,
+                ..s.arranger.view()
+            }),
         app.gen_tab,
         app.fx_slot_info(),
         views::fx_chain_panel::SoundsView {
@@ -18778,6 +20114,7 @@ mod tests {
                 app.in_trim_state(),
                 None,
                 crate::arp::ArpView::default(),
+                None,
                 None,
                 Default::default(),
                 Default::default(),
@@ -20353,6 +21690,13 @@ mod tests {
                     focused: app.rack_focus == RackFocus::Seq,
                     ..s.seq.view()
                 }),
+                app.slots
+                    .get(app.active_slot)
+                    .map(|s| arranger::ArrangerView {
+                        cursor: app.arr_control,
+                        focused: app.rack_focus == RackFocus::Arr,
+                        ..s.arranger.view()
+                    }),
                 app.gen_tab,
                 app.fx_slot_info(),
                 views::fx_chain_panel::SoundsView {
@@ -21491,6 +22835,12 @@ mod tests {
                             | RackButton::SeqPart
                             | RackButton::SeqChain
                             | RackButton::SeqErase
+                            // Nor the arranger's, which sits on the same row.
+                            | RackButton::ArrOn
+                            | RackButton::ArrPlay
+                            | RackButton::ArrRole
+                            | RackButton::ArrSeed
+                            | RackButton::ArrText
                     )
                 })
                 .count()
@@ -23201,6 +24551,96 @@ mod tests {
     /// the `ARP` button was gone — the only way off was the cursor and Enter —
     /// and the knob's own second click nudged a switch that was already up, so
     /// it stayed on.
+    /// A progression comes from a file, and one that does not read leaves the
+    /// part that was playing alone.
+    #[test]
+    fn a_progression_file_becomes_the_part() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        app.edit_arranger(ArrEdit::Toggle);
+
+        let dir = std::env::temp_dir().join(format!("choz-arr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("blues.chord");
+        std::fs::write(&good, "key = F\nstyle = minor_blues\n|| Im7 | IVm7 | Im7 | V7b9 ||").unwrap();
+        app.load_arranger_text(good);
+        assert_eq!(app.slots[0].arranger.bars(), 4);
+        assert_eq!(app.slots[0].arranger.style().name, "minor_blues");
+        assert!(app.slots[0].arranger.error().is_none());
+        let part: Vec<u8> = app.slots[0].arranger.part().iter().map(|n| n.note).collect();
+
+        let bad = dir.join("typo.chord");
+        std::fs::write(&bad, "key = F\n|| Im7 | Zq9 ||").unwrap();
+        app.load_arranger_text(bad);
+        assert!(app.slots[0].arranger.error().is_some(), "it says what is wrong");
+        let after: Vec<u8> = app.slots[0].arranger.part().iter().map(|n| n.note).collect();
+        assert_eq!(part, after, "and keeps playing what it had");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The arranger's switch: on, and the box it belongs to is the one on
+    /// screen with the arrows — and the other two artifacts are off, because a
+    /// tab plays one of them.
+    #[test]
+    fn the_arranger_switch_brings_its_box_up_and_takes_the_tab() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        app.edit_seq(SeqEdit::Toggle);
+        assert!(app.slots[0].seq.settings.on, "a sequencer to displace");
+
+        app.edit_arranger(ArrEdit::Toggle);
+        assert!(app.slots[0].arranger.is_on(), "on");
+        assert!(app.slots[0].arranger.is_playing(), "and rolling: on is on");
+        assert!(!app.slots[0].seq.settings.on, "one artifact per tab");
+        assert_eq!(app.gen_tab, views::fx_chain_panel::GenTab::Arr);
+        assert_eq!(app.rack_focus, RackFocus::Arr, "and it has the arrows");
+
+        // The box says what it read: the style, how long it is, and the part.
+        let (screen, rack) = render_rack(&mut app, 140, 40);
+        assert!(screen.contains("BASS"), "the role: {screen}");
+        assert!(screen.contains("major_blues"), "the style: {screen}");
+        assert!(screen.contains("I7"), "the progression itself: {screen}");
+
+        // The role steps round with a click, and the part is regenerated for
+        // whoever it now is — a drummer plays notes a bass player does not.
+        let (_, role) = rack
+            .buttons
+            .iter()
+            .find(|(b, _)| *b == RackButton::ArrRole)
+            .copied()
+            .expect("the role button is drawn while it is on");
+        let bass: Vec<u8> = app.slots[0].arranger.part().iter().map(|n| n.note).collect();
+        click(&mut app, role.x + 1, role.y);
+        assert_eq!(app.slots[0].arranger.settings.role, arranger::generate::Role::Drums);
+        let drums: Vec<u8> = app.slots[0].arranger.part().iter().map(|n| n.note).collect();
+        assert_ne!(bass, drums, "the part follows the role");
+
+        // And the keyboard reaches the same controls: the arrows walk them,
+        // Enter presses the one they are on.
+        app.arr_control = 0;
+        app.press_arr_control();
+        assert!(!app.slots[0].arranger.is_playing(), "Enter on PLAY stops it");
+        app.step_arr_cursor(2);
+        let seed = app.slots[0].arranger.settings.seed;
+        app.press_arr_control();
+        assert_ne!(
+            app.slots[0].arranger.settings.seed,
+            seed,
+            "Enter on SEED is another interpretation"
+        );
+
+        // Off, the box is gone and the arrows with it.
+        app.edit_arranger(ArrEdit::Toggle);
+        assert!(!app.slots[0].arranger.is_on());
+        assert_eq!(app.rack_focus, RackFocus::Fx);
+    }
+
     #[test]
     fn the_arp_switch_turns_it_off_as_well_as_on() {
         let _g = ui_guard();
@@ -24961,8 +26401,12 @@ mod tests {
         assert_eq!(app.plugin_paths.dirs(fmt).len(), count);
     }
 
-    /// Settings → Plugin paths lists every format, and edits persist into the
-    /// config the scanner reads.
+    /// Settings → Plugin paths lists every **scanned** format, and edits persist
+    /// into the config the scanner reads.
+    ///
+    /// Samples are not among them: a library is not installed anywhere a
+    /// convention points at, and walking one at every rescan means decoding and
+    /// analysing hundreds of files. They come in by `LOAD`.
     #[test]
     fn plugin_paths_modal_lists_formats_and_edits_dirs() {
         sandbox_state_dir();
@@ -24970,13 +26414,19 @@ mod tests {
         app.plugin_paths = choz_engine::PluginPaths::default();
         open_paths_tab(&mut app);
         let items = app.modal.as_ref().unwrap().list.items.clone();
-        for fmt in choz_engine::PluginFormat::ALL {
+        for fmt in choz_engine::PluginFormat::SCANNED {
             assert!(
                 items.iter().any(|i| i == fmt.label()),
                 "{} missing",
                 fmt.label()
             );
         }
+        assert!(
+            !items
+                .iter()
+                .any(|i| i == choz_engine::PluginFormat::Samples.label()),
+            "the samples library is back in the scan list"
+        );
 
         // Put the cursor on the first LV2 directory and switch it off.
         let rows = app.path_rows();
@@ -27340,6 +28790,20 @@ mod tests {
             app,
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+        );
+    }
+
+    /// The other button, for the gestures that have one: saving a sound, and
+    /// the sample's END mark.
+    fn right_click(app: &mut App, x: u16, y: u16) {
+        handle_mouse(
+            app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
                 column: x,
                 row: y,
                 modifiers: crossterm::event::KeyModifiers::NONE,
@@ -31111,6 +32575,637 @@ mod tests {
         );
     }
 
+    /// The SLICE button is the layout *and* how many pieces it cuts into: off
+    /// it slices at the default, on it steps the count, and past the last one
+    /// it stops slicing. A break with twenty hits in it is the reason the
+    /// count stopped being a constant.
+    #[test]
+    fn the_slice_button_steps_how_many_pieces() {
+        // Off: the first press slices, at the count every project written
+        // before this one says.
+        assert_eq!(
+            next_slice_step(sampler::Mode::Auto, sampler::SLICES),
+            Some(sampler::SLICES)
+        );
+        // On: round the choices, and then back to not slicing.
+        let mut seen = Vec::new();
+        let mut now = sampler::SLICE_CHOICES[0];
+        while let Some(n) = next_slice_step(sampler::Mode::Slice, now) {
+            seen.push(n);
+            now = n;
+        }
+        assert_eq!(seen, sampler::SLICE_CHOICES[1..].to_vec());
+        // A count nobody offers — an id typed by hand — steps off rather than
+        // hunting for a place in a list it is not in.
+        assert_eq!(next_slice_step(sampler::Mode::Slice, 7), None);
+    }
+
+    /// Switching the arranger on puts the tab on the instrument its part is
+    /// played on, out of what the SoundFont in it actually has — and a bank
+    /// with nothing suitable leaves the sound alone rather than silencing the
+    /// part.
+    #[test]
+    fn the_arranger_picks_the_instrument_its_part_is_played_on() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Sf2 {
+            path: "/sf/band.sf2".into(),
+            bank: 0,
+            preset: 0,
+        }));
+        app.active_slot = 0;
+        app.slots[0].presets = vec![
+            sources::Sf2Preset { bank: 0, preset: 0, name: "Piano".into() },
+            sources::Sf2Preset { bank: 0, preset: 32, name: "Acoustic Bass".into() },
+            sources::Sf2Preset { bank: 0, preset: 65, name: "Alto Sax".into() },
+            sources::Sf2Preset { bank: 128, preset: 0, name: "Standard Kit".into() },
+        ];
+        app.slots[0].arranger.settings.role = arranger::generate::Role::Bass;
+        app.edit_arranger(ArrEdit::Toggle);
+        assert_eq!(app.slots[0].preset_cursor, 1, "not the upright");
+
+        // The tune, in a style that plays it on a horn: no tenor in this bank,
+        // so the alto plays it. (The roles
+        // are a ring in `Role::ALL`'s order, and the guitar came last.)
+        app.slots[0]
+            .arranger
+            .set_text("key = C\nstyle = jazz_swing\n|| I7 | IV7 ||");
+        app.edit_arranger(ArrEdit::Role(3));
+        assert_eq!(
+            app.slots[0].arranger.settings.role,
+            arranger::generate::Role::Melody
+        );
+        assert_eq!(app.slots[0].preset_cursor, 2, "not the sax");
+
+        // The drums are a bank, not a program.
+        app.edit_arranger(ArrEdit::Role(-2));
+        assert_eq!(
+            app.slots[0].arranger.settings.role,
+            arranger::generate::Role::Drums
+        );
+        assert_eq!(app.slots[0].preset_cursor, 3, "not the kit");
+
+        // A SoundFont with only a kit in it: the part still plays on whatever
+        // was there.
+        app.slots[0].presets = vec![sources::Sf2Preset {
+            bank: 128,
+            preset: 0,
+            name: "Standard Kit".into(),
+        }];
+        app.slots[0].preset_cursor = 0;
+        app.edit_arranger(ArrEdit::Role(1));
+        assert_eq!(app.slots[0].preset_cursor, 0, "it moved anyway");
+    }
+
+
+    /// The progression is written **here**, with a caret in it: the one place
+    /// in choz where text is typed rather than searched with. The editor takes
+    /// every printable key while it is open, which is what keeps the letters
+    /// off the piano.
+    #[test]
+    fn the_progression_can_be_written_in_the_tui() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        app.slots[0]
+            .arranger
+            .set_text("key = C\n|| I7 | IV7 ||");
+        app.open_arranger_edit();
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::ArrEditText)
+        );
+
+        // Typing goes in where the caret is, and Enter opens a line.
+        for c in "style = rock".chars() {
+            handle_modal_key(&mut app, KeyCode::Char(c));
+        }
+        handle_modal_key(&mut app, KeyCode::Enter);
+        // …and the keys that mean something else everywhere else are the
+        // editor's while it is open: `q` does not quit, `P` does not panic.
+        handle_modal_key(&mut app, KeyCode::Char('q'));
+        assert!(!app.quit, "q quit out of a chord chart");
+        handle_modal_key(&mut app, KeyCode::Backspace);
+
+        // F2 keeps it; the arranger reads what was written.
+        handle_modal_key(&mut app, KeyCode::F(2));
+        assert!(app.modal.is_none(), "the editor stayed open");
+        let text = app.slots[0].arranger.settings.text.clone();
+        assert!(text.starts_with("style = rock\n"), "{text:?}");
+        assert!(text.contains("|| I7 | IV7 ||"), "{text:?}");
+        assert_eq!(app.slots[0].arranger.style().name, "rock");
+
+        // Esc throws the typing away instead.
+        app.open_arranger_edit();
+        for c in "xxx".chars() {
+            handle_modal_key(&mut app, KeyCode::Char(c));
+        }
+        handle_modal_key(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_none());
+        assert_eq!(app.slots[0].arranger.settings.text, text, "Esc kept it");
+
+        // The mark and the arrows are a selection, and what is typed replaces
+        // it — the thing a search box has never had to do.
+        app.open_arranger_edit();
+        handle_modal_key(&mut app, KeyCode::F(4));
+        handle_modal_key(&mut app, KeyCode::Char('|'));
+        handle_modal_key(&mut app, KeyCode::F(2));
+        assert_eq!(app.slots[0].arranger.settings.text, "|");
+    }
+
+    /// The audition is a key and a dynamic, not a fixed C4 at 100: a pack with
+    /// velocity layers in it is heard one layer at a time, and the layer is
+    /// chosen here.
+    #[test]
+    fn the_audition_picks_its_key_and_its_dynamic() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: "/Samples/violin".into(),
+            format: choz_engine::PluginFormat::Samples.label().to_string(),
+            name: "violin".into(),
+        }));
+        app.active_slot = 0;
+        assert_eq!(app.slots[0].sampler_audition, (60, 100));
+        app.step_audition(2, 0);
+        app.step_audition(0, 8);
+        assert_eq!(app.slots[0].sampler_audition, (62, 108));
+        // Neither runs off the end of MIDI.
+        for _ in 0..40 {
+            app.step_audition(4, 8);
+        }
+        assert_eq!(app.slots[0].sampler_audition, (127, 127));
+
+        // And the audition plays what it says.
+        app.toggle_sample_preview();
+        assert_eq!(app.sampler_note, Some(127));
+        app.toggle_sample_preview();
+        assert_eq!(app.sampler_note, None);
+    }
+
+    /// A pack with two ways of playing a note is switched between by playing
+    /// its keyswitch — which is what the instrument itself listens for, so the
+    /// button and a real keyboard do the same thing.
+    #[test]
+    fn the_articulation_button_plays_the_keyswitch() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: "/Samples/viola".into(),
+            format: choz_engine::PluginFormat::Samples.label().to_string(),
+            name: "viola".into(),
+        }));
+        app.active_slot = 0;
+        app.slots[0].sampler_arts = vec!["sustain".into(), "staccato".into()];
+        app.slots[0].sampler_switch = Some(24);
+        app.step_articulation();
+        assert_eq!(app.slots[0].sampler_art, 1);
+        // Round the ring.
+        app.step_articulation();
+        assert_eq!(app.slots[0].sampler_art, 0);
+        // One articulation: nothing to step, and no button on the panel.
+        app.slots[0].sampler_arts.clear();
+        app.step_articulation();
+        assert_eq!(app.slots[0].sampler_art, 0);
+        assert!(app.sampler_panel().is_some_and(|p| p.articulation.is_none()));
+    }
+
+
+    /// The envelope drawing is dragged, not only turned: the graph was
+    /// read-only, and dragging a vertex is what anybody tries first.
+    #[test]
+    fn the_envelope_is_dragged_in_its_drawing() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: "/Samples/violin".into(),
+            format: choz_engine::PluginFormat::Samples.label().to_string(),
+            name: "violin".into(),
+        }));
+        app.active_slot = 0;
+        app.slots[0].instr_params = choz_engine::instruments::sampler::params();
+        app.slots[0].instr_values = vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0];
+
+        let (_, rack) = render_rack(&mut app, 120, 24);
+        let env = rack.sample_env.expect("no envelope to drag");
+        // The first quarter is the attack: high up in it is a long one.
+        click(&mut app, env.x, env.y);
+        assert!(
+            app.slots[0].instr_values[2] > 0.5,
+            "the attack did not move: {:?}",
+            app.slots[0].instr_values
+        );
+        // …and the last quarter is the release.
+        click(&mut app, env.x + env.width - 1, env.y);
+        assert!(app.slots[0].instr_values[5] > 0.5);
+        // Low in the sustain's third is a quiet sustain.
+        click(&mut app, env.x + env.width / 2 + 1, env.y + 1);
+        assert!(app.slots[0].instr_values[4] < 0.5);
+    }
+    /// The map can be corrected: a root note the detector got wrong is a number
+    /// somebody types, and it survives being reopened because it is written to
+    /// a `.smpreset` beside the folder.
+    #[test]
+    fn the_map_editor_corrects_a_region_and_saves_it() {
+        use choz_engine::instruments::sampler::preset;
+        let _g = ui_guard();
+
+        // A folder with two named notes in it — the same shape the engine's own
+        // end-to-end test builds.
+        let dir = std::env::temp_dir().join(format!("choz-ui-map-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The files can be empty: both name their note, so nothing here is
+        // decoded — which is the point of reading names first.
+        for name in ["cello_C3", "cello_C4"] {
+            std::fs::write(dir.join(format!("{name}.wav")), []).unwrap();
+        }
+
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: choz_engine::paths::path_id(&dir),
+            format: choz_engine::PluginFormat::Samples.label().to_string(),
+            name: "cello".into(),
+        }));
+        app.active_slot = 0;
+
+        app.open_sampler_map();
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::SamplerMap)
+        );
+        let rows = app.modal.as_ref().unwrap().list.items.len();
+        assert_eq!(rows, 2, "a row per region");
+        let before = app.sampler_map.as_ref().unwrap().regions[0].root;
+
+        // The first column is the root, and PageUp is an octave — which is how
+        // a root note is usually wrong.
+        handle_modal_key(&mut app, KeyCode::PageUp);
+        assert_eq!(app.sampler_map.as_ref().unwrap().regions[0].root, before + 12);
+        // Enter steps to the next column, and the arrows then move that one.
+        app.modal_select();
+        assert_eq!(app.sampler_map_col, 1);
+        handle_modal_key(&mut app, KeyCode::Right);
+        let map = app.sampler_map.clone().unwrap();
+        assert!(map.regions[0].lo_key >= 1);
+
+        // F2 writes it beside the folder and closes.
+        handle_modal_key(&mut app, KeyCode::F(2));
+        assert!(app.modal.is_none());
+        let saved = preset::read(&preset::path_for(&dir)).expect("no preset was written");
+        assert_eq!(saved.regions[0].root, before + 12);
+        // …and the tab is pointed at the saved map rather than at the folder.
+        assert!(app
+            .synths
+            .iter()
+            .any(|s| sampler::is_preset_id(&s.id)), "the preset is not loadable");
+
+        // Reopening reads the correction back rather than scanning over it.
+        app.open_sampler_map();
+        assert_eq!(
+            app.sampler_map.as_ref().unwrap().regions[0].root,
+            before + 12,
+            "the correction did not survive"
+        );
+        // Esc throws away what was not saved.
+        handle_modal_key(&mut app, KeyCode::PageDown);
+        handle_modal_key(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_none() && app.sampler_map.is_none());
+        let again = preset::read(&preset::path_for(&dir)).unwrap();
+        assert_eq!(again.regions[0].root, before + 12, "Esc wrote anyway");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Everything the sampler puts on the panel belongs to the **instrument**,
+    /// not to the row its name is on: beside the source button its nine buttons
+    /// and its two drawings pushed SOURCE off the line and read as part of the
+    /// picker. Buttons, sample and envelope are all inside the INSTRUMENT box,
+    /// above the knobs they belong to — and the window to be played is marked
+    /// on the sample, START with the left button and END with the right.
+    #[test]
+    fn the_sample_and_its_window_are_drawn_inside_the_instrument_box() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: "/Samples/violin".into(),
+            format: choz_engine::PluginFormat::Samples.label().to_string(),
+            name: "violin".into(),
+        }));
+        app.active_slot = 0;
+        app.slots[0].instr_params = choz_engine::instruments::sampler::params();
+        app.slots[0].instr_values = vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0];
+
+        let (_, rack) = render_rack(&mut app, 120, 30);
+        let wave = rack.sample_wave.expect("no waveform");
+        let env = rack.sample_env.expect("no envelope");
+        let source = rack
+            .buttons
+            .iter()
+            .find(|(b, _)| *b == views::fx_chain_panel::RackButton::Source)
+            .map(|(_, r)| *r)
+            .expect("no source button");
+        let first_knob = rack.instr_knobs.first().map(|(_, r)| *r).expect("no knobs");
+        assert!(
+            wave.y > source.y,
+            "the sample is still up on the instrument's name row"
+        );
+        // **Nothing of the sampler's is on that row.** SOURCE is the tab's
+        // instrument; LOAD, CLEAR, ▶, SLICE, the layout, the audition and MAP
+        // are the sampler's, and they are in its box — on the row they pushed
+        // SOURCE off the line and read as part of the picker.
+        for (btn, rect) in rack.buttons.iter() {
+            if matches!(
+                btn,
+                views::fx_chain_panel::RackButton::SampleFolder
+                    | views::fx_chain_panel::RackButton::SampleClear
+                    | views::fx_chain_panel::RackButton::SamplePlay
+                    | views::fx_chain_panel::RackButton::SampleSlice
+                    | views::fx_chain_panel::RackButton::SampleLayout
+                    | views::fx_chain_panel::RackButton::SampleNote
+                    | views::fx_chain_panel::RackButton::SampleVelocity
+                    | views::fx_chain_panel::RackButton::SampleMap
+            ) {
+                assert!(
+                    rect.y > source.y,
+                    "{btn:?} is still beside SOURCE"
+                );
+                assert!(
+                    rect.y < first_knob.y,
+                    "{btn:?} is below the knobs instead of above them"
+                );
+            }
+        }
+        assert!(
+            wave.y < first_knob.y && env.y < first_knob.y,
+            "the pictures are below the knobs they are of"
+        );
+        // Inside the box, which starts one column in from the panel.
+        assert!(wave.x >= 2, "the sample is drawn outside the box");
+
+        // The right button puts END where it was clicked; the left one START.
+        right_click(&mut app, wave.x + wave.width - 2, wave.y);
+        let end = app.slots[0].instr_values[SAMPLER_END];
+        assert!(end > 0.8, "END did not move: {end}");
+        click(&mut app, wave.x + 1, wave.y);
+        let start = app.slots[0].instr_values[SAMPLER_START];
+        assert!(start < 0.2, "START did not move: {start}");
+        // …and each one moved only its own mark.
+        assert!((app.slots[0].instr_values[SAMPLER_END] - end).abs() < 1e-6);
+    }
+
+    /// Eyeball probe: prints the panel so a human can look at it. Ignored so it
+    /// never runs in CI — `cargo test -p choz-ui --lib panel_probe -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn panel_probe() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: "/Samples/violin".into(),
+            format: choz_engine::PluginFormat::Samples.label().to_string(),
+            name: "violin".into(),
+        }));
+        app.active_slot = 0;
+        app.slots[0].instr_params = choz_engine::instruments::sampler::params();
+        app.slots[0].instr_values = vec![0.15, 1.0, 0.2, 0.3, 0.7, 0.4, 0.0, 1.0, 0.0, 0.8];
+        app.slots[0].sampler_peaks = (0..256)
+            .map(|i| ((i as f32 / 12.0).sin().abs() * (1.0 - i as f32 / 300.0)).max(0.0))
+            .collect();
+        for (w, h) in [(110u16, 34u16), (80, 26), (60, 20)] {
+            let (text, _) = render_rack(&mut app, w, h);
+            println!("== {w}x{h} ==\n{text}\n");
+        }
+    }
+
+    /// Every sampler button with more than one answer opens a list. Stepping is
+    /// fine for two positions and a guessing game for ten: `KIT` is three
+    /// presses from `AUTO`, and nothing on the button says what the fourth does.
+    #[test]
+    fn the_samplers_many_valued_buttons_open_a_list() {
+        let _g = ui_guard();
+        let dir = std::env::temp_dir().join(format!("choz-ui-picks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Named notes, so nothing is decoded — see the map editor's test.
+        for name in ["cello_C3", "cello_C4"] {
+            std::fs::write(dir.join(format!("{name}.wav")), []).unwrap();
+        }
+
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: choz_engine::paths::path_id(&dir),
+            format: choz_engine::PluginFormat::Samples.label().to_string(),
+            name: "cello".into(),
+        }));
+        app.active_slot = 0;
+
+        // The layout: four rows, and the one it is on is where the cursor sits.
+        assert!(app.open_sampler_choice(SamplerPick::Layout));
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::SamplerChoice(SamplerPick::Layout))
+        );
+        let rows = app.modal.as_ref().unwrap().list.items.clone();
+        assert_eq!(rows.len(), sampler::Mode::ALL.len());
+        assert!(rows[0].contains("AUTO"));
+        assert_eq!(app.modal.as_ref().unwrap().list.cursor, 0, "not on AUTO");
+
+        // The slice counts, with "not slicing" as the first row — turning it
+        // off was the answer hidden past the last count.
+        app.modal = None;
+        assert!(app.open_sampler_choice(SamplerPick::Slices));
+        let rows = app.modal.as_ref().unwrap().list.items.clone();
+        assert_eq!(rows.len(), sampler::SLICE_CHOICES.len() + 1);
+        assert!(rows[1].starts_with("8"), "{rows:?}");
+
+        // The audition's key: every note by name, and the ones the map plays
+        // marked — a list of a hundred and twenty-eight rows is long, and one
+        // that says which of them sound is the one worth scrolling.
+        app.modal = None;
+        assert!(app.open_sampler_choice(SamplerPick::Note));
+        let rows = app.modal.as_ref().unwrap().list.items.clone();
+        assert_eq!(rows.len(), 128);
+        assert!(rows[60].starts_with("C4"));
+        assert_eq!(app.modal.as_ref().unwrap().list.cursor, 60);
+        assert!(
+            rows.iter().any(|r| r.contains('\u{25CF}')),
+            "nothing is marked as playable"
+        );
+        // Picking one is what the audition plays from then on.
+        if let Some(m) = app.modal.as_mut() {
+            m.list.cursor = 48;
+        }
+        app.modal_select();
+        assert_eq!(app.slots[0].sampler_audition.0, 48);
+
+        // The dynamic, in bands: 127 rows to pick one of three velocity layers
+        // is a list nobody reads.
+        app.modal = None;
+        assert!(app.open_sampler_choice(SamplerPick::Velocity));
+        assert_eq!(app.modal.as_ref().unwrap().list.items.len(), 8);
+        if let Some(m) = app.modal.as_mut() {
+            m.list.cursor = 0;
+        }
+        app.modal_select();
+        assert_eq!(app.slots[0].sampler_audition.1, 15);
+
+        // One articulation is nothing to choose between: no list, and the
+        // button keeps doing what it did.
+        app.modal = None;
+        assert!(!app.open_sampler_choice(SamplerPick::Articulation));
+        assert!(app.modal.is_none());
+        app.slots[0].sampler_arts = vec!["sustain".into(), "staccato".into()];
+        assert!(app.open_sampler_choice(SamplerPick::Articulation));
+        if let Some(m) = app.modal.as_mut() {
+            m.list.cursor = 1;
+        }
+        app.modal_select();
+        assert_eq!(app.slots[0].sampler_art, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// LOAD on a library of archives: the picker lists the `.zip`s, choosing
+    /// one puts the pack in the tab, nothing is added to the scan — samples are
+    /// not a scanned format — and where the picker was is remembered so the
+    /// next LOAD opens on the library.
+    #[test]
+    fn loading_a_sample_pack_takes_the_zip_and_remembers_its_folder() {
+        let _g = ui_guard();
+        let base = std::env::temp_dir().join(format!("choz-ui-zips-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // A real (tiny) zip: one named note, so nothing is decoded.
+        let zip = base.join("violin.zip");
+        {
+            let file = std::fs::File::create(&zip).unwrap();
+            let mut w = zip::ZipWriter::new(file);
+            w.start_file(
+                "violin_C4.wav",
+                zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+            use std::io::Write;
+            w.write_all(b"").unwrap();
+            w.finish().unwrap();
+        }
+
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: sampler::EMPTY_ID.into(),
+            format: choz_engine::PluginFormat::Samples.label().to_string(),
+            name: sampler::NAME.into(),
+        }));
+        app.active_slot = 0;
+
+        app.open_samples_folder();
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::SamplesFolder)
+        );
+        // Point the browser at the library and find the archive in its list.
+        if let Some(b) = app.modal.as_mut().and_then(|m| m.browser.as_mut()) {
+            b.set_dir(base.clone());
+        }
+        app.refresh_modal();
+        let rows = app.modal.as_ref().unwrap().list.items.clone();
+        let at = rows
+            .iter()
+            .position(|r| r.contains("violin.zip"))
+            .unwrap_or_else(|| panic!("no archive in the picker: {rows:?}"));
+        if let Some(m) = app.modal.as_mut() {
+            m.list.cursor = at;
+        }
+        app.modal_select();
+
+        // The pack is in the catalogue, under the archive's own path.
+        assert!(
+            app.plugins.iter().any(|p| p.path == zip),
+            "the archive was not adopted"
+        );
+        // **Nothing was added to the plugin paths**: samples are not scanned,
+        // and a library walked at every rescan is the cost this avoids.
+        assert!(
+            app.plugin_paths
+                .dirs(choz_engine::PluginFormat::Samples)
+                .is_empty(),
+            "the library was put in the scan list"
+        );
+        // What is remembered is where the picker was, so the next LOAD opens on
+        // the library rather than at $HOME — the folder, not the one archive.
+        assert_eq!(app.ui.samples_dir.as_deref(), Some(base.as_path()));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A song with a sampler tab reopens in a fresh session. Samples are not
+    /// scanned, so the catalogue is empty when the project lands — the project
+    /// wrote down where the folder was, and that is what brings it back.
+    #[test]
+    fn a_reopened_project_finds_its_sample_folder_again() {
+        let _g = ui_guard();
+        sandbox_state_dir();
+        let dir = std::env::temp_dir().join(format!("choz-ui-reopen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Named notes, so nothing is decoded.
+        for name in ["harp_C4", "harp_C5"] {
+            std::fs::write(dir.join(format!("{name}.wav")), []).unwrap();
+        }
+
+        // The session that loaded it: the folder is in the catalogue and a tab
+        // is playing it, which is what gets written to the file.
+        let mut had = App::new();
+        let found = choz_engine::paths::scan_path(&dir, choz_engine::PluginFormat::Samples);
+        assert!(!found.is_empty(), "the folder holds no instrument");
+        had.register_samples(&found);
+        let source = AudioSource::Plugin {
+            id: found[0].id.clone(),
+            format: choz_engine::PluginFormat::Samples.label().to_string(),
+            name: found[0].name.clone(),
+        };
+        had.slots.push(RackSlot::new(source.clone()));
+        had.active_slot = 0;
+        // The working copy is what the snapshot writes back into the active
+        // tab — see `persist_active`.
+        had.source = source;
+        let project = had.project_snapshot();
+
+        // The session that opens it: nothing has ever been loaded here.
+        let mut fresh = App::new();
+        assert!(
+            fresh.synths.iter().all(|s| s.path != dir),
+            "the catalogue was not empty to start with"
+        );
+        fresh.adopt_project_samples(&project);
+        assert!(
+            fresh.synths.iter().any(|s| s.path == dir),
+            "the folder did not come back"
+        );
+        // …and the tab resolves to the sampler rather than falling back to MIDI.
+        let source = fresh.project_source(&project.rack[0].instrument, 0);
+        assert!(
+            matches!(&source, AudioSource::Plugin { format, .. }
+                if *format == choz_engine::PluginFormat::Samples.label()),
+            "{source:?}"
+        );
+
+        // A folder that moved says so and does not stop the load.
+        let mut moved = project.clone();
+        let gone = dir.join("nowhere");
+        moved.rack[0].instrument.path = Some(gone.clone());
+        moved.rack[0].instrument.id = Some(choz_engine::paths::path_id(&gone));
+        let mut fresh = App::new();
+        fresh.adopt_project_samples(&moved);
+        assert!(fresh.synths.iter().all(|s| s.path != gone));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The sampler's setup is **on the rack panel**, not buried behind a key.
     /// It has no plugin parameters, so the INSTRUMENT box never draws for it —
     /// which left its folder and its layout with nowhere to be reached from.
@@ -31179,7 +33274,7 @@ mod tests {
         }));
         app.active_slot = 0;
         app.slots[0].instr_params = choz_engine::instruments::sampler::params();
-        app.slots[0].instr_values = vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        app.slots[0].instr_values = vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0];
 
         let (_, rack) = render_rack(&mut app, 120, 24);
         let rect = |want: views::fx_chain_panel::RackButton| {
@@ -31197,16 +33292,27 @@ mod tests {
         click(&mut app, play.x + 1, play.y);
         assert_eq!(app.sampler_note, None, "the audition note was left held");
 
-        // LOOP is the sampler's second knob.
-        let looping = rect(views::fx_chain_panel::RackButton::SampleLoop);
-        click(&mut app, looping.x + 1, looping.y);
-        assert_eq!(app.slots[0].instr_values[SAMPLER_LOOP], 1.0);
-        click(&mut app, looping.x + 1, looping.y);
-        assert_eq!(app.slots[0].instr_values[SAMPLER_LOOP], 0.0);
+        // LOOP is **not** on this row: it is the sampler's second knob, and it
+        // is in the INSTRUMENT box with the rest of its parameters. The same
+        // value drawn twice in two places is what made this row unreadable.
+        // LOOP is **not** on this row any more: it is a knob in the INSTRUMENT
+        // box with the rest of the sampler's parameters, and the same value
+        // drawn twice in two places is what made this row unreadable. Clicking
+        // its cell twice — select, then press — flips it, the same gesture
+        // every other switch-shaped knob answers to.
+        let loop_cell = rack
+            .instr_knobs
+            .iter()
+            .find(|(pi, _)| *pi == 1)
+            .map(|(_, r)| *r)
+            .expect("LOOP is not in the instrument box");
+        click(&mut app, loop_cell.x + 1, loop_cell.y);
+        click(&mut app, loop_cell.x + 1, loop_cell.y);
+        assert_eq!(app.slots[0].instr_values[1], 1.0, "LOOP did not flip");
 
-        // SLICE is a layout, so pressing it is a reload of the same folder —
-        // which needs an engine. What is checked here is that the button is
-        // wired to it; `the_layout_steps_through_every_mode` covers the rest.
+        // SLICE has more than one answer — off, and four counts — so a click
+        // opens its list rather than guessing which press lands on the one
+        // wanted. The wheel over it still steps it in place.
         let slice = rect(views::fx_chain_panel::RackButton::SampleSlice);
         assert!(matches!(
             mouse_action(
@@ -31214,6 +33320,15 @@ mod tests {
                 slice.y,
                 &app.layout.borrow(),
                 MouseEventKind::Down(MouseButton::Left)
+            ),
+            MouseAction::SamplerPick(SamplerPick::Slices)
+        ));
+        assert!(matches!(
+            mouse_action(
+                slice.x + 1,
+                slice.y,
+                &app.layout.borrow(),
+                MouseEventKind::ScrollDown
             ),
             MouseAction::ToggleSampleSlice
         ));

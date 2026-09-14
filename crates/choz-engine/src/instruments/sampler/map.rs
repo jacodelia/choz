@@ -41,8 +41,14 @@ pub fn regions(samples: &[Sample]) -> Vec<SfzRegion> {
 /// pitch still comes out a kit: there is no root note to transpose away from,
 /// and stretching silence across the keyboard is not a thing that can be done.
 pub fn regions_with(samples: &[Sample], mode: Mode) -> Vec<SfzRegion> {
+    regions_with_slices(samples, mode, super::SLICES)
+}
+
+/// The same, told how many pieces `SLICE` cuts into — see
+/// [`super::slices_of_id`]. Every other layout ignores it.
+pub fn regions_with_slices(samples: &[Sample], mode: Mode, slices: usize) -> Vec<SfzRegion> {
     if mode == Mode::Slice {
-        return slice_map(samples);
+        return slice_map(samples, slices.max(1));
     }
     let pitched = match mode {
         Mode::Auto => looks_pitched(samples),
@@ -54,12 +60,73 @@ pub fn regions_with(samples: &[Sample], mode: Mode) -> Vec<SfzRegion> {
         // between, only different sounds, and every one of them wants a key.
         return drum_map(&samples.iter().collect::<Vec<_>>());
     }
-    let group = primary_group(samples);
-    let chosen: Vec<&Sample> = samples
+    // Every way of playing the note, not just the most recorded one: the
+    // primary group opens the instrument and the others sit behind keyswitches
+    // — see [`articulation_groups`]. A pack with sustain and staccato in it was
+    // half a pack while only one of them was in the map.
+    let groups = articulation_groups(samples);
+    let mut out = Vec::new();
+    for (index, group) in groups.iter().enumerate() {
+        let chosen: Vec<&Sample> = samples
+            .iter()
+            .filter(|s| s.group == *group && s.root.is_some())
+            .collect();
+        for mut region in pitched_map(&chosen) {
+            region.articulation = index;
+            out.push(region);
+        }
+    }
+    out
+}
+
+/// The groups an instrument can be played with, the primary one first.
+///
+/// Only groups that cover enough of the keyboard to be an articulation of the
+/// same instrument rather than an odd file or two: a third of what the primary
+/// group reaches. A pack with one way of playing a note gives one group, which
+/// is what every kit and nearly every free library is.
+pub fn articulation_groups(samples: &[Sample]) -> Vec<String> {
+    let primary = primary_group(samples);
+    let notes = |group: &str| -> usize {
+        let mut roots: Vec<u8> = samples
+            .iter()
+            .filter(|s| s.group == group && s.root.is_some())
+            .filter_map(|s| s.root)
+            .collect();
+        roots.sort_unstable();
+        roots.dedup();
+        roots.len()
+    };
+    let widest = notes(&primary);
+    let mut rest: Vec<String> = samples
         .iter()
-        .filter(|s| s.group == group && s.root.is_some())
+        .map(|s| s.group.clone())
+        .filter(|g| *g != primary && notes(g) * 3 >= widest)
         .collect();
-    pitched_map(&chosen)
+    rest.sort();
+    rest.dedup();
+    let mut out = vec![primary];
+    out.extend(rest);
+    out
+}
+
+/// Where the keyswitches go: the octave under the lowest key anything is
+/// mapped to, and `None` when there is no room or nothing to switch.
+///
+/// Under the map rather than over it, because a library's top octave is where
+/// its highest notes are and its bottom one is usually empty — and because
+/// under is where every sample library in the world puts them.
+pub fn switch_base(regions: &[SfzRegion], count: usize) -> Option<u8> {
+    if count < 2 {
+        return None;
+    }
+    let lowest = regions.iter().map(|r| r.lo_key).min()?;
+    // The map is usually stretched to the bottom of the keyboard, so there is
+    // no gap to put them in: then they take the bottom keys and shadow them.
+    // Nothing was recorded down there — what is on those keys is the lowest
+    // sample transposed into a growl — and a switch you cannot reach is worse
+    // than three keys you would not play.
+    Some(lowest.saturating_sub(count as u8))
 }
 
 /// Whether this folder is an instrument to be played across a keyboard, or a
@@ -151,30 +218,130 @@ pub fn primary_group(samples: &[Sample]) -> String {
     best.map(|b| b.0.to_string()).unwrap_or_default()
 }
 
-/// One file per key, from C2 up, played at the pitch it was recorded at.
+/// What a drum is called, and which General MIDI key that is.
 ///
-/// ponytail: alphabetical, so `kick` `snare` `hat` land in that order rather
-/// than the drummer's. Naming the parts (kick → 36, snare → 38, the GM map) is
-/// worth doing when someone asks for it; until then the order is at least the
-/// one the folder listing shows.
+/// Longest match wins, so `open hat` is not read as `hat` and `ride bell` is
+/// not read as `ride`; the table is walked in order and the first hit stops
+/// it. Written the way sample packs name files — `BD`, `SD`, `CHH`, `OHH` are
+/// as common as the words.
+///
+/// ponytail: `contains` on the stem, not a tokeniser. `kick_01.wav`,
+/// `01-Kick.wav` and `Kick Drum Hard.wav` all say kick, and none of them needs
+/// a grammar to say it.
+const GM_NAMES: &[(&[&str], u8)] = &[
+    (&["pedal hat", "pedalhat", "foot hat", "phh"], 44),
+    (&["open hat", "openhat", "hat open", "ohh"], 46),
+    (&["closed hat", "closedhat", "hat closed", "chh"], 42),
+    (&["hihat", "hi-hat", "hi hat", "hat", "hh"], 42),
+    (&["side stick", "sidestick", "rimshot", "rim"], 37),
+    (&["bass drum", "bassdrum", "kick", "bd"], 36),
+    (&["clap"], 39),
+    (&["snare", "sd"], 38),
+    (&["ride bell", "ridebell"], 53),
+    (&["ride"], 51),
+    (&["crash"], 49),
+    (&["china"], 52),
+    (&["splash"], 55),
+    (&["floor tom", "floortom"], 43),
+    (&["tom"], 45),
+    (&["cowbell"], 56),
+    (&["tambourine", "tamb"], 54),
+    (&["shaker", "cabasa"], 69),
+    (&["maraca"], 70),
+    (&["conga"], 63),
+    (&["bongo"], 60),
+    (&["timbale"], 65),
+    (&["agogo"], 67),
+    (&["clave"], 75),
+    (&["woodblock", "wood block"], 76),
+    (&["guiro"], 73),
+    (&["triangle"], 81),
+    (&["whistle"], 71),
+    (&["vibraslap"], 58),
+    (&["cuica"], 78),
+];
+
+/// The GM key a file's name asks for, if it asks for one.
+fn gm_key(sample: &Sample) -> Option<u8> {
+    let stem = sample
+        .path
+        .file_stem()?
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        // `kick-01`, `kick_01` and `kick 01` are the same name; so is
+        // `01.kick`.
+        .replace(['_', '-', '.'], " ");
+    GM_NAMES
+        .iter()
+        .find(|(names, _)| names.iter().any(|n| stem.contains(n)))
+        .map(|(_, key)| *key)
+}
+
+/// One file per key, played at the pitch it was recorded at: **the General MIDI
+/// key its name asks for**, and the first free key for whatever the table does
+/// not recognise.
+///
+/// A kit whose kick is not on 36 is a kit that plays wrong under every drum
+/// pattern written for one — choz's own arranger included, which speaks GM and
+/// nothing else. Alphabetical order put `hat` `kick` `snare` on 36, 37, 38,
+/// which is three wrong sounds rather than none.
+///
+/// Two files asking for the same key —`kick_hard`, `kick_soft`— is a velocity
+/// layer the name did not spell out, and this is not the place to guess: the
+/// first one alphabetically keeps the GM key and the rest take free keys, so
+/// both are playable and neither is lost.
 fn drum_map(samples: &[&Sample]) -> Vec<SfzRegion> {
     let mut sorted: Vec<&&Sample> = samples.iter().collect();
     sorted.sort_by(|a, b| a.path.cmp(&b.path));
-    // From C2, where every hardware kit puts its kick — unless there are more
-    // sounds than there are keys above it, and then from the bottom of the
-    // keyboard, because a sound with no key is a sound that cannot be played
-    // at all. Philharmonia's whole `percussion.zip` read as one kit is 148 of
-    // them; this is what keeps 128 rather than 92.
-    let base = match sorted.len() > (128 - DRUM_BASE as usize) {
+    // From C2, where every hardware sampler and every GM kit puts its kick —
+    // unless there are more sounds than there are keys above it, and then from
+    // the bottom of the keyboard, because a sound with no key is a sound that
+    // cannot be played at all. Philharmonia's whole `percussion.zip` read as
+    // one kit is 148 of them; this is what keeps 128 rather than 92.
+    let crowded = sorted.len() > (128 - DRUM_BASE as usize);
+    let base = match crowded {
         true => 0,
         false => DRUM_BASE,
     };
+    let mut taken = [false; 128];
+    // The named ones first, so an unnamed file cannot sit on the key a kick
+    // was going to ask for.
+    let mut keys: Vec<Option<u8>> = sorted
+        .iter()
+        .map(|s| match crowded {
+            // No room to be picky: a hundred and fifty sounds do not fit on a
+            // GM kit, and every one of them still wants a key.
+            true => None,
+            false => match gm_key(s) {
+                // First come keeps the GM key; the second `kick` takes a free
+                // one below.
+                Some(k) if !taken[k as usize] => {
+                    taken[k as usize] = true;
+                    Some(k)
+                }
+                _ => None,
+            },
+        })
+        .collect();
+    let mut free = base as usize;
+    for key in keys.iter_mut().filter(|k| k.is_none()) {
+        while taken.get(free) == Some(&true) {
+            free += 1;
+        }
+        // Past the top of the keyboard: what is left has nowhere to go, and a
+        // region on no key is worse than no region.
+        if free > 127 {
+            break;
+        }
+        taken[free] = true;
+        *key = Some(free as u8);
+    }
     sorted
         .iter()
-        .enumerate()
-        .filter_map(|(i, s)| {
-            let key = base.checked_add(u8::try_from(i).ok()?)?;
-            (key <= 127).then(|| SfzRegion {
+        .zip(keys)
+        .filter_map(|(s, key)| {
+            let key = key?;
+            Some(SfzRegion {
                 sample: s.path.clone(),
                 lo_key: key,
                 hi_key: key,
@@ -187,28 +354,49 @@ fn drum_map(samples: &[&Sample]) -> Vec<SfzRegion> {
                 tune_cents: 0.0,
                 start: 0.0,
                 end: 1.0,
+                articulation: 0,
             })
         })
         .collect()
 }
 
-/// One sample cut into [`super::SLICES`] equal pieces, one per key from
-/// [`DRUM_BASE`] up.
+/// One sample cut **where it is hit**, one piece per key from [`DRUM_BASE`] up.
 ///
 /// The longest file in the folder, because that is the break: a folder that
 /// also holds one-shots would otherwise get sliced on whichever came first.
 /// Each piece plays at the speed it was recorded — a slice transposed is a
 /// different drum, same as a kit.
-fn slice_map(samples: &[Sample]) -> Vec<SfzRegion> {
+///
+/// The cuts come from [`super::slice_points`], which listens for the onsets;
+/// As many equal pieces as were asked for are what is left when it hears nothing it
+/// can call a hit, and they are what a break played to a grid wants anyway.
+fn slice_map(samples: &[Sample], slices: usize) -> Vec<SfzRegion> {
     let Some(sample) = samples.iter().max_by_key(|s| s.bytes) else {
         return Vec::new();
     };
-    let n = super::SLICES;
-    (0..n)
-        .filter_map(|i| {
+    let cuts = super::slice_points(&sample.path, slices);
+    slice_regions(&sample.path, &cuts, slices)
+}
+
+/// The regions for one sliced file, given the cuts. Split out from
+/// [`slice_map`] so a test can hand it the cuts rather than a file to decode.
+fn slice_regions(path: &std::path::Path, cuts: &[f32], slices: usize) -> Vec<SfzRegion> {
+    let n = slices.max(1);
+    let equal: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
+    let cuts = match cuts.len() >= 2 {
+        true => cuts,
+        false => &equal,
+    };
+    cuts.iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(i, start)| {
             let key = DRUM_BASE.checked_add(u8::try_from(i).ok()?)?;
-            (key <= 127).then(|| SfzRegion {
-                sample: sample.path.clone(),
+            // The last piece runs to the end of the file: whatever is after
+            // the final hit is its tail.
+            let end = cuts.get(i + 1).copied().unwrap_or(1.0);
+            (key <= 127 && end > start).then(|| SfzRegion {
+                sample: path.to_path_buf(),
                 lo_key: key,
                 hi_key: key,
                 pitch_key_center: key,
@@ -216,8 +404,9 @@ fn slice_map(samples: &[Sample]) -> Vec<SfzRegion> {
                 hi_vel: 127,
                 gain: 1.0,
                 tune_cents: 0.0,
-                start: i as f32 / n as f32,
-                end: (i + 1) as f32 / n as f32,
+                start,
+                end,
+                articulation: 0,
             })
         })
         .collect()
@@ -250,6 +439,7 @@ fn pitched_map(samples: &[&Sample]) -> Vec<SfzRegion> {
                 tune_cents: -sample.cents,
                 start: 0.0,
                 end: 1.0,
+                articulation: 0,
             });
         }
     }
@@ -414,10 +604,19 @@ mod tests {
             grouped("v_C5_sustain.wav", 72, "v_sustain"),
             grouped("v_C4_staccato.wav", 60, "v_staccato"),
         ]);
-        assert_eq!(regions.len(), 2);
-        assert!(regions
+        // The sustain opens the instrument — articulation 0 — and the staccato
+        // is in the map behind a keyswitch rather than dropped.
+        let opening: Vec<&SfzRegion> = regions.iter().filter(|r| r.articulation == 0).collect();
+        assert_eq!(opening.len(), 2);
+        assert!(opening
             .iter()
             .all(|r| r.sample.to_string_lossy().contains("sustain")));
+        assert!(
+            regions
+                .iter()
+                .any(|r| r.articulation == 1 && r.sample.to_string_lossy().contains("staccato")),
+            "the staccato was dropped instead of switched to"
+        );
     }
 
     /// Philharmonia's saxophone, in miniature: the short set reaches one more
@@ -454,6 +653,7 @@ mod tests {
         assert!(
             regions
                 .iter()
+                .filter(|r| r.articulation == 0)
                 .all(|r| r.sample.to_string_lossy().contains("_15")),
             "the short set won on one note"
         );
@@ -490,8 +690,10 @@ mod tests {
             of("m_C4.wav", 60, "m_normal", Articulation::Sustain, 38_000),
             of("m_C5.wav", 72, "m_normal", Articulation::Sustain, 38_000),
         ]);
+        // The normal set opens it; the tremolo is behind a keyswitch.
         assert!(regions
             .iter()
+            .filter(|r| r.articulation == 0)
             .all(|r| !r.sample.to_string_lossy().contains("_trem")));
     }
 
@@ -515,8 +717,9 @@ mod tests {
             samples.push(of(&format!("v_C5_025_{i}.wav"), 72, "v_025", 12_000));
         }
         let regions = regions(&samples);
-        assert_eq!(regions.len(), 2, "the short set was mapped");
-        assert!(regions
+        let opening: Vec<&SfzRegion> = regions.iter().filter(|r| r.articulation == 0).collect();
+        assert_eq!(opening.len(), 2, "the short set opens the instrument");
+        assert!(opening
             .iter()
             .all(|r| r.sample.to_string_lossy().contains("_15")));
     }
@@ -616,7 +819,8 @@ mod tests {
 
     /// Nothing in the folder has a pitch: it is a drum kit, and a drum kit is
     /// one hit per key at the speed it was recorded — not one hit stretched
-    /// across the keyboard.
+    /// across the keyboard. **And the keys are the General MIDI ones**: a kick
+    /// that is not on 36 plays wrong under every pattern written for a kit.
     #[test]
     fn a_folder_with_no_pitches_becomes_a_drum_map() {
         let regions = regions(&[
@@ -625,10 +829,71 @@ mod tests {
             sample("snare.wav", None, None),
         ]);
         assert_eq!(regions.len(), 3);
+        // Alphabetical in the list, GM on the keyboard.
         assert_eq!(regions[0].sample.to_string_lossy(), "hat.wav");
-        assert_eq!((regions[0].lo_key, regions[0].hi_key), (36, 36));
-        assert_eq!(regions[0].pitch_key_center, 36);
-        assert_eq!((regions[2].lo_key, regions[2].hi_key), (38, 38));
+        assert_eq!((regions[0].lo_key, regions[0].hi_key), (42, 42));
+        assert_eq!(regions[0].pitch_key_center, 42);
+        assert_eq!(regions[1].lo_key, 36);
+        assert_eq!(regions[2].lo_key, 38);
+    }
+
+    /// The names a pack actually uses, and the ones that would be read as the
+    /// wrong drum by a shorter match.
+    #[test]
+    fn the_names_a_pack_uses_land_on_their_gm_keys() {
+        for (file, key) in [
+            ("01-Kick.wav", 36),
+            ("BD_hard.wav", 36),
+            ("Snare Drum.wav", 38),
+            ("CHH.wav", 42),
+            ("hihat_closed_02.wav", 42),
+            // The longer name wins: `open hat` is not a hat, and `ride bell`
+            // is not a ride.
+            ("OHH.wav", 46),
+            ("hat-open.wav", 46),
+            ("ride_bell.wav", 53),
+            ("Ride.wav", 51),
+            ("Floor Tom.wav", 43),
+            ("tom3.wav", 45),
+            ("crash_cymbal.wav", 49),
+            ("rimshot.wav", 37),
+            ("clap 01.wav", 39),
+            ("cowbell.wav", 56),
+        ] {
+            let regions = regions(&[sample(file, None, None)]);
+            assert_eq!(regions[0].lo_key, key, "{file}");
+        }
+        // Nothing the table knows: the first free key from the drum base up.
+        let regions = regions(&[sample("blorp.wav", None, None)]);
+        assert_eq!(regions[0].lo_key, DRUM_BASE);
+    }
+
+    /// Two kicks are a velocity layer nobody spelled out. The first keeps 36
+    /// and the second gets a key of its own — both playable, neither lost.
+    #[test]
+    fn two_files_asking_for_one_key_both_get_played() {
+        let regions = regions(&[
+            sample("kick_hard.wav", None, None),
+            sample("kick_soft.wav", None, None),
+        ]);
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].lo_key, 36);
+        assert_ne!(regions[1].lo_key, 36);
+        assert_eq!(regions[1].sample.to_string_lossy(), "kick_soft.wav");
+    }
+
+    /// More sounds than there are keys: GM goes out of the window, because a
+    /// hundred and fifty of them do not fit on a kit and a sound with no key
+    /// cannot be played at all.
+    #[test]
+    fn a_crowded_folder_falls_back_to_the_whole_keyboard() {
+        let many: Vec<Sample> = (0..140)
+            .map(|i| sample(&format!("hit{i:03}.wav"), None, None))
+            .collect();
+        let regions = regions(&many);
+        assert_eq!(regions.len(), 128);
+        assert_eq!(regions[0].lo_key, 0);
+        assert_eq!(regions[127].lo_key, 127);
     }
 
     /// SLICE cuts the longest file into a piece per key, and the pieces cover
@@ -653,5 +918,33 @@ mod tests {
             assert!((r.end - r.start - 1.0 / super::super::SLICES as f32).abs() < 1e-6);
         }
         assert_eq!(regions.last().map(|r| r.end), Some(1.0));
+    }
+
+    /// And when the detector *did* hear the hits, the pieces are where they
+    /// are: a slice per onset, joined end to end, the last one running out to
+    /// the end of the file.
+    #[test]
+    fn slice_cuts_on_the_onsets_when_there_are_any() {
+        let cuts = [0.0, 0.17, 0.41, 0.66, 0.83];
+        let regions = slice_regions(Path::new("break.wav"), &cuts, super::super::SLICES);
+        assert_eq!(regions.len(), cuts.len());
+        for (i, r) in regions.iter().enumerate() {
+            assert_eq!(r.lo_key, DRUM_BASE + i as u8);
+            assert!((r.start - cuts[i]).abs() < 1e-6);
+            let end = cuts.get(i + 1).copied().unwrap_or(1.0);
+            assert!((r.end - end).abs() < 1e-6);
+        }
+        // One cut is not a slicing: back to equal pieces, which is what a
+        // break played to a grid wanted anyway.
+        assert_eq!(
+            slice_regions(Path::new("break.wav"), &[0.0], super::super::SLICES).len(),
+            super::super::SLICES
+        );
+        // And how many equal pieces is whatever was asked for: the count is a
+        // number the id carries, not a constant any more.
+        assert_eq!(
+            slice_regions(Path::new("break.wav"), &[0.0], 24).len(),
+            24
+        );
     }
 }

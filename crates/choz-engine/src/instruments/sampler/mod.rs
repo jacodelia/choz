@@ -35,6 +35,7 @@ pub mod archive;
 pub mod cache;
 pub mod map;
 pub mod name;
+pub mod preset;
 
 use std::path::{Path, PathBuf};
 
@@ -112,7 +113,13 @@ impl Mode {
 
     /// Read one back off an instrument id. Anything else is `Auto`, including
     /// a path that happens to contain a `#`.
+    ///
+    /// `#slice` may carry how many pieces it was cut into — `#slice24` — which
+    /// is still the slice mode. See [`slices_of_id`].
     pub fn of_id(id: &str) -> Mode {
+        if slice_tail(id).is_some() {
+            return Mode::Slice;
+        }
         Mode::ALL
             .iter()
             .copied()
@@ -122,6 +129,9 @@ impl Mode {
 
     /// The id with the mode taken off: the path it names.
     pub fn strip(id: &str) -> &str {
+        if let Some((path, _)) = slice_tail(id) {
+            return path;
+        }
         let mode = Mode::of_id(id);
         id.strip_suffix(mode.suffix()).unwrap_or(id)
     }
@@ -391,9 +401,50 @@ pub fn describe_one(root_dir: &Path, path: &Path, bytes: u64) -> Sample {
     }
 }
 
-/// How many pieces [`Mode::Slice`] cuts a sample into: two octaves of keys,
-/// which is what a break wants and what fits under two hands.
+/// How many pieces [`Mode::Slice`] cuts a sample into unless told otherwise:
+/// two octaves of keys, which is what a break wants and what fits under two
+/// hands.
 pub const SLICES: usize = 16;
+
+/// The counts the button steps through. A break with twenty hits in it has
+/// nowhere to put four of them at sixteen, and past thirty-two the keys run
+/// out of the part of the keyboard a kit lives on.
+pub const SLICE_CHOICES: &[usize] = &[8, 16, 24, 32];
+
+/// `("path", pieces)` when an id ends in a slice suffix, `None` otherwise. The
+/// count is optional: plain `#slice` is [`SLICES`], which is what every project
+/// written before the count existed says.
+fn slice_tail(id: &str) -> Option<(&str, usize)> {
+    let (path, tail) = id.rsplit_once("#slice")?;
+    match tail.is_empty() {
+        true => Some((path, SLICES)),
+        false => tail.parse::<usize>().ok().map(|n| (path, n.max(1))),
+    }
+}
+
+/// The suffix that says an id names a saved map rather than a folder — see
+/// [`preset`]. The path beside it is the `.smpreset` file itself.
+pub const PRESET_SUFFIX: &str = "#preset";
+
+/// Whether this id names a saved map.
+pub fn is_preset_id(id: &str) -> bool {
+    id.ends_with(PRESET_SUFFIX)
+}
+
+/// How many pieces the id asks for, whatever it is: a non-slice id is the
+/// default, because nothing is going to ask it.
+pub fn slices_of_id(id: &str) -> usize {
+    slice_tail(id).map(|(_, n)| n).unwrap_or(SLICES)
+}
+
+/// The suffix for a slice layout of `n` pieces. The default count writes the
+/// plain `#slice` an older choz already reads.
+pub fn slice_suffix(n: usize) -> String {
+    match n == SLICES {
+        true => Mode::Slice.suffix().to_string(),
+        false => format!("#slice{n}"),
+    }
+}
 
 /// The sampler's own knobs, in the order the rack draws and addresses them.
 ///
@@ -425,6 +476,26 @@ pub fn params() -> Vec<choz_ports::PluginParam> {
         p("DECAY", 0.0, Knobs::MAX_DECAY, 0.0, "s", "ENV"),
         p("SUSTAIN", 0.0, 100.0, 100.0, "%", "ENV"),
         p("RELEASE", 0.0, Knobs::MAX_RELEASE, 0.0, "s", "ENV"),
+        // Appended, and appended on purpose: a project saved before these
+        // existed reads its six values into the six that were here first.
+        p("LOOP ST", 0.0, 100.0, 0.0, "%", "SAMPLE"),
+        p("LOOP END", 0.0, 100.0, 100.0, "%", "SAMPLE"),
+        // Ten milliseconds by default rather than nothing: a held note over a
+        // loop that was cut where the waveform is not at zero clicks once a
+        // cycle, and a click is a spike in a chord that is already summing.
+        // Somebody who wants the butt join turns it down.
+        p(
+            "XFADE",
+            0.0,
+            Knobs::MAX_CROSSFADE * 1000.0,
+            10.0,
+            "ms",
+            "SAMPLE",
+        ),
+        // Where the key stops playing, against the same span START measures.
+        // Last in the list for the same reason the three above it are: a
+        // project written before it reads its own knobs where it left them.
+        p("END", 0.0, 100.0, 100.0, "%", "SAMPLE"),
     ];
     for (i, param) in out.iter_mut().enumerate() {
         param.id = i as u32;
@@ -432,15 +503,45 @@ pub fn params() -> Vec<choz_ports::PluginParam> {
     out
 }
 
+/// What the panel needs to draw one sample: its shape and where `SLICE` would
+/// cut it.
+///
+/// Both come out of the same decode, because they were two of them and a
+/// folder is adopted often enough to feel it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Shape {
+    /// `buckets` peak levels, 0..1 — the waveform.
+    pub peaks: Vec<f32>,
+    /// Where the cuts fall, as fractions of the file. Empty when nothing in it
+    /// sounded like a hit, which is when the map falls back to equal pieces.
+    pub cuts: Vec<f32>,
+}
+
+/// The shape of one sample and its cuts, from one decode.
+///
+/// Called once when a folder is adopted and never while anything is drawing:
+/// it reads the file.
+pub fn shape(path: &Path, buckets: usize, slices: usize) -> Shape {
+    let Ok(pcm) = crate::instruments::sfz::decode(path, 44_100) else {
+        return Shape::default();
+    };
+    Shape {
+        peaks: peaks_of(&pcm, buckets),
+        cuts: analyze::onsets(&pcm, 44_100, slices),
+    }
+}
+
 /// The shape of one sample, as `buckets` peak levels 0..1 — what the panel
 /// draws as a waveform.
-///
-/// The file is decoded to do it, which is why this is called once when a
-/// folder is adopted and not while anything is drawing.
 pub fn peaks(path: &Path, buckets: usize) -> Vec<f32> {
     let Ok(pcm) = crate::instruments::sfz::decode(path, 44_100) else {
         return Vec::new();
     };
+    peaks_of(&pcm, buckets)
+}
+
+/// The peaks of already-decoded interleaved stereo.
+fn peaks_of(pcm: &[f32], buckets: usize) -> Vec<f32> {
     let frames = pcm.len() / 2;
     if frames == 0 || buckets == 0 {
         return Vec::new();
@@ -455,6 +556,62 @@ pub fn peaks(path: &Path, buckets: usize) -> Vec<f32> {
                 .fold(0.0f32, |m, s| m.max(s.abs()))
         })
         .collect()
+}
+
+/// Where `SLICE` cuts a break: the onsets of the file, as fractions, or an
+/// empty list when nothing in it sounded like a hit.
+pub fn slice_points(path: &Path, max: usize) -> Vec<f32> {
+    let Ok(pcm) = crate::instruments::sfz::decode(path, 44_100) else {
+        return Vec::new();
+    };
+    analyze::onsets(&pcm, 44_100, max)
+}
+
+/// What a folder can be played with, and the lowest key that selects one:
+/// `(names, switch base)`.
+///
+/// The same answer [`build_with`] gives the instrument, for an interface that
+/// wants to draw the list without asking the audio thread. Backed by the same
+/// cache the scan is, so this is a read of what is already known.
+pub fn articulations(dir: &Path) -> (Vec<String>, Option<u8>) {
+    let samples = describe(dir);
+    if samples.is_empty() {
+        return (Vec::new(), None);
+    }
+    let names = map::articulation_groups(&samples);
+    let regions = map::regions(&samples);
+    let base = map::switch_base(&regions, names.len());
+    match names.len() > 1 {
+        true => (names, base),
+        false => (Vec::new(), None),
+    }
+}
+
+/// Which sample a key plays, and the part of it that key gets.
+///
+/// `(file, start, end)` — the fractions are `0.0..1.0` for anything but a
+/// slice. What the panel draws when the shape it shows is meant to be the shape
+/// of what is sounding rather than of whichever file the map happened to put
+/// first.
+pub fn sample_for(
+    dir: &Path,
+    mode: Mode,
+    slices: usize,
+    articulation: usize,
+    note: u8,
+    velocity: u8,
+) -> Option<(PathBuf, f32, f32)> {
+    let samples = describe(dir);
+    let regions = map::regions_with_slices(&samples, mode, slices);
+    let hit = regions
+        .iter()
+        .find(|r| {
+            r.articulation == articulation
+                && (r.lo_key..=r.hi_key).contains(&note)
+                && (r.lo_vel..=r.hi_vel).contains(&velocity)
+        })
+        .or_else(|| regions.first())?;
+    Some((hit.sample.clone(), hit.start, hit.end))
 }
 
 /// The file a folder's waveform is drawn from: the one the map would reach
@@ -476,17 +633,74 @@ pub fn empty() -> crate::instruments::sfz::SfzSampler {
     crate::instruments::sfz::SfzSampler::empty(NAME.to_string())
 }
 
+/// Build from a saved map rather than from a scan — see [`preset`].
+///
+/// This is the load that does not read a hundred and ten file names and does
+/// not analyse anything: the answer was worked out once and written down.
+pub fn build_preset(
+    preset: &preset::Preset,
+    sample_rate: u32,
+) -> Result<crate::instruments::sfz::SfzSampler> {
+    let regions = preset.regions();
+    if regions.is_empty() {
+        bail!("{}: a preset with no regions in it", preset.name);
+    }
+    let mut instrument = crate::instruments::sfz::SfzSampler::from_regions(
+        regions,
+        sample_rate,
+        preset.name.clone(),
+    )?;
+    instrument.set_articulations(preset.articulations.clone(), preset.switch_base);
+    Ok(instrument)
+}
+
+/// Everything a folder builds, as a preset ready to write.
+pub fn preset_of(dir: &Path, mode: Mode, slices: usize) -> Result<preset::Preset> {
+    let samples = describe(dir);
+    if samples.is_empty() {
+        bail!("{}: no samples in it", dir.display());
+    }
+    let regions = map::regions_with_slices(&samples, mode, slices);
+    if regions.is_empty() {
+        bail!("{}: nothing in it could be mapped to a key", dir.display());
+    }
+    let names = map::articulation_groups(&samples);
+    let base = map::switch_base(&regions, names.len());
+    let name = match archive::is_archive(dir) {
+        true => dir.file_stem(),
+        false => dir.file_name(),
+    }
+    .map(|s| s.to_string_lossy().into_owned())
+    .unwrap_or_else(|| "samples".into());
+    let names = match names.len() > 1 {
+        true => names,
+        false => Vec::new(),
+    };
+    Ok(preset::Preset::of(dir, &name, &regions, &names, base))
+}
+
 /// The same, with the user overruling the layout — see [`Mode`].
 pub fn build_with(
     dir: &Path,
     sample_rate: u32,
     mode: Mode,
 ) -> Result<crate::instruments::sfz::SfzSampler> {
+    build_id(dir, sample_rate, mode, SLICES)
+}
+
+/// The same, told how many pieces `SLICE` is cutting into — which is what the
+/// instrument id carries, so that a project comes back cut the way it was left.
+pub fn build_id(
+    dir: &Path,
+    sample_rate: u32,
+    mode: Mode,
+    slices: usize,
+) -> Result<crate::instruments::sfz::SfzSampler> {
     let samples = describe(dir);
     if samples.is_empty() {
         bail!("{}: no samples in it", dir.display());
     }
-    let regions = map::regions_with(&samples, mode);
+    let regions = map::regions_with_slices(&samples, mode, slices);
     if regions.is_empty() {
         bail!("{}: nothing in it could be mapped to a key", dir.display());
     }
@@ -498,7 +712,13 @@ pub fn build_with(
     }
     .map(|s| s.to_string_lossy().into_owned())
     .unwrap_or_else(|| "samples".into());
-    crate::instruments::sfz::SfzSampler::from_regions(regions, sample_rate, name)
+    // What it can be played with, and the keys that select them. A pack with
+    // one articulation says nothing and behaves exactly as it did.
+    let names = map::articulation_groups(&samples);
+    let base = map::switch_base(&regions, names.len());
+    let mut instrument = crate::instruments::sfz::SfzSampler::from_regions(regions, sample_rate, name)?;
+    instrument.set_articulations(names, base);
+    Ok(instrument)
 }
 
 #[cfg(test)]
@@ -550,6 +770,24 @@ mod tests {
         // A path with a `#` in it is a path, not a mode.
         assert_eq!(Mode::of_id("/Samples/drum#2"), Mode::Auto);
         assert_eq!(Mode::strip("/Samples/drum#2"), "/Samples/drum#2");
+    }
+
+    /// How many pieces SLICE cut into rides on the id beside the layout, so a
+    /// project comes back cut the way it was left — and a project written
+    /// before the count existed says the default.
+    #[test]
+    fn the_id_carries_how_many_pieces() {
+        for n in SLICE_CHOICES.iter().copied() {
+            let id = format!("/Samples/break{}", slice_suffix(n));
+            assert_eq!(Mode::of_id(&id), Mode::Slice, "{id}");
+            assert_eq!(Mode::strip(&id), "/Samples/break", "{id}");
+            assert_eq!(slices_of_id(&id), n, "{id}");
+        }
+        // The old spelling, and the ids that are not slicing at all.
+        assert_eq!(slices_of_id("/Samples/break#slice"), SLICES);
+        assert_eq!(Mode::of_id("/Samples/break#slice"), Mode::Slice);
+        assert_eq!(slices_of_id("/Samples/break#kit"), SLICES);
+        assert_eq!(Mode::of_id("/Samples/break#slicex"), Mode::Auto);
     }
 
     /// The whole trip, on files: three notes in a folder become an instrument
@@ -744,5 +982,321 @@ mod tests {
         assert_eq!(s.confidence, 1.0);
         assert!(s.from_name);
         assert_eq!(s.velocity, Some(76));
+    }
+
+    /// A held note loops **between the points it was given**, and the join is
+    /// faded rather than butted together — which is what stops a sustain that
+    /// does not close at zero from clicking once a second.
+    #[test]
+    fn a_loop_has_its_own_points_and_a_fade_across_the_join() {
+        use crate::instruments::sfz::Knobs;
+        use crate::sources::AudioSource;
+
+        let dir = std::env::temp_dir().join(format!("choz-sampler-loop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        // A second of tone that ends on a step: the first half is loud and the
+        // second half is silent, so a loop that ran past its end is audible as
+        // silence and a join with no fade is audible as a click.
+        let mut w = hound::WavWriter::create(dir.join("pad_C4.wav"), spec).unwrap();
+        for i in 0..48_000 {
+            let t = i as f32 / 48_000.0;
+            let s = match i < 24_000 {
+                true => (std::f32::consts::TAU * 220.0 * t).sin() * 0.5,
+                false => 0.0,
+            };
+            w.write_sample((s * i16::MAX as f32) as i16).unwrap();
+        }
+        w.finalize().unwrap();
+
+        let mut instrument = build(&dir, 48_000).expect("the folder would not build");
+        // LOOP on, and the loop is the first quarter of the file: a note held
+        // for a second must never reach the silent half.
+        instrument.set_param(1, 1.0);
+        instrument.set_param(6, 0.0);
+        instrument.set_param(7, 0.25);
+        // …and the release long enough that the envelope is not what is being
+        // measured.
+        instrument.set_param(5, 1.0);
+        instrument.note_on(60, 100);
+        let mut buf = vec![0.0f32; 2 * 48_000];
+        instrument.render(&mut buf, 48_000);
+        // The last tenth of the second still sounds: without loop points it
+        // would be in the silent half of the file.
+        let tail = &buf[buf.len() - 9_600..];
+        assert!(
+            tail.iter().any(|s| s.abs() > 0.05),
+            "the note ran past its loop"
+        );
+
+        // The crossfade is a knob, and it is the last one.
+        let mut k = Knobs::default();
+        k.set(8, 1.0);
+        assert!((k.crossfade - Knobs::MAX_CROSSFADE).abs() < 1e-6);
+        k.set(6, 0.5);
+        k.set(7, 0.75);
+        assert!((k.loop_start - 0.5).abs() < 1e-6 && (k.loop_end - 0.75).abs() < 1e-6);
+        // The six that were here first did not move: a project saved before
+        // these existed reads its values into the same knobs.
+        assert_eq!(params()[0].name, "START");
+        assert_eq!(params()[5].name, "RELEASE");
+        assert_eq!(params().len(), 10);
+        assert_eq!(params()[9].name, "END");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pack with two ways of playing the note gets both, and the keys under
+    /// the map choose between them: the keyswitch, which is what made a pack
+    /// with sustain and staccato in it half a pack.
+    #[test]
+    fn two_articulations_are_both_in_the_map_and_a_key_chooses() {
+        use crate::sources::AudioSource;
+
+        let dir = std::env::temp_dir().join(format!("choz-sampler-ks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        // The sustain rings for half a second; the staccato is a tenth of it.
+        // Both cover the same three notes, which is what makes them two
+        // articulations of one instrument rather than an odd file.
+        for (art, frames) in [("sustain", 24_000usize), ("staccato", 2_400)] {
+            for (name, freq) in [("C3", 130.81), ("C4", 261.63), ("C5", 523.25)] {
+                let file = dir.join(format!("viola_{name}_{art}.wav"));
+                let mut w = hound::WavWriter::create(file, spec).unwrap();
+                for i in 0..frames {
+                    let t = i as f32 / 48_000.0;
+                    let s = (std::f32::consts::TAU * freq * t).sin() * 0.5;
+                    w.write_sample((s * i16::MAX as f32) as i16).unwrap();
+                }
+                w.finalize().unwrap();
+            }
+        }
+
+        let samples = describe(&dir);
+        let groups = map::articulation_groups(&samples);
+        assert_eq!(groups.len(), 2, "{groups:?}");
+        let regions = map::regions(&samples);
+        assert!(
+            regions.iter().any(|r| r.articulation == 1),
+            "the second articulation is not in the map"
+        );
+
+        let mut instrument = build(&dir, 48_000).expect("the folder would not build");
+        assert_eq!(instrument.articulations().len(), 2);
+        let base = instrument.switch_base().expect("no keyswitches");
+        // Under everything that was recorded. A map stretched to the bottom of
+        // the keyboard leaves no gap, and then they take the bottom keys —
+        // which is what `map::switch_base` says and why this is `<=`.
+        let lowest_root = samples.iter().filter_map(|s| s.root).min().unwrap();
+        assert!(base < lowest_root, "{base} is not under the instrument");
+
+        // The switch selects and does not sound.
+        let mut buf = vec![0.0f32; 512];
+        instrument.note_on(base + 1, 100);
+        instrument.render(&mut buf, 48_000);
+        assert!(buf.iter().all(|s| *s == 0.0), "a keyswitch made a sound");
+        assert_eq!(instrument.articulation(), 1);
+
+        // …and what plays now is the short one: half a second in, the staccato
+        // has been over for a long time.
+        let mut long = vec![0.0f32; 2 * 24_000];
+        instrument.note_on(60, 100);
+        instrument.render(&mut long, 48_000);
+        let tail = &long[long.len() - 4_800..];
+        assert!(
+            tail.iter().all(|s| s.abs() < 0.01),
+            "the sustain played under a staccato keyswitch"
+        );
+
+        // Back to the first, and the same note rings.
+        instrument.note_off(60);
+        instrument.note_on(base, 100);
+        assert_eq!(instrument.articulation(), 0);
+        instrument.note_on(60, 100);
+        let mut long = vec![0.0f32; 2 * 24_000];
+        instrument.render(&mut long, 48_000);
+        let tail = &long[long.len() - 4_800..];
+        assert!(
+            tail.iter().any(|s| s.abs() > 0.01),
+            "the sustain did not come back"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A long sample is **not** held in memory: the first load decodes it once
+    /// into the raw cache and maps it, and every load after that is a map and no
+    /// decode at all. A short one is held exactly as it was — nothing about a
+    /// drum kit was slow.
+    #[test]
+    fn a_long_sample_goes_out_to_disk_and_plays_from_there() {
+        use crate::instruments::stream;
+        use crate::sources::AudioSource;
+
+        let dir = std::env::temp_dir().join(format!("choz-sampler-stream-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        // Three seconds — past `stream::THRESHOLD_FRAMES` — and a second file
+        // short enough to stay in memory.
+        for (name, frames) in [
+            ("cello_C3", stream::THRESHOLD_FRAMES + 48_000),
+            ("cello_C5", 4_800),
+        ] {
+            let mut w = hound::WavWriter::create(dir.join(format!("{name}.wav")), spec).unwrap();
+            for i in 0..frames {
+                let t = i as f32 / 48_000.0;
+                let s = (std::f32::consts::TAU * 220.0 * t).sin() * 0.5;
+                w.write_sample((s * i16::MAX as f32) as i16).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let long = dir.join("cello_C3.wav");
+        let short = dir.join("cello_C5.wav");
+        // Nothing cached before the first load.
+        let _ = std::fs::remove_file(stream::cache_path(&long, 48_000));
+        assert!(stream::mapped(&long, 48_000).is_none());
+
+        let mut instrument = build(&dir, 48_000).expect("the folder would not build");
+        // The long one is out on disk now; the short one was never written.
+        assert!(
+            stream::mapped(&long, 48_000).is_some(),
+            "the long sample was not cached"
+        );
+        assert!(
+            stream::mapped(&short, 48_000).is_none(),
+            "a short sample does not need a cache"
+        );
+
+        // …and it plays from there, past the head that is kept in memory.
+        instrument.note_on(48, 100);
+        let mut buf = vec![0.0f32; 2 * (stream::HEAD_FRAMES + 24_000)];
+        instrument.render(&mut buf, 48_000);
+        let tail = &buf[2 * stream::HEAD_FRAMES..];
+        assert!(
+            tail.iter().any(|s| s.abs() > 0.05),
+            "silent past the head — the mapping is not being read"
+        );
+
+        // The second load reads the cache and does not decode: the proof is a
+        // file whose audio has been made unreadable — the same name, the same
+        // length and the same mtime, so the cache still answers to it, but
+        // nothing in it can be decoded any more.
+        let bytes = std::fs::metadata(&long).unwrap().len() as usize;
+        let meta = std::fs::File::open(&long).unwrap().metadata().unwrap();
+        std::fs::write(&long, vec![0u8; bytes]).unwrap();
+        let file = std::fs::File::options().write(true).open(&long).unwrap();
+        file.set_modified(meta.modified().unwrap()).unwrap();
+        drop(file);
+        let mut again = build(&dir, 48_000).expect("the second load failed");
+        again.note_on(48, 100);
+        // Two seconds. Only the long sample can still be sounding a second in:
+        // the short one is a tenth of a second even transposed down two
+        // octaves.
+        let mut buf = vec![0.0f32; 2 * 96_000];
+        again.render(&mut buf, 48_000);
+        assert!(
+            buf[2 * 48_000..].iter().any(|s| s.abs() > 0.05),
+            "a second in there is nothing: the cache was not used"
+        );
+
+        let _ = std::fs::remove_file(stream::cache_path(&long, 48_000));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// START and END are a window on the sample: what is outside them is not
+    /// played, which is what the two marks on the panel mean.
+    #[test]
+    fn start_and_end_are_the_window_a_key_plays() {
+        use crate::sources::AudioSource;
+
+        let dir = std::env::temp_dir().join(format!("choz-sampler-window-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        // A second: loud for the first half, silent for the second.
+        let mut w = hound::WavWriter::create(dir.join("pad_C4.wav"), spec).unwrap();
+        for i in 0..48_000 {
+            let t = i as f32 / 48_000.0;
+            let s = match i < 24_000 {
+                true => (std::f32::consts::TAU * 220.0 * t).sin() * 0.5,
+                false => 0.0,
+            };
+            w.write_sample((s * i16::MAX as f32) as i16).unwrap();
+        }
+        w.finalize().unwrap();
+
+        let played = |start: f32, end: f32| -> usize {
+            let mut instrument = build(&dir, 48_000).expect("the folder would not build");
+            instrument.set_param(0, start);
+            instrument.set_param(9, end);
+            // No release tail in the way of counting frames.
+            instrument.set_param(5, 0.0);
+            instrument.note_on(60, 100);
+            let mut buf = vec![0.0f32; 2 * 48_000];
+            instrument.render(&mut buf, 48_000);
+            buf.chunks(2).filter(|f| f[0].abs() > 0.01).count()
+        };
+
+        // The whole loud half.
+        let all = played(0.0, 1.0);
+        assert!(all > 20_000, "{all} frames of a half-second tone");
+        // Stopped a quarter in: a quarter of the file, not half.
+        let quarter = played(0.0, 0.25);
+        assert!(
+            (10_000..14_000).contains(&quarter),
+            "END at 25% played {quarter} frames"
+        );
+        // …and started halfway, where the file goes quiet: nothing.
+        assert_eq!(played(0.5, 1.0), 0, "the silent half sounded");
+        // END under START is nothing said, not silence.
+        assert_eq!(played(0.0, 0.0), all, "END at zero silenced the note");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The library on this machine, when it is here: twenty `.zip`s in one
+    /// folder, which is the shape a sample library actually arrives in. Skipped
+    /// where it is not — a test that needs somebody's disk is a test that says
+    /// so and gets out of the way.
+    #[test]
+    #[ignore]
+    fn the_real_library_reads_as_one_instrument_per_archive() {
+        let dir = std::path::Path::new("/home/jorge/repo/philharmonia/all-samples");
+        if !dir.is_dir() {
+            return;
+        }
+        let packs: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| archive::is_archive(p))
+            .collect();
+        assert!(!packs.is_empty(), "no archives in {}", dir.display());
+        for pack in packs.iter().take(3) {
+            let found = instruments(pack);
+            assert!(!found.is_empty(), "{} holds no instrument", pack.display());
+            println!("{} -> {} instrument(s)", pack.display(), found.len());
+        }
     }
 }

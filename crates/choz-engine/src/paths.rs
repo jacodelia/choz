@@ -44,6 +44,31 @@ impl PluginFormat {
         PluginFormat::Pd,
     ];
 
+    /// The formats choz goes looking for on disk.
+    ///
+    /// **Everything but `Samples`.** A folder of samples is not installed
+    /// anywhere a convention would point at: it is a library somebody
+    /// downloaded, and a scan of it means decoding and analysing hundreds of
+    /// files to find out what is in it. It gets into choz the one way that is
+    /// honest about that cost — the `LOAD` button, on the folder or the archive
+    /// the person actually means.
+    pub const SCANNED: &'static [PluginFormat] = &[
+        PluginFormat::Ladspa,
+        PluginFormat::Dssi,
+        PluginFormat::Lv2,
+        PluginFormat::Vst2,
+        PluginFormat::Vst3,
+        PluginFormat::Clap,
+        PluginFormat::Sf2,
+        PluginFormat::Sfz,
+        PluginFormat::Pd,
+    ];
+
+    /// Whether the scan walks directories of this format at all.
+    pub fn is_scanned(self) -> bool {
+        Self::SCANNED.contains(&self)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             PluginFormat::Ladspa => "LADSPA",
@@ -164,7 +189,8 @@ impl PluginFormat {
             PluginFormat::Clap => vec![user(".clap")],
             PluginFormat::Sf2 => vec![user(".local/share/sounds/sf2"), user(".sounds")],
             PluginFormat::Sfz => vec![user(".sfz")],
-            PluginFormat::Samples => vec![user("Samples"), user("samples")],
+            // Not scanned — see `SCANNED`. A folder gets in by `LOAD`.
+            PluginFormat::Samples => vec![],
             PluginFormat::Pd => vec![user("pd"), user(".local/share/pd"), user("Documents/Pd")],
         };
         dirs.extend(user_dirs.into_iter().flatten());
@@ -236,6 +262,11 @@ impl<'de> Deserialize<'de> for PluginPaths {
             .entries
             .into_iter()
             .filter_map(|(label, dirs)| Some((PluginFormat::from_label(&label)?, dirs)))
+            // A format that is no longer scanned is dropped rather than kept:
+            // a config written when `SAMPLES` was a scanned format would
+            // otherwise keep walking somebody's library at every rescan, and
+            // there is nothing in the interface left to edit it with.
+            .filter(|(format, _)| format.is_scanned())
             .collect();
         // **A format the file has never heard of gets its defaults**, not an
         // empty list.
@@ -263,7 +294,9 @@ impl<'de> Deserialize<'de> for PluginPaths {
 impl Default for PluginPaths {
     fn default() -> Self {
         Self {
-            entries: PluginFormat::ALL
+            // Only what is scanned: a samples directory in this list would be a
+            // library walked at every rescan, and samples come in by `LOAD`.
+            entries: PluginFormat::SCANNED
                 .iter()
                 .map(|&f| {
                     let dirs = f
@@ -594,8 +627,9 @@ mod tests {
         assert_eq!(lv2.len(), 1);
         assert_eq!(lv2[0].path, Path::new("/opt/my-lv2"));
 
-        // And everything the file never mentioned has somewhere to look.
-        for &format in PluginFormat::ALL {
+        // And every **scanned** format the file never mentioned has somewhere
+        // to look. Samples are not scanned at all — they come in by `LOAD`.
+        for &format in PluginFormat::SCANNED {
             assert!(
                 !paths.dirs(format).is_empty(),
                 "{} would search nowhere",
@@ -637,7 +671,7 @@ mod tests {
         let cfg: PluginPaths = serde_json::from_str(json).expect("unknown format must not fail");
         assert_eq!(
             cfg.entries.len(),
-            PluginFormat::ALL.len(),
+            PluginFormat::SCANNED.len(),
             "the unknown one is dropped and the known ones are all there"
         );
         assert_eq!(
@@ -710,5 +744,36 @@ mod tests {
         assert!(lv2[0].path.is_dir());
 
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// Samples are not a scanned format: they arrive by `LOAD`, on the folder
+    /// or the archive somebody actually meant. A config written when they were
+    /// one does not get to keep walking that library at every rescan.
+    #[test]
+    fn samples_are_not_scanned_and_an_old_config_stops_scanning_them() {
+        assert!(!PluginFormat::Samples.is_scanned());
+        assert!(PluginPaths::default().dirs(PluginFormat::Samples).is_empty());
+        assert!(PluginFormat::Samples.default_dirs().is_empty());
+
+        let json = r#"{"entries":[
+            ["SAMPLES",[{"path":"/home/me/philharmonia","enabled":true}]],
+            ["Lv2",[{"path":"/home/me/.lv2","enabled":true}]]
+        ]}"#;
+        let cfg: PluginPaths = serde_json::from_str(json).unwrap();
+        assert!(
+            cfg.dirs(PluginFormat::Samples).is_empty(),
+            "an old config still walks the library"
+        );
+        assert!(
+            !cfg.all_enabled()
+                .iter()
+                .any(|p| p == Path::new("/home/me/philharmonia")),
+            "the scan would still go there"
+        );
+        // …and what the file said about a scanned format is untouched.
+        assert_eq!(
+            cfg.dirs(PluginFormat::Lv2)[0].path,
+            Path::new("/home/me/.lv2")
+        );
     }
 }

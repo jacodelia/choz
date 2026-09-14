@@ -459,6 +459,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "x11rb",
+ "zip",
 ]
 
 [[package]]

@@ -1049,6 +1049,56 @@ mod tests {
         BUILT_IN_KINDS.iter().map(|(id, _)| *id).collect()
     }
 
+    /// **No built-in allocates in `process_block`.** The rule is in
+    /// `docs/fx-audit.md`, it broke once without the suite noticing —three
+    /// effects copying the block with `buf.to_vec()`— and reading the diff is
+    /// not a mechanism that scales.
+    ///
+    /// An allocation on the audio thread is a lock on the audio thread: the
+    /// allocator's, held by whatever other thread happened to be in it, and
+    /// the block is late through no fault of the DSP.
+    #[test]
+    fn no_built_in_allocates_in_process_block() {
+        // The counter, checked against itself first: an allocator that counts
+        // nothing would pass this test however the effects behaved, and that
+        // is a green light nobody should trust.
+        let (_, seen) = crate::alloc_count::counted(|| vec![0u8; 64]);
+        assert!(seen > 0, "the counting allocator is not counting");
+
+        let defaults = [0.5f32; 16];
+        let mut guilty: Vec<String> = Vec::new();
+        for (kind, name) in BUILT_IN_KINDS {
+            let Some(mut proc) = build_processor(kind, &defaults, 48_000) else {
+                continue;
+            };
+            // Everything allocated up front and outside the count: the buffer,
+            // and whatever the effect sizes when it first sees one. An effect
+            // that grows a delay line on its first block is doing it at
+            // `activate` time in a host, not in the middle of a stream.
+            let mut buf = vec![0.0f32; 512];
+            proc.process_block(&mut buf, 48_000);
+            let (_, allocs) = crate::alloc_count::counted(|| {
+                for block in 0..8 {
+                    // Signal rather than silence: an effect that takes a
+                    // shortcut on a silent block would never reach the code
+                    // this is here to watch.
+                    for (i, s) in buf.iter_mut().enumerate() {
+                        *s = (((block * 512 + i) as f32) * 0.01).sin() * 0.5;
+                    }
+                    proc.process_block(&mut buf, 48_000);
+                }
+            });
+            if allocs > 0 {
+                guilty.push(format!("{name} ({kind}): {allocs}"));
+            }
+        }
+        assert!(
+            guilty.is_empty(),
+            "these allocate on the audio thread:\n  {}",
+            guilty.join("\n  ")
+        );
+    }
+
     /// A gate driven by notes opens for a tab that makes no sound worth
     /// metering — which is the whole reason that source exists.
     ///

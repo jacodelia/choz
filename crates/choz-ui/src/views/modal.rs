@@ -703,6 +703,9 @@ mod tests {
 
     #[test]
     fn long_list_scrolls_with_the_cursor_and_shows_a_scrollbar() {
+        // The buttons it looks for are translated, and the language is a
+        // global: without the lock this reads whatever another test left set.
+        let _g = crate::views::theme::ui_guard();
         let items: Vec<String> = (0..50).map(|i| format!("item{i}")).collect();
         let mut m = ListModal::new("PICK", items);
         m.cursor = 49;

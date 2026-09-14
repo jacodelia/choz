@@ -66,6 +66,8 @@ use clap_sys::ext::note_ports::{
 use clap_sys::ext::params::{
     clap_param_info, clap_plugin_params, CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE,
 };
+use clap_sys::ext::state::{clap_plugin_state, CLAP_EXT_STATE};
+use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::factory::plugin_factory::{clap_plugin_factory, CLAP_PLUGIN_FACTORY_ID};
 use clap_sys::host::clap_host;
 use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
@@ -98,6 +100,9 @@ enum Sort {
     Arp,
     /// The step sequencer: nothing in, notes out.
     Seq,
+    /// The arranger: nothing in, a band's worth of notes out — one role at a
+    /// time, the way a tab in choz plays one.
+    Arr,
     /// The metronome: nothing in, a click out. Not a note generator — what it
     /// makes is audio — and not an effect either, since it processes nothing.
     Met,
@@ -106,7 +111,7 @@ enum Sort {
 impl Sort {
     /// Notes in and notes out, with no audio anywhere: the two artifacts.
     fn is_generator(self) -> bool {
-        matches!(self, Sort::Arp | Sort::Seq)
+        matches!(self, Sort::Arp | Sort::Seq | Sort::Arr)
     }
 
     /// The audio ports it publishes, as `(inputs, outputs)`. An effect takes a
@@ -116,7 +121,7 @@ impl Sort {
         match self {
             Sort::Fx(_) => (1, 1),
             Sort::Met => (0, 1),
-            Sort::Arp | Sort::Seq => (0, 0),
+            Sort::Arp | Sort::Seq | Sort::Arr => (0, 0),
         }
     }
 }
@@ -233,6 +238,21 @@ fn catalogue() -> &'static [Exported] {
                 "org.choz.gen.seq",
                 "choz Sequencer",
                 "choz's step sequencer, outside choz",
+                &["note-effect"],
+            ),
+        });
+        // The third artifact. Its progression is text, which does not fit in a
+        // `0..1` parameter — so the knobs are the three things that *are*
+        // numbers (which musician, which style, which interpretation) and the
+        // text rides in `clap.state`, which is what a host saves with the
+        // session anyway.
+        out.push(Exported {
+            sort: Sort::Arr,
+            params: arr_params(),
+            descriptor: describe(
+                "org.choz.gen.arr",
+                "choz Arranger",
+                "choz's arranger, outside choz: a band from a chord chart",
                 &["note-effect"],
             ),
         });
@@ -389,11 +409,43 @@ fn seq_params() -> Vec<FxParam> {
     out
 }
 
+use choz_engine::artifacts::arranger::{generate::Role, Arranger, ArrangerSettings};
+
+/// The arranger's knobs: which musician this instance is, which style it plays
+/// and which interpretation of it.
+///
+/// The progression is not among them — see [`Sort::Arr`]. Three numbers is the
+/// whole of what a host can automate here, and that is the honest list.
+fn arr_params() -> Vec<FxParam> {
+    vec![
+        FxParam::new("Role", 0.0, 0.0, (Role::ALL.len() - 1) as f32, ""),
+        FxParam::new(
+            "Style",
+            0.0,
+            0.0,
+            (choz_engine::artifacts::arranger::style::ALL.len() - 1) as f32,
+            "",
+        ),
+        FxParam::new("Seed", 0.0, 1.0, 64.0, ""),
+    ]
+}
+
+/// The progression an exported arranger starts on: the same twelve bars the
+/// box in choz opens with, so a host that loads it and presses play hears a
+/// band rather than silence.
+fn arr_defaults() -> Arranger {
+    Arranger::new(ArrangerSettings {
+        on: true,
+        ..Default::default()
+    })
+}
+
 /// A running artifact. Built at `activate` beside the effects' processor, and
 /// for the same reason: the host says the sample rate then and not before.
 enum Generator {
     Arp(Box<Arp>),
     Seq(Box<Seq>),
+    Arr(Box<Arranger>),
 }
 
 impl Generator {
@@ -406,6 +458,7 @@ impl Generator {
                 seq.settings.on = true;
                 Generator::Seq(Box::new(seq))
             }
+            Sort::Arr => Generator::Arr(Box::new(arr_defaults())),
             Sort::Fx(_) | Sort::Met => return None,
         };
         for (i, v) in values.iter().copied().enumerate() {
@@ -416,6 +469,10 @@ impl Generator {
             // transport is what a host offers instead. `tick` still counts the
             // host's grid whenever it is moving.
             seq.play();
+        }
+        // …and the same for the band.
+        if let Generator::Arr(arr) = &mut gen {
+            arr.play();
         }
         Some(gen)
     }
@@ -429,6 +486,27 @@ impl Generator {
                     // the panel that has a chord to drop; out here nothing is
                     // held between blocks that a mode change invalidates.
                     let _ = arp.settings.set_norm(param, value);
+                }
+            }
+            Generator::Arr(arr) => {
+                let styles = choz_engine::artifacts::arranger::style::ALL;
+                match index {
+                    0 => {
+                        let n = Role::ALL.len();
+                        let k = ((value * (n - 1) as f32).round() as usize).min(n - 1);
+                        arr.set_role(Role::ALL[k]);
+                    }
+                    // The style is the text's to say, so setting it here means
+                    // rewriting the line that says it: one place decides, the
+                    // same as inside choz.
+                    1 => {
+                        let n = styles.len();
+                        let k = ((value * (n - 1) as f32).round() as usize).min(n - 1);
+                        let text = with_style(&arr.settings.text, styles[k].name);
+                        arr.set_text(text);
+                    }
+                    2 => arr.set_seed((value.clamp(0.0, 1.0) * 63.0).round() as u32 + 1),
+                    _ => {}
                 }
             }
             Generator::Seq(seq) => {
@@ -485,7 +563,51 @@ impl Generator {
         match self {
             Generator::Arp(arp) => arp.tick(now, out),
             Generator::Seq(seq) => seq.tick(now, out),
+            Generator::Arr(arr) => arr.tick(now, out),
         }
+    }
+
+    /// The progression, for the host to save — empty for the two artifacts
+    /// that keep everything in their knobs.
+    fn state(&self) -> String {
+        match self {
+            Generator::Arr(arr) => arr.settings.text.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// …and back in. A text that does not read leaves the last one playing,
+    /// which is what the box does too.
+    fn set_state(&mut self, text: &str) {
+        if let Generator::Arr(arr) = self {
+            arr.set_text(text);
+            arr.play();
+        }
+    }
+}
+
+/// The same text with its `style =` line saying `name` — added if it had none.
+///
+/// The style belongs to the progression, not beside it: two places to say it
+/// is two places to disagree.
+fn with_style(text: &str, name: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 32);
+    let mut written = false;
+    for line in text.lines() {
+        let head = line.split('#').next().unwrap_or("").trim().to_ascii_lowercase();
+        if head.starts_with("style") && head.contains('=') && !head.contains('|') {
+            if !written {
+                out.push_str(&format!("style = {name}\n"));
+                written = true;
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    match written {
+        true => out,
+        false => format!("style = {name}\n{out}"),
     }
 }
 
@@ -514,6 +636,10 @@ struct Instance {
     /// Interleaved scratch, sized at `activate`. The audio thread never
     /// allocates.
     scratch: Vec<f32>,
+    /// The arranger's progression, as text. Kept on the instance and not only
+    /// in the generator, because a host may save or load it while the plugin
+    /// is deactivated — the same reason `values` lives here.
+    state: String,
 }
 
 impl Instance {
@@ -909,10 +1035,87 @@ unsafe extern "C" fn plugin_get_extension(
     if id == CLAP_EXT_NOTE_PORTS && generator {
         return &NOTE_PORTS as *const _ as *const c_void;
     }
+    // Only the arranger has anything that is not a knob: its progression.
+    if id == CLAP_EXT_STATE && sort == Some(Sort::Arr) {
+        return &STATE as *const _ as *const c_void;
+    }
     std::ptr::null()
 }
 
 unsafe extern "C" fn plugin_on_main_thread(_plugin: *const clap_plugin) {}
+
+// ─── State ──────────────────────────────────────────────────────────────────
+
+/// The arranger's progression, saved with the host's session.
+///
+/// Plain UTF-8, exactly the text somebody wrote: a chord chart is the one thing
+/// here a person would want to read in a diff, and wrapping it in a format
+/// would buy nothing that a text file does not already have.
+static STATE: clap_plugin_state = clap_plugin_state {
+    save: Some(state_save),
+    load: Some(state_load),
+};
+
+unsafe extern "C" fn state_save(plugin: *const clap_plugin, stream: *const clap_ostream) -> bool {
+    let Some(inst) = (unsafe { instance(plugin) }) else {
+        return false;
+    };
+    let Some(write) = (unsafe { stream.as_ref() }).and_then(|s| s.write) else {
+        return false;
+    };
+    // Between `deactivate` and the next `activate` there is no generator to
+    // ask; what the host set is still in `values`, and the text it last loaded
+    // is kept beside them for exactly this.
+    let text = match inst.generator.as_ref() {
+        Some(gen) => gen.state(),
+        None => inst.state.clone(),
+    };
+    let bytes = text.as_bytes();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        let n = unsafe {
+            write(
+                stream,
+                bytes[at..].as_ptr() as *const c_void,
+                (bytes.len() - at) as u64,
+            )
+        };
+        if n <= 0 {
+            return false;
+        }
+        at += n as usize;
+    }
+    true
+}
+
+unsafe extern "C" fn state_load(plugin: *const clap_plugin, stream: *const clap_istream) -> bool {
+    let Some(inst) = (unsafe { instance(plugin) }) else {
+        return false;
+    };
+    let Some(read) = (unsafe { stream.as_ref() }).and_then(|s| s.read) else {
+        return false;
+    };
+    let mut text = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = unsafe { read(stream, buf.as_mut_ptr() as *mut c_void, buf.len() as u64) };
+        if n < 0 {
+            return false;
+        }
+        if n == 0 {
+            break;
+        }
+        text.extend_from_slice(&buf[..n as usize]);
+    }
+    let Ok(text) = String::from_utf8(text) else {
+        return false;
+    };
+    inst.state = text.clone();
+    if let Some(gen) = inst.generator.as_mut() {
+        gen.set_state(&text);
+    }
+    true
+}
 
 // ─── Audio ports ────────────────────────────────────────────────────────────
 
@@ -973,7 +1176,8 @@ unsafe extern "C" fn note_ports_count(plugin: *const clap_plugin, is_input: bool
     };
     match (inst.exported().sort, is_input) {
         (Sort::Arp, _) => 1,
-        (Sort::Seq, false) => 1,
+        // The two that play what is written on them take nothing in.
+        (Sort::Seq | Sort::Arr, false) => 1,
         _ => 0,
     }
 }
@@ -1226,6 +1430,7 @@ unsafe extern "C" fn factory_create(
         values,
         sample_rate: 48_000,
         scratch: Vec::new(),
+        state: String::new(),
     });
     let raw = Box::into_raw(instance);
     // The instance points at itself, which is how the C side finds it again.
@@ -1476,8 +1681,8 @@ mod tests {
             let count = ((*factory).get_plugin_count.unwrap())(factory) as usize;
             assert_eq!(
                 count,
-                choz_engine::fx_chain::BUILT_IN_KINDS.len() + 3,
-                "every built-in travels, and so do the arp, the seq and the click"
+                choz_engine::fx_chain::BUILT_IN_KINDS.len() + 4,
+                "every built-in travels, and so do the three artifacts and the click"
             );
 
             let mut artifacts = Vec::new();
@@ -1520,7 +1725,12 @@ mod tests {
             artifacts.sort();
             assert_eq!(
                 artifacts,
-                ["org.choz.gen.arp", "org.choz.gen.seq", "org.choz.met"]
+                [
+                    "org.choz.gen.arp",
+                    "org.choz.gen.arr",
+                    "org.choz.gen.seq",
+                    "org.choz.met"
+                ]
             );
         }
     }
@@ -1533,7 +1743,11 @@ mod tests {
         use clap_sys::ext::note_ports::{clap_plugin_note_ports, CLAP_EXT_NOTE_PORTS};
         let _guard = guard();
         unsafe {
-            for (id, ins) in [("org.choz.gen.arp", 1u32), ("org.choz.gen.seq", 0)] {
+            for (id, ins) in [
+                ("org.choz.gen.arp", 1u32),
+                ("org.choz.gen.seq", 0),
+                ("org.choz.gen.arr", 0),
+            ] {
                 let plugin = open(id);
                 let notes = ((*plugin).get_extension.unwrap())(plugin, CLAP_EXT_NOTE_PORTS.as_ptr())
                     as *const clap_plugin_note_ports;
@@ -1979,5 +2193,79 @@ mod tests {
         assert_eq!(off, 0.0, "switched off it still clicked: {off}");
         // Left as it was found: the click is a singleton of the process.
         choz_engine::artifacts::metronome::metronome().set_on(false);
+    }
+
+    /// The third artifact: a band out of a chord chart, in somebody else's
+    /// host. Its progression is text, so it rides in `clap.state` — the two
+    /// things worth checking are that it plays and that what a host saves comes
+    /// back.
+    #[test]
+    fn the_exported_arranger_plays_and_keeps_its_progression() {
+        let _guard = guard();
+        unsafe {
+            // The seed is knob 2; anything moves it off its default, which is
+            // all this needs — the point is that it plays at all.
+            let played = run_generator("org.choz.gen.arr", &[], &[], 400);
+            assert!(
+                played.iter().any(|e| e.header.type_ == CLAP_EVENT_NOTE_ON),
+                "the band played nothing"
+            );
+
+            // The state round-trip, through the two stream callbacks a host
+            // hands over.
+            let plugin = open("org.choz.gen.arr");
+            let state = ((*plugin).get_extension.unwrap())(plugin, CLAP_EXT_STATE.as_ptr())
+                as *const clap_plugin_state;
+            assert!(!state.is_null(), "no state extension on the arranger");
+
+            let written = "key = F\nstyle = bossa\n|| Imaj7 | IIm7 | V7 | Imaj7 ||";
+            let mut reader = Reader {
+                bytes: written.as_bytes().to_vec(),
+                at: 0,
+            };
+            let istream = clap_istream {
+                ctx: &mut reader as *mut Reader as *mut c_void,
+                read: Some(read_in),
+            };
+            assert!(((*state).load.unwrap())(plugin, &istream), "load failed");
+
+            let mut writer: Vec<u8> = Vec::new();
+            let ostream = clap_ostream {
+                ctx: &mut writer as *mut Vec<u8> as *mut c_void,
+                write: Some(write_out),
+            };
+            assert!(((*state).save.unwrap())(plugin, &ostream), "save failed");
+            assert_eq!(String::from_utf8_lossy(&writer), written);
+
+            ((*plugin).destroy.unwrap())(plugin);
+        }
+    }
+
+    /// A host's input stream, for the state test.
+    struct Reader {
+        bytes: Vec<u8>,
+        at: usize,
+    }
+
+    unsafe extern "C" fn read_in(
+        stream: *const clap_istream,
+        buffer: *mut c_void,
+        size: u64,
+    ) -> i64 {
+        let reader = &mut *((*stream).ctx as *mut Reader);
+        let n = (reader.bytes.len() - reader.at).min(size as usize);
+        std::ptr::copy_nonoverlapping(reader.bytes[reader.at..].as_ptr(), buffer as *mut u8, n);
+        reader.at += n;
+        n as i64
+    }
+
+    unsafe extern "C" fn write_out(
+        stream: *const clap_ostream,
+        buffer: *const c_void,
+        size: u64,
+    ) -> i64 {
+        let out = &mut *((*stream).ctx as *mut Vec<u8>);
+        out.extend_from_slice(std::slice::from_raw_parts(buffer as *const u8, size as usize));
+        size as i64
     }
 }

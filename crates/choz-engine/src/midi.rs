@@ -649,12 +649,31 @@ pub fn event_of(data: &[u8], source: InputSource, bank: &mut u8) -> Option<Input
     }
 }
 
+/// How hard a key is being leaned on, as the CC every instrument here already
+/// understands. Aftertouch is pressure and so is expression; a synth that does
+/// nothing with CC 11 would have done nothing with `0xD0` either.
+///
+/// ponytail: **channel** pressure and **poly** pressure both land here, so
+/// leaning on one key moves the whole tab rather than that note. Per-note
+/// pressure wants a per-voice gain the sources do not have; the upgrade is a
+/// `poly_aftertouch` on `AudioSource` and a voice that reads it, and nothing
+/// asked for it yet.
+const PRESSURE_CC: u8 = 11;
+
 /// Parse a raw MIDI message. Note-on with velocity 0 is the conventional
-/// note-off. Returns `None` for anything choz has no use for (clock, aftertouch,
-/// sysex).
+/// note-off. Returns `None` for anything choz has no use for (clock, sysex).
 fn parse(data: &[u8]) -> Option<Msg> {
     if data.len() < 2 {
         return None;
+    }
+    // Channel pressure is two bytes, like a program change: status and the
+    // pressure itself.
+    if data[0] & 0xF0 == 0xD0 {
+        return Some(Msg::Cc {
+            channel: data[0] & 0x0F,
+            cc: PRESSURE_CC,
+            value: data[1] & 0x7F,
+        });
     }
     // Program change is the one two-byte message choz uses; everything below
     // needs the second data byte.
@@ -684,6 +703,13 @@ fn parse(data: &[u8]) -> Option<Msg> {
             channel,
             cc: data[1],
             value: data[2],
+        }),
+        // Polyphonic pressure: which key it is arrives in `data[1]` and is
+        // thrown away — see [`PRESSURE_CC`].
+        0xA0 => Some(Msg::Cc {
+            channel,
+            cc: PRESSURE_CC,
+            value: data[2] & 0x7F,
         }),
         // LSB first, then MSB — both 7-bit.
         0xE0 => Some(Msg::Bend {
@@ -996,5 +1022,39 @@ mod tests {
             }
             other => panic!("the reader dropped the note: {other:?}"),
         }
+    }
+
+    /// Aftertouch is pressure, and pressure is expression: both the channel
+    /// message and the polyphonic one arrive as CC 11, which every instrument
+    /// in choz already understands. What is lost is *which* key was leaned on
+    /// — see `PRESSURE_CC`.
+    #[test]
+    fn aftertouch_arrives_as_expression() {
+        assert_eq!(
+            parse(&[0xD0, 90]),
+            Some(Msg::Cc {
+                channel: 0,
+                cc: 11,
+                value: 90
+            })
+        );
+        // Channel is kept, which is what a multi-timbral rack routes on.
+        assert_eq!(
+            parse(&[0xD3, 64]),
+            Some(Msg::Cc {
+                channel: 3,
+                cc: 11,
+                value: 64
+            })
+        );
+        // Polyphonic: the note byte is dropped, the pressure is not.
+        assert_eq!(
+            parse(&[0xA0, 60, 120]),
+            Some(Msg::Cc {
+                channel: 0,
+                cc: 11,
+                value: 120
+            })
+        );
     }
 }

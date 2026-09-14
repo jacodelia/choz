@@ -13,3 +13,4 @@
 pub mod sampler;
 pub mod sf2_patch;
 pub mod sfz;
+pub mod stream;

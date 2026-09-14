@@ -207,6 +207,11 @@ pub struct Slot {
     /// `default` (off, empty) keeps every project written before it loadable.
     #[serde(default)]
     pub seq: crate::seq::SeqSettings,
+    /// The tab's arranger — the progression, the role it plays of it and the
+    /// seed that decides how. Added later, so `default` (off, the twelve-bar
+    /// it opens with) keeps every project written before it loadable.
+    #[serde(default)]
+    pub arranger: crate::arranger::ArrangerSettings,
 }
 
 fn default_channel() -> u8 {
@@ -588,6 +593,12 @@ mod tests {
                     // has a pattern to lose.
                     seq.parts[1][0] = 0b0001_0001_0001_0001;
                     seq
+                },
+                arranger: crate::arranger::ArrangerSettings {
+                    on: true,
+                    text: "key = F\nstyle = minor_blues\n|| Im7 | IVm7 ||".into(),
+                    role: crate::arranger::generate::Role::Drums,
+                    seed: 7,
                 },
             }],
         }

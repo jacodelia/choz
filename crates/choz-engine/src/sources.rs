@@ -211,6 +211,10 @@ fn zone_channel(zone: u8) -> u8 {
     (zone as usize % ZONES) as u8 + 1
 }
 
+/// Channel volume, which this synth deliberately ignores — see
+/// [`Sf2Synth::control_change`].
+pub const CC_VOLUME: u8 = 7;
+
 impl Sf2Synth {
     /// The channel a note plays on: its octave's zone when that zone has been
     /// given a program, and the tab's own channel otherwise.
@@ -475,7 +479,19 @@ impl AudioSource for Sf2Synth {
 
     /// Pedals and wheels reach every zone: the sustain pedal holds the whole
     /// keyboard, not the half of it the last note happened to be in.
+    ///
+    /// **Channel volume does not reach it at all.** CC 7 is a second volume
+    /// control on top of the tab's own VOL fader, fighting it and doing so
+    /// invisibly: it is drawn nowhere and saved in no project. A controller's
+    /// volume slider is a knob like any other — bind it with MIDI learn to the
+    /// fader, or to whatever else it should move, and the binding is then a
+    /// thing you can see and the project keeps. Decided 2026-09-13, after the
+    /// 2026-08-31 fix that made the nine channels at least lose the fight
+    /// together.
     fn control_change(&mut self, cc: u8, value: u8) {
+        if cc == CC_VOLUME {
+            return;
+        }
         for channel in 1..=ZONES as u8 {
             let _ = self.synth.send_event(oxisynth::MidiEvent::ControlChange {
                 channel,
@@ -586,10 +602,14 @@ mod tests {
     /// The cause was a channel that nobody re-initialised. `set_zone_program`
     /// sends the GM channel volume every time `push_split` runs, which is on
     /// almost every interaction; channel 0 got it once, when the file loaded.
-    /// `control_change` forwards an incoming CC to *all* the channels, so the
+    /// `control_change` forwarded an incoming CC to *all* the channels, so the
     /// first CC 7 from a keyboard's volume slider stuck on channel 0 and was
     /// wiped from every zone at the next push — **15.2 dB** between the same
     /// note, on the same preset, at the same velocity.
+    ///
+    /// Since 2026-09-13 the CC 7 does not reach the synth at all (see
+    /// [`Sf2Synth::control_change`]), so this now checks both halves: the levels
+    /// match, **and** the slider changed nothing to match about.
     #[test]
     fn a_volume_cc_does_not_leave_the_tabs_own_sound_behind() {
         let path = std::path::Path::new("/usr/share/sounds/sf2/FluidR3_GM.sf2");
@@ -622,6 +642,7 @@ mod tests {
             (zone, own)
         };
 
+        let mut both = Vec::new();
         for after_cc in [false, true] {
             let (zone, own) = level(after_cc);
             assert!(zone > 1e-4 && own > 1e-4, "both have to sound");
@@ -630,7 +651,16 @@ mod tests {
                 db.abs() < 1.0,
                 "a zone and the tab's own sound differ by {db:+.1} dB (CC sent: {after_cc})"
             );
+            both.push(own);
         }
+        // …and the slider did not move the tab at all: the volume of a tab is
+        // its fader, and a controller's knob gets there through MIDI learn like
+        // any other.
+        let db = 20.0 * (both[1] / both[0]).log10();
+        assert!(
+            db.abs() < 0.5,
+            "the keyboard's volume slider moved the SoundFont by {db:+.1} dB"
+        );
     }
 
     /// **A SoundFont is in the same league as a hosted plugin.**

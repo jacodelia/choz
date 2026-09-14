@@ -499,6 +499,14 @@ pub struct UiSettings {
     /// so an old `ui.json` still looks the way it did.
     #[serde(default)]
     pub border_color: Option<(u8, u8, u8)>,
+    /// The last folder `LOAD` was pointed at, so the picker opens where the
+    /// library is rather than at `$HOME`.
+    ///
+    /// Here rather than in the plugin paths because samples are **not** a
+    /// scanned format — see `PluginFormat::SCANNED`. This is where the picker
+    /// was, not a directory anything walks.
+    #[serde(default)]
+    pub samples_dir: Option<std::path::PathBuf>,
     /// Name of the theme the colours came from, for the UI to show which row is
     /// active. Editing a colour afterwards just leaves it stale, which is why
     /// the drawing code never reads it.
@@ -557,6 +565,7 @@ impl Default for UiSettings {
             osc: OscSettings::default(),
             background: Background::default(),
             border_color: None,
+            samples_dir: None,
             theme_name: THEMES[0].name.to_string(),
             background_tint: default_tint(),
             panel_tint: None,
