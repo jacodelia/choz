@@ -5,16 +5,17 @@ día por día, con los porqués y lo último arriba; cómo encajan las piezas, e
 [architecture.md](architecture.md); las dos auditorías, en
 [fx-audit.md](fx-audit.md). Este documento se poda cada vez que un punto se
 cierra, para que lo que quede sea sólo lo que queda: se podó entero el
-2026-08-19, el 2026-08-29, el 2026-08-31, el 2026-09-01 y el 2026-09-13, y las
-cinco veces lo que decía "hecho" se fue al changelog.
+2026-08-19, el 2026-08-29, el 2026-08-31, el 2026-09-01, el 2026-09-13 y el
+2026-09-16, y las seis veces lo que decía "hecho" se fue al changelog.
 
 **Hoy no falta nada pedido y no queda ninguna decisión abierta.** Lo que queda
-son tres bordes —el sidechain, el sampler y el arreglador—, dos decisiones de no
-hacer, y las notas para el que retome.
+son cuatro bordes —MIDI, el sidechain, el sampler y el arreglador—, dos
+decisiones de no hacer, y las notas para el que retome.
 
-Última actualización: 2026-09-13 — se cerraron el punto del CC 7 y casi todo lo
-que el sampler y el arreglador tenían abierto; lo cerrado está en el
-[changelog](../CHANGELOG.md).
+Última actualización: 2026-09-16 — el sampler se niveló y se mapeó para
+cualquier pack, la expresión MIDI llega entera a todos los formatos (VST3
+incluido) y el lector MIDI dejó de poder morirse; lo cerrado está en el
+[changelog](../CHANGELOG.md). Lo que el sampler dejó abierto se anotó abajo.
 
 ## Estado en una línea
 
@@ -69,12 +70,16 @@ salidas estéreo, una por tab. Una tab puede **salir del master
 por un puerto propio**, uno por tab en un lugar fijo y del ancho que la tab
 tenga, que es lo que Ardour graba pista por pista. El sampler de carpetas
 **corta por transientes, guarda su mapa en un `.smpreset` que se edita y se
-relinkea, y cambia de articulación por keyswitch**; el arreglador **tiene forma
+relinkea, y cambia de articulación por keyswitch**, **se nivela solo —contra el
+rack y nota por nota dentro de cada capa— y toca una nota grabada en cada tecla
+que alguna capa grabó**, con cualquier pack: un archivo suelto, nombres con
+guiones, capas `v1…vN`, la nota del chunk `smpl` o la otra convención de
+octava; el arreglador **tiene forma
 —partes, intro y final—, veinticinco estilos (más los que se escriban en
 `~/.local/state/choz/styles`), su progresión se escribe dentro de la TUI y sale
 en el `.clap` como tercer artifact.** **La 1.0.0 está publicada y
 sus paquetes verificados; la 1.3.11 es este árbol.**
-983 tests (el workspace sin `choz-plugin-lv2`, que en esta máquina se cuelga),
+1006 tests (el workspace sin `choz-plugin-lv2`, que en esta máquina se cuelga),
 `clippy --workspace --all-targets -D warnings` limpio con `+beta`.
 
 Las comprobaciones con hardware delante quedaron dichas en los gotchas, que es
@@ -84,7 +89,7 @@ donde se van a leer.
 
 ## Pendiente
 
-Tres bordes y dos decisiones de no hacer. Lo entregado se cuenta día por día en
+Cuatro bordes y dos decisiones de no hacer. Lo entregado se cuenta día por día en
 el [changelog](../CHANGELOG.md); un punto que se cierra sale de aquí, porque
 este documento es lo que queda y no lo que hubo.
 
@@ -93,6 +98,14 @@ Las dos auditorías —la de DSP y la de guardado— viven enteras en
 sección 6 tiene lo único que se midió y se decidió **no** arreglar (el peine del
 shifter de voces), y la 7 lo que hay que saber antes de tocar el guardado de un
 efecto. No se repiten acá.
+
+### 0 · MIDI: los bordes que quedan (2026-09-16)
+
+- **VST3 sólo pide el mapa MIDI del bus 0, canal 0**, que es por donde choz
+  manda sus notas; un plugin que mapea distinto por canal no lo ve. Un CC que
+  llega por el mapa mueve el procesador, no la ventana del plugin.
+- **El orden de notas y controles de `drain_midi` no tiene test**: los tests de
+  la UI no levantan el motor, y verlo desde ahí pide un motor observable.
 
 ### 1 · Sidechain: lo que queda fuera del gate (2026-09-02)
 
@@ -121,13 +134,32 @@ Nota de nombres, que sigue en pie: `fx/sidechain.rs::SidechainDuck` se llama
 llama nadie** en todo el árbol—, mientras que lo que sí hace sidechain se llama
 GATE.
 
-### 2 · El sampler de carpetas (2026-09-13)
+### 2 · El sampler de carpetas (2026-09-16)
 
-- **El streaming no tiene anillo por voz.** Una página desalojada cuesta un
-  fault en el hilo de audio (`instruments/stream.rs` lo dice de sí mismo). Para
-  que sea imposible hace falta un hilo lector con un anillo por voz y robo de
-  voz cuando el disco no llega — **con una librería de verdad delante y
-  medido**, no a ciegas.
+- **El streaming no tiene anillo por voz — y ya está medido.** Una página
+  desalojada cuesta un fault en el hilo de audio (`instruments/stream.rs` lo
+  dice de sí mismo). El 2026-09-16 dejó de ser teoría: el log cuenta los fallos
+  de página mayores de los bloques tardíos, y la sesión con la flauta de
+  Philharmonia dio 21 avisos, todos esperando al disco. Lo que falta es un hilo
+  lector con un anillo por voz y robo de voz cuando el disco no llega.
+- **`choz-sampler` no es un plugin CLAP propio.** Dentro de un DAW sólo existe
+  dentro del rack entero (el instrumento CLAP "choz"), con las mismas reglas
+  porque viven en `choz-engine`; el `.clap` de efectos y artifacts no lo trae.
+  Para cargarlo solo en cualquier DAW falta un plugin con la carpeta en su
+  estado y sus knobs como parámetros.
+- **Una capa fina se descarta entera** (`map::dense_layers`). Lo fino sería
+  conservarla en las teclas cercanas a sus notas y caer a la vecina en el
+  resto; pide una zona por tecla por capa, no por raíz.
+- **Del chunk `smpl` sólo se lee la nota**, y sólo en archivos sueltos: sus
+  puntos de loop no se usan y un WAV dentro de un `.zip` va al detector.
+- **Los loops no se buscan solos**: LOOP ST y LOOP END empiezan en toda la
+  región, y un sonido con ataque largo necesita que alguien corra los puntos a
+  la parte sostenida.
+- **Notas escritas como número MIDI** (`piano_060.wav`) no se leen, a propósito:
+  en los nombres un número suele ser una duración o una toma. Los canales más
+  allá del estéreo se descartan.
+- **La rueda de modulación es un vibrato fijo** (5,5 Hz, ±50 cents), sin
+  perillas propias.
 - **Los knobs son globales al instrumento.** `START`, `END`, `LOOP`, `LOOP ST`,
   `LOOP END`, `XFADE` y la envolvente valen para todas las regiones a la vez. Falta
   que vivan por región y que el editor los muestre; el `.smpreset` ya guarda

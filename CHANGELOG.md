@@ -12,7 +12,7 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **983 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo), 532 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **1006 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo), 555 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio.
 - **56 efectos propios**, publicados también como un `.clap` con los dos artifacts.
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
@@ -33,6 +33,153 @@ lleva lo que falta —nada de lo ya hecho— y
   *su* objeto está mal escrito: pregúntele al objeto.
 
 ## Sin publicar
+
+### 2026-09-16 — el sampler para cualquier pack, la expresión MIDI entera y un lector MIDI que no se muere
+
+Una sesión que empezó auditando la flauta de Philharmonia y terminó con reglas
+que no saben nada de Philharmonia. Todo en `6593e8f`.
+
+#### Los samples vuelven al escaneo
+
+La decisión anterior (abajo, "Los samples salen del escaneo") se revirtió: una
+librería de samples es un instrumento más y se edita en Ajustes → Plugin paths.
+
+- **`PluginFormat::SCANNED` incluye `Samples`**, con `~/Samples` y `~/samples`
+  por defecto, y un `plugin-paths.json` que ya nombraba una librería la conserva.
+- **Chip `SAMPLE`** en el selector de fuentes para las librerías; **`choz-sampler`
+  queda siempre bajo `CLAP`**, porque es un instrumento propio de choz.
+- **Una ruta de búsqueda que es ella misma el instrumento** —un `.zip` o un
+  `.wav`, que es lo que `LOAD` agrega— **se encuentra al reescanear.** Antes
+  `scan_dir` sólo miraba *dentro* de cada ruta: el pack estaba hasta el próximo
+  reescaneo y después desaparecía.
+- **El modal de Plugin paths dice qué hace cada fila**: encabezados con su
+  cantidad de carpetas, botones y nota según la fila (un formato agrega, una
+  carpeta se edita o se quita), y **al cerrar reescanea detrás de la barra de
+  progreso** en vez de bloquear la interfaz.
+
+#### Nivel: medido sobre quince instrumentos, aplicado a cualquiera
+
+Medido con ffmpeg sobre ~12.000 archivos: el pico mediano de Philharmonia va de
+−9 dBFS (tuba) a −28 dBFS (flauta), y el ajuste automático, con tope en +6 dB,
+nunca podía cerrar esos 19 dB. En el log: `tab 1 trimmed to 2.00 — peaking 0.03`.
+
+- **Una ganancia por instrumento** (`SfzSampler::normalize`): el pico mediano de
+  sus notas a −12 dBFS, salvo que eso lleve el décimo más fuerte por encima de
+  0 dBFS; gana la menor, acotada a −12…+24 dB. Los quince quedan a la misma
+  altura; la flauta pasó de RMS 0.019 a 0.061 y el ajuste termina en 0.95.
+- **Cada nota contra su capa**: la flauta forte sube ~18 dB de C4 a A6 y la
+  escala cromática salía como un crescendo contra la rodilla. Cada nota de una
+  capa afinada va a la mediana de la capa, dentro de ±18 dB; **las capas entre
+  sí no se tocan** (el pianissimo sigue más suave que el fortissimo) y **un kit
+  no se iguala** (una capa es afinada si estira alguna muestra sobre varias
+  teclas). Resultado: picos idénticos en las 42 notas grabadas de cada capa.
+- **El pico de cada archivo se guarda** junto al caché PCM (`.peak`): se lee una
+  vez por archivo, y la primera lectura de un caché viejo, además, trae sus
+  páginas a memoria.
+
+#### Mapa: cada tecla toca una nota grabada
+
+- **Una capa de velocidad con pocas notas no es una capa**: la flauta tiene 42
+  forte y 2 fortissimo, y desde velocidad 105 esas dos muestras se estiraban
+  sobre las 88 teclas y saturaban. Una capa necesita un tercio de las notas de
+  la más completa —la misma regla que las articulaciones— o su rango pasa a las
+  vecinas.
+- **Tecla por tecla, la nota grabada gana**: el oboe fortissimo termina en E6 y
+  estiraba esa muestra sobre F6…G6, así que la E6 cambiaba de color según la
+  fuerza con que el barrido la golpeaba. Ahora cada capa usa su propia nota
+  dentro de su alcance (la mitad de la distancia entre sus notas grabadas) y,
+  si no, la de la capa de velocidad más cercana que la tenga. Auditoría de 19
+  instrumentos: de 14 con teclas transpuestas dentro de su rango (trombón hasta
+  6 semitonos) a 0, salvo la guitarra, que no tiene 81–82 en ninguna capa. Las
+  tomas (round robin) se conservan.
+
+#### Cualquier pack, no una librería
+
+- **Un archivo suelto es un instrumento**, y LOAD lo ofrece (`.wav`, `.flac`,
+  `.aiff`, `.mp3`, `.ogg`; un test impide que el selector y el sampler dejen de
+  coincidir). Una grabación sola con tono se estira sobre el teclado; antes iba a
+  una tecla como un tambor.
+- **Nombres sólo con guiones** (`Cello-C3-f-rr2`) se leen, sin romper
+  `mezzo-forte` ni `arco-normal`. **`soft`/`medium`/`hard`** son dinámicas.
+- **`v1…vN` son capas, no velocidades**: si todas las velocidades del pack son
+  ≤16, se reparten sobre 1–127.
+- **La nota del chunk `smpl` de un WAV** gana sobre el detector, pero cuenta
+  como detectada (muchos exportadores escriben 60 en todo, y un kit no debe
+  volverse afinado).
+- **Convención de octava**: un pack nombrado con C3 = do central suena una
+  octava corrido. Se escuchan tres notas repartidas; si **las tres** coinciden en
+  un número entero de octavas, se mueve el pack. Queda en el caché del pack; en
+  los 20 instrumentos de Philharmonia no movió ninguna nota.
+- **STRETCH sobre sonidos sin tono** (la cabasa) los reparte desde C4 sobre las
+  128 teclas. **Todos los layouts de una carpeta escaneada se cargan**: la tabla
+  sólo tenía el id AUTO, y elegir STRETCH no hacía nada y no lo decía.
+
+#### Envolvente y loop
+
+- **Rangos**: ATTACK 5 s, DECAY 10 s, RELEASE 10 s, XFADE 1 s. Las perillas
+  guardan su posición, así que un proyecto previo abre con tiempos más largos.
+- **LOOP REL** (parámetro 10): el loop sigue durante el release, y una muestra
+  de 1,5 s se sostiene y se apaga en 9 s con el nivel parejo.
+- **Empalme sin clic y sin golpe**: el crossfade pasó de potencia constante
+  (+3 dB en material correlacionado) a ganancia constante; un loop desde el
+  primer frame corre el punto de retorno lo que dura el fundido; una ventana
+  cortada con END se apaga en 15 ms.
+- **Vibrato con la rueda de modulación** (5,5 Hz, ±50 cents); **sustain,
+  expresión, pitch bend (±2) y los CC 120/121/123** llegan al sampler, y una
+  tecla repetida suelta la nota anterior en vez de apilar voces.
+- **RESET en el sampler**, que además restaura articulación, audición y layout.
+  RESET cargaba el valor por defecto sin normalizar: XFADE volvía al máximo, y
+  en los SoundFonts pasaba lo mismo con cualquier parámetro de rango distinto a
+  0…1.
+- **El play suena en A4**, o en la tecla más cercana que el mapa toca (antes C4,
+  y un kit sin nada ahí quedaba en silencio). **El selector NOTE es un piano**
+  con los colores de SPLIT, las teclas con sonido en celeste y la elegida en
+  amarillo.
+
+#### MIDI: la expresión entera, en el orden en que se toca
+
+- **El aftertouch dejó de ser CC 11.** Un SoundFont lee CC 11 como volumen: al
+  aflojar la presión llegaba 0 y todas las notas siguientes quedaban mudas (el
+  KeyStep 32 y el Keystation Pro 88 mandan aftertouch). Ahora es
+  `AudioSource::pressure`, de canal o polifónico, hasta CLAP, VST2, LV2, DSSI, el
+  sandbox y oxisynth, y se puede asignar por MIDI learn como `AFTERTOUCH`.
+- **VST3 recibe CC, pitch bend y aftertouch** por `IMidiMapping`: antes no
+  recibía ninguno. Con los plugins instalados, Surge XT, TyrellN6, TripleCheese
+  y Kars cambian con el bend.
+- **Notas y controles en el orden en que llegaron**: `drain_midi` aplicaba
+  primero las notas y después los CC, y "pedal abajo, tecla, soltar" perdía el
+  sustain. **El bend respeta su canal** (en MULTI iba al tab equivocado).
+- **Latencia de entrada**: el loop esperaba hasta 50 ms entre la tecla y el
+  sonido; ahora 5 ms, con el dibujo limitado aparte.
+- **LV2 recibe 2 bytes** para program change y channel pressure.
+
+#### El lector MIDI no se muere
+
+Tres tests de `midi` fallaban juntos alrededor de una vez cada 25 corridas con
+la máquina cargada. No era el test:
+
+- **El puerto `choz MIDI IN` se publicaba después de avisar "listo"**, así que
+  por unos milisegundos se nombraba un puerto que no existía.
+- **Un pánico con el candado de rutas tomado lo envenenaba** y, desde ahí,
+  `connect_inputs` devolvía cero puertos y el lector descartaba todo: **entrada
+  MIDI muerta hasta reiniciar, sin decirlo.** Ahora se toma tolerando el
+  envenenamiento (`midi::routes`), con un test que lo provoca.
+- **Una confirmación atrasada del lector respondía al pedido siguiente**; ahora
+  lleva el estado publicado. 40 de 40 corridas cargadas pasan.
+
+#### Diagnóstico y carga
+
+- **Los bloques tardíos cuentan los fallos de página mayores del hilo de audio**
+  (`meter::major_faults`) y el log dice cuándo esperó al disco en vez de culpar
+  a "un navegador". La sesión del 16 lo confirmó: los 21 avisos con
+  `SAMPLES:flute` fueron lecturas de disco del streaming.
+- **La carga pendiente dibuja su cartel antes de bloquear**: el frame se limitaba
+  a 33 ms y un clic justo después de un frame cargaba sin cartel. Elegir una
+  carpeta de samples también escanea detrás del cartel.
+- **Los tests no escriben el estado del usuario**: los del motor, los de la UI y
+  los de `choz-clap` (que levantan el rack entero) guardaban `ui.json`, las rutas
+  y los cachés en `~/.local/state/choz`; ahí quedaron 197 cachés `choz-sampler-*`
+  y un `samples_dir` apuntando a `/tmp`.
 
 ### Los samples salen del escaneo: entran por LOAD y por ningún otro lado
 
