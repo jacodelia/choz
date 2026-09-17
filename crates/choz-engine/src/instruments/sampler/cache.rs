@@ -37,6 +37,11 @@ struct CacheFile {
     version: u32,
     dir: PathBuf,
     entries: Vec<Entry>,
+    /// The octave the pack's note names are off by — see
+    /// `super::octave_of_names`. Absent in caches written before it existed,
+    /// which then work it out once.
+    #[serde(default)]
+    octave: Option<i8>,
 }
 
 /// `$XDG_STATE_HOME/choz/samples/<folder>-<id>.json`. The folder's name is in
@@ -78,29 +83,31 @@ fn fingerprint(path: &Path) -> Option<(u64, u64)> {
     Some((meta.len(), mtime))
 }
 
-/// The samples of `dir` that are still exactly as they were analysed.
-pub fn read(dir: &Path) -> HashMap<PathBuf, Sample> {
+/// The samples of `dir` that are still exactly as they were analysed, and the
+/// octave correction worked out for their names, if one was.
+pub fn read(dir: &Path) -> (HashMap<PathBuf, Sample>, Option<i8>) {
     let Ok(text) = std::fs::read_to_string(path_for(dir)) else {
-        return HashMap::new();
+        return (HashMap::new(), None);
     };
     let Ok(cached) = serde_json::from_str::<CacheFile>(&text) else {
-        return HashMap::new();
+        return (HashMap::new(), None);
     };
     if cached.version != VERSION {
-        return HashMap::new();
+        return (HashMap::new(), None);
     }
-    cached
+    let samples = cached
         .entries
         .into_iter()
         .filter(|e| fingerprint(&e.sample.path) == Some((e.len, e.mtime)))
         .map(|e| (e.sample.path.clone(), e.sample))
-        .collect()
+        .collect();
+    (samples, cached.octave)
 }
 
 /// Write the folder's analysis back. A cache that cannot be written is not an
 /// error worth stopping a load for — it costs the next scan its time, nothing
 /// more.
-pub fn write(dir: &Path, samples: &[Sample]) {
+pub fn write(dir: &Path, samples: &[Sample], octave: Option<i8>) {
     let entries: Vec<Entry> = samples
         .iter()
         .filter_map(|s| {
@@ -116,6 +123,7 @@ pub fn write(dir: &Path, samples: &[Sample]) {
         version: VERSION,
         dir: dir.to_path_buf(),
         entries,
+        octave,
     };
     let path = path_for(dir);
     if let Some(parent) = path.parent() {
@@ -143,11 +151,12 @@ mod tests {
         std::fs::write(&wav, b"one").unwrap();
 
         let sample = super::super::describe_one(&dir, &wav, 3);
-        write(&dir, std::slice::from_ref(&sample));
-        assert!(read(&dir).contains_key(&wav), "not cached");
+        write(&dir, std::slice::from_ref(&sample), Some(-1));
+        assert!(read(&dir).0.contains_key(&wav), "not cached");
+        assert_eq!(read(&dir).1, Some(-1), "the octave correction is kept");
 
         std::fs::write(&wav, b"a different length entirely").unwrap();
-        assert!(!read(&dir).contains_key(&wav), "stale entry survived");
+        assert!(!read(&dir).0.contains_key(&wav), "stale entry survived");
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(path_for(&dir));

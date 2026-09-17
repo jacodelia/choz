@@ -23,6 +23,65 @@ use crate::sources::AudioSource;
 /// grows the vector — it is called from the audio thread.
 const MAX_VOICES: usize = 32;
 
+/// Where [`SfzSampler::normalize`] puts an instrument's typical note: its median
+/// peak at -12 dBFS.
+///
+/// Measured, not picked: across Philharmonia's fifteen instruments the median
+/// peak runs from -9 dBFS (tuba) to -28 dBFS (flute) — 19 dB between two tabs
+/// the auto-trim, capped at +6 dB, could never close. Levelled here they land
+/// together, and the RMS of a typical note then sits near the rack's
+/// `TARGET_RMS`, so the trim has little left to do.
+const TYPICAL_PEAK: f32 = 0.25;
+
+/// …and never so loud that the top tenth of its samples passes full scale: the
+/// dynamics inside an instrument are the instrument, and a pianissimo layer
+/// dragged up to meet the fortissimo one is not normalisation.
+const LOUD_PEAK: f32 = 1.0;
+
+/// How far one note may be moved to meet the rest of its layer: ±18 dB, which
+/// is the whole climb of Philharmonia's flute across its range. Past that the
+/// file is broken or silent, and a note that far off is better heard as it is
+/// than dragged into place.
+const NOTE_RANGE: (f32, f32) = (0.125, 8.0);
+
+/// How far a pack can be moved either way: -12 dB to +24 dB. A pack outside
+/// that is silence, a broken file, or something that should not be guessed at.
+const LEVEL_RANGE: (f32, f32) = (0.25, 16.0);
+
+/// Pitch bend's reach, either way, in semitones — the General MIDI default and
+/// what every controller's wheel is built for.
+const BEND_SEMITONES: f32 = 2.0;
+
+/// The modulation wheel's vibrato: how fast, and how wide at the top of the
+/// wheel, in cents either way. What General MIDI makes of CC 1, and about what
+/// a player does with a finger on a string.
+const VIBRATO_HZ: f32 = 5.5;
+const VIBRATO_CENTS: f32 = 50.0;
+
+/// The pedals, the wheel and expression, as they stand.
+#[derive(Clone, Copy)]
+struct Performance {
+    /// CC 64 down: a key that comes up keeps sounding until the pedal does.
+    sustain: bool,
+    /// CC 11, 0..1. Full until something says otherwise.
+    expression: f32,
+    /// Pitch bend as a playback-rate ratio. 1.0 is the wheel at rest.
+    bend: f64,
+    /// CC 1, 0..1: how much vibrato.
+    modulation: f32,
+}
+
+impl Default for Performance {
+    fn default() -> Self {
+        Self {
+            sustain: false,
+            expression: 1.0,
+            bend: 1.0,
+            modulation: 0.0,
+        }
+    }
+}
+
 // ─── Parsing ────────────────────────────────────────────────────────────────
 
 /// One region as written in the file: a sample path plus its key/velocity range.
@@ -361,11 +420,7 @@ pub(crate) fn decode(path: &Path, target_sr: u32) -> Result<Vec<f32>> {
 /// The same, with the bytes already in hand — which is how an instrument built
 /// out of one zip decodes a hundred regions without opening the archive a
 /// hundred times. `None` reads the file (or the entry) itself.
-pub(crate) fn decode_from(
-    path: &Path,
-    bytes: Option<Vec<u8>>,
-    target_sr: u32,
-) -> Result<Vec<f32>> {
+pub(crate) fn decode_from(path: &Path, bytes: Option<Vec<u8>>, target_sr: u32) -> Result<Vec<f32>> {
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::codecs::DecoderOptions;
     use symphonia::core::formats::FormatOptions;
@@ -493,9 +548,19 @@ struct Voice {
     /// The envelope at the moment the key came up: release falls from there,
     /// not from 1.0, or letting go during the attack jumps to full volume.
     off_env: f32,
+    /// The key is up but the sustain pedal is holding it.
+    pedalled: bool,
 }
 
 impl Voice {
+    fn release(&mut self) {
+        self.releasing = true;
+        self.since_off = 0.0;
+        // From wherever the envelope had got to: letting go during the attack
+        // fades from there, it does not jump to full volume first.
+        self.off_env = self.env;
+    }
+
     /// The amplitude envelope at this instant.
     fn envelope(&self, k: &Knobs) -> f32 {
         if self.releasing {
@@ -538,6 +603,10 @@ pub struct Knobs {
     /// How long the turn-round is faded across, in seconds. Zero is the butt
     /// join that clicks on anything that does not close at zero.
     pub crossfade: f32,
+    /// The loop keeps turning after the key comes up, so the release fades a
+    /// sound that is still sustaining instead of the tail of the file. Off, the
+    /// loop holds only while the key does — what a sustain loop is.
+    pub loop_release: bool,
     /// Amplitude envelope, seconds and a level.
     pub attack: f32,
     pub decay: f32,
@@ -554,6 +623,7 @@ impl Default for Knobs {
             loop_start: 0.0,
             loop_end: 1.0,
             crossfade: 0.0,
+            loop_release: false,
             attack: 0.0,
             decay: 0.0,
             sustain: 1.0,
@@ -566,12 +636,17 @@ impl Knobs {
     /// The longest a knob can ask for, per parameter. The rack shows these as
     /// the range of each knob, so the two have to agree — see
     /// [`crate::instruments::sampler::params`].
-    pub const MAX_ATTACK: f32 = 2.0;
-    pub const MAX_DECAY: f32 = 4.0;
-    pub const MAX_RELEASE: f32 = 4.0;
-    /// The longest turn-round fade. Past a quarter of a second it is not a
-    /// loop join any more, it is a second voice.
-    pub const MAX_CROSSFADE: f32 = 0.25;
+    ///
+    /// Long enough to be a pad: a sample of a second and a half, looped, held
+    /// under a ten-second release, is an instrument that swells and dies away
+    /// rather than one that stops when the file does.
+    pub const MAX_ATTACK: f32 = 5.0;
+    pub const MAX_DECAY: f32 = 10.0;
+    pub const MAX_RELEASE: f32 = 10.0;
+    /// The longest turn-round fade. A second is long enough to hide the join in
+    /// breath, bow noise or a room; it is capped by the loop itself anyway —
+    /// never more than half of it.
+    pub const MAX_CROSSFADE: f32 = 1.0;
 
     /// Take one normalised value from the rack. Index is the parameter's.
     pub fn set(&mut self, index: usize, v: f32) {
@@ -590,6 +665,7 @@ impl Knobs {
             7 => self.loop_end = v,
             8 => self.crossfade = v * Self::MAX_CROSSFADE,
             9 => self.end = v,
+            10 => self.loop_release = v >= 0.5,
             _ => {}
         }
     }
@@ -616,6 +692,15 @@ pub struct SfzSampler {
     /// Where the polyphony headroom got to at the end of the last block — see
     /// [`AudioSource::render`]. `0.0` is "nothing rendered yet".
     headroom: f32,
+    /// The instrument's own level — see [`SfzSampler::normalize`]. 1.0 is the
+    /// files as they are.
+    level: f32,
+    perf: Performance,
+    /// Where expression was at the end of the last block, so a CC 11 sweep is a
+    /// slide and not a staircase.
+    expression_was: f32,
+    /// The vibrato's phase, in cycles.
+    vibrato_phase: f32,
     /// The ways this instrument can be played, when its pack ships more than
     /// one — `sustain`, `staccato`, `pizzicato`. Empty otherwise, which is
     /// every SFZ file and every kit.
@@ -657,6 +742,10 @@ impl SfzSampler {
             strikes: [0; 128],
             knobs: Knobs::default(),
             headroom: 0.0,
+            level: 1.0,
+            perf: Performance::default(),
+            expression_was: 1.0,
+            vibrato_phase: 0.0,
             articulations: Vec::new(),
             articulation: 0,
             switch_base: None,
@@ -727,6 +816,10 @@ impl SfzSampler {
             strikes: [0; 128],
             knobs: Knobs::default(),
             headroom: 0.0,
+            level: 1.0,
+            perf: Performance::default(),
+            expression_was: 1.0,
+            vibrato_phase: 0.0,
             articulations: Vec::new(),
             articulation: 0,
             switch_base: None,
@@ -735,6 +828,81 @@ impl SfzSampler {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Level the instrument: every note against the others in its layer, then
+    /// the whole instrument against the rest of the rack.
+    ///
+    /// **Across the keyboard, one layer plays level.** Philharmonia's forte
+    /// flute climbs about 18 dB from C4 to A6 — the top octave peaks at full
+    /// scale while the bottom one sits at a tenth of it — so a chromatic scale
+    /// up the keyboard came out as a crescendo into the soft knee. Each note of
+    /// a layer is moved to the layer's median peak, within [`NOTE_RANGE`].
+    ///
+    /// **Between layers, nothing is moved**: a library's pianissimo is quieter
+    /// than its fortissimo on purpose, so the layers are equalised each on its
+    /// own and the gap between them is kept. And only a layer that stretches a
+    /// sample across keys is a pitched instrument — a kit, and a sliced loop,
+    /// play each sound on a key of its own, and a kick is not supposed to be as
+    /// loud as a hi-hat.
+    ///
+    /// Then one gain for the whole instrument: the median note peak at
+    /// [`TYPICAL_PEAK`] unless that would push the loudest tenth past
+    /// [`LOUD_PEAK`], and the smaller of the two wins.
+    ///
+    /// For the folder sampler. An SFZ file carries its author's `volume`
+    /// opcodes, which are already an answer to this.
+    pub fn normalize(&mut self) {
+        self.equalize_layers();
+        let mut peaks: Vec<f32> = self
+            .regions
+            .iter()
+            .map(|r| r.pcm.peak() * r.region.gain)
+            .filter(|p| *p > 1e-4)
+            .collect();
+        if peaks.is_empty() {
+            return;
+        }
+        peaks.sort_by(f32::total_cmp);
+        let at = |q: f32| peaks[((peaks.len() - 1) as f32 * q) as usize];
+        let (typical, loud) = (at(0.5), at(0.9));
+        self.level = (TYPICAL_PEAK / typical)
+            .min(LOUD_PEAK / loud)
+            .clamp(LEVEL_RANGE.0, LEVEL_RANGE.1);
+    }
+
+    /// Move each note of a pitched layer to the layer's median peak — see
+    /// [`Self::normalize`]. A layer is an articulation and a velocity range.
+    fn equalize_layers(&mut self) {
+        let layer = |r: &SfzRegion| (r.articulation, r.lo_vel, r.hi_vel);
+        let mut layers: Vec<(usize, u8, u8)> = self.regions.iter().map(|r| layer(&r.region)).collect();
+        layers.sort_unstable();
+        layers.dedup();
+        for key in layers {
+            let members = || self.regions.iter().filter(|r| layer(&r.region) == key);
+            // A kit plays each sound on its own key; only a stretched sample
+            // says this layer is one instrument across the keyboard.
+            if !members().any(|r| r.region.lo_key != r.region.hi_key) {
+                continue;
+            }
+            let mut peaks: Vec<f32> = members().map(|r| r.pcm.peak()).filter(|p| *p > 1e-4).collect();
+            if peaks.len() < 2 {
+                continue;
+            }
+            peaks.sort_by(f32::total_cmp);
+            let median = peaks[(peaks.len() - 1) / 2];
+            for r in self.regions.iter_mut().filter(|r| layer(&r.region) == key) {
+                let peak = r.pcm.peak();
+                if peak > 1e-4 {
+                    r.region.gain *= (median / peak).clamp(NOTE_RANGE.0, NOTE_RANGE.1);
+                }
+            }
+        }
+    }
+
+    /// The gain [`Self::normalize`] settled on.
+    pub fn level(&self) -> f32 {
+        self.level
     }
 
     /// Where the knobs are, for whoever draws them.
@@ -749,6 +917,19 @@ impl AudioSource for SfzSampler {
         out.fill(0.0);
         let dt = 1.0 / sample_rate as f32;
         let knobs = self.knobs;
+        // The wheel's vibrato, read once per block at the block's middle.
+        //
+        // ponytail: one rate for the block, not one per frame. At 256 frames a
+        // cycle of 5.5 Hz is still ~70 steps at 96 kHz and ~35 at 48 kHz, far
+        // under what an ear resolves as steps in a 50-cent wobble; a larger
+        // block would want the ratio interpolated across it.
+        let block_cycles = VIBRATO_HZ * frames as f32 / sample_rate as f32;
+        let mid = self.vibrato_phase + block_cycles * 0.5;
+        self.vibrato_phase = (self.vibrato_phase + block_cycles).fract();
+        let cents = self.perf.modulation * VIBRATO_CENTS * (mid * std::f32::consts::TAU).sin();
+        let bend = self.perf.bend * 2f64.powf(cents as f64 / 1200.0);
+        let (expr_from, expr_to) = (self.expression_was, self.perf.expression);
+        self.expression_was = expr_to;
         // How loud the sum of what is sounding is allowed to be.
         //
         // A chord of long notes is the case: six voices of the same sample add
@@ -773,7 +954,7 @@ impl AudioSource for SfzSampler {
             // Where this voice turns round, and how long the fade across the
             // join is. A loop shorter than the fade is a loop the fade would
             // read past the start of, so it is the fade that gives way.
-            let looping = knobs.looping && !voice.releasing;
+            let looping = knobs.looping && (!voice.releasing || knobs.loop_release);
             let end = match looping {
                 true => voice.loop_to,
                 false => voice.to,
@@ -783,6 +964,19 @@ impl AudioSource for SfzSampler {
                 true => ((knobs.crossfade.max(0.0) as f64) * sample_rate as f64).min(span * 0.5),
                 false => 0.0,
             };
+            // **Where the loop really comes back to.** The fade mixes the end
+            // of the loop with what comes *before* its start, and a loop that
+            // starts at the top of the sample has nothing there: the fade was
+            // skipped and the join clicked. The return point moves in by the
+            // fade instead, so there is always something to fade with.
+            let back_to = voice.loop_from.max(fade);
+            // A note that is not looping ends where its window ends — often in
+            // the middle of the sound, with END pulled in — so its last few
+            // milliseconds are faded rather than cut.
+            // Only where the window stops short of the file: a file that ends
+            // ends the way it was recorded.
+            let tail = (RELEASE_SECONDS as f64 * sample_rate as f64).max(1.0);
+            let cut_short = voice.to + 1.0 < (voice.pcm.frames() - 1) as f64;
             for f in 0..frames {
                 let i0 = voice.pos as usize;
                 // Past its end — the whole file, or the slice it was given.
@@ -790,7 +984,7 @@ impl AudioSource for SfzSampler {
                     // A held loop goes back to where it was told to; anything
                     // else is finished.
                     if looping {
-                        voice.pos = voice.loop_from;
+                        voice.pos = back_to;
                     } else {
                         voice.pos = f64::INFINITY;
                         break;
@@ -814,7 +1008,7 @@ impl AudioSource for SfzSampler {
                 // which is the join a sustained note needs not to click.
                 let left = end - voice.pos;
                 if fade > 0.0 && left < fade {
-                    let ahead = voice.loop_from - left;
+                    let ahead = back_to - left;
                     let j0 = ahead.max(0.0) as usize;
                     if ahead >= 0.0 && j0 + 1 < voice.pcm.frames() {
                         let u = (ahead - j0 as f64) as f32;
@@ -822,17 +1016,25 @@ impl AudioSource for SfzSampler {
                         let (al1, ar1) = voice.pcm.frame(j0 + 1);
                         let al = al0 + u * (al1 - al0);
                         let ar = ar0 + u * (ar1 - ar0);
-                        // Equal power, so the join does not dip in the middle.
+                        // **Equal gain, not equal power.** The two ends of a
+                        // loop of one sustained note are the same sound, and
+                        // equal-power weights (sin + cos, up to 1.41 together)
+                        // lift a correlated join by up to 3 dB — a bump every
+                        // cycle, into the knee. Linear weights sum to one, so
+                        // the join is never louder than the louder of its two
+                        // sides.
                         let x = ((left / fade) as f32).clamp(0.0, 1.0);
-                        let (a, b) = ((x * std::f32::consts::FRAC_PI_2).sin(), (x * std::f32::consts::FRAC_PI_2).cos());
-                        l = l * a + al * b;
-                        r = r * a + ar * b;
+                        l = l * x + al * (1.0 - x);
+                        r = r * x + ar * (1.0 - x);
                     }
                 }
-                let gain = voice.gain * voice.env;
+                let mut gain = voice.gain * voice.env;
+                if !looping && cut_short && left < tail {
+                    gain *= (left / tail).clamp(0.0, 1.0) as f32;
+                }
                 out[f * 2] += l * gain;
                 out[f * 2 + 1] += r * gain;
-                voice.pos += voice.rate;
+                voice.pos += voice.rate * bend;
                 voice.age += dt;
                 if voice.releasing {
                     voice.since_off += dt;
@@ -853,7 +1055,7 @@ impl AudioSource for SfzSampler {
                 0 | 1 => 1.0,
                 n => f as f32 / (n - 1) as f32,
             };
-            let g = from + (self.headroom - from) * t;
+            let g = (from + (self.headroom - from) * t) * (expr_from + (expr_to - expr_from) * t);
             for ch in 0..2 {
                 let x = out[f * 2 + ch] * g;
                 out[f * 2 + ch] = soft_knee(x);
@@ -867,6 +1069,53 @@ impl AudioSource for SfzSampler {
     /// envelope worth having.
     fn set_param(&mut self, index: usize, value: f32) {
         self.knobs.set(index, value);
+    }
+
+    /// Sustain (64), expression (11), modulation (1) and the three resets
+    /// (120, 121, 123).
+    ///
+    /// The modulation wheel (1) is vibrato, as General MIDI has it. CC 7 stays
+    /// out on purpose, as it does for SoundFonts: a tab's volume is its fader.
+    fn control_change(&mut self, cc: u8, value: u8) {
+        match cc {
+            64 => {
+                self.perf.sustain = value >= 64;
+                if !self.perf.sustain {
+                    for voice in self.voices.iter_mut().filter(|v| v.pedalled) {
+                        voice.pedalled = false;
+                        voice.release();
+                    }
+                }
+            }
+            1 => self.perf.modulation = value as f32 / 127.0,
+            11 => self.perf.expression = value as f32 / 127.0,
+            // All sound off: now, tails included.
+            120 => self.voices.clear(),
+            // Reset all controllers.
+            121 => {
+                self.perf = Performance::default();
+                for voice in self.voices.iter_mut().filter(|v| v.pedalled) {
+                    voice.pedalled = false;
+                    voice.release();
+                }
+            }
+            // All notes off: every key up, the pedal still honoured.
+            123 => {
+                let sustain = self.perf.sustain;
+                for voice in self.voices.iter_mut().filter(|v| !v.releasing) {
+                    match sustain {
+                        true => voice.pedalled = true,
+                        false => voice.release(),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn pitch_bend(&mut self, value: u16) {
+        let semis = (value.min(16383) as f32 - 8192.0) / 8192.0 * BEND_SEMITONES;
+        self.perf.bend = 2f64.powf(semis as f64 / 12.0);
     }
 
     fn note_on(&mut self, note: u8, velocity: u8) {
@@ -906,6 +1155,17 @@ impl AudioSource for SfzSampler {
         else {
             return;
         };
+        // The same key struck again: the note it was already playing — held by
+        // the pedal, or still ringing — lets go rather than stacking under the
+        // new one, which is what a key on an instrument does.
+        for voice in self
+            .voices
+            .iter_mut()
+            .filter(|v| v.note == note && !v.releasing)
+        {
+            voice.pedalled = false;
+            voice.release();
+        }
         if self.voices.len() == MAX_VOICES {
             // Steal the oldest rather than grow: `push` past the capacity would
             // allocate on the audio thread.
@@ -938,7 +1198,7 @@ impl AudioSource for SfzSampler {
         };
         let mut voice = Voice {
             note,
-            gain: hit.region.gain * (velocity as f32 / 127.0),
+            gain: hit.region.gain * self.level * (velocity as f32 / 127.0),
             rate: hit.region.rate_for_note(note) as f64,
             pcm: hit.pcm.clone(),
             pos,
@@ -950,6 +1210,7 @@ impl AudioSource for SfzSampler {
             age: 0.0,
             since_off: 0.0,
             off_env: 0.0,
+            pedalled: false,
         };
         // Where the envelope starts, so a note released inside the same block
         // it began fades from a real level rather than from silence.
@@ -958,17 +1219,18 @@ impl AudioSource for SfzSampler {
     }
 
     /// The key came up: fade, do not cut. See [`RELEASE_SECONDS`].
+    /// Under the sustain pedal the key comes up and the note does not.
     fn note_off(&mut self, note: u8) {
+        let sustain = self.perf.sustain;
         for voice in self
             .voices
             .iter_mut()
-            .filter(|v| !v.releasing && v.note == note)
+            .filter(|v| !v.releasing && !v.pedalled && v.note == note)
         {
-            voice.releasing = true;
-            voice.since_off = 0.0;
-            // From wherever the envelope had got to: letting go during the
-            // attack fades from there, it does not jump to full volume first.
-            voice.off_env = voice.env;
+            match sustain {
+                true => voice.pedalled = true,
+                false => voice.release(),
+            }
         }
     }
 
@@ -976,6 +1238,8 @@ impl AudioSource for SfzSampler {
     /// Vec's buffer, which is what keeps this RT-safe.
     fn all_notes_off(&mut self) {
         self.voices.clear();
+        // A panic that left the pedal down would hold the next note forever.
+        self.perf = Performance::default();
     }
 
     fn plays_on_transport_stop(&self) -> bool {
@@ -1090,6 +1354,10 @@ mod tests {
             strikes: [0; 128],
             knobs: Knobs::default(),
             headroom: 0.0,
+            level: 1.0,
+            perf: Performance::default(),
+            expression_was: 1.0,
+            vibrato_phase: 0.0,
             articulations: Vec::new(),
             articulation: 0,
             switch_base: None,
@@ -1169,6 +1437,10 @@ mod tests {
             strikes: [0; 128],
             knobs: Knobs::default(),
             headroom: 0.0,
+            level: 1.0,
+            perf: Performance::default(),
+            expression_was: 1.0,
+            vibrato_phase: 0.0,
             articulations: Vec::new(),
             articulation: 0,
             switch_base: None,
@@ -1216,6 +1488,10 @@ mod tests {
             strikes: [0; 128],
             knobs: Knobs::default(),
             headroom: 0.0,
+            level: 1.0,
+            perf: Performance::default(),
+            expression_was: 1.0,
+            vibrato_phase: 0.0,
             articulations: Vec::new(),
             articulation: 0,
             switch_base: None,
@@ -1228,8 +1504,8 @@ mod tests {
     #[test]
     fn the_envelope_knobs_shape_the_note() {
         let mut s = bench(vec![1.0; 2000]);
-        // ATTACK is knob 2, of two seconds: 0.05 of it is 0.1 s = 100 frames.
-        s.set_param(2, 0.05);
+        // ATTACK is knob 2, of five seconds: 0.02 of it is 0.1 s = 100 frames.
+        s.set_param(2, 0.02);
         s.note_on(60, 127);
         let mut buf = vec![0.0f32; 200];
         s.render(&mut buf, 1000);
@@ -1241,9 +1517,9 @@ mod tests {
         assert!(buf[80] > buf[20], "the attack did not ramp up");
         assert!((buf[198] - 1.0).abs() < 0.05, "it never reached the top");
 
-        // RELEASE is knob 5, of four seconds: 0.05 is 0.2 s = 200 frames, so
+        // RELEASE is knob 5, of ten seconds: 0.02 is 0.2 s = 200 frames, so
         // the voice is still sounding a hundred frames after the key came up.
-        s.set_param(5, 0.05);
+        s.set_param(5, 0.02);
         s.note_off(60);
         let mut buf = vec![0.0f32; 200];
         s.render(&mut buf, 1000);
@@ -1392,6 +1668,267 @@ mod tests {
             voice.loop_to - voice.loop_from >= MIN_LOOP_FRAMES,
             "a {}-frame loop",
             voice.loop_to - voice.loop_from
+        );
+    }
+
+    /// Loudest absolute sample of `frames` frames rendered.
+    fn loudest(s: &mut SfzSampler, frames: usize) -> f32 {
+        let mut buf = vec![0.0f32; frames * 2];
+        s.render(&mut buf, 1000);
+        buf.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+    }
+
+    /// A quiet pack is brought up to where a typical note peaks at
+    /// [`TYPICAL_PEAK`]; a loud one is not pushed past full scale; and the gap
+    /// between two layers of one instrument is left exactly as it was.
+    #[test]
+    fn normalize_levels_the_instrument_and_keeps_its_dynamics() {
+        // Flute-like: every file at -28 dBFS.
+        let mut quiet = bench(vec![0.04; 8000]);
+        quiet.normalize();
+        assert!(
+            (quiet.level() - TYPICAL_PEAK / 0.04).abs() < 1e-3,
+            "{}",
+            quiet.level()
+        );
+
+        // Tuba-like: loud already, so it comes down rather than up.
+        let mut loud = bench(vec![0.9; 8000]);
+        loud.normalize();
+        assert!(loud.level() < 1.0, "{}", loud.level());
+
+        // Two layers, 20 dB apart: one gain for both, so still 20 dB apart.
+        let mut layers = bench(vec![0.05; 8000]);
+        let mut soft = layers.regions[0].region.clone();
+        soft.lo_vel = 0;
+        soft.hi_vel = 63;
+        layers.regions[0].region.lo_vel = 64;
+        layers.regions.push(Loaded {
+            region: soft,
+            pcm: crate::instruments::stream::Pcm::mem(vec![0.005; 8000]),
+        });
+        layers.normalize();
+        layers.note_on(60, 127);
+        let hard = loudest(&mut layers, 50);
+        layers.all_notes_off();
+        layers.note_on(60, 63);
+        let gentle = loudest(&mut layers, 50) * 127.0 / 63.0;
+        assert!((hard / gentle - 10.0).abs() < 0.5, "{hard} vs {gentle}");
+    }
+
+    /// A chromatic scale up one layer comes out level, however the recording
+    /// climbed — and a kit keeps its kick louder than its hi-hat.
+    #[test]
+    fn a_pitched_layer_is_level_across_the_keyboard_and_a_kit_is_not() {
+        let region = |lo, hi, root| SfzRegion {
+            sample: PathBuf::new(),
+            lo_key: lo,
+            hi_key: hi,
+            pitch_key_center: root,
+            lo_vel: 0,
+            hi_vel: 127,
+            gain: 1.0,
+            tune_cents: 0.0,
+            start: 0.0,
+            end: 1.0,
+            articulation: 0,
+        };
+        let build = |zones: [(u8, u8, u8); 3]| {
+            let mut s = bench(vec![0.0; 2]);
+            s.regions = zones
+                .iter()
+                .zip([0.1f32, 0.2, 0.8])
+                .map(|(&(lo, hi, root), level)| Loaded {
+                    region: region(lo, hi, root),
+                    pcm: crate::instruments::stream::Pcm::mem(vec![level; 8000]),
+                })
+                .collect();
+            s.normalize();
+            [60u8, 61, 62].map(|note| {
+                s.all_notes_off();
+                s.note_on(note, 127);
+                loudest(&mut s, 50)
+            })
+        };
+        // Three roots stretched across the keyboard, recorded 18 dB apart.
+        let flute = build([(0, 60, 60), (61, 61, 61), (62, 127, 62)]);
+        assert!(
+            flute.iter().all(|p| (p / flute[1] - 1.0).abs() < 0.02),
+            "the scale is not level: {flute:?}"
+        );
+        // Three drums, each on its own key: left as they were recorded.
+        let kit = build([(60, 60, 60), (61, 61, 61), (62, 62, 62)]);
+        assert!(kit[2] / kit[0] > 7.0, "the kit was flattened: {kit:?}");
+    }
+
+    /// Normalised positions of the sampler's knobs, by index, as the rack sends
+    /// them.
+    fn knob(s: &mut SfzSampler, index: usize, v: f32) {
+        s.set_param(index, v);
+    }
+
+    /// **A short sample can ring as long as the release says.** With LOOP and
+    /// LOOP REL on, the loop keeps turning after the key comes up and a long
+    /// release fades a sustaining sound; with LOOP REL off the note runs into
+    /// the end of the file and stops, as a sustain loop should.
+    #[test]
+    fn a_loop_through_the_release_outlasts_the_file() {
+        let heard_late = |loop_release: bool| {
+            let mut s = bench(vec![0.5; 400]); // 200 frames at 1000 Hz: 0.2 s
+            knob(&mut s, 1, 1.0); // LOOP
+            knob(&mut s, 10, if loop_release { 1.0 } else { 0.0 });
+            knob(&mut s, 5, 0.3); // RELEASE: 3 s
+            s.note_on(60, 127);
+            loudest(&mut s, 100);
+            s.note_off(60);
+            loudest(&mut s, 1000); // a second into the release
+            loudest(&mut s, 100)
+        };
+        assert!(heard_late(true) > 0.1, "the loop stopped with the key");
+        assert!(heard_late(false) < 1e-6, "a sustain loop outlived its key");
+    }
+
+    /// The loop's join is never louder than the sound it joins — a constant
+    /// level stays constant through the fade — and a loop that starts at the
+    /// top of the sample still gets its fade instead of a click.
+    #[test]
+    fn a_crossfaded_loop_neither_bumps_nor_clicks() {
+        // Constant: equal-power weights would lift the join to 0.71.
+        let mut flat = bench(vec![0.5; 2000]);
+        knob(&mut flat, 1, 1.0);
+        knob(&mut flat, 8, 0.1); // 100 ms at 1000 Hz, capped at half the loop
+        flat.note_on(60, 127);
+        let top = loudest(&mut flat, 5000);
+        assert!(top <= 0.501, "the join lifted the level: {top}");
+
+        // A ramp from 0 to 1, looped whole from its first frame: the join goes
+        // from the top of the ramp back to the bottom. Faded, no step between
+        // two output frames comes near that jump.
+        let ramp: Vec<f32> = (0..1000).flat_map(|i| [i as f32 / 1000.0; 2]).collect();
+        let mut s = bench(ramp);
+        knob(&mut s, 1, 1.0);
+        knob(&mut s, 8, 0.1);
+        s.note_on(60, 127);
+        let mut buf = vec![0.0f32; 5000 * 2];
+        s.render(&mut buf, 1000);
+        let jump = buf
+            .chunks(2)
+            .map(|f| f[0])
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(jump < 0.05, "the loop clicked: a step of {jump}");
+    }
+
+    /// END pulled into the middle of the sound fades the last few
+    /// milliseconds instead of cutting the note on a non-zero sample.
+    #[test]
+    fn a_window_cut_short_fades_out() {
+        let mut s = bench(vec![0.5; 20_000]); // 10 s at 1000 Hz
+        knob(&mut s, 9, 0.5); // END halfway
+        s.note_on(60, 127);
+        let mut buf = vec![0.0f32; 6000 * 2];
+        s.render(&mut buf, 1000);
+        let left: Vec<f32> = buf.chunks(2).map(|f| f[0]).collect();
+        let last = left.iter().rposition(|v| *v != 0.0).expect("it sounded");
+        assert!(left[last] < 0.1, "it stopped on {} instead of fading", left[last]);
+        assert!(left[last - 40] > 0.4, "the fade is longer than a fade");
+    }
+
+    /// Under the sustain pedal a released key keeps sounding, and lifting the
+    /// pedal lets it go. A note-off that arrives before the pedal is up must not
+    /// be lost, and a panic lifts the pedal too.
+    #[test]
+    fn the_sustain_pedal_holds_released_keys() {
+        let mut s = bench(vec![0.5; 80_000]);
+        s.control_change(64, 127);
+        s.note_on(60, 100);
+        s.note_off(60);
+        loudest(&mut s, 200);
+        assert!(
+            s.voices.iter().any(|v| v.note == 60 && !v.releasing),
+            "the pedal let go of it"
+        );
+
+        s.control_change(64, 0);
+        loudest(&mut s, 200);
+        assert!(s.voices.is_empty(), "lifting the pedal did not release it");
+
+        // A panic with the pedal down leaves it up.
+        s.control_change(64, 127);
+        s.all_notes_off();
+        s.note_on(62, 100);
+        s.note_off(62);
+        loudest(&mut s, 200);
+        assert!(s.voices.is_empty(), "the pedal survived the panic");
+    }
+
+    /// The modulation wheel wobbles the pitch: at rest a voice reads the sample
+    /// at exactly its rate, with the wheel up it drifts off it and back.
+    #[test]
+    fn the_modulation_wheel_is_vibrato() {
+        let read = |wheel: u8| -> Vec<f64> {
+            let mut s = bench(vec![0.5; 400_000]);
+            s.control_change(1, wheel);
+            s.note_on(60, 127);
+            (0..40)
+                .map(|_| {
+                    let before = s.voices[0].pos;
+                    let mut buf = vec![0.0f32; 64];
+                    s.render(&mut buf, 1000);
+                    s.voices[0].pos - before
+                })
+                .collect()
+        };
+        assert!(read(0).iter().all(|step| (step - 32.0).abs() < 1e-9), "vibrato with the wheel down");
+        let wobble = read(127);
+        let (lo, hi) = wobble.iter().fold((f64::MAX, f64::MIN), |(l, h), v| (l.min(*v), h.max(*v)));
+        // ±50 cents is about ±2.9% of the rate.
+        assert!(hi > 32.5 && lo < 31.5, "{lo}..{hi}");
+        assert!(hi < 33.2 && lo > 30.8, "wider than the wheel allows: {lo}..{hi}");
+    }
+
+    /// Striking a key again releases the note it was playing instead of
+    /// stacking a second voice under it.
+    #[test]
+    fn a_repeated_key_does_not_stack_voices() {
+        let mut s = bench(vec![0.5; 80_000]);
+        s.control_change(64, 127);
+        for _ in 0..5 {
+            s.note_on(60, 100);
+            s.note_off(60);
+        }
+        loudest(&mut s, 200);
+        let sounding = s.voices.iter().filter(|v| !v.releasing).count();
+        assert_eq!(sounding, 1, "{sounding} voices of one key");
+    }
+
+    /// The bend wheel moves the pitch — two semitones up plays the sample
+    /// faster by 2^(2/12) — and expression scales the level, back to full on
+    /// a controller reset.
+    #[test]
+    fn bend_and_expression_reach_the_voices() {
+        let mut s = bench((0..80_000).map(|i| i as f32 / 80_000.0).collect());
+        s.note_on(60, 127);
+        s.pitch_bend(16383);
+        let mut buf = vec![0.0f32; 2000];
+        s.render(&mut buf, 1000);
+        let pos = s.voices[0].pos;
+        let expected = 1000.0 * 2f64.powf((16383.0f64 - 8192.0) / 8192.0 * 2.0 / 12.0);
+        assert!((pos - expected).abs() < 2.0, "{pos} vs {expected}");
+
+        let mut e = bench(vec![0.5; 80_000]);
+        e.note_on(60, 127);
+        let full = loudest(&mut e, 100);
+        e.control_change(11, 0);
+        loudest(&mut e, 100); // the slide down
+        assert!(loudest(&mut e, 100) < 1e-6, "expression 0 is not silence");
+        e.control_change(121, 0);
+        loudest(&mut e, 100);
+        assert!(
+            (loudest(&mut e, 100) - full).abs() < 0.05,
+            "reset left expression down"
         );
     }
 }

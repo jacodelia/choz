@@ -255,6 +255,12 @@ pub fn files(dir: &Path) -> Vec<(PathBuf, u64)> {
         // A folder inside an archive: `percussion.zip/bass drum`.
         Some((zip, prefix)) => archive::samples_under(&zip, Some(&prefix)),
         None if archive::is_archive(dir) => archive::samples(dir),
+        // One file on its own is an instrument too: the most ordinary thing to
+        // hand a sampler is a single recording.
+        None if is_sample(dir) && dir.is_file() => {
+            let bytes = std::fs::metadata(dir).map(|m| m.len()).unwrap_or(0);
+            vec![(dir.to_path_buf(), bytes)]
+        }
         None => {
             let mut found = Vec::new();
             collect(dir, 0, &mut found);
@@ -316,6 +322,9 @@ pub fn instruments(path: &Path) -> Vec<PathBuf> {
     if archive::is_archive(path) {
         return archive::instruments(path);
     }
+    if is_sample(path) && path.is_file() {
+        return vec![path.to_path_buf()];
+    }
     match is_instrument_dir(path) {
         true => vec![path.to_path_buf()],
         false => Vec::new(),
@@ -326,7 +335,8 @@ pub fn instruments(path: &Path) -> Vec<PathBuf> {
 /// and the cache in front of both.
 pub fn describe(dir: &Path) -> Vec<Sample> {
     let files = files(dir);
-    let mut cached = cache::read(dir);
+    let (mut cached, octave) = cache::read(dir);
+    let octave_unknown = octave.is_none();
     let mut out = Vec::with_capacity(files.len());
     let mut analysed = 0usize;
     for (path, bytes) in files {
@@ -337,10 +347,148 @@ pub fn describe(dir: &Path) -> Vec<Sample> {
         analysed += 1;
         out.push(describe_one(dir, &path, bytes));
     }
-    if analysed > 0 {
-        cache::write(dir, &out);
+    // Worked out once per pack and kept, like the rest: it costs a decode of
+    // a few files. The cache holds the names as they were read, and the
+    // correction is applied on the way out, so it is never applied twice.
+    let octave = match (octave, analysed) {
+        (Some(o), 0) => o,
+        _ => octave_of_names(&out),
+    };
+    if analysed > 0 || octave_unknown {
+        cache::write(dir, &out, Some(octave));
     }
+    apply_octave(&mut out, octave);
+    velocities_as_layers(&mut out);
     out
+}
+
+/// **Whose middle C.** A name says `C3` and means MIDI 60 in Yamaha's, FL
+/// Studio's and Logic's convention, and MIDI 48 in Roland's and in General
+/// MIDI's — both are everywhere, and a pack read in the wrong one plays every
+/// note an octave off, in tune with itself and with nothing else.
+///
+/// The audio settles it. A few named files, spread across the range, are run
+/// through the same pitch detector the unnamed ones get; when **every one** of
+/// them hears the name a whole number of octaves out, the names are moved by
+/// that many. Unanimous, because the detector's own failure is an octave
+/// error on the odd note — a single disagreement leaves the names as written.
+///
+/// Returns octaves to add. 0 when there is nothing to check, or no agreement.
+fn octave_of_names(samples: &[Sample]) -> i8 {
+    let mut named: Vec<&Sample> = samples
+        .iter()
+        .filter(|s| s.from_name && s.root.is_some())
+        .collect();
+    if named.is_empty() {
+        return 0;
+    }
+    named.sort_by_key(|s| s.root);
+    let picks: Vec<&Sample> = [1, 2, 3]
+        .iter()
+        .map(|q| named[(named.len() - 1) * q / 4])
+        .collect::<Vec<_>>();
+    let mut picks = picks;
+    picks.dedup_by_key(|s| s.path.clone());
+    let heard: Vec<i32> = picks
+        .iter()
+        .filter_map(|s| {
+            let detected = analyze::analyze(&s.path).ok()?.root? as i32;
+            Some(detected - s.root? as i32)
+        })
+        .collect();
+    octave_from_offsets(&heard)
+}
+
+/// The octave every offset agrees on, when they all agree — split out of
+/// [`octave_of_names`] so the decision can be tested without audio.
+fn octave_from_offsets(offsets: &[i32]) -> i8 {
+    let octaves: Vec<i32> = offsets
+        .iter()
+        .map(|d| {
+            let o = (*d as f32 / 12.0).round() as i32;
+            match (d - o * 12).abs() <= 1 {
+                true => o,
+                false => 0,
+            }
+        })
+        .collect();
+    match octaves.first() {
+        Some(&o) if o != 0 && octaves.iter().all(|x| *x == o) => o.clamp(-2, 2) as i8,
+        _ => 0,
+    }
+}
+
+fn apply_octave(samples: &mut [Sample], octave: i8) {
+    if octave == 0 {
+        return;
+    }
+    for s in samples.iter_mut().filter(|s| s.from_name) {
+        s.root = s
+            .root
+            .and_then(|r| u8::try_from(r as i32 + octave as i32 * 12).ok())
+            .filter(|r| *r <= 127);
+    }
+}
+
+/// **`v1`, `v2`, `v3` are layers, not velocities.** A pack that numbers its
+/// dynamics from one would otherwise put its loudest layer at velocity 3 and
+/// leave 4..127 to it alone. When every stated velocity is 16 or under, they
+/// are read as positions and spread across the range.
+fn velocities_as_layers(samples: &mut [Sample]) {
+    let Some(max) = samples.iter().filter_map(|s| s.velocity).max() else {
+        return;
+    };
+    if max > 16 {
+        return;
+    }
+    for s in samples.iter_mut() {
+        s.velocity = s
+            .velocity
+            .map(|v| ((v as u32 * 127) / max as u32).clamp(1, 127) as u8);
+    }
+}
+
+/// The unity note a WAV file carries in its `smpl` chunk, with the fraction of
+/// a semitone it is sharp by, in cents.
+///
+/// What an editor writes when somebody sets the root key — so it is a
+/// statement, not a guess. It is still treated like a detected pitch rather
+/// than a name, because a great many exports write 60 whatever the file is:
+/// a kit of drums all "at C4" must not become one pitched instrument, and the
+/// pitched-or-kit test already asks detected roots to spread over an octave.
+///
+/// ponytail: files on disk only; a WAV inside an archive falls through to the
+/// detector.
+fn smpl_root(path: &Path) -> Option<(u8, f32)> {
+    use std::io::{Read, Seek, SeekFrom};
+    if !path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("wav") || e.eq_ignore_ascii_case("wave"))
+    {
+        return None;
+    }
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut header = [0u8; 12];
+    f.read_exact(&mut header).ok()?;
+    if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut chunk = [0u8; 8];
+    while f.read_exact(&mut chunk).is_ok() {
+        let size = u32::from_le_bytes(chunk[4..8].try_into().ok()?) as u64;
+        if &chunk[0..4] == b"smpl" {
+            let mut body = [0u8; 20];
+            f.read_exact(&mut body).ok()?;
+            let unity = u32::from_le_bytes(body[12..16].try_into().ok()?);
+            let fraction = u32::from_le_bytes(body[16..20].try_into().ok()?);
+            let cents = fraction as f32 / 4_294_967_296.0 * 100.0;
+            return u8::try_from(unity).ok().filter(|n| *n <= 127).map(|n| (n, cents));
+        }
+        // Chunks are padded to an even length.
+        f.seek(SeekFrom::Current((size + size % 2) as i64)).ok()?;
+    }
+    None
 }
 
 /// One file. Public so a UI can re-read a single sample the user just fixed
@@ -378,7 +526,17 @@ pub fn describe_one(root_dir: &Path, path: &Path, bytes: u64) -> Sample {
         Some(_) => None,
         None => analyze::analyze(path)
             .map_err(|e| eprintln!("choz: sampler {}: {e}", path.display()))
-            .ok(),
+            .ok()
+            .map(|mut a| {
+                // A root the file states in its own header beats one the
+                // detector heard.
+                if let Some((root, cents)) = smpl_root(path) {
+                    a.root = Some(root);
+                    a.cents = cents;
+                    a.confidence = 1.0;
+                }
+                a
+            }),
     };
     Sample {
         path: path.to_path_buf(),
@@ -496,6 +654,12 @@ pub fn params() -> Vec<choz_ports::PluginParam> {
         // Last in the list for the same reason the three above it are: a
         // project written before it reads its own knobs where it left them.
         p("END", 0.0, 100.0, 100.0, "%", "SAMPLE"),
+        // The loop through the release: what lets a short sample ring for as
+        // long as the RELEASE knob says. Appended, like the rest.
+        choz_ports::PluginParam {
+            steps: 2,
+            ..p("LOOP REL", 0.0, 1.0, 0.0, "", "SAMPLE")
+        },
     ];
     for (i, param) in out.iter_mut().enumerate() {
         param.id = i as u32;
@@ -651,6 +815,7 @@ pub fn build_preset(
         preset.name.clone(),
     )?;
     instrument.set_articulations(preset.articulations.clone(), preset.switch_base);
+    instrument.normalize();
     Ok(instrument)
 }
 
@@ -716,14 +881,122 @@ pub fn build_id(
     // one articulation says nothing and behaves exactly as it did.
     let names = map::articulation_groups(&samples);
     let base = map::switch_base(&regions, names.len());
-    let mut instrument = crate::instruments::sfz::SfzSampler::from_regions(regions, sample_rate, name)?;
+    let mut instrument =
+        crate::instruments::sfz::SfzSampler::from_regions(regions, sample_rate, name)?;
     instrument.set_articulations(names, base);
+    // Levelled against the rack: a folder of samples says nothing about how
+    // loud it means to be, and Philharmonia's instruments are 19 dB apart.
+    instrument.normalize();
     Ok(instrument)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sine at `freq` for half a second, mono 16-bit at 44.1 kHz — written
+    /// here so these checks need no library on the machine.
+    fn tone(path: &Path, freq: f32) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        for i in 0..22_050 {
+            let t = i as f32 / 44_100.0;
+            w.write_sample(((t * freq * std::f32::consts::TAU).sin() * 16_000.0) as i16)
+                .unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("choz-generic-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// **Any recording is an instrument.** One file, named nothing a parser
+    /// can read: it is found, its pitch is heard, and it plays across the
+    /// keyboard — not as a drum on one key.
+    #[test]
+    fn a_single_unnamed_recording_plays_across_the_keyboard() {
+        let dir = scratch("single");
+        let file = dir.join("my take.wav");
+        tone(&file, 440.0);
+        assert_eq!(instruments(&file), vec![file.clone()]);
+        let samples = describe(&file);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].root, Some(69), "the detector did not hear A4");
+        let regions = map::regions(&samples);
+        assert_eq!(regions.len(), 1);
+        assert_eq!((regions[0].lo_key, regions[0].hi_key), (0, 127));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A WAV that states its root key in its `smpl` chunk is believed over
+    /// what the detector hears.
+    #[test]
+    fn the_root_key_a_wav_states_is_believed() {
+        let dir = scratch("smpl");
+        let file = dir.join("pad.wav");
+        tone(&file, 440.0);
+        // Append a `smpl` chunk saying unity note 60 and fix the RIFF size.
+        let mut bytes = std::fs::read(&file).unwrap();
+        let mut chunk = b"smpl".to_vec();
+        chunk.extend(36u32.to_le_bytes());
+        let mut body = [0u8; 36];
+        body[12..16].copy_from_slice(&60u32.to_le_bytes());
+        chunk.extend(body);
+        bytes.extend(chunk);
+        let riff = (bytes.len() - 8) as u32;
+        bytes[4..8].copy_from_slice(&riff.to_le_bytes());
+        std::fs::write(&file, bytes).unwrap();
+        assert_eq!(smpl_root(&file).map(|r| r.0), Some(60));
+        assert_eq!(describe(&file)[0].root, Some(60));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pack named in the other octave convention — `C3` meaning middle C —
+    /// is moved to where it sounds, and one named in choz's own is left alone.
+    #[test]
+    fn a_pack_named_an_octave_off_is_moved_to_where_it_sounds() {
+        let dir = scratch("octave");
+        for (name, freq) in [("keys_C3", 261.63), ("keys_E3", 329.63), ("keys_G3", 392.0)] {
+            tone(&dir.join(format!("{name}.wav")), freq);
+        }
+        let mut roots: Vec<u8> = describe(&dir).iter().filter_map(|s| s.root).collect();
+        roots.sort_unstable();
+        assert_eq!(roots, vec![60, 64, 67], "still read as C3 = 48");
+        // Served from the cache, the correction is applied once, not twice.
+        let mut again: Vec<u8> = describe(&dir).iter().filter_map(|s| s.root).collect();
+        again.sort_unstable();
+        assert_eq!(again, roots);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(octave_from_offsets(&[12, 12, 11]), 1);
+        assert_eq!(octave_from_offsets(&[-12, -12]), -1);
+        assert_eq!(octave_from_offsets(&[0, 0, 0]), 0);
+        assert_eq!(octave_from_offsets(&[12, 0, 12]), 0, "one disagreement leaves the names");
+        assert_eq!(octave_from_offsets(&[]), 0);
+    }
+
+    /// `v1`, `v2`, `v3` are three layers spread over the range, not three
+    /// velocities at the bottom of it.
+    #[test]
+    fn numbered_layers_spread_across_the_velocity_range() {
+        let dir = scratch("layers");
+        for v in 1..=3 {
+            std::fs::write(dir.join(format!("pad_C4_v{v}.wav")), []).unwrap();
+        }
+        let mut velocities: Vec<u8> = describe(&dir).iter().filter_map(|s| s.velocity).collect();
+        velocities.sort_unstable();
+        assert_eq!(velocities, vec![42, 84, 127]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The folders count when the filenames stay quiet, and the filename wins
     /// when they disagree — the more specific statement is the one to believe.
@@ -1046,8 +1319,9 @@ mod tests {
         // these existed reads its values into the same knobs.
         assert_eq!(params()[0].name, "START");
         assert_eq!(params()[5].name, "RELEASE");
-        assert_eq!(params().len(), 10);
+        assert_eq!(params().len(), 11);
         assert_eq!(params()[9].name, "END");
+        assert_eq!(params()[10].name, "LOOP REL");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -162,6 +162,15 @@ fn line(event: &InputEvent, ports: &[String]) -> Line<'static> {
             format!("{} bank {}", m.program, m.bank),
             OK,
         ),
+        InputEvent::Pressure(m) => (
+            m.source,
+            "AFTERTOUCH".to_string(),
+            match m.note {
+                Some(n) => format!("{} {}", n, m.value),
+                None => m.value.to_string(),
+            },
+            WARN,
+        ),
         InputEvent::Bend(m) => (
             m.source,
             "PITCH BEND".to_string(),
@@ -552,7 +561,10 @@ impl KeyboardState {
                 self.ccs.truncate(CC_SHOWN);
             }
             InputEvent::Bend(m) => self.bend = m.value,
-            InputEvent::Program(_) | InputEvent::Control(_) | InputEvent::Clock(..) => {}
+            InputEvent::Program(_)
+            | InputEvent::Pressure(_)
+            | InputEvent::Control(_)
+            | InputEvent::Clock(..) => {}
         }
     }
 
@@ -2261,11 +2273,13 @@ mod tests {
         // A wheel at rest reads 0, not 8192.
         let centre = text(InputEvent::Bend(BendMsg {
             source: src,
+            channel: 0,
             value: 8192,
         }));
         assert!(centre.contains("+0"), "got {centre:?}");
         let down = text(InputEvent::Bend(BendMsg {
             source: src,
+            channel: 0,
             value: 0,
         }));
         assert!(down.contains("-8192"), "got {down:?}");
@@ -3119,6 +3133,7 @@ mod tests {
         k.feed(
             &InputEvent::Bend(BendMsg {
                 source: InputSource::Midi(0),
+                channel: 0,
                 value: 0,
             }),
             None,

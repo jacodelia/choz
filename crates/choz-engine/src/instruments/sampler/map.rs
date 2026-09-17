@@ -31,6 +31,10 @@ use super::{Articulation, Mode, Sample};
 /// every GM kit puts the kick.
 const DRUM_BASE: u8 = 36;
 
+/// Where a sound with no pitch of its own plays at its recorded speed when
+/// STRETCH spreads it over the keyboard: middle C.
+const STRETCH_ROOT: u8 = 60;
+
 /// Build the playable map: a keyboard of transposed multisamples, or a kit of
 /// one-shots, depending on what the folder turns out to be.
 pub fn regions(samples: &[Sample]) -> Vec<SfzRegion> {
@@ -38,8 +42,7 @@ pub fn regions(samples: &[Sample]) -> Vec<SfzRegion> {
 }
 
 /// The same, with the layout forced. `Stretch` on a folder where nothing has a
-/// pitch still comes out a kit: there is no root note to transpose away from,
-/// and stretching silence across the keyboard is not a thing that can be done.
+/// pitch plays it across the keyboard from middle C — see [`STRETCH_ROOT`].
 pub fn regions_with(samples: &[Sample], mode: Mode) -> Vec<SfzRegion> {
     regions_with_slices(samples, mode, super::SLICES)
 }
@@ -52,8 +55,27 @@ pub fn regions_with_slices(samples: &[Sample], mode: Mode, slices: usize) -> Vec
     }
     let pitched = match mode {
         Mode::Auto => looks_pitched(samples),
-        Mode::Stretch => samples.iter().any(|s| s.root.is_some()),
+        Mode::Stretch => true,
         Mode::Kit | Mode::Slice => false,
+    };
+    // **STRETCH on sounds with no pitch at all** — a cabasa, a shaker, a noise
+    // — plays them across the keyboard anyway, as recorded at middle C: the
+    // player asked for every key, and a sound transposed is still a sound.
+    // A folder where only some files have a pitch stretches those, as before.
+    let unpitched: Vec<Sample>;
+    let samples = match mode == Mode::Stretch && samples.iter().all(|s| s.root.is_none()) {
+        true => {
+            unpitched = samples
+                .iter()
+                .cloned()
+                .map(|mut s| {
+                    s.root = Some(STRETCH_ROOT);
+                    s
+                })
+                .collect();
+            &unpitched[..]
+        }
+        false => samples,
     };
     if !pitched {
         // A kit is not grouped: there are no variants of one note to choose
@@ -149,6 +171,13 @@ fn looks_pitched(samples: &[Sample]) -> bool {
     let found: Vec<u8> = samples.iter().filter_map(|s| s.root).collect();
     if found.is_empty() {
         return false;
+    }
+    // **One recording with a pitch is an instrument.** There is no octave of
+    // roots to span and no second file to compare it with — and what anyone
+    // hands a sampler a single melodic sample for is to play it across the
+    // keyboard. A single hit with no pitch is still a kit of one.
+    if samples.len() == 1 {
+        return true;
     }
     if samples
         .iter()
@@ -413,8 +442,14 @@ fn slice_regions(path: &std::path::Path, cuts: &[f32], slices: usize) -> Vec<Sfz
 }
 
 fn pitched_map(samples: &[&Sample]) -> Vec<SfzRegion> {
+    let samples = &dense_layers(samples);
     let layers = velocity_layers(samples);
-    let mut out = Vec::new();
+    // Where the instrument itself was recorded, whichever layer recorded it.
+    let (low, high) = samples
+        .iter()
+        .filter_map(|s| s.root)
+        .fold((u8::MAX, 0u8), |(lo, hi), r| (lo.min(r), hi.max(r)));
+    let mut out: Vec<Vec<SfzRegion>> = Vec::new();
     for (velocity, lo_vel, hi_vel) in &layers {
         let in_layer: Vec<&&Sample> = samples
             .iter()
@@ -423,10 +458,23 @@ fn pitched_map(samples: &[&Sample]) -> Vec<SfzRegion> {
         let mut roots: Vec<u8> = in_layer.iter().filter_map(|s| s.root).collect();
         roots.sort_unstable();
         roots.dedup();
+        let mut layer = Vec::new();
         for sample in &in_layer {
             let Some(root) = sample.root else { continue };
-            let (lo_key, hi_key) = key_zone(root, &roots);
-            out.push(SfzRegion {
+            let (mut lo_key, mut hi_key) = key_zone(root, &roots);
+            // **A layer stretches past its own last note only where the
+            // instrument ends.** Oboe fortissimo stops at E6 while every other
+            // dynamic goes on to G6: stretched to the top, a hard F6 or G6
+            // played the E6 sample transposed, and E6 itself changed colour
+            // with how hard the sweep happened to hit it. Those keys are
+            // filled from a layer that recorded them — see below.
+            if lo_key == 0 && root > low {
+                lo_key = root;
+            }
+            if hi_key == 127 && root < high {
+                hi_key = root;
+            }
+            layer.push(SfzRegion {
                 sample: sample.path.clone(),
                 lo_key,
                 hi_key,
@@ -442,8 +490,126 @@ fn pitched_map(samples: &[&Sample]) -> Vec<SfzRegion> {
                 articulation: 0,
             });
         }
+        out.push(layer);
     }
-    out
+    // **Every key plays a recorded note when any layer has one.** Per layer,
+    // per key: the layer's own region when its note is within the layer's
+    // `reach`; otherwise the nearest layer — in velocity — that recorded the
+    // key within that reach; otherwise the layer's own stretch, or, for a key it
+    // does not reach at all, the nearest layer that does. A soft trombone
+    // missing four notes in its low octave played them six semitones
+    // transposed while every other dynamic had them, so a chromatic sweep
+    // changed colour on those keys with how hard each one was hit.
+    let distance = |r: &SfzRegion, key: usize| (key as i32 - r.pitch_key_center as i32).unsigned_abs();
+    let covering = |layer: &[SfzRegion], key: usize| -> Option<usize> {
+        layer
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| (r.lo_key as usize..=r.hi_key as usize).contains(&key))
+            .min_by_key(|(_, r)| distance(r, key))
+            .map(|(k, _)| k)
+    };
+    // How far a layer's own stretch is its normal: half the gap between its
+    // recorded notes. A chromatic layer plays its own note or one a semitone
+    // off; a pack recorded every minor third reaches a semitone either way on
+    // its own and borrows nothing; one recorded every fifth reaches three.
+    // Only a key further than that is a hole.
+    let reach: Vec<u32> = out
+        .iter()
+        .map(|layer| {
+            let mut roots: Vec<u8> = layer.iter().map(|r| r.pitch_key_center).collect();
+            roots.sort_unstable();
+            roots.dedup();
+            let mut gaps: Vec<u32> = roots.windows(2).map(|w| (w[1] - w[0]) as u32).collect();
+            gaps.sort_unstable();
+            gaps.get(gaps.len() / 2).map(|g| g.div_ceil(2)).unwrap_or(1).max(1)
+        })
+        .collect();
+    let mut regions = Vec::new();
+    for (i, (_, lo_vel, hi_vel)) in layers.iter().enumerate() {
+        let mut by_velocity: Vec<usize> = (0..out.len()).filter(|j| *j != i).collect();
+        by_velocity.sort_by_key(|j| j.abs_diff(i));
+        // Which layer's region plays each key, as (layer, region).
+        let chosen: Vec<Option<(usize, usize)>> = (0..128usize)
+            .map(|key| {
+                let own = covering(&out[i], key).map(|k| (i, k));
+                if own.is_some_and(|(_, k)| distance(&out[i][k], key) <= reach[i]) {
+                    return own;
+                }
+                let recorded = by_velocity.iter().find_map(|&j| {
+                    covering(&out[j], key)
+                        .filter(|k| distance(&out[j][*k], key) <= reach[i])
+                        .map(|k| (j, k))
+                });
+                recorded
+                    .or(own)
+                    .or_else(|| by_velocity.iter().find_map(|&j| covering(&out[j], key).map(|k| (j, k))))
+            })
+            .collect();
+        // Runs of keys played by the same note of the same layer become one
+        // region per take of that note: takes are round robins, and choosing
+        // "a region" must not choose one take and drop the others.
+        let note_of = |c: Option<(usize, usize)>| c.map(|(j, k)| (j, out[j][k].pitch_key_center));
+        let mut key = 0usize;
+        while key < 128 {
+            let Some((j, root)) = note_of(chosen[key]) else {
+                key += 1;
+                continue;
+            };
+            let from = key;
+            while key < 128 && note_of(chosen[key]) == Some((j, root)) {
+                key += 1;
+            }
+            for take in out[j].iter().filter(|r| r.pitch_key_center == root) {
+                regions.push(SfzRegion {
+                    lo_key: from as u8,
+                    hi_key: (key - 1) as u8,
+                    lo_vel: *lo_vel,
+                    hi_vel: *hi_vel,
+                    ..take.clone()
+                });
+            }
+        }
+    }
+    regions
+}
+
+/// The samples of the velocity layers that can carry the keyboard.
+///
+/// **A layer with a handful of notes is not a layer.** Philharmonia's flute has
+/// 42 forte notes and 2 fortissimo ones; as a layer of its own the fortissimo
+/// took every note played at 105 and up, and played those two samples
+/// stretched across all 88 keys — the bottom octaves three octaves down, the
+/// level off the top of the scale. So a layer needs a third of the notes of
+/// the widest one, the rule [`articulation_groups`] uses, and a thinner one is
+/// left out: its velocities go to the layers beside it, which have a note near
+/// every key.
+///
+/// ponytail: left out whole. Keeping a sparse layer on the keys near its own
+/// roots and falling back elsewhere is the finer answer, and wants a zone per
+/// key per layer rather than per root.
+fn dense_layers<'a>(samples: &[&'a Sample]) -> Vec<&'a Sample> {
+    let notes = |velocity: u8| -> usize {
+        let mut roots: Vec<u8> = samples
+            .iter()
+            .filter(|s| s.velocity == Some(velocity))
+            .filter_map(|s| s.root)
+            .collect();
+        roots.sort_unstable();
+        roots.dedup();
+        roots.len()
+    };
+    let widest = samples
+        .iter()
+        .filter_map(|s| s.velocity)
+        .map(notes)
+        .max()
+        .unwrap_or(0);
+    samples
+        .iter()
+        .copied()
+        .filter(|s| s.velocity.is_none_or(|v| notes(v) * 3 >= widest))
+        .collect()
 }
 
 /// Where one root's zone starts and ends, given every root in its layer.
@@ -552,6 +718,118 @@ mod tests {
         assert_eq!(regions.len(), 1);
         assert_eq!((regions[0].lo_key, regions[0].hi_key), (0, 127));
         assert_eq!(regions[0].pitch_key_center, 60);
+    }
+
+    /// A layer that stops short of the instrument's top note does not stretch
+    /// its last note over the keys another layer recorded: those keys play the
+    /// nearest layer that has them, at this layer's velocities.
+    #[test]
+    fn a_layer_that_ends_early_borrows_the_keys_above_it() {
+        let mut samples: Vec<Sample> = (84..=91)
+            .map(|n| sample(&format!("o_{n}_forte.wav"), Some(n), Some(96)))
+            .collect();
+        samples.extend((84..=88).map(|n| sample(&format!("o_{n}_ff.wav"), Some(n), Some(112))));
+        let regions = regions(&samples);
+        let at = |key: u8, vel: u8| {
+            let hits: Vec<&SfzRegion> = regions
+                .iter()
+                .filter(|r| (r.lo_key..=r.hi_key).contains(&key) && (r.lo_vel..=r.hi_vel).contains(&vel))
+                .collect();
+            assert_eq!(hits.len(), 1, "key {key} vel {vel}: {hits:?}");
+            (hits[0].pitch_key_center, hits[0].sample.to_string_lossy().into_owned())
+        };
+        // E6 hard is its own fortissimo, and nothing else.
+        assert_eq!(at(88, 120), (88, "o_88_ff.wav".into()));
+        // F6 and G6 hard are recorded notes, from the forte layer — not E6
+        // fortissimo transposed.
+        assert_eq!(at(89, 120), (89, "o_89_forte.wav".into()));
+        assert_eq!(at(91, 120), (91, "o_91_forte.wav".into()));
+        // Past the instrument's own top, the top note still stretches.
+        assert_eq!(at(100, 120).0, 91);
+        // And every key answers at every velocity.
+        for key in 0..=127u8 {
+            for vel in [1u8, 100, 127] {
+                at(key, vel);
+            }
+        }
+    }
+
+    /// A pack recorded every four semitones stretches each layer its usual
+    /// two either way, and does not trade its dynamic for another layer's
+    /// note just because that layer was recorded at different pitches.
+    #[test]
+    fn a_sparse_pack_keeps_its_own_dynamic_within_its_reach() {
+        let mut samples: Vec<Sample> = [48u8, 52, 56, 60]
+            .iter()
+            .map(|n| sample(&format!("s_{n}_forte.wav"), Some(*n), Some(96)))
+            .collect();
+        samples.extend(
+            [50u8, 54, 58]
+                .iter()
+                .map(|n| sample(&format!("s_{n}_piano.wav"), Some(*n), Some(48))),
+        );
+        let regions = regions(&samples);
+        let at = |key: u8, vel: u8| {
+            let hits: Vec<&SfzRegion> = regions
+                .iter()
+                .filter(|r| (r.lo_key..=r.hi_key).contains(&key) && (r.lo_vel..=r.hi_vel).contains(&vel))
+                .collect();
+            assert_eq!(hits.len(), 1, "key {key} vel {vel}: {hits:?}");
+            hits[0].sample.to_string_lossy().into_owned()
+        };
+        // Loud at 50: two semitones from the forte 48 or 52 — its own layer.
+        assert!(at(50, 120).contains("forte"), "{}", at(50, 120));
+        assert!(at(56, 20).contains("piano"), "{}", at(56, 20));
+    }
+
+    /// A hole in the middle of a layer is filled from a layer that recorded
+    /// the note, not by transposing the layer's neighbour three semitones.
+    #[test]
+    fn a_hole_in_a_layer_plays_the_note_another_layer_recorded() {
+        let mut samples: Vec<Sample> = (40..=50)
+            .map(|n| sample(&format!("t_{n}_forte.wav"), Some(n), Some(96)))
+            .collect();
+        samples.extend(
+            [40u8, 41, 42, 48, 49, 50]
+                .iter()
+                .map(|n| sample(&format!("t_{n}_piano.wav"), Some(*n), Some(48))),
+        );
+        let regions = regions(&samples);
+        let at = |key: u8, vel: u8| {
+            let hits: Vec<&SfzRegion> = regions
+                .iter()
+                .filter(|r| (r.lo_key..=r.hi_key).contains(&key) && (r.lo_vel..=r.hi_vel).contains(&vel))
+                .collect();
+            assert_eq!(hits.len(), 1, "key {key} vel {vel}: {hits:?}");
+            hits[0].pitch_key_center
+        };
+        // The soft layer's own notes stay its own, and so does a semitone off.
+        assert_eq!(at(40, 20), 40);
+        assert_eq!(at(43, 20), 42);
+        // Deep in the hole it plays the recorded note.
+        assert_eq!(at(45, 20), 45);
+        assert_eq!(at(46, 20), 46);
+    }
+
+    /// A velocity layer with two notes in it does not take the top of the
+    /// velocity range and stretch those two across the keyboard: its range
+    /// goes to the full layer beside it.
+    #[test]
+    fn a_thin_velocity_layer_gives_its_range_to_the_full_one() {
+        let mut samples: Vec<Sample> = (60..72)
+            .map(|n| sample(&format!("f_{n}_forte.wav"), Some(n), Some(96)))
+            .collect();
+        samples.push(sample("f_84_ff.wav", Some(84), Some(112)));
+        samples.push(sample("f_86_ff.wav", Some(86), Some(112)));
+        let regions = regions(&samples);
+        assert!(
+            regions.iter().all(|r| !r.sample.to_string_lossy().contains("ff")),
+            "the two-note layer is still in the map"
+        );
+        assert!(
+            regions.iter().all(|r| (r.lo_vel, r.hi_vel) == (0, 127)),
+            "the full layer does not take every velocity"
+        );
     }
 
     #[test]
@@ -746,6 +1024,20 @@ mod tests {
         let stretched = regions_with(&kit_shaped, Mode::Stretch);
         assert_eq!(stretched.len(), 2, "the unpitched one cannot be stretched");
         assert_eq!((stretched[0].lo_key, stretched[1].hi_key), (0, 127));
+
+        // A folder where nothing has a pitch — a cabasa — still stretches when
+        // asked: every key plays, at its recorded speed on middle C.
+        let shaker = [hit("cabasa_1.wav", None), hit("cabasa_2.wav", None)];
+        assert!(regions(&shaker).iter().all(|r| r.lo_key == r.hi_key), "AUTO is a kit");
+        let spread = regions_with(&shaker, Mode::Stretch);
+        assert!(!spread.is_empty());
+        for key in 0..=127u8 {
+            assert!(
+                spread.iter().any(|r| (r.lo_key..=r.hi_key).contains(&key)),
+                "key {key} is silent under STRETCH"
+            );
+        }
+        assert!(spread.iter().all(|r| r.pitch_key_center == 60));
 
         // And KIT flattens an instrument back to one key per sample.
         let instrument = [

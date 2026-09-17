@@ -142,8 +142,10 @@ pub struct DSSI_Descriptor {
 
 pub const SND_SEQ_EVENT_NOTEON: u8 = 6;
 pub const SND_SEQ_EVENT_NOTEOFF: u8 = 7;
+pub const SND_SEQ_EVENT_KEYPRESS: u8 = 8;
 pub const SND_SEQ_EVENT_CONTROLLER: u8 = 10;
 pub const SND_SEQ_EVENT_PGMCHANGE: u8 = 11;
+pub const SND_SEQ_EVENT_CHANPRESS: u8 = 12;
 pub const SND_SEQ_EVENT_PITCHBEND: u8 = 13;
 
 /// `snd_seq_ev_note_t`.
@@ -251,6 +253,18 @@ impl snd_seq_event_t {
             // real event type, not the shorthand.
             0x90 if data[2] & 0x7F == 0 => note(0, SND_SEQ_EVENT_NOTEOFF),
             0x90 => note(data[2] & 0x7F, SND_SEQ_EVENT_NOTEON),
+            // Polyphonic pressure rides in the note event's velocity, as ALSA
+            // carries it.
+            0xA0 => note(data[2] & 0x7F, SND_SEQ_EVENT_KEYPRESS),
+            0xD0 => Some(Self::with_data(
+                SND_SEQ_EVENT_CHANPRESS,
+                frame,
+                snd_seq_ev_ctrl_t {
+                    channel,
+                    value: (data[1] & 0x7F) as c_int,
+                    ..Default::default()
+                },
+            )),
             0xB0 => Some(Self::with_data(
                 SND_SEQ_EVENT_CONTROLLER,
                 frame,

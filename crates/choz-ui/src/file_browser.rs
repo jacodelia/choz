@@ -70,13 +70,18 @@ const DIR_MARK: &str = "<dir>";
 /// offers the current directory itself as the first entry.
 pub const DIR_PICK: &[&str] = &[DIR_MARK];
 
-/// The same, for the sampler: a folder **or** one of the `.zip`s in it.
+/// The same, for the sampler: a folder, one of the `.zip`s in it, **or a
+/// single recording** — the most ordinary thing to hand a sampler. The audio
+/// extensions are `sampler::EXTENSIONS`, spelled out because a `const` cannot
+/// be concatenated.
 ///
 /// A sample library arrives as one archive per instrument — Philharmonia's is
 /// twenty of them in one directory — and choz reads an archive where it sits.
 /// The picker that could only answer "this directory" made the user unpack
 /// them first, which is the step the whole archive reader exists to avoid.
-pub const DIR_OR_ZIP: &[&str] = &[DIR_MARK, "zip"];
+pub const DIR_OR_ZIP: &[&str] = &[
+    DIR_MARK, "zip", "wav", "wave", "flac", "aiff", "aif", "mp3", "ogg",
+];
 
 /// What counts as a background image. Decoding is `image`'s problem; this is
 /// only what the browser lists.
@@ -197,6 +202,7 @@ mod tests {
         std::fs::write(base.join("violin.zip"), b"x").unwrap();
         std::fs::write(base.join("cello.ZIP"), b"x").unwrap();
         std::fs::write(base.join("notes.txt"), b"x").unwrap();
+        std::fs::write(base.join("take.wav"), b"x").unwrap();
 
         let b = FileBrowser::open(&base, DIR_OR_ZIP);
         let labels: Vec<&str> = b.entries.iter().map(|e| e.label.as_str()).collect();
@@ -205,6 +211,8 @@ mod tests {
         // Both archives, whatever case they spell their extension in.
         assert!(labels.contains(&"violin.zip"), "{labels:?}");
         assert!(labels.contains(&"cello.ZIP"), "{labels:?}");
+        // A single recording is an instrument too.
+        assert!(labels.contains(&"take.wav"), "{labels:?}");
         // …and nothing else.
         assert!(!labels.contains(&"notes.txt"), "{labels:?}");
 
@@ -222,5 +230,22 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The picker offers exactly the audio the sampler reads: a format added to
+    /// one list and not the other is a file that cannot be picked, or one that
+    /// is picked and then refused.
+    #[test]
+    fn the_sampler_picker_offers_every_format_the_sampler_reads() {
+        let offered: Vec<&str> = DIR_OR_ZIP
+            .iter()
+            .copied()
+            .filter(|e| *e != DIR_MARK && *e != "zip")
+            .collect();
+        assert_eq!(
+            offered,
+            choz_engine::instruments::sampler::EXTENSIONS,
+            "the picker and the sampler disagree about what a sample is"
+        );
     }
 }

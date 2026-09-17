@@ -287,6 +287,12 @@ pub(crate) enum EngineCommand {
         slot: usize,
         value: u16,
     },
+    /// Aftertouch: `note` is `Some` for polyphonic pressure.
+    Pressure {
+        slot: usize,
+        note: Option<u8>,
+        value: u8,
+    },
 }
 
 /// Items retired by the RT thread, returned to the UI thread to be dropped
@@ -587,10 +593,11 @@ impl EmbeddedRt {
     pub fn render(&mut self, frames: usize) {
         let started = std::time::Instant::now();
         let cpu_started = crate::meter::cpu_micros();
+        let faults_started = crate::meter::major_faults();
         let frames = frames.min(self.max_frames());
         self.rt.apply_commands();
         self.rt.render(frames);
-        publish_load(started, cpu_started, frames, self.rt.sample_rate);
+        publish_load(started, cpu_started, faults_started, frames, self.rt.sample_rate);
     }
 
     /// The largest block this rack was built for.
@@ -2356,6 +2363,11 @@ impl AudioEngine {
         self.send(EngineCommand::PitchBend { slot, value });
     }
 
+    /// Send aftertouch to one slot — see [`AudioSource::pressure`].
+    pub fn pressure(&mut self, slot: usize, note: Option<u8>, value: u8) {
+        self.send(EngineCommand::Pressure { slot, note, value });
+    }
+
     pub fn set_playing(&self, play: bool) {
         self.playing.store(play, Ordering::Relaxed);
     }
@@ -2368,6 +2380,7 @@ impl AudioEngine {
 fn audio_callback(buf: &mut [f32], state: &mut RtState) {
     let started = std::time::Instant::now();
     let cpu_started = crate::meter::cpu_micros();
+    let faults_started = crate::meter::major_faults();
     state.apply_commands();
     let frames = buf.len() / 2;
     state.drain_capture(frames);
@@ -2376,7 +2389,7 @@ fn audio_callback(buf: &mut [f32], state: &mut RtState) {
         buf[f * 2] = state.mix[0][f];
         buf[f * 2 + 1] = state.mix[1][f];
     }
-    publish_load(started, cpu_started, frames, state.sample_rate);
+    publish_load(started, cpu_started, faults_started, frames, state.sample_rate);
 }
 
 /// What this block cost against what it had — on the wall clock and on a CPU.
@@ -2384,13 +2397,20 @@ fn audio_callback(buf: &mut [f32], state: &mut RtState) {
 pub(crate) fn publish_load(
     started: std::time::Instant,
     cpu_started: u64,
+    faults_started: u64,
     frames: usize,
     sample_rate: u32,
 ) {
     let budget = std::time::Duration::from_secs_f64(frames as f64 / sample_rate.max(1) as f64);
     let cpu =
         std::time::Duration::from_micros(crate::meter::cpu_micros().saturating_sub(cpu_started));
-    crate::meter::load().publish(started.elapsed(), cpu, budget);
+    let took = started.elapsed();
+    let load = crate::meter::load();
+    load.publish(took, cpu, budget);
+    load.publish_faults(
+        crate::meter::major_faults().saturating_sub(faults_started),
+        took > budget,
+    );
 }
 
 impl RtState {
@@ -2631,6 +2651,11 @@ impl RtState {
                 EngineCommand::PitchBend { slot, value } => {
                     if let Some(s) = state.slots.get_mut(slot) {
                         s.source.pitch_bend(value);
+                    }
+                }
+                EngineCommand::Pressure { slot, note, value } => {
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        s.source.pressure(note, value);
                     }
                 }
             }
@@ -3643,11 +3668,15 @@ mod tests {
         }
     }
 
+    /// One aftertouch message as a source received it: `(note, value)`.
+    type Pressed = (Option<u8>, u8);
+
     /// Records the pedal/wheel traffic a slot receives.
     #[derive(Default)]
     struct Expressive {
         ccs: std::sync::Arc<parking_lot::Mutex<Vec<(u8, u8)>>>,
         bends: std::sync::Arc<parking_lot::Mutex<Vec<u16>>>,
+        pressures: std::sync::Arc<parking_lot::Mutex<Vec<Pressed>>>,
     }
     impl AudioSource for Expressive {
         fn render(&mut self, out: &mut [f32], _sr: u32) -> usize {
@@ -3659,6 +3688,9 @@ mod tests {
         }
         fn pitch_bend(&mut self, value: u16) {
             self.bends.lock().push(value);
+        }
+        fn pressure(&mut self, note: Option<u8>, value: u8) {
+            self.pressures.lock().push((note, value));
         }
     }
 
@@ -4753,6 +4785,7 @@ mod tests {
         let played = Expressive::default();
         let (q_ccs, p_ccs) = (quiet.ccs.clone(), played.ccs.clone());
         let p_bends = played.bends.clone();
+        let p_pressures = played.pressures.clone();
 
         cmd_tx
             .push(EngineCommand::AddSlot(Box::new(quiet)))
@@ -4781,6 +4814,21 @@ mod tests {
                 value: 16383,
             })
             .unwrap();
+        // Aftertouch as itself — channel and polyphonic — and never as CC 11.
+        cmd_tx
+            .push(EngineCommand::Pressure {
+                slot: 1,
+                note: None,
+                value: 40,
+            })
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::Pressure {
+                slot: 1,
+                note: Some(60),
+                value: 70,
+            })
+            .unwrap();
         // Out-of-range targets are dropped, not panics.
         cmd_tx
             .push(EngineCommand::ControlChange {
@@ -4802,6 +4850,7 @@ mod tests {
             "sustain and mod wheel arrive unfiltered"
         );
         assert_eq!(&*p_bends.lock(), &[16383]);
+        assert_eq!(&*p_pressures.lock(), &[(None, 40), (Some(60), 70)]);
         assert!(
             q_ccs.lock().is_empty(),
             "a slot bound to another input stays untouched"

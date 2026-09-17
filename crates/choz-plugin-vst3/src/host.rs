@@ -581,6 +581,17 @@ impl EditFeed {
         g.pending.push((id, value));
     }
 
+    /// The same change without marking it touched: a pedal or a wheel moving
+    /// a parameter is performance, not the user grabbing a knob, and MIDI learn
+    /// must not bind to it.
+    pub fn queue(&self, id: u32, value: f64) {
+        let mut g = self.lock();
+        if g.pending.len() >= MAX_PENDING_EDITS {
+            g.pending.remove(0);
+        }
+        g.pending.push((id, value));
+    }
+
     /// Take everything queued, for one process block.
     fn drain(&self, out: &mut Vec<(u32, f64)>) {
         out.clear();
@@ -728,6 +739,24 @@ fn note_on_event(ch: u8, note: u8, vel: u8) -> Event {
     e
 }
 
+fn poly_pressure_event(ch: u8, note: u8, pressure: u8) -> Event {
+    let mut e: Event = unsafe { std::mem::zeroed() };
+    e.r#type = Event_::EventTypes_::kPolyPressureEvent as u16;
+    e.__field0.polyPressure = PolyPressureEvent {
+        channel: ch as int16,
+        pitch: note as int16,
+        pressure: pressure as f32 / 127.0,
+        noteId: -1,
+    };
+    e
+}
+
+/// Where a MIDI controller lands in a VST3 plugin: 0..127 are the CCs, then
+/// channel pressure and pitch bend, as `IMidiMapping` numbers them.
+pub const MIDI_CONTROLLERS: usize = 130;
+const CTRL_AFTERTOUCH: usize = 128;
+const CTRL_PITCH_BEND: usize = 129;
+
 fn note_off_event(ch: u8, note: u8) -> Event {
     let mut e: Event = unsafe { std::mem::zeroed() };
     e.r#type = Event_::EventTypes_::kNoteOffEvent as u16;
@@ -810,6 +839,12 @@ pub struct Vst3RealInstance {
     /// most JUCE plugins number theirs in a way that made "index as id" address
     /// the wrong parameter, or none at all.
     param_ids: Vec<u32>,
+    /// **VST3 has no MIDI controllers.** A pedal, the modulation wheel, the
+    /// bend wheel and channel pressure all have to be parameters, and the
+    /// plugin says which through `IMidiMapping`: this is its answer, asked once
+    /// at load, indexed by [`MIDI_CONTROLLERS`]. `None` is a controller the
+    /// plugin does nothing with.
+    midi_map: [Option<u32>; MIDI_CONTROLLERS],
     /// The parameter changes handed to the plugin each block.
     param_changes: ComWrapper<HostParamChanges>,
     /// Edits reported by the plugin's own GUI (and by choz's knobs), on their
@@ -988,6 +1023,21 @@ impl Vst3RealInstance {
             })
             .unwrap_or_default();
 
+        let midi_map = controller
+            .as_ref()
+            .and_then(|c| c.cast::<IMidiMapping>())
+            .map(|m| {
+                std::array::from_fn(|n| {
+                    let mut id: ParamID = 0;
+                    // SAFETY: a live mapping interface of a live controller;
+                    // bus 0 and channel 0 are where choz sends its notes.
+                    (unsafe { m.getMidiControllerAssignment(0, 0, n as CtrlNumber, &mut id) }
+                        == kResultOk)
+                        .then_some(id)
+                })
+            })
+            .unwrap_or([None; MIDI_CONTROLLERS]);
+
         // The controller reports GUI edits here. Without a handler, a plugin
         // whose window is open moves its own knobs and the processor never
         // hears about it.
@@ -1108,6 +1158,7 @@ impl Vst3RealInstance {
             out_channels,
             _ctx: ctx,
             param_ids,
+            midi_map,
             param_changes: ComWrapper::new(HostParamChanges::new()),
             edits,
             edit_scratch: Vec::with_capacity(64),
@@ -1143,6 +1194,38 @@ impl Vst3RealInstance {
     }
     pub fn note_off(&mut self, ch: u8, note: u8) {
         self.pending.push(note_off_event(ch, note));
+    }
+
+    /// A MIDI controller, as the parameter the plugin mapped it to — see
+    /// `midi_map`. `value` is normalised 0..1. Nothing when the plugin mapped
+    /// nothing, which is what a synth without that controller should hear.
+    fn controller(&self, number: usize, value: f64) {
+        if let Some(Some(id)) = self.midi_map.get(number) {
+            self.edits.queue(*id, value.clamp(0.0, 1.0));
+        }
+    }
+
+    /// Whether the plugin mapped MIDI controller `number` (see
+    /// [`MIDI_CONTROLLERS`]) to a parameter.
+    pub fn maps_controller(&self, number: usize) -> bool {
+        self.midi_map.get(number).is_some_and(|m| m.is_some())
+    }
+
+    pub fn control_change(&self, cc: u8, value: u8) {
+        self.controller((cc & 0x7F) as usize, value as f64 / 127.0);
+    }
+
+    pub fn pitch_bend(&self, value: u16) {
+        self.controller(CTRL_PITCH_BEND, value.min(16383) as f64 / 16383.0);
+    }
+
+    /// Polyphonic pressure is an event of its own in VST3; channel pressure is
+    /// a mapped controller like the rest.
+    pub fn pressure(&mut self, ch: u8, note: Option<u8>, value: u8) {
+        match note {
+            Some(n) => self.pending.push(poly_pressure_event(ch, n, value)),
+            None => self.controller(CTRL_AFTERTOUCH, value as f64 / 127.0),
+        }
     }
 
     /// Render one interleaved-stereo block as an instrument (no audio input).

@@ -84,6 +84,15 @@ impl Pcm {
         }
     }
 
+    /// The loudest sample in it, either channel, linear. Off the audio thread
+    /// only: in memory it is a scan, mapped it was worked out at [`map`].
+    pub fn peak(&self) -> f32 {
+        match self {
+            Pcm::Mem(pcm) => pcm.iter().fold(0.0f32, |m, s| m.max(s.abs())),
+            Pcm::Disk(m) => m.peak,
+        }
+    }
+
     /// One frame, as `(left, right)`. Out of range is silence rather than a
     /// panic: the audio thread is the last place to find out about an
     /// off-by-one.
@@ -107,6 +116,8 @@ pub struct Mapped {
     frames: usize,
     /// The first [`HEAD_FRAMES`] frames, held so a note-on never faults.
     head: Vec<f32>,
+    /// See [`Pcm::peak`].
+    peak: f32,
 }
 
 // SAFETY: the mapping is read-only and never moved; `ptr` is valid until `Drop`
@@ -224,8 +235,7 @@ pub fn cache_and_map(sample: &Path, sample_rate: u32, pcm: Vec<f32>) -> Result<P
     }
     let path = cache_path(sample, sample_rate);
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("cannot make {}", dir.display()))?;
+        std::fs::create_dir_all(dir).with_context(|| format!("cannot make {}", dir.display()))?;
     }
     if !path.exists() {
         // Written beside and renamed: a cache half written by a process that
@@ -267,8 +277,8 @@ fn write_raw(path: &Path, pcm: &[f32]) -> Result<()> {
 /// Map a raw cache file, keeping its head in memory.
 pub fn map(path: &Path) -> Result<Pcm> {
     use std::os::unix::io::AsRawFd;
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("cannot open {}", path.display()))?;
+    let file =
+        std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
     let bytes = file.metadata()?.len() as usize;
     let floats = bytes / std::mem::size_of::<f32>();
     if floats < 2 {
@@ -306,11 +316,29 @@ pub fn map(path: &Path) -> Result<Pcm> {
     let mut head = Vec::with_capacity(head_frames * 2);
     // SAFETY: `head_frames * 2 <= floats`, the length mapped.
     head.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr, head_frames * 2) });
+    // The peak, kept beside the cache so it is read once per file and not once
+    // per load. A cache written before the sidecar existed pays one scan —
+    // which also brings its pages in, the same thing `MADV_WILLNEED` asks for.
+    let sidecar = path.with_extension("peak");
+    let peak = match std::fs::read(&sidecar)
+        .ok()
+        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+    {
+        Some(b) => f32::from_ne_bytes(b),
+        None => {
+            // SAFETY: `floats` is the length mapped.
+            let all = unsafe { std::slice::from_raw_parts(ptr, floats) };
+            let peak = all.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            let _ = std::fs::write(&sidecar, peak.to_ne_bytes());
+            peak
+        }
+    };
     Ok(Pcm::Disk(Arc::new(Mapped {
         ptr,
         bytes,
         frames,
         head,
+        peak,
     })))
 }
 
@@ -331,9 +359,7 @@ mod tests {
         // Two frames per index, so a frame that came back from the wrong place
         // is obvious.
         let frames = HEAD_FRAMES + 1_000;
-        let pcm: Vec<f32> = (0..frames)
-            .flat_map(|i| [i as f32, -(i as f32)])
-            .collect();
+        let pcm: Vec<f32> = (0..frames).flat_map(|i| [i as f32, -(i as f32)]).collect();
         let mapped = cache_and_map(&file, 48_000, pcm).expect("could not cache");
         assert_eq!(mapped.frames(), frames);
         for i in [0usize, 1, HEAD_FRAMES - 1, HEAD_FRAMES, frames - 1] {
@@ -343,10 +369,23 @@ mod tests {
         // place to find out about an off-by-one.
         assert_eq!(mapped.frame(frames), (0.0, 0.0));
 
+        // The peak, worked out once and read back from beside the cache.
+        let top = (frames - 1) as f32;
+        assert_eq!(mapped.peak(), top);
+        assert_eq!(
+            super::mapped(&file, 48_000).unwrap().peak(),
+            top,
+            "the sidecar"
+        );
+
         // And the second load does not need the audio again.
         assert!(super::mapped(&file, 48_000).is_some());
-        assert!(super::mapped(&file, 44_100).is_none(), "the rate is part of it");
+        assert!(
+            super::mapped(&file, 44_100).is_none(),
+            "the rate is part of it"
+        );
 
+        let _ = std::fs::remove_file(cache_path(&file, 48_000).with_extension("peak"));
         let _ = std::fs::remove_file(cache_path(&file, 48_000));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -360,5 +399,6 @@ mod tests {
         assert_eq!(pcm.frame(0), (0.25, -0.25));
         assert_eq!(pcm.frame(1), (0.5, -0.5));
         assert_eq!(pcm.frame(2), (0.0, 0.0));
+        assert_eq!(pcm.peak(), 0.5);
     }
 }

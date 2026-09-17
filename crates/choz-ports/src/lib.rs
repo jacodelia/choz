@@ -633,6 +633,16 @@ pub trait AudioSource: Send {
     /// 8192. Default no-op. RT thread, same constraints as `control_change`.
     fn pitch_bend(&mut self, _value: u16) {}
 
+    /// Aftertouch: how hard a key is being leaned on after it went down.
+    /// `note` is `Some` for polyphonic pressure and `None` for channel
+    /// pressure. Default no-op. RT thread, same constraints as
+    /// `control_change`.
+    ///
+    /// Its own message and not CC 11: a SoundFont reads CC 11 as expression,
+    /// which is volume, so a keyboard easing off the keys after a note sent
+    /// expression to zero and every note after it was silent.
+    fn pressure(&mut self, _note: Option<u8>, _value: u8) {}
+
     /// Select a bank/preset (program change). Default no-op: only multi-preset
     /// sources (SF2) react. Called on the RT thread, so implementations must not
     /// allocate or block.

@@ -209,6 +209,9 @@ pub struct SplitView<'a> {
     /// **note** rather than painting a zone, where nothing else on the keyboard
     /// says where the setting currently sits.
     pub highlight: Option<u8>,
+    /// Keys drawn in a colour of their own because something sounds there —
+    /// the sampler's audition picker marks the keys its samples are mapped to.
+    pub lit: &'a [(u8, Color)],
     /// Draw SELECT and CANCEL. SPLIT does not: it paints, and there is nothing
     /// to take back. A picker does, because a note tried by ear has to be
     /// possible to try and then not keep.
@@ -316,6 +319,9 @@ pub fn draw_split_modal(f: &mut Frame, area: Rect, v: SplitView) -> SplitRects {
         // on one that has them the key being set is the thing to see.
         if v.highlight == Some(n) {
             return Some(HEADER); // the chosen note wears the accent every heading here does
+        }
+        if let Some(&(_, c)) = v.lit.iter().find(|(k, _)| *k == n) {
+            return Some(c);
         }
         v.octaves
             .get(octave_of(n))

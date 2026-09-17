@@ -515,6 +515,22 @@ impl AudioSource for Sf2Synth {
         }
     }
 
+    /// Pressure as pressure: the SoundFont's own modulators decide what it
+    /// does, and most do nothing — which is right, and is not silence.
+    fn pressure(&mut self, note: Option<u8>, value: u8) {
+        let value = value.min(127);
+        for channel in 0..=ZONES as u8 {
+            let _ = self.synth.send_event(match note {
+                Some(key) => oxisynth::MidiEvent::PolyphonicKeyPressure {
+                    channel,
+                    key: key.min(127),
+                    value,
+                },
+                None => oxisynth::MidiEvent::ChannelPressure { channel, value },
+            });
+        }
+    }
+
     /// `0` = the SoundFont's own reverb send, `1` = its chorus send, both as
     /// on/off; everything after them is one of [`crate::instruments::sf2_patch::EDITS`].
     ///

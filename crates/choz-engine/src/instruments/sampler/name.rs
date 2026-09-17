@@ -58,8 +58,16 @@ pub fn parse(stem: &str) -> Parsed {
     // `C-1` is a note whose octave is -1, and `mezzo-forte` is one dynamic
     // rather than two. The hyphen comes apart further down, per token, where
     // `arco-normal` needs it and these two do not.
+    //
+    // **Unless the hyphen is all the name has.** `Cello-C3-f` and
+    // `Piano-A0-v64-rr2` are how a large share of packs are named, and there
+    // the hyphen *is* the separator: read whole, the note was never found.
+    let separators: &[char] = match stem.contains(['_', ' ']) {
+        true => &['_', '.', ' '],
+        false => &['_', '.', ' ', '-'],
+    };
     let tokens: Vec<&str> = stem
-        .split(['_', '.', ' '])
+        .split(separators)
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .collect();
@@ -164,6 +172,10 @@ fn dynamic_value(token: &str) -> Option<u8> {
         "f" | "forte" => 96,
         "ff" | "fortissimo" => 112,
         "fff" | "ffff" => 127,
+        // How drum and one-shot packs say it.
+        "soft" | "light" => 40,
+        "med" | "medium" => 80,
+        "hard" | "loud" => 120,
         _ => return None,
     })
 }
@@ -215,6 +227,19 @@ mod tests {
         // velocity 48 because of what the instrument is called.
         assert_eq!(parse("piano_C4").velocity, None);
         assert_eq!(parse("piano_C4_v80").velocity, Some(80));
+    }
+
+    /// A name held together only by hyphens is read the same as one held
+    /// together by underscores — and a hyphen inside an underscored name is
+    /// still part of a word.
+    #[test]
+    fn a_hyphenated_name_gives_up_its_note_and_dynamic() {
+        let p = parse("Cello-C3-f-rr2");
+        assert_eq!((p.note, p.velocity, p.round_robin), (Some(48), Some(96), Some(2)));
+        assert_eq!(parse("Piano-A0-v64").note, Some(21));
+        assert_eq!(parse("Snare-Hard").velocity, Some(120));
+        assert_eq!(parse("violin_A4_15_mezzo-forte_arco-normal").velocity, Some(76));
+        assert_eq!(parse("kick_C-1").note, Some(0));
     }
 
     #[test]

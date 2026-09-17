@@ -527,21 +527,27 @@ impl Lv2Instance {
             write += write_time_position(&mut buf[write..], time);
             for msg in &self.pending_midi {
                 let ev_hdr = std::mem::size_of::<LV2_Atom_Event>();
-                let needed = pad8(ev_hdr + 3);
+                // Program change and channel pressure are two bytes on the
+                // wire; saying three hands the plugin a stray zero.
+                let len = match msg[0] & 0xF0 {
+                    0xC0 | 0xD0 => 2,
+                    _ => 3,
+                };
+                let needed = pad8(ev_hdr + len);
                 if write + needed > buf.len() {
                     break;
                 }
                 let ev = LV2_Atom_Event {
                     frames: 0,
                     body: LV2_Atom {
-                        size: 3,
+                        size: len as u32,
                         type_: midi_urid,
                     },
                 };
                 let ev_bytes =
                     unsafe { std::slice::from_raw_parts(&ev as *const _ as *const u8, ev_hdr) };
                 buf[write..write + ev_hdr].copy_from_slice(ev_bytes);
-                buf[write + ev_hdr..write + ev_hdr + 3].copy_from_slice(&msg[..3]);
+                buf[write + ev_hdr..write + ev_hdr + len].copy_from_slice(&msg[..len]);
                 write += needed;
             }
         }
@@ -1422,6 +1428,13 @@ impl AudioSource for Lv2Instrument {
         let v = value.min(16383);
         self.inst
             .queue_midi([0xE0, (v & 0x7F) as u8, (v >> 7) as u8]);
+    }
+
+    fn pressure(&mut self, note: Option<u8>, value: u8) {
+        self.inst.queue_midi(match note {
+            Some(n) => [0xA0, n & 0x7F, value & 0x7F],
+            None => [0xD0, value & 0x7F, 0],
+        });
     }
 
     fn program_change(&mut self, bank: u8, preset: u8) {

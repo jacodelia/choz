@@ -502,9 +502,8 @@ pub struct UiSettings {
     /// The last folder `LOAD` was pointed at, so the picker opens where the
     /// library is rather than at `$HOME`.
     ///
-    /// Here rather than in the plugin paths because samples are **not** a
-    /// scanned format — see `PluginFormat::SCANNED`. This is where the picker
-    /// was, not a directory anything walks.
+    /// Beside the plugin paths rather than in them: this is where the picker
+    /// was, which is not the same as a directory the scan walks.
     #[serde(default)]
     pub samples_dir: Option<std::path::PathBuf>,
     /// Name of the theme the colours came from, for the UI to show which row is

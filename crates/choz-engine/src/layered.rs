@@ -113,6 +113,12 @@ impl AudioSource for Layered {
         }
     }
 
+    fn pressure(&mut self, note: Option<u8>, value: u8) {
+        for v in self.voices.iter_mut() {
+            v.pressure(note, value);
+        }
+    }
+
     fn all_notes_off(&mut self) {
         for v in self.voices.iter_mut() {
             v.all_notes_off();

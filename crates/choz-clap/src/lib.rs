@@ -1006,7 +1006,18 @@ mod tests {
     }
 
     /// Open the plugin the way a host does: through the entry point, by id.
+    ///
+    /// In a state directory of the test's own. The rack inside the plugin is
+    /// the whole of choz, and it saves `ui.json`, the plugin paths and the scan
+    /// cache like the application does — which these tests did into the
+    /// user's `~/.local/state/choz`.
     unsafe fn open() -> *const clap_plugin {
+        if std::env::var_os("XDG_STATE_HOME").is_none() {
+            let tmp = std::env::temp_dir().join(format!("choz_clap_state_{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&tmp);
+            // SAFETY: tests only, and every test that opens one holds `guard`.
+            unsafe { std::env::set_var("XDG_STATE_HOME", &tmp) };
+        }
         let factory = unsafe { entry_get_factory(CLAP_PLUGIN_FACTORY_ID.as_ptr()) }
             as *const clap_plugin_factory;
         assert!(!factory.is_null(), "the factory is not published");

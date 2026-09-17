@@ -66,6 +66,7 @@ impl jack::ProcessHandler for JackRt {
     fn process(&mut self, _: &Client, ps: &ProcessScope) -> Control {
         let started = std::time::Instant::now();
         let cpu_started = crate::meter::cpu_micros();
+        let faults_started = crate::meter::major_faults();
         let frames = ps.n_frames() as usize;
         self.state.apply_commands();
 
@@ -87,7 +88,13 @@ impl jack::ProcessHandler for JackRt {
         }
         self.read_midi(ps);
         self.write_midi(ps);
-        crate::engine::publish_load(started, cpu_started, frames, self.state.sample_rate);
+        crate::engine::publish_load(
+            started,
+            cpu_started,
+            faults_started,
+            frames,
+            self.state.sample_rate,
+        );
         Control::Continue
     }
 }

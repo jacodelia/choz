@@ -842,6 +842,13 @@ impl AudioSource for ClapInstrument {
         self.queue_midi([0xE0, (v & 0x7F) as u8, (v >> 7) as u8]);
     }
 
+    fn pressure(&mut self, note: Option<u8>, value: u8) {
+        self.queue_midi(match note {
+            Some(n) => [0xA0, n & 0x7F, value & 0x7F],
+            None => [0xD0, value & 0x7F, 0],
+        });
+    }
+
     fn set_param(&mut self, index: usize, value: f32) {
         queue_param(&mut self.queue, &self.params, index, value);
     }
