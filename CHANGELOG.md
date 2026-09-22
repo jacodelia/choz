@@ -32,6 +32,28 @@ lleva lo que falta —nada de lo ya hecho— y
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
 
+## [1.3.13] — 2026-09-21
+
+### 2026-09-21 — el arreglador suena dentro de un DAW, y el rack viaja en el paquete
+
+Dos cosas vistas en REAPER con la 1.3.12 instalada.
+
+**El arreglador del plugin no tocaba nunca.** `Embedded::tick` era una copia a
+mano de la lista del loop de la terminal y se había quedado sin
+`tick_arrangers`: PLAY lo ponía a tocar y la forma no avanzaba, con SoundFont o
+sin ella. Lo de "sin SF2 no suena, está bien" escondía que *con* SF2 tampoco.
+Ahora los dos loops llaman a un solo `App::tick_loop`, así que no pueden volver
+a separarse.
+
+**El paquete no traía el rack.** El `.deb`, el `.rpm`, el PKGBUILD y los
+tarballs instalaban `choz.clap` (los efectos y los artifacts) pero no
+`choz-rack.clap` (choz mismo). REAPER seguía cargando un rack 1.3.11 de
+`~/.clap`, anterior al chip `SAMPLE` de SOURCE, y el `choz.clap` viejo de ahí
+tapaba el nuevo de `/usr/lib/clap` por llevar el mismo nombre. El release
+compila `choz-clap` y lo instala como `/usr/lib/clap/choz-rack.clap`. Quien
+tenga copias en `~/.clap` de un `install.sh` anterior tiene que borrarlas para
+que el host vea las del paquete.
+
 ## [1.3.12] — 2026-09-21
 
 ### 2026-09-21 — los estilos del arreglador dejan de escribirse a mano

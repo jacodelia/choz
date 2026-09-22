@@ -80,7 +80,7 @@ en `arranger/rhythms`** por `tools/mid_to_styles.py`, su progresión se arma
 dentro de la TUI —una grilla de
 compases, un acorde por subdivisión de la agrupación— y sale
 en el `.clap` como cuarto artifact.** **La 1.0.0 está publicada y
-sus paquetes verificados; la 1.3.12 es este árbol.**
+sus paquetes verificados; la 1.3.13 es este árbol.**
 1045 tests (el workspace sin `choz-plugin-lv2`, que en esta máquina se cuelga),
 `clippy --workspace --all-targets -D warnings` limpio con `+beta`.
 
