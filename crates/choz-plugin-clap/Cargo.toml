@@ -6,7 +6,6 @@ description = "CLAP plugin hosting for choz (real hosting via clack-host behind 
 
 [dependencies]
 choz-ports.workspace = true
-anyhow.workspace = true
 serde.workspace = true
 clack-host = "0.1.0"
 # Same version clack-host itself depends on, so the raw struct layouts match.

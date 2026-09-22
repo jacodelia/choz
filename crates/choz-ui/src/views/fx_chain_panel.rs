@@ -515,6 +515,9 @@ pub struct SbxState {
     /// Blocks the child missed — audible gaps — and crash restarts.
     pub missed: u64,
     pub restarts: u64,
+    /// The supervisor gave up: too many crashes too fast, so the slot stays
+    /// silent instead of chasing another restart.
+    pub dead: bool,
 }
 
 /// Button text for a sandbox toggle: the state, and what it has cost.
@@ -525,6 +528,9 @@ pub fn sbx_label(s: SbxState) -> String {
         } else {
             " SBX \u{25CB} ".into()
         };
+    }
+    if s.dead {
+        return format!(" SBX \u{25CF} DEAD ({}\u{21BB}) ", s.restarts);
     }
     let mut label = String::from(" SBX \u{25CF}");
     if s.missed > 0 {

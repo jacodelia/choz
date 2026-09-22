@@ -322,7 +322,11 @@ Three more come and go:
    stay on it.
 5. **Sandbox supervisor**, one per sandboxed plugin: watches the child process
    and restarts it if it dies. The audio thread never waits on it — the exchange
-   has its own deadline and reads silence meanwhile.
+   has its own deadline and reads silence meanwhile. It also reads the child's
+   stderr through a pipe (instead of inheriting it) to forward it into the log
+   and to watch its rate — five crashes in ten seconds, or 16 MiB of output in
+   two, and it gives up: no more restarts, the plugin is quarantined, and the
+   `SBX` button reads `DEAD` instead of counting another restart.
 6. **Worker processes** (not threads): scanning and load-probing re-run the choz
    binary with `--choz-scan-worker` / `--choz-probe-worker` /
    `--choz-sandbox-worker`. Every child carries `CHOZ_WORKER=1`, so a worker never
@@ -1015,6 +1019,13 @@ layers, each measured against what is installed on the dev machine:
    audio, for a realtime thread that is waiting on it. Applied to whatever the
    probe saw die on teardown and to anything the user pins with the `SBX` button
    (`<state dir>/plugin-sandbox.json`).
+
+   **A restart is not unconditional.** A plugin that crashes five times inside
+   ten seconds, or that writes more than 16 MiB to stderr inside two, is not
+   restarted again: the supervisor quarantines it (`quarantine::set_forced`) and
+   marks it `dead`, so a plugin crash-looping or flooding the log (a real case:
+   an LV2 synth printing a ring-buffer warning on every dropped note, unrated)
+   costs one process's worth of CPU and disk instead of an unbounded amount.
 
    **Having a window is not a reason**, though it used to be. What that cost was
    measured on the rig it broke: at 96 kHz and 128 frames a block is 1.33 ms, and

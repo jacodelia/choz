@@ -4836,6 +4836,7 @@ impl App {
             state.live = true;
             state.missed = s.missed();
             state.restarts = s.restarts();
+            state.dead = s.dead();
         }
         state
     }

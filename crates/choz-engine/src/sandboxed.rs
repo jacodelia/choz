@@ -32,6 +32,20 @@ const CHANNELS: u32 = 2;
 /// rest of the callback — the other slots still have to be mixed.
 const DEADLINE_SHARE: f64 = 2.0 / 3.0;
 
+/// How many crashes inside [`CRASH_LOOP_WINDOW`] mean "this plugin is not
+/// coming back" rather than "unlucky once". A plugin that dies over and over
+/// costs a fresh process and a log line every time; past this many the
+/// supervisor stops feeding it restarts instead of chasing it forever.
+const CRASH_LOOP_RESTARTS: usize = 5;
+const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(10);
+
+/// How much stderr a plugin's child may write before it looks like a flood
+/// rather than ordinary chatter. A plugin printing a warning on every dropped
+/// note (AVLdrums' `Ringbuffer full`, unrated) fills a disk in minutes; no
+/// real diagnostic output needs 16 MiB every two seconds.
+const FLOOD_BYTES: u64 = 16 * 1024 * 1024;
+const FLOOD_WINDOW: Duration = Duration::from_secs(2);
+
 /// Everything needed to start the child again after it dies.
 #[derive(Clone)]
 struct ChildSpec {
@@ -57,7 +71,7 @@ impl ChildSpec {
             .arg(&self.shm_name)
             .arg(self.frames.to_string())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .context("cannot start the plugin sandbox")
     }
@@ -74,7 +88,7 @@ impl ChildSpec {
             .arg(&self.shm_name)
             .arg(self.frames.to_string())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .with_context(|| {
                 format!(
@@ -102,6 +116,66 @@ fn pd_host_exe() -> PathBuf {
     PathBuf::from(EXE)
 }
 
+/// Spawn `spec`'s child and start forwarding its stderr into choz's own
+/// (still going through this process's redirected fd 2, so it lands in the
+/// same log file it always did) — with a watch on the rate, so a plugin that
+/// starts flooding is killed instead of ridden out.
+fn spawn_watched(spec: &ChildSpec, flooded: &Arc<AtomicBool>) -> Result<std::process::Child> {
+    let mut child = spec.spawn()?;
+    if let Some(pipe) = child.stderr.take() {
+        watch_for_flood(pipe, child.id(), Arc::clone(flooded));
+    }
+    Ok(child)
+}
+
+/// Push one more `(when, bytes)` reading, drop whatever fell out of
+/// [`FLOOD_WINDOW`], and return the total still inside it. Split out so the
+/// windowing itself is testable without a pipe or a process.
+fn record_and_total(
+    recent: &mut Vec<(std::time::Instant, u64)>,
+    now: std::time::Instant,
+    bytes: u64,
+) -> u64 {
+    recent.retain(|(t, _)| now.duration_since(*t) < FLOOD_WINDOW);
+    recent.push((now, bytes));
+    recent.iter().map(|(_, b)| b).sum()
+}
+
+/// Copy `pipe` into choz's stderr, chunk by chunk, until either the child
+/// closes it (a normal exit) or it writes more than [`FLOOD_BYTES`] inside
+/// [`FLOOD_WINDOW`] — a plugin already known to misbehave enough to run
+/// sandboxed does not also get to fill the disk.
+fn watch_for_flood(mut pipe: std::process::ChildStderr, pid: u32, flooded: Arc<AtomicBool>) {
+    std::thread::Builder::new()
+        .name("choz-sandbox-log".into())
+        .spawn(move || {
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 8192];
+            // (when, bytes) still inside the window, oldest first.
+            let mut recent = Vec::<(std::time::Instant, u64)>::new();
+            loop {
+                let n = match pipe.read(&mut buf) {
+                    Ok(0) | Err(_) => return, // child closed it, or is gone
+                    Ok(n) => n,
+                };
+                let _ = std::io::stderr().write_all(&buf[..n]);
+                let total = record_and_total(&mut recent, std::time::Instant::now(), n as u64);
+                if total > FLOOD_BYTES {
+                    eprintln!(
+                        "choz: pid {pid} wrote {total} bytes in under {:?}; killing it before \
+                         it fills the disk",
+                        FLOOD_WINDOW,
+                    );
+                    flooded.store(true, Ordering::Relaxed);
+                    // SAFETY: our own child, by its own pid.
+                    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                    return;
+                }
+            }
+        })
+        .ok();
+}
+
 /// The host end: a plugin instance living in another process.
 pub struct SandboxedPlugin {
     bridge: Host,
@@ -114,6 +188,10 @@ pub struct SandboxedPlugin {
     child: Arc<std::sync::Mutex<std::process::Child>>,
     /// Set on drop so the supervisor stops resurrecting anything.
     closing: Arc<AtomicBool>,
+    /// Set by the log-flood watcher when it kills a child for writing too much
+    /// too fast, so the supervisor gives up instead of restarting it into
+    /// another flood.
+    flooded: Arc<AtomicBool>,
     /// Missed blocks and restarts, shared with whoever is showing them. The
     /// instance itself belongs to the RT thread, so this is all the UI gets.
     status: choz_ports::SandboxStatus,
@@ -162,7 +240,8 @@ impl SandboxedPlugin {
             shm_name: name,
             frames,
         };
-        let child = Arc::new(std::sync::Mutex::new(spec.spawn()?));
+        let flooded = Arc::new(AtomicBool::new(false));
+        let child = Arc::new(std::sync::Mutex::new(spawn_watched(&spec, &flooded)?));
 
         let block = frames as usize * CHANNELS as usize;
         let mut me = Self {
@@ -170,6 +249,7 @@ impl SandboxedPlugin {
             shm: Arc::new(shm),
             child: Arc::clone(&child),
             closing: Arc::new(AtomicBool::new(false)),
+            flooded,
             status: choz_ports::SandboxStatus::default(),
             supervisor: None,
             frames: frames as usize,
@@ -257,10 +337,23 @@ impl SandboxedPlugin {
     fn supervise(&mut self, spec: ChildSpec) {
         let child = Arc::clone(&self.child);
         let closing = Arc::clone(&self.closing);
+        let flooded = Arc::clone(&self.flooded);
         let restarts = Arc::clone(&self.status.restarts);
+        let dead = Arc::clone(&self.status.dead);
         let handle = std::thread::Builder::new()
             .name("choz-sandbox-supervisor".into())
             .spawn(move || {
+                // Timestamps of restarts still inside the crash-loop window,
+                // oldest first. Local to this thread: nothing else touches it.
+                let mut recent = Vec::<std::time::Instant>::new();
+                let give_up = |reason: &str| {
+                    eprintln!(
+                        "choz: {} {reason}; quarantining it instead of restarting it again",
+                        spec.path.display(),
+                    );
+                    crate::quarantine::set_forced(spec.format, &spec.path, &spec.id, true);
+                    dead.store(true, Ordering::Relaxed);
+                };
                 loop {
                     // `wait` needs the lock only while the child is gone; poll
                     // instead so `Drop` can still kill it.
@@ -278,8 +371,25 @@ impl SandboxedPlugin {
                     if closing.load(Ordering::Relaxed) {
                         return;
                     }
+                    // The log watcher already killed this one for flooding —
+                    // restarting it would just flood again.
+                    if flooded.swap(false, Ordering::Relaxed) {
+                        give_up(&format!("flooded the log ({exited})"));
+                        return;
+                    }
+                    let now = std::time::Instant::now();
+                    recent.retain(|t| now.duration_since(*t) < CRASH_LOOP_WINDOW);
+                    recent.push(now);
+                    if recent.len() > CRASH_LOOP_RESTARTS {
+                        give_up(&format!(
+                            "crashed {} times in {:?} ({exited})",
+                            recent.len(),
+                            CRASH_LOOP_WINDOW,
+                        ));
+                        return;
+                    }
                     eprintln!("choz: plugin sandbox died ({exited}); restarting it");
-                    match spec.spawn() {
+                    match spawn_watched(&spec, &flooded) {
                         Ok(fresh) => {
                             if let Ok(mut slot) = child.lock() {
                                 *slot = fresh;
@@ -719,5 +829,40 @@ impl Drop for EditorThread {
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod flood_tests {
+    use super::*;
+
+    #[test]
+    fn a_burst_under_the_limit_does_not_total_past_it() {
+        let mut recent = Vec::new();
+        let now = std::time::Instant::now();
+        let total = record_and_total(&mut recent, now, FLOOD_BYTES - 1);
+        assert!(total <= FLOOD_BYTES);
+    }
+
+    #[test]
+    fn readings_past_the_limit_add_up_to_a_flood() {
+        let mut recent = Vec::new();
+        let now = std::time::Instant::now();
+        record_and_total(&mut recent, now, FLOOD_BYTES / 2);
+        let total = record_and_total(&mut recent, now, FLOOD_BYTES / 2 + 1);
+        assert!(total > FLOOD_BYTES, "two halves plus one byte should flood");
+    }
+
+    #[test]
+    fn a_reading_outside_the_window_is_forgotten() {
+        let mut recent = Vec::new();
+        let now = std::time::Instant::now();
+        record_and_total(&mut recent, now, FLOOD_BYTES);
+        // Long past the window: the old reading must not still count, or a
+        // plugin that was merely verbose once, minutes ago, would look like
+        // it is flooding right now.
+        let later = now + FLOOD_WINDOW + Duration::from_secs(1);
+        let total = record_and_total(&mut recent, later, 1);
+        assert_eq!(total, 1, "the old reading should have aged out");
     }
 }
