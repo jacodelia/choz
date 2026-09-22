@@ -7,7 +7,7 @@
 //! you can get back, and a bug is one you can reproduce.
 
 use super::chord::{Chord, Progression};
-use super::style::{Lead, Style};
+use super::style::Style;
 
 /// General MIDI percussion, which is what the drum part speaks. The kit is the
 /// instrument's business — a tab with a GM SoundFont on channel 10, or a drum
@@ -35,27 +35,27 @@ pub enum Role {
     #[default]
     Bass,
     Drums,
+    /// `Melody` and `Solo` are what a project written before those roles went
+    /// says, and they read back as this one: a saved rack must not stop opening
+    /// because a role did.
+    #[serde(alias = "Melody", alias = "Solo")]
     Piano,
-    /// The same chords with a guitar's voicings and a strum across them.
+    /// The same chords with a guitar's voicings and a strum across them, and
+    /// the rhythm the piano is *not* playing — see [`counter_hold`].
     Guitar,
-    /// The tune: one line, in motifs, over the same progression.
-    Melody,
-    /// The same shape played busier and leaning on the chord changes.
-    Solo,
 }
 
 impl Role {
     /// New roles go on the **end**: the variant's position is what a saved
     /// project wrote and what [`Rng::new`] seeds from, so moving one changes
     /// both the role a project reopens with and what it plays.
-    pub const ALL: [Role; 6] = [
-        Role::Bass,
-        Role::Drums,
-        Role::Piano,
-        Role::Melody,
-        Role::Solo,
-        Role::Guitar,
-    ];
+    /// **A band, not a whole arrangement.** The tune and the solo were here and
+    /// went: what the arranger is for is the part nobody in the room is going
+    /// to play, and the melody is the thing the player *is* playing. What they
+    /// left behind — a lead's register, its menu of durations — went with the
+    /// hand-written styles: what plays now is measured off real rhythms, and
+    /// there is nothing in a measurement for a role nobody has.
+    pub const ALL: [Role; 4] = [Role::Bass, Role::Drums, Role::Piano, Role::Guitar];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -63,20 +63,23 @@ impl Role {
             Role::Drums => "DRUMS",
             Role::Piano => "PIANO",
             Role::Guitar => "GUITAR",
-            Role::Melody => "MELODY",
-            Role::Solo => "SOLO",
         }
     }
 }
 
 /// A note in the arrangement. Positions are in beats from the top of the
 /// progression, which is the only timeline the roles share.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Note {
     pub note: u8,
     pub vel: u8,
     pub start: f64,
     pub len: f64,
+    /// Who plays it. Carried on the note because a band in one tab is several
+    /// parts on one timeline, and where a note goes — which zone of the tab's
+    /// instrument holds the kit, the bass, the horn — is not something the
+    /// pitch can say: a bass and a piano share notes.
+    pub role: Role,
 }
 
 /// xorshift32: a sequence rather than a surprise, and the same one the
@@ -123,67 +126,122 @@ impl Rng {
     }
 }
 
-/// How near two notes have to be in time to count as the same moment: an
-/// eighth at the tempo everything defaults to.
-const UNISON: f64 = 0.25;
-
-/// Move what lands on the same note at the same moment as something in
-/// `others` — up a step, or down when there is no room.
+/// What the band is playing *into*: the tempo, the bar, and the three knobs a
+/// player turns by ear.
 ///
-/// A unison between two lines is not a chord, it is one line with a thicker
-/// tone, and the seed is all that was keeping them apart.
-fn avoid(part: &mut [Note], others: &[Note], low: u8, high: u8) {
-    for n in part.iter_mut() {
-        let clash = others
-            .iter()
-            .any(|o| o.note == n.note && (o.start - n.start).abs() < UNISON);
-        if clash {
-            // A step up, or down when the top of the register is in the way.
-            // Never out of the register: the line it belongs to is the line it
-            // has to stay in.
-            n.note = match n.note.saturating_add(2) <= high {
-                true => n.note + 2,
-                false => n.note.saturating_sub(2).max(low),
-            };
+/// Passed in rather than read off the transport, so baking stays a function of
+/// its arguments — see the module's own promise about the seed.
+#[derive(Debug, Clone, Copy)]
+pub struct Bake<'a> {
+    /// What it will be played at. Only the drums read it: what a kit can play
+    /// at 130 and what it can play at 230 are different parts.
+    pub bpm: f32,
+    /// On top of the style's own swing, as a share of the division it counts
+    /// in. The sequencer's knob, on the same scale, because there is one swing
+    /// in this program.
+    pub swing: f32,
+    /// **How far** a note may stray from what was generated, 0..1 — the size of
+    /// the deviation, in velocity and in time.
+    pub random: f32,
+    /// **How often** that deviation is applied, 0..1. Rolled once a note: at 0
+    /// the part plays exactly as it was generated.
+    pub prob: f32,
+    /// How the bar is grouped — `3+2+2` for a 7/8 counted the way the metronome
+    /// clicks it. Empty is a bar that is not grouped, which is most of them.
+    /// The group each one starts on is where the accent goes.
+    pub groups: &'a [u8],
+}
+
+impl Bake<'_> {
+    /// Everything at its default, at `bpm` — what the tests and a plain tab
+    /// bake with.
+    pub fn at(bpm: f32) -> Self {
+        Self {
+            bpm,
+            swing: 0.0,
+            random: 0.0,
+            prob: 0.0,
+            groups: &[],
         }
+    }
+
+    /// The beat each group of the bar starts on.
+    fn accents(&self, groups: &[u8], beats_per_bar: f64, unit: f64) -> Vec<f64> {
+        let mut out = Vec::new();
+        let mut at = 0.0;
+        for g in groups.iter().copied() {
+            if at >= beats_per_bar - 1e-9 {
+                break;
+            }
+            out.push(at);
+            at += g as f64 * unit;
+        }
+        out
     }
 }
 
-/// The whole of a role's part.
-pub fn bake(prog: &Progression, style: &Style, role: Role, seed: u32) -> Vec<Note> {
+/// The whole of a role's part. Every note comes out stamped with who plays it
+/// — see [`Note::role`].
+pub fn bake(prog: &Progression, style: &Style, role: Role, seed: u32, ctx: &Bake) -> Vec<Note> {
+    // The style, with the knobs on it: the swing is the style's plus the tab's,
+    // because a style is a feel and a knob is a player leaning on it.
+    let style = &Style {
+        swing: (style.swing + ctx.swing).clamp(0.0, 0.9),
+        ..*style
+    };
     let mut rng = Rng::new(seed, role, style.human * role_feel(role));
     let mut out = Vec::new();
     match role {
         Role::Bass => bass(prog, style, &mut rng, &mut out),
-        Role::Drums => drums(prog, style, &mut rng, &mut out),
-        Role::Piano => comp(prog, style, &mut rng, &mut out, style.comp, 0.0, true),
-        Role::Guitar => comp(
+        Role::Drums => drums(prog, style, &mut rng, &mut out, ctx),
+        Role::Piano => comp(
             prog,
             style,
             &mut rng,
             &mut out,
-            style.guitar.unwrap_or_else(|| guitar_of(style.comp)),
-            style.strum.max(0.0),
-            false,
+            style.comp,
+            0.0,
+            true,
+            PIANO_NOTES,
         ),
-        Role::Melody => lead(prog, style, &mut rng, &mut out, style.lead),
-        Role::Solo => {
-            lead(
+        // The guitar plays against the piano rather than beside it: whatever
+        // the piano is holding, this is the other length — see
+        // [`counter_hold`]. Two chord instruments playing the same rhythm is
+        // one chord instrument with a chorus on it.
+        Role::Guitar => {
+            let mut c = style.guitar.unwrap_or_else(|| guitar_of(style.comp));
+            c.hold = counter_hold(style.comp.hold, style.beats_per_bar);
+            comp(
                 prog,
                 style,
                 &mut rng,
                 &mut out,
-                style.solo.unwrap_or_else(|| solo_of(style.lead)),
-            );
-            // The soloist hears the tune. Every role bakes on its own — that is
-            // what lets one tab play one part — but the parts are a function of
-            // the text and the seed, so the solo can bake the melody and get
-            // out of its way. It is the only pair where landing on the same
-            // note at the same time is heard as a mistake.
-            let l = style.solo.unwrap_or_else(|| solo_of(style.lead));
-            let melody = bake(prog, style, Role::Melody, seed);
-            avoid(&mut out, &melody, l.low, l.high);
+                c,
+                style.strum.max(0.0),
+                false,
+                GUITAR_NOTES,
+            )
         }
+    }
+    // Stamped here rather than in six generators: whoever is baking is the
+    // role that was asked for, and a generator that has to remember to say so
+    // is a generator that will forget.
+    for n in out.iter_mut() {
+        n.role = role;
+    }
+    // The two knobs that are not the style's: how far a note may stray and how
+    // often it does. The sequencer's pair, with the same meanings — what makes
+    // a part that goes round twelve bars stop sounding like it is going round
+    // twelve bars.
+    vary(&mut out, &mut rng, ctx.random, ctx.prob);
+    // The accents the bar's grouping asks for: a 7/8 counted 3+2+2 leans on the
+    // beat each group starts on, which is what makes it that 7/8 and not the
+    // other one.
+    accent(&mut out, ctx, prog, style.beats_per_bar);
+    // A chord instrument lets go when it plays again: whatever the style says a
+    // chord is held for, the next strum is what ends it.
+    if matches!(role, Role::Piano | Role::Guitar) {
+        damp(&mut out);
     }
     let total = prog.beats(style.beats_per_bar);
     out.retain(|n| n.start < total && n.len > 0.0);
@@ -193,7 +251,46 @@ pub fn bake(prog: &Progression, style: &Style, role: Role, seed: u32) -> Vec<Not
         n.len = n.len.min(total - n.start);
     }
     out.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.note.cmp(&b.note)));
+    balance(&mut out, role);
     out
+}
+
+/// The band's own mix, applied last: what a role is worth against the others,
+/// and what a chord is worth against a single note.
+///
+/// A style's `vel` is how hard the *kit* hits — it is measured off the drums —
+/// and handing the same number to four players is four players fighting for
+/// the same room. Worse, a chord instrument puts five notes where the bass puts
+/// one, so a comp at the bass's velocity is five times the bass's energy and
+/// the line disappears under it. Both of those are mixing and neither belongs
+/// in a generator, so they happen here, once, to whatever came out.
+///
+/// The fader in the box is on top of this — see [`super::Arranger::rebake`].
+fn balance(out: &mut [Note], role: Role) {
+    // The bass is the reference. Everything else sits under it, because what a
+    // backing band is for is the part nobody in the room is playing, and the
+    // one you have to hear is the one holding the harmony down.
+    let level = match role {
+        Role::Bass => 1.0,
+        Role::Drums => 0.82,
+        Role::Piano => 0.62,
+        Role::Guitar => 0.55,
+    };
+    // Notes struck together share the room they are given. Not `1/n` — that is
+    // a chord quieter than one note of it, which is not what a piano does —
+    // but the square root, which keeps the *sum* roughly level.
+    let mut i = 0;
+    while i < out.len() {
+        let mut j = i + 1;
+        while j < out.len() && (out[j].start - out[i].start).abs() < 1e-6 {
+            j += 1;
+        }
+        let share = level / ((j - i) as f32).sqrt();
+        for n in &mut out[i..j] {
+            n.vel = (n.vel as f32 * share).round().clamp(1.0, 127.0) as u8;
+        }
+        i = j;
+    }
 }
 
 /// How far an off-division is pushed late, in beats. The sequencer's reading
@@ -213,6 +310,78 @@ fn swung(pos: f64, style: &Style) -> f64 {
     }
 }
 
+/// Move what the dice say to move: `random` is how far, `prob` is how often.
+///
+/// Velocity and time, never pitch — a note in another place is a mistake, and a
+/// note at another weight is a player. Deterministic, like everything else
+/// here: the same seed gives the same variation.
+fn vary(part: &mut [Note], rng: &mut Rng, random: f32, prob: f32) {
+    if random <= 0.0 || prob <= 0.0 {
+        return;
+    }
+    for n in part.iter_mut() {
+        if !rng.chance(prob) {
+            continue;
+        }
+        let v = n.vel as f32 * (1.0 - random * 0.5 * rng.f());
+        n.vel = v.clamp(1.0, 127.0) as u8;
+        // A twentieth of a beat at the widest, either way: past that it is not
+        // a player pushing, it is a note in the wrong place.
+        let shift = (rng.f() as f64 - 0.5) * 0.1 * random as f64;
+        n.start = (n.start + shift).max(0.0);
+        n.len = (n.len * (1.0 - random as f64 * 0.3 * rng.f() as f64)).max(0.05);
+    }
+}
+
+/// Lean on the beat each group of the bar starts on.
+///
+/// Only where the bar says it is grouped: `3+2+2` is not seven equal eighths,
+/// and the difference between it and `2+2+3` is exactly this.
+///
+/// **Each bar is grouped on its own.** A bar written `| Cm:3 F:2 Bb:2 |` says
+/// where its own accents are; the tab's grouping — the metronome's, or the one
+/// the arranger was given — is what a bar that said nothing is counted in.
+fn accent(part: &mut [Note], ctx: &Bake, prog: &Progression, beats_per_bar: f64) {
+    if beats_per_bar <= 0.0 {
+        return;
+    }
+    let bars = prog.bars.len();
+    for n in part.iter_mut() {
+        let bar = (n.start / beats_per_bar).floor();
+        if bar < 0.0 || bar >= bars as f64 {
+            continue;
+        }
+        // The bar's own weights when it was written with more than one slot,
+        // the tab's grouping otherwise.
+        let own = prog.bars[bar as usize].groups();
+        let groups: &[u8] = match own.len() >= 2 {
+            true => &own,
+            false => ctx.groups,
+        };
+        if groups.len() < 2 {
+            continue;
+        }
+        let cells: f64 = groups.iter().map(|g| *g as f64).sum();
+        if cells <= 0.0 {
+            continue;
+        }
+        // What one group-count is worth, in beats: seven eighths in a bar of
+        // 3.5 beats is half a beat each.
+        let unit = beats_per_bar / cells;
+        let starts = ctx.accents(groups, beats_per_bar, unit);
+        let into = n.start - bar * beats_per_bar;
+        // The downbeat is already the loudest thing in the bar; this is about
+        // the ones inside it.
+        if starts
+            .iter()
+            .skip(1)
+            .any(|s| (into - s).abs() < unit * 0.25)
+        {
+            n.vel = n.vel.saturating_add(10).min(127);
+        }
+    }
+}
+
 /// How loose a role is allowed to be, against the style's own looseness. The
 /// drummer is the clock and the soloist is the one allowed to lean on it;
 /// putting the same jitter on both is what makes a generated band sound like
@@ -222,8 +391,6 @@ fn role_feel(role: Role) -> f32 {
         Role::Drums => 0.6,
         Role::Bass => 0.8,
         Role::Piano | Role::Guitar => 1.0,
-        Role::Melody => 1.2,
-        Role::Solo => 1.4,
     }
 }
 
@@ -332,6 +499,8 @@ fn bass(prog: &Progression, style: &Style, rng: &mut Rng, out: &mut Vec<Note>) {
                     true => 1.4,
                     false => 0.9,
                 },
+                // Who plays it is stamped by `bake`, which knows.
+                ..Default::default()
             };
             // What came before has to get out of the way of an anticipation,
             // or the two overlap and the same note is asked to stop twice.
@@ -419,18 +588,53 @@ fn chord_tone(chord: &Chord, prev: u8, b: &super::style::Bass, rng: &mut Rng) ->
 
 /// Kick, snare, a cymbal keeping time, ghost notes, and a fill where the form
 /// turns. The sounds are the instrument's; this is only what is hit and when.
-fn drums(prog: &Progression, style: &Style, rng: &mut Rng, out: &mut Vec<Note>) {
+fn drums(prog: &Progression, style: &Style, rng: &mut Rng, out: &mut Vec<Note>, ctx: &Bake) {
+    let bpm = ctx.bpm;
     let bpb = style.beats_per_bar;
     let d = style.drums;
+    // What the tempo leaves room for. A style's numbers are written for the
+    // feel and not for the clock, so a funk counting sixteenths on the hat is
+    // right at 100 and is a buzz at 230 — the hands thin out, which is what a
+    // drummer does and what the generated part used not to.
+    let fast = bpm >= FAST_BPM;
+    let very_fast = bpm >= VERY_FAST_BPM;
+    let cymbal = match (fast, very_fast) {
+        (_, true) => d.cymbal.max(1.0),
+        (true, _) => d.cymbal.max(0.5),
+        _ => d.cymbal,
+    };
+    // The ghosts are the first thing to go: they live between the hands, and at
+    // this tempo there is nothing between them.
+    let ghost = match (fast, very_fast) {
+        (_, true) => 0.0,
+        (true, _) => d.ghost * 0.35,
+        _ => d.ghost,
+    };
+    let grid = fill_grid(bpm);
+    // The fill played last, so the next one is a different one.
+    let mut last_fill: Option<usize> = None;
     for bar in 0..prog.bars.len() {
         let at = bar as f64 * bpb;
-        let fill = d.fill_every > 0 && (bar + 1) % d.fill_every == 0;
-        // The turnaround: the bar that hands the form back to the top gets two
-        // beats of fill instead of one. Everything else keeps its last beat.
-        let turnaround = fill && bar + 1 == prog.bars.len() && bpb >= 3.0;
-        let last_beat = match turnaround {
-            true => bpb - 2.0,
-            false => bpb - 1.0,
+        // **The fill is chosen before the groove is laid**, because how much of
+        // the bar it takes is what says where the groove stops: a two-beat
+        // turnaround that started while the hat was still counting would be two
+        // drummers. `None` is a bar with no fill in it at all, and then nothing
+        // stops.
+        let wanted = d.fill_every > 0 && (bar + 1) % d.fill_every == 0;
+        // The turnaround: the bar that hands the form back to the top asks for
+        // two beats instead of one.
+        let turnaround = wanted && bar + 1 == prog.bars.len() && bpb >= 3.0;
+        let chosen = match wanted {
+            true => pick_fill(rng, if turnaround { 2.0 } else { 1.0 }, grid, last_fill),
+            false => None,
+        };
+        if chosen.is_some() {
+            last_fill = chosen;
+        }
+        let fill = chosen.is_some();
+        let last_beat = match chosen {
+            Some(i) => bpb - FILLS[i].beats,
+            None => bpb,
         };
 
         for pos in d.kick.iter().copied() {
@@ -444,7 +648,7 @@ fn drums(prog: &Progression, style: &Style, rng: &mut Rng, out: &mut Vec<Note>) 
         }
         // The cymbal: a ride swings its off-beats, a hat does not, and both
         // stop where a fill starts.
-        let cymbal = match d.ride {
+        let drum = match d.ride {
             true => gm::RIDE,
             false => gm::HAT_CLOSED,
         };
@@ -456,15 +660,28 @@ fn drums(prog: &Progression, style: &Style, rng: &mut Rng, out: &mut Vec<Note>) 
                     true => style.vel,
                     false => style.vel.saturating_sub(18),
                 };
-                push_hit(out, rng, cymbal, at + swung(pos, style), vel, 0.2);
+                push_hit(out, rng, drum, at + swung(pos, style), vel, 0.2);
             }
-            pos += d.cymbal.max(0.125);
+            pos += cymbal.max(0.125);
         }
         // Ghosts: quiet snares between the backbeats, which is the difference
         // between a drum machine and someone playing one.
-        let mut g = 0.5;
+        //
+        // On the division the style counts in, not on every half beat: a funk
+        // ghosts in sixteenths and a shuffle in swung eighths, and putting both
+        // on the same grid was what made the two sound like the same drummer.
+        // Never on a beat that already has something on it, and never on a bare
+        // downbeat — a ghost is what fills the gap, not what marks the bar.
+        let step = cymbal.max(0.125);
+        let mut g = step;
         while g < bpb - 1e-9 {
-            if !(fill && g >= last_beat) && rng.chance(d.ghost) {
+            let taken = d
+                .kick
+                .iter()
+                .chain(d.snare.iter())
+                .any(|p| (p - g).abs() < 1e-6)
+                || g.fract().abs() < 1e-6;
+            if !taken && !(fill && g >= last_beat) && rng.chance(ghost) {
                 push_hit(
                     out,
                     rng,
@@ -474,28 +691,20 @@ fn drums(prog: &Progression, style: &Style, rng: &mut Rng, out: &mut Vec<Note>) 
                     0.15,
                 );
             }
-            g += 1.0;
+            g += step;
         }
-        // A fill is a table of four sixteenths, and which of the tables it is
-        // comes off the dice: the same fill every four bars is the thing that
-        // gives a generated drummer away in one chorus.
-        if fill {
-            // Two tables on the turnaround, one anywhere else — and never the
-            // same table twice in a row, which is the whole point of there
-            // being four of them.
-            let first = rng.pick(FILLS.len());
-            let shapes: Vec<[u8; 4]> = match turnaround {
-                true => vec![FILLS[first], FILLS[(first + 1 + rng.pick(FILLS.len() - 1)) % FILLS.len()]],
-                false => vec![FILLS[first]],
-            };
-            let hits: Vec<u8> = shapes.concat();
-            let n = hits.len();
-            for (i, note) in hits.into_iter().enumerate() {
-                let pos = at + last_beat + i as f64 * 0.25;
-                // Fills build: the last sixteenth is the one that hands the bar
-                // back, and it is the loudest.
-                let step = (12 * (n - 1 - i) / (n - 1).max(1)) as u8;
-                push_hit(out, rng, note, pos, style.vel.saturating_sub(step), 0.2);
+        // The fill: one played by somebody, off the table — a beat of it where
+        // the form is only turning a corner, two where it goes back to the top.
+        // Never the same one twice running, and never one the tempo cannot
+        // carry: see [`pick_fill`].
+        if let Some(i) = chosen {
+            let f = &FILLS[i];
+            // Laid so it *ends* on the barline, which is where the groove picks
+            // the bar back up.
+            let from = at + bpb - f.beats;
+            for (pos, note, vel) in f.hits.iter().copied() {
+                let vel = (style.vel as f32 * vel).clamp(1.0, 127.0) as u8;
+                push_hit(out, rng, note, from + pos, vel, 0.2);
             }
         }
         // The crash marks where the form comes back round, downbeat of the bar
@@ -506,15 +715,235 @@ fn drums(prog: &Progression, style: &Style, rng: &mut Rng, out: &mut Vec<Note>) 
     }
 }
 
-/// The fills, as tables: down the toms, a roll on the snare, and the one that
-/// answers itself in pairs. Four sixteenths on the last beat, which is the
-/// fill that fits in every style here.
-const FILLS: &[[u8; 4]] = &[
-    [gm::SNARE, gm::TOM_HI, gm::TOM_MID, gm::TOM_LO],
-    [gm::SNARE, gm::SNARE, gm::SNARE, gm::SNARE],
-    [gm::SNARE, gm::SNARE, gm::TOM_LO, gm::TOM_LO],
-    [gm::TOM_HI, gm::TOM_HI, gm::TOM_MID, gm::SNARE],
+/// A fill, as it was played: where each hit falls inside it, which drum it is,
+/// and how hard against the style's own velocity.
+///
+/// # Where these come from
+///
+/// The `Drums/` folder of a 52,000-file MIDI collection — 196 loops, 232 bars
+/// of them fills — folded onto a sixteenth grid and counted. What is here is
+/// the shapes that came up most, kept as they were played: the tom that
+/// answers itself with the kick under it, the single-stroke roll that builds
+/// into the downbeat, the paradiddle with the kick on the second stroke, the
+/// open hat that gets choked by the snare. A generated fill is only as good as
+/// the fills it was copied from.
+pub struct Fill {
+    /// How much of the bar it takes, in beats. One beat is an ordinary fill and
+    /// two is what a turnaround gets.
+    pub beats: f64,
+    /// `(beats into the fill, drum, share of the style's velocity)`.
+    pub hits: &'static [(f64, u8, f32)],
+}
+
+impl Fill {
+    /// The shortest step in it, in beats — what says whether a tempo can carry
+    /// it. A sixteenth at 220 is 68 ms, and what a kit plays at 68 ms is a
+    /// single-stroke roll, not four separate drums.
+    fn finest(&self) -> f64 {
+        let mut finest = self.beats;
+        for w in self.hits.windows(2) {
+            let step = w[1].0 - w[0].0;
+            if step > 1e-6 && step < finest {
+                finest = step;
+            }
+        }
+        finest
+    }
+}
+
+/// The fills. One beat and two, sixteenths and eighths — the eighth ones are
+/// what a fast tempo is left with, and they are real fills and not the others
+/// with hits taken out.
+pub const FILLS: &[Fill] = &[
+    // ── A beat of sixteenths ────────────────────────────────────────────
+    // Down the toms, which is the fill everybody knows.
+    Fill {
+        beats: 1.0,
+        hits: &[
+            (0.0, gm::TOM_HI, 0.92),
+            (0.25, gm::TOM_MID, 0.95),
+            (0.5, gm::TOM_LO, 1.0),
+            (0.75, gm::TOM_LO, 1.05),
+        ],
+    },
+    // The single-stroke roll, building into the downbeat.
+    Fill {
+        beats: 1.0,
+        hits: &[
+            (0.0, gm::SNARE, 0.8),
+            (0.25, gm::SNARE, 0.88),
+            (0.5, gm::SNARE, 0.96),
+            (0.75, gm::SNARE, 1.05),
+        ],
+    },
+    // The one with the kick under the first stroke — 7 bars of the library.
+    Fill {
+        beats: 1.0,
+        hits: &[
+            (0.0, gm::KICK, 1.0),
+            (0.0, gm::SNARE, 0.85),
+            (0.25, gm::SNARE, 0.9),
+            (0.5, gm::SNARE, 0.95),
+            (0.75, gm::SNARE, 1.05),
+        ],
+    },
+    // The open hat choked by the snare, straight out of the funk loops.
+    Fill {
+        beats: 1.0,
+        hits: &[
+            (0.0, gm::HAT_OPEN, 0.8),
+            (0.25, gm::SNARE, 0.85),
+            (0.5, gm::KICK, 1.0),
+            (0.75, gm::SNARE, 1.0),
+        ],
+    },
+    // The paradiddle: kick, kick, snare, kick.
+    Fill {
+        beats: 1.0,
+        hits: &[
+            (0.0, gm::KICK, 1.0),
+            (0.25, gm::KICK, 0.9),
+            (0.5, gm::SNARE, 0.95),
+            (0.75, gm::KICK, 1.0),
+        ],
+    },
+    // Snare and mid tom answering each other.
+    Fill {
+        beats: 1.0,
+        hits: &[
+            (0.0, gm::TOM_MID, 0.9),
+            (0.25, gm::SNARE, 0.9),
+            (0.5, gm::SNARE, 0.95),
+            (0.75, gm::TOM_MID, 1.05),
+        ],
+    },
+    // ── A beat of eighths — what a fast tempo can actually play ─────────
+    // The most common bar in the whole library: floor tom, then the kick and
+    // the floor tom together.
+    Fill {
+        beats: 1.0,
+        hits: &[
+            (0.0, gm::TOM_LO, 0.95),
+            (0.5, gm::KICK, 1.0),
+            (0.5, gm::TOM_LO, 1.05),
+        ],
+    },
+    Fill {
+        beats: 1.0,
+        hits: &[(0.0, gm::SNARE, 0.9), (0.5, gm::TOM_LO, 1.05)],
+    },
+    Fill {
+        beats: 1.0,
+        hits: &[(0.0, gm::TOM_HI, 0.9), (0.5, gm::TOM_LO, 1.05)],
+    },
+    Fill {
+        beats: 1.0,
+        hits: &[(0.0, gm::KICK, 1.0), (0.5, gm::SNARE, 1.05)],
+    },
+    // ── Two beats: the turnaround ───────────────────────────────────────
+    // The library's most common two-beat shape, in eighths, so it survives a
+    // fast tempo as well.
+    Fill {
+        beats: 2.0,
+        hits: &[
+            (0.0, gm::KICK, 0.95),
+            (1.0, gm::TOM_LO, 0.95),
+            (1.5, gm::KICK, 1.0),
+            (1.5, gm::TOM_LO, 1.05),
+        ],
+    },
+    Fill {
+        beats: 2.0,
+        hits: &[
+            (0.0, gm::KICK, 0.95),
+            (0.5, gm::TOM_LO, 0.9),
+            (1.0, gm::SNARE, 1.0),
+            (1.5, gm::TOM_LO, 1.05),
+        ],
+    },
+    // Down the kit: high tom twice, then the floor tom with the kick.
+    Fill {
+        beats: 2.0,
+        hits: &[
+            (0.0, gm::KICK, 0.95),
+            (0.5, gm::TOM_HI, 0.88),
+            (0.75, gm::TOM_HI, 0.92),
+            (1.0, gm::TOM_MID, 0.96),
+            (1.5, gm::KICK, 1.0),
+            (1.5, gm::TOM_LO, 1.05),
+        ],
+    },
+    // Two beats of single strokes, which is what a rock turnaround is.
+    Fill {
+        beats: 2.0,
+        hits: &[
+            (0.0, gm::SNARE, 0.72),
+            (0.25, gm::SNARE, 0.76),
+            (0.5, gm::SNARE, 0.8),
+            (0.75, gm::SNARE, 0.84),
+            (1.0, gm::SNARE, 0.88),
+            (1.25, gm::SNARE, 0.92),
+            (1.5, gm::SNARE, 0.98),
+            (1.75, gm::SNARE, 1.05),
+        ],
+    },
+    // The open-hat one, stretched over two beats.
+    Fill {
+        beats: 2.0,
+        hits: &[
+            (0.0, gm::HAT_OPEN, 0.8),
+            (0.25, gm::SNARE, 0.85),
+            (0.5, gm::SNARE, 0.9),
+            (0.75, gm::KICK, 0.95),
+            (1.0, gm::HAT_OPEN, 0.85),
+            (1.25, gm::SNARE, 0.95),
+            (1.5, gm::KICK, 1.0),
+            (1.75, gm::SNARE, 1.05),
+        ],
+    },
 ];
+
+/// Above this the sixteenths go: at 190 one is 79 ms, and four drums 79 ms
+/// apart is a blur however well they are played. The hats thin to eighths, the
+/// ghosts mostly go, and the fills come out of the eighth-note half of
+/// [`FILLS`].
+pub const FAST_BPM: f32 = 190.0;
+
+/// And above this the eighths go too — the cymbal counts the beat, which is
+/// what a drummer does at a tempo nobody can ride at.
+pub const VERY_FAST_BPM: f32 = 240.0;
+
+/// The shortest step a fill may have at this tempo.
+fn fill_grid(bpm: f32) -> f64 {
+    match bpm >= FAST_BPM {
+        true => 0.5,
+        false => 0.25,
+    }
+}
+
+/// One fill that fits: no longer than `beats`, and nothing in it faster than
+/// `grid`. `avoid` is the one played last, because the same fill twice running
+/// is what gives a generated drummer away in one chorus.
+fn pick_fill(rng: &mut Rng, beats: f64, grid: f64, avoid: Option<usize>) -> Option<usize> {
+    let fits: Vec<usize> = (0..FILLS.len())
+        .filter(|i| FILLS[*i].beats <= beats + 1e-9 && FILLS[*i].finest() >= grid - 1e-9)
+        .collect();
+    // The longest that fit, when any do: a turnaround asked for two beats.
+    let longest = fits
+        .iter()
+        .map(|i| FILLS[*i].beats)
+        .fold(0.0f64, |a, b| a.max(b));
+    let best: Vec<usize> = fits
+        .iter()
+        .copied()
+        .filter(|i| (FILLS[*i].beats - longest).abs() < 1e-9)
+        .collect();
+    let pool: Vec<usize> = match best.iter().any(|i| Some(*i) != avoid) {
+        true => best.iter().copied().filter(|i| Some(*i) != avoid).collect(),
+        false => best,
+    };
+    pool.get(rng.pick(pool.len())).copied()
+}
 
 fn push_hit(out: &mut Vec<Note>, rng: &mut Rng, note: u8, start: f64, vel: u8, len: f64) {
     let mut n = Note {
@@ -522,6 +951,8 @@ fn push_hit(out: &mut Vec<Note>, rng: &mut Rng, note: u8, start: f64, vel: u8, l
         vel,
         start,
         len,
+        // Who plays it is stamped by `bake`, which knows.
+        ..Default::default()
     };
     human(rng, &mut n, 0.02);
     out.push(n);
@@ -533,6 +964,7 @@ fn push_hit(out: &mut Vec<Note>, rng: &mut Rng, note: u8, start: f64, vel: u8, l
 /// chord carries, placed at the octave nearest where the last voicing sat. A
 /// comp that re-stacks from the root every bar jumps an octave for no reason
 /// and stops sounding like hands.
+#[allow(clippy::too_many_arguments)]
 fn comp(
     prog: &Progression,
     style: &Style,
@@ -541,6 +973,7 @@ fn comp(
     c: super::style::Comp,
     strum: f64,
     shell: bool,
+    max: usize,
 ) {
     let bpb = style.beats_per_bar;
     let mut prev_top = (c.low + c.high) / 2;
@@ -556,7 +989,7 @@ fn comp(
             if !rng.chance(c.density) {
                 continue;
             }
-            let voicing = voice(chord, prev_top, c.low, c.high, shell);
+            let voicing = voice(chord, prev_top, c.low, c.high, shell, max);
             if let Some(top) = voicing.last() {
                 prev_top = *top;
             }
@@ -592,6 +1025,8 @@ fn comp(
                     vel,
                     start: (start + jitter + across * strum).max(0.0),
                     len,
+                    // Who plays it is stamped by `bake`, which knows.
+                    ..Default::default()
                 };
                 // Velocity alone, so the chord still lands together.
                 let v = n.vel as i32 + (rng.f() * 10.0) as i32 - 5;
@@ -604,7 +1039,77 @@ fn comp(
 
 /// The notes of one voicing, ascending, at the octave that moves least from
 /// `prev_top`.
-fn voice(chord: &Chord, prev_top: u8, low: u8, high: u8, shell: bool) -> Vec<u8> {
+/// How far apart two notes have to start to be **different** chords, in beats.
+/// A strum is one chord crossing the strings — a few hundredths of a beat — and
+/// the hits of even the busiest comping are a sixteenth apart.
+const HIT_WINDOW: f64 = 0.1;
+
+/// Let go of a chord when the same instrument plays the next one.
+///
+/// `Comp::hold` is how long a chord *wants* to ring, and on a busy pattern it is
+/// longer than the gap to the next hit: the notes pile up, four strums deep, and
+/// what comes out is not a chord but every chord of the bar at once. That is the
+/// wall an extended chart turned the accompaniment into — twenty-two voices
+/// sounding together where a guitarist has six strings.
+///
+/// A little overlap is left on purpose: a hand comes off the strings as the next
+/// one lands, and cutting exactly on the beat is a staccato nobody played.
+fn damp(part: &mut [Note]) {
+    /// How much of a beat a chord is allowed to ring into the next one.
+    const LEGATO: f64 = 0.02;
+    let mut starts: Vec<f64> = part.iter().map(|n| n.start).collect();
+    starts.sort_by(f64::total_cmp);
+    for n in part.iter_mut() {
+        // The next hit of this instrument: the first start far enough along to
+        // be another chord rather than the rest of this strum.
+        let after = n.start + HIT_WINDOW;
+        let at = starts.partition_point(|s| *s <= after);
+        if let Some(next) = starts.get(at) {
+            n.len = n.len.min((next - n.start + LEGATO).max(0.05));
+        }
+    }
+}
+
+/// How many notes one hand plays. A pianist voicing a thirteenth chord plays
+/// four or five notes, not the eight the symbol spells: the rest are the bass
+/// player's, or simply not played. Without this an extended chart handed the
+/// comping every tone it could name — seven-note strums, twenty-two voices
+/// sounding at once, and an accompaniment that was a wall.
+const PIANO_NOTES: usize = 4;
+const GUITAR_NOTES: usize = 5;
+
+/// The tones worth keeping when there are more than a hand can play, most
+/// characteristic first: the third says major or minor, the seventh says what
+/// kind of seventh, the top tension is why the chord was written extended at
+/// all, and an altered fifth is never decoration. The root and the plain fifth
+/// go last — a bass player is playing the root.
+fn voicing_priority(tone: i32) -> u8 {
+    match tone.rem_euclid(12) {
+        3 | 4 => 0,         // the third
+        10 | 11 => 1,       // the seventh
+        1 | 2 | 6 | 8 => 2, // the altered tensions and the altered fifth
+        9 => 3,             // the sixth, or the thirteenth
+        5 => 4,             // the eleventh
+        0 => 5,             // the root
+        _ => 6,             // the fifth
+    }
+}
+
+/// The tones a hand of `max` notes plays, in the order they sound.
+fn hand(tones: &[i32], max: usize) -> Vec<i32> {
+    if tones.len() <= max {
+        return tones.to_vec();
+    }
+    let mut kept: Vec<i32> = tones.to_vec();
+    // Stable by priority, so two tones worth the same keep the order the chord
+    // spelled them in.
+    kept.sort_by_key(|t| (voicing_priority(*t), *t));
+    kept.truncate(max);
+    kept.sort_unstable();
+    kept
+}
+
+fn voice(chord: &Chord, prev_top: u8, low: u8, high: u8, shell: bool, max: usize) -> Vec<u8> {
     // What is voiced: the tones that say what the chord *is*. With a seventh
     // there, the root and the fifth are the bass player's and are left out —
     // for the piano. A guitar keeps them: six strings under one hand is a
@@ -622,6 +1127,9 @@ fn voice(chord: &Chord, prev_top: u8, low: u8, high: u8, shell: bool) -> Vec<u8>
         true => chord.tones.clone(),
         false => tones,
     };
+    // A hand, not a spelling: an extended chord is voiced with the notes that
+    // say what it is.
+    let tones = hand(&tones, max.max(2));
     let pcs: Vec<u8> = tones
         .iter()
         .map(|t| ((chord.root as i32 + t).rem_euclid(12)) as u8)
@@ -666,6 +1174,26 @@ fn voice(chord: &Chord, prev_top: u8, low: u8, high: u8, shell: bool) -> Vec<u8>
     }
 }
 
+/// The length the guitar holds a chord for, against the piano's.
+///
+/// **Short against long, long against short.** Two chord instruments holding
+/// the same length are one chord instrument played twice: what makes a rhythm
+/// section out of a piano and a guitar is that one of them is ringing while the
+/// other is chopping. So the piano's `hold` decides the guitar's, and the
+/// dividing line is the beat — under it the piano is comping short and the
+/// guitar rings the bar out; over it the piano is sustaining and the guitar
+/// answers with the chop.
+///
+/// The bar is the ceiling either way: a chord held past the next one is a
+/// chord playing over the change.
+pub fn counter_hold(piano: f64, beats_per_bar: f64) -> f64 {
+    let bar = beats_per_bar.max(1.0);
+    match piano <= 1.0 {
+        true => (bar - piano).max(1.5).min(bar),
+        false => (piano * 0.25).clamp(0.2, 0.75),
+    }
+}
+
 /// The guitar's register, from the style's piano comp.
 ///
 /// What a style that did not write its own [`Style::guitar`] gets: the piano's
@@ -680,207 +1208,5 @@ fn guitar_of(c: super::style::Comp) -> super::style::Comp {
         // damped, it is not held down.
         hold: (c.hold * 0.8).max(0.25),
         ..c
-    }
-}
-
-// ─── Melody and solo ────────────────────────────────────────────────────────
-
-/// One bar of shape, before it knows what chord it is over.
-///
-/// A motif is what makes a melody a melody rather than an arpeggiator with
-/// dice: the same shape comes back changed — transposed, pushed late, resolved
-/// — instead of being rolled again.
-#[derive(Clone)]
-struct Motif {
-    /// `(start in the bar, length in beats, degree of the scale relative to the
-    /// phrase's first note)`.
-    notes: Vec<(f64, f64, i32)>,
-}
-
-/// The durations a solo is built from: the melody's menu with the long notes
-/// taken out, which is most of what makes one sound like the other played
-/// busier.
-const SOLO_NOTES: &[f64] = &[0.5, 0.5, 0.25, 0.75, 1.0];
-
-/// The solo, from the style's melody.
-///
-/// What a style that did not write its own [`Style::solo`] gets: the melody
-/// played busier and a little higher.
-fn solo_of(l: Lead) -> Lead {
-    Lead {
-        notes: SOLO_NOTES,
-        rest: l.rest * 0.4,
-        chromatic: (l.chromatic * 2.0).min(0.8),
-        // A soloist sits above the tune, and both stay clear of the comping.
-        low: l.low.saturating_add(5).min(120),
-        high: l.high.saturating_add(5).min(127),
-        ..l
-    }
-}
-
-/// A bar's worth of shape: durations off the style's menu, and a walk up and
-/// down the scale in steps.
-fn motif(rng: &mut Rng, l: &Lead, bpb: f64) -> Motif {
-    let mut notes = Vec::new();
-    let mut at = 0.0;
-    let mut degree = 0i32;
-    while at < bpb - 1e-9 {
-        let len = l.notes[rng.pick(l.notes.len())].min(bpb - at);
-        if !rng.chance(l.rest) {
-            notes.push((at, len, degree));
-            // Mostly by step, sometimes by a third, and on a leash: a random
-            // walk with nothing holding it climbs out of the register and
-            // never comes back.
-            let step = match rng.chance(0.75) {
-                true => 1,
-                false => 2,
-            };
-            let step = match rng.chance(0.5) {
-                true => step,
-                false => -step,
-            };
-            degree = (degree + step).clamp(-7, 7);
-        }
-        at += len;
-    }
-    // A bar of nothing but rests is a bar the form loses; the dice do not get
-    // to delete a phrase.
-    if notes.is_empty() {
-        notes.push((0.0, 1.0, 0));
-    }
-    Motif { notes }
-}
-
-/// The same figure, worked: one of its notes broken in two, and the walk it
-/// makes widened by a step.
-///
-/// This is what "the motif grows" means and all it means — the shape is still
-/// recognisably the one the phrase opened with, which is the whole point of
-/// there being a motif at all.
-fn develop(m: &Motif, l: &Lead, rng: &mut Rng, bpb: f64) -> Motif {
-    let mut notes = m.notes.clone();
-    if notes.is_empty() {
-        return Motif { notes };
-    }
-    // Break the longest note in two: the busier version of the same shape.
-    let at = notes
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    let (start, len, degree) = notes[at];
-    // Only where both halves still land on a sixteenth: a dotted eighth broken
-    // in two is two dotted sixteenths, which is not a figure anybody plays.
-    let half = len / 2.0;
-    if len >= 0.5 && ((half * 4.0) - (half * 4.0).round()).abs() < 1e-9 {
-        let step = match rng.chance(0.5) {
-            true => 1,
-            false => -1,
-        };
-        notes[at] = (start, half, degree);
-        notes.insert(at + 1, (start + half, half, degree + step));
-    }
-    // …and one of them says a little more than it did.
-    let lift = rng.pick(notes.len());
-    let (start, len, degree) = notes[lift];
-    notes[lift] = (start, len, (degree + 1).clamp(-7, 7));
-    // A rest opens where the dice say, so the figure does not fill up.
-    if rng.chance(l.rest) && notes.len() > 2 {
-        let drop = rng.pick(notes.len());
-        notes.remove(drop);
-    }
-    notes.retain(|(s, len, _)| *s < bpb - 1e-9 && *len > 0.0);
-    let _ = (start, len, degree);
-    match notes.is_empty() {
-        true => m.clone(),
-        false => Motif { notes },
-    }
-}
-
-/// A degree of the chord's scale, as a pitch.
-///
-/// This is the only place anything reads [`Chord::scale`]: the chord says what
-/// may be played over it, and the line picks a rung of that ladder. Counted
-/// from the scale's root at the octave nearest the register's middle, and
-/// folded back inside when the walk leaves it.
-fn scale_note(chord: &Chord, degree: i32, anchor: u8, low: u8, high: u8) -> u8 {
-    let n = chord.scale.len().max(1) as i32;
-    let semis = match chord.scale.is_empty() {
-        true => 0,
-        false => chord.scale[degree.rem_euclid(n) as usize] + 12 * degree.div_euclid(n),
-    };
-    let mut note = in_range(chord.root, low, high, anchor) as i32 + semis;
-    while note > high as i32 {
-        note -= 12;
-    }
-    while note < low as i32 {
-        note += 12;
-    }
-    note.clamp(0, 127) as u8
-}
-
-/// A single line, in four-bar phrases: `A A' B A''`.
-///
-/// `A'` answers `A` a third up the scale and pushed late, `B` is the other
-/// shape, and `A''` comes back down and lands on a chord tone — which is what
-/// a phrase ending is. The melody and the solo are the same function with
-/// different numbers: see [`solo_of`].
-fn lead(prog: &Progression, style: &Style, rng: &mut Rng, out: &mut Vec<Note>, l: Lead) {
-    let bpb = style.beats_per_bar;
-    let a = motif(rng, &l, bpb);
-    let b = motif(rng, &l, bpb);
-    let anchor = (l.low / 2) + (l.high / 2);
-    // The phrase the last four bars grew into. A figure that comes back exactly
-    // as it left is an exercise; one that comes back busier is a tune being
-    // played by somebody.
-    let mut grown = a.clone();
-    for bar in 0..prog.bars.len() {
-        // Each time round the four bars, the figure is worked a little more.
-        if bar > 0 && bar % 4 == 0 {
-            grown = develop(&grown, &l, rng, bpb);
-        }
-        let (m, transpose, shift, resolve) = match bar % 4 {
-            0 => (&grown, 0, 0.0, false),
-            1 => (&grown, 2, l.displace, false),
-            2 => (&b, 0, 0.0, false),
-            _ => (&grown, -1, 0.0, true),
-        };
-        let last = m.notes.len() - 1;
-        for (i, (start, len, degree)) in m.notes.iter().copied().enumerate() {
-            let beat = bar as f64 * bpb + start + shift;
-            let Some((chord, left)) = prog.at(beat, bpb) else {
-                continue;
-            };
-            let mut note = scale_note(chord, degree + transpose, anchor, l.low, l.high);
-            // The end of a phrase is where a line says something: land on a
-            // chord tone rather than wherever the walk had got to.
-            if i == last && resolve {
-                note = chord.nearest_tone(note).clamp(l.low, l.high);
-            }
-            // …and the note before a chord change leans into the next chord
-            // from a semitone away, which is the whole of why a line sounds
-            // like it knew the change was coming.
-            if left <= len + 1e-6 && rng.chance(l.chromatic) {
-                if let Some(next) = prog.next_after(beat, bpb) {
-                    let target = next.nearest_tone(note);
-                    note = match target >= note {
-                        true => target.saturating_sub(1),
-                        false => target.saturating_add(1),
-                    }
-                    .clamp(l.low, l.high);
-                }
-            }
-            let mut n = Note {
-                note,
-                vel: style.vel.saturating_sub(4),
-                start: swung(beat, style),
-                // Articulated rather than legato: a line that ties every note
-                // into the next is one nobody can hear the rhythm of.
-                len: len * 0.9,
-            };
-            human(rng, &mut n, 0.02);
-            out.push(n);
-        }
     }
 }

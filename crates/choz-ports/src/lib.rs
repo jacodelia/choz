@@ -608,6 +608,23 @@ pub trait AudioSource: Send {
     /// MIDI note-off. Default no-op.
     fn note_off(&mut self, _note: u8) {}
 
+    /// A note-on aimed at one of the source's zones — the channel a layered
+    /// source keeps a program on. `None` is the source's own program, which is
+    /// what every key, port and OSC message sends.
+    ///
+    /// This is what lets one tab play a band: the arranger's drums go to the
+    /// zone holding the kit and its bass to the zone holding the bass, at the
+    /// same time, out of the one SoundFont the tab has loaded. A source that
+    /// does not layer zones plays it as an ordinary note — one timbre, which is
+    /// what it has.
+    ///
+    /// There is no zoned note-**off** on purpose: a source that routes by zone
+    /// has to let go of a note wherever it went, because the zones can be
+    /// re-pointed while a note is held.
+    fn note_on_zone(&mut self, note: u8, velocity: u8, _zone: Option<u8>) {
+        self.note_on(note, velocity);
+    }
+
     /// MIDI control change — pedals (sustain 64, sostenuto 66, soft 67),
     /// expression (11), volume (7) and the modulation wheel (1) all arrive
     /// here. Default no-op: only playable synths react. Called on the RT
@@ -1101,6 +1118,11 @@ impl PluginParam {
 pub struct Transport {
     /// Frames played since the stream started.
     samples: std::sync::atomic::AtomicU64,
+    /// Frames since the stream opened, **whatever the transport is doing**.
+    /// The one free clock: a metronome switched on with the transport stopped
+    /// and every artifact counting its own steps read this, so they share a
+    /// phase instead of each starting a clock of their own.
+    free: std::sync::atomic::AtomicU64,
     /// Beats per minute, as `f32` bits.
     bpm: std::sync::atomic::AtomicU32,
     sample_rate: std::sync::atomic::AtomicU32,
@@ -1161,6 +1183,7 @@ impl Transport {
     const fn new() -> Self {
         Self {
             samples: std::sync::atomic::AtomicU64::new(0),
+            free: std::sync::atomic::AtomicU64::new(0),
             bpm: std::sync::atomic::AtomicU32::new(Self::DEFAULT_BPM.to_bits()),
             sample_rate: std::sync::atomic::AtomicU32::new(48_000),
             playing: std::sync::atomic::AtomicBool::new(false),
@@ -1173,6 +1196,51 @@ impl Transport {
     pub fn advance(&self, frames: usize) {
         self.samples
             .fetch_add(frames as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Move the free clock on by one block. Called from the audio callback for
+    /// every block, rolling or stopped — that is what makes it free.
+    pub fn advance_free(&self, frames: usize) {
+        self.free
+            .fetch_add(frames as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Frames since the stream opened. Never rewound by the transport: the
+    /// point of it is that pressing stop does not move anybody's phase.
+    pub fn free_samples(&self) -> u64 {
+        self.free.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Put the free clock at a frame. For the tests, and for anything that has
+    /// to line the free phase up with a timeline somebody else owns.
+    pub fn set_free_samples(&self, samples: u64) {
+        self.free
+            .store(samples, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The free clock in quarter notes.
+    pub fn free_ppq(&self) -> f64 {
+        self.free_samples() as f64 / self.sample_rate() as f64 * (self.bpm() as f64 / 60.0)
+    }
+
+    /// **The position every artifact counts its steps off.** The transport
+    /// while it rolls, the free clock otherwise — one number, so the
+    /// metronome, the sequencer, the arpeggiator and the arranger cannot be on
+    /// different grids, whoever started first.
+    pub fn position_ppq(&self) -> f64 {
+        match self.playing() {
+            true => self.ppq(),
+            false => self.free_ppq(),
+        }
+    }
+
+    /// The frame that position sits on, for whatever schedules against the
+    /// audio timeline.
+    pub fn position_samples(&self) -> u64 {
+        match self.playing() {
+            true => self.samples(),
+            false => self.free_samples(),
+        }
     }
 
     /// Back to the top. A new stream starts at zero, or the user rewinds.
@@ -1206,6 +1274,7 @@ impl Transport {
         self.sample_rate
             .store(sr.max(1), std::sync::atomic::Ordering::Relaxed);
         self.rewind();
+        self.free.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn playing(&self) -> bool {

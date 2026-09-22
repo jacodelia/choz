@@ -1004,7 +1004,11 @@ mod tests {
             let seen = our_ports(ports.client);
             seen.iter().any(|n| n == VIRTUAL_IN_PORT).then_some(seen)
         });
-        assert!(seen.is_some(), "the published port is not on the sequencer: {:?}", our_ports(ports.client));
+        assert!(
+            seen.is_some(),
+            "the published port is not on the sequencer: {:?}",
+            our_ports(ports.client)
+        );
     }
 
     /// Switched off under MENU → MIDI IN, the port goes away. It has to be
@@ -1035,7 +1039,11 @@ mod tests {
         let gone = wait_for(|| {
             (!our_ports(ports.client).iter().any(|n| n == VIRTUAL_IN_PORT)).then_some(())
         });
-        assert!(gone.is_some(), "the port is still on the sequencer: {:?}", our_ports(ports.client));
+        assert!(
+            gone.is_some(),
+            "the port is still on the sequencer: {:?}",
+            our_ports(ports.client)
+        );
 
         // And switching it back on names it first again.
         let names = connect_inputs(tx, &[]);
@@ -1060,7 +1068,11 @@ mod tests {
         assert!(ROUTES.is_poisoned(), "the test did not poison anything");
         let (tx, _rx) = flume::unbounded();
         let names = connect_inputs(tx, &[]);
-        assert_eq!(names.first().map(String::as_str), Some(VIRTUAL_IN_PORT), "{names:?}");
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some(VIRTUAL_IN_PORT),
+            "{names:?}"
+        );
     }
 
     /// The bug this whole module exists for: a note sent to the published port

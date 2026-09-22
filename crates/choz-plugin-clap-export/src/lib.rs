@@ -67,11 +67,11 @@ use clap_sys::ext::params::{
     clap_param_info, clap_plugin_params, CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE,
 };
 use clap_sys::ext::state::{clap_plugin_state, CLAP_EXT_STATE};
-use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::factory::plugin_factory::{clap_plugin_factory, CLAP_PLUGIN_FACTORY_ID};
 use clap_sys::host::clap_host;
 use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
 use clap_sys::process::{clap_process, clap_process_status, CLAP_PROCESS_CONTINUE};
+use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::version::CLAP_VERSION;
 
 /// Interleaved stereo, which is what every choz effect processes.
@@ -395,7 +395,10 @@ fn seq_params() -> Vec<FxParam> {
     let defaults = choz_engine::artifacts::seq::SeqSettings::default();
     for track in 0..TRACKS {
         out.push(FxParam::new(
-            forever_str(format!("{} Note", choz_engine::artifacts::seq::track_name(track))),
+            forever_str(format!(
+                "{} Note",
+                choz_engine::artifacts::seq::track_name(track)
+            )),
             defaults.notes[track] as f32 / 127.0,
             0.0,
             127.0,
@@ -563,7 +566,14 @@ impl Generator {
         match self {
             Generator::Arp(arp) => arp.tick(now, out),
             Generator::Seq(seq) => seq.tick(now, out),
-            Generator::Arr(arr) => arr.tick(now, out),
+            // Outside choz the band is one CLAP instance a musician — the host
+            // has the channels, not this plugin — so which role a note came
+            // from is nothing this end can use.
+            Generator::Arr(arr) => {
+                let mut band = Vec::new();
+                arr.tick(now, &mut band);
+                out.extend(band.into_iter().map(|(_, e)| e));
+            }
         }
     }
 
@@ -594,7 +604,12 @@ fn with_style(text: &str, name: &str) -> String {
     let mut out = String::with_capacity(text.len() + 32);
     let mut written = false;
     for line in text.lines() {
-        let head = line.split('#').next().unwrap_or("").trim().to_ascii_lowercase();
+        let head = line
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
         if head.starts_with("style") && head.contains('=') && !head.contains('|') {
             if !written {
                 out.push_str(&format!("style = {name}\n"));
@@ -990,6 +1005,10 @@ unsafe fn follow_host_transport(
         CLAP_TRANSPORT_HAS_TIME_SIGNATURE, CLAP_TRANSPORT_IS_PLAYING,
     };
     let clock = choz_ports::transport();
+    // The free clock counts blocks whatever the host's transport says, the way
+    // it does inside choz: it is the phase the metronome and the artifacts
+    // share when nothing is rolling.
+    clock.advance_free(frames);
     if transport.is_null() {
         clock.advance(frames);
         return;
@@ -2117,11 +2136,16 @@ mod tests {
                 let params = ((*plugin).get_extension.unwrap())(plugin, CLAP_EXT_PARAMS.as_ptr())
                     as *const clap_plugin_params;
                 assert!(!params.is_null());
-                assert_eq!(((*params).count.unwrap())(plugin), 4, "on, level, sound, grouping");
+                assert_eq!(
+                    ((*params).count.unwrap())(plugin),
+                    4,
+                    "on, level, sound, grouping"
+                );
 
                 // No input port at all: a click is made, not processed.
-                let ports = ((*plugin).get_extension.unwrap())(plugin, CLAP_EXT_AUDIO_PORTS.as_ptr())
-                    as *const clap_plugin_audio_ports;
+                let ports =
+                    ((*plugin).get_extension.unwrap())(plugin, CLAP_EXT_AUDIO_PORTS.as_ptr())
+                        as *const clap_plugin_audio_ports;
                 assert!(!ports.is_null(), "the click has to publish an output");
                 let count = (*ports).count.unwrap();
                 assert_eq!(count(plugin, true), 0, "it takes nothing in");
@@ -2146,7 +2170,12 @@ mod tests {
                     };
                     let events = [&event.header as *const clap_event_header];
                     let list = events_list(&events);
-                    assert!(((*plugin).activate.unwrap())(plugin, 48_000.0, 1, FRAMES as u32));
+                    assert!(((*plugin).activate.unwrap())(
+                        plugin,
+                        48_000.0,
+                        1,
+                        FRAMES as u32
+                    ));
                     let mut left = vec![0.0f32; FRAMES];
                     let mut right = vec![0.0f32; FRAMES];
                     let mut ptrs = [left.as_mut_ptr(), right.as_mut_ptr()];
@@ -2189,7 +2218,10 @@ mod tests {
         let quiet = peak(1.0, 0.2);
         let off = peak(0.0, 1.0);
         assert!(loud > 0.01, "the click never sounded: {loud}");
-        assert!(quiet < loud, "the level knob does nothing: {quiet} vs {loud}");
+        assert!(
+            quiet < loud,
+            "the level knob does nothing: {quiet} vs {loud}"
+        );
         assert_eq!(off, 0.0, "switched off it still clicked: {off}");
         // Left as it was found: the click is a singleton of the process.
         choz_engine::artifacts::metronome::metronome().set_on(false);
@@ -2265,7 +2297,10 @@ mod tests {
         size: u64,
     ) -> i64 {
         let out = &mut *((*stream).ctx as *mut Vec<u8>);
-        out.extend_from_slice(std::slice::from_raw_parts(buffer as *const u8, size as usize));
+        out.extend_from_slice(std::slice::from_raw_parts(
+            buffer as *const u8,
+            size as usize,
+        ));
         size as i64
     }
 }

@@ -202,6 +202,8 @@ pub enum RackButton {
     /// shape.
     SeqOn,
     SeqPlay,
+    SeqPause,
+    SeqStop,
     SeqRec,
     /// Step the part being edited, `A`..`H`. In a box with a song chain it is
     /// also what appends to it — see [`crate::seq::Seq::chain`].
@@ -219,14 +221,26 @@ pub enum RackButton {
     /// rows this panel does not have.
     ArrOn,
     ArrPlay,
-    /// Which musician this tab is: bass, drums or piano.
-    ArrRole,
-    /// Another interpretation of the same progression.
+    /// The tonic, on a piano.
+    ArrKey,
+    /// The style, out of every style the arranger has.
+    ArrStyle,
+    /// Another interpretation of the same progression, out of a list that says
+    /// what each one plays like.
     ArrSeed,
     /// Open a progression written in a text file.
     ArrText,
-    /// Write the progression here, with a caret in it.
-    ArrEditText,
+    ArrPause,
+    ArrStop,
+    /// Degrees or letters: the notation the chart is written in.
+    ArrRoman,
+    /// One musician of the band: in or out, and how loud. Indexed into
+    /// `Role::ALL`.
+    ArrPart(usize),
+    /// The bar the band counts: the same dialogue the sequencer's METER opens.
+    ArrMeter,
+    /// One of the three variation knobs: swing, random, probability.
+    ArrKnob(usize),
     /// What opens or ducks the selected effect: another tab, the external
     /// clock, or the internal metronome's tap.
     FxGate,
@@ -311,6 +325,17 @@ pub struct RackLayout {
     /// knows how many strips fit in the width, so it is the side that says how
     /// many pages there are.
     pub loop_pages: (usize, usize),
+    /// The band's faders: `(index into `Role::ALL`, bar rect)`. The wheel over
+    /// one is its level, the same contract every other bar in this panel has.
+    pub arr_faders: Vec<(usize, Rect)>,
+    /// The chart itself, which is its own button: clicking it opens the editor.
+    pub arr_progression: Option<Rect>,
+    /// The arranger's three variation knobs, as the sequencer's are: `(which,
+    /// bar rect)`, and where a click lands in one *is* its value.
+    pub arr_knobs: Vec<(usize, Rect)>,
+    /// The bar matrix: `(bar from 0, its cell)`. A click opens the chart with
+    /// the caret in that bar.
+    pub arr_bars: Vec<(usize, Rect)>,
     /// (slider, **bar** rect) of the sequencer's three variation sliders. The
     /// rect is the bar alone and not the whole label, so where a click lands in
     /// it *is* the value — see [`seq_slider_at`].
@@ -425,6 +450,23 @@ fn seq_slider_label(name: &str, v: f32) -> (String, u16) {
     let head = format!(" {name} ");
     let prefix = head.chars().count() as u16;
     (format!("{head}{bar} {:>3.0}% ", v * 100.0), prefix)
+}
+
+/// Cells of an arranger fader's bar. Narrower than the sequencer's: there are
+/// six of them on one row.
+pub const ARR_BAR_W: u16 = 4;
+
+/// One musician's button: the name, a bar for the fader, and how many columns
+/// come before that bar. Built together so the drawing and the wheel cannot
+/// disagree about where it is — the same contract [`seq_slider_label`] has.
+pub fn arr_fader_label(name: &str, gain: f32) -> (String, u16) {
+    let filled = (gain.clamp(0.0, 1.0) * ARR_BAR_W as f32).round() as usize;
+    let bar: String = (0..ARR_BAR_W as usize)
+        .map(|i| if i < filled { '\u{2588}' } else { '\u{2591}' })
+        .collect();
+    let head = format!(" {name} ");
+    let prefix = head.chars().count() as u16;
+    (format!("{head}{bar} "), prefix)
 }
 
 /// The value a click at column `x` on a slider's bar means, 0..1.
@@ -1376,41 +1418,161 @@ fn draw_arranger_box(
         let rect = row.button(f, text, style);
         layout.buttons.push((btn, rect));
     };
+    // The transport, in the symbols every transport uses: play from the top,
+    // pause where it is, stop and rewind. Symbols and not words because three
+    // words of six languages is a row nobody can read at a glance.
     button(
         &mut row,
         f,
         RackButton::ArrPlay,
-        format!(" {} ", t(if arr.playing { "STOP" } else { "PLAY" })),
+        " \u{25B6} ".to_string(),
         cursor(0, arr.playing),
     );
     button(
         &mut row,
         f,
-        RackButton::ArrRole,
-        format!(" {} ", s.role.name()),
-        cursor(1, false),
+        RackButton::ArrPause,
+        " \u{23F8} ".to_string(),
+        // Lit while it is paused mid-form: the button that would start it again
+        // is the one saying where it is.
+        cursor(1, !arr.playing && arr.bar > 0),
+    );
+    button(
+        &mut row,
+        f,
+        RackButton::ArrStop,
+        " \u{25A0} ".to_string(),
+        cursor(2, false),
+    );
+    // The two things a chart is made of that are *names*, each on its own
+    // button and each opening its own picker: the key on a keyboard, the style
+    // out of the list of every style there is. The progression itself has no
+    // button — the bars at the bottom of the box are it, and clicking them
+    // opens the editor. All of them are written into the text, because the text
+    // is still the one source.
+    button(
+        &mut row,
+        f,
+        RackButton::ArrKey,
+        format!(
+            " {} {} ",
+            t("KEY"),
+            crate::arranger::chord::pitch_class_name(arr.key)
+        ),
+        cursor(3, false),
+    );
+    button(
+        &mut row,
+        f,
+        RackButton::ArrStyle,
+        format!(" {} ", arr.style),
+        cursor(4, false),
     );
     button(
         &mut row,
         f,
         RackButton::ArrSeed,
         format!(" SEED {} ", s.seed),
-        cursor(2, false),
+        cursor(5, false),
     );
     button(
         &mut row,
         f,
         RackButton::ArrText,
         format!(" {} ", t("LOAD")),
-        cursor(3, false),
+        cursor(6, false),
     );
+    // Degrees or letters. The button says what it would give you, the way every
+    // switch in this rack does: pressed, the chart is written the other way.
     button(
         &mut row,
         f,
-        RackButton::ArrEditText,
-        format!(" {} ", t("EDIT")),
-        cursor(4, false),
+        RackButton::ArrRoman,
+        format!(
+            " {} ",
+            if s.roman {
+                "I\u{2013}IV\u{2013}V"
+            } else {
+                "C\u{2013}F\u{2013}G"
+            }
+        ),
+        cursor(7, s.roman),
     );
+    y = row.finish();
+    if y >= inner.y + inner.height {
+        return y;
+    }
+
+    // ─── The band ──────────────────────────────────────────────────────
+    //
+    // One button a musician: the click puts them in or out, the wheel over the
+    // bar is how loud they play. All of them are played by the tab's one
+    // instrument — a band with a bass on a bass and a kit on the drums is
+    // still a tab per musician — so what this row is for is hearing the whole
+    // arrangement at once and balancing it.
+    let band = s.band();
+    let mut row = ButtonRow::new(inner, bg, y, 2);
+    for (i, role) in crate::arranger::generate::Role::ALL.iter().enumerate() {
+        let gain = band
+            .iter()
+            .find(|(r, _)| r == role)
+            .map(|(_, g)| *g)
+            .unwrap_or(0.0);
+        let (label, prefix) = arr_fader_label(role.name(), gain);
+        let rect = row.button(f, label, cursor(8 + i, gain > 0.0));
+        layout.buttons.push((RackButton::ArrPart(i), rect));
+        let bar_x = rect.x + prefix;
+        let bar_w = ARR_BAR_W.min((rect.x + rect.width).saturating_sub(bar_x));
+        if bar_w > 0 {
+            layout
+                .arr_faders
+                .push((i, Rect::new(bar_x, rect.y, bar_w, 1)));
+        }
+    }
+    y = row.finish();
+    if y >= inner.y + inner.height {
+        return y;
+    }
+
+    // ─── The feel ──────────────────────────────────────────────────────
+    //
+    // The bar the band counts and the three knobs the sequencer has, on the
+    // same scales and with the same meanings: there is one bar and one swing in
+    // this program. METER opens the same dialogue the sequencer's does, because
+    // it is the same bar.
+    let mut row = ButtonRow::new(inner, bg, y, 2);
+    let meter = {
+        let (num, den) = arr.meter;
+        match arr.groups.len() > 1 {
+            true => format!(
+                " {} {num}/{den} {} ",
+                t("METER"),
+                arr.groups
+                    .iter()
+                    .map(|g| g.to_string())
+                    .collect::<Vec<_>>()
+                    .join("+")
+            ),
+            false => format!(" {} {num}/{den} ", t("METER")),
+        }
+    };
+    let rect = row.button(f, meter, cursor(12, false));
+    layout.buttons.push((RackButton::ArrMeter, rect));
+    for (i, (name, value)) in [("SWING", s.swing), ("RAND", s.random), ("PROB", s.prob)]
+        .into_iter()
+        .enumerate()
+    {
+        let (label, prefix) = seq_slider_label(name, value);
+        let rect = row.button(f, label, cursor(13 + i, value > 0.0));
+        layout.buttons.push((RackButton::ArrKnob(i), rect));
+        let bar_x = rect.x + prefix;
+        let bar_w = SEQ_BAR_W.min((rect.x + rect.width).saturating_sub(bar_x));
+        if bar_w > 0 {
+            layout
+                .arr_knobs
+                .push((i, Rect::new(bar_x, rect.y, bar_w, 1)));
+        }
+    }
     y = row.finish();
     if y >= inner.y + inner.height {
         return y;
@@ -1458,23 +1620,190 @@ fn draw_arranger_box(
     // The progression, on one line, with the bar that is sounding lit: a
     // number in the header says which bar it is, and a number is not something
     // anybody follows while playing.
-    let spans: Vec<Span> = progression_pieces(&s.text, arr.bar, inner.width.saturating_sub(1) as usize)
+    //
+    // **The line is the button.** A `PROGRESSION` button beside the others was
+    // a second place to press for the thing already written across the bottom
+    // of the box; clicking the chart is what anybody tries first, and the
+    // arrows land on it as its own control.
+    // ─── The bars, as a matrix ─────────────────────────────────────────
+    //
+    // A cell a bar, subdivided into what the meter counts and broken where the
+    // grouping breaks it: a 7/8 counted 3+2+2 is drawn as three groups and not
+    // as seven cells in a row, because that is the difference between it and
+    // 2+2+3. Clicking a bar opens the chart with the caret in it.
+    //
+    // Drawn where there is room for it; on a panel with none, the chart stays
+    // the one line it always was, which is the rule the rest of this panel
+    // follows.
+    let bars = chart_bars(&s.text);
+    let cell_w = arr_cell_width(&bars, arr.cells, arr.groups);
+    let per_row = ((inner.width.saturating_sub(1)) / cell_w.max(1)).max(1) as usize;
+    let rows = bars.len().div_ceil(per_row.max(1)) as u16 * 2;
+    let room = (inner.y + inner.height).saturating_sub(y);
+    if !bars.is_empty() && rows < room && cell_w < inner.width {
+        return draw_arranger_bars(f, inner, y, arr, &bars, cell_w, per_row, bg, layout);
+    }
+
+    let picked = arr.focused && arr.cursor == ARR_PROGRESSION;
+    let width = inner.width.saturating_sub(1) as usize;
+    let spans: Vec<Span> = progression_pieces(&s.text, arr.bar, width)
         .into_iter()
         .map(|(text, playing)| {
             Span::styled(
                 text,
-                match playing {
-                    true => Style::default().fg(ON_COLOUR).add_modifier(Modifier::BOLD),
-                    false => Style::default().fg(HEADER),
+                match (picked, playing) {
+                    (true, _) => Style::default()
+                        .fg(Color::Black)
+                        .bg(SEL)
+                        .add_modifier(Modifier::BOLD),
+                    (false, true) => Style::default().fg(ON_COLOUR).add_modifier(Modifier::BOLD),
+                    (false, false) => Style::default().fg(HEADER),
                 },
             )
         })
         .collect();
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(bg),
-        Rect::new(inner.x, y, inner.width, 1),
-    );
+    // A column in, like every other line of the box: the bars start with a bar
+    // line, and flush against the section's frame the two read as one.
+    let rect = Rect::new(inner.x + 1, y, inner.width.saturating_sub(1), 1);
+    f.render_widget(Paragraph::new(Line::from(spans)).style(bg), rect);
+    layout.arr_progression = Some(rect);
     y + 1
+}
+
+/// Which of the arranger's controls the progression line is — the last one, as
+/// it is the last thing drawn. Kept here beside the drawing that has to agree
+/// with it; `crate::ARR_CONTROLS` is the list itself.
+pub const ARR_PROGRESSION: usize = 16;
+
+/// The chart as bars, by the rule the parser reads it with: a bar line or a
+/// newline ends a bar, and the lines that name the key and the style are not
+/// bars at all.
+pub fn chart_bars(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| {
+            !l.split_once('=').is_some_and(|(k, _)| {
+                let k = k.trim();
+                k.eq_ignore_ascii_case("key")
+                    || k.eq_ignore_ascii_case("style")
+                    || k.eq_ignore_ascii_case("form")
+            })
+        })
+        .filter(|l| !l.starts_with('['))
+        .flat_map(|l| l.split('|'))
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// How wide one bar of the matrix is drawn: the widest chord in the chart, or
+/// the subdivisions with their group breaks, whichever needs more.
+fn arr_cell_width(bars: &[String], cells: usize, groups: &[u8]) -> u16 {
+    let label = bars.iter().map(|b| b.chars().count()).max().unwrap_or(4);
+    let breaks = groups.len().saturating_sub(1);
+    // The pulses, the gaps between the groups, and the bar's own number in
+    // front of them — a form of ninety-six bars is one nobody can count off the
+    // screen without it.
+    let pulses = cells + breaks + 3;
+    (label.max(pulses) as u16 + 2).clamp(8, 28)
+}
+
+/// Which group of the bar a subdivision belongs to, for the break between them.
+fn arr_group_of(cell: usize, groups: &[u8]) -> usize {
+    let mut at = 0usize;
+    for (i, g) in groups.iter().enumerate() {
+        at += *g as usize;
+        if cell < at {
+            return i;
+        }
+    }
+    groups.len().saturating_sub(1)
+}
+
+/// The matrix: two rows a line of bars — the pulses over the chord — with the
+/// bar that is sounding lit and the pulse inside it brighter still.
+#[allow(clippy::too_many_arguments)]
+fn draw_arranger_bars(
+    f: &mut Frame,
+    inner: Rect,
+    mut y: u16,
+    arr: crate::arranger::ArrangerView<'_>,
+    bars: &[String],
+    cell_w: u16,
+    per_row: usize,
+    bg: Style,
+    layout: &mut RackLayout,
+) -> u16 {
+    let floor = inner.y + inner.height;
+    let here = arr.bar.saturating_sub(1);
+    for (row, chunk) in bars.chunks(per_row).enumerate() {
+        if y + 1 >= floor {
+            break;
+        }
+        let mut pulses: Vec<Span> = Vec::new();
+        let mut names: Vec<Span> = Vec::new();
+        for (col, text) in chunk.iter().enumerate() {
+            let bar = row * per_row + col;
+            let playing = arr.bar > 0 && bar == here;
+            let x = inner.x + 1 + col as u16 * cell_w;
+            let rect = Rect::new(
+                x,
+                y,
+                cell_w.min((inner.x + inner.width).saturating_sub(x)),
+                2,
+            );
+            layout.arr_bars.push((bar, rect));
+            // The pulses of this bar, with a gap where the grouping breaks.
+            let mut cells = String::new();
+            for cell in 0..arr.cells {
+                if cell > 0
+                    && !arr.groups.is_empty()
+                    && arr_group_of(cell, arr.groups) != arr_group_of(cell - 1, arr.groups)
+                {
+                    cells.push(' ');
+                }
+                let lit = playing && arr.pulse == Some(cell);
+                cells.push(match (cell == 0, lit) {
+                    (_, true) => '\u{25CF}',
+                    (true, _) => '\u{25CB}',
+                    _ => '\u{00B7}',
+                });
+            }
+            let style = match playing {
+                true => Style::default().fg(ON_COLOUR).add_modifier(Modifier::BOLD),
+                false => Style::default().fg(OFF_COLOUR),
+            };
+            pulses.push(Span::styled(
+                format!(" {:>2} {:<w$}", bar + 1, cells, w = cell_w as usize - 4),
+                style,
+            ));
+            // The bar's own chords, and the number of the bar in front of the
+            // first of each row so a long form can still be counted.
+            let name = truncate(text, cell_w as usize - 1);
+            names.push(Span::styled(
+                format!(" {:<w$}", name, w = cell_w as usize - 1),
+                match playing {
+                    true => Style::default().fg(Color::Black).bg(ON_COLOUR),
+                    false => Style::default().fg(HEADER),
+                },
+            ));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(pulses)).style(bg),
+            Rect::new(inner.x + 1, y, inner.width.saturating_sub(1), 1),
+        );
+        y += 1;
+        if y >= floor {
+            break;
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(names)).style(bg),
+            Rect::new(inner.x + 1, y, inner.width.saturating_sub(1), 1),
+        );
+        y += 1;
+    }
+    y
 }
 
 /// The progression cut into bars for one row of the panel: `(text, sounding)`
@@ -1498,7 +1827,10 @@ fn progression_pieces(text: &str, bar: usize, width: usize) -> Vec<(String, bool
         .filter(|b| !b.is_empty())
         .collect();
     if bars.is_empty() {
-        return vec![(format!(" {}", truncate(&flat, width.saturating_sub(1))), false)];
+        return vec![(
+            format!(" {}", truncate(&flat, width.saturating_sub(1))),
+            false,
+        )];
     }
     let pieces: Vec<String> = bars.iter().map(|b| format!(" {b} |")).collect();
     // Where the window starts: back from the playing bar until the next step
@@ -1568,12 +1900,28 @@ fn draw_seq_box(
         let rect = row.button(f, text, style);
         layout.buttons.push((btn, rect));
     };
+    // The transport, in the symbols a transport uses — the same three the
+    // arranger has, because they are the same three things.
     button(
         &mut row,
         f,
         RackButton::SeqPlay,
-        format!(" {} ", t(if seq.playing { "STOP" } else { "PLAY" })),
+        " \u{25B6} ".to_string(),
         if seq.playing { lit } else { btn_style },
+    );
+    button(
+        &mut row,
+        f,
+        RackButton::SeqPause,
+        " \u{23F8} ".to_string(),
+        btn_style,
+    );
+    button(
+        &mut row,
+        f,
+        RackButton::SeqStop,
+        " \u{25A0} ".to_string(),
+        btn_style,
     );
     // REC arms the recorder; what it writes is whatever is played into the tab,
     // quantised to the step the playhead is on.
@@ -2389,6 +2737,36 @@ pub fn draw_fx_chain_panel(
         y = row.finish();
     }
 
+    // ── The artifacts ──────────────────────────────────────────────────────
+    //
+    // The three of them — arpeggiator, sequencer, arranger — live inside one
+    // frame: they are one thing the tab does, and a row of switches floating
+    // between the instrument's box and the FX chain's read as neither's. The
+    // boxes inside keep their own frames, which is what says which of them has
+    // the arrows.
+    let art_top = y;
+    // **The frame costs two rows, so it is drawn where the panel can spare
+    // them.** On a five-inch screen the knobs inside matter more than the line
+    // round them — the same rule the arpeggiator's own box follows one level
+    // down, and the same rule this panel follows everywhere: only the shape
+    // changes.
+    let art_framed =
+        (inner.y + inner.height).saturating_sub(y) >= ARP_KNOBS_ROWS + FX_CHAIN_ROWS + 3;
+    // What the section draws inside: a column each side and a row at the
+    // bottom for the frame. Its `y` is the panel's, so everything that measures
+    // the room left measures it against the same floor, one row higher.
+    let panel_inner = inner;
+    let inner = match art_framed {
+        true => Rect::new(
+            inner.x + 1,
+            inner.y,
+            inner.width.saturating_sub(2),
+            inner.height.saturating_sub(1),
+        ),
+        false => inner,
+    };
+    y += u16::from(art_framed);
+
     // ── The two note generators, as tabs ───────────────────────────────────
     //
     // A tab can make notes two ways — a pattern of steps and an arpeggiator —
@@ -2751,6 +3129,33 @@ pub fn draw_fx_chain_panel(
         y = draw_arranger_box(f, inner, y, view, bg, btn_style, &mut layout);
     }
 
+    // The frame round the lot, drawn **after** what is in it: a `Block` with no
+    // style of its own paints its border cells and leaves everything inside
+    // alone, so the section does not have to know how tall it is before it is
+    // drawn. Lit when whichever box is showing has the arrows.
+    let art_focused =
+        focused && ((gen_tab == GenTab::Arp && arp.focused) || seq_focused || arr_focused);
+    let art_height = (y + 1)
+        .saturating_sub(art_top)
+        .min((panel_inner.y + panel_inner.height).saturating_sub(art_top));
+    if art_framed && art_height >= 2 {
+        f.render_widget(
+            Block::default()
+                .title(format!(" {} ", t("ARTIFACTS")))
+                .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
+                .borders(Borders::ALL)
+                .border_style(match art_focused {
+                    true => Style::default().fg(SEL).add_modifier(Modifier::BOLD),
+                    false => Style::default().fg(ui_border()),
+                }),
+            Rect::new(panel_inner.x, art_top, panel_inner.width, art_height),
+        );
+    }
+    let inner = panel_inner;
+    if art_framed {
+        y = art_top + art_height;
+    }
+
     // Whichever box has the arrows is the one drawn live: with four boxes on
     // the panel, "not the instrument's" stopped being the same as "the FX's".
     let fx_focused = focused
@@ -2879,7 +3284,12 @@ pub fn draw_fx_chain_panel(
             // The buttons first — LOAD is what to do next on a tab with no
             // folder, so it is the first thing in the box — and the two
             // drawings under them.
-            let area = Rect::new(inner.x + 2, y + 1, inner.width.saturating_sub(4), button_lines);
+            let area = Rect::new(
+                inner.x + 2,
+                y + 1,
+                inner.width.saturating_sub(4),
+                button_lines,
+            );
             let mut row = ButtonRow::new(area, bg, area.y, 0);
             for (btn, text, style) in sampler_buttons.drain(..) {
                 let rect = row.button(f, text, style);

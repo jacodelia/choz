@@ -599,6 +599,15 @@ mod tests {
                     text: "key = F\nstyle = minor_blues\n|| Im7 | IVm7 ||".into(),
                     role: crate::arranger::generate::Role::Drums,
                     seed: 7,
+                    // A band of two, so the round trip has faders to lose.
+                    parts: vec![0.6, 1.0, 0.0, 0.0],
+                    swing: 0.25,
+                    random: 0.4,
+                    prob: 0.5,
+                    // A band counting 3+2+2 while the click counts something
+                    // else, so the round trip has a grouping to lose.
+                    groups: vec![3, 2, 2],
+                    roman: true,
                 },
             }],
         }

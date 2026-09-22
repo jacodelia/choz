@@ -203,7 +203,7 @@ const SF2_MAX_FRAMES: usize = 4096;
 /// SoundFont is loaded once for all of them, so a zone costs a channel and no
 /// memory at all. Channel 0 stays the tab's own program, for every octave with
 /// no zone on it.
-const ZONES: usize = 8;
+pub const ZONES: usize = 8;
 
 /// The MIDI channel zone `z` plays on. Zone 0 is channel 1: channel 0 belongs
 /// to the tab itself.
@@ -417,6 +417,26 @@ impl AudioSource for Sf2Synth {
     fn note_on(&mut self, note: u8, velocity: u8) {
         let _ = self.synth.send_event(oxisynth::MidiEvent::NoteOn {
             channel: self.channel_for(note),
+            key: note,
+            vel: velocity,
+        });
+    }
+
+    /// A note aimed at one zone goes to that zone's channel, whatever octave it
+    /// is in: the arranger's band is six musicians in one tab, and which one is
+    /// playing is not something the pitch can say — a bass and a piano share
+    /// notes.
+    ///
+    /// A zone nobody has given a program to falls back to the split, which is
+    /// the same rule [`Sf2Synth::channel_for`] follows: routing to an empty
+    /// channel is silence.
+    fn note_on_zone(&mut self, note: u8, velocity: u8, zone: Option<u8>) {
+        let channel = zone
+            .filter(|z| self.zone_set.get(*z as usize % ZONES) == Some(&true))
+            .map(zone_channel)
+            .unwrap_or_else(|| self.channel_for(note));
+        let _ = self.synth.send_event(oxisynth::MidiEvent::NoteOn {
+            channel,
             key: note,
             vel: velocity,
         });

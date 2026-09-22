@@ -326,6 +326,8 @@ impl Arp {
         if self.next_step.is_none() {
             self.step = 0;
             self.next_step = Some(now);
+            // A new chord comes in on its first note, not on the next boundary.
+            self.grid = None;
         }
     }
 
@@ -384,6 +386,7 @@ impl Arp {
             // chord starts on its first note instead of mid-pattern.
             self.silence(out);
             self.next_step = None;
+            self.grid = None;
             return;
         }
         // The gate closes even if the next step is far away. When the note-on
@@ -414,7 +417,10 @@ impl Arp {
             self.grid = Some(index);
             {
                 let step = self.step_len();
-                let swung = self.swing_of(self.step);
+                // The parity that decides the gate is the boundary's own — the
+                // one `next_grid_step` pushed late. A private counter said the
+                // opposite thing every time it fell out of step with the grid.
+                let swung = self.swing_of(index.rem_euclid(2) as usize);
                 let gate = swung.mul_f32(self.settings.gate.clamp(0.05, 1.0));
                 let sequence = self.sequence();
                 if sequence.is_empty() {
@@ -435,16 +441,30 @@ impl Arp {
                 return;
             }
         }
-        // The free-running clock: no transport to follow, so a step is due
-        // when enough time has gone by, and its notes are "now".
-        self.grid = None;
-        let Some(due) = self.next_step else {
-            self.next_step = Some(now);
+        // The free clock: the same grid, counted off
+        // [`choz_ports::Transport::position_ppq`] rather than scheduled ahead —
+        // with nothing rolling there is no audio timeline to put a sample on,
+        // so its notes are still "now". What changed is the *phase*: the steps
+        // fall on the shared boundaries, so the click switched on halfway
+        // through lands on them too.
+        let Some((index, frac)) = self.free_step() else {
             return;
         };
-        if now < due {
+        if self.grid == Some(index) {
             return;
         }
+        // The first step of a chord is played the moment the key goes down —
+        // an arpeggiator that made you wait up to a step for its first note is
+        // a different instrument. Everything after it is on the grid.
+        let first = self.grid.is_none();
+        // SWING against a counted grid: the odd steps are simply not due until
+        // they are `swing` of a step late. The parity is the grid's, not a
+        // counter of its own, so it cannot drift out of phase with the
+        // sequencer or the click.
+        if !first && index.rem_euclid(2) == 1 && frac < self.settings.swing as f64 {
+            return;
+        }
+        self.grid = Some(index);
 
         let sequence = self.sequence();
         if sequence.is_empty() {
@@ -454,31 +474,13 @@ impl Arp {
         let (note, vel) = sequence[idx];
 
         self.release(out);
-        // The free-running clock has no timeline to be accurate against, so
-        // its notes are "now" — which is what they always were.
         out.push(ArpEvent::On { note, vel, at: 0 });
         self.sounding = Some(note);
 
-        let step = self.step_len();
-        // Swing pushes every other step late. Applied to *this* step's length
-        // so the pair still adds up to two straight steps — a swing that
-        // stretched both would just be a slower tempo.
-        let swung = if self.step % 2 == 1 {
-            step.mul_f32(1.0 + self.settings.swing)
-        } else {
-            step.mul_f32(1.0 - self.settings.swing)
-        };
+        // Swing stretches this step, so the gate keeps its share of whatever
+        // the step turned out to be.
+        let swung = self.swing_of(index.rem_euclid(2) as usize);
         self.off_at = Some(now + swung.mul_f32(self.settings.gate.clamp(0.05, 1.0)));
-        // From `due`, not from `now`: a late tick must not push the grid, or a
-        // busy UI thread would drag the tempo down over time.
-        self.next_step = Some(due + swung);
-        // …but never so far behind that it fires several steps in a row to
-        // catch up. A stall is a stall; catching up would sound like a burst.
-        if let Some(next) = self.next_step {
-            if next < now {
-                self.next_step = Some(now + swung);
-            }
-        }
         self.step = self.step.wrapping_add(1);
     }
 
@@ -584,23 +586,34 @@ impl Arp {
         Duration::from_secs_f32(60.0 / self.bpm() * self.settings.div.quarters())
     }
 
-    /// The tempo the steps are counted at: the transport's while `SYNC` is on,
-    /// its own otherwise.
+    /// The tempo the steps are counted at: the transport's, which is the one
+    /// tempo in choz — see [`ArpSettings::tempo`].
     pub fn bpm(&self) -> f32 {
         self.settings.tempo()
     }
 
-    /// Which step of the transport's grid the playhead is on, or `None` when
-    /// there is no grid to follow — `SYNC` off, or a transport that is not
-    /// running.
+    /// Whether the transport is the clock: something rolling to schedule
+    /// against.
     ///
-    /// This is the whole of "synced": the step number comes from the song
-    /// position rather than from counting durations, so nothing accumulates.
-    /// A stall skips steps instead of firing a burst to catch up, which is the
-    /// same rule the free-running clock follows and for the same reason.
-    /// Whether the transport is the clock: something rolling to lock to.
+    /// Both clocks are a grid now — the step number comes from a position
+    /// rather than from counting durations, so nothing accumulates and a stall
+    /// skips steps instead of firing a burst. What the transport adds is an
+    /// audio timeline: a boundary can be scheduled ahead and carry the sample it
+    /// is for. The free clock has none, so its notes are "now" — see
+    /// [`Self::free_step`].
     fn synced(&self) -> bool {
         choz_ports::transport().playing()
+    }
+
+    /// Which step of the free grid the playhead is on and how far into it it
+    /// is. The sequencer counts the same way off the same position.
+    fn free_step(&self) -> Option<(i64, f64)> {
+        let step_q = self.settings.div.quarters() as f64;
+        if step_q <= 0.0 {
+            return None;
+        }
+        let pos = choz_ports::transport().position_ppq() / step_q;
+        Some((pos.floor() as i64, pos - pos.floor()))
     }
 
     /// The next step boundary, once it is close enough to send: `(index,
@@ -641,12 +654,17 @@ impl Arp {
 
     /// How long step `n` lasts once swing has pushed it about. Applied to
     /// *this* step's length, so a pair still adds up to two straight ones.
+    ///
+    /// Swing delays the **odd** boundaries, so it is the even step that gets
+    /// longer and the odd one that makes the time back — the sequencer's rule,
+    /// on the sequencer's parity. It was the other way round here, which is why
+    /// the same knob felt different on the two boxes.
     fn swing_of(&self, n: usize) -> Duration {
         let step = self.step_len();
         if n % 2 == 1 {
-            step.mul_f32(1.0 + self.settings.swing)
-        } else {
             step.mul_f32(1.0 - self.settings.swing)
+        } else {
+            step.mul_f32(1.0 + self.settings.swing)
         }
     }
 

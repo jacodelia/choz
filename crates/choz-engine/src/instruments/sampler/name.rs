@@ -235,10 +235,16 @@ mod tests {
     #[test]
     fn a_hyphenated_name_gives_up_its_note_and_dynamic() {
         let p = parse("Cello-C3-f-rr2");
-        assert_eq!((p.note, p.velocity, p.round_robin), (Some(48), Some(96), Some(2)));
+        assert_eq!(
+            (p.note, p.velocity, p.round_robin),
+            (Some(48), Some(96), Some(2))
+        );
         assert_eq!(parse("Piano-A0-v64").note, Some(21));
         assert_eq!(parse("Snare-Hard").velocity, Some(120));
-        assert_eq!(parse("violin_A4_15_mezzo-forte_arco-normal").velocity, Some(76));
+        assert_eq!(
+            parse("violin_A4_15_mezzo-forte_arco-normal").velocity,
+            Some(76)
+        );
         assert_eq!(parse("kick_C-1").note, Some(0));
     }
 

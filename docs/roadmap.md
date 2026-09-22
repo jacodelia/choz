@@ -75,8 +75,10 @@ rack y nota por nota dentro de cada capa— y toca una nota grabada en cada tecl
 que alguna capa grabó**, con cualquier pack: un archivo suelto, nombres con
 guiones, capas `v1…vN`, la nota del chunk `smpl` o la otra convención de
 octava; el arreglador **tiene forma
-—partes, intro y final—, veinticinco estilos (más los que se escriban en
-`~/.local/state/choz/styles`), su progresión se escribe dentro de la TUI y sale
+—partes, intro y final—, **210 estilos, todos medidos de los acompañamientos
+en `arranger/rhythms`** por `tools/mid_to_styles.py`, su progresión se arma
+dentro de la TUI —una grilla de
+compases, un acorde por subdivisión de la agrupación— y sale
 en el `.clap` como tercer artifact.** **La 1.0.0 está publicada y
 sus paquetes verificados; la 1.3.11 es este árbol.**
 1006 tests (el workspace sin `choz-plugin-lv2`, que en esta máquina se cuelga),
@@ -89,7 +91,7 @@ donde se van a leer.
 
 ## Pendiente
 
-Cuatro bordes y dos decisiones de no hacer. Lo entregado se cuenta día por día en
+Cinco bordes y dos decisiones de no hacer. Lo entregado se cuenta día por día en
 el [changelog](../CHANGELOG.md); un punto que se cierra sale de aquí, porque
 este documento es lo que queda y no lo que hubo.
 
@@ -172,22 +174,87 @@ GATE.
   mano. `zip` es lo que usan las librerías libres; los demás se agregan en
   `sampler::archive` cuando aparezca uno que importe.
 
-### 3 · El arreglador (2026-09-13)
+### 3 · El arreglador (2026-09-17)
 
-- **Más estilos**, cuando alguien los pida: agregar uno son cuarenta números —en
-  Rust o en un `.style`—, no código.
-- **El groove de semicorcheas es medio groove.** `swing_div` empuja las
-  semicorcheas, pero los fantasmas de la batería siguen cayendo cada medio
-  tiempo: sus posiciones también tendrían que ser del estilo.
-- **Los fills no dependen del estilo.** Son cuatro tablas (`generate::FILLS`) y
-  el turnaround son dos seguidas; un fill de dos compases no cabe en esa forma.
+- **Cinco nombres quedaron sin expandir** en el picker —`Scrswing`,
+  `Drngense`, `Ruchnsn1/2`, `Dongbeiy`, `Mus`—: la abreviatura podría ser dos
+  cosas y `tools/mid_to_styles.py` sólo expande lo que es seguro. Si alguien
+  sabe qué son, es una línea en `WORDS`.
+- **Más estilos** salen de más ritmos: se deja el `.mid` en
+  `crates/choz-engine/src/artifacts/arranger/rhythms`, se corre
+  `tools/mid_to_styles.py` y la tabla `arranger::styles::ALL` se vuelve a
+  escribir sola. No hay formato de estilo ni estilos escritos a mano, y choz no
+  lee la carpeta en runtime: sólo lleva la tabla. Un estilo que suena mal es una
+  medición que corregir en el script, no una constante que tocar. El formato que
+  tiene que tener un archivo está en `rhythms/README.md`.
+- **Lo que no se puede medir de un ritmo sobre un acorde**: `approach`,
+  `passing` y `human` salen de proxies (intervalos de semitono y de tono en el
+  bajo, y una constante para la soltura, porque los ritmos vienen cuadrados
+  sobre la grilla). Si el bajo suena cuadrado, es ahí.
+- **Los fills no dependen del estilo.** Son quince (`generate::FILLS`), sacados
+  de los 232 compases de fill de la librería de loops, y se eligen por lo que el
+  tempo permite y por cuánto compás sobra —no por el estilo—: un fill de bossa y
+  uno de heavy salen de la misma bolsa. Un fill de dos compases sigue sin caber
+  en la forma.
+- **El tempo se mira al hornear, no al tocar.** La batería se adelgaza sobre 190
+  y otra vez sobre 240 (`generate::FAST_BPM`), y `retune_to_tempo` vuelve a
+  hornear cuando el tempo cruza una de esas líneas — pero lo llama el loop de la
+  UI, no `tick`, porque `tick` es lo que corre el callback de un plugin. Un
+  `.clap` exportado del arreglador se queda con el tempo que tenía cuando se
+  horneó.
+- **El bajo es una nota por tiempo.** La librería de MIDI dice que un bajo real
+  toca entre siete y once notas por compás; acá la grilla del generador es de un
+  golpe por tiempo, así que `density` sólo puede sacar notas, nunca meterlas
+  entre dos. Sería un `step` por estilo, como el `cymbal` de la batería.
+- **La banda multitímbrica es sólo del SoundFont.** Con un SF2 de varios
+  programas cada rol tiene su zona y su banco (`push_arranger_band`), pero con
+  un plugin, el sampler o un SF2 de un preset la banda entera suena en un
+  timbre: esos instrumentos tienen un patch. Un plugin por rol pediría varias
+  instancias en una tab, que es lo que hoy son varias tabs.
+- **Con el arpegiador prendido la zona se pierde.** `ArpEvent` no lleva zona, así
+  que una banda que pasa por el arpegiador vuelve a ser un timbre. Nadie pidió
+  arpegiar una banda entera; está dicho acá para que no se audite de nuevo.
+- **Las zonas son ocho y se comparten con el split.** La banda las toma desde
+  arriba salteando las de los botones de sonido; una tab con ocho sonidos y una
+  banda de seis pide más canales de los que hay, y los que no entran se quedan
+  con el programa de la tab.
 - **No hay humanización por rol dentro del estilo**: que el funk quiera la
   batería clavada y el bajo suelto no se puede decir.
-- **El comping no escucha a nadie.** El solo se corre de la melodía
-  (`generate::avoid`); el piano y la guitarra se hornean solos, así que una voz
-  del comping puede caer en la nota que la melodía está tocando.
+- **El comping no escucha a nadie, salvo en la duración.** La guitarra toca la
+  longitud contraria a la del piano (`generate::counter_hold`), pero las dos se
+  hornean por separado, así que sus voces pueden caer en la misma nota a la vez.
+  Con la melodía y el solo afuera, es el único par que queda.
+- **La matriz del panel muestra, no edita.** Cada compás es un botón que abre la
+  grilla con el cursor ahí; las subdivisiones dibujadas siguen siendo dibujo. La
+  grilla sí edita: la agrupación de cada compás y un acorde por subdivisión.
+  Acentuar o silenciar una subdivisión suelta todavía pediría un dato por celda
+  que no existe.
+- **Las secciones y el `form` no se editan en la grilla**: entran por archivo.
+  La notación sí es un switch (grados o letras) y el picker ofrece las dos.
 - **La progresión no tiene repeticiones ni saltos**: `form` es una lista de
   partes, sin `x2`, sin D.C. y sin coda. Se escribe repitiendo el nombre.
+
+### 4 · El plugin que inunda el log (2026-09-17)
+
+Reportado: un `choz.log` de 3,4 GB. La línea que lo escribía **no es de este
+repo**: es el fluidsynth interno de AVLdrums (LV2 hosteado) imprimiendo
+`Ringbuffer full` por stderr en cada robo de voz fallido, sin rate-limit; choz
+manda fd 1 y fd 2 de los plugins al log por diseño (`choz-ui/src/log.rs`), así
+que un plugin charlatán llena el disco. La mitigación que ya existe es forzarlo
+a sandbox (`x` en el rack). Lo que falta:
+
+- **Techo al log — escrito, sin mergear.** Está resuelto en el PR #7
+  (`fix/plugin-log-runaway` → `develop`): `log::spawn_log_watchdog()` mira el
+  archivo cada 5 s y lo trunca pasados los 32 MiB, lo que es seguro debajo de
+  los fd ya duplicados porque ambos se abren `O_APPEND` (busca el fin de archivo
+  en cada escritura, no guarda offset). **`develop` todavía no lo tiene**:
+  `crates/choz-ui/src/log.rs` acá sigue sin watchdog. Lo que falta es mergearlo.
+- **Matar al que no responde.** El PR #7 no lo toca, y es la otra mitad: un
+  plugin hosteado que se cuelga, que revienta
+  en cadena o que escribe cientos de MB en segundos tendría que ser descargado
+  —y puesto en cuarentena— en vez de arrastrar a choz entero. Las tres capas
+  contra código ajeno (escaneo fuera de proceso, cuarentena, sandbox) miran el
+  crash, no el ruido.
 
 ## Las dos piezas que quedan fuera, por decisión
 
@@ -511,7 +578,6 @@ tail -f ~/.local/state/choz/choz.log    # ver errores/log en vivo
 # una carga lenta y nada más.
 du -sh ~/.local/state/choz/pcm          # el PCM crudo de los samples largos
 rm -rf ~/.local/state/choz/pcm          # y así se tira
-ls ~/.local/state/choz/styles/*.style   # los estilos del arreglador, si hay
 
 # lo que cuesta el detector de A→M dentro del callback (sube = xruns en TODO
 # el grafo, no sólo en choz)

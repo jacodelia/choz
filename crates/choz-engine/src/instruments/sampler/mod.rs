@@ -483,7 +483,10 @@ fn smpl_root(path: &Path) -> Option<(u8, f32)> {
             let unity = u32::from_le_bytes(body[12..16].try_into().ok()?);
             let fraction = u32::from_le_bytes(body[16..20].try_into().ok()?);
             let cents = fraction as f32 / 4_294_967_296.0 * 100.0;
-            return u8::try_from(unity).ok().filter(|n| *n <= 127).map(|n| (n, cents));
+            return u8::try_from(unity)
+                .ok()
+                .filter(|n| *n <= 127)
+                .map(|n| (n, cents));
         }
         // Chunks are padded to an even length.
         f.seek(SeekFrom::Current((size + size % 2) as i64)).ok()?;
@@ -980,7 +983,11 @@ mod tests {
         assert_eq!(octave_from_offsets(&[12, 12, 11]), 1);
         assert_eq!(octave_from_offsets(&[-12, -12]), -1);
         assert_eq!(octave_from_offsets(&[0, 0, 0]), 0);
-        assert_eq!(octave_from_offsets(&[12, 0, 12]), 0, "one disagreement leaves the names");
+        assert_eq!(
+            octave_from_offsets(&[12, 0, 12]),
+            0,
+            "one disagreement leaves the names"
+        );
         assert_eq!(octave_from_offsets(&[]), 0);
     }
 

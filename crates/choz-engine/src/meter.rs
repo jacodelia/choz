@@ -795,7 +795,9 @@ impl Load {
             let n = faults.min(u32::MAX as u64) as u32;
             let _ = self
                 .late_faults
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_add(n)));
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_add(n))
+                });
         }
     }
 
@@ -918,7 +920,7 @@ mod tests {
         load.publish_faults(3, false);
         load.publish_faults(2, true);
         assert_eq!(load.take_late_faults(), 2);
-        assert_eq!(load.take_late_faults(), 0, "read once"); 
+        assert_eq!(load.take_late_faults(), 0, "read once");
 
         // A healthy block, then one that overran the deadline without doing any
         // more work: preempted, not slow.

@@ -500,7 +500,8 @@ fn pitched_map(samples: &[&Sample]) -> Vec<SfzRegion> {
     // missing four notes in its low octave played them six semitones
     // transposed while every other dynamic had them, so a chromatic sweep
     // changed colour on those keys with how hard each one was hit.
-    let distance = |r: &SfzRegion, key: usize| (key as i32 - r.pitch_key_center as i32).unsigned_abs();
+    let distance =
+        |r: &SfzRegion, key: usize| (key as i32 - r.pitch_key_center as i32).unsigned_abs();
     let covering = |layer: &[SfzRegion], key: usize| -> Option<usize> {
         layer
             .iter()
@@ -522,7 +523,10 @@ fn pitched_map(samples: &[&Sample]) -> Vec<SfzRegion> {
             roots.dedup();
             let mut gaps: Vec<u32> = roots.windows(2).map(|w| (w[1] - w[0]) as u32).collect();
             gaps.sort_unstable();
-            gaps.get(gaps.len() / 2).map(|g| g.div_ceil(2)).unwrap_or(1).max(1)
+            gaps.get(gaps.len() / 2)
+                .map(|g| g.div_ceil(2))
+                .unwrap_or(1)
+                .max(1)
         })
         .collect();
     let mut regions = Vec::new();
@@ -541,9 +545,11 @@ fn pitched_map(samples: &[&Sample]) -> Vec<SfzRegion> {
                         .filter(|k| distance(&out[j][*k], key) <= reach[i])
                         .map(|k| (j, k))
                 });
-                recorded
-                    .or(own)
-                    .or_else(|| by_velocity.iter().find_map(|&j| covering(&out[j], key).map(|k| (j, k))))
+                recorded.or(own).or_else(|| {
+                    by_velocity
+                        .iter()
+                        .find_map(|&j| covering(&out[j], key).map(|k| (j, k)))
+                })
             })
             .collect();
         // Runs of keys played by the same note of the same layer become one
@@ -733,10 +739,15 @@ mod tests {
         let at = |key: u8, vel: u8| {
             let hits: Vec<&SfzRegion> = regions
                 .iter()
-                .filter(|r| (r.lo_key..=r.hi_key).contains(&key) && (r.lo_vel..=r.hi_vel).contains(&vel))
+                .filter(|r| {
+                    (r.lo_key..=r.hi_key).contains(&key) && (r.lo_vel..=r.hi_vel).contains(&vel)
+                })
                 .collect();
             assert_eq!(hits.len(), 1, "key {key} vel {vel}: {hits:?}");
-            (hits[0].pitch_key_center, hits[0].sample.to_string_lossy().into_owned())
+            (
+                hits[0].pitch_key_center,
+                hits[0].sample.to_string_lossy().into_owned(),
+            )
         };
         // E6 hard is its own fortissimo, and nothing else.
         assert_eq!(at(88, 120), (88, "o_88_ff.wav".into()));
@@ -772,7 +783,9 @@ mod tests {
         let at = |key: u8, vel: u8| {
             let hits: Vec<&SfzRegion> = regions
                 .iter()
-                .filter(|r| (r.lo_key..=r.hi_key).contains(&key) && (r.lo_vel..=r.hi_vel).contains(&vel))
+                .filter(|r| {
+                    (r.lo_key..=r.hi_key).contains(&key) && (r.lo_vel..=r.hi_vel).contains(&vel)
+                })
                 .collect();
             assert_eq!(hits.len(), 1, "key {key} vel {vel}: {hits:?}");
             hits[0].sample.to_string_lossy().into_owned()
@@ -798,7 +811,9 @@ mod tests {
         let at = |key: u8, vel: u8| {
             let hits: Vec<&SfzRegion> = regions
                 .iter()
-                .filter(|r| (r.lo_key..=r.hi_key).contains(&key) && (r.lo_vel..=r.hi_vel).contains(&vel))
+                .filter(|r| {
+                    (r.lo_key..=r.hi_key).contains(&key) && (r.lo_vel..=r.hi_vel).contains(&vel)
+                })
                 .collect();
             assert_eq!(hits.len(), 1, "key {key} vel {vel}: {hits:?}");
             hits[0].pitch_key_center
@@ -823,7 +838,9 @@ mod tests {
         samples.push(sample("f_86_ff.wav", Some(86), Some(112)));
         let regions = regions(&samples);
         assert!(
-            regions.iter().all(|r| !r.sample.to_string_lossy().contains("ff")),
+            regions
+                .iter()
+                .all(|r| !r.sample.to_string_lossy().contains("ff")),
             "the two-note layer is still in the map"
         );
         assert!(
@@ -1028,7 +1045,10 @@ mod tests {
         // A folder where nothing has a pitch — a cabasa — still stretches when
         // asked: every key plays, at its recorded speed on middle C.
         let shaker = [hit("cabasa_1.wav", None), hit("cabasa_2.wav", None)];
-        assert!(regions(&shaker).iter().all(|r| r.lo_key == r.hi_key), "AUTO is a kit");
+        assert!(
+            regions(&shaker).iter().all(|r| r.lo_key == r.hi_key),
+            "AUTO is a kit"
+        );
         let spread = regions_with(&shaker, Mode::Stretch);
         assert!(!spread.is_empty());
         for key in 0..=127u8 {
@@ -1197,9 +1217,7 @@ mod tests {
         let samples = [sample("stab.wav", None, None), long];
         let regions = regions_with(&samples, Mode::Slice);
         assert_eq!(regions.len(), super::super::SLICES);
-        assert!(regions
-            .iter()
-            .all(|r| r.sample == Path::new("break.wav")));
+        assert!(regions.iter().all(|r| r.sample == Path::new("break.wav")));
         // Consecutive keys from the drum base, each playing the next piece.
         for (i, r) in regions.iter().enumerate() {
             assert_eq!(r.lo_key, DRUM_BASE + i as u8);
@@ -1234,9 +1252,6 @@ mod tests {
         );
         // And how many equal pieces is whatever was asked for: the count is a
         // number the id carries, not a constant any more.
-        assert_eq!(
-            slice_regions(Path::new("break.wav"), &[0.0], 24).len(),
-            24
-        );
+        assert_eq!(slice_regions(Path::new("break.wav"), &[0.0], 24).len(), 24);
     }
 }

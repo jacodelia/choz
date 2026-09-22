@@ -875,7 +875,8 @@ impl SfzSampler {
     /// [`Self::normalize`]. A layer is an articulation and a velocity range.
     fn equalize_layers(&mut self) {
         let layer = |r: &SfzRegion| (r.articulation, r.lo_vel, r.hi_vel);
-        let mut layers: Vec<(usize, u8, u8)> = self.regions.iter().map(|r| layer(&r.region)).collect();
+        let mut layers: Vec<(usize, u8, u8)> =
+            self.regions.iter().map(|r| layer(&r.region)).collect();
         layers.sort_unstable();
         layers.dedup();
         for key in layers {
@@ -885,7 +886,10 @@ impl SfzSampler {
             if !members().any(|r| r.region.lo_key != r.region.hi_key) {
                 continue;
             }
-            let mut peaks: Vec<f32> = members().map(|r| r.pcm.peak()).filter(|p| *p > 1e-4).collect();
+            let mut peaks: Vec<f32> = members()
+                .map(|r| r.pcm.peak())
+                .filter(|p| *p > 1e-4)
+                .collect();
             if peaks.len() < 2 {
                 continue;
             }
@@ -1832,7 +1836,11 @@ mod tests {
         s.render(&mut buf, 1000);
         let left: Vec<f32> = buf.chunks(2).map(|f| f[0]).collect();
         let last = left.iter().rposition(|v| *v != 0.0).expect("it sounded");
-        assert!(left[last] < 0.1, "it stopped on {} instead of fading", left[last]);
+        assert!(
+            left[last] < 0.1,
+            "it stopped on {} instead of fading",
+            left[last]
+        );
         assert!(left[last - 40] > 0.4, "the fade is longer than a fade");
     }
 
@@ -1881,12 +1889,20 @@ mod tests {
                 })
                 .collect()
         };
-        assert!(read(0).iter().all(|step| (step - 32.0).abs() < 1e-9), "vibrato with the wheel down");
+        assert!(
+            read(0).iter().all(|step| (step - 32.0).abs() < 1e-9),
+            "vibrato with the wheel down"
+        );
         let wobble = read(127);
-        let (lo, hi) = wobble.iter().fold((f64::MAX, f64::MIN), |(l, h), v| (l.min(*v), h.max(*v)));
+        let (lo, hi) = wobble
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(l, h), v| (l.min(*v), h.max(*v)));
         // ±50 cents is about ±2.9% of the rate.
         assert!(hi > 32.5 && lo < 31.5, "{lo}..{hi}");
-        assert!(hi < 33.2 && lo > 30.8, "wider than the wheel allows: {lo}..{hi}");
+        assert!(
+            hi < 33.2 && lo > 30.8,
+            "wider than the wheel allows: {lo}..{hi}"
+        );
     }
 
     /// Striking a key again releases the note it was playing instead of

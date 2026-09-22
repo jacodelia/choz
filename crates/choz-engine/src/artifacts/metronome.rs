@@ -121,8 +121,6 @@ pub struct Metronome {
     /// Linear, 0..1.
     gain: AtomicU32,
     style: AtomicU32,
-    /// Frames since it was switched on, advanced by the audio callback.
-    pos: AtomicU64,
     /// How the bar is grouped, as up to sixteen 4-bit parts, least significant
     /// first; a zero nibble ends the list. Packed into one atomic because the
     /// reader is the audio callback, and a `Vec` there is not an option.
@@ -147,7 +145,6 @@ impl Metronome {
             on: AtomicBool::new(false),
             gain: AtomicU32::new(0x3f00_0000), // 0.5
             style: AtomicU32::new(0),
-            pos: AtomicU64::new(0),
             groups: AtomicU64::new(0),
             dest: AtomicU32::new(0),
             tap: AtomicU32::new(0),
@@ -222,13 +219,12 @@ impl Metronome {
         self.on.load(Ordering::Relaxed)
     }
 
-    /// Switching it on restarts the count, so the first beat is the beat you
-    /// switched it on for rather than wherever a free-running counter had got
-    /// to — the difference between counting a band in and joining it.
+    /// Switching it on does **not** restart the count: the click joins whatever
+    /// is already playing on the beat it is already on. Restarting from zero is
+    /// what put the click off the grid of a sequence that had started first —
+    /// the count belongs to
+    /// [`choz_ports::Transport::position_ppq`], not to this button.
     pub fn set_on(&self, on: bool) {
-        if on {
-            self.pos.store(0, Ordering::Relaxed);
-        }
         self.on.store(on, Ordering::Relaxed);
     }
 
@@ -271,12 +267,11 @@ impl Metronome {
         let beats_per_bar = num.max(1) as u64;
         let gain = self.gain();
         let style = self.style();
-        // The private counter is advanced either way, so stopping the
-        // transport carries on from where the click already was instead of
-        // jumping back to whatever it last counted on its own.
-        let own = self.pos.fetch_add(frames as u64, Ordering::Relaxed);
-        let t = choz_ports::transport();
-        let start = if t.playing() { t.samples() } else { own };
+        // One clock for everybody: the transport while it rolls, the free clock
+        // otherwise — the same number the sequencer, the arpeggiator and the
+        // arranger count their steps off, so the click cannot land between
+        // their beats.
+        let start = choz_ports::transport().position_samples();
         let mut peak = 0.0f32;
 
         for f in 0..frames.min(out.len() / 2) {
@@ -347,11 +342,11 @@ fn click(style: ClickStyle, t: f32, stress: Stress) -> f32 {
 }
 
 impl Metronome {
-    /// Put the click's own clock somewhere, for the test below. Not public
-    /// beyond the crate: nothing else has any business moving it.
+    /// Put the shared free clock somewhere, for the tests below — the click has
+    /// no clock of its own any more.
     #[cfg(test)]
     fn set_pos_for_test(&self, pos: u64) {
-        self.pos.store(pos, Ordering::Relaxed);
+        choz_ports::transport().set_free_samples(pos);
     }
 }
 
@@ -467,6 +462,96 @@ mod tests {
             "the downbeat has to be distinguishable from the others"
         );
         m.set_on(false);
+    }
+
+    /// **One clock.** A sequence started first and the metronome switched on
+    /// halfway through it: the click has to land on the sequencer's steps, not
+    /// between them.
+    ///
+    /// The bug this pins: the metronome counted a private frame counter that
+    /// restarted at zero every time the button was pressed, while the
+    /// sequencer counted an `Instant` of its own. Two clocks, two origins, and
+    /// a click that was in time with nothing.
+    #[test]
+    fn the_click_lands_on_the_sequencers_steps() {
+        use crate::artifacts::seq::{Seq, SeqSettings};
+
+        let _clock = crate::test_locks::transport();
+        let t = choz_ports::transport();
+        let sr = 48_000u32;
+        t.set_playing(false);
+        t.set_sample_rate(sr);
+        t.set_bpm(120.0); // half a second a beat, an eighth of that a step
+        t.set_time_signature(4, 4);
+
+        // The sequence starts where nothing is round: three eighths of a beat
+        // in, which is where a button press lands in real life.
+        let start = 9_000u64;
+        t.set_free_samples(start);
+        let mut seq = Seq::new(SeqSettings {
+            on: true,
+            ..Default::default()
+        });
+        for step in 0..crate::artifacts::seq::STEPS {
+            seq.toggle_step(0, step);
+        }
+        seq.play();
+
+        // …and the metronome is switched on after it, mid-bar.
+        let m = metronome();
+        m.set_groups(&[]);
+        m.set_on(true);
+
+        let block = 64usize;
+        let mut buf = vec![0.0f32; block * 2];
+        let mut out = Vec::new();
+        let t0 = std::time::Instant::now();
+        let (mut clicks, mut steps): (Vec<u64>, Vec<u64>) = (Vec::new(), Vec::new());
+        // Two seconds: four beats, sixty-four steps.
+        for i in 0..(sr as u64 * 2 / block as u64) {
+            let pos = start + i * block as u64;
+            t.set_free_samples(pos);
+            buf.fill(0.0);
+            m.render(&mut buf, block, sr);
+            // The onset only: a click rings for a few blocks, and what is being
+            // compared here is where it *starts*.
+            let loud = buf.iter().fold(0.0f32, |a, b| a.max(b.abs())) > 0.1;
+            // A click rings for a good part of a beat; the beats are half a
+            // second apart, so anything inside a quarter of one is the same
+            // click still sounding.
+            let ringing = clicks.last().is_some_and(|last| pos - last < 6_000);
+            if loud && !ringing {
+                clicks.push(pos);
+            }
+            out.clear();
+            seq.tick(t0 + std::time::Duration::from_millis(i * 4 / 3), &mut out);
+            if out
+                .iter()
+                .any(|e| matches!(e, crate::artifacts::arp::ArpEvent::On { .. }))
+            {
+                steps.push(pos);
+            }
+        }
+        m.set_on(false);
+        t.set_free_samples(0);
+
+        assert!(clicks.len() > 2, "the click never sounded: {clicks:?}");
+        assert!(steps.len() > 8, "the sequencer never played: {steps:?}");
+        // Every click is on a step. One block of slack: a beat boundary falls
+        // inside a block, so the click sounds in the block that contains it and
+        // the step fires on the tick that reads the position past it.
+        let slack = 2 * block as u64;
+        // Four beats of it, one click each.
+        assert!(
+            clicks.len() >= 3,
+            "the click is not on the beat: {clicks:?}"
+        );
+        for c in &clicks {
+            assert!(
+                steps.iter().any(|s| s.abs_diff(*c) <= slack),
+                "a click at {c} fell between the sequencer's steps: {steps:?}"
+            );
+        }
     }
 
     /// While something is rolling the click counts the **transport's**

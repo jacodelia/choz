@@ -172,8 +172,8 @@ pub fn write(path: &Path, preset: &Preset) -> Result<()> {
 
 /// Read one. A version this build does not know is an error rather than a guess.
 pub fn read(path: &Path) -> Result<Preset> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("cannot read {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
     let preset: Preset = serde_json::from_str(&text)
         .with_context(|| format!("{} is not a sampler preset", path.display()))?;
     if preset.version != VERSION {
@@ -251,7 +251,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("choz-smpreset-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let regions = vec![region("/lib/violin/C4.wav", 60), region("/lib/violin/C5.wav", 72)];
+        let regions = vec![
+            region("/lib/violin/C4.wav", 60),
+            region("/lib/violin/C5.wav", 72),
+        ];
         let preset = Preset::of(
             Path::new("/lib/violin"),
             "violin",

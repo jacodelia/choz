@@ -103,10 +103,10 @@ impl Slot {
 
     /// Play a note now, and remember it for `PANIC`.
     #[inline]
-    fn play(&mut self, note: u8, vel: u8, on: bool) {
+    fn play(&mut self, note: u8, vel: u8, on: bool, zone: Option<u8>) {
         if on {
             self.held |= 1u128 << (note & 0x7F);
-            self.source.note_on(note, vel);
+            self.source.note_on_zone(note, vel, zone);
         } else {
             self.held &= !(1u128 << (note & 0x7F));
             self.source.note_off(note);
@@ -114,18 +114,24 @@ impl Slot {
     }
 
     /// Take a note, now or later. `at == 0` is now.
-    fn schedule(&mut self, at: u64, note: u8, vel: u8, on: bool) {
+    fn schedule(&mut self, at: u64, note: u8, vel: u8, on: bool, zone: Option<u8>) {
         if at == 0 {
-            self.play(note, vel, on);
+            self.play(note, vel, on, zone);
             return;
         }
         if let Some(slot) = self.pending.iter_mut().find(|p| p.is_none()) {
-            *slot = Some(Scheduled { at, note, vel, on });
+            *slot = Some(Scheduled {
+                at,
+                note,
+                vel,
+                on,
+                zone,
+            });
             return;
         }
         // Full. A note slightly early is still the note; a dropped one is
         // silence, or worse, a note that never stops.
-        self.play(note, vel, on);
+        self.play(note, vel, on, zone);
     }
 
     /// The earliest pending note inside `[start, end)`, taken off the queue.
@@ -260,6 +266,9 @@ pub(crate) enum EngineCommand {
         slot: usize,
         note: u8,
         vel: u8,
+        /// The source zone the note is for, when it is for one — the band in a
+        /// tab, each musician on the program their own zone holds.
+        zone: Option<u8>,
         /// Transport sample the note is **for**. `0` means "as soon as it
         /// arrives", which is what every input that has no schedule of its own
         /// sends: a key, a MIDI port, OSC. A generator that knows when its next
@@ -597,7 +606,13 @@ impl EmbeddedRt {
         let frames = frames.min(self.max_frames());
         self.rt.apply_commands();
         self.rt.render(frames);
-        publish_load(started, cpu_started, faults_started, frames, self.rt.sample_rate);
+        publish_load(
+            started,
+            cpu_started,
+            faults_started,
+            frames,
+            self.rt.sample_rate,
+        );
     }
 
     /// The largest block this rack was built for.
@@ -671,6 +686,10 @@ struct Scheduled {
     note: u8,
     vel: u8,
     on: bool,
+    /// Which of the source's zones it is for — see
+    /// [`choz_ports::AudioSource::note_on_zone`]. `None` is the tab's own
+    /// program, which is what everything but the arranger's band sends.
+    zone: Option<u8>,
 }
 
 /// Smallest quantum choz will force on the graph. Forcing 64 frames onto a
@@ -2309,11 +2328,20 @@ impl AudioEngine {
 
     /// Send a note-on to one slot. Input→slot routing lives in the UI.
     pub fn note_on(&mut self, slot: usize, note: u8, vel: u8) {
+        self.note_on_zone_at(slot, note, vel, 0, None);
+    }
+
+    /// A note-on for one of the slot's zones — what a band in one tab sends, so
+    /// the drums land on the kit and the bass on the bass out of the same
+    /// SoundFont. `at` is the transport sample, `0` for "as soon as it
+    /// arrives"; `zone` of `None` is the tab's own program.
+    pub fn note_on_zone_at(&mut self, slot: usize, note: u8, vel: u8, at: u64, zone: Option<u8>) {
         self.send(EngineCommand::NoteOn {
             slot,
             note,
             vel,
-            at: 0,
+            at,
+            zone,
         });
     }
 
@@ -2330,12 +2358,7 @@ impl AudioEngine {
     /// and it is the only way its resolution stops being the interface's wake
     /// interval.
     pub fn note_on_at(&mut self, slot: usize, note: u8, vel: u8, at: u64) {
-        self.send(EngineCommand::NoteOn {
-            slot,
-            note,
-            vel,
-            at,
-        });
+        self.note_on_zone_at(slot, note, vel, at, None);
     }
 
     pub fn note_off_at(&mut self, slot: usize, note: u8, at: u64) {
@@ -2389,7 +2412,13 @@ fn audio_callback(buf: &mut [f32], state: &mut RtState) {
         buf[f * 2] = state.mix[0][f];
         buf[f * 2 + 1] = state.mix[1][f];
     }
-    publish_load(started, cpu_started, faults_started, frames, state.sample_rate);
+    publish_load(
+        started,
+        cpu_started,
+        faults_started,
+        frames,
+        state.sample_rate,
+    );
 }
 
 /// What this block cost against what it had — on the wall clock and on a CPU.
@@ -2612,9 +2641,10 @@ impl RtState {
                     note,
                     vel,
                     at,
+                    zone,
                 } => {
                     if let Some(s) = state.slots.get_mut(slot) {
-                        s.schedule(at, note, vel, true);
+                        s.schedule(at, note, vel, true, zone);
                         // What a gate driven by *playing* reads — see
                         // [`crate::meter::NoteLevels`]. Published where the
                         // note arrives and not where the slot renders, so a
@@ -2624,7 +2654,7 @@ impl RtState {
                 }
                 EngineCommand::NoteOff { slot, note, at } => {
                     if let Some(s) = state.slots.get_mut(slot) {
-                        s.schedule(at, note, 0, false);
+                        s.schedule(at, note, 0, false, None);
                     }
                 }
                 EngineCommand::Panic => {
@@ -2766,6 +2796,10 @@ impl RtState {
         if playing {
             transport.advance(frames);
         }
+        // The free clock never stops: it is the phase the metronome and every
+        // artifact with no transport to follow count off, and a phase that
+        // moved with the stop button would be four clocks again.
+        transport.advance_free(frames);
         let n = (frames * 2).min(scratch.len());
         let sr = *sample_rate;
 
@@ -2957,7 +2991,7 @@ impl RtState {
                         // segment that starts here is rendered.
                         while next_event < count && due[next_event].unwrap().0 <= at {
                             let ev = due[next_event].unwrap().1;
-                            slot.play(ev.note, ev.vel, ev.on);
+                            slot.play(ev.note, ev.vel, ev.on, ev.zone);
                             next_event += 1;
                         }
                         let end = due
@@ -3247,7 +3281,9 @@ fn jack_route_to(sink: &str, client_name: &str) -> Result<()> {
         anyhow::bail!("output '{sink}' has no playback ports");
     }
 
-    for (out, target) in pair_ports(&ours, &targets) {
+    let pairs = pair_ports(&ours, &targets);
+    let wired = pairs.len();
+    for (out, target) in pairs {
         // Tear the old wiring down first: a port left connected to two sinks
         // plays through both.
         if let Some(port) = client.port_by_name(out) {
@@ -3259,6 +3295,12 @@ fn jack_route_to(sink: &str, client_name: &str) -> Result<()> {
             .connect_ports_by_name(out, target)
             .with_context(|| format!("cannot connect {out} to {target}"))?;
     }
+    // **Said out loud even though it worked.** Picking an output and hearing
+    // nothing used to leave no line at all in the log: this path was silent on
+    // success, `connect` was silent on success, and a run that ended up wired
+    // to the wrong sink looked exactly like a run that was wired to the right
+    // one. The log is the only thing there is to read afterwards.
+    eprintln!("choz: output wired to '{sink}' — {wired} of {} ports", ours.len());
     Ok(())
 }
 
@@ -4387,6 +4429,7 @@ mod tests {
                 note: 60,
                 vel: 100,
                 at: 9,
+                zone: None,
             })
             .unwrap();
         state.apply_commands();
@@ -4459,6 +4502,7 @@ mod tests {
                 note: 60,
                 vel: 100,
                 at: 4,
+                zone: None,
             })
             .unwrap();
         state.apply_commands();
@@ -4489,6 +4533,7 @@ mod tests {
                 note: 64,
                 vel: 100,
                 at: 0,
+                zone: None,
             })
             .unwrap();
         state.apply_commands();
@@ -4743,6 +4788,7 @@ mod tests {
                 note: 60,
                 vel: 100,
                 at: 0,
+                zone: None,
             })
             .unwrap();
 
@@ -4758,6 +4804,7 @@ mod tests {
                 note: 62,
                 vel: 100,
                 at: 0,
+                zone: None,
             })
             .unwrap();
         cmd_tx

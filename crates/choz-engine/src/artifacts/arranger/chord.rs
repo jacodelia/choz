@@ -116,6 +116,166 @@ pub fn pitch_class_name(pc: u8) -> &'static str {
     NAMES[(pc % 12) as usize]
 }
 
+/// `0` = C, with a flat: what a note called by a flat function is called.
+pub fn pitch_class_name_flat(pc: u8) -> &'static str {
+    const FLAT: [&str; 12] = [
+        "C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B",
+    ];
+    FLAT[(pc % 12) as usize]
+}
+
+/// `0` = C, spelled the way a chart in `key` would spell it.
+///
+/// The sharps are only right half the time: the flat seven of C is `Bb`
+/// everywhere it is written, and `A#` is a chart a player has to translate. Two
+/// rules, which is all a key really says about spelling — the flat side of the
+/// circle writes flats, and the degrees a progression *reaches by flattening*
+/// (`bII`, `bIII`, `bVI`, `bVII`) are flats in any key. What is left is the
+/// sharp four, which is a sharp.
+pub fn pitch_class_name_in_key(pc: u8, key: u8) -> &'static str {
+    // F, Bb, Eb, Ab, Db, Gb: the flat side of the circle.
+    const FLAT_KEYS: [u8; 6] = [5, 10, 3, 8, 1, 6];
+    let semis = (pc as i32 - key as i32).rem_euclid(12);
+    let flat = FLAT_KEYS.contains(&(key % 12)) || matches!(semis, 1 | 3 | 8 | 10);
+    match flat {
+        true => pitch_class_name_flat(pc),
+        false => pitch_class_name(pc),
+    }
+}
+
+/// A symbol split where the root ends: `Cm7b5` is `(0, "m7b5")`, `IIm7` in C is
+/// `(2, "m7")`. `None` for a symbol that is not a chord.
+///
+/// What a dialogue that *builds* a chord opens on: it has to know what is
+/// already written without re-implementing the grammar that reads it.
+pub fn root_and_quality(symbol: &str, key: u8) -> Option<(u8, String)> {
+    let sym = symbol.trim();
+    if matches!(sym, "-" | "%" | "/" | "") {
+        return None;
+    }
+    let (root, rest) = split_root(sym, Some(key)).ok()?;
+    // A quality that does not parse is not a chord: the caller would build a
+    // dialogue around something the arranger refuses.
+    quality(rest).ok()?;
+    Some((root, rest.to_string()))
+}
+
+/// Whether a chart is written in degrees, by reading the first symbol in it.
+///
+/// The notation is a property of the text, not a flag beside it: a chart opened
+/// from a file says which it is, and a switch that disagreed with what is on
+/// screen would be the worst of both.
+pub fn is_roman(text: &str) -> bool {
+    for line in text.lines() {
+        let body = line.split('#').next().unwrap_or("").trim();
+        if body.is_empty()
+            || body.starts_with('[')
+            || body
+                .split_once('=')
+                .is_some_and(|(name, _)| !name.contains('|'))
+        {
+            continue;
+        }
+        for token in body.split(['|', ' ', '\t']) {
+            let sym = token.split(':').next().unwrap_or("").trim();
+            if sym.is_empty() || matches!(sym, "-" | "%" | "/") {
+                continue;
+            }
+            return sym.starts_with(['I', 'V']);
+        }
+    }
+    false
+}
+
+/// The same chord, spelled the other way: `C7` in the key of C is `I7`, and
+/// `I7` is `C7`.
+///
+/// What the arranger's notation switch is: a chart is read as degrees by
+/// somebody thinking about the form and as letters by somebody playing it, and
+/// they are the same chart. A hold (`-`) is a hold either way, and a symbol that
+/// does not parse is handed back untouched — it is somebody's typing, not ours
+/// to lose.
+pub fn respell(symbol: &str, key: u8, roman: bool) -> String {
+    let sym = symbol.trim();
+    if matches!(sym, "-" | "%" | "/" | "") {
+        return sym.to_string();
+    }
+    let Ok((root, rest)) = split_root(sym, Some(key)) else {
+        return sym.to_string();
+    };
+    match roman {
+        true => format!("{}{rest}", roman_of(root, key)),
+        false => format!("{}{rest}", pitch_class_name_in_key(root, key)),
+    }
+}
+
+/// The degree a pitch class is in `key`, in the notation [`split_root`] reads:
+/// the accidental comes **after** the numeral, so the flat seven is `VIIb`.
+fn roman_of(root: u8, key: u8) -> String {
+    const NUMERAL: [&str; 7] = ["I", "II", "III", "IV", "V", "VI", "VII"];
+    let semis = (root as i32 - key as i32).rem_euclid(12);
+    if let Some(i) = DEGREE.iter().position(|d| *d == semis) {
+        return NUMERAL[i].to_string();
+    }
+    // Between two degrees: the one above it, flattened — `bIII` rather than
+    // `#II`, which is how a progression is written.
+    match DEGREE.iter().position(|d| *d > semis) {
+        Some(i) => format!("{}b", NUMERAL[i]),
+        None => format!("{}#", NUMERAL[6]),
+    }
+}
+
+/// A whole chart, respelled. The lines that are not bars — the headers, the
+/// section names — are left exactly as they were, and so is every space and bar
+/// line: only the symbols change, so a chart keeps the shape it was written in.
+pub fn respell_text(text: &str, roman: bool) -> String {
+    let key = settings_of(text).0.unwrap_or(0);
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let body = line.split('#').next().unwrap_or("");
+        let is_bar = !body.trim().is_empty()
+            && !body.trim_start().starts_with('[')
+            && !body
+                .split_once('=')
+                .is_some_and(|(name, _)| !name.contains('|'));
+        if !is_bar {
+            out.push_str(line);
+            continue;
+        }
+        // Word by word, keeping everything that is not a word: the `|`, the
+        // spaces a chart is laid out with, and a comment at the end of the line.
+        let mut word = String::new();
+        for c in line.chars() {
+            match c.is_whitespace() || c == '|' || c == '#' {
+                true => {
+                    if !word.is_empty() {
+                        out.push_str(&respell_token(&word, key, roman));
+                        word.clear();
+                    }
+                    out.push(c);
+                }
+                false => word.push(c),
+            }
+        }
+        if !word.is_empty() {
+            out.push_str(&respell_token(&word, key, roman));
+        }
+    }
+    out
+}
+
+/// One word of a bar: the symbol respelled, the `:3` that says how long it is
+/// left alone.
+fn respell_token(token: &str, key: u8, roman: bool) -> String {
+    match token.split_once(':') {
+        Some((sym, weight)) => format!("{}:{weight}", respell(sym, key, roman)),
+        None => respell(token, key, roman),
+    }
+}
+
 /// One chord symbol, roman or american.
 ///
 /// `key` is the tonic as a pitch class. Roman degrees without one are an error
@@ -193,6 +353,9 @@ fn split_root(sym: &str, key: Option<u8>) -> Result<(u8, &str)> {
 
 /// One thing a quality can say, so the table below stays a table.
 enum Alter {
+    /// `m(maj7)`, `mMaj9`: the major seventh on top of whatever triad the
+    /// letters asked for. Written after the family, so it cannot be the family.
+    MajSeventh(i32),
     Sus(i32),
     Add9,
     B5,
@@ -236,9 +399,16 @@ fn quality(mut rest: &str) -> Result<(Vec<i32>, Vec<i32>), String> {
     let (mut sus, mut add9) = (None, false);
     let (mut b5, mut s5) = (false, false);
     let (mut b9, mut s9, mut s11, mut b13) = (false, false, false, false);
+    let mut major_seventh = false;
     while !rest.is_empty() {
         let before = rest;
         for (token, alter) in [
+            ("(maj7)", Alter::MajSeventh(7)),
+            ("(maj9)", Alter::MajSeventh(9)),
+            ("maj13", Alter::MajSeventh(13)),
+            ("maj11", Alter::MajSeventh(11)),
+            ("maj9", Alter::MajSeventh(9)),
+            ("maj7", Alter::MajSeventh(7)),
             ("sus2", Alter::Sus(2)),
             ("sus4", Alter::Sus(5)),
             ("sus", Alter::Sus(5)),
@@ -267,6 +437,10 @@ fn quality(mut rest: &str) -> Result<(Vec<i32>, Vec<i32>), String> {
             };
             rest = stripped;
             match alter {
+                Alter::MajSeventh(n) => {
+                    major_seventh = true;
+                    number = number.max(n);
+                }
                 Alter::Sus(s) => sus = Some(s),
                 Alter::Add9 => add9 = true,
                 Alter::B5 => b5 = true,
@@ -317,6 +491,9 @@ fn quality(mut rest: &str) -> Result<(Vec<i32>, Vec<i32>), String> {
     };
     if number >= 7 {
         tones.push(match family {
+            // A minor with a major seventh is the one chord whose seventh its
+            // letters do not say: `Cm(maj7)` is a minor triad and a B.
+            _ if major_seventh => 11,
             Family::Maj => 11,
             // A full diminished seventh, which is what `dim7` means and what
             // `dim` is taken to mean in a progression.
@@ -353,6 +530,8 @@ fn quality(mut rest: &str) -> Result<(Vec<i32>, Vec<i32>), String> {
         // half-diminished from the dorian minor — not the letters.
         Family::HalfDim => vec![0, 1, 3, 5, 6, 8, 10],
         Family::Min if b5 => vec![0, 1, 3, 5, 6, 8, 10],
+        // Melodic minor: the scale the minor-major seventh came from.
+        Family::Min if major_seventh => vec![0, 2, 3, 5, 7, 9, 11],
         Family::Min => vec![0, 2, 3, 5, 7, 9, 10],
         Family::Dim => vec![0, 2, 3, 5, 6, 8, 9, 11],
         Family::Aug => vec![0, 2, 4, 6, 8, 10],
@@ -369,15 +548,73 @@ fn quality(mut rest: &str) -> Result<(Vec<i32>, Vec<i32>), String> {
 
 /// One bar of the progression, and the chords that share it.
 ///
-/// A bar's chords divide it evenly: two chords in a bar of four are two beats
-/// each, which is what `I7 IIIb7` means everywhere it is written that way.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A bar's chords divide it by `weights`: `| C G |` in four is two beats each,
+/// and `| Cm:3 F:2 Bb:2 |` in 7/8 is the bar grouped 3+2+2 — the metronome's
+/// own grouping, written where the chords are. `weights` is always as long as
+/// `chords`; all ones is the even split every chart written before the
+/// groupings means.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Bar {
     pub chords: Vec<Chord>,
+    /// How much of the bar each chord holds, as shares of their sum. Never
+    /// empty, never zero — see [`Bar::new`].
+    pub weights: Vec<f64>,
+}
+
+impl Bar {
+    /// A bar of chords with the weight each one was written with. A missing or
+    /// unusable weight is `1.0`, which is the even split.
+    pub fn new(chords: Vec<Chord>, weights: Vec<f64>) -> Self {
+        let mut weights = weights;
+        weights.resize(chords.len(), 1.0);
+        for w in &mut weights {
+            if !w.is_finite() || *w <= 0.0 {
+                *w = 1.0;
+            }
+        }
+        Self { chords, weights }
+    }
+
+    /// Where slot `i` starts and how long it is, in beats of a
+    /// `beats_per_bar` bar.
+    fn slot(&self, i: usize, beats_per_bar: f64) -> (f64, f64) {
+        let total: f64 = self.weights.iter().sum();
+        if total <= 0.0 || self.weights.is_empty() {
+            return (0.0, beats_per_bar);
+        }
+        let start: f64 = self.weights[..i.min(self.weights.len())].iter().sum();
+        let len = self.weights.get(i).copied().unwrap_or(total);
+        (beats_per_bar * start / total, beats_per_bar * len / total)
+    }
+
+    /// Which slot the bar is `into` beats in, or `None` for an empty bar.
+    fn slot_at(&self, into: f64, beats_per_bar: f64) -> Option<usize> {
+        if self.chords.is_empty() {
+            return None;
+        }
+        let last = self.chords.len() - 1;
+        for i in 0..=last {
+            let (start, len) = self.slot(i, beats_per_bar);
+            if into < start + len {
+                return Some(i);
+            }
+        }
+        Some(last)
+    }
+
+    /// The grouping the bar is written in, as the metronome counts one: the
+    /// weights as whole numbers when they are whole, which is every bar a
+    /// grouping wrote.
+    pub fn groups(&self) -> Vec<u8> {
+        self.weights
+            .iter()
+            .map(|w| w.round().clamp(1.0, 15.0) as u8)
+            .collect()
+    }
 }
 
 /// What was written: a key, a style by name, and the bars.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Progression {
     /// Tonic as a pitch class. `C` when nothing said otherwise — american
     /// symbols do not need it, and the scales still want a context.
@@ -405,8 +642,7 @@ impl Progression {
         let bar = (beat / beats_per_bar).floor() as usize;
         let bar = self.bars.get(bar.min(self.bars.len() - 1))?;
         let into = beat.rem_euclid(beats_per_bar);
-        let share = beats_per_bar / bar.chords.len() as f64;
-        let index = ((into / share).floor() as usize).min(bar.chords.len() - 1);
+        let index = bar.slot_at(into, beats_per_bar)?;
         // A chord held over the slots next to it is one chord, not three: the
         // way to write `I7` for three beats of four is `| I7 - - IV7 |`, and a
         // bass line told it changes every beat would approach a change that is
@@ -415,7 +651,8 @@ impl Progression {
         while bar.chords.get(last + 1) == Some(&bar.chords[index]) {
             last += 1;
         }
-        Some((&bar.chords[index], share * (last + 1) as f64 - into))
+        let (start, len) = bar.slot(last, beats_per_bar);
+        Some((&bar.chords[index], start + len - into))
     }
 
     /// The chord that follows the one at `beat` — what a bass line has to know
@@ -440,6 +677,28 @@ impl Progression {
 
 /// Read a progression: the headers, then the bars.
 ///
+/// The `key` and the `style` a chart names, without reading its bars.
+///
+/// What a text that does not parse is still asked: both are picked from
+/// dialogues of their own and written back into the text, and a typo three bars
+/// down must not be what swallows the pick.
+pub fn settings_of(text: &str) -> (Option<u8>, Option<String>) {
+    let mut key = None;
+    let mut style = None;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        match name.trim().to_ascii_lowercase().as_str() {
+            "key" => key = pitch_class(value.trim()).ok(),
+            "style" => style = Some(value.trim().to_ascii_lowercase()),
+            _ => {}
+        }
+    }
+    (key, style)
+}
+
 /// Tolerant on purpose — `||` and `|` are the same delimiter, blank bars carry
 /// the last chord on, and `-` holds the one before it. What is not tolerated is
 /// a chord it cannot read: silently dropping one would play a different song
@@ -496,8 +755,12 @@ pub fn parse_progression(text: &str) -> Result<Progression> {
                 continue;
             }
         }
+        // The newline is kept, because it is a bar line: a chart written in
+        // rows of four bars with no `|` at the ends of them used to have the
+        // last bar of each row run into the first of the next — see
+        // [`parse_bars`].
         let body = &mut parts[cur].1;
-        body.push(' ');
+        body.push('\n');
         body.push_str(line);
     }
 
@@ -537,20 +800,55 @@ pub fn parse_progression(text: &str) -> Result<Progression> {
     })
 }
 
+/// `C:3` — a chord and how much of its bar it holds. `1.0` when nothing said.
+///
+/// The `:` cannot collide with a chord symbol: no quality is written with one,
+/// and a weight that is not a number is an error rather than a chord nobody
+/// asked for.
+fn split_weight(token: &str) -> Result<(&str, f64)> {
+    let Some((symbol, weight)) = token.split_once(':') else {
+        return Ok((token, 1.0));
+    };
+    let Ok(weight) = weight.parse::<f64>() else {
+        bail!("{token}: {weight} is not how long a chord is");
+    };
+    if !weight.is_finite() || weight <= 0.0 {
+        bail!("{token}: a chord cannot be {weight} of a bar long");
+    }
+    Ok((symbol, weight))
+}
+
 /// The bars of one part. Split out of [`parse_progression`] so a form can ask
 /// for the same part twice without the chords being read twice differently.
 fn parse_bars(body: &str, key: Option<u8>) -> Result<Vec<Bar>> {
-
     let mut bars = Vec::new();
     let mut last: Option<Chord> = None;
-    for bar in body.split('|') {
+    // **A line ends a bar, whether or not it is closed with a bar line.** A
+    // chart is written in rows of four:
+    //
+    // ```text
+    // Im7  | Im7      | Im7 | Im7
+    // IVm7 | IVm7     | Im7 | Im7
+    // ```
+    //
+    // and joining the rows on nothing ran the last bar of one into the first of
+    // the next — twelve bars read as ten, with two of them carrying two chords
+    // nobody wrote together.
+    for bar in body.split(['|', '\n']) {
         let bar = bar.trim();
         if bar.is_empty() {
             // `||` at either end, and the space between two bar lines.
             continue;
         }
         let mut chords = Vec::new();
-        for symbol in bar.split_whitespace() {
+        let mut weights = Vec::new();
+        for token in bar.split_whitespace() {
+            // `C:3` is a chord that holds three of the bar's own units — the
+            // grouping written where the chords are, so a 7/8 counted 3+2+2 is
+            // three chords of the lengths it is counted in. Without one a bar
+            // divides evenly, which is what every chart written before this
+            // means.
+            let (symbol, weight) = split_weight(token)?;
             let chord = match symbol {
                 "-" | "%" | "/" => match last.clone() {
                     Some(chord) => chord,
@@ -560,11 +858,12 @@ fn parse_bars(body: &str, key: Option<u8>) -> Result<Vec<Bar>> {
             };
             last = Some(chord.clone());
             chords.push(chord);
+            weights.push(weight);
         }
         if chords.is_empty() {
             continue;
         }
-        bars.push(Bar { chords });
+        bars.push(Bar::new(chords, weights));
     }
     Ok(bars)
 }
@@ -590,8 +889,14 @@ mod tests {
         assert_eq!(c("IIb7"), pitch_class("Db").unwrap());
         // Another key, same degrees.
         let bb = pitch_class("Bb").unwrap();
-        assert_eq!(parse("IV7", Some(bb)).unwrap().root, pitch_class("Eb").unwrap());
-        assert_eq!(parse("V7", Some(bb)).unwrap().root, pitch_class("F").unwrap());
+        assert_eq!(
+            parse("IV7", Some(bb)).unwrap().root,
+            pitch_class("Eb").unwrap()
+        );
+        assert_eq!(
+            parse("V7", Some(bb)).unwrap().root,
+            pitch_class("F").unwrap()
+        );
         // And without one it is not a chord, rather than a guess.
         assert!(parse("I7", None).is_err());
     }
@@ -637,9 +942,39 @@ mod tests {
     #[test]
     fn a_chord_brings_its_scale() {
         assert_eq!(parse("C7", None).unwrap().scale, vec![0, 2, 4, 5, 7, 9, 10]);
-        assert_eq!(parse("C7b9", None).unwrap().scale, vec![0, 1, 3, 4, 6, 8, 10]);
-        assert_eq!(parse("Cm7", None).unwrap().scale, vec![0, 2, 3, 5, 7, 9, 10]);
-        assert_eq!(parse("Cm7b5", None).unwrap().scale, vec![0, 1, 3, 5, 6, 8, 10]);
+        assert_eq!(
+            parse("C7b9", None).unwrap().scale,
+            vec![0, 1, 3, 4, 6, 8, 10]
+        );
+        assert_eq!(
+            parse("Cm7", None).unwrap().scale,
+            vec![0, 2, 3, 5, 7, 9, 10]
+        );
+        assert_eq!(
+            parse("Cm7b5", None).unwrap().scale,
+            vec![0, 1, 3, 5, 6, 8, 10]
+        );
+    }
+
+    /// A row of bars with no bar line at the ends of it is still four bars: a
+    /// chart is written in rows, and the newline is a bar line.
+    #[test]
+    fn a_line_ends_a_bar() {
+        let prog = parse_progression(
+            "key = C\nIm7  | Im7      | Im7 | Im7\nIVm7 | IVm7     | Im7 | Im7\nV7   | VIb7 V7  | Im7 | V7",
+        )
+        .unwrap();
+        assert_eq!(prog.bars.len(), 12, "the rows ran into each other");
+        // The one bar that really does hold two chords is the one that was
+        // written that way.
+        let two: Vec<usize> = prog
+            .bars
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.chords.len() > 1)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(two, vec![9], "{two:?}");
     }
 
     #[test]
@@ -727,5 +1062,94 @@ mod tests {
 
         // A form that names a part nobody wrote is an error, not silence.
         assert!(parse_progression("key = C\nform = a c\n[a]\n| I7 |").is_err());
+    }
+
+    /// A bar is grouped where it is written: `C:3 F:2 Bb:2` in a 7/8 bar of 3.5
+    /// beats is 1.5 + 1 + 1, not three equal thirds. Without weights a bar
+    /// still divides evenly, which is every chart written before this.
+    #[test]
+    fn a_bars_weights_are_how_long_its_chords_are() {
+        let prog = parse_progression("|| Cm:3 F:2 Bb:2 | C G ||").unwrap();
+        assert_eq!(prog.bars[0].groups(), vec![3, 2, 2]);
+        assert_eq!(prog.bars[1].groups(), vec![1, 1], "no weights, even split");
+
+        let sym = |beat: f64| prog.at(beat, 3.5).map(|(c, left)| (c.symbol.clone(), left));
+        // The 3+2+2 bar: three eighths of Cm, two of F, two of Bb.
+        let (first, left) = sym(0.0).unwrap();
+        assert_eq!(first, "Cm");
+        assert!((left - 1.5).abs() < 1e-9, "Cm holds 1.5 beats, not {left}");
+        assert_eq!(sym(1.4).unwrap().0, "Cm", "still inside the first group");
+        let (second, left) = sym(1.5).unwrap();
+        assert_eq!(second, "F");
+        assert!((left - 1.0).abs() < 1e-9, "F holds one beat, not {left}");
+        assert_eq!(sym(2.5).unwrap().0, "Bb");
+        // The even bar after it splits in two.
+        assert_eq!(sym(3.5).unwrap().0, "C");
+        assert_eq!(sym(5.3).unwrap().0, "G");
+
+        // A weight that is not a length is an error rather than a chord nobody
+        // wrote.
+        assert!(parse_progression("|| C:x ||").is_err());
+        assert!(parse_progression("|| C:0 ||").is_err());
+    }
+
+    /// The same chart, spelled the other way: degrees for whoever is thinking
+    /// about the form, letters for whoever is playing it.
+    #[test]
+    fn a_chart_can_be_read_as_degrees_or_as_letters() {
+        // In C: the degrees of a blues, and the chords they are.
+        let c = pitch_class("C").unwrap();
+        assert_eq!(respell("I7", c, false), "C7");
+        assert_eq!(respell("IV7", c, false), "F7");
+        assert_eq!(respell("VIIb7", c, false), "Bb7", "the flat seven");
+        assert_eq!(respell("C7", c, true), "I7");
+        assert_eq!(respell("F7", c, true), "IV7");
+        assert_eq!(respell("Bb7", c, true), "VIIb7");
+        assert_eq!(respell("Eb", c, true), "IIIb");
+        // Round trip, in a flat key where the spelling is the point: Bb's
+        // degrees are written with flats, not with A sharps.
+        let bb = pitch_class("Bb").unwrap();
+        assert_eq!(respell("I7", bb, false), "Bb7");
+        assert_eq!(respell("IIIb", bb, false), "Db");
+        assert_eq!(respell("Db", bb, true), "IIIb");
+        // A hold is a hold, and typing nobody can read is handed back whole.
+        assert_eq!(respell("-", c, true), "-");
+        assert_eq!(respell("what", c, true), "what");
+
+        // A whole chart keeps its shape: the headers, the sections, the bar
+        // lines and the weights are where they were.
+        let text = "key = C\nstyle = rock\n\n[a]\n| I7  | IVm7:3 -:2 | VIIb7 |  # tail";
+        let letters = respell_text(text, false);
+        assert_eq!(
+            letters, "key = C\nstyle = rock\n\n[a]\n| C7  | Fm7:3 -:2 | Bb7 |  # tail",
+            "{letters:?}"
+        );
+        assert_eq!(respell_text(&letters, true), text, "not a round trip");
+        // And both read as the same music.
+        let a = parse_progression(text).unwrap();
+        let b = parse_progression(&letters).unwrap();
+        assert_eq!(
+            a.bars.iter().map(|b| b.chords[0].root).collect::<Vec<_>>(),
+            b.bars.iter().map(|b| b.chords[0].root).collect::<Vec<_>>()
+        );
+    }
+
+    /// The one chord whose seventh its letters do not say: a minor triad with a
+    /// major seventh, out of the melodic minor.
+    #[test]
+    fn a_minor_can_take_a_major_seventh() {
+        let notes = pcs("Cm(maj7)", None);
+        assert_eq!(notes, vec![0, 3, 7, 11], "C Eb G B");
+        assert_eq!(
+            pcs("Cmmaj7", None),
+            notes,
+            "the same chord, written plainer"
+        );
+        let scale = parse("Cm(maj7)", None).unwrap().scale;
+        assert_eq!(scale, vec![0, 2, 3, 5, 7, 9, 11], "melodic minor");
+        // The plain minor seventh is untouched by it.
+        assert_eq!(pcs("Cm7", None), vec![0, 3, 7, 10]);
+        // And the major-major is still the major.
+        assert_eq!(pcs("Cmaj7", None), vec![0, 4, 7, 11]);
     }
 }

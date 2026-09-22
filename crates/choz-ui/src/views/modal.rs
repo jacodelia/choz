@@ -37,6 +37,10 @@ pub struct ListModal {
     pub scroll: usize,
     /// Extra line above the buttons (e.g. the current directory).
     pub note: String,
+    /// A heading over the rows, for a list whose rows are columns: the chord
+    /// matrix names what each column is. Empty (the usual) draws nothing, and
+    /// the list takes the row back.
+    pub header: String,
     /// Extra buttons on the button row: `(label, the key they stand for)`.
     /// Clicking one is the same as pressing that key, so mouse and keyboard
     /// share a single handler.
@@ -456,6 +460,18 @@ pub fn draw_list_modal(
             f.render_widget(Paragraph::new(Span::styled(label, st)), rect);
             x += w + 1;
         }
+        y += 1;
+    }
+    // A heading over the rows, in the hint colour: it is a label, not a row to
+    // pick, so nothing about it is selectable.
+    if !m.header.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                m.header.clone(),
+                Style::default().fg(HINT).add_modifier(Modifier::BOLD),
+            )),
+            Rect::new(content.x, y, content.width, 1),
+        );
         y += 1;
     }
 

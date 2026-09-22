@@ -173,10 +173,7 @@ pub fn onsets(stereo: &[f32], sample_rate: u32, max: usize) -> Vec<f32> {
         .collect();
     // The rise, and only the rise: energy falling away is the tail of the hit
     // before, not a new one.
-    let flux: Vec<f32> = env
-        .windows(2)
-        .map(|w| (w[1] - w[0]).max(0.0))
-        .collect();
+    let flux: Vec<f32> = env.windows(2).map(|w| (w[1] - w[0]).max(0.0)).collect();
     let mean = flux.iter().sum::<f32>() / flux.len().max(1) as f32;
     // Half again over the average rise, and never on a file that is all noise
     // floor: a threshold of nothing finds a hit every hop.
@@ -303,7 +300,10 @@ mod tests {
         }
         let found = onsets(&audio, 44_100, 8);
         assert_eq!(found.len(), 8, "{found:?}");
-        assert!(found.windows(2).all(|w| w[0] < w[1]), "out of order: {found:?}");
+        assert!(
+            found.windows(2).all(|w| w[0] < w[1]),
+            "out of order: {found:?}"
+        );
         assert_eq!(found[0], 0.0, "the first slice is the top of the file");
     }
 
