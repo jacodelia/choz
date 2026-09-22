@@ -7,6 +7,7 @@
 #   ./packaging/install.sh --skip-deps-check      install without checking ALSA
 #   ./packaging/install.sh --no-clap      skip choz's own effects as a CLAP
 #                                         plugin (they are installed by default)
+#   ./packaging/install.sh --yes          replace a previous install without asking
 #   ./packaging/install.sh --uninstall
 #
 # What it will never touch, install or uninstall: ~/.local/state/choz. The
@@ -17,6 +18,7 @@ PREFIX="${PREFIX:-$HOME/.local}"
 BINARY=""
 UNINSTALL=0
 SKIP_DEPS=0
+ASSUME_YES=0
 # choz's 45 effects as one `.clap`, for Bitwig/Reaper/Carla. Installed **with
 # the program**: they are choz's own DSP, not a third-party plugin, and a host
 # that ships its effects only to itself is a host whose effects nobody else can
@@ -40,7 +42,8 @@ while [ $# -gt 0 ]; do
         --skip-deps-check) SKIP_DEPS=1; shift ;;
         --with-clap) WITH_CLAP=1; shift ;;
         --no-clap) WITH_CLAP=0; shift ;;
-        -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+        -y|--yes) ASSUME_YES=1; shift ;;
+        -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
 done
@@ -69,9 +72,11 @@ remove_installed() {
             say "cannot remove $bin ($version): no write permission — try sudo"
         fi
     done
-    [ -f "$CLAP_DIR/choz.clap" ] && rm -f "$CLAP_DIR/choz.clap"
-    [ -f "$CLAP_DIR/choz-rack.clap" ] && rm -f "$CLAP_DIR/choz-rack.clap"
-    [ -f "$BIN_DIR/choz-pd-host" ] && rm -f "$BIN_DIR/choz-pd-host"
+    # Both bundles — the effects and choz itself — said out loud like the rest:
+    # a plugin left behind is a host still offering choz after it is gone.
+    for f in "$CLAP_DIR/choz.clap" "$CLAP_DIR/choz-rack.clap" "$BIN_DIR/choz-pd-host"; do
+        [ -f "$f" ] && rm -f "$f" && say "removed $f"
+    done
     [ -d "$WALLPAPER_DIR" ] && rm -rf "$WALLPAPER_DIR"
     for f in "$BIN_DIR/choz-launcher" "$APP_DIR/choz.desktop" \
              "$ICON_DIR/choz.svg" "$MIME_DIR/choz-project.xml"; do
@@ -82,6 +87,39 @@ remove_installed() {
         [ -e "$f" ] && rm -f "$f" && say "removed $f"
     done
     return 0
+}
+
+# Every previous copy this install would replace, one per line: the binaries on
+# the known paths and the CLAP bundles. The same list `remove_installed` walks.
+previous_installs() {
+    for bin in $KNOWN_BINS "$BIN_DIR/choz"; do
+        [ -e "$bin" ] || continue
+        printf '  %s (%s)\n' "$bin" "$("$bin" --version 2>/dev/null || echo "unknown version")"
+    done | sort -u
+    for f in "$CLAP_DIR/choz.clap" "$CLAP_DIR/choz-rack.clap"; do
+        [ -f "$f" ] && printf '  %s\n' "$f"
+    done
+    return 0
+}
+
+# **Asked, not assumed**: a copy in `~/.clap` may be a build somebody made on
+# purpose. Only on a terminal — piped, scripted or `--yes`, it replaces, which
+# is what an upgrade has always done here.
+confirm_replace() {
+    found=$(previous_installs)
+    [ -n "$found" ] || return 0
+    say "a previous choz is installed:"
+    say "$found"
+    if [ "$ASSUME_YES" = 1 ] || [ ! -t 0 ]; then
+        say "replacing it with $new_version"
+        return 0
+    fi
+    printf 'Replace it with %s? [Y/n] ' "$new_version"
+    read -r answer || answer=n
+    case "$answer" in
+        ""|[Yy]*) return 0 ;;
+        *) say "nothing changed"; exit 0 ;;
+    esac
 }
 
 refresh_caches() {
@@ -149,7 +187,7 @@ check_runtime_deps() {
     fi
     if ! ldconfig -p 2>/dev/null | grep -q 'libjack\.so'; then
         say "note: libjack is not installed — choz will use ALSA."
-        say "      For JACK/PipeWire routing: apt install libjack-jackd2-0 | pacman -S jack2 | dnf install jack-audio-connection-kit"
+        say "      For JACK/PipeWire routing: apt install pipewire-jack | pacman -S pipewire-jack | dnf install pipewire-jack-audio-connection-kit"
     fi
     return 0
 }
@@ -180,6 +218,7 @@ fi
 new_version=$("$BINARY" --version 2>/dev/null || echo "choz (unknown)")
 
 # Upgrade means replacing what is there, not installing alongside it.
+confirm_replace
 remove_installed
 
 mkdir -p "$BIN_DIR" "$APP_DIR" "$ICON_DIR" "$MIME_DIR"
@@ -260,6 +299,12 @@ if [ "$WITH_CLAP" -eq 1 ]; then
 fi
 
 refresh_caches
+
+# A package's bundles are shadowed by these: a host reads `~/.clap` first and
+# keeps loading whichever version sits there.
+if [ "$WITH_CLAP" -eq 1 ] && [ -f /usr/lib/clap/choz-rack.clap ]; then
+    say "note: /usr/lib/clap has choz from a package; the copies in $CLAP_DIR win over it"
+fi
 
 case ":$PATH:" in
     *":$BIN_DIR:"*) ;;

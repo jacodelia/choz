@@ -332,3 +332,36 @@ fn the_desktop_entry_lands_under_audio() {
         "the icon name has to match the installed choz.svg",
     );
 }
+
+/// **Both CLAP bundles, in every package.** 1.3.12 shipped the effects and not
+/// the rack, and a DAW went on loading a stale rack from `~/.clap`. Declared as
+/// package files is also what makes the package manager take them away again
+/// on uninstall, so this is the uninstall's check as much as the install's.
+#[test]
+fn every_package_carries_both_clap_bundles() {
+    let manifest = manifest();
+    let tables = [
+        ("the .deb", section(&manifest, "package.metadata.deb")),
+        (
+            "the ARM .deb",
+            section(&manifest, "package.metadata.deb.variants.arm"),
+        ),
+        (
+            "the .rpm",
+            section(&manifest, "package.metadata.generate-rpm"),
+        ),
+    ];
+    for (name, table) in &tables {
+        for dest in ["usr/lib/clap/choz.clap", "usr/lib/clap/choz-rack.clap"] {
+            assert!(table.contains(dest), "{name} does not install {dest}");
+        }
+    }
+    let pkgbuild = std::fs::read_to_string(root().join("../../packaging/arch/PKGBUILD.in"))
+        .expect("read PKGBUILD.in");
+    for dest in ["/usr/lib/clap/choz.clap", "/usr/lib/clap/choz-rack.clap"] {
+        assert!(
+            pkgbuild.contains(dest),
+            "the Arch package does not install {dest}"
+        );
+    }
+}

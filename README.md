@@ -10,7 +10,7 @@ Built with Rust, ratatui and cpal. Provides a TUI for managing note inputs, inst
 
 ## Status
 
-**1.3.13.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
+**1.3.14.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
 LADSPA, DSSI, VST2, VST3 and Pure Data patches are really hosted** — instruments
 and audio effects, with their own parameters and their own windows — choz's own
 56 effects and all four artifacts — the arpeggiator, the step sequencer, the
@@ -127,14 +127,18 @@ To **build** (the `-dev` headers; see below for what a *built* choz needs):
 sudo apt install build-essential pkg-config libasound2-dev libjack-jackd2-dev
 
 # Arch
-sudo pacman -S base-devel alsa-lib jack2
+sudo pacman -S base-devel alsa-lib pipewire-jack
 
 # Fedora
-sudo dnf install @development-tools alsa-lib-devel jack-audio-connection-kit-devel
+sudo dnf install @development-tools alsa-lib-devel pipewire-jack-audio-connection-kit-devel
 ```
 
-`libjack`'s headers are what the native JACK backend is compiled against — it
-works against PipeWire's JACK layer too, which is the usual setup. **No X11
+The build needs JACK's **headers and `jack.pc`**, nothing else: libjack itself
+is `dlopen`ed. Every current desktop runs **PipeWire with its JACK layer
+(`pipewire-jack`)** rather than jack2, and on Arch and Fedora that package is
+where the headers come from too. Debian and Ubuntu package PipeWire's JACK
+without headers, so there `libjack-jackd2-dev` supplies them — it installs
+beside `pipewire-jack` and does not replace it at runtime. **No X11
 headers**: the plugin windows go through `x11rb`, which speaks the protocol
 itself and links no C library.
 
@@ -180,7 +184,7 @@ third by hand:
 |---|---|---|
 | `libc` | yes | nothing runs |
 | `libasound.so.2` (ALSA) | yes | choz starts but opens no audio device |
-| `libjack.so.0` | **optional** — `dlopen`ed at runtime | choz uses ALSA; no JACK/PipeWire routing, no per-channel outputs |
+| `libjack.so.0` | **optional** — `dlopen`ed at runtime; normally PipeWire's (`pipewire-jack`), jack2's works the same | choz uses ALSA; no JACK/PipeWire routing, no per-channel outputs |
 | `libpd` (Pure Data) | **optional** — linked only by `choz-pd-host`, from `libpd-dev` (not `puredata-dev`) | choz installs and runs; Pure Data patches cannot be hosted |
 | X11 | not linked | plugin windows go through `x11rb`, which speaks the protocol itself |
 
@@ -189,7 +193,10 @@ runtime choice, not a build-time dependency. **The packages refuse to install
 without ALSA**, and that is read off the built packages rather than intended:
 `dpkg-deb -f` shows `Depends: libasound2t64 (>= 1.0.29), libc6 (>= 2.43)`, and
 the `.rpm` requires `libasound.so.2()(64bit)` down to its `ALSA_0.9` symbol
-versions, so `apt` and `rpm -i` both stop. JACK is a `Recommends` in both.
+versions, so `apt` and `rpm -i` both stop. JACK is a `Recommends` in both:
+`pipewire-jack` first on Debian/Ubuntu (jack2's library still satisfies it), and
+the `libjack.so.0` soname on Fedora, which PipeWire's JACK provides. On Arch it
+is an `optdepends` on `pipewire-jack`.
 
 `install.sh` checks all three before it copies anything. **A missing ALSA stops
 the install** — a choz that starts and then opens no device looks like a bug in
@@ -222,7 +229,7 @@ native binaries**: a Raspberry Pi loads plugins built for ARM, not the x86 ones.
 | What | Where | Why |
 |---|---|---|
 | `choz.clap` | `~/.clap` (script) or `/usr/lib/clap` (packages) | choz's own 56 effects plus the arpeggiator and step sequencer as note effects, usable from Bitwig, Reaper, Carla or any CLAP host. Every effect publishes its full knob list, so all of them are automatable and saveable from the host. `--no-clap` skips it. |
-| `choz-rack.clap` | the same places | **choz itself**, as a CLAP instrument: the whole rack on a track in the DAW, with its own window and **sixteen stereo outputs** — put a tab on pair 4 in the rack and it arrives on the host's fourth output, on its own track, the way a sampler's individual outs do. The track's own audio arrives as `host:in_1`/`in_2`, so a tab can process it and the rack is an effect chain too. The rack is saved with the host's session. |
+| `choz-rack.clap` | the same places | **choz itself**, as a CLAP instrument: the whole rack on a track in the DAW, with its own window and **sixteen stereo outputs** — put a tab on pair 4 in the rack and it arrives on the host's fourth output, on its own track, the way a sampler's individual outs do. The track's own audio arrives as `host:in_1`/`in_2`, so a tab can process it and the rack is an effect chain too. The rack is saved with the host's session. It takes the host's notes and MIDI but **not its transport**: tempo, meter and play are choz's own. Ardour does not load CLAP — record choz there through JACK/PipeWire and the direct outs (manual, section 2.5). |
 | Wallpapers | `<prefix>/share/choz/wallpapers` | A fresh install opens on the image choz ships with, and the picker starts there. |
 | `choz-pd-host` | next to `choz` | The only binary that links libpd — installed when libpd is present. |
 
@@ -316,7 +323,7 @@ headroom for plugin DSP at small buffer sizes.
 ## Architecture
 
 ```
-choz/                      11 crates, version 1.3.13
+choz/                      11 crates, version 1.3.14
 ├── crates/
 │   ├── choz-ports/         RT-safe traits every host implements: AudioSource,
 │   │                       FxProcessor, PluginEditor, PluginParam, SandboxStatus
@@ -374,7 +381,7 @@ ring so they are freed off the RT thread.
 
 | | |
 |---|---|
-| choz | **1.3.13** |
+| choz | **1.3.14** |
 | Rust edition | 2021 (`choz-plugin-lv2` is 2024) |
 | Toolchain tested | rustc 1.97.1 |
 | Platform | Linux. ALSA/JACK/PipeWire. Released for x86-64, aarch64 and armv7 |
@@ -475,3 +482,10 @@ State lives in `~/.local/state/choz/`: `choz.log`, `plugins.json` (scan cache),
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
+
+**One vendored dependency keeps its own licence.** `vendor/oxisynth` is
+[oxisynth](https://github.com/PolyMeilex/oxisynth) 0.1.0 (LGPL-2.1, its
+`LICENSE` beside it) with one addition — `Synth::read_next_groups`, which
+reads every audio group instead of only the first, so each musician of the
+arranger's band can have a mixer strip of its own. The change is described in
+`vendor/oxisynth/CHOZ-PATCH.md` and wired in through `[patch.crates-io]`.

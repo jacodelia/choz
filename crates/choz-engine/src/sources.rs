@@ -186,10 +186,20 @@ pub struct Sf2Synth {
     /// pointed anywhere plays the tab's program, so it must not be routed to an
     /// empty channel and go silent.
     zone_set: [bool; ZONES],
-    /// Pre-allocated de-interleaved render scratch (oxisynth writes L/R planar).
-    buf_l: Vec<f32>,
-    buf_r: Vec<f32>,
+    /// How loud each MIDI channel goes into the tab's output, per side —
+    /// channel 0 the tab's own program, 1… the zones. `(1, 1)` unless the
+    /// arranger's band is split out on the mixer; see
+    /// [`AudioSource::set_zone_mix`].
+    mix: [(f32, f32); GROUPS],
+    /// Each zone's peak, for those strips.
+    meter: std::sync::Arc<choz_ports::ZoneMeter>,
 }
+
+/// Audio groups the synth renders: one per MIDI channel a tab uses — its own
+/// and one per zone — so each channel comes out on its own and is summed
+/// here, through [`Sf2Synth::mix`]. Needs the patched oxisynth
+/// (`vendor/oxisynth`): upstream renders the groups and reads only the first.
+const GROUPS: usize = ZONES + 1;
 
 /// Max render block, in frames. cpal blocks are far smaller (256).
 const SF2_MAX_FRAMES: usize = 4096;
@@ -232,6 +242,18 @@ impl Sf2Synth {
 impl Sf2Synth {
     /// Load an SF2 file and select `bank`/`preset` on channel 0. Non-RT (file I/O).
     pub fn load(path: &Path, bank: u8, preset: u8, sample_rate: u32) -> Result<Self> {
+        Self::load_groups(path, bank, preset, sample_rate, GROUPS)
+    }
+
+    /// [`Self::load`] with `groups` audio groups. One is upstream's own mix,
+    /// every channel in the first group — what the test compares against.
+    fn load_groups(
+        path: &Path,
+        bank: u8,
+        preset: u8,
+        sample_rate: u32,
+        groups: usize,
+    ) -> Result<Self> {
         use oxisynth::{MidiEvent, SoundFont, Synth, SynthDescriptor};
 
         // **Measured, not guessed.** `examples/level_probe` renders C4 at
@@ -253,12 +275,13 @@ impl Sf2Synth {
         // when I press the sustain" comes from — those are dropouts, not
         // clipping. Sixty-four still covers both hands sustained on a layered
         // preset (three layers × twenty-one held notes) and bounds what the
-        // pedal can cost.
-        const POLYPHONY: u16 = 64;
+        // pedal can cost. It is a setting now — Settings → AUDIO, and see
+        // `crate::polyphony` for where its bounds come from.
         let desc = SynthDescriptor {
             sample_rate: sample_rate as f32,
             gain: 0.5,
-            polyphony: POLYPHONY,
+            polyphony: crate::polyphony(),
+            audio_groups: groups.clamp(1, GROUPS) as u8,
             ..Default::default()
         };
         let mut synth =
@@ -289,8 +312,8 @@ impl Sf2Synth {
             font_id,
             split: [None; choz_ports::SPLIT_OCTAVES],
             zone_set: [false; ZONES],
-            buf_l: vec![0.0; SF2_MAX_FRAMES],
-            buf_r: vec![0.0; SF2_MAX_FRAMES],
+            mix: [(1.0, 1.0); GROUPS],
+            meter: std::sync::Arc::new(choz_ports::ZoneMeter::new()),
         })
     }
 }
@@ -402,16 +425,37 @@ pub fn list_sf2_presets(path: &Path) -> Result<Vec<Sf2Preset>> {
 impl AudioSource for Sf2Synth {
     fn render(&mut self, out: &mut [f32], _sample_rate: u32) -> usize {
         let frames = (out.len() / 2).min(SF2_MAX_FRAMES);
-        {
-            let l = &mut self.buf_l[..frames];
-            let r = &mut self.buf_r[..frames];
-            self.synth.write((l, r));
-        }
+        // Every channel on its own, summed here through its own gain: what
+        // lets a band in one tab be mixed musician by musician. Reverb and
+        // chorus come back in group 0 — the tab's own channel — so a strip
+        // turns its musician's dry sound down, not the room.
+        let mut groups = [(0.0f32, 0.0f32); GROUPS];
+        let mut peaks = [0.0f32; GROUPS];
         for i in 0..frames {
-            out[i * 2] = self.buf_l[i];
-            out[i * 2 + 1] = self.buf_r[i];
+            self.synth.read_next_groups(&mut groups);
+            let (mut l, mut r) = (0.0, 0.0);
+            for (c, (gl, gr)) in groups.iter().enumerate() {
+                let (ml, mr) = self.mix[c];
+                l += gl * ml;
+                r += gr * mr;
+                peaks[c] = peaks[c].max(gl.abs()).max(gr.abs());
+            }
+            out[i * 2] = l;
+            out[i * 2 + 1] = r;
+        }
+        for zone in 0..ZONES {
+            self.meter
+                .publish(zone, peaks[zone_channel(zone as u8) as usize]);
         }
         frames
+    }
+
+    fn set_zone_mix(&mut self, zone: u8, left: f32, right: f32) {
+        self.mix[zone_channel(zone) as usize] = (left.max(0.0), right.max(0.0));
+    }
+
+    fn zone_meter(&self) -> Option<std::sync::Arc<choz_ports::ZoneMeter>> {
+        Some(self.meter.clone())
     }
 
     fn note_on(&mut self, note: u8, velocity: u8) {
@@ -646,6 +690,56 @@ mod tests {
     /// Since 2026-09-13 the CC 7 does not reach the synth at all (see
     /// [`Sf2Synth::control_change`]), so this now checks both halves: the levels
     /// match, **and** the slider changed nothing to match about.
+    /// **Rendering every channel on its own changes nothing** until a strip
+    /// moves: the groups, summed, are the one-group synth to the rounding —
+    /// reverb and chorus included — and a zone turned down is gone from the
+    /// output while its meter still says what it is playing.
+    #[test]
+    fn a_zone_can_be_mixed_on_its_own_and_nothing_else_moves() {
+        let path = std::path::Path::new("/usr/share/sounds/sf2/TimGM6mb.sf2");
+        if !path.exists() {
+            return;
+        }
+        let play = |s: &mut Sf2Synth| {
+            s.set_zone_program(0, 0, 33); // a bass on zone 0
+            s.note_on(60, 100); // the tab's own piano
+            s.note_on_zone(40, 100, Some(0));
+            let mut out = vec![0.0f32; 2 * 4800];
+            s.render(&mut out, 48_000);
+            out
+        };
+        // Upstream's own mix: one group, every channel in it.
+        let mut plain = Sf2Synth::load_groups(path, 0, 0, 48_000, 1).unwrap();
+        let reference = play(&mut plain);
+        let mut one = Sf2Synth::load(path, 0, 0, 48_000).unwrap();
+        let ours = play(&mut one);
+        let worst = ours
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-4,
+            "summing the groups moved the sound by {worst}"
+        );
+        assert!(one.meter.get(0) > 0.01, "the bass's meter reads its bass");
+
+        // The bass's strip down: its channel is gone, the piano is not.
+        let mut muted = Sf2Synth::load(path, 0, 0, 48_000).unwrap();
+        muted.set_zone_mix(0, 0.0, 0.0);
+        let without = play(&mut muted);
+        let energy = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>();
+        assert!(
+            energy(&without) < energy(&ours),
+            "muting the zone took nothing out"
+        );
+        assert!(
+            energy(&without) > 0.0,
+            "and the tab's own piano is still there"
+        );
+        assert!(muted.meter.get(0) > 0.01, "the meter is before the strip");
+    }
+
     #[test]
     fn a_volume_cc_does_not_leave_the_tabs_own_sound_behind() {
         let path = std::path::Path::new("/usr/share/sounds/sf2/FluidR3_GM.sf2");

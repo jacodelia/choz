@@ -345,19 +345,22 @@ fn accent(part: &mut [Note], ctx: &Bake, prog: &Progression, beats_per_bar: f64)
     if beats_per_bar <= 0.0 {
         return;
     }
-    let bars = prog.bars.len();
     for n in part.iter_mut() {
-        let bar = (n.start / beats_per_bar).floor();
-        if bar < 0.0 || bar >= bars as f64 {
+        let Some((bar, into)) = prog.locate(n.start, beats_per_bar) else {
             continue;
-        }
+        };
+        // A bar in another signature has its own count, and the tab's
+        // grouping is of the style's bar: only its own weights apply there.
+        let len = prog.bar_beats(bar, beats_per_bar);
         // The bar's own weights when it was written with more than one slot,
         // the tab's grouping otherwise.
-        let own = prog.bars[bar as usize].groups();
-        let groups: &[u8] = match own.len() >= 2 {
-            true => &own,
-            false => ctx.groups,
+        let own = prog.bars[bar].groups();
+        let groups: &[u8] = match (own.len() >= 2, (len - beats_per_bar).abs() > 1e-9) {
+            (true, _) => &own,
+            (false, false) => ctx.groups,
+            (false, true) => continue,
         };
+        let beats_per_bar = len;
         if groups.len() < 2 {
             continue;
         }
@@ -369,7 +372,6 @@ fn accent(part: &mut [Note], ctx: &Bake, prog: &Progression, beats_per_bar: f64)
         // 3.5 beats is half a beat each.
         let unit = beats_per_bar / cells;
         let starts = ctx.accents(groups, beats_per_bar, unit);
-        let into = n.start - bar * beats_per_bar;
         // The downbeat is already the loudest thing in the bar; this is about
         // the ones inside it.
         if starts
@@ -614,7 +616,15 @@ fn drums(prog: &Progression, style: &Style, rng: &mut Rng, out: &mut Vec<Note>, 
     // The fill played last, so the next one is a different one.
     let mut last_fill: Option<usize> = None;
     for bar in 0..prog.bars.len() {
-        let at = bar as f64 * bpb;
+        let at = prog.bar_start(bar, bpb);
+        // A chart that changes meter: this bar is as long as its own
+        // signature, and plays the groove the style measured for it — or its
+        // own, cut to length or carried on.
+        let own = bpb;
+        let meter = prog.bars[bar].meter;
+        let bpb = prog.bar_beats(bar, own);
+        let odd_meter = (bpb - own).abs() > 1e-9;
+        let groove = style.groove_for(meter).filter(|_| odd_meter);
         // **The fill is chosen before the groove is laid**, because how much of
         // the bar it takes is what says where the groove stops: a two-beat
         // turnaround that started while the hat was still counting would be two
@@ -637,10 +647,30 @@ fn drums(prog: &Progression, style: &Style, rng: &mut Rng, out: &mut Vec<Note>, 
             None => bpb,
         };
 
-        for pos in d.kick.iter().copied() {
+        // A two-bar groove answers itself on the odd bars.
+        let (kick, snare) = match bar % 2 == 1 && !d.kick_b.is_empty() {
+            true => (
+                d.kick_b,
+                if d.snare_b.is_empty() {
+                    d.snare
+                } else {
+                    d.snare_b
+                },
+            ),
+            false => (d.kick, d.snare),
+        };
+        let (kick, snare): (Vec<f64>, Vec<f64>) = match (groove, odd_meter) {
+            (Some(g), _) => (g.kick.to_vec(), g.snare.to_vec()),
+            (None, true) => (
+                super::style::fit(kick, own, bpb),
+                super::style::fit(snare, own, bpb),
+            ),
+            (None, false) => (kick.to_vec(), snare.to_vec()),
+        };
+        for pos in kick.iter().copied() {
             push_hit(out, rng, gm::KICK, at + swung(pos, style), style.vel, 0.25);
         }
-        for pos in d.snare.iter().copied() {
+        for pos in snare.iter().copied() {
             if fill && pos >= last_beat {
                 continue;
             }
@@ -675,10 +705,9 @@ fn drums(prog: &Progression, style: &Style, rng: &mut Rng, out: &mut Vec<Note>, 
         let step = cymbal.max(0.125);
         let mut g = step;
         while g < bpb - 1e-9 {
-            let taken = d
-                .kick
+            let taken = kick
                 .iter()
-                .chain(d.snare.iter())
+                .chain(snare.iter())
                 .any(|p| (p - g).abs() < 1e-6)
                 || g.fract().abs() < 1e-6;
             if !taken && !(fill && g >= last_beat) && rng.chance(ghost) {
@@ -708,8 +737,10 @@ fn drums(prog: &Progression, style: &Style, rng: &mut Rng, out: &mut Vec<Note>, 
             }
         }
         // The crash marks where the form comes back round, downbeat of the bar
-        // after a fill and the top of the arrangement.
-        if bar == 0 || (d.fill_every > 0 && bar % d.fill_every == 0 && bar > 0) {
+        // after a fill and the top of the arrangement — and where the meter
+        // changes, which is the other place a band marks the one.
+        let turned = bar > 0 && prog.bars[bar].meter != prog.bars[bar - 1].meter;
+        if bar == 0 || turned || (d.fill_every > 0 && bar % d.fill_every == 0 && bar > 0) {
             push_hit(out, rng, gm::CRASH, at, style.vel, 0.5);
         }
     }
@@ -981,8 +1012,17 @@ fn comp(
     // plays, not over the ones the density threw away.
     let mut hits = 0usize;
     for bar in 0..prog.bars.len() {
-        for hit in c.hits.iter().copied() {
-            let beat = bar as f64 * bpb + hit;
+        let from = prog.bar_start(bar, bpb);
+        let len = prog.bar_beats(bar, bpb);
+        let bar_hits: Vec<f64> = match (len - bpb).abs() > 1e-9 {
+            true => match style.groove_for(prog.bars[bar].meter) {
+                Some(g) if !g.hits.is_empty() => g.hits.to_vec(),
+                _ => super::style::fit(c.hits, bpb, len),
+            },
+            false => c.hits.to_vec(),
+        };
+        for hit in bar_hits {
+            let beat = from + hit;
             let Some((chord, left)) = prog.at(beat, bpb) else {
                 continue;
             };

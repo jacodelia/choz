@@ -695,8 +695,10 @@ enum ModalKind {
     SeqChoice(SeqPick),
     /// One of the sampler's settings, out of a list — see [`SamplerPick`].
     SamplerChoice(SamplerPick),
-    /// A progression written in a text file, for the tab's arranger.
+    /// A progression for the tab's arranger: a `.chord`, or a `.mid`.
     ArrText,
+    /// Where the arranger's `.mid` is written.
+    ArrExport,
     /// The tonic, picked on a piano — `(the key it came in with)`, so CANCEL
     /// has something to put back. The keys of the chosen note's pitch class
     /// wear the accent, every octave of them: a tonic is a note name and not
@@ -1505,6 +1507,9 @@ impl PathEdit {
 struct SaveName {
     dir: std::path::PathBuf,
     text: TextEdit,
+    /// What a bare name is given: `.yml` for a project, `.mid` for the
+    /// arranger's export.
+    ext: &'static str,
     /// The target already exists and Enter is now the confirmation.
     confirm: bool,
     /// Why the last save failed, kept on screen instead of dying in stderr.
@@ -1519,17 +1524,30 @@ impl SaveName {
         Self {
             dir,
             text: TextEdit::new(name),
+            ext: ".yml",
             confirm: false,
             error: None,
         }
     }
 
+    /// The same prompt for a file of another kind.
+    fn with_ext(mut self, ext: &'static str) -> Self {
+        self.ext = ext;
+        self
+    }
+
     /// Where Enter would write. A bare name gets `.yml` so the browser (and
-    /// `Project::load`) still recognises it.
+    /// `Project::load`) still recognises it. A MIDI file gets `.mid` unless it
+    /// already ends in one: `take.2` is a name, not a format.
     fn target(&self) -> std::path::PathBuf {
         let mut name = self.text.buf.trim().to_string();
-        if !name.contains('.') {
-            name.push_str(".yml");
+        let lower = name.to_ascii_lowercase();
+        let named = match self.ext {
+            ".mid" => lower.ends_with(".mid") || lower.ends_with(".midi"),
+            _ => name.contains('.'),
+        };
+        if !named {
+            name.push_str(self.ext);
         }
         self.dir.join(name)
     }
@@ -1728,6 +1746,8 @@ impl Default for MainStrip {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StripRef {
     Tab(usize),
+    /// A split-out musician of a tab's band.
+    Band(usize, arranger::generate::Role),
     Bus(usize),
     Main,
 }
@@ -2007,6 +2027,10 @@ struct App {
     path_edit: Option<PathEdit>,
     /// The SAVE PROJECT name prompt, once a directory has been picked.
     save_name: Option<SaveName>,
+    /// The session's bar was taken from a playing arranger — see
+    /// [`App::follow_arranger_meter`] — and is the player's own again when the
+    /// band stops.
+    meter_followed: bool,
     /// The file this project was last saved to or loaded from — what plain
     /// "Save project" rewrites without asking anything.
     project_file: Option<std::path::PathBuf>,
@@ -2213,6 +2237,7 @@ impl App {
             paths_format: None,
             path_edit: None,
             save_name: None,
+            meter_followed: false,
             project_file: None,
             saved_project: None,
             port_edit: None,
@@ -4088,6 +4113,16 @@ impl App {
                 level_bar(m.gain()),
                 m.gain() * 100.0
             ),
+            // Last, so the rows above keep the places they have always had.
+            format!(
+                "  {:<12} {}",
+                i18n::t("FOLLOW ARR"),
+                if self.ui.audio.follow_arranger {
+                    "ON"
+                } else {
+                    "OFF"
+                }
+            ),
         ]
     }
 
@@ -4142,6 +4177,10 @@ impl App {
                 // accent beats that are no longer there.
                 choz_engine::artifacts::metronome::metronome().set_groups(&[]);
                 self.ui.audio.time_sig = (n, d);
+                // A bar set by hand is the player taking the count back: the
+                // band's would otherwise put it straight back on the next tick.
+                self.ui.audio.follow_arranger = false;
+                self.meter_followed = false;
                 self.ui.save();
             }
             4 => {
@@ -4173,6 +4212,10 @@ impl App {
                 let next =
                     (m.dest().index() as isize + delta).rem_euclid(choz_engine::BUSES as isize + 1);
                 m.set_dest(choz_engine::Dest::from_index(next as usize));
+            }
+            8 => {
+                self.ui.audio.follow_arranger = !self.ui.audio.follow_arranger;
+                self.ui.save();
             }
             7 => {
                 let g = m.gain() + 0.1 * delta as f32;
@@ -6233,6 +6276,17 @@ impl App {
                 };
                 setting_row("Feedback guard", state)
             },
+            // Voices an instrument may sound — a SoundFont tab and a sampler
+            // tab each. Read when one is built, so the row says so.
+            setting_row(
+                "Polyphony",
+                format!(
+                    "{} voices  ({}–{}, applies to instruments loaded next)",
+                    a.polyphony,
+                    choz_engine::POLYPHONY_MIN,
+                    choz_engine::POLYPHONY_MAX
+                ),
+            ),
             // choz only builds oxisynth; the row exists so the setting matches
             // seqterm's file, not to pretend there is a choice.
             setting_row(
@@ -6538,6 +6592,17 @@ impl App {
                 self.ui.save();
                 self.refresh_modal();
                 return true;
+            }
+            (SEC_ENGINE, 8) if step != 0 => {
+                let steps = settings::POLYPHONY_STEPS;
+                let i = steps
+                    .iter()
+                    .position(|v| *v == self.ui.audio.polyphony)
+                    .unwrap_or(4) as isize;
+                let n = steps.len() as isize;
+                self.ui.audio.polyphony = steps[(((i + step) % n + n) % n) as usize];
+                choz_engine::set_polyphony(self.ui.audio.polyphony);
+                self.ui.save();
             }
             // SF2 engine and the read-only rows below it take no input.
             (SEC_ENGINE, _) => return true,
@@ -7981,6 +8046,7 @@ impl App {
             ModalKind::AddPath
             | ModalKind::SamplesFolder
             | ModalKind::LoopExport
+            | ModalKind::ArrExport
             | ModalKind::SaveProject
             | ModalKind::LoadProject => self
                 .modal
@@ -8134,6 +8200,7 @@ impl App {
                 | ModalKind::AddPath
                 | ModalKind::SamplesFolder
                 | ModalKind::LoopExport
+                | ModalKind::ArrExport
                 | ModalKind::SaveProject
                 | ModalKind::LoadProject,
                 Some(b),
@@ -8156,10 +8223,16 @@ impl App {
                     (!e.is_dir).then(|| e.path.clone())
                 });
             }
-            if let (ModalKind::SaveProject, Some(n)) = (m.kind, self.save_name.as_ref()) {
+            if let (ModalKind::SaveProject | ModalKind::ArrExport, Some(n)) =
+                (m.kind, self.save_name.as_ref())
+            {
+                let midi = m.kind == ModalKind::ArrExport;
                 m.list.note = n.note();
                 if n.confirm {
-                    m.list.title = i18n::t("OVERWRITE PROJECT?").to_string();
+                    m.list.title = match midi {
+                        true => format!("{}?", i18n::t("OVERWRITE")),
+                        false => i18n::t("OVERWRITE PROJECT?").to_string(),
+                    };
                     m.list.items = vec![
                         format!(
                             "  {} \u{2014} {}",
@@ -8172,7 +8245,10 @@ impl App {
                     m.list.scroll = 0;
                     return;
                 }
-                m.list.title = "SAVE PROJECT".to_string();
+                m.list.title = match midi {
+                    true => format!("{} MIDI", i18n::t("EXPORT")),
+                    false => "SAVE PROJECT".to_string(),
+                };
             }
             // The search box, when there is one: the letters typed so far, with
             // a caret, in the line the picker keeps its hints on.
@@ -8672,7 +8748,8 @@ impl App {
                     None => true,
                 }
             }
-            ModalKind::SaveProject => {
+            ModalKind::SaveProject | ModalKind::ArrExport => {
+                let midi = m.kind == ModalKind::ArrExport;
                 // While the name is being typed the list is only a backdrop:
                 // a stray click must not re-pick the directory under it. The
                 // overwrite question, though, *is* the list.
@@ -8703,6 +8780,15 @@ impl App {
                     }
                     // Picking the directory only asks for the name; the save
                     // itself is `save_name_key`'s Enter.
+                    Some(file_browser::Action::PickFile(dir)) if midi => {
+                        // A name to start from, not one to accept blindly:
+                        // the tab it came from, which is what tells two
+                        // exports of the same session apart.
+                        let name = format!("choz-tab{}-arranger", self.active_slot + 1);
+                        self.save_name = Some(SaveName::new(dir, name).with_ext(".mid"));
+                        self.refresh_modal();
+                        false
+                    }
                     Some(file_browser::Action::PickFile(dir)) => {
                         let name = self
                             .project_file
@@ -9864,10 +9950,29 @@ impl App {
         }
     }
 
+    /// Write what the open name prompt is for: the project, or the band's MIDI.
+    fn commit_save_name(&mut self, target: &std::path::Path) {
+        match self.modal.as_ref().map(|m| m.kind) {
+            Some(ModalKind::ArrExport) => match self.export_arranger_midi_to(target) {
+                Ok(()) => self.close_modal(),
+                Err(e) => {
+                    if let Some(n) = self.save_name.as_mut() {
+                        n.confirm = false;
+                        n.error = Some(e.to_string());
+                    }
+                }
+            },
+            _ => self.save_project_to(target),
+        }
+    }
+
     /// Keys of the SAVE PROJECT name prompt: typing the file name, and the
     /// separate Enter that agrees to overwrite. Returns true when handled.
     fn save_name_key(&mut self, key: KeyCode) -> bool {
-        if self.modal.as_ref().map(|m| m.kind) != Some(ModalKind::SaveProject) {
+        if !matches!(
+            self.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::SaveProject | ModalKind::ArrExport)
+        ) {
             return false;
         }
         let Some(mut edit) = self.save_name.take() else {
@@ -9901,7 +10006,7 @@ impl App {
                     edit.confirm = overwrite;
                     self.save_name = Some(edit);
                     if overwrite {
-                        self.save_project_to(&target);
+                        self.commit_save_name(&target);
                     } else {
                         // Back to the name, which is the other way out of a
                         // collision: save it as something else.
@@ -9941,7 +10046,7 @@ impl App {
                         }
                     } else {
                         self.save_name = Some(edit);
-                        self.save_project_to(&target);
+                        self.commit_save_name(&target);
                     }
                 }
             }
@@ -10099,8 +10204,10 @@ impl App {
                 return match self.strip_ref(i) {
                     StripRef::Tab(t) => Some(LearnTarget::Pan(t)),
                     StripRef::Main => Some(LearnTarget::MainPan),
-                    StripRef::Bus(_) => None,
-                }
+                    // ponytail: a musician's strip is not a learn target yet;
+                    // add one when a controller wants a band on its faders.
+                    StripRef::Bus(_) | StripRef::Band(..) => None,
+                };
             }
             _ => return None,
         };
@@ -10108,6 +10215,7 @@ impl App {
             // A group has one fader: both halves of the strip are it.
             StripRef::Bus(b) => Some(LearnTarget::BusGain(b)),
             StripRef::Main => Some(LearnTarget::MainGain { right }),
+            StripRef::Band(..) => None,
             StripRef::Tab(t) => Some(match right {
                 true => LearnTarget::GainR(t),
                 false => LearnTarget::Gain(t),
@@ -12548,6 +12656,59 @@ impl App {
         for (slot_index, role, event) in events {
             self.play_arranger_event(slot_index, role, event, now);
         }
+        self.follow_arranger_meter();
+    }
+
+    /// **The click counts the band's bar.** While an arranger plays — the
+    /// active tab's, else the first one playing — the session takes its meter
+    /// (the chart's, else the style's) and its grouping, so a country waltz
+    /// clicks in three and the sequencer's grid is the same bar. When nothing
+    /// plays any more, the player's own `time_sig` comes back.
+    ///
+    /// Inside a DAW too: `choz-rack.clap` does not read the host's transport,
+    /// so the rack's bar is still its own to set.
+    fn follow_arranger_meter(&mut self) {
+        if !self.ui.audio.follow_arranger {
+            return;
+        }
+        let t = choz_ports::transport();
+        let band = self
+            .slots
+            .get(self.active_slot)
+            .filter(|s| s.arranger.is_playing())
+            .or_else(|| self.slots.iter().find(|s| s.arranger.is_playing()))
+            .map(|s| {
+                let (_, written) = s.arranger.written_bar();
+                let groups = match written.is_empty() {
+                    true => s.arranger.settings.groups.clone(),
+                    false => written.to_vec(),
+                };
+                (s.arranger.own_meter(), groups, s.arranger.bar_origin_ppq())
+            });
+        let m = choz_engine::artifacts::metronome::metronome();
+        match band {
+            Some((meter, groups, origin)) => {
+                if t.time_signature() != meter {
+                    t.set_time_signature(meter.0, meter.1);
+                    m.set_groups(&groups);
+                    // A chart that changes meter changes it on a downbeat of
+                    // its own, and the click's one moves there with it.
+                    if let Some(origin) = origin {
+                        t.set_bar_origin(origin);
+                    }
+                }
+                self.meter_followed = true;
+            }
+            None if self.meter_followed => {
+                self.meter_followed = false;
+                let (n, d) = self.ui.audio.time_sig;
+                if t.time_signature() != (n, d) {
+                    t.set_time_signature(n, d);
+                    m.set_groups(&[]);
+                }
+            }
+            None => {}
+        }
     }
 
     /// One note of the band, sent where that musician plays.
@@ -12646,6 +12807,57 @@ impl App {
                 engine.set_zone_program(tab, zone, bank, preset);
             }
         }
+        self.push_band_mix(tab);
+    }
+
+    /// The musicians of `tab`'s band that get a strip of their own in the
+    /// mixer: SPLIT OUT up, the arranger on, and a zone of the tab's
+    /// instrument to be heard on — which is what a SoundFont with the programs
+    /// for it gives each of them (see [`Self::push_arranger_band`]).
+    fn band_roles(&self, tab: usize) -> Vec<(arranger::generate::Role, u8)> {
+        let Some(s) = self.slots.get(tab) else {
+            return Vec::new();
+        };
+        if !s.arranger.is_on() || !s.arranger.settings.split {
+            return Vec::new();
+        }
+        arranger::generate::Role::ALL
+            .iter()
+            .filter_map(|r| s.arr_zones[*r as usize].map(|z| (*r, z)))
+            .collect()
+    }
+
+    /// Every split-out musician on the desk, in the order the mixer draws
+    /// them: after the tabs, before the groups.
+    fn band_strips(&self) -> Vec<(usize, arranger::generate::Role, u8)> {
+        (0..self.slots.len())
+            .flat_map(|t| self.band_roles(t).into_iter().map(move |(r, z)| (t, r, z)))
+            .collect()
+    }
+
+    /// Hand each zone of `tab`'s instrument its level: a split-out musician's
+    /// strip, or unity — a band that is not split, and every zone that is not
+    /// a musician's, plays as it always did.
+    fn push_band_mix(&mut self, tab: usize) {
+        let roles = self.band_roles(tab);
+        let Some(slot) = self.slots.get(tab) else {
+            return;
+        };
+        let mix: Vec<(u8, (f32, f32))> = (0..choz_engine::sources::ZONES as u8)
+            .map(|z| {
+                let side = roles
+                    .iter()
+                    .find(|(_, zone)| *zone == z)
+                    .map(|(r, _)| slot.arranger.settings.strip(*r).sides())
+                    .unwrap_or((1.0, 1.0));
+                (z, side)
+            })
+            .collect();
+        if let Some(engine) = self.audio_engine.as_mut() {
+            for (zone, (l, r)) in mix {
+                engine.set_zone_mix(tab, zone, l, r);
+            }
+        }
     }
 
     /// Switch a tab's arranger off and take its notes with it — the other half
@@ -12660,10 +12872,7 @@ impl App {
         }
         slot.arranger.settings.on = false;
         slot.arranger.stop(&mut out);
-        let now = std::time::Instant::now();
-        for event in out {
-            self.play_seq_event(slot_index, event, now);
-        }
+        self.send_arranger_offs(slot_index, out);
     }
 
     /// Whether the active tab has an arranger switched on.
@@ -12779,6 +12988,13 @@ impl App {
             }
             ArrEdit::Roman(roman) => arr.set_roman(roman),
             ArrEdit::Text => {}
+            // What is sounding lets go first: the notes are about to be aimed
+            // at other tabs, and a note-off sent to the new one is a note left
+            // hanging on the old.
+            ArrEdit::Split => {
+                arr.silence(&mut out);
+                arr.settings.split = !arr.settings.split;
+            }
         }
         // Switching it on brings its tab up and takes the arrows, the way the
         // sequencer's switch does — and stops the other two artifacts, because
@@ -12798,6 +13014,10 @@ impl App {
         if fit {
             self.fit_arranger_instrument(slot_index);
         }
+        if matches!(edit, ArrEdit::Style(_)) {
+            self.adopt_bar(slot_index);
+        }
+        self.send_arranger_offs(slot_index, out);
         // Who is in the band decides which zone plays what, and switching the
         // whole thing off gives the channels back. Worked out after every
         // gesture rather than after the ones somebody thought of: it is a
@@ -12806,9 +13026,13 @@ impl App {
         if stop_click {
             self.stop_click_with_the_band();
         }
+    }
+
+    /// What an arranger let go of, sent where its notes went.
+    fn send_arranger_offs(&mut self, owner: usize, out: Vec<arp::ArpEvent>) {
         let now = std::time::Instant::now();
         for event in out {
-            self.play_seq_event(slot_index, event, now);
+            self.play_seq_event(owner, event, now);
         }
     }
 
@@ -12877,6 +13101,8 @@ impl App {
             ArrControl::Style => self.open_arr_style(),
             ArrControl::Seed => self.open_arr_seed(),
             ArrControl::Text => self.edit_arranger(ArrEdit::Text),
+            ArrControl::Export => self.open_arranger_export(),
+            ArrControl::Split => self.edit_arranger(ArrEdit::Split),
             ArrControl::Notation => {
                 let roman = self
                     .slots
@@ -13227,11 +13453,52 @@ impl App {
         self.modal = None;
     }
 
+    /// Where the band's `.mid` goes: a directory, the way the loop export asks.
+    fn open_arranger_export(&mut self) {
+        let start = self
+            .project_file
+            .as_ref()
+            .and_then(|f| f.parent())
+            .filter(|d| d.is_dir())
+            .map(|d| d.to_path_buf())
+            .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        let mut modal = Modal::new(
+            ModalKind::ArrExport,
+            views::modal::ListModal::new(format!("{} MIDI", i18n::t("EXPORT")), Vec::new()),
+        );
+        modal.browser = Some(file_browser::FileBrowser::open(
+            &start,
+            file_browser::DIR_PICK,
+        ));
+        self.modal = Some(modal);
+        self.refresh_modal();
+    }
+
+    /// Write the active tab's band to `path`, one pass of the form — the
+    /// name the prompt asked for. An error stays on the prompt.
+    fn export_arranger_midi_to(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
+        let slot = self
+            .slots
+            .get(self.active_slot)
+            .ok_or_else(|| anyhow::anyhow!("no tab to export"))?;
+        let bytes = arranger::smf::write(&slot.arranger, choz_ports::transport().bpm());
+        // Read back before it is written: a file LOAD would refuse — a band of
+        // one — is said on the prompt, not found out the next time it is opened.
+        arranger::smf::chart_of(&bytes)?;
+        std::fs::write(path, bytes)?;
+        eprintln!("choz: arranger exported to {}", path.display());
+        Ok(())
+    }
+
     fn open_arranger_text(&mut self) {
         let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let mut modal = Modal::new(
             ModalKind::ArrText,
-            views::modal::ListModal::new(format!("OPEN .{}", ARR_EXTS.join(" / .")), Vec::new()),
+            views::modal::ListModal::new(
+                format!("{} .{}", i18n::t("OPEN"), ARR_EXTS.join(" / .")),
+                Vec::new(),
+            ),
         );
         modal.browser = Some(file_browser::FileBrowser::open(&start, ARR_EXTS));
         self.modal = Some(modal);
@@ -13242,7 +13509,16 @@ impl App {
     /// not parse leaves the part that was playing alone and says so on the box
     /// — the same rule the arranger itself follows.
     fn load_arranger_text(&mut self, path: std::path::PathBuf) {
-        let text = match std::fs::read_to_string(&path) {
+        let midi = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("mid") || e.eq_ignore_ascii_case("midi"));
+        let read = match midi {
+            true => std::fs::read(&path)
+                .map_err(anyhow::Error::from)
+                .and_then(|b| arranger::smf::chart_of(&b)),
+            false => std::fs::read_to_string(&path).map_err(anyhow::Error::from),
+        };
+        let text = match read {
             Ok(text) => text,
             // The log, because the RACK has no status line — the same place
             // the loop export writes its failures to.
@@ -13259,11 +13535,44 @@ impl App {
         }
         match self.slots.get(slot_index).and_then(|s| s.arranger.error()) {
             Some(e) => eprintln!("choz: {}: {e}", path.display()),
-            None => eprintln!("choz: progression from {}", path.display()),
+            None => {
+                eprintln!("choz: progression from {}", path.display());
+                self.adopt_bar(slot_index);
+            }
         }
         let now = std::time::Instant::now();
         for event in out {
             self.play_seq_event(slot_index, event, now);
+        }
+    }
+
+    /// **The bar a chart or a style is in becomes the session's**: the chart's
+    /// `meter` line, else the style's own signature — a waltz is 3/4, Tarkus
+    /// 5/4. The metronome clicks it, METER shows it, the sequencer's grid is
+    /// it, and it is the bar kept for the next start. The grouping goes with
+    /// it: the chart's `groups`, or none, because the old one counted another
+    /// bar. Choosing a style is choosing its bar; FOLLOW ARR only kept them
+    /// together while the band played, and the panel said the old bar the rest
+    /// of the time.
+    fn adopt_bar(&mut self, slot_index: usize) {
+        let Some((meter, groups)) = self.slots.get(slot_index).map(|s| {
+            let (_, written) = s.arranger.written_bar();
+            (s.arranger.default_meter(), written.to_vec())
+        }) else {
+            return;
+        };
+        let (num, den) = meter;
+        choz_ports::transport().set_time_signature(num, den);
+        choz_engine::artifacts::metronome::metronome().set_groups(&groups);
+        self.ui.audio.time_sig = (num, den);
+        self.ui.save();
+        if let Some(slot) = self.slots.get_mut(slot_index) {
+            if !groups.is_empty() {
+                slot.arranger.set_groups(&groups);
+            }
+            // Baked against the session's old bar a moment ago: again, in this
+            // one, from where it stands.
+            slot.arranger.rebake_keeping_place();
         }
     }
 
@@ -14041,6 +14350,29 @@ impl App {
         self.ui.save();
     }
 
+    /// Put `source` into engine slot `i`: what a rebuilt rack does for every
+    /// tab, and what a split-out band does for each of its musicians.
+    fn load_source_into(
+        engine: &mut choz_engine::AudioEngine,
+        synths: &[SynthEntry],
+        i: usize,
+        source: &AudioSource,
+        dssi: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        match source {
+            AudioSource::Midi => Ok(()),
+            AudioSource::Sf2 { path, bank, preset } => engine.load_sf2(i, path, *bank, *preset),
+            AudioSource::AudioFile { path, looping } => engine.load_wav(i, path, *looping),
+            AudioSource::Plugin { id, .. } => match synths.iter().find(|s| s.id == *id) {
+                Some(entry) => {
+                    let (fmt, path, id) = (entry.format, entry.path.clone(), entry.id.clone());
+                    Self::load_plugin_into(engine, i, fmt, &path, &id, dssi)
+                }
+                None => Err(anyhow::anyhow!("plugin {id} is no longer available")),
+            },
+        }
+    }
+
     /// Create one engine slot per rack tab and fill it from the UI model:
     /// instrument, FX chain with its knobs, mixer and routing. The engine side
     /// is assumed empty — this runs after something dropped it (an output
@@ -14056,18 +14388,8 @@ impl App {
             if engine.add_silent().is_none() {
                 break;
             }
-            let loaded = match &slot.source {
-                AudioSource::Midi => Ok(()),
-                AudioSource::Sf2 { path, bank, preset } => engine.load_sf2(i, path, *bank, *preset),
-                AudioSource::AudioFile { path, looping } => engine.load_wav(i, path, *looping),
-                AudioSource::Plugin { id, .. } => match self.synths.iter().find(|s| s.id == *id) {
-                    Some(entry) => {
-                        let (fmt, path, id) = (entry.format, entry.path.clone(), entry.id.clone());
-                        Self::load_plugin_into(engine, i, fmt, &path, &id, &slot.dssi_config)
-                    }
-                    None => Err(anyhow::anyhow!("plugin {id} is no longer available")),
-                },
-            };
+            let loaded =
+                Self::load_source_into(engine, &self.synths, i, &slot.source, &slot.dssi_config);
             if let Err(e) = loaded {
                 eprintln!("choz: reloading tab {}: {e}", i + 1);
             }
@@ -14437,6 +14759,30 @@ impl App {
                 }),
             })
             .collect();
+        // A split-out band's musicians, after the tabs: their channels of the
+        // tab's instrument, before the tab's own fader.
+        for (t, role, zone) in self.band_strips() {
+            let b = self.slots[t].arranger.settings.strip(role);
+            strips.push(MixerStrip {
+                kind: StripKind::Band,
+                label: format!("{}\u{00B7}{}", t + 1, role.name()),
+                gain: b.gain,
+                gain_r: b.gain,
+                link: true,
+                pan: b.pan,
+                mute: b.mute,
+                solo: false,
+                active: false,
+                side: None,
+                level: self
+                    .audio_engine
+                    .as_ref()
+                    .map(|e| e.zone_level(t, zone as usize))
+                    .unwrap_or(0.0),
+                mono: true,
+                dest: None,
+            });
+        }
         // Then the desk's own: the four groups and the main, in the order they
         // are summed. A group is a sum, so it has one fader and no pan.
         for (i, b) in self.buses.iter().enumerate() {
@@ -14512,7 +14858,7 @@ impl App {
     fn mix_cursor(&self) -> usize {
         match self.desk_strip {
             None => self.active_slot,
-            Some(k) => self.slots.len() + k,
+            Some(k) => self.slots.len() + self.band_strips().len() + k,
         }
     }
 
@@ -14522,17 +14868,40 @@ impl App {
         match self.strip_ref(i) {
             StripRef::Tab(t) => self.slots.get(t).map(|s| s.gain).unwrap_or(0.0),
             StripRef::Bus(b) => self.buses.get(b).map(|b| b.gain).unwrap_or(0.0),
+            StripRef::Band(t, r) => self
+                .slots
+                .get(t)
+                .map(|s| s.arranger.settings.strip(r).gain)
+                .unwrap_or(1.0),
             StripRef::Main => self.main.gain,
         }
     }
 
     fn strip_ref(&self, i: usize) -> StripRef {
         let tabs = self.slots.len();
+        let band = self.band_strips();
         match i {
             _ if i < tabs => StripRef::Tab(i),
-            _ if i < tabs + choz_engine::BUSES => StripRef::Bus(i - tabs),
+            _ if i < tabs + band.len() => {
+                let (t, r, _) = band[i - tabs];
+                StripRef::Band(t, r)
+            }
+            _ if i < tabs + band.len() + choz_engine::BUSES => StripRef::Bus(i - tabs - band.len()),
             _ => StripRef::Main,
         }
+    }
+
+    /// Move a split-out musician's strip, and hand it to the engine.
+    fn with_band_strip(
+        &mut self,
+        tab: usize,
+        role: arranger::generate::Role,
+        f: impl FnOnce(&mut arranger::BandStrip),
+    ) {
+        if let Some(s) = self.slots.get_mut(tab) {
+            f(s.arranger.settings.strip_mut(role));
+        }
+        self.push_band_mix(tab);
     }
 
     /// Move a strip's level, whatever it belongs to. `set` replaces, `nudge`
@@ -14541,6 +14910,7 @@ impl App {
         let v = value.clamp(0.0, views::fx_chain_panel::MAX_GAIN);
         match self.strip_ref(i) {
             StripRef::Tab(_) => return,
+            StripRef::Band(t, r) => return self.with_band_strip(t, r, |b| b.gain = v),
             StripRef::Bus(b) => self.buses[b].gain = v,
             StripRef::Main => self.main.gain = v,
         }
@@ -14565,6 +14935,11 @@ impl App {
                 self.with_mix(i, |s| s.pan = at(cur));
                 return;
             }
+            StripRef::Band(t, r) => {
+                let cur = self.slots.get(t).map(|s| s.arranger.settings.strip(r).pan);
+                let v = at(cur.unwrap_or(0.0));
+                return self.with_band_strip(t, r, |b| b.pan = v);
+            }
             StripRef::Bus(_) => return,
             StripRef::Main => self.main.pan = at(self.main.pan),
         }
@@ -14577,6 +14952,7 @@ impl App {
                 self.with_mix(t, |s| s.mute = !s.mute);
                 return;
             }
+            StripRef::Band(t, r) => return self.with_band_strip(t, r, |b| b.mute = !b.mute),
             StripRef::Bus(b) => self.buses[b].mute = !self.buses[b].mute,
             StripRef::Main => self.main.mute = !self.main.mute,
         }
@@ -17577,6 +17953,9 @@ enum ArrEdit {
     Knob(usize, f32),
     /// Open a progression written in a text file.
     Text,
+    /// Every musician on a tab — a mixer strip — of their own, or back in
+    /// this one.
+    Split,
     /// Read the chart as roman degrees or as american symbols. The text is
     /// rewritten either way — see [`arranger::Arranger::set_roman`].
     Roman(bool),
@@ -17598,6 +17977,10 @@ enum ArrControl {
     Notation,
     Seed,
     Text,
+    /// The band's part, out as a `.mid`.
+    Export,
+    /// Split outputs.
+    Split,
     /// One musician of the band, by their place in `Role::ALL`: Enter puts them
     /// in or out, the arrows move their fader.
     Part(usize),
@@ -17611,7 +17994,7 @@ enum ArrControl {
 /// first, then one button a musician. The order is the panel's \u{2014} see
 /// `views::fx_chain_panel::draw_arranger_box` \u{2014} because the arrows walk what
 /// the eye does.
-const ARR_CONTROLS: [ArrControl; 17] = [
+const ARR_CONTROLS: [ArrControl; 19] = [
     ArrControl::Play,
     ArrControl::Pause,
     ArrControl::Stop,
@@ -17619,11 +18002,13 @@ const ARR_CONTROLS: [ArrControl; 17] = [
     ArrControl::Style,
     ArrControl::Seed,
     ArrControl::Text,
+    ArrControl::Export,
     ArrControl::Notation,
     ArrControl::Part(0),
     ArrControl::Part(1),
     ArrControl::Part(2),
     ArrControl::Part(3),
+    ArrControl::Split,
     ArrControl::Meter,
     ArrControl::Knob(0),
     ArrControl::Knob(1),
@@ -17637,8 +18022,9 @@ const ARR_CONTROLS: [ArrControl; 17] = [
 /// enough to read what each one does; `SEED +` still walks to any number.
 const ARR_SEEDS: [u32; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 
-/// What a progression is written in. Plain text, because that is what it is.
-const ARR_EXTS: &[&str] = &["chord", "txt"];
+/// What a progression is opened from: a chart, or a MIDI file its chords are
+/// heard off — see [`choz_engine::artifacts::arranger::smf`].
+const ARR_EXTS: &[&str] = &["chord", "mid", "midi"];
 
 /// Whether a line is one of the two settings the pickers own.
 fn names_a_setting(line: &str) -> bool {
@@ -18058,6 +18444,8 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                             RackButton::ArrStyle => MouseAction::ArrPress(ArrControl::Style),
                             RackButton::ArrSeed => MouseAction::ArrPress(ArrControl::Seed),
                             RackButton::ArrText => MouseAction::ArrEdit(ArrEdit::Text),
+                            RackButton::ArrExport => MouseAction::ArrPress(ArrControl::Export),
+                            RackButton::ArrSplit => MouseAction::ArrPress(ArrControl::Split),
                             // The switch says what it would give you, so the
                             // click asks for the other notation.
                             RackButton::ArrRoman => MouseAction::ArrRoman,
@@ -18855,6 +19243,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             // A group is one fader: both sides of the click set the same level,
             // because there is only one. The main has two, like a tab.
             (StripRef::Bus(_), _) => app.set_strip_gain(i, v * views::fx_chain_panel::MAX_GAIN),
+            // One fader, like a group — and a pan, unlike one.
+            (StripRef::Band(..), views::midi_monitor::MixerHit::Pan(_)) => {
+                app.set_strip_pan(i, v * 2.0 - 1.0, false)
+            }
+            (StripRef::Band(..), _) => app.set_strip_gain(i, v * views::fx_chain_panel::MAX_GAIN),
             (StripRef::Main, views::midi_monitor::MixerHit::Gain(_)) => {
                 app.set_main_gain(MixSide::Left, v, false)
             }
@@ -18870,6 +19263,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         },
         MouseAction::MixerNudge(i, side, d) => match app.strip_ref(i) {
             StripRef::Tab(_) => app.nudge_gain(i, side, d),
+            StripRef::Band(t, r) => {
+                let g = app.slots.get(t).map(|s| s.arranger.settings.strip(r).gain);
+                app.set_strip_gain(i, g.unwrap_or(1.0) + d)
+            }
             StripRef::Bus(b) => app.set_strip_gain(i, app.buses[b].gain + d),
             StripRef::Main => app.set_main_gain(side, d, true),
         },
@@ -18903,13 +19300,14 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             views::midi_monitor::MixerHit::Link(_) => match app.strip_ref(i) {
                 StripRef::Tab(t) => app.toggle_link(t),
                 StripRef::Main => app.toggle_main_link(),
-                StripRef::Bus(_) => {}
+                StripRef::Bus(_) | StripRef::Band(..) => {}
             },
             views::midi_monitor::MixerHit::Dest(_) => app.open_mixer_dest(i),
             views::midi_monitor::MixerHit::Select(_) => {
                 // Clicking a strip is how the MIXER takes the keyboard: from
                 // then on the arrows are on levels.
-                if let StripRef::Tab(t) = app.strip_ref(i) {
+                // A musician's strip takes you to the band's tab.
+                if let StripRef::Tab(t) | StripRef::Band(t, _) = app.strip_ref(i) {
                     app.focus = Focus::Mixer;
                     app.switch_slot(t);
                 }
@@ -20285,6 +20683,48 @@ enum BarId {
     Clk,
     Panic,
     Dsp,
+    Mem,
+}
+
+/// This process's resident memory, in bytes: `/proc/self/statm`'s second
+/// field, in pages. `None` without a /proc.
+///
+/// ponytail: two small /proc reads a frame; cache them if a profile ever
+/// shows the menu bar.
+fn rss_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    Some(pages * page.max(4096) as u64)
+}
+
+/// Whether the machine is short of memory: under 15% of it still available.
+/// That is where a streamed sample library starts reading back in late blocks.
+fn memory_short() -> bool {
+    let Ok(info) = std::fs::read_to_string("/proc/meminfo") else {
+        return false;
+    };
+    let field = |name: &str| -> Option<u64> {
+        info.lines()
+            .find(|l| l.starts_with(name))?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    };
+    match (field("MemTotal:"), field("MemAvailable:")) {
+        (Some(total), Some(avail)) if total > 0 => avail * 100 / total < 15,
+        _ => false,
+    }
+}
+
+/// `312M`, `1.4G`.
+fn mem_label(bytes: u64) -> String {
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    match mib < 1024.0 {
+        true => format!("{mib:.0}M"),
+        false => format!("{:.1}G", mib / 1024.0),
+    }
 }
 
 fn draw_menu_bar(f: &mut Frame, app: &App, area: Rect) {
@@ -20345,6 +20785,18 @@ fn draw_menu_bar(f: &mut Frame, app: &App, area: Rect) {
         true => bold(Color::Black, Color::Rgb(230, 200, 120)),
         false => off,
     };
+    // **TAP is a button, not the metronome's state.** It wore the click's gold
+    // and read as part of the MET switch. Its own colour — a muted teal, softer
+    // than the gold and of another hue — and a tinted face even with the click
+    // off, so it looks like something to press.
+    let tap_style = match met_on {
+        true => Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(120, 170, 170)),
+        false => Style::default()
+            .fg(Color::Rgb(160, 195, 195))
+            .bg(Color::Rgb(40, 58, 62)),
+    };
     let rec_on = app.automation.recording;
     let rec_style = if rec_on {
         bold(Color::Black, ERR)
@@ -20387,7 +20839,7 @@ fn draw_menu_bar(f: &mut Frame, app: &App, area: Rect) {
                 // say whether the click landed.
                 match app.met_taps.last() {
                     Some(t) if t.elapsed() < Duration::from_millis(150) => bold(Color::Black, WARN),
-                    _ => met_style,
+                    _ => tap_style,
                 },
             )],
         ),
@@ -20473,6 +20925,23 @@ fn draw_menu_bar(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(dsp_fg).bg(Color::Rgb(40, 46, 56)),
             )],
         ),
+        // What choz holds in RAM right now — a sample library is the thing
+        // that grows it — and in the warning colour when the machine is short.
+        (
+            BarId::Mem,
+            vec![Span::styled(
+                format!(
+                    " MEM {:>5} ",
+                    rss_bytes().map(mem_label).unwrap_or_else(|| "?".into())
+                ),
+                Style::default()
+                    .fg(match memory_short() {
+                        true => WARN,
+                        false => Color::Rgb(150, 155, 165),
+                    })
+                    .bg(Color::Rgb(40, 46, 56)),
+            )],
+        ),
     ];
 
     let width = |v: &[(BarId, Vec<Span>)]| -> u16 {
@@ -20485,6 +20954,7 @@ fn draw_menu_bar(f: &mut Frame, app: &App, area: Rect) {
     // can still reach goes first, and the switches with no other home go last.
     let available = area.width.saturating_sub(x - area.x);
     for id in [
+        BarId::Mem,
         BarId::Panic,
         BarId::Learn,
         BarId::Clk,
@@ -20534,7 +21004,7 @@ fn draw_menu_bar(f: &mut Frame, app: &App, area: Rect) {
                 BarId::Clk => layout.clock_rect = Some(r),
                 BarId::Panic => layout.panic_rect = Some(r),
                 BarId::Learn => layout.learn_rect = Some(r),
-                BarId::Dsp => {}
+                BarId::Dsp | BarId::Mem => {}
             }
             bx += w;
         }
@@ -25378,9 +25848,9 @@ mod tests {
             assert!(r.x >= edge, "{name} follows what came before it: {r:?}");
             edge = r.x + r.width;
         }
-        // Only the DSP readout sits right of PANIC, and then the margin.
+        // Only the DSP and MEM readouts sit right of PANIC, and then the margin.
         assert!(
-            edge >= 120 - 12,
+            edge >= 120 - 12 - 11,
             "the cluster reaches the right edge, ending at {edge}"
         );
         assert_eq!(rect.y, 0);
@@ -25952,6 +26422,363 @@ mod tests {
             .map(|n| n.note)
             .collect();
         assert_eq!(part, after, "and keeps playing what it had");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A chart that changes meter takes the click with it**, bar by bar:
+    /// the session's signature is the bar's, the one moves to that bar's
+    /// downbeat, and the grid editor writes the meters back as it read them.
+    #[test]
+    fn the_click_follows_a_chart_that_changes_meter() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let t = choz_ports::transport();
+        t.set_playing(false);
+        t.set_bpm(120.0);
+        t.set_sample_rate(48_000);
+        t.set_time_signature(4, 4);
+        t.set_bar_origin(0.0);
+        t.set_free_samples(0);
+        let mut app = App::new();
+        app.ui.audio.follow_arranger = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        app.edit_arranger(ArrEdit::Toggle);
+        app.slots[0]
+            .arranger
+            .set_text("style = tarkus\n| 5/4 Fm | 3/4 Db | 7/8 Eb | 4/4 Fm |");
+        app.edit_arranger(ArrEdit::Play);
+        let q = 24_000.0;
+        let mut seen: Vec<((u16, u16), f64)> = Vec::new();
+        let mut beat = 0.0;
+        while beat < 16.0 {
+            t.set_free_samples((beat * q) as u64);
+            app.tick_arrangers();
+            let now = (t.time_signature(), t.bar_origin());
+            if seen.last().map(|(m, _)| *m) != Some(now.0) {
+                seen.push(now);
+            }
+            beat += 0.05;
+        }
+        let meters: Vec<(u16, u16)> = seen.iter().map(|(m, _)| *m).collect();
+        // Into the chart's first bar on the first tick, and round again to it
+        // when the form comes back to the top.
+        assert_eq!(
+            meters,
+            vec![(5, 4), (3, 4), (7, 8), (4, 4), (5, 4)],
+            "{seen:?}"
+        );
+        // Each change moved the one to that bar's downbeat: 5/4 at 0, the 3/4
+        // five beats later, the 7/8 three after that, and so on.
+        let origins: Vec<f64> = seen
+            .iter()
+            .map(|(_, o)| (o * 100.0).round() / 100.0)
+            .collect();
+        assert_eq!(origins, vec![0.0, 5.0, 8.0, 11.5, 15.5], "{seen:?}");
+
+        let chart = chart_edit::ChartEdit::parse(&views::fx_chain_panel::chart_bars(
+            &app.slots[0].arranger.settings.text,
+        ));
+        assert!(chart.text().contains("| 3/4 Db |"), "{}", chart.text());
+
+        app.edit_arranger(ArrEdit::Stop);
+        t.set_time_signature(4, 4);
+        t.set_bar_origin(0.0);
+    }
+
+    /// **SPLIT OUT is the mixer, not the rack.** Off by default; up, the band
+    /// stays in its one tab and each musician gets a strip on the desk — after
+    /// the tabs, before the groups — whose fader, pan and mute are that
+    /// musician's channel of the tab's instrument. No tab is opened, and the
+    /// groups are still where the desk has them.
+    #[test]
+    fn split_out_shows_the_band_on_the_mixer_without_new_tabs() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Sf2 {
+            path: "/fonts/gm.sf2".into(),
+            bank: 0,
+            preset: 0,
+        }));
+        app.slots[0].presets = vec![
+            sources::Sf2Preset {
+                bank: 0,
+                preset: 0,
+                name: "Piano".into(),
+            },
+            sources::Sf2Preset {
+                bank: 0,
+                preset: 33,
+                name: "Bass".into(),
+            },
+            sources::Sf2Preset {
+                bank: 128,
+                preset: 0,
+                name: "Kit".into(),
+            },
+        ];
+        app.active_slot = 0;
+        app.edit_arranger(ArrEdit::Toggle);
+        app.edit_arranger(ArrEdit::Part(1)); // bass and drums
+        use arranger::generate::Role;
+        use views::midi_monitor::StripKind;
+
+        assert!(!app.slots[0].arranger.settings.split, "off by default");
+        let tabs_and_desk = app.mixer_strips().len();
+        assert!(app.mixer_strips().iter().all(|s| s.kind != StripKind::Band));
+
+        app.edit_arranger(ArrEdit::Split);
+        assert_eq!(app.slots.len(), 1, "no tab is opened for a musician");
+        let strips = app.mixer_strips();
+        assert_eq!(strips.len(), tabs_and_desk + 2, "a strip a musician");
+        assert_eq!(strips[1].kind, StripKind::Band);
+        assert_eq!(strips[2].kind, StripKind::Band);
+        assert!(
+            strips.iter().any(|s| s.label.contains("BASS")),
+            "named for who plays"
+        );
+        assert!(
+            matches!(app.strip_ref(3), StripRef::Bus(0)),
+            "the groups after them"
+        );
+
+        // The bass's strip: fader, pan, mute — the band's own settings.
+        let bass = (1..3)
+            .find(|i| matches!(app.strip_ref(*i), StripRef::Band(0, Role::Bass)))
+            .unwrap();
+        app.set_strip_gain(bass, 0.5);
+        app.set_strip_pan(bass, -1.0, false);
+        app.toggle_strip_mute(bass);
+        let b = app.slots[0].arranger.settings.strip(Role::Bass);
+        assert_eq!((b.gain, b.pan, b.mute), (0.5, -1.0, true), "{b:?}");
+        assert_eq!(b.sides(), (0.0, 0.0), "muted is silent on both sides");
+        app.toggle_strip_mute(bass);
+        assert_eq!(
+            app.slots[0].arranger.settings.strip(Role::Bass).sides(),
+            (0.5, 0.0),
+            "hard left at half"
+        );
+        assert_eq!(app.slots[0].gain, 1.0, "the tab's own fader did not move");
+
+        // Down again: one strip for the band, as any tab.
+        app.edit_arranger(ArrEdit::Split);
+        assert_eq!(app.mixer_strips().len(), tabs_and_desk);
+    }
+
+    /// **Choosing a style loads its bar**, playing or not: METER, the click,
+    /// the session's saved signature and the band's own bar all become the
+    /// style's — a waltz 3/4, a 6/8 blues 6/8, Tarkus 5/4 — and back to 4/4
+    /// with a rock.
+    #[test]
+    fn choosing_a_style_loads_its_meter() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let t = choz_ports::transport();
+        t.set_playing(false);
+        t.set_time_signature(4, 4);
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        app.edit_arranger(ArrEdit::Toggle);
+        for (style, meter, beats) in [
+            ("cntywltz", (3, 4), 3.0),
+            ("strtrock", (4, 4), 4.0),
+            ("6_8blues", (6, 8), 3.0),
+            ("tarkus", (5, 4), 5.0),
+            ("strtrock", (4, 4), 4.0),
+        ] {
+            app.edit_arranger(ArrEdit::Style(style));
+            let a = &app.slots[0].arranger;
+            assert_eq!(a.view().meter, meter, "{style}: METER");
+            assert_eq!(t.time_signature(), meter, "{style}: the click");
+            assert_eq!(app.ui.audio.time_sig, meter, "{style}: the bar kept");
+            assert_eq!(a.view().beats_per_bar, beats, "{style}: the band's own bar");
+        }
+        t.set_time_signature(4, 4);
+    }
+
+    #[test]
+    fn the_metronome_counts_the_arrangers_bar_while_it_plays() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let t = choz_ports::transport();
+        t.set_playing(false);
+        t.set_time_signature(4, 4);
+        let mut app = App::new();
+        app.ui.audio.time_sig = (4, 4);
+        app.ui.audio.follow_arranger = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        app.edit_arranger(ArrEdit::Toggle);
+        app.edit_arranger(ArrEdit::Style("cntywltz"));
+        assert_eq!(app.slots[0].arranger.own_meter(), (3, 4));
+        assert_eq!(
+            t.time_signature(),
+            (3, 4),
+            "choosing the style loaded its bar"
+        );
+        // A bar of the player's own set afterwards, the way a session opens
+        // with the one it was saved with: what FOLLOW ARR has to give back.
+        app.ui.audio.time_sig = (4, 4);
+        t.set_time_signature(4, 4);
+
+        app.edit_arranger(ArrEdit::Play);
+        app.tick_arrangers();
+        assert_eq!(t.time_signature(), (3, 4), "the click counts the waltz");
+        assert!((t.bar_quarters() - 3.0).abs() < 1e-9);
+
+        app.edit_arranger(ArrEdit::Stop);
+        app.tick_arrangers();
+        assert_eq!(
+            t.time_signature(),
+            (4, 4),
+            "and the player's bar comes back"
+        );
+
+        // Off: the session keeps its own bar.
+        app.step_metronome_row(8, 1);
+        assert!(!app.ui.audio.follow_arranger);
+        app.edit_arranger(ArrEdit::Play);
+        app.tick_arrangers();
+        assert_eq!(t.time_signature(), (4, 4), "off is off");
+        app.edit_arranger(ArrEdit::Stop);
+
+        // On again, and a bar set by hand takes the count back.
+        app.step_metronome_row(8, 1);
+        app.edit_arranger(ArrEdit::Play);
+        app.tick_arrangers();
+        assert_eq!(t.time_signature(), (3, 4));
+        app.step_metronome_row(2, 1); // BEATS: 3 -> 4
+        app.tick_arrangers();
+        assert!(
+            !app.ui.audio.follow_arranger,
+            "setting BEATS stops following"
+        );
+        assert_eq!(t.time_signature(), (4, 4), "and the hand-set bar stays");
+
+        app.edit_arranger(ArrEdit::Stop);
+        t.set_time_signature(4, 4);
+        choz_engine::artifacts::metronome::metronome().set_groups(&[]);
+    }
+
+    /// LOAD reads the bar as well as the chords: a chart that says 7/8 counted
+    /// 3+2+2 puts the click, the grid and the tab's grouping on it.
+    #[test]
+    fn a_progression_file_brings_its_meter_and_grouping() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let t = choz_ports::transport();
+        let (had_sig, had_groups) = (
+            t.time_signature(),
+            choz_engine::artifacts::metronome::metronome().groups(),
+        );
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        app.edit_arranger(ArrEdit::Toggle);
+
+        let dir = std::env::temp_dir().join(format!("choz-arr-meter-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("seven.chord");
+        std::fs::write(
+            &file,
+            "key = D\nmeter = 7/8\ngroups = 3+2+2\n| Dm7 | G7 | Cmaj7 | A7 |",
+        )
+        .unwrap();
+        app.load_arranger_text(file);
+
+        let arr = &app.slots[0].arranger;
+        assert!(arr.error().is_none(), "{:?}", arr.error());
+        assert_eq!(arr.bars(), 4);
+        assert_eq!(arr.meter(), (7, 8));
+        assert_eq!(arr.settings.groups, vec![3, 2, 2], "the tab's grouping");
+        assert_eq!(t.time_signature(), (7, 8), "the session's bar");
+        assert_eq!(app.ui.audio.time_sig, (7, 8));
+        assert_eq!(
+            choz_engine::artifacts::metronome::metronome().groups(),
+            vec![3, 2, 2],
+            "the click counts it the same way"
+        );
+        // The headers are not bars on the grid.
+        let text = app.slots[0].arranger.settings.text.clone();
+        assert_eq!(
+            views::fx_chain_panel::chart_bars(&text),
+            vec!["Dm7", "G7", "Cmaj7", "A7"]
+        );
+
+        t.set_time_signature(had_sig.0, had_sig.1);
+        choz_engine::artifacts::metronome::metronome().set_groups(&had_groups);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// EXPORT MIDI is on the box, writes the band as a `.mid`, and LOAD opens
+    /// that file back as the chart that wrote it.
+    #[test]
+    fn the_arranger_exports_a_midi_file_that_loads_back() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        app.edit_arranger(ArrEdit::Toggle);
+        let (screen, rack) = render_rack(&mut app, 160, 40);
+        assert!(
+            screen.contains("EXPORT MIDI"),
+            "no EXPORT on the box:\n{screen}"
+        );
+        assert!(rack
+            .buttons
+            .iter()
+            .any(|(b, _)| *b == views::fx_chain_panel::RackButton::ArrExport));
+
+        let dir = std::env::temp_dir().join(format!("choz-arr-midi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let chart = app.slots[0].arranger.settings.text.clone();
+        // A tab's band starts as one musician, and a file of one instrument is
+        // not one LOAD takes back: the prompt says so instead of writing it.
+        app.open_arranger_export();
+        app.save_name = Some(SaveName::new(dir.clone(), "solo".into()).with_ext(".mid"));
+        app.save_name_key(KeyCode::Enter);
+        assert!(
+            app.save_name.as_ref().is_some_and(|n| n.error.is_some()),
+            "a band of one was written"
+        );
+        assert!(!dir.join("solo.mid").exists());
+        app.close_modal();
+        app.edit_arranger(ArrEdit::Part(1)); // and the drums
+                                             // EXPORT asks for the name: a directory first, then what to call it —
+                                             // a bare name gets `.mid`, and a name already taken asks again.
+        app.open_arranger_export();
+        app.save_name = Some(SaveName::new(dir.clone(), String::new()).with_ext(".mid"));
+        for c in "my-blues".chars() {
+            assert!(app.save_name_key(KeyCode::Char(c)));
+        }
+        assert!(app.save_name_key(KeyCode::Enter));
+        let path = dir.join("my-blues.mid");
+        assert!(path.exists(), "written under the name that was typed");
+        assert!(app.modal.is_none(), "and the prompt closes");
+        app.open_arranger_export();
+        app.save_name = Some(SaveName::new(dir.clone(), "my-blues".into()).with_ext(".mid"));
+        app.save_name_key(KeyCode::Enter);
+        assert!(
+            app.save_name.as_ref().is_some_and(|n| n.confirm),
+            "an existing file is asked about, not replaced"
+        );
+        app.close_modal();
+        app.slots[0].arranger.set_text("| Dm |");
+        app.load_arranger_text(path);
+        assert!(app.slots[0].arranger.error().is_none());
+        assert_eq!(
+            app.slots[0].arranger.settings.text, chart,
+            "the chart came back"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -28999,6 +29826,52 @@ mod tests {
     /// having gone quiet on its own — which is exactly the moment a player
     /// needs to know it was choz that pulled the microphone down.
     #[test]
+    fn polyphony_is_a_setting_with_bounds() {
+        let _guard = ui_guard();
+        sandbox_state_dir();
+        let mut app = App::new();
+        // 256 out of the box, and the row says what it is and its range.
+        assert_eq!(app.ui.audio.polyphony, choz_engine::POLYPHONY_DEFAULT);
+        assert_eq!(choz_engine::POLYPHONY_DEFAULT, 256);
+        let rows = app.engine_rows();
+        let row = rows
+            .iter()
+            .find(|r| r.contains("Polyphony"))
+            .expect("a Polyphony row");
+        assert!(
+            row.contains("256") && row.contains("16") && row.contains("1024"),
+            "{row}"
+        );
+        // Upwards only: another test building an instrument meanwhile must never
+        // be handed fewer voices than it expects.
+        open_paths_tab(&mut app);
+        if let Some(m) = app.modal.as_mut() {
+            m.list.filter = TAB_AUDIO;
+            m.list.sidebar_cursor = SEC_ENGINE;
+            m.list.sidebar_focused = false;
+            m.list.cursor = 8;
+        }
+        assert!(app.audio_settings_key(KeyCode::Right));
+        assert_eq!(app.ui.audio.polyphony, 512);
+        assert_eq!(
+            choz_engine::polyphony(),
+            512,
+            "applied to what is built next"
+        );
+        assert_eq!(
+            settings::UiSettings::load().audio.polyphony,
+            512,
+            "and saved"
+        );
+        // The engine keeps it inside its bounds whatever it is handed.
+        choz_engine::set_polyphony(u16::MAX);
+        assert_eq!(choz_engine::polyphony(), choz_engine::POLYPHONY_MAX);
+        choz_engine::set_polyphony(choz_engine::POLYPHONY_DEFAULT);
+        app.ui.audio.polyphony = choz_engine::POLYPHONY_DEFAULT;
+        app.ui.save();
+    }
+
+    #[test]
     fn the_feedback_guard_is_switchable_and_says_when_it_is_holding() {
         let _guard = ui_guard();
         sandbox_state_dir();
@@ -29696,6 +30569,29 @@ mod tests {
         choz_ports::transport().set_bpm(120.0);
     }
 
+    /// The menu bar says how much memory choz holds, next to the DSP load —
+    /// what a sample library grows — read off the process itself.
+    #[test]
+    fn the_menu_bar_shows_the_memory_in_use() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        let mut term = Terminal::new(TestBackend::new(200, 30)).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let top: String = (0..200)
+            .map(|x| term.backend().buffer()[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(top.contains("MEM "), "no memory on the bar: {top}");
+        let rss = rss_bytes().expect("a /proc to read");
+        assert!(
+            rss > 1024 * 1024,
+            "resident memory of a whole process: {rss}"
+        );
+        assert_eq!(mem_label(312 * 1024 * 1024), "312M");
+        assert_eq!(mem_label(1536 * 1024 * 1024), "1.5G");
+    }
+
     /// The same tap, on the menu bar: a rack with no arpeggiator still needs a
     /// tempo it can play in.
     #[test]
@@ -29711,7 +30607,21 @@ mod tests {
         let met = app.layout.borrow().met_rect.unwrap();
         assert!(tap.x + tap.width <= met.x, "TAP sits left of the metronome");
 
+        // A button of its own colour, on or off: not the click's gold, and not
+        // the grey every switch that is off wears.
         let m = choz_engine::artifacts::metronome::metronome();
+        for on in [true, false] {
+            m.set_on(on);
+            term.draw(|f| ui(f, &mut app)).unwrap();
+            let buf = term.backend().buffer();
+            let bg = |x: u16, y: u16| buf[(x, y)].bg;
+            assert_ne!(
+                bg(tap.x + 1, tap.y),
+                bg(met.x + 1, met.y),
+                "TAP wears the metronome's colour (click {on})"
+            );
+        }
+
         m.set_on(false);
         for _ in 0..4 {
             click(&mut app, tap.x + 1, tap.y);
@@ -35599,6 +36509,8 @@ mod tests {
         assert_eq!(again.regions[0].root, before + 12, "Esc wrote anyway");
 
         let _ = std::fs::remove_dir_all(&dir);
+        // The preset lives beside the folder, not in it.
+        let _ = std::fs::remove_file(preset::path_for(&dir));
     }
 
     /// Everything the sampler puts on the panel belongs to the **instrument**,

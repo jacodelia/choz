@@ -608,6 +608,16 @@ mod tests {
                     // else, so the round trip has a grouping to lose.
                     groups: vec![3, 2, 2],
                     roman: true,
+                    // Split out, so the round trip has the switch to lose.
+                    split: true,
+                    split_mix: vec![
+                        crate::arranger::BandStrip {
+                            gain: 0.7,
+                            pan: -0.3,
+                            mute: false,
+                        };
+                        4
+                    ],
                 },
             }],
         }

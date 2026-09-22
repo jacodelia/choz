@@ -19,9 +19,13 @@ use anyhow::{bail, Context, Result};
 
 use crate::sources::AudioSource;
 
-/// Simultaneous voices. Past this the oldest is stolen, so `note_on` never
-/// grows the vector — it is called from the audio thread.
-const MAX_VOICES: usize = 32;
+/// Simultaneous voices: the global polyphony (Settings → AUDIO, see
+/// [`crate::polyphony`]), reserved once when the instrument is built. Past it
+/// the oldest is stolen, so `note_on` never grows the vector — it is called
+/// from the audio thread.
+fn voice_capacity() -> usize {
+    crate::polyphony() as usize
+}
 
 /// Where [`SfzSampler::normalize`] puts an instrument's typical note: its median
 /// peak at -12 dBFS.
@@ -737,7 +741,7 @@ impl SfzSampler {
     pub fn empty(name: String) -> Self {
         Self {
             regions: Vec::new(),
-            voices: Vec::with_capacity(MAX_VOICES),
+            voices: Vec::with_capacity(voice_capacity()),
             name,
             strikes: [0; 128],
             knobs: Knobs::default(),
@@ -811,7 +815,7 @@ impl SfzSampler {
         }
         Ok(Self {
             regions,
-            voices: Vec::with_capacity(MAX_VOICES),
+            voices: Vec::with_capacity(voice_capacity()),
             name,
             strikes: [0; 128],
             knobs: Knobs::default(),
@@ -1170,7 +1174,10 @@ impl AudioSource for SfzSampler {
             voice.pedalled = false;
             voice.release();
         }
-        if self.voices.len() == MAX_VOICES {
+        // Against what was reserved, not the setting: it may have moved since
+        // this instrument was built, and growing past the reservation is an
+        // allocation on the audio thread.
+        if self.voices.len() >= self.voices.capacity() {
             // Steal the oldest rather than grow: `push` past the capacity would
             // allocate on the audio thread.
             self.voices.remove(0);
@@ -1353,7 +1360,7 @@ mod tests {
                 },
                 pcm,
             }],
-            voices: Vec::with_capacity(MAX_VOICES),
+            voices: Vec::with_capacity(voice_capacity()),
             name: "test".into(),
             strikes: [0; 128],
             knobs: Knobs::default(),
@@ -1436,7 +1443,7 @@ mod tests {
         let mut s = SfzSampler {
             // The two takes differ only in gain, which is what the test reads.
             regions: vec![region(0.25), region(1.0)],
-            voices: Vec::with_capacity(MAX_VOICES),
+            voices: Vec::with_capacity(voice_capacity()),
             name: "test".into(),
             strikes: [0; 128],
             knobs: Knobs::default(),
@@ -1487,7 +1494,7 @@ mod tests {
                 },
                 pcm: crate::instruments::stream::Pcm::mem(pcm),
             }],
-            voices: Vec::with_capacity(MAX_VOICES),
+            voices: Vec::with_capacity(voice_capacity()),
             name: "test".into(),
             strikes: [0; 128],
             knobs: Knobs::default(),
@@ -1650,6 +1657,7 @@ mod tests {
         // …and the worst case the sampler allows: every voice it has.
         let mut full = bench(vec![1.0; 8000]);
         full.set_param(1, 1.0);
+        const MAX_VOICES: usize = 32;
         for note in 40..40 + MAX_VOICES as u8 {
             full.note_on(note, 127);
         }

@@ -272,6 +272,9 @@ jobs:
           mkdir -p dist release
           find artifacts -name '*.tar.gz' -exec cp {} dist/ \;
           sh packaging/arch/mkpkgbuild.sh "$VER" dist > release/PKGBUILD
+          # `install=` in the PKGBUILD names this file, and makepkg wants it
+          # beside the PKGBUILD.
+          cp packaging/arch/choz-bin.install release/
           cat release/PKGBUILD
 
       - name: Lint and generate .SRCINFO
@@ -292,6 +295,7 @@ jobs:
           files: |
             release/PKGBUILD
             release/.SRCINFO
+            release/choz-bin.install
 
       - name: Push to the AUR
         if: ${{ env.AUR_SSH_KEY != '' }}
@@ -307,8 +311,8 @@ jobs:
           git config --global user.name "choz release bot"
           git config --global user.email "jorgecodelia@gmail.com"
           git clone ssh://aur@aur.archlinux.org/choz-bin.git aur
-          cp release/PKGBUILD release/.SRCINFO aur/
+          cp release/PKGBUILD release/.SRCINFO release/choz-bin.install aur/
           cd aur
-          git add PKGBUILD .SRCINFO
+          git add PKGBUILD .SRCINFO choz-bin.install
           git commit -m "choz-bin ${GITHUB_REF_NAME#v}"
           git push

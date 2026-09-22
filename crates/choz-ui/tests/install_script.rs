@@ -258,6 +258,12 @@ fn the_clap_bundle_is_installed_by_default_and_removable() {
     if !existed {
         std::fs::write(&bundle, b"not really a plugin").unwrap();
     }
+    // And the rack: without one the script would build it, a release compile.
+    let rack_so = target.join("libchoz_clap.so");
+    let rack_existed = rack_so.exists();
+    if !rack_existed {
+        std::fs::write(&rack_so, b"not really a plugin").unwrap();
+    }
 
     let out = run(
         &prefix,
@@ -271,8 +277,19 @@ fn the_clap_bundle_is_installed_by_default_and_removable() {
     let wallpaper = prefix.join("share/choz/wallpapers/wallpaper.jpg");
     assert!(wallpaper.exists(), "the wallpapers ship too: {out}");
 
+    let rack = home.join(".clap/choz-rack.clap");
+    assert!(
+        rack.exists(),
+        "choz itself is installed as a CLAP too: {out}"
+    );
+
     let out = run(&prefix, &home, &["--uninstall"]);
     assert!(!installed.exists(), "and uninstall takes it away: {out}");
+    assert!(!rack.exists(), "the rack as well: {out}");
+    assert!(
+        out.contains(&format!("removed {}", rack.display())),
+        "and says so: {out}"
+    );
     assert!(!wallpaper.exists(), "wallpapers too: {out}");
 
     // Whoever does not want the plugin says so.
@@ -290,6 +307,9 @@ fn the_clap_bundle_is_installed_by_default_and_removable() {
 
     if !existed {
         let _ = std::fs::remove_file(&bundle);
+    }
+    if !rack_existed {
+        let _ = std::fs::remove_file(&rack_so);
     }
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -348,6 +368,63 @@ fn a_missing_jack_is_a_note_not_a_refusal() {
         prefix.join("bin/choz").exists(),
         "JACK is optional, so this installs"
     );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// On a terminal, a previous install is asked about before it is replaced — and
+/// "no" leaves it exactly where it was. Driven through `script`, which gives the
+/// installer the pty it checks for; skipped where there is none.
+#[test]
+fn the_installer_asks_before_replacing_a_previous_install() {
+    if Command::new("script").arg("--version").output().is_err() {
+        eprintln!("skipped: no `script` to give the installer a terminal");
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!("choz_install_ask_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (prefix, home) = (tmp.join("prefix"), tmp.join("home"));
+    std::fs::create_dir_all(&home).unwrap();
+    let binary = env!("CARGO_BIN_EXE_choz");
+    run(&prefix, &home, &["--binary", binary, "--no-clap"]);
+    let installed = prefix.join("bin/choz");
+    let before = std::fs::metadata(&installed).unwrap().modified().unwrap();
+
+    let on_a_terminal = |answer: &str| {
+        let line = format!(
+            "sh {} --prefix {} --binary {} --no-clap --skip-deps-check",
+            script().display(),
+            prefix.display(),
+            binary
+        );
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "printf '{answer}\\n' | script -qec \"{line}\" /dev/null"
+            ))
+            .env("HOME", &home)
+            .env("CHOZ_SEARCH_BINS", "")
+            .output()
+            .expect("sh is installed");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    let out = on_a_terminal("n");
+    assert!(out.contains("a previous choz is installed"), "{out}");
+    assert!(out.contains("Replace it with"), "it asks: {out}");
+    assert!(out.contains("nothing changed"), "no is no: {out}");
+    assert_eq!(
+        std::fs::metadata(&installed).unwrap().modified().unwrap(),
+        before,
+        "the old binary was touched after a no"
+    );
+
+    let out = on_a_terminal("y");
+    assert!(
+        out.contains(&format!("removed {}", installed.display())),
+        "yes replaces: {out}"
+    );
+    assert!(installed.exists());
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

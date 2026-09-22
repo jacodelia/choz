@@ -54,6 +54,12 @@ pub struct Bass {
 pub struct Drums {
     pub kick: &'static [f64],
     pub snare: &'static [f64],
+    /// The **second bar** of a groove that is two bars long — the two-step's
+    /// answer — played on every other bar. Empty is a one-bar groove, which is
+    /// every rhythm that does not ask for two (a drum track named `… Drum
+    /// 2bar`, see `rhythms/README.md`).
+    pub kick_b: &'static [f64],
+    pub snare_b: &'static [f64],
     /// How often the cymbal speaks, in beats. `0.5` is eighths.
     pub cymbal: f64,
     /// Ride rather than hi-hat, and the swung "ding-ding-a-ding" with it.
@@ -62,6 +68,19 @@ pub struct Drums {
     pub ghost: f32,
     /// A fill on the last bar of every `fill_every` bars. `0` is never.
     pub fill_every: usize,
+}
+
+/// How a style plays a bar of **another** signature than its own — what a
+/// heterometric rhythm measures for each meter it changes to (a `Meter`
+/// section of the rhythm, see `rhythms/README.md`). A meter with none of these
+/// gets the style's own bar cut to length, or carried on into the extra beats.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeterGroove {
+    pub meter: (u8, u8),
+    pub kick: &'static [f64],
+    pub snare: &'static [f64],
+    /// Where the comp hits in that bar.
+    pub hits: &'static [f64],
 }
 
 /// How a style wants its chords comped. `hits` are positions in the bar.
@@ -126,11 +145,38 @@ pub struct Style {
     pub bass_gm: &'static [u8],
     pub piano_gm: &'static [u8],
     pub guitar_gm: &'static [u8],
+    /// The bars it knows in other signatures, for a chart that changes meter.
+    /// Empty for a style measured in one.
+    pub meters: &'static [MeterGroove],
 }
 
 pub use super::styles::ALL;
 
+/// A pattern written for a bar of `own` beats, laid over a bar of `len`: cut
+/// where the bar ends, and carried on from the top into the beats a longer bar
+/// has — a 4/4 groove in a 5/4 bar plays its first beat again.
+pub fn fit(pattern: &[f64], own: f64, len: f64) -> Vec<f64> {
+    if own <= 0.0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut from = 0.0;
+    while from < len - 1e-9 {
+        out.extend(pattern.iter().map(|p| from + p).filter(|p| *p < len - 1e-9));
+        from += own;
+    }
+    out
+}
+
 impl Style {
+    /// The groove this style plays in a bar of `meter`, when it measured one.
+    pub fn groove_for(&self, meter: Option<(u16, u16)>) -> Option<&MeterGroove> {
+        let (num, den) = meter?;
+        self.meters
+            .iter()
+            .find(|g| (g.meter.0 as u16, g.meter.1 as u16) == (num, den))
+    }
+
     /// The GM programs a role is played on, best first.
     ///
     /// A list rather than a number because a SoundFont is not obliged to have

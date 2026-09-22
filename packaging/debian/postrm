@@ -12,4 +12,10 @@ if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
         gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor || true
 fi
 
+# The answer to the `config` question goes with the package.
+if [ "$1" = "purge" ] && [ -e /usr/share/debconf/confmodule ]; then
+    . /usr/share/debconf/confmodule
+    db_purge
+fi
+
 exit 0

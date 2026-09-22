@@ -52,6 +52,8 @@ impl Embedded {
         // Armed before a single block is rendered: the run-away it exists for
         // can happen on the first one. Same as the standalone splash path.
         choz_engine::feedback::arm(app.ui.audio.feedback_guard);
+        // Before any instrument is built: it reads the polyphony when it is.
+        choz_engine::set_polyphony(app.ui.audio.polyphony);
         let mut engine = choz_engine::AudioEngine::new(sample_rate, max_frames);
         let rt = engine.start_embedded(PAIRS * 2, inputs, max_frames).ok()?;
         app.audio_engine = Some(engine);

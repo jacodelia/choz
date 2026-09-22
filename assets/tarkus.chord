@@ -1,0 +1,17 @@
+# A chart that changes meter, for style = tarkus. A bar that starts with a
+# signature changes to it, and the bars after it stay there until the next
+# one; a part starts back in the style's own 5/4. The chords are an original
+# progression in F minor, not the piece's.
+key = F
+style = tarkus
+
+[eruption]
+| Fm | Fm | Eb | Db |
+| Fm | Fm | Ab | Bb |
+[turn]
+| 3/4 Cm | Db | 4/4 Eb | 2/4 Fm |
+[odd]
+| 5/8 Fm | Fm | 7/8 Eb | 6/8 Db |
+| 9/8 Cm | Db | 12/8 Eb | 6/4 Fm |
+
+form = eruption turn eruption odd eruption

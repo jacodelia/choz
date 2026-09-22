@@ -1,9 +1,11 @@
 [workspace]
 resolver = "2"
+# Third-party code patched in place — see vendor/oxisynth/CHOZ-PATCH.md.
+exclude = ["vendor"]
 members = ["crates/choz-ports", "crates/choz-engine", "crates/choz-plugin-clap", "crates/choz-plugin-lv2", "crates/choz-plugin-ladspa", "crates/choz-plugin-vst2", "crates/choz-plugin-vst3", "crates/choz-plugin-sandbox", "crates/choz-plugin-pd", "crates/choz-plugin-clap-export", "crates/choz-ui", "crates/choz-clap"]
 
 [workspace.package]
-version = "1.3.13"
+version = "1.3.14"
 edition = "2021"
 description = "A terminal-based audio plugin host — like Carla for the terminal"
 repository = "https://github.com/jacodelia/choz"
@@ -56,3 +58,11 @@ choz-clap = { path = "crates/choz-clap" }
 # Symbols stay: a freeze in a hosted plugin is diagnosed with `gdb -p`, and a
 # stripped binary answers that with fourteen `??` frames. Debug info still goes.
 strip = "debuginfo"
+
+# **oxisynth, patched**: one public call, `Synth::read_next_groups`, that hands
+# back every audio group's sample instead of only the first. It is what lets a
+# SoundFont tab put each musician of the arranger's band on a mixer strip of
+# its own without a second instance — and a second copy of a 580 MB font. The
+# library is LGPL-2.1; the change is in vendor/oxisynth/CHOZ-PATCH.md.
+[patch.crates-io]
+oxisynth = { path = "vendor/oxisynth" }

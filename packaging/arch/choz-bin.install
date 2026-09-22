@@ -1,0 +1,17 @@
+# choz bundles left in users' ~/.clap by an earlier install.sh shadow the ones
+# this package puts in /usr/lib/clap: a host loads them first and keeps running
+# the old version. They are set aside as *.bak, which hosts do not load — what
+# the .deb does when its question is answered by default (see
+# packaging/debian/templates). pacman cannot ask, so it does not.
+post_install() {
+  for f in /root/.clap/choz.clap /root/.clap/choz-rack.clap \
+           /home/*/.clap/choz.clap /home/*/.clap/choz-rack.clap; do
+    [ -f "$f" ] || continue
+    mv -f "$f" "$f.bak" && echo "choz: set aside $f as $f.bak"
+  done
+  return 0
+}
+
+post_upgrade() {
+  post_install
+}

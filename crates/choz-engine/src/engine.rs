@@ -237,6 +237,14 @@ pub(crate) enum EngineCommand {
         preset: u8,
     },
     /// Point one keyboard zone of a slot at a program of the loaded file.
+    /// One zone's level into its slot's output — see
+    /// [`choz_ports::AudioSource::set_zone_mix`].
+    SetZoneMix {
+        slot: usize,
+        zone: u8,
+        left: f32,
+        right: f32,
+    },
     SetZoneProgram {
         slot: usize,
         zone: u8,
@@ -360,6 +368,7 @@ pub struct AudioEngine {
     playing: Arc<AtomicBool>,
     /// Number of rack slots the UI has created (kept in sync with the RT side).
     slot_count: usize,
+
     /// Native-editor handle per slot, mirrored with `slot_count`. Taken from
     /// each source before it moves to the RT thread — that is the only moment
     /// the UI can still reach it.
@@ -383,6 +392,8 @@ pub struct AudioEngine {
     /// capture moment, same reason: listing and loading a preset are main-thread
     /// work that the RT copy of the source can no longer be asked for.
     presets: Vec<Option<choz_ports::PresetsHandle>>,
+    /// Each slot's zone levels, when its instrument layers zones.
+    zone_meters: Vec<Option<std::sync::Arc<choz_ports::ZoneMeter>>>,
     /// Each slot's by-path control surface, when the plugin keeps its controls
     /// somewhere a parameter list cannot reach — ZynAddSubFX's OSC server, and
     /// its harmonics.
@@ -808,6 +819,7 @@ impl AudioEngine {
             backend: AudioBackend::Alsa,
             playing: Arc::new(AtomicBool::new(false)),
             slot_count: 0,
+
             editors: Vec::new(),
             layers: Vec::new(),
             fx_editors: Vec::new(),
@@ -817,6 +829,7 @@ impl AudioEngine {
             zone_states: Vec::new(),
             fx_states: Vec::new(),
             presets: Vec::new(),
+            zone_meters: Vec::new(),
             paths: Vec::new(),
             sandboxes: Vec::new(),
             fx_sandboxes: Vec::new(),
@@ -1761,6 +1774,7 @@ impl AudioEngine {
         self.states.push(source.state());
         self.zone_states.push(source.zone_state(1));
         self.presets.push(source.presets());
+        self.zone_meters.push(source.zone_meter());
         self.paths.push(source.paths());
         self.sandboxes.push(source.sandbox());
         self.fx_editors.push(Vec::new());
@@ -1792,6 +1806,7 @@ impl AudioEngine {
             self.states.remove(slot);
             self.fx_states.remove(slot);
             self.presets.remove(slot);
+            self.zone_meters.remove(slot);
             self.paths.remove(slot);
             self.sandboxes.remove(slot);
             self.fx_sandboxes.remove(slot);
@@ -2081,6 +2096,29 @@ impl AudioEngine {
         });
     }
 
+    /// How loud zone `zone` of `slot`'s instrument goes into the slot, per
+    /// side. The band's split-out strips in the mixer move this.
+    pub fn set_zone_mix(&mut self, slot: usize, zone: u8, left: f32, right: f32) {
+        if slot >= self.slot_count {
+            return;
+        }
+        self.send(EngineCommand::SetZoneMix {
+            slot,
+            zone,
+            left,
+            right,
+        });
+    }
+
+    /// Zone `zone` of `slot`'s last block, linear peak, before its strip.
+    pub fn zone_level(&self, slot: usize, zone: usize) -> f32 {
+        self.zone_meters
+            .get(slot)
+            .and_then(|m| m.as_ref())
+            .map(|m| m.get(zone))
+            .unwrap_or(0.0)
+    }
+
     /// Which zone each octave of `slot`'s keyboard plays.
     pub fn set_split(&mut self, slot: usize, split: [Option<u8>; choz_ports::SPLIT_OCTAVES]) {
         if slot >= self.slot_count {
@@ -2108,6 +2146,7 @@ impl AudioEngine {
         // is reached through its own handle — see [`Self::set_slot_zone_state`].
         self.zone_states[slot] = source.zone_state(1);
         self.presets[slot] = source.presets();
+        self.zone_meters[slot] = source.zone_meter();
         self.paths[slot] = source.paths();
         self.sandboxes[slot] = source.sandbox();
         self.send(EngineCommand::SetSlotSource { slot, source });
@@ -2614,6 +2653,16 @@ impl RtState {
                 EngineCommand::SetSlotProgram { slot, bank, preset } => {
                     if let Some(s) = state.slots.get_mut(slot) {
                         s.source.program_change(bank, preset);
+                    }
+                }
+                EngineCommand::SetZoneMix {
+                    slot,
+                    zone,
+                    left,
+                    right,
+                } => {
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        s.source.set_zone_mix(zone, left, right);
                     }
                 }
                 EngineCommand::SetZoneProgram {
