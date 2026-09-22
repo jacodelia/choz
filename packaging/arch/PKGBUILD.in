@@ -20,12 +20,14 @@ license=('MIT')
 # audio through ALSA — which is why it belongs in optdepends and nowhere else.
 depends=('alsa-lib' 'gcc-libs' 'glibc')
 optdepends=(
-  'jack2: JACK/PipeWire routing and per-channel outputs'
-  'pipewire-jack: same, on a PipeWire system'
+  'pipewire-jack: JACK/PipeWire routing and per-channel outputs'
+  'jack2: same, on a system running JACK itself instead of PipeWire'
   'kitty: the terminal the launcher prefers — wallpaper at real pixel resolution'
   'libpd: hosting Pure Data patches as effects'
 )
 provides=('choz')
+# Sets aside old copies of choz's CLAP bundles in ~/.clap — see the file.
+install=choz-bin.install
 conflicts=('choz')
 
 _url="$url/releases/download/v$pkgver"

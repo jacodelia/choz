@@ -272,17 +272,21 @@ impl Metronome {
         // arranger count their steps off, so the click cannot land between
         // their beats.
         let start = choz_ports::transport().position_samples();
+        // Bars are counted from the transport's origin — zero, until a chart
+        // that changes meter moves it to the one of the bar that changed.
+        let origin = choz_ports::transport().bar_origin() * quarter;
         let mut peak = 0.0f32;
 
         for f in 0..frames.min(out.len() / 2) {
-            let pos = (start + f as u64) as f64;
-            let beat_index = (pos / beat) as u64;
+            let pos = (start + f as u64) as f64 - origin;
+            let beat_index = (pos / beat).floor() as i64;
             let t = (pos - beat_index as f64 * beat) / sample_rate as f64;
+            let beat_index = beat_index.rem_euclid(beats_per_bar as i64) as u64;
             // The downbeat is a different note, not a louder one: on a busy
             // stage "louder" is the first thing the room takes away. The
             // grouping's accents sit between the two, which is how 2+2+3 is
             // told apart from seven of the same tap.
-            let stress = self.stress_at(beat_index % beats_per_bar, beats_per_bar);
+            let stress = self.stress_at(beat_index, beats_per_bar);
             let s = click(style, t as f32, stress) * gain;
             peak = peak.max(s.abs());
             out[f * 2] += s;
@@ -422,6 +426,38 @@ mod tests {
 
     /// Off it is silence; on it puts a click on the beat and nothing between
     /// them — and the first beat of the bar is not the same sound as the rest.
+    /// The click counts bars from the transport's origin: moved to a quarter
+    /// in, the downbeat is there, and the bar comes round again from it.
+    #[test]
+    fn the_downbeat_is_counted_from_the_bar_origin() {
+        let _g = crate::test_locks::transport();
+        let t = choz_ports::transport();
+        t.set_playing(false);
+        t.set_sample_rate(48_000);
+        t.set_bpm(120.0);
+        t.set_time_signature(4, 4);
+        let m = metronome();
+        m.set_on(true);
+        m.set_groups(&[]);
+        let q = 24_000u64;
+        let render_at = |pos: u64| {
+            t.set_free_samples(pos);
+            let mut buf = vec![0.0f32; 512];
+            m.render(&mut buf, 256, 48_000);
+            buf
+        };
+        t.set_bar_origin(1.0);
+        let down = render_at(q);
+        let weak = render_at(2 * q);
+        let again = render_at(5 * q);
+        let before = render_at(0);
+        t.set_bar_origin(0.0);
+        m.set_on(false);
+        assert_ne!(down, weak, "the one moved with the origin");
+        assert_eq!(down, again, "and comes round a bar later");
+        assert_eq!(before, weak, "the beat before it is the last of a bar");
+    }
+
     #[test]
     fn it_clicks_on_the_beat_and_only_there() {
         let _clock = crate::test_locks::transport();

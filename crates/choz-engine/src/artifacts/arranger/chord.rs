@@ -559,6 +559,10 @@ pub struct Bar {
     /// How much of the bar each chord holds, as shares of their sum. Never
     /// empty, never zero — see [`Bar::new`].
     pub weights: Vec<f64>,
+    /// The bar's own signature, when the chart changes meter: `| 5/4 Fm |`,
+    /// and every bar after it until the next change. `None` is the chart's
+    /// (or the style's) bar — see [`Progression::bar_beats`].
+    pub meter: Option<(u16, u16)>,
 }
 
 impl Bar {
@@ -572,7 +576,11 @@ impl Bar {
                 *w = 1.0;
             }
         }
-        Self { chords, weights }
+        Self {
+            chords,
+            weights,
+            meter: None,
+        }
     }
 
     /// Where slot `i` starts and how long it is, in beats of a
@@ -630,18 +638,67 @@ pub struct Progression {
     /// `(name, first bar)` of each section, in playing order. Empty for a text
     /// that never named one. What the panel says you are in.
     pub sections: Vec<(String, usize)>,
+    /// `meter = 7/8`: the bar this chart is written in. `None` leaves it to the
+    /// session, and to the style under that.
+    pub meter: Option<(u16, u16)>,
+    /// `groups = 3+2+2`: how the bar is counted, in the metronome's notation.
+    /// Empty leaves it to the tab and the click.
+    pub groups: Vec<u8>,
 }
 
 impl Progression {
-    /// The chord sounding at `beat` of the whole arrangement, and how many
-    /// beats are left of it.
-    pub fn at(&self, beat: f64, beats_per_bar: f64) -> Option<(&Chord, f64)> {
+    /// Whether any bar has a signature of its own — a chart that changes
+    /// meter. Everything below takes the plain arithmetic when it does not.
+    pub fn heterometric(&self) -> bool {
+        self.bars.iter().any(|b| b.meter.is_some())
+    }
+
+    /// How long bar `i` is, in quarter-note beats: its own signature, or
+    /// `beats_per_bar`.
+    pub fn bar_beats(&self, i: usize, beats_per_bar: f64) -> f64 {
+        match self.bars.get(i).and_then(|b| b.meter) {
+            Some((num, den)) => (num as f64 * 4.0 / den.max(1) as f64).max(0.25),
+            None => beats_per_bar,
+        }
+    }
+
+    /// Where bar `i` starts, in beats from the top.
+    pub fn bar_start(&self, i: usize, beats_per_bar: f64) -> f64 {
+        match self.heterometric() {
+            false => i as f64 * beats_per_bar,
+            true => (0..i.min(self.bars.len()))
+                .map(|j| self.bar_beats(j, beats_per_bar))
+                .sum(),
+        }
+    }
+
+    /// Which bar `beat` falls in and how far into it. Past the end is the last
+    /// bar, the way it always read.
+    pub fn locate(&self, beat: f64, beats_per_bar: f64) -> Option<(usize, f64)> {
         if self.bars.is_empty() || beats_per_bar <= 0.0 {
             return None;
         }
-        let bar = (beat / beats_per_bar).floor() as usize;
-        let bar = self.bars.get(bar.min(self.bars.len() - 1))?;
-        let into = beat.rem_euclid(beats_per_bar);
+        if !self.heterometric() {
+            let bar = ((beat / beats_per_bar).floor() as usize).min(self.bars.len() - 1);
+            return Some((bar, beat.rem_euclid(beats_per_bar)));
+        }
+        let mut start = 0.0;
+        for i in 0..self.bars.len() {
+            let len = self.bar_beats(i, beats_per_bar);
+            if beat < start + len || i + 1 == self.bars.len() {
+                return Some((i, (beat - start).clamp(0.0, len - 1e-9)));
+            }
+            start += len;
+        }
+        None
+    }
+
+    /// The chord sounding at `beat` of the whole arrangement, and how many
+    /// beats are left of it.
+    pub fn at(&self, beat: f64, beats_per_bar: f64) -> Option<(&Chord, f64)> {
+        let (i, into) = self.locate(beat, beats_per_bar)?;
+        let bar = self.bars.get(i)?;
+        let beats_per_bar = self.bar_beats(i, beats_per_bar);
         let index = bar.slot_at(into, beats_per_bar)?;
         // A chord held over the slots next to it is one chord, not three: the
         // way to write `I7` for three beats of four is `| I7 - - IV7 |`, and a
@@ -671,7 +728,26 @@ impl Progression {
     }
 
     pub fn beats(&self, beats_per_bar: f64) -> f64 {
-        self.bars.len() as f64 * beats_per_bar
+        self.bar_start(self.bars.len(), beats_per_bar)
+    }
+
+    /// Where each chord starts, in beats from the top, and what it is called —
+    /// a held chord (`C - -`) once, not once a slot.
+    pub fn changes(&self, beats_per_bar: f64) -> Vec<(f64, &str)> {
+        let mut out: Vec<(f64, &str)> = Vec::new();
+        let mut last: Option<&Chord> = None;
+        for (b, bar) in self.bars.iter().enumerate() {
+            let len = self.bar_beats(b, beats_per_bar);
+            let from = self.bar_start(b, beats_per_bar);
+            for (i, chord) in bar.chords.iter().enumerate() {
+                if last != Some(chord) {
+                    let (start, _) = bar.slot(i, len);
+                    out.push((from + start, chord.symbol.as_str()));
+                }
+                last = Some(chord);
+            }
+        }
+        out
     }
 }
 
@@ -707,6 +783,8 @@ pub fn parse_progression(text: &str) -> Result<Progression> {
     let mut key = None;
     let mut style = String::new();
     let mut form: Vec<String> = Vec::new();
+    let mut meter = None;
+    let mut groups = Vec::new();
     // The sections, in the order they were written: `("", body)` for a text
     // that never opened one, which is every text written before sections
     // existed.
@@ -750,6 +828,8 @@ pub fn parse_progression(text: &str) -> Result<Progression> {
                             .map(|p| p.trim().to_ascii_lowercase())
                             .collect()
                     }
+                    "meter" | "time" => meter = Some(parse_meter(value.trim())?),
+                    "groups" | "grouping" => groups = parse_groups(value.trim())?,
                     other => bail!("{other}: not a setting the arranger knows"),
                 }
                 continue;
@@ -792,12 +872,46 @@ pub fn parse_progression(text: &str) -> Result<Progression> {
     if bars.is_empty() {
         bail!("no bars in the progression");
     }
+    // The same rule the metronome counts by: a grouping is of *this* bar.
+    let sum: u16 = groups.iter().map(|g| *g as u16).sum();
+    if let Some((num, _)) = meter.filter(|_| !groups.is_empty()) {
+        if sum != num {
+            bail!("groups add up to {sum}, and a {num}-beat bar needs {num}");
+        }
+    }
     Ok(Progression {
         key: key.unwrap_or(0),
         style,
         bars,
         sections,
+        meter,
+        groups,
     })
+}
+
+/// `7/8`: a count of 1 to 32 over a note value the metronome has.
+fn parse_meter(value: &str) -> Result<(u16, u16)> {
+    let parsed = value
+        .split_once('/')
+        .and_then(|(n, d)| Some((n.trim().parse::<u16>().ok()?, d.trim().parse::<u16>().ok()?)));
+    match parsed {
+        Some((num, den)) if (1..=32).contains(&num) && [1, 2, 4, 8, 16].contains(&den) => {
+            Ok((num, den))
+        }
+        _ => bail!("meter = {value}: not a signature (write it 7/8)"),
+    }
+}
+
+/// `3+2+2`, `3 2 2` or `3,2,2`: groups of 1 to 15 units.
+fn parse_groups(value: &str) -> Result<Vec<u8>> {
+    value
+        .split(['+', ',', ' '])
+        .filter(|g| !g.is_empty())
+        .map(|g| match g.parse::<u8>() {
+            Ok(n) if (1..=15).contains(&n) => Ok(n),
+            _ => bail!("groups = {value}: {g} is not a group (write it 3+2+2)"),
+        })
+        .collect()
 }
 
 /// `C:3` — a chord and how much of its bar it holds. `1.0` when nothing said.
@@ -823,6 +937,9 @@ fn split_weight(token: &str) -> Result<(&str, f64)> {
 fn parse_bars(body: &str, key: Option<u8>) -> Result<Vec<Bar>> {
     let mut bars = Vec::new();
     let mut last: Option<Chord> = None;
+    // `| 5/4 Fm |`: the bar's signature, and every bar's after it in this part
+    // until the next one — a score's rule, written where the chords are.
+    let mut meter: Option<(u16, u16)> = None;
     // **A line ends a bar, whether or not it is closed with a bar line.** A
     // chart is written in rows of four:
     //
@@ -843,6 +960,10 @@ fn parse_bars(body: &str, key: Option<u8>) -> Result<Vec<Bar>> {
         let mut chords = Vec::new();
         let mut weights = Vec::new();
         for token in bar.split_whitespace() {
+            if chords.is_empty() && is_meter_token(token) {
+                meter = Some(parse_meter(token)?);
+                continue;
+            }
             // `C:3` is a chord that holds three of the bar's own units — the
             // grouping written where the chords are, so a 7/8 counted 3+2+2 is
             // three chords of the lengths it is counted in. Without one a bar
@@ -863,9 +984,22 @@ fn parse_bars(body: &str, key: Option<u8>) -> Result<Vec<Bar>> {
         if chords.is_empty() {
             continue;
         }
-        bars.push(Bar::new(chords, weights));
+        let mut bar = Bar::new(chords, weights);
+        bar.meter = meter;
+        bars.push(bar);
     }
     Ok(bars)
+}
+
+/// `5/4`, `12/8`: a signature at the head of a bar, not a chord — no chord
+/// symbol is two numbers either side of a slash.
+fn is_meter_token(token: &str) -> bool {
+    token.split_once('/').is_some_and(|(n, d)| {
+        !n.is_empty()
+            && !d.is_empty()
+            && n.bytes().all(|b| b.is_ascii_digit())
+            && d.bytes().all(|b| b.is_ascii_digit())
+    })
 }
 
 #[cfg(test)]
@@ -954,6 +1088,71 @@ mod tests {
             parse("Cm7b5", None).unwrap().scale,
             vec![0, 1, 3, 5, 6, 8, 10]
         );
+    }
+
+    /// **A chart can change meter.** A bar that starts with a signature is in
+    /// it, and so is every bar after it in the part until the next one; the
+    /// bars are as long as their signatures, and a chord's place is inside its
+    /// own bar.
+    #[test]
+    fn a_chart_changes_meter_bar_by_bar() {
+        let p = parse_progression("| 5/4 C | F | 3/4 G | 7/8 Am G |").unwrap();
+        let meters: Vec<_> = p.bars.iter().map(|b| b.meter).collect();
+        assert_eq!(
+            meters,
+            vec![Some((5, 4)), Some((5, 4)), Some((3, 4)), Some((7, 8))]
+        );
+        assert!(p.heterometric());
+        assert_eq!(p.beats(4.0), 5.0 + 5.0 + 3.0 + 3.5);
+        assert_eq!(p.bar_start(3, 4.0), 13.0);
+        let name = |beat: f64| p.at(beat, 4.0).unwrap().0.symbol.clone();
+        assert_eq!(name(9.9), "F");
+        assert_eq!(name(10.0), "G", "bar three starts at ten");
+        assert_eq!(name(13.0), "Am");
+        assert_eq!(name(15.0), "G", "the second half of a 7/8 bar");
+        assert_eq!(
+            p.at(10.0, 4.0).unwrap().1,
+            3.0,
+            "a 3/4 bar holds three beats"
+        );
+        let changes: Vec<f64> = p.changes(4.0).iter().map(|(at, _)| *at).collect();
+        assert_eq!(changes, vec![0.0, 5.0, 10.0, 13.0, 14.75]);
+        // A part starts back in the chart's bar, and a plain chart is not
+        // heterometric at all.
+        let parts = parse_progression("[a]\n| 3/4 C |\n[b]\n| F |").unwrap();
+        assert_eq!(parts.bars[1].meter, None);
+        assert!(!parse_progression("| C | F |").unwrap().heterometric());
+        assert!(parse_progression("| 7/9 C |").is_err(), "not a signature");
+    }
+
+    /// A chart says its bar: the signature and how it is counted, in the
+    /// spellings people write them in — and one that does not add up is an
+    /// error, not a grouping quietly dropped.
+    #[test]
+    fn a_chart_names_its_meter_and_its_grouping() {
+        let p = parse_progression("meter = 7/8\ngroups = 3+2+2\n| C | F |").unwrap();
+        assert_eq!(p.meter, Some((7, 8)));
+        assert_eq!(p.groups, vec![3, 2, 2]);
+        for spelling in ["time = 7/8\ngrouping = 3 2 2", "meter=7/8\ngroups=3,2,2"] {
+            let p = parse_progression(&format!("{spelling}\n| C |")).unwrap();
+            assert_eq!(
+                (p.meter, p.groups),
+                (Some((7, 8)), vec![3, 2, 2]),
+                "{spelling}"
+            );
+        }
+        let plain = parse_progression("| C |").unwrap();
+        assert_eq!((plain.meter, plain.groups), (None, vec![]));
+        for bad in [
+            "meter = 7\n| C |",
+            "meter = 7/9\n| C |",
+            "meter = 0/4\n| C |",
+            "groups = 3+x\n| C |",
+            "groups = 3+0\n| C |",
+            "meter = 7/8\ngroups = 3+3+3\n| C |",
+        ] {
+            assert!(parse_progression(bad).is_err(), "{bad} read");
+        }
     }
 
     /// A row of bars with no bar line at the ends of it is still four bars: a

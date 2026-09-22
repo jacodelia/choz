@@ -75,14 +75,19 @@ rack y nota por nota dentro de cada capa— y toca una nota grabada en cada tecl
 que alguna capa grabó**, con cualquier pack: un archivo suelto, nombres con
 guiones, capas `v1…vN`, la nota del chunk `smpl` o la otra convención de
 octava; el arreglador **tiene forma
-—partes, intro y final—, **210 estilos, todos medidos de los acompañamientos
+—partes, intro y final—, **212 estilos, todos medidos de los acompañamientos
 en `arranger/rhythms`** por `tools/mid_to_styles.py`, su progresión se arma
 dentro de la TUI —una grilla de
 compases, un acorde por subdivisión de la agrupación— y sale
-en el `.clap` como cuarto artifact.** **La 1.0.0 está publicada y
-sus paquetes verificados; la 1.3.13 es este árbol.**
-1045 tests (el workspace sin `choz-plugin-lv2`, que en esta máquina se cuelga),
-`clippy --workspace --all-targets -D warnings` limpio con `+beta`.
+en el `.clap` como cuarto artifact**; sus charts **cambian de compás barra por
+barra** (`| 5/4 Fm | 3/4 Db |`) y el metrónomo los sigue, lee y escribe **MIDI**
+—exporta la banda balanceada, un canal por músico, y abre un `.mid` de dos a
+cuatro instrumentos—, y **SPLIT OUT** pone a cada músico en una tira propia del
+MIXER sin abrir otra tab. La polifonía de los instrumentos es un ajuste (16–1024, 256
+por defecto) y la barra de arriba dice la RAM que choz tiene. **La 1.3.14 es
+este árbol, publicada con sus paquetes.** El workspace sin
+`choz-plugin-lv2` (que en esta máquina se cuelga) pasa, y `clippy --workspace
+--all-targets -D warnings` está limpio con `+beta`.
 
 Las comprobaciones con hardware delante quedaron dichas en los gotchas, que es
 donde se van a leer.
@@ -91,7 +96,7 @@ donde se van a leer.
 
 ## Pendiente
 
-Cinco bordes y dos decisiones de no hacer. Lo entregado se cuenta día por día en
+Seis bordes y dos decisiones de no hacer. Lo entregado se cuenta día por día en
 el [changelog](../CHANGELOG.md); un punto que se cierra sale de aquí, porque
 este documento es lo que queda y no lo que hubo.
 
@@ -207,10 +212,17 @@ GATE.
   golpe por tiempo, así que `density` sólo puede sacar notas, nunca meterlas
   entre dos. Sería un `step` por estilo, como el `cymbal` de la batería.
 - **La banda multitímbrica es sólo del SoundFont.** Con un SF2 de varios
-  programas cada rol tiene su zona y su banco (`push_arranger_band`), pero con
-  un plugin, el sampler o un SF2 de un preset la banda entera suena en un
-  timbre: esos instrumentos tienen un patch. Un plugin por rol pediría varias
-  instancias en una tab, que es lo que hoy son varias tabs.
+  programas cada rol tiene su zona, su banco y —con SPLIT OUT— su tira en el
+  MIXER (oxisynth parchado, `vendor/oxisynth`). Con un plugin, el sampler o un
+  SF2 de un preset la banda suena en un timbre y no hay canales que separar: esos
+  instrumentos tienen un patch. Las tiras de la banda tampoco se aprenden a un CC
+  ni se recorren con las flechas del MIXER todavía.
+- **Heterometría: lo que falta.** Un chart cambia de compás barra por barra y
+  un estilo trae un groove por métrica (`Style::meters`, hoy sólo `tarkus`),
+  pero: la matriz del panel dibuja las subdivisiones del compás del estilo y no
+  las de cada barra; un `.mid` que se abre con LOAD lee sólo su primer compás
+  (los cambios del archivo no llegan al chart); y los fills son de la bolsa
+  común, cortados al largo de la barra.
 - **Con el arpegiador prendido la zona se pierde.** `ArpEvent` no lleva zona, así
   que una banda que pasa por el arpegiador vuelve a ser un timbre. Nadie pidió
   arpegiar una banda entera; está dicho acá para que no se audite de nuevo.
@@ -243,18 +255,24 @@ manda fd 1 y fd 2 de los plugins al log por diseño (`choz-ui/src/log.rs`), así
 que un plugin charlatán llena el disco. La mitigación que ya existe es forzarlo
 a sandbox (`x` en el rack). Lo que falta:
 
-- **Techo al log — escrito, sin mergear.** Está resuelto en el PR #7
-  (`fix/plugin-log-runaway` → `develop`): `log::spawn_log_watchdog()` mira el
-  archivo cada 5 s y lo trunca pasados los 32 MiB, lo que es seguro debajo de
-  los fd ya duplicados porque ambos se abren `O_APPEND` (busca el fin de archivo
-  en cada escritura, no guarda offset). **`develop` todavía no lo tiene**:
-  `crates/choz-ui/src/log.rs` acá sigue sin watchdog. Lo que falta es mergearlo.
-- **Matar al que no responde.** El PR #7 no lo toca, y es la otra mitad: un
+- **Matar al que no responde.** El techo al log ya está (PR #7, en la 1.3.12:
+  el log se trunca pasados los 32 MiB); esto es la otra mitad: un
   plugin hosteado que se cuelga, que revienta
   en cadena o que escribe cientos de MB en segundos tendría que ser descargado
   —y puesto en cuarentena— en vez de arrastrar a choz entero. Las tres capas
   contra código ajeno (escaneo fuera de proceso, cuarentena, sandbox) miran el
   crash, no el ruido.
+
+### 5 · choz dentro de un DAW no sigue al host (2026-09-22)
+
+`choz-rack.clap` toma del host las notas, el MIDI y el audio de la pista, **pero
+no el transporte**: no lee `clap_event_transport`, así que el tempo, el compás y
+el play del rack son los suyos aunque REAPER diga otra cosa. Los plugins de
+`choz.clap` (efectos y artifacts) sí lo leen. Lo que falta es lo mismo que ya
+hacen ellos: tomar tempo, compás, posición y play del evento de transporte en
+cada bloque y ponerlos en `choz_ports::transport()` —con lo que el metrónomo y
+el seguimiento de compás del arreglador pasarían a ser del host dentro de un
+DAW—. El manual (2.5) lo dice como límite hasta entonces.
 
 ## Las dos piezas que quedan fuera, por decisión
 
@@ -510,11 +528,13 @@ contra una habitación.
   propósito y se alarga con un patch real delante; un `.pd` necesita `adc~`
   **y** `dac~`; el dispositivo de audio no cambia solo **nunca**; JSFX no
   existe en choz.
-- **Lo que se instala con choz**: sus 56 efectos **y los dos artifacts** —el
-  arpegiador y el secuenciador— como un solo `.clap` de 48 plugins (`~/.clap`
-  desde el instalador, `/usr/lib/clap` desde los paquetes), los wallpapers en
-  `share/choz/wallpapers` —una instalación nueva abre con el que trae— y
-  `choz-pd-host` cuando hay libpd. `--no-clap` para quien no quiera el plugin.
+- **Lo que se instala con choz**: sus 56 efectos **y los cuatro artifacts** —el
+  arpegiador, el secuenciador, el metrónomo y el arreglador— en `choz.clap`,
+  **y choz entero como instrumento** en `choz-rack.clap` (`~/.clap` desde el
+  instalador, `/usr/lib/clap` desde los paquetes: una copia vieja en `~/.clap`
+  tapa la del paquete, y los paquetes la apartan como `*.bak`), los wallpapers
+  en `share/choz/wallpapers` y `choz-pd-host` cuando hay libpd. `--no-clap` para
+  quien no quiera los plugins.
 
 - **Un patch de Pd sin símbolos de recepción en sus sliders no suena, y no es
   un fallo de choz.** Un `hsl` recién puesto en Pd vale cero y no se puede

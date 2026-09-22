@@ -39,8 +39,8 @@ priority = "optional"
 # libjack is *not* there on purpose: choz `dlopen`s it, so without it choz runs
 # on ALSA. That makes it a recommendation, which apt installs by default and the
 # user can decline.
-depends = "$auto"
-recommends = "libjack-jackd2-0 | libjack0, puredata"
+depends = "$auto, debconf (>= 0.5) | debconf-2.0"
+recommends = "pipewire-jack | libjack-jackd2-0 | libjack0, puredata"
 # Refresh the menu, MIME and icon caches. Debian ships triggers that usually do
 # this; "usually" is how an application installs and never appears in the menu.
 maintainer-scripts = "../../packaging/debian"
@@ -104,7 +104,7 @@ assets = [
 #
 #   cargo deb -p choz-ui --variant arm --target aarch64-unknown-linux-gnu
 [package.metadata.deb.variants.arm]
-depends = "libasound2t64 | libasound2, libc6"
+depends = "libasound2t64 | libasound2, libc6, debconf (>= 0.5) | debconf-2.0"
 # **The whole list again, minus one line.** A variant that declares `assets`
 # replaces the table above rather than adding to it, and the ARM build has one
 # file the x86_64 build has: `choz-pd-host` links libpd, `cross` has no libpd for
@@ -143,6 +143,15 @@ post_install_script = """
 update-desktop-database -q /usr/share/applications 2>/dev/null || true
 update-mime-database /usr/share/mime 2>/dev/null || true
 gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor 2>/dev/null || true
+# choz bundles left in users' ~/.clap by an earlier install.sh shadow the ones
+# in /usr/lib/clap: a host loads them first. Set aside as *.bak, which hosts do
+# not load — what the .deb does when its question is answered by default
+# (see packaging/debian/templates). rpm cannot ask, so it does not.
+for f in /root/.clap/choz.clap /root/.clap/choz-rack.clap /home/*/.clap/choz.clap /home/*/.clap/choz-rack.clap; do
+    [ -f "$f" ] || continue
+    mv -f "$f" "$f.bak" && echo "choz: set aside $f as $f.bak"
+done
+true
 """
 post_uninstall_script = """
 update-desktop-database -q /usr/share/applications 2>/dev/null || true
@@ -205,6 +214,8 @@ zip = { version = "0.6", default-features = false, features = ["deflate"] }
 x11rb = { version = "0.13", features = ["randr"] }
 
 # A weak dependency, and a table because that is the shape cargo-generate-rpm
-# takes: libjack is `dlopen`ed, so choz runs without it — on ALSA.
+# takes: libjack is `dlopen`ed, so choz runs without it — on ALSA. Asked for by
+# soname, which Fedora's default `pipewire-jack-audio-connection-kit-libs`
+# provides and jack2's would too.
 [package.metadata.generate-rpm.recommends]
-jack-audio-connection-kit = "*"
+"libjack.so.0()(64bit)" = "*"

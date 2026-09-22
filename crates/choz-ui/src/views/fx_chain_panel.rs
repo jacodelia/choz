@@ -228,8 +228,12 @@ pub enum RackButton {
     /// Another interpretation of the same progression, out of a list that says
     /// what each one plays like.
     ArrSeed,
-    /// Open a progression written in a text file.
+    /// Open a progression: a `.chord` chart, or a `.mid` it is heard off.
     ArrText,
+    /// Write the band's part out as a `.mid`.
+    ArrExport,
+    /// Split outputs: a tab — a mixer strip — per musician.
+    ArrSplit,
     ArrPause,
     ArrStop,
     /// Degrees or letters: the notation the chart is written in.
@@ -724,6 +728,15 @@ fn draw_sampler_graphs(
             }
         })
         .collect();
+    // **A picture, not a meter**: scaled to the sample's own peak. A library
+    // recorded at -28 dBFS (Philharmonia's flute) drew as a flat line, which
+    // hides exactly what the drawing is for — where the note starts and where
+    // it has died away. How loud it is, the meters say.
+    let top = peaks.iter().fold(0.0f32, |m, v| m.max(*v));
+    let peaks: Vec<f32> = match top > 1e-6 {
+        true => peaks.iter().map(|v| v / top).collect(),
+        false => peaks,
+    };
     let last = wave_w.saturating_sub(1) as f32;
     let column = |v: f32| -> usize { (v.clamp(0.0, 1.0) * last).round() as usize };
     let start_at = column(view.start);
@@ -1482,6 +1495,13 @@ fn draw_arranger_box(
         format!(" {} ", t("LOAD")),
         cursor(6, false),
     );
+    button(
+        &mut row,
+        f,
+        RackButton::ArrExport,
+        format!(" {} MIDI ", t("EXPORT")),
+        cursor(7, false),
+    );
     // Degrees or letters. The button says what it would give you, the way every
     // switch in this rack does: pressed, the chart is written the other way.
     button(
@@ -1496,7 +1516,7 @@ fn draw_arranger_box(
                 "C\u{2013}F\u{2013}G"
             }
         ),
-        cursor(7, s.roman),
+        cursor(8, s.roman),
     );
     y = row.finish();
     if y >= inner.y + inner.height {
@@ -1519,7 +1539,7 @@ fn draw_arranger_box(
             .map(|(_, g)| *g)
             .unwrap_or(0.0);
         let (label, prefix) = arr_fader_label(role.name(), gain);
-        let rect = row.button(f, label, cursor(8 + i, gain > 0.0));
+        let rect = row.button(f, label, cursor(9 + i, gain > 0.0));
         layout.buttons.push((RackButton::ArrPart(i), rect));
         let bar_x = rect.x + prefix;
         let bar_w = ARR_BAR_W.min((rect.x + rect.width).saturating_sub(bar_x));
@@ -1529,6 +1549,10 @@ fn draw_arranger_box(
                 .push((i, Rect::new(bar_x, rect.y, bar_w, 1)));
         }
     }
+    // Split outputs: the band as one strip, or a strip a musician. Lit when
+    // they are split, the way every switch on this rack says what it is.
+    let rect = row.button(f, format!(" {} ", t("SPLIT OUT")), cursor(13, s.split));
+    layout.buttons.push((RackButton::ArrSplit, rect));
     y = row.finish();
     if y >= inner.y + inner.height {
         return y;
@@ -1556,14 +1580,14 @@ fn draw_arranger_box(
             false => format!(" {} {num}/{den} ", t("METER")),
         }
     };
-    let rect = row.button(f, meter, cursor(12, false));
+    let rect = row.button(f, meter, cursor(14, false));
     layout.buttons.push((RackButton::ArrMeter, rect));
     for (i, (name, value)) in [("SWING", s.swing), ("RAND", s.random), ("PROB", s.prob)]
         .into_iter()
         .enumerate()
     {
         let (label, prefix) = seq_slider_label(name, value);
-        let rect = row.button(f, label, cursor(13 + i, value > 0.0));
+        let rect = row.button(f, label, cursor(15 + i, value > 0.0));
         layout.buttons.push((RackButton::ArrKnob(i), rect));
         let bar_x = rect.x + prefix;
         let bar_w = SEQ_BAR_W.min((rect.x + rect.width).saturating_sub(bar_x));
@@ -1673,7 +1697,7 @@ fn draw_arranger_box(
 /// Which of the arranger's controls the progression line is — the last one, as
 /// it is the last thing drawn. Kept here beside the drawing that has to agree
 /// with it; `crate::ARR_CONTROLS` is the list itself.
-pub const ARR_PROGRESSION: usize = 16;
+pub const ARR_PROGRESSION: usize = 18;
 
 /// The chart as bars, by the rule the parser reads it with: a bar line or a
 /// newline ends a bar, and the lines that name the key and the style are not
@@ -1681,14 +1705,9 @@ pub const ARR_PROGRESSION: usize = 16;
 pub fn chart_bars(text: &str) -> Vec<String> {
     text.lines()
         .map(|l| l.split('#').next().unwrap_or("").trim())
-        .filter(|l| {
-            !l.split_once('=').is_some_and(|(k, _)| {
-                let k = k.trim();
-                k.eq_ignore_ascii_case("key")
-                    || k.eq_ignore_ascii_case("style")
-                    || k.eq_ignore_ascii_case("form")
-            })
-        })
+        // Every header — `key`, `style`, `form`, `meter`, `groups` — and no
+        // bar: a chord is never written with an `=` in it.
+        .filter(|l| !l.contains('='))
         .filter(|l| !l.starts_with('['))
         .flat_map(|l| l.split('|'))
         .map(str::trim)

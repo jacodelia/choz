@@ -3,7 +3,7 @@
 // Every number is measured off the rhythm of the same name — see the
 // script for what each measurement is.
 
-use super::style::{Bass, Comp, Drums, Style};
+use super::style::{Bass, Comp, Drums, MeterGroove, Style};
 
 pub const ALL: &[Style] = &[
     Style {
@@ -29,6 +29,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.75, 2.0, 2.5, 3.25],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.0,
@@ -47,6 +49,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[1, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "16bt_bld",
@@ -71,6 +74,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.75, 2.0, 2.5],
             snare: &[0.25, 1.0, 1.75, 2.75, 3.0, 3.75],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.0,
@@ -87,6 +92,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "16btshfl",
@@ -111,6 +117,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 0.8333, 1.5, 2.5, 3.3333],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -127,6 +135,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "50_srock",
@@ -151,6 +160,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[1.0, 2.6667, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.6667,
             ride: false,
             ghost: 0.0,
@@ -169,6 +180,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "50spnrck",
@@ -193,6 +205,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: true,
             ghost: 0.0,
@@ -209,6 +223,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[27, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "60_s_8bt",
@@ -233,6 +248,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.0, 2.5, 3.5],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.062,
@@ -249,6 +266,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "60_s_pop",
@@ -273,6 +291,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0, 2.5, 3.5],
             snare: &[1.0, 1.5, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -289,6 +309,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[34, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "60_srock",
@@ -313,6 +334,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0, 3.5],
             snare: &[0.0, 1.0, 2.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -329,6 +352,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[27, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "60_srock_2",
@@ -353,6 +377,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 3.0, 3.5],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -369,6 +395,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "60_sshfl",
@@ -393,6 +420,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 0.5, 1.0, 1.8333, 2.3333, 2.8333, 3.0, 3.5],
             snare: &[0.5, 1.5, 2.5, 3.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -409,6 +438,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[1, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "60_ssoul",
@@ -433,6 +463,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0, 2.5, 3.5],
             snare: &[0.0, 1.0, 2.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.031,
@@ -449,6 +481,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[34, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "6_8_bld",
@@ -473,6 +506,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[1.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.75,
@@ -489,6 +524,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "6_8_enka",
@@ -513,6 +549,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.6667, 2.0, 3.6667],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.3333,
             ride: false,
             ghost: 0.0,
@@ -531,6 +569,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[1, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "6_8_pop",
@@ -555,6 +594,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0, 2.5],
             snare: &[1.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -571,6 +612,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "6_8bld_1",
@@ -595,6 +637,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.5],
             snare: &[1.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.25,
             ride: false,
             ghost: 0.0,
@@ -611,6 +655,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "6_8bld_2",
@@ -635,6 +680,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.6667, 2.0],
             snare: &[3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.3333,
             ride: false,
             ghost: 0.0,
@@ -651,6 +698,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "6_8bld_3",
@@ -675,6 +723,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[1.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.75,
@@ -691,6 +741,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "6_8blues",
@@ -715,6 +766,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 1.75, 2.5],
             snare: &[1.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -731,6 +784,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "6_8rkbld",
@@ -755,6 +809,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.5],
             snare: &[1.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -771,6 +827,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "90_s_bld",
@@ -795,6 +852,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.0],
             snare: &[3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -811,6 +870,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[5, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "a_gt_pop",
@@ -835,6 +895,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.75, 2.25, 2.5, 3.5],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.0,
@@ -851,6 +913,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "adani",
@@ -875,6 +938,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.5, 3.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -891,6 +956,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[26, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "amrcnrck",
@@ -915,6 +981,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -931,6 +999,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "argcmbia",
@@ -955,6 +1024,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[0.0, 1.0, 2.0, 3.0, 3.25],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 1.0,
@@ -971,6 +1042,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "arpegio1",
@@ -995,6 +1067,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -1011,6 +1085,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "arpegio2",
@@ -1035,6 +1110,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -1051,6 +1128,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "arpegio3",
@@ -1075,6 +1153,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -1091,6 +1171,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "bachata",
@@ -1115,6 +1196,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -1131,6 +1214,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[24, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "baladi",
@@ -1155,6 +1239,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 0.5, 2.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -1171,6 +1257,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[19, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "banda",
@@ -1195,6 +1282,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[0.5, 1.5, 2.5, 3.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.5,
@@ -1211,6 +1300,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[57, 33, 32, 0],
         piano_gm: &[61, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "beguine",
@@ -1235,6 +1325,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -1251,6 +1343,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "beijing",
@@ -1275,6 +1368,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: true,
             ghost: 0.0,
@@ -1291,6 +1386,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[15, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "bhajan",
@@ -1315,6 +1411,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -1333,6 +1431,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[1, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "bhangra",
@@ -1357,6 +1456,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.0, 2.3333, 2.8333, 3.5],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: true,
             ghost: 0.0,
@@ -1373,6 +1474,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[34, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "bluegras",
@@ -1397,6 +1499,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[0.5, 1.5, 2.5, 3.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -1416,6 +1520,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "bluesbld",
@@ -1440,6 +1545,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 5.0, 5.5],
             snare: &[3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.0,
@@ -1456,6 +1563,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "bolero",
@@ -1480,6 +1588,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 2.0,
             ride: false,
             ghost: 1.0,
@@ -1496,6 +1606,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[24, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "boogie",
@@ -1520,6 +1631,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[0.0, 0.6667, 1.0, 1.6667, 2.0, 2.6667, 3.0, 3.6667],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.062,
@@ -1536,6 +1649,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "bosanova",
@@ -1560,6 +1674,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.0],
             snare: &[0.0, 1.0, 1.5, 2.5, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 2.0,
             ride: false,
             ghost: 0.5,
@@ -1576,6 +1692,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "brushbld",
@@ -1600,6 +1717,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 1.0,
@@ -1616,6 +1735,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "calypso",
@@ -1640,6 +1760,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[0.75, 1.5, 2.75, 3.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -1659,6 +1781,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[114, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "caucasia",
@@ -1683,6 +1806,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[0.5, 1.5, 2.5, 3.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -1703,6 +1828,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[23, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "cha_cha",
@@ -1727,6 +1853,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -1743,6 +1871,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "chinspop",
@@ -1767,6 +1896,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 0.8333, 2.3333, 2.8333],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.3333,
             ride: false,
             ghost: 0.375,
@@ -1783,6 +1914,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "cnty_8bt",
@@ -1807,6 +1939,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.062,
@@ -1823,6 +1957,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "cnty_bld",
@@ -1847,6 +1982,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0, 2.5],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -1865,6 +2002,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "cnty_pop",
@@ -1889,6 +2027,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -1905,6 +2045,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "cntyshfl",
@@ -1929,6 +2070,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.625, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.625,
             ride: false,
             ghost: 0.0,
@@ -1947,6 +2090,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "cntywltz",
@@ -1971,6 +2115,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.625],
             snare: &[1.0, 2.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.0,
@@ -1987,6 +2133,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "cumbia_1",
@@ -2011,6 +2158,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.0,
@@ -2027,6 +2176,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "cumbia_2",
@@ -2051,6 +2201,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[0.0, 1.0, 2.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.3333,
             ride: false,
             ghost: 1.0,
@@ -2067,6 +2219,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[16, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "dadra",
@@ -2091,6 +2244,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0, 2.5, 3.0, 5.0, 5.5],
             snare: &[1.5, 4.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.0,
@@ -2107,6 +2262,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "daizu",
@@ -2131,6 +2287,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -2150,6 +2308,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[107, 33, 32, 0],
         piano_gm: &[11, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "dandiya",
@@ -2174,6 +2333,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 0.0833, 1.375, 1.4167, 3.0, 3.0833, 3.4167, 3.5],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.0,
@@ -2192,6 +2353,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[24, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "dangdut",
@@ -2216,6 +2378,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 3.0],
             snare: &[2.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.0,
@@ -2232,6 +2396,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[27, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "discopop",
@@ -2256,6 +2421,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -2272,6 +2439,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[38, 33, 32, 0],
         piano_gm: &[28, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "dixie",
@@ -2296,6 +2464,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[0.0, 1.0, 1.6667, 2.0, 2.6667, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.6667,
             ride: false,
             ghost: 0.125,
@@ -2315,6 +2485,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[3, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "dongbeiy",
@@ -2339,6 +2510,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -2355,6 +2528,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[107, 33, 32, 0],
         piano_gm: &[110, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "drngense",
@@ -2379,6 +2553,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.0,
@@ -2395,6 +2571,50 @@ pub const ALL: &[Style] = &[
         bass_gm: &[57, 33, 32, 0],
         piano_gm: &[46, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
+    },
+    Style {
+        name: "drumnbass",
+        label: "Drum & Bass",
+        beats_per_bar: 4.0,
+        meter: (4, 4),
+        swing: 0.0,
+        swing_div: 0.5,
+        vel: 98,
+        human: 0.6,
+        strum: 0.03,
+        bass: Bass {
+            walking: false,
+            density: 0.625,
+            approach: 0.0,
+            passing: 0.0,
+            pickup: 0.0,
+            octave_jump: 0.333,
+            low: 34,
+            high: 50,
+        },
+        drums: Drums {
+            kick: &[0.0, 2.5],
+            snare: &[1.0, 3.0],
+            kick_b: &[0.0, 1.75, 2.5],
+            snare_b: &[1.0, 3.0, 3.75],
+            cymbal: 0.25,
+            ride: false,
+            ghost: 0.312,
+            fill_every: 4,
+        },
+        comp: Comp {
+            hits: &[0.0],
+            density: 1.0,
+            hold: 3.75,
+            low: 54,
+            high: 78,
+        },
+        guitar: None,
+        bass_gm: &[38, 33, 32, 0],
+        piano_gm: &[4, 0],
+        guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "dscosoul",
@@ -2419,6 +2639,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[1.0, 1.75, 1.8333, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -2439,6 +2661,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[1, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "e_hiphop",
@@ -2463,6 +2686,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.25,
@@ -2479,6 +2704,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[39, 33, 32, 0],
         piano_gm: &[27, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "e_hiphop_2",
@@ -2503,6 +2729,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.5,
@@ -2519,6 +2747,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[39, 33, 32, 0],
         piano_gm: &[27, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "easy_bld",
@@ -2543,6 +2772,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.0,
@@ -2561,6 +2792,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "elec_bld",
@@ -2585,6 +2817,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 3.75],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -2601,6 +2835,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "enka",
@@ -2625,6 +2860,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -2641,6 +2878,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "ep_bld_1",
@@ -2665,6 +2903,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.75, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.0,
@@ -2681,6 +2921,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "ep_bld_2",
@@ -2705,6 +2946,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.75, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.0,
@@ -2721,6 +2964,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[5, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "euro_pop",
@@ -2745,6 +2989,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.125,
@@ -2761,6 +3007,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[39, 33, 32, 0],
         piano_gm: &[2, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "f_gospel",
@@ -2785,6 +3032,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 0.75, 1.0, 2.0, 2.25, 2.75, 3.0, 3.25],
             snare: &[0.5, 1.5, 2.5, 3.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.062,
@@ -2801,6 +3050,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "fastsoul",
@@ -2825,6 +3075,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[1.0, 3.0, 3.625],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.0,
@@ -2841,6 +3093,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[1, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "fingcnty",
@@ -2865,6 +3118,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -2881,6 +3136,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "folklore",
@@ -2905,6 +3161,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -2921,6 +3179,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[24, 33, 32, 0],
         piano_gm: &[24, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "forro",
@@ -2945,6 +3204,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[0.0, 0.75, 1.5, 2.0, 2.75, 3.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.188,
@@ -2961,6 +3222,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "fox_trot",
@@ -2985,6 +3247,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0],
             snare: &[0.0, 1.0, 2.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.6667,
             ride: false,
             ghost: 0.0,
@@ -3001,6 +3265,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "fr_waltz",
@@ -3025,6 +3290,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[0.0, 1.0, 2.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.708,
@@ -3041,6 +3308,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "fstbband",
@@ -3065,6 +3333,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.6667,
             ride: false,
             ghost: 0.0,
@@ -3081,6 +3351,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "funk16bt",
@@ -3105,6 +3376,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.0, 3.25, 3.75],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -3123,6 +3396,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "funk_8bt",
@@ -3147,6 +3421,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.125,
@@ -3163,6 +3439,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[27, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "funkshfl",
@@ -3187,6 +3464,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.3333,
             ride: false,
             ghost: 0.0,
@@ -3205,6 +3484,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[7, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "garba",
@@ -3229,6 +3509,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.6667, 3.0, 3.3333],
             snare: &[0.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: true,
             ghost: 0.0,
@@ -3245,6 +3527,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[89, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "grmnmrch",
@@ -3271,6 +3554,8 @@ pub const ALL: &[Style] = &[
             snare: &[
                 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75,
             ],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: true,
             ghost: 0.094,
@@ -3287,6 +3572,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[68, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "gtr_8bt",
@@ -3311,6 +3597,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.25,
@@ -3327,6 +3615,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "guangdon",
@@ -3351,6 +3640,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -3367,6 +3658,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[107, 33, 32, 0],
         piano_gm: &[15, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "hawaiian",
@@ -3391,6 +3683,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.6667, 2.0],
             snare: &[0.0, 1.0, 2.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 2.0,
             ride: false,
             ghost: 0.438,
@@ -3407,6 +3701,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[24, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "hip_hop1",
@@ -3431,6 +3726,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 0.75, 1.5, 2.5, 3.5, 3.75],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.125,
@@ -3447,6 +3744,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[39, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "hip_hop1_2",
@@ -3471,6 +3769,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 0.75, 1.5, 2.5, 3.5, 3.75],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.125,
@@ -3487,6 +3787,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[39, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "hip_hop2",
@@ -3511,6 +3812,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.25, 2.5, 2.75, 3.25],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.0,
@@ -3527,6 +3830,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[26, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "hip_hop2_2",
@@ -3551,6 +3855,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.25, 2.5, 2.75, 3.25],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.0,
@@ -3567,6 +3873,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[26, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "huangmei",
@@ -3591,6 +3898,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.0, 3.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -3607,6 +3916,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[107, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "indipop1",
@@ -3631,6 +3941,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[0.75, 1.5, 2.5, 2.75, 3.5, 3.75],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.0,
@@ -3649,6 +3961,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[39, 33, 32, 0],
         piano_gm: &[80, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "indipop2",
@@ -3673,6 +3986,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.6667, 3.3333],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5833,
             ride: false,
             ghost: 0.0,
@@ -3692,6 +4007,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[39, 33, 32, 0],
         piano_gm: &[24, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "jhaptaal",
@@ -3716,6 +4032,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -3735,6 +4053,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[104, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "jiangnan",
@@ -3759,6 +4078,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0, 3.5],
             snare: &[3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.5,
@@ -3775,6 +4096,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[15, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "jingju",
@@ -3799,6 +4121,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -3815,6 +4139,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[107, 33, 32, 0],
         piano_gm: &[15, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "jz_waltz",
@@ -3839,6 +4164,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.6667],
             snare: &[0.0, 0.6667, 1.625, 1.6667, 2.0, 2.6667],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.083,
@@ -3855,6 +4182,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "jzcombo1",
@@ -3879,6 +4207,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.6667,
             ride: true,
             ghost: 0.875,
@@ -3895,6 +4225,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "jzcombo2",
@@ -3919,6 +4250,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.6667, 3.625],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 2.0,
             ride: false,
             ghost: 0.281,
@@ -3935,6 +4268,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[1, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "jzcombo3",
@@ -3959,6 +4293,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 2.0,
             ride: false,
             ghost: 0.75,
@@ -3975,6 +4311,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "keharwa",
@@ -3999,6 +4336,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.25, 1.5, 2.0, 2.25, 2.75, 3.25, 3.5],
             snare: &[0.75, 2.75],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -4015,6 +4354,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[34, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "khaliji",
@@ -4039,6 +4379,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.25, 2.25],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.0,
@@ -4055,6 +4397,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "kroncong",
@@ -4079,6 +4422,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5],
             snare: &[2.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 2.0,
             ride: true,
             ghost: 0.0,
@@ -4095,6 +4440,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "kwaito",
@@ -4119,6 +4465,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[0.75, 1.5, 2.75, 3.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.75,
             ride: false,
             ghost: 0.0,
@@ -4137,6 +4485,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[39, 33, 32, 0],
         piano_gm: &[16, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "kwaito_2",
@@ -4161,6 +4510,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[0.75, 1.5, 2.75, 3.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.75,
             ride: false,
             ghost: 0.0,
@@ -4179,6 +4530,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[39, 33, 32, 0],
         piano_gm: &[16, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "ltinfusn",
@@ -4203,6 +4555,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 0.75, 1.0, 2.0, 2.75, 3.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: true,
             ghost: 0.75,
@@ -4219,6 +4573,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "ltinrock",
@@ -4243,6 +4598,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -4259,6 +4616,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "malfouf",
@@ -4283,6 +4641,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -4299,6 +4659,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "mambo",
@@ -4323,6 +4684,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.75, 1.5, 2.75, 3.5],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -4339,6 +4702,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "march",
@@ -4363,6 +4727,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0, 3.6667],
             snare: &[0.0, 0.6667, 1.0, 1.6667, 2.0, 2.6667, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 1.0,
@@ -4379,6 +4745,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[58, 33, 32, 0],
         piano_gm: &[72, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "mdrn_bld",
@@ -4403,6 +4770,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.75, 2.0, 2.5, 3.25],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.0,
@@ -4419,6 +4788,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "mdrn_r_b",
@@ -4443,6 +4813,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.8333, 1.875, 2.0, 2.3333, 2.5],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -4459,6 +4831,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[38, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "mdrncnty",
@@ -4483,6 +4856,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0, 2.5, 3.3333, 3.5, 3.8333],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -4499,6 +4874,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "melow8bt",
@@ -4523,6 +4899,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.0],
             snare: &[3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -4539,6 +4917,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "menggu",
@@ -4563,6 +4942,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -4579,6 +4960,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[107, 33, 32, 0],
         piano_gm: &[15, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "merengue",
@@ -4603,6 +4985,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.0,
@@ -4619,6 +5003,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[1, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "miaozu",
@@ -4643,6 +5028,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0],
             snare: &[0.0, 1.0, 2.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -4661,6 +5048,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[107, 33, 32, 0],
         piano_gm: &[20, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "midbband",
@@ -4685,6 +5073,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0],
             snare: &[1.0, 2.625, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: true,
             ghost: 0.312,
@@ -4701,6 +5091,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "mus",
@@ -4725,6 +5116,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0],
             snare: &[1.0, 1.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.0,
@@ -4741,6 +5134,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[46, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "n_o_r_r",
@@ -4765,6 +5159,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 1.5833],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 2.0,
             ride: false,
             ghost: 0.844,
@@ -4781,6 +5177,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[1, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "norteno",
@@ -4805,6 +5202,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[0.5, 1.5, 2.5, 3.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.0,
@@ -4821,6 +5220,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[21, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "ochswing",
@@ -4845,6 +5245,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 2.0,
             ride: false,
             ghost: 0.594,
@@ -4861,6 +5263,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "old_rock",
@@ -4885,6 +5288,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -4901,6 +5306,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "old_soul",
@@ -4925,6 +5331,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.5, 3.5],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -4941,6 +5349,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "oldie8bt",
@@ -4965,6 +5374,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0, 3.6667],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.6667,
             ride: false,
             ghost: 0.031,
@@ -4984,6 +5395,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "orgnrock",
@@ -5008,6 +5420,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.75, 2.0, 2.5, 3.25, 3.75],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.094,
@@ -5024,6 +5438,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "pagode",
@@ -5048,6 +5463,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[0.0, 0.75, 1.0, 1.75, 2.0, 2.75, 3.0, 3.75],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 1.0,
@@ -5064,6 +5481,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "pasillo",
@@ -5088,6 +5506,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -5104,6 +5524,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[24, 33, 32, 0],
         piano_gm: &[24, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "pasodble",
@@ -5128,6 +5549,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[0.5, 1.5, 2.5, 2.75, 3.0, 3.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: true,
             ghost: 0.0,
@@ -5144,6 +5567,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[1, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "pianor_r",
@@ -5168,6 +5592,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -5184,6 +5610,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "pno8beat",
@@ -5208,6 +5635,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.75, 2.0, 2.5],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.0,
@@ -5224,6 +5653,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "pnobld_1",
@@ -5248,6 +5678,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.25,
@@ -5264,6 +5696,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "pnobld_2",
@@ -5288,6 +5721,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -5304,6 +5739,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "pnomrch1",
@@ -5328,6 +5764,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -5344,6 +5782,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "pnomrch2",
@@ -5368,6 +5807,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -5384,6 +5825,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "pnowaltz",
@@ -5408,6 +5850,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.5],
             snare: &[1.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.0,
@@ -5424,6 +5868,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "pnrckbld",
@@ -5448,6 +5893,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: true,
             ghost: 0.0,
@@ -5464,6 +5911,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "polka",
@@ -5488,6 +5936,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[0.5, 1.5, 2.5, 3.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.562,
@@ -5504,6 +5954,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "polwaltz",
@@ -5528,6 +5979,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[1.0, 2.0, 2.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.042,
@@ -5544,6 +5997,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "pop",
@@ -5568,6 +6022,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -5584,6 +6040,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "pop_bld",
@@ -5608,6 +6065,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.75, 2.0, 2.5, 3.5],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -5624,6 +6083,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[1, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "pop_rock",
@@ -5648,6 +6108,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.25, 1.3333, 1.75, 1.8333, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.031,
@@ -5666,6 +6128,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "pop_shfl",
@@ -5690,6 +6153,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.6667, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.3333,
             ride: false,
             ghost: 0.0,
@@ -5706,6 +6171,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "popregae",
@@ -5730,6 +6196,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 2.8333, 3.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.3333,
             ride: false,
             ghost: 0.0,
@@ -5746,6 +6214,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[27, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "punta",
@@ -5770,6 +6239,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -5786,6 +6257,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[24, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "qinqiang",
@@ -5810,6 +6282,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -5826,6 +6300,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[15, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "quickstp",
@@ -5850,6 +6325,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.6667,
             ride: false,
             ghost: 0.0,
@@ -5866,6 +6343,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "r_b",
@@ -5890,6 +6368,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.75, 2.5],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -5906,6 +6386,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "r_b_bld",
@@ -5930,6 +6411,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.0,
@@ -5946,6 +6429,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[38, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "r_r",
@@ -5970,6 +6454,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[0.0, 1.0, 2.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 2.0,
             ride: false,
             ghost: 0.312,
@@ -5986,6 +6472,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "ragtime",
@@ -6010,6 +6497,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -6026,6 +6515,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "rckblues",
@@ -6050,6 +6540,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -6069,6 +6561,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "regeton1",
@@ -6093,6 +6586,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[0.75, 1.5, 2.75, 3.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -6111,6 +6606,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[87, 33, 32, 0],
         piano_gm: &[80, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "regeton2",
@@ -6135,6 +6631,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 0.75, 1.0, 1.5, 2.0, 2.75, 3.0, 3.5],
             snare: &[0.75, 1.5, 2.75, 3.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.25,
@@ -6151,6 +6649,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "reggae",
@@ -6175,6 +6674,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[1.0, 2.8333, 3.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -6194,6 +6695,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[18, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "rhumba",
@@ -6218,6 +6720,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.0, 3.5],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: true,
             ghost: 0.375,
@@ -6237,6 +6741,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "rock",
@@ -6261,6 +6766,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.0,
@@ -6277,6 +6784,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[27, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "rock_bld",
@@ -6301,6 +6809,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 0.5, 2.5],
             snare: &[1.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.0,
@@ -6319,6 +6829,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "rockwltz",
@@ -6343,6 +6854,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 5.6667],
             snare: &[3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.0,
@@ -6359,6 +6872,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[27, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "ruchnsn1",
@@ -6383,6 +6897,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.312,
@@ -6399,6 +6915,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "ruchnsn2",
@@ -6423,6 +6940,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.281,
@@ -6439,6 +6958,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[27, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "rupak",
@@ -6463,6 +6983,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 0.75, 3.5, 4.0],
             snare: &[2.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.0,
@@ -6481,6 +7003,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[24, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "s_gospel",
@@ -6505,6 +7028,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.0,
@@ -6521,6 +7046,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "salsa_1",
@@ -6545,6 +7071,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -6561,6 +7089,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[1, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "salsa_2",
@@ -6585,6 +7114,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -6603,6 +7134,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[1, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "samba_1",
@@ -6627,6 +7159,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 0.75, 1.0, 2.0, 2.75, 3.0],
             snare: &[0.5, 1.25, 2.0, 2.75, 3.5, 3.75],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: true,
             ghost: 0.0,
@@ -6643,6 +7177,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "samba_2",
@@ -6667,6 +7202,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 0.75, 1.0, 2.0, 2.75, 3.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.0,
@@ -6685,6 +7222,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "schlager",
@@ -6709,6 +7247,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -6725,6 +7265,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[5, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "scrswing",
@@ -6749,6 +7290,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 2.0,
             ride: false,
             ghost: 0.5,
@@ -6765,6 +7308,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "serenade",
@@ -6789,6 +7333,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -6805,6 +7351,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[6, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "shfblues",
@@ -6829,6 +7376,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.781,
@@ -6845,6 +7394,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[27, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "shflrock",
@@ -6869,6 +7419,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[0.0, 1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.6667,
             ride: false,
             ghost: 0.562,
@@ -6885,6 +7437,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[18, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "shouka_1",
@@ -6909,6 +7462,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 3.5],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.0,
@@ -6925,6 +7480,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[1, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "shouka_2",
@@ -6949,6 +7505,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[1.0, 1.5, 2.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -6965,6 +7523,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[1, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "sirtaki",
@@ -6989,6 +7548,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[0.5, 1.5, 2.5, 3.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: true,
             ghost: 0.0,
@@ -7005,6 +7566,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[24, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "ska",
@@ -7029,6 +7591,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 1.75, 2.0, 2.25, 2.5],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.0,
@@ -7045,6 +7609,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[2, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "slow_bld",
@@ -7069,6 +7634,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -7085,6 +7652,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "slowbld1",
@@ -7109,6 +7677,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -7125,6 +7695,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "slowbld2",
@@ -7149,6 +7720,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 3.75],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -7165,6 +7738,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "slowrock",
@@ -7189,6 +7763,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[0.0, 1.0, 2.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 2.0,
             ride: false,
             ghost: 1.0,
@@ -7205,6 +7781,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[27, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "slowsoul",
@@ -7229,6 +7806,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.3333, 2.5, 2.8333],
             snare: &[1.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -7245,6 +7824,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "slwbband",
@@ -7269,6 +7849,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 2.0,
             ride: false,
             ghost: 0.25,
@@ -7285,6 +7867,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "slwblues",
@@ -7309,6 +7892,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.6667, 2.0, 3.6667],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.3333,
             ride: false,
             ghost: 0.0,
@@ -7328,6 +7913,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[46, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "slwbossa",
@@ -7352,6 +7938,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.0],
             snare: &[0.5, 1.5, 2.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 2.0,
             ride: false,
             ghost: 1.0,
@@ -7368,6 +7956,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "slwswing",
@@ -7392,6 +7981,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 2.0,
             ride: false,
             ghost: 1.0,
@@ -7408,6 +7999,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "slwwaltz",
@@ -7432,6 +8024,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[0.0, 1.0, 2.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.0,
@@ -7448,6 +8042,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "strd_pno",
@@ -7472,6 +8067,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -7488,6 +8085,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "strqrtet",
@@ -7512,6 +8110,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -7528,6 +8128,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[43, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "strt_8bt",
@@ -7552,6 +8153,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -7568,6 +8171,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[35, 33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "strtrock",
@@ -7592,6 +8196,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0, 3.5],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -7608,6 +8214,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[27, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "swing",
@@ -7632,6 +8239,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[2.6667],
             snare: &[3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.6667,
             ride: true,
             ghost: 0.0,
@@ -7648,6 +8257,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "synthpop",
@@ -7672,6 +8282,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -7688,6 +8300,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[39, 33, 32, 0],
         piano_gm: &[95, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "tango",
@@ -7712,6 +8325,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[0.0, 1.0, 2.0, 3.0, 3.125, 3.25, 3.875],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.5,
@@ -7728,6 +8343,108 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
+    },
+    Style {
+        name: "tarkus",
+        label: "Tarkus (heterometric)",
+        beats_per_bar: 5.0,
+        meter: (5, 4),
+        swing: 0.0,
+        swing_div: 0.5,
+        vel: 96,
+        human: 0.6,
+        strum: 0.03,
+        bass: Bass {
+            walking: false,
+            density: 1.0,
+            approach: 0.0,
+            passing: 0.0,
+            pickup: 1.0,
+            octave_jump: 0.0,
+            low: 28,
+            high: 44,
+        },
+        drums: Drums {
+            kick: &[0.0],
+            snare: &[2.0, 3.5],
+            kick_b: &[],
+            snare_b: &[],
+            cymbal: 0.5,
+            ride: true,
+            ghost: 0.0,
+            fill_every: 0,
+        },
+        comp: Comp {
+            hits: &[0.0, 1.0, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5],
+            density: 1.0,
+            hold: 0.375,
+            low: 48,
+            high: 79,
+        },
+        guitar: None,
+        bass_gm: &[33, 32, 0],
+        piano_gm: &[16, 4, 0],
+        guitar_gm: &[27, 24, 0],
+        meters: &[
+            MeterGroove {
+                meter: (2, 4),
+                kick: &[0.0],
+                snare: &[1.0, 1.75],
+                hits: &[0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75],
+            },
+            MeterGroove {
+                meter: (3, 4),
+                kick: &[0.0],
+                snare: &[0.5, 1.5, 2.5],
+                hits: &[0.0, 0.5, 1.5, 2.5],
+            },
+            MeterGroove {
+                meter: (4, 4),
+                kick: &[0.0, 1.0, 2.0, 3.0, 3.5],
+                snare: &[3.5],
+                hits: &[0.0, 1.5, 2.5, 3.0, 3.5],
+            },
+            MeterGroove {
+                meter: (6, 4),
+                kick: &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+                snare: &[1.0, 2.0, 3.0, 4.0, 5.0],
+                hits: &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+            },
+            MeterGroove {
+                meter: (5, 8),
+                kick: &[0.0],
+                snare: &[1.0, 1.75],
+                hits: &[0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25],
+            },
+            MeterGroove {
+                meter: (6, 8),
+                kick: &[0.0],
+                snare: &[],
+                hits: &[0.0, 0.5, 1.0, 1.5, 2.0, 2.5],
+            },
+            MeterGroove {
+                meter: (7, 8),
+                kick: &[0.0],
+                snare: &[],
+                hits: &[],
+            },
+            MeterGroove {
+                meter: (9, 8),
+                kick: &[0.0, 1.5, 3.0],
+                snare: &[0.0, 1.5, 3.0],
+                hits: &[0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
+            },
+            MeterGroove {
+                meter: (12, 8),
+                kick: &[0.0],
+                snare: &[],
+                hits: &[
+                    0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25,
+                    3.5, 3.75, 4.0, 4.25, 4.5, 4.75, 5.0, 5.25, 5.5, 5.75,
+                ],
+            },
+        ],
     },
     Style {
         name: "teccmbia",
@@ -7752,6 +8469,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -7768,6 +8487,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "tech_pop",
@@ -7792,6 +8512,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -7808,6 +8530,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[38, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "teentaal",
@@ -7832,6 +8555,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.5, 2.0, 3.5],
             snare: &[0.5, 1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: true,
             ghost: 0.0,
@@ -7848,6 +8573,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[34, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "tex_mex",
@@ -7872,6 +8598,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[0.5, 1.5, 2.5, 3.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.0,
@@ -7888,6 +8616,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[2, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "trance",
@@ -7912,6 +8641,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 2.0, 3.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.0,
@@ -7931,6 +8662,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[38, 33, 32, 0],
         piano_gm: &[80, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "uk_beat",
@@ -7955,6 +8687,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.5,
             ride: false,
             ghost: 0.0,
@@ -7971,6 +8705,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "unplgbld",
@@ -7995,6 +8730,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -8011,6 +8748,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[25, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "valenato",
@@ -8035,6 +8773,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[1.0, 1.5, 3.0, 3.5],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.312,
@@ -8051,6 +8791,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "vienwltz",
@@ -8075,6 +8816,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[0.9167, 1.0833, 2.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.458,
@@ -8091,6 +8834,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[48, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "waltz_1",
@@ -8115,6 +8859,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[1.0, 2.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.167,
@@ -8131,6 +8877,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "waltz_2",
@@ -8155,6 +8902,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -8171,6 +8920,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "waltz_3",
@@ -8195,6 +8945,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -8211,6 +8963,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "waltz_4",
@@ -8235,6 +8988,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -8251,6 +9006,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "xinjiang",
@@ -8275,6 +9031,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 0.5, 2.0, 2.5],
             snare: &[1.0, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.25,
             ride: false,
             ghost: 0.0,
@@ -8294,6 +9052,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[34, 33, 32, 0],
         piano_gm: &[15, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "xmassong",
@@ -8318,6 +9077,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 2.0],
             snare: &[1.0, 2.625, 3.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 2.0,
             ride: false,
             ghost: 0.312,
@@ -8334,6 +9095,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "xmaswltz",
@@ -8358,6 +9120,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[1.0, 2.0, 2.625],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 1.0,
             ride: false,
             ghost: 0.167,
@@ -8374,6 +9138,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[33, 32, 0],
         piano_gm: &[46, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "yaozu",
@@ -8398,6 +9163,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -8414,6 +9181,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[107, 33, 32, 0],
         piano_gm: &[40, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "yuju",
@@ -8438,6 +9206,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0],
             snare: &[],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -8454,6 +9224,7 @@ pub const ALL: &[Style] = &[
         bass_gm: &[107, 33, 32, 0],
         piano_gm: &[4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
     Style {
         name: "zangzu",
@@ -8478,6 +9249,8 @@ pub const ALL: &[Style] = &[
         drums: Drums {
             kick: &[0.0, 1.0, 3.5],
             snare: &[2.0],
+            kick_b: &[],
+            snare_b: &[],
             cymbal: 0.0,
             ride: false,
             ghost: 0.0,
@@ -8494,5 +9267,6 @@ pub const ALL: &[Style] = &[
         bass_gm: &[46, 33, 32, 0],
         piano_gm: &[107, 4, 0],
         guitar_gm: &[27, 24, 0],
+        meters: &[],
     },
 ];

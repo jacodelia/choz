@@ -12,7 +12,7 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **1045 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo), 573 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **1074 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo), 591 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio, y `cargo fmt --all --check` también.
 - **56 efectos propios**, publicados también como un `.clap` con los cuatro artifacts (arpegiador, secuenciador, metrónomo y arreglador).
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
@@ -31,6 +31,367 @@ lleva lo que falta —nada de lo ya hecho— y
   `choz-engine::test_locks` tiene un candado por global; en `choz-ui` el par es
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
+
+## [1.3.14] — 2026-09-22
+
+### 2026-09-22 — la auditoría de la release: PLAY entre dos relojes, y el candado de los tests
+
+- **PLAY esperaba en el reloj equivocado.** El downbeat de entrada se fijaba al
+  apretar ▶ (ver abajo) sobre el reloj libre; si después arrancaba el transporte
+  —el PLAY del rack—, la posición saltaba a otro número y la banda podía tardar
+  compases en entrar. Ahora el objetivo recuerda en qué reloj se calculó y se
+  recalcula si cambió, o si la posición volvió más de un compás atrás. Test:
+  `play_follows_the_clock_it_ends_up_on`. Salió de un test que fallaba una de
+  cada tantas corridas completas (`a_chorus_plays_what_was_baked`).
+- **El candado del transporte de los tests restablece todo lo global del
+  reloj**: además de play, tempo, compás y posición, ahora el origen del compás,
+  el reloj libre y el metrónomo. Un test que dejaba el click encendido o el reloj
+  libre a mitad de un tiempo hacía fallar en cascada una docena de tests de
+  render una corrida de cada tres —"an empty rack is silent", "the first beat
+  sounds: 0"—; verificado con ocho corridas seguidas del binario completo.
+- i18n auditado: `SPLIT OUT`, `FOLLOW ARR` y `OPEN` tienen sus ocho idiomas; lo
+  que no pasa por `t()` —`MEM`, la fila `Polyphony`, los nombres de los músicos—
+  sigue la convención de `DSP`, las filas de Ajustes y los roles del panel.
+
+
+### 2026-09-22 — cambiar de estilo cambia el compás de la banda, y SPLIT OUT no congela la interfaz
+
+**El visor del METER no se actualizaba** — o, mejor dicho, decía el compás nuevo
+mientras la banda seguía en el viejo. Con FOLLOW ARR, al cambiar de un vals a
+`strtrock` el click todavía estaba en 3/4 en el momento de hornear, así que la
+banda se horneó en compases de **3**; un tick después el click pasaba a 4/4, y
+`retune_to_tempo` sólo miraba "¿la sesión puso un compás distinto?" —con la
+sesión en 4/4 la respuesta es "no puso ninguno"—, así que nunca volvía a hornear.
+Medido: `cntywltz → strtrock` quedaba en 3 tiempos, y después de `tarkus`, en 5,
+incluso tras STOP. Ahora el arreglador recuerda el compás propio del estilo
+(`own_bpb`) y compara contra lo que *debería* estar contando: el de la sesión si
+lo hay, el del estilo si no. Test: `a_style_change_leaves_no_bar_behind`.
+
+**SPLIT OUT congelaba la interfaz ~2,4 s**: el log de la última sesión muestra
+`probed tab 2… 5 with middle C — 600 ms`. Cada tab de la banda cargaba su
+instrumento con la sonda de nivel —600 ms de do central tocados en el hilo de la
+interfaz—, una tras otra, para un nivel que después se copia de la tab dueña.
+`AudioEngine::set_probe` la apaga para esas cargas.
+
+### 2026-09-22 — PLAY del arreglador tardaba compases en entrar, o no entraba
+
+Reportado con `cargo run --release`: "al presionar play tuvo un delay importante
+para comenzar". Era de hoy: PLAY espera el próximo downbeat del compás del
+click, y ese downbeat **se calculaba otra vez en cada tick** como "el próximo
+después de ahora". Un tick tenía que caer sobre él con una tolerancia de una
+millonésima de tiempo; si no caía, el objetivo pasaba al compás siguiente, y así.
+La interfaz hace un tick cada ~5 ms, así que la banda entraba cuando la suerte lo
+dejaba: medido, a 120 un PLAY en el tiempo 13,37 entró en el 20 (no en el 16), y
+a 174 y a 285 **no entró nunca** en 16 tiempos.
+
+- El downbeat se fija **una vez**, al apretar PLAY (`Arranger::enter_at`), y se
+  espera ése.
+- **Apretado sobre el uno** —hasta un octavo de tiempo tarde, 62 ms a 120— entra
+  en ese compás y no espera uno entero.
+- Si la interfaz se trabó más allá (un diálogo, una carga), entra en el siguiente
+  en vez de tocar el hueco de golpe.
+
+Medido otra vez con la interfaz, doce PLAY en lugares al azar: a 285 entra en
+0,34 s de media (el compás es 0,84 s), a 120 en 0,81 s (2 s), a 174 en 0,56 s
+(1,38 s); el peor caso siempre es menos de un compás. Test:
+`play_comes_in_on_the_next_downbeat_whatever_the_ticks`, con ticks de 5 ms que
+nunca caen sobre un tiempo.
+
+### 2026-09-22 — la polifonía es un ajuste, la RAM está en la barra, y el manual tiene sampler y arreglador
+
+- **Polifonía** en Ajustes → AUDIO, una para todos los instrumentos: el
+  SoundFont (era 64 fijo) y el sampler/SFZ (era 32 fijo). **16 a 1024, 256 por
+  defecto** — el default de FluidSynth, y lo que un SF2 necesita cuando el
+  arreglador toca una banda entera en él: cuatro músicos, presets de dos o tres
+  capas y colas de release. El mínimo es lo que dos manos de acordes en capas
+  necesitan; el máximo, porque un pool se paga cuando se **llena** (con el pedal:
+  a 64 voces un bloque pasó de 233 a 330 µs) y 1024 es dieciséis veces eso en una
+  tab. Se lee al construir un instrumento, así que aplica a lo que se carga
+  después, y la fila lo dice. El sampler roba contra lo que reservó, no contra el
+  ajuste, para no alocar nunca en el hilo de audio.
+- **MEM** en la barra de arriba, al lado del DSP: la memoria residente del
+  proceso (`/proc/self/statm`), y en amarillo cuando a la máquina le queda menos
+  del 15 % —que es cuando un sample en streaming empieza a leerse en bloques
+  tardíos—. Es lo primero que se va si la barra no entra.
+- **La forma de onda del sampler se escala a su propio pico.** Un pack grabado a
+  −28 dBFS (el cello y la flauta de Philharmonia) se dibujaba como una línea
+  plana; es un dibujo de dónde empieza y muere la nota, no un medidor.
+- **Manual**: capturas del sampler con el cello de Philharmonia (figura 5.6) y del
+  arreglador tocando el chart heterométrico de Tarkus (figura 9.3), renderizadas
+  de la interfaz real contra un backend de celdas. **Roadmap**: fuera lo que ya
+  está (el techo al log, la banda multitímbrica que ahora es SPLIT OUT), y adentro
+  lo que salió hoy — el rack embebido no sigue el transporte del host, y lo que le
+  falta a la heterometría.
+
+Tests: `polyphony_is_a_setting_with_bounds`, `the_menu_bar_shows_the_memory_in_use`.
+
+### 2026-09-22 — charts heterométricos, el estilo `tarkus` y un drum & bass que no es bossa
+
+**El drum & bass "a veces dejaba de sonar".** Auditado: no era el motor. Offline,
+con `DSoundFontV4.sf2` y la misma banda, cada compás suena, y con polifonía 64 y
+512 el audio es idéntico bit a bit (no hay robo de voces; con 4 sí cambia, así que
+la prueba mide). Lo que había: la sesión estaba a **285 BPM** (`ui.json`), y por
+encima de `VERY_FAST_BPM` (240) el kit pierde los fantasmas y el hi-hat queda en
+negras — un bombo-caja desnudo con un pad encima, que es lo que sonaba a bossa —;
+el pad era **Pad 2 "warm"**, de ataque lento, en una voicing de dos notas a
+velocidad ~44, que a 0,84 s el compás nunca terminaba de abrir antes de volver a
+atacar: el colchón aparecía y desaparecía; y el estilo medía `vel: 112`, el doble
+de fuerte que el resto, con picos de 2,1 en los fills sobre la tab ya en ×2.00.
+
+- **drumnbass** rehecho: un groove de **dos compases** (el B empuja el bombo al
+  "a" del dos y la caja levanta en el último dieciseisavo), hi-hat en semicorcheas
+  —así los fantasmas se reparten sobre la grilla de dieciseisavos y cambian de
+  lugar en cada compás—, velocidades de librería (`vel: 98`) y un **Rhodes** en
+  vez del pad. Tocarlo cerca de 174, no a 285.
+- **Groove de dos compases, opt-in**: `Drums::kick_b`/`snare_b`, medidos cuando la
+  pista de batería se llama `… Drum 2bar`. Sin la marca, vacíos: 51 de los 210
+  estilos tienen compases impares distintos y no se tocaron.
+
+**Charts que cambian de compás.** Un compás que empieza con una métrica está en
+ella, y los que siguen también hasta el próximo cambio: `| 5/4 Fm | 3/4 Db |`.
+Cada compás dura lo que su métrica; los generadores, los acentos y el editor de la
+grilla lo respetan, y EXPORT MIDI escribe cada cambio de compás. Mientras suena,
+el metrónomo (FOLLOW ARR) toma la métrica de cada compás, y el **origen del
+compás** del transporte (`Transport::bar_origin`) se mueve a su downbeat: el uno
+de un 5/4 después de tres 4/4 cae donde cae, no donde caería un cuarto 4/4. El
+secuenciador cuenta desde el mismo origen.
+
+**`style = tarkus` ("Tarkus (heterometric)")**, medido de `rhythms/tarkus.mid`,
+que salió de `Tarkus.mid` (ELP): su 5/4 como compás propio y un groove por cada
+métrica a la que cambia la obra — 2/4, 3/4, 4/4, 6/4, 5/8, 6/8, 7/8, 9/8 y 12/8 —
+en la tabla nueva `Style::meters`, medida de secciones `Meter<n>` del ritmo. Un
+compás en una métrica sin groove propio toca el del estilo recortado o continuado.
+La batería está como se tocó (cuantizada a semicorcheas y con el nivel
+normalizado); el bajo y el órgano guardan **sólo su ritmo** sobre alturas neutras,
+así el archivo del repo no lleva la melodía ni la armonía de la obra.
+`assets/tarkus.chord` es un chart de ejemplo que pasa por todas esas métricas, con
+una progresión propia en fa menor.
+
+De paso: un test del editor del mapa del sampler dejaba un `.smpreset` en `/tmp`
+en cada corrida (el preset va al lado de la carpeta, no adentro); ahora lo borra.
+
+Tests: `a_chart_changes_meter_bar_by_bar`,
+`a_heterometric_style_plays_each_bar_in_its_own_meter`,
+`the_downbeat_is_counted_from_the_bar_origin`,
+`a_heterometric_chart_exports_its_meters`,
+`the_click_follows_a_chart_that_changes_meter`,
+`drum_and_bass_plays_a_two_bar_two_step`.
+
+### 2026-09-22 — elegir un estilo carga su compás
+
+Reportado: "al seleccionar un estilo sigo sin ver la actualización de meter". El
+METER de la caja es el compás de la **sesión** —el del metrónomo—, y elegir un
+estilo no lo tocaba: sólo FOLLOW ARR lo movía, y sólo mientras la banda tocaba, y
+al parar volvía al compás guardado. Y con la sesión fuera de 4/4, ese compás le
+ganaba al del estilo en el visor.
+
+Ahora **elegir un estilo es elegir su compás** (`App::adopt_bar`): el `meter` del
+chart si lo tiene, si no la figura del estilo —un vals 3/4, un 6/8 blues 6/8,
+Tarkus 5/4—, en el transporte, en el metrónomo (el agrupamiento del chart o
+ninguno) y en el compás que se guarda para el próximo arranque, y la banda se
+vuelve a hornear en él en el acto. LOAD hace lo mismo con el chart que abre. Test:
+`choosing_a_style_loads_its_meter`.
+
+### 2026-09-22 — el manual, auditado contra lo del día
+
+Lo que el manual no decía o decía mal después de los cambios de hoy:
+
+- **3.2** la barra de arriba: fila **MEM**.
+- **11.1** el MIXER: las tiras de una banda con SPLIT OUT, y que las flechas las
+  saltean y no son destino de MIDI learn todavía.
+- **13.1** AUDIO: **Polyphony**, su rango, por qué 256 y cuándo bajar a 128.
+- **9.3/9.4** PLAY espera como mucho un compás y entra ya si se aprieta sobre el
+  uno; y `assets/default.chord` y `assets/tarkus.chord` son del árbol de fuentes,
+  no se instalan (el chart por defecto va dentro del programa).
+- **1.4** el libjack de siempre es el de `pipewire-jack`.
+- **16** problemas: el DAW que muestra un choz viejo, la banda que satura, ▶ que
+  tarda, y el click y la banda contando compases distintos.
+
+### 2026-09-22 — SPLIT OUT: cada músico del arreglador en su tira del mixer
+
+Un botón **SPLIT OUT** en la fila de la banda, **apagado por defecto**. Arriba, la
+banda sigue en su tab —no se abre ninguna otra— y el MIXER muestra **una tira por
+músico** después de las tabs y antes de los grupos (`1·BASS`, `1·DRUMS`…): un
+fader, un pan y un mute sobre **el canal de ese músico dentro del instrumento de
+la tab**, antes del fader de la tab. Su medidor lee ese canal.
+
+- **Cómo**: en un SoundFont cada músico ya toca en una zona —un canal MIDI— con
+  su programa. oxisynth renderiza cada canal en su propio *audio group*
+  (`channel % audio_groups`) pero su API sólo lee el primero; está **vendorizado
+  en `vendor/oxisynth`** (LGPL-2.1, el cambio en `CHOZ-PATCH.md`) con
+  `Synth::read_next_groups`, y `Sf2Synth` se construye con un grupo por canal
+  que usa y los suma a través de una ganancia por canal (`set_zone_mix`). Sin
+  duplicar el sintetizador: la fuente de 580 MB de la sesión sería 2,3 GB con
+  una instancia por músico. Reverb y chorus vuelven en el canal de la tab, así
+  que una tira baja el sonido seco de su músico, no la sala.
+- **Nada cambia con el switch abajo**: test contra el mix de un solo grupo —el de
+  upstream— con reverb incluida, diferencia menor a 1e-4.
+- Sólo donde la banda tiene zonas: un SoundFont con los programas para ella. Con
+  un plugin o el sampler la banda es un timbre y no hay canales que separar.
+- Las tiras no se aprenden a un CC ni se recorren con las flechas del MIXER
+  todavía; mouse y rueda sí. Se guardan con el proyecto (`split_mix`).
+
+Tests: `a_zone_can_be_mixed_on_its_own_and_nothing_else_moves`,
+`split_out_shows_the_band_on_the_mixer_without_new_tabs`,
+`a_band_strip_is_a_fader_a_pan_and_a_mute`.
+
+### 2026-09-22 — cambiar de estilo cambia el compás de la banda
+
+**El visor del METER decía el compás nuevo mientras la banda seguía en el
+viejo.** Con FOLLOW ARR, al cambiar de un vals a `strtrock` el click todavía
+estaba en 3/4 al hornear, así que la banda se horneó en compases de **3**; un tick
+después el click pasaba a 4/4, y `retune_to_tempo` sólo preguntaba "¿la sesión
+puso un compás distinto?" —en 4/4 no puso ninguno—, así que nunca volvía a
+hornear. Medido: `cntywltz → strtrock` quedaba en 3 tiempos, y después de
+`tarkus`, en 5, incluso tras STOP. Ahora el arreglador recuerda el compás propio
+del estilo (`own_bpb`) y compara contra lo que *debería* contar: el de la sesión si
+lo hay, el del estilo si no. Test: `a_style_change_leaves_no_bar_behind`.
+
+### 2026-09-22 — un estilo drum & bass
+
+`style = drumnbass` ("Drum & Bass" en el picker), medido como todos de su ritmo,
+`arranger/rhythms/drumnbass.mid`, escrito para esto: el two-step a 174 —bombo en
+el uno y en el "y" del tres, redoblante en dos y cuatro, hi-hat en corcheas con
+una semicorchea, fantasmas suaves—, un sub pegado al bombo que salta la octava
+cada dos compases, un pad sostenido (GM Pad 2 "warm") y un compás de fill.
+
+Los fantasmas van **adelantados** en el tiempo (2,25 y 3,25) a propósito: en
+1,75 el script los mide como corcheas tarde y el estilo sale shuffle. Y el bajo
+usa dos alturas, raíz y octava: con tres el script lo lee como walking. Test:
+`drum_and_bass_plays_the_two_step` genera a 174 y exige bombo en 0 y 2,5,
+redoblante en 1 y 3, y que los hats sigan (174 está bajo `FAST_BPM`).
+
+### 2026-09-22 — i18n de lo nuevo, TAP con color propio y el manual al día
+
+- **i18n**: `FOLLOW ARR` y `OPEN` (el título del diálogo de LOAD, que estaba en
+  inglés fijo) tienen fila en los ocho idiomas. `EXPORT MIDI` y el `OVERWRITE?`
+  del prompt reusan `EXPORT` y `OVERWRITE`. Los mensajes de error del parser y
+  del lector MIDI siguen en inglés, como todos los del motor.
+- **TAP** dejó de vestir el dorado del metrónomo y se leía como parte del switch
+  MET: ahora es un verde azulado apagado, con la cara teñida aunque el click esté
+  apagado, para que se vea como un botón. Un test compara su fondo con el de MET,
+  encendido y apagado.
+- **Manual** (`docs/choz-manual.odt` y `.pdf`, versión 1.3.14): secciones nuevas
+  2.5 (choz dentro de un DAW: REAPER con `choz-rack.clap`, dieciséis salidas y
+  sus límites; Ardour por JACK y direct outs, porque no carga CLAP), 5.6 (el
+  sampler), 9.3–9.6 (el arreglador, los charts `.chord`, MIDI de ida y vuelta, y
+  el click que sigue su compás); al día 1.5 y 1.6 (instalar, reemplazar y
+  desinstalar los dos bundles), 9.1, 9.2, 10.2 y 10.3. El índice se regeneró.
+- **Auditoría**: `choz-rack.clap` no lee `clap_event_transport` —toma notas y
+  MIDI del host, no su tempo ni su play—. El manual y el README lo dicen, y el
+  seguimiento del compás del arreglador ya no se apaga embebido por un host que
+  en realidad no manda.
+
+### 2026-09-21 — el metrónomo sigue el compás del arreglador
+
+Un estilo en 3 (un vals) seguía sonando en 3 sobre un click en 4/4: entraban
+juntos y se separaban. Ahora, mientras un arreglador toca —el de la pestaña
+activa, o el primero que esté tocando—, la sesión toma **su** compás (el `meter`
+del chart, o el del estilo) y su agrupamiento: el click, la grilla del
+secuenciador y la entrada en el downbeat miden el mismo compás. Al parar vuelve
+el `time_sig` del jugador. Una fila nueva, **FOLLOW ARR**, al final del menú del
+metrónomo lo apaga (encendido por defecto); tocar BEATS o UNIT a mano también lo
+apaga, porque es el jugador tomando el conteo. Vale también embebido:
+`choz-rack.clap` no lee el transporte del host (sólo notas y MIDI), así que el
+compás del rack sigue siendo suyo.
+
+### 2026-09-21 — el "uno" de cada artefacto es el del metrónomo
+
+El metrónomo cuenta el compás desde la posición del reloj compartido, pero:
+
+- **El secuenciador** contaba sus pasos en una grilla global desde cero y daba la
+  vuelta cada `bar_steps`, un número redondeado y recortado a 16. En 7/8 con
+  pasos de negra (3,5 pasos) o en 7/4 a 1/16 (28 de 16), su paso 0 se alejaba
+  del tiempo fuerte un poco cada compás. Ahora los pasos se cuentan **desde cada
+  downbeat**: el compás que no es un número entero de pasos termina en un paso
+  corto, y los que no caben en la grilla son silencio hasta el próximo "uno".
+- **El arreglador** empezaba el compás uno en el instante del botón. Ahora PLAY y
+  PAUSE→reanudar entran en el **próximo downbeat** del compás de la sesión;
+  reanudar vuelve al principio del compás en que se pausó.
+- El arpegiador no tiene compás: sus pasos ya caían sobre la grilla del click.
+
+### 2026-09-21 — EXPORT MIDI pide el nombre y sale balanceado
+
+- Después de elegir el directorio, EXPORT pide el nombre (el mismo prompt que
+  guardar proyecto, con `.mid` por defecto y pregunta antes de sobrescribir).
+- **Niveles**: dentro de una pestaña toda la banda toca un solo instrumento y los
+  generadores dejan el acompañamiento bajo (el piano de un shuffle promedia menos
+  de 20 de velocidad, contra 52 del bajo). En el archivo cada músico tiene su
+  canal, así que cada parte se lleva a un promedio propio —batería 96, bajo 92,
+  piano 80, guitarra 74— sin perder los acentos, y **el fader va al CC 7** (100 a
+  fader lleno) en vez de a la velocidad.
+- **LOAD y EXPORT exigen de 2 a 4 instrumentos** (canales con notas, la batería
+  incluida). Un MIDI de un solo instrumento o un arreglo GM completo no es lo que
+  el arreglador toca; EXPORT de una banda de un músico se rechaza en el prompt en
+  vez de escribir un archivo que LOAD no aceptaría.
+
+### 2026-09-21 — el arreglador exporta e importa MIDI
+
+- **EXPORT MIDI** en la caja: elige un directorio y escribe
+  `choz-tab<N>-arranger.mid`, tipo 1, 480 PPQ. Una pista conductora con el tempo,
+  el compás, un marcador en cada cambio de acorde y **el `.chord` entero como
+  evento de texto**; después una pista por músico, en el canal que espera un
+  reproductor GM (la batería en el 10) y con el programa del estilo.
+- **LOAD abre `.chord`, `.mid` y `.midi`**, y ya no `.txt`. Un `.mid` que escribió
+  choz vuelve exactamente como el chart que lo escribió; uno ajeno se *escucha*:
+  un acorde por compás, o dos cuando las mitades son claramente distintas,
+  eligiendo entre doce calidades por duración de cada nota, con la raíz tomada
+  del registro grave y sin contar el canal 10. Es heurístico: una melodía llena de
+  notas de paso puede partir un compás que es un solo acorde.
+- **`assets/default.chord`** es la progresión por defecto: `DEFAULT_TEXT` la toma
+  con `include_str!`, así el archivo y lo que toca una pestaña nueva no pueden
+  separarse.
+
+### 2026-09-21 — PipeWire-JACK por defecto en las dependencias
+
+Todos los escritorios actuales traen `pipewire-jack` y no jack2. El README, el
+`Recommends` del `.deb` (`pipewire-jack | libjack-jackd2-0 | libjack0`), el
+`optdepends` de Arch y el aviso de `install.sh` lo ponen primero; el `.rpm`
+recomienda el soname `libjack.so.0()(64bit)`, que cumplen los dos. Para
+compilar, `jack-sys` pide `jack.pc` aunque cargue libjack con `dlopen`: en Arch y
+Fedora sale del paquete de PipeWire, en Debian/Ubuntu de `libjack-jackd2-dev`,
+que no reemplaza a `pipewire-jack` en runtime.
+
+### 2026-09-21 — la desinstalación dice que quita los dos plugins
+
+`install.sh --uninstall` ya borraba `~/.clap/choz.clap` y `choz-rack.clap`, pero
+callado; ahora lo dice como el resto. Un test exige que el `.deb` (base y ARM), el
+`.rpm` y el PKGBUILD declaren los dos bundles: declarados es también lo que hace
+que el gestor de paquetes los quite al desinstalar.
+
+### 2026-09-21 — LOAD del arreglador lee también el compás
+
+**El archivo decía los acordes y nada más.** El parser conocía `key`, `style` y
+`form`; un `meter = 7/8` era un error ("not a setting the arranger knows") y la
+métrica salía siempre de la sesión o del estilo. Ahora un `.chord` puede
+decir el compás y cómo se cuenta:
+
+```text
+key = D
+style = strtrock
+meter = 7/8          # también: time = 7/8
+groups = 3+2+2       # también: grouping = 3 2 2, o 3,2,2
+| Dm7 | G7:3 C:4 | Cmaj7 | A7 |
+```
+
+- **Lo que dice el texto gana** sobre el compás de la sesión y el agrupamiento
+  de la pestaña: un archivo en 7/8 suena en 7/8 aunque la sesión esté en 4/4.
+- **LOAD lo lleva al resto de la sesión**: el transporte y el metrónomo pasan a
+  7/8 contado 3+2+2, y el agrupamiento de la pestaña queda en el del archivo,
+  así el editor de la grilla abre sobre el mismo compás.
+- Un agrupamiento que no suma el numerador (`meter = 7/8` con `groups = 3+3+3`)
+  es un error en la caja, no un agrupamiento descartado en silencio.
+- `chart_bars` dejaba pasar a la grilla cualquier encabezado que no fuera
+  `key`/`style`/`form`; ahora descarta toda línea con `=`, que un acorde nunca
+  lleva.
+
+### 2026-09-21 — el instalador pregunta antes de reemplazar
+
+- `install.sh` lista lo que ya hay (binarios con su `--version`, `~/.clap/choz*.clap`)
+  y pregunta `[Y/n]` en una terminal; `--yes`, o sin terminal, reemplaza como antes.
+- El `.deb` pregunta por debconf si encuentra `choz*.clap` en el `~/.clap` de
+  algún usuario, y los renombra a `*.bak` (los hosts no los cargan). El `.rpm` y
+  el paquete de Arch no pueden preguntar: hacen lo que el `.deb` por defecto.
 
 ## [1.3.13] — 2026-09-21
 

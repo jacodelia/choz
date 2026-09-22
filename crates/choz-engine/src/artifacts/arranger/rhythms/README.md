@@ -19,8 +19,15 @@ from is the thing to listen to first.
   says the style takes fills at all.
 - **A track name per track**, `<section> <part> [flags…]`, where the part is
   one of `Percussion`, `Drum`, `Bass`, `Chord1`…`Chord5`. Anything after the
-  part is ignored by the measuring and is there to be read by a person.
+  part is ignored by the measuring and is there to be read by a person — except
+  `2bar` on the drum track (`Var1 Drum 2bar`): the groove is two bars long, the
+  even bars are its first and the odd bars its answer.
 - **Sections laid end to end**, so the file plays through as an arrangement.
+- **A heterometric rhythm** — one that changes meter — adds a section per
+  signature it changes to, marked `Meter<n> <bars>bar <num>/<den>` (`Meter3
+  4bar 7/8`) with its own `Meter3 Drum`, `Meter3 Chord1`… tracks. Each one is
+  measured into the style's `meters` table: how it plays a bar of that
+  signature when a chart changes to it (`| 7/8 Dm |`).
 - **Drums on MIDI channel 10**, General MIDI numbering, and the melodic parts
   with a program change each — the program is what the style asks a SoundFont
   for.

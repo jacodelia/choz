@@ -1,0 +1,21 @@
+#!/bin/sh
+# Ask about choz bundles left in users' ~/.clap by an earlier `install.sh`:
+# they shadow the ones this package puts in /usr/lib/clap. See `templates`.
+set -e
+[ -e /usr/share/debconf/confmodule ] || exit 0
+. /usr/share/debconf/confmodule
+
+files=""
+for f in /root/.clap/choz.clap /root/.clap/choz-rack.clap \
+         /home/*/.clap/choz.clap /home/*/.clap/choz-rack.clap; do
+    [ -f "$f" ] && files="${files:+$files, }$f"
+done
+if [ -n "$files" ]; then
+    db_subst choz/replace-old-clap files "$files"
+    # Asked on every install that finds some, not once ever: the answer is
+    # about these files, and next time they may be others.
+    db_fset choz/replace-old-clap seen false
+    db_input high choz/replace-old-clap || true
+    db_go || true
+fi
+exit 0

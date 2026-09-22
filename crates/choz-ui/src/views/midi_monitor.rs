@@ -1356,6 +1356,10 @@ pub enum StripKind {
     /// sides — a group is already a sum.
     Bus,
     Main,
+    /// One musician of a tab's arranger band, split out: its channel of the
+    /// tab's instrument, before the tab's own fader. One fader, a pan and a
+    /// mute; the tab it belongs to is what goes on to the desk.
+    Band,
 }
 
 /// One strip of the MIXER: a rack tab, a subgroup, or the main.
@@ -1516,6 +1520,7 @@ fn draw_strip(f: &mut Frame, area: Rect, tab: usize, st: &MixerStrip) -> Vec<Mix
             .add_modifier(Modifier::BOLD),
         StripKind::Bus => Style::default().fg(HEADER).add_modifier(Modifier::BOLD),
         StripKind::Tab => name_style,
+        StripKind::Band => Style::default().fg(HEADER),
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(format!("{title:<w$}"), name_style)))
@@ -1752,7 +1757,7 @@ fn strip_bottom(area: Rect) -> u16 {
 /// Has this strip two sides, and so somewhere to pan between? A group is a
 /// mono sum with one fader; a tab and the main are stereo.
 fn is_stereo(kind: StripKind) -> bool {
-    matches!(kind, StripKind::Tab | StripKind::Main)
+    matches!(kind, StripKind::Tab | StripKind::Main | StripKind::Band)
 }
 
 /// How wide one vertical fader is: half the strip, less the gutter and the
@@ -2295,6 +2300,49 @@ mod tests {
             note.contains("C4") && note.contains("vel 100"),
             "got {note:?}"
         );
+    }
+
+    /// A musician of a split-out band draws as one fader with a pan and a
+    /// mute — no solo, no link, no destination: the tab it belongs to is what
+    /// goes on to the desk.
+    #[test]
+    fn a_band_strip_is_a_fader_a_pan_and_a_mute() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let strip = MixerStrip {
+            kind: StripKind::Band,
+            label: "1\u{00B7}BASS".to_string(),
+            gain: 1.0,
+            gain_r: 1.0,
+            mono: true,
+            link: true,
+            pan: -0.5,
+            mute: false,
+            solo: false,
+            level: 0.3,
+            active: false,
+            side: None,
+            dest: None,
+        };
+        let mut term = Terminal::new(TestBackend::new(STRIP_W, 12)).unwrap();
+        let mut hits = Vec::new();
+        term.draw(|f| hits = draw_mixer(f, f.area(), std::slice::from_ref(&strip)))
+            .unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("BASS"), "{text}");
+        let has = |want: fn(&MixerHit) -> bool| hits.iter().any(|(h, _)| want(h));
+        assert!(has(|h| matches!(h, MixerHit::Gain(0))), "a fader");
+        assert!(has(|h| matches!(h, MixerHit::Pan(0))), "a pan");
+        assert!(has(|h| matches!(h, MixerHit::Mute(0))), "a mute");
+        assert!(!has(|h| matches!(
+            h,
+            MixerHit::Solo(0) | MixerHit::Dest(0) | MixerHit::GainR(0)
+        )));
     }
 
     /// Each strip says what is arriving on it, inside its own fader and in its

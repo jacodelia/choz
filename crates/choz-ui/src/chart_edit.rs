@@ -315,6 +315,9 @@ impl Slot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BarEdit {
     pub slots: Vec<Slot>,
+    /// The signature the bar was written with, `5/4` — kept as it was typed,
+    /// so editing the chords of a chart that changes meter keeps its meters.
+    pub meter: Option<String>,
 }
 
 impl BarEdit {
@@ -325,6 +328,7 @@ impl BarEdit {
                 sym,
                 weight: cells.max(1),
             }],
+            meter: None,
         }
     }
 
@@ -357,9 +361,23 @@ impl BarEdit {
 
     fn line(&self) -> String {
         let weighted = self.weighted();
-        let tokens: Vec<String> = self.slots.iter().map(|s| s.token(weighted)).collect();
+        let mut tokens: Vec<String> = self.slots.iter().map(|s| s.token(weighted)).collect();
+        if let Some(m) = &self.meter {
+            tokens.insert(0, m.clone());
+        }
         format!("| {} |", tokens.join(" "))
     }
+}
+
+/// `5/4`: a bar's signature, not a chord — the arranger's own reading, see
+/// `chord::parse_bars`.
+fn is_meter(token: &str) -> bool {
+    token.split_once('/').is_some_and(|(n, d)| {
+        !n.is_empty()
+            && !d.is_empty()
+            && n.bytes().all(|b| b.is_ascii_digit())
+            && d.bytes().all(|b| b.is_ascii_digit())
+    })
 }
 
 /// The chart being edited, and where the cursor is in it.
@@ -386,11 +404,19 @@ impl ChartEdit {
     pub fn parse(bars: &[String]) -> Self {
         let bars: Vec<BarEdit> = bars
             .iter()
-            .map(|bar| BarEdit {
-                slots: match bar.split_whitespace().map(slot_of).collect::<Vec<Slot>>() {
-                    slots if slots.is_empty() => vec![Slot::hold()],
-                    slots => slots,
-                },
+            .map(|bar| {
+                let mut tokens: Vec<&str> = bar.split_whitespace().collect();
+                let meter = match tokens.first() {
+                    Some(t) if is_meter(t) => Some(tokens.remove(0).to_string()),
+                    _ => None,
+                };
+                BarEdit {
+                    slots: match tokens.into_iter().map(slot_of).collect::<Vec<Slot>>() {
+                        slots if slots.is_empty() => vec![Slot::hold()],
+                        slots => slots,
+                    },
+                    meter,
+                }
             })
             .collect();
         Self {

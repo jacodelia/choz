@@ -42,6 +42,7 @@
 
 pub mod chord;
 pub mod generate;
+pub mod smf;
 pub mod style;
 pub mod styles;
 
@@ -106,6 +107,53 @@ pub struct ArrangerSettings {
     /// See [`chord::respell_text`].
     #[serde(default)]
     pub roman: bool,
+    /// **Split outputs**: every musician of the band on a tab of their own —
+    /// and so on a strip of their own in the mixer, with its fader, its FX,
+    /// its group and its direct out. The rack's tabs are its channels, so this
+    /// is the arranger asking for more of them; see choz-ui's
+    /// `sync_arranger_split`.
+    #[serde(default)]
+    pub split: bool,
+    /// Each musician's strip when the band is split out, by `Role::ALL`
+    /// place. Missing is a strip at unity, centred, unmuted.
+    #[serde(default)]
+    pub split_mix: Vec<BandStrip>,
+}
+
+/// One musician's strip in the mixer, when the band is split out: how loud
+/// their channel of the tab's instrument goes into the tab, where it sits, and
+/// whether it is heard at all.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BandStrip {
+    pub gain: f32,
+    pub pan: f32,
+    pub mute: bool,
+}
+
+impl Default for BandStrip {
+    fn default() -> Self {
+        Self {
+            gain: 1.0,
+            pan: 0.0,
+            mute: false,
+        }
+    }
+}
+
+impl BandStrip {
+    /// Left and right gain: the balance law, unity in the middle, the far
+    /// side down to nothing at the edge — the tab's own pan still places the
+    /// whole of it.
+    pub fn sides(&self) -> (f32, f32) {
+        if self.mute {
+            return (0.0, 0.0);
+        }
+        let p = self.pan.clamp(-1.0, 1.0);
+        (
+            self.gain * (1.0 - p).min(1.0),
+            self.gain * (1.0 + p).min(1.0),
+        )
+    }
 }
 
 impl ArrangerSettings {
@@ -121,6 +169,21 @@ impl ArrangerSettings {
             true => vec![(self.role, 1.0)],
             false => on,
         }
+    }
+
+    /// A musician's strip, when the band is split out.
+    pub fn strip(&self, role: Role) -> BandStrip {
+        self.split_mix
+            .get(role as usize)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn strip_mut(&mut self, role: Role) -> &mut BandStrip {
+        if self.split_mix.len() < Role::ALL.len() {
+            self.split_mix.resize(Role::ALL.len(), BandStrip::default());
+        }
+        &mut self.split_mix[role as usize]
     }
 
     pub fn gain(&self, role: Role) -> f32 {
@@ -176,6 +239,9 @@ impl Default for ArrangerSettings {
             // player reads off a chart. Degrees are the switch — see
             // [`Arranger::set_roman`].
             roman: false,
+            // Off until asked for: a band is one strip, like any tab.
+            split: false,
+            split_mix: Vec::new(),
         }
     }
 }
@@ -185,7 +251,10 @@ impl Default for ArrangerSettings {
 ///
 /// **In letters**: it is what a chart handed to a player is written in, and the
 /// degrees are one press away for whoever is thinking about the form instead.
-pub const DEFAULT_TEXT: &str = "key = C\nstyle = shfblues\n\n|| C7 | F7 | C7 | C7 | F7 | F7 | C7 | A7 | Dm7 | G7 | C7 G7 | C7 ||";
+///
+/// **The file is the one copy**: `assets/default.chord` ships beside the
+/// wallpapers, so the chart a fresh tab plays is also one LOAD can open.
+pub const DEFAULT_TEXT: &str = include_str!("../../../../../assets/default.chord");
 
 /// A tab's arranger: the text, the part it baked from it, and where the
 /// playhead is in it.
@@ -208,6 +277,21 @@ pub struct Arranger {
     /// Kept so the panel can draw the bar the band is actually playing, and so
     /// a grouping change is noticed.
     groups: Vec<u8>,
+    /// The `meter` and `groups` lines of the text, as it last read. **What the
+    /// chart says wins** over the session and the tab: a file that says 7/8 is
+    /// a song in 7/8.
+    written_meter: Option<(u16, u16)>,
+    written_groups: Vec<u8>,
+    /// Where each bar starts and what it is in, for a chart that changes
+    /// meter. Empty for one that does not — a bar is then `beats_per_bar`.
+    bar_starts: Vec<f64>,
+    bar_meters: Vec<(u16, u16)>,
+    /// The style's own bar, before the session's was put over it: what the
+    /// band should be counting when the session says nothing (4/4). Kept
+    /// because `style.beats_per_bar` is overwritten, and without it a band
+    /// that was baked in a waltz's 3 while the click still said 3/4 had no way
+    /// to see it should now be in 4.
+    own_bpb: f64,
     /// The tempo the part was baked for. What a kit can play at 130 and what it
     /// can play at 230 are different parts — see [`generate::FAST_BPM`] — so
     /// the band is re-baked when the tempo crosses one of those lines, and
@@ -228,6 +312,16 @@ pub struct Arranger {
     cursor: usize,
     /// The shared position the last tick read, to turn into a step forward.
     last_pos: Option<f64>,
+    /// The downbeat PLAY is waiting for, worked out **once**, when it is
+    /// pressed. Worked out again on every tick it was always the *next* one,
+    /// and a tick had to land on it to the millionth of a beat or the wait
+    /// moved on a bar — the band came in whenever luck let it, or not at all.
+    ///
+    /// With the clock it was worked out on — the transport's or the free one —
+    /// because they are two different numbers: PLAY on the free clock and the
+    /// rack's PLAY a moment later is a target the transport's position may be
+    /// bars short of.
+    enter_at: Option<(f64, bool)>,
     /// What is sounding, how many beats of it are left, and who is playing it.
     sounding: Vec<(u8, f64, Role)>,
 }
@@ -242,6 +336,11 @@ impl Default for Arranger {
             style: style::ALL[0],
             key: 0,
             groups: Vec::new(),
+            written_meter: None,
+            written_groups: Vec::new(),
+            bar_starts: Vec::new(),
+            bar_meters: Vec::new(),
+            own_bpb: 4.0,
             bpm: 120.0,
             bars: 0,
             sections: Vec::new(),
@@ -250,6 +349,7 @@ impl Default for Arranger {
             at: 0.0,
             cursor: 0,
             last_pos: None,
+            enter_at: None,
             sounding: Vec::new(),
         };
         arranger.rebake();
@@ -366,6 +466,10 @@ fn band_of(bpm: f32) -> u8 {
 /// defaults to.
 const JUMP_BEATS: f64 = 4.0;
 
+/// How late after a downbeat PLAY still counts as on it, in beats: an eighth
+/// of one, 62 ms at 120 — a hand pressing on the one, not a bar early.
+const ENTRY_GRACE: f64 = 0.125;
+
 impl Arranger {
     pub fn new(settings: ArrangerSettings) -> Self {
         let mut arranger = Self {
@@ -396,6 +500,12 @@ impl Arranger {
 
     /// The bar the band counts, as a signature — see [`ArrangerView::meter`].
     pub fn meter(&self) -> (u16, u16) {
+        if let Some(m) = self.bar_index().and_then(|i| self.bar_meters.get(i)) {
+            return *m;
+        }
+        if let Some(meter) = self.written_meter {
+            return meter;
+        }
         match session_bar() {
             Some(_) => choz_ports::transport().time_signature(),
             None => (self.style.meter.0 as u16, self.style.meter.1 as u16),
@@ -464,13 +574,28 @@ impl Arranger {
             return None;
         }
         let cells = self.cells();
-        let into = self.at.rem_euclid(bpb) / bpb * cells as f64;
+        // In a chart that changes meter, the share of *this* bar gone by.
+        let (into, bpb) = match self.bar_index().filter(|_| !self.bar_starts.is_empty()) {
+            Some(i) => {
+                let (n, d) = self.bar_meters[i];
+                (
+                    self.at - self.bar_starts[i],
+                    n as f64 * 4.0 / d.max(1) as f64,
+                )
+            }
+            None => (self.at.rem_euclid(bpb), bpb),
+        };
+        let into = into / bpb.max(1e-9) * cells as f64;
         Some((into.floor() as usize).min(cells.saturating_sub(1)))
     }
 
     /// Which bar the playhead is in, from 0 — `None` when the style has no
     /// bar length to divide by.
     fn bar_index(&self) -> Option<usize> {
+        if !self.bar_starts.is_empty() {
+            let i = self.bar_starts.partition_point(|s| *s <= self.at + 1e-9);
+            return Some(i.saturating_sub(1));
+        }
         (self.style.beats_per_bar > 0.0)
             .then(|| (self.at / self.style.beats_per_bar).floor() as usize)
     }
@@ -483,6 +608,53 @@ impl Arranger {
             .rev()
             .find(|(_, from)| *from <= bar)
             .map(|(name, _)| name.as_str())
+    }
+
+    /// How the band counts the bar: what the chart says, else the tab's own
+    /// grouping, else the click's.
+    fn grouping(&self) -> Vec<u8> {
+        match self.written_groups.is_empty() {
+            true => self.settings.grouping(),
+            false => self.written_groups.clone(),
+        }
+    }
+
+    /// The bar the band is written in, whatever the session counts: the
+    /// chart's `meter`, else the style's own (a waltz is 3/4). What the
+    /// metronome takes when it follows the arranger.
+    pub fn own_meter(&self) -> (u16, u16) {
+        // A chart that changes meter is in the bar the playhead is in.
+        if let Some(m) = self.bar_index().and_then(|i| self.bar_meters.get(i)) {
+            return *m;
+        }
+        self.written_meter
+            .unwrap_or((self.style.meter.0 as u16, self.style.meter.1 as u16))
+    }
+
+    /// The chart's bar before any change of meter in it: its `meter` line, or
+    /// the style's own.
+    pub fn default_meter(&self) -> (u16, u16) {
+        self.written_meter
+            .unwrap_or((self.style.meter.0 as u16, self.style.meter.1 as u16))
+    }
+
+    /// Where the bar the playhead is in started, on the shared clock, in
+    /// quarter notes — what the metronome counts its one from when the bar
+    /// changes length under it. `None` before the band has counted anything.
+    pub fn bar_origin_ppq(&self) -> Option<f64> {
+        let last = self.last_pos?;
+        let start = match self.bar_index() {
+            Some(i) if !self.bar_starts.is_empty() => self.bar_starts[i],
+            Some(i) => i as f64 * self.style.beats_per_bar,
+            None => return None,
+        };
+        Some(last - (self.at - start))
+    }
+
+    /// The `meter` and `groups` the chart names — what LOAD hands the session
+    /// so the click and the grid count the bar the band does.
+    pub fn written_bar(&self) -> (Option<(u16, u16)>, &[u8]) {
+        (self.written_meter, &self.written_groups)
     }
 
     pub fn set_text(&mut self, text: impl Into<String>) {
@@ -557,21 +729,48 @@ impl Arranger {
         match chord::parse_progression(&self.settings.text) {
             Ok(prog) => {
                 self.style = style::by_name(&prog.style);
-                // The bar the session counts, when somebody set one.
-                if let Some(bar) = session_bar() {
+                self.own_bpb = self.style.beats_per_bar;
+                self.written_meter = prog.meter;
+                self.written_groups = prog.groups.clone();
+                // The bar the chart names, or the one the session counts when
+                // somebody set one.
+                // A chart that changes meter keeps its own: the session follows
+                // it bar by bar (see choz-ui's `follow_arranger_meter`), and
+                // letting the session's bar back in here would re-bake the form
+                // every time it did.
+                let bar = match (prog.meter, prog.heterometric()) {
+                    (Some((num, den)), _) => Some((num as f64 * 4.0 / den as f64).max(0.25)),
+                    (None, true) => None,
+                    (None, false) => session_bar(),
+                };
+                if let Some(bar) = bar {
                     self.style.beats_per_bar = bar;
                 }
                 self.key = prog.key;
                 self.bars = prog.bars.len();
                 self.sections = prog.sections.clone();
                 self.total = prog.beats(self.style.beats_per_bar);
+                let default = self
+                    .written_meter
+                    .unwrap_or((self.style.meter.0 as u16, self.style.meter.1 as u16));
+                (self.bar_starts, self.bar_meters) = match prog.heterometric() {
+                    true => (0..prog.bars.len())
+                        .map(|i| {
+                            (
+                                prog.bar_start(i, self.style.beats_per_bar),
+                                prog.bars[i].meter.unwrap_or(default),
+                            )
+                        })
+                        .unzip(),
+                    false => (Vec::new(), Vec::new()),
+                };
                 // Every player in the band, on one timeline. Each is baked on
                 // its own — that is what lets a tab play one of them — and the
                 // fader is a scale on the velocity, because a tab has one
                 // instrument and one level.
                 self.baked.clear();
                 self.bpm = tempo();
-                self.groups = self.settings.grouping();
+                self.groups = self.grouping();
                 let ctx = generate::Bake {
                     bpm: self.bpm,
                     swing: self.settings.swing,
@@ -631,8 +830,15 @@ impl Arranger {
     /// because somebody moved the tempo.
     pub fn retune_to_tempo(&mut self) -> bool {
         let moved = band_of(tempo()) != band_of(self.bpm)
-            || self.settings.grouping() != self.groups
-            || session_bar().is_some_and(|bar| (bar - self.style.beats_per_bar).abs() > 1e-9);
+            || self.grouping() != self.groups
+            // The bar the band should be in — the session's when somebody set
+            // one, the style's own when the session is plain 4/4 — against the
+            // one it was baked in. Checking only the first half left a band
+            // baked in a waltz's 3 (the click still in 3/4 when the style
+            // changed) counting 3 for ever once the click went back to 4/4.
+            || (self.written_meter.is_none()
+                && self.bar_starts.is_empty()
+                && (session_bar().unwrap_or(self.own_bpb) - self.style.beats_per_bar).abs() > 1e-9);
         if !moved {
             return false;
         }
@@ -666,6 +872,7 @@ impl Arranger {
         self.at = 0.0;
         self.cursor = 0;
         self.last_pos = None;
+        self.enter_at = None;
     }
 
     /// **PLAY starts the progression from the top.** Bar one, on the clock's
@@ -696,6 +903,29 @@ impl Arranger {
         // The clock has run on while it was out; the next tick measures from
         // wherever it is now rather than counting the gap as music.
         self.last_pos = None;
+        self.enter_at = None;
+        // Back in at the top of the bar it was left in, because it comes back
+        // in on a downbeat: carrying on from mid-bar would put the rest of the
+        // bar over the click's "one".
+        let bpb = self.style.beats_per_bar;
+        if let Some(start) = self
+            .bar_index()
+            .and_then(|i| self.bar_starts.get(i).copied())
+        {
+            self.at = start;
+            self.cursor = self
+                .baked
+                .iter()
+                .position(|n| n.start >= self.at - 1e-9)
+                .unwrap_or(self.baked.len());
+        } else if bpb > 0.0 {
+            self.at = (self.at / bpb).floor() * bpb;
+            self.cursor = self
+                .baked
+                .iter()
+                .position(|n| n.start >= self.at - 1e-9)
+                .unwrap_or(self.baked.len());
+        }
     }
 
     /// The pause button: out of the band, or back into it at the same bar.
@@ -810,13 +1040,44 @@ impl Arranger {
         let pos = transport.position_ppq();
         let delta = match self.last_pos {
             Some(last) => pos - last,
-            // Coming in: nothing has been played yet, so nothing moved.
-            //
-            // **The form starts where the button says**, not where the clock
-            // happens to be: PLAY is bar one and PAUSE is the bar it was left
-            // in. The clock is what the band counts *time* in — it is never what
-            // picks the bar.
-            None => 0.0,
+            // Coming in: **on the next downbeat of the bar the metronome
+            // clicks.** The form still starts where the button says — PLAY is
+            // bar one, PAUSE the bar it was left in — but *when* is the
+            // clock's: coming in the instant the button was pressed put the
+            // band's "one" anywhere in the click's bar.
+            None => {
+                let bar = transport.bar_quarters().max(0.25);
+                let rolling = transport.playing();
+                // Worked out again only when the clock under it changed, or
+                // went back past it (a rewind): otherwise it is the one PLAY
+                // was pressed before.
+                let stale = self
+                    .enter_at
+                    .is_none_or(|(at, on)| on != rolling || at - pos > bar + 1e-9);
+                if stale {
+                    let origin = transport.bar_origin();
+                    let this = origin + ((pos - origin) / bar + 1e-9).floor() * bar;
+                    // Pressed on the one — a hair late, as a hand is — is this
+                    // bar, not a whole bar's wait for the next.
+                    let at = match pos - this <= ENTRY_GRACE {
+                        true => this,
+                        false => this + bar,
+                    };
+                    self.enter_at = Some((at, rolling));
+                }
+                let target = self.enter_at.map(|(at, _)| at).unwrap_or(pos);
+                if pos < target - 1e-9 {
+                    return None;
+                }
+                self.enter_at = None;
+                // The interface stalled past it (a dialogue, a load): come in on
+                // the next one rather than play the gap at once.
+                if pos - target > JUMP_BEATS {
+                    return None;
+                }
+                self.last_pos = Some(target);
+                return Some(pos - target);
+            }
         };
         self.last_pos = Some(pos);
         // Rewound, or dragged: play from there rather than playing everything
@@ -1353,6 +1614,317 @@ mod tests {
 
     /// The bar the session counts is the bar the band plays, and the grouping
     /// is what it leans on: a 7/8 counted 3+2+2 is not seven equal eighths.
+    /// **What the chart says wins.** A 7/8 file plays 7/8 in a 4/4 session,
+    /// counted the way it is written — and that is not a difference the tempo
+    /// loop re-bakes over on every tick.
+    #[test]
+    fn a_chart_that_names_its_bar_is_played_in_it() {
+        let _g = crate::test_locks::transport();
+        let t = choz_ports::transport();
+        t.set_time_signature(4, 4);
+        let arr = Arranger::new(ArrangerSettings {
+            on: true,
+            text: "meter = 7/8\ngroups = 3+2+2\n| C | F |".into(),
+            ..Default::default()
+        });
+        assert!(arr.error().is_none(), "{:?}", arr.error());
+        assert_eq!(arr.meter(), (7, 8));
+        assert!(
+            (arr.beats() - 7.0).abs() < 1e-9,
+            "two bars of 3.5: {}",
+            arr.beats()
+        );
+        assert_eq!(arr.view().groups, &[3, 2, 2]);
+        assert_eq!(arr.written_bar(), (Some((7, 8)), &[3u8, 2, 2][..]));
+        let mut arr = arr;
+        assert!(
+            !arr.retune_to_tempo(),
+            "a written bar is re-baked every tick"
+        );
+    }
+
+    /// **Drum & bass is a two-bar two-step at 174**, measured off
+    /// `rhythms/drumnbass.mid`: bar A has the kick on one and the and-of-three,
+    /// bar B answers with a kick on the "a" of two and a snare picking up into
+    /// the next bar; the hats run in sixteenths, so the ghosts land somewhere
+    /// else every bar. The comp is a Rhodes — a pad's slow attack never opened
+    /// at this tempo, and the chord came and went.
+    #[test]
+    fn drum_and_bass_plays_a_two_bar_two_step() {
+        let _g = crate::test_locks::transport();
+        let style = style::by_name("drumnbass");
+        assert_eq!(style.name, "drumnbass", "the style is in the table");
+        assert_eq!(style.label, "Drum & Bass");
+        assert_eq!(style.swing, 0.0, "straight, not shuffled");
+        assert_eq!(style.piano_gm.first(), Some(&4), "a Rhodes, not a slow pad");
+        let prog =
+            chord::parse_progression("style = drumnbass\n| Cm7 | Abmaj7 | Fm7 | G7 |").unwrap();
+        let part = generate::bake(&prog, &style, Role::Drums, 1, &generate::Bake::at(174.0));
+        let hits = |key: u8, bar: usize| -> Vec<f64> {
+            let from = bar as f64 * 4.0;
+            let mut at: Vec<f64> = part
+                .iter()
+                .filter(|n| n.note == key && n.vel >= 70)
+                .map(|n| ((n.start - from) * 4.0).round() / 4.0)
+                .filter(|p| (0.0..4.0).contains(p))
+                .collect();
+            at.dedup();
+            at
+        };
+        assert_eq!(
+            hits(gm::KICK, 0),
+            vec![0.0, 2.5],
+            "bar A: one and the and-of-three"
+        );
+        assert_eq!(hits(gm::SNARE, 0), vec![1.0, 3.0], "bar A: two and four");
+        assert_eq!(
+            hits(gm::KICK, 1),
+            vec![0.0, 1.75, 2.5],
+            "bar B pushes the kick"
+        );
+        assert_eq!(hits(gm::SNARE, 1), vec![1.0, 3.0, 3.75], "and picks up");
+        let hats = part
+            .iter()
+            .filter(|n| n.note == gm::HAT_CLOSED && n.start < 4.0)
+            .count();
+        assert!(hats >= 12, "sixteenth hats at 174: {hats}");
+        // Other styles keep their one-bar groove.
+        assert!(style::by_name("strtrock").drums.kick_b.is_empty());
+    }
+
+    /// **Tarkus is heterometric**: measured off `rhythms/tarkus.mid`, a 5/4
+    /// of its own and a groove for each signature the piece changes to. In a
+    /// chart that changes meter every bar is as long as its signature, plays
+    /// the groove measured for it, and the arranger says which bar — and which
+    /// meter — the playhead is in, for the click to follow.
+    #[test]
+    fn a_heterometric_style_plays_each_bar_in_its_own_meter() {
+        let _g = crate::test_locks::transport();
+        let style = style::by_name("tarkus");
+        assert_eq!(style.name, "tarkus");
+        assert_eq!(style.meter, (5, 4));
+        for want in [(3, 4), (4, 4), (5, 8), (7, 8), (9, 8), (12, 8)] {
+            assert!(
+                style.meters.iter().any(|g| g.meter == want),
+                "no {want:?} groove"
+            );
+        }
+        let text = include_str!("../../../../../assets/tarkus.chord");
+        let prog = chord::parse_progression(text).unwrap();
+        assert!(prog.heterometric());
+        let part = generate::bake(&prog, &style, Role::Drums, 1, &generate::Bake::at(160.0));
+        // Every bar starts on a kick, wherever its length put it.
+        for i in 0..prog.bars.len() {
+            let at = prog.bar_start(i, style.beats_per_bar);
+            assert!(
+                part.iter()
+                    .any(|n| n.note == gm::KICK && (n.start - at).abs() < 0.1),
+                "bar {} ({:?}) has no downbeat at {at}",
+                i + 1,
+                prog.bars[i].meter
+            );
+        }
+        // Nothing of a bar spills into the next.
+        let three = (0..prog.bars.len())
+            .find(|i| prog.bars[*i].meter == Some((3, 4)))
+            .unwrap();
+        let (from, len) = (prog.bar_start(three, 5.0), prog.bar_beats(three, 5.0));
+        assert_eq!(len, 3.0);
+        let groove = style.groove_for(Some((3, 4))).unwrap();
+        let kicks: Vec<f64> = part
+            .iter()
+            .filter(|n| n.note == gm::KICK && n.start >= from - 0.05 && n.start < from + len - 0.05)
+            .map(|n| ((n.start - from) * 4.0).round() / 4.0)
+            .collect();
+        assert_eq!(
+            kicks.first(),
+            groove.kick.first(),
+            "the 3/4 bar plays the 3/4 groove"
+        );
+
+        // The arranger follows it: the meter of the bar the playhead is in.
+        let t = choz_ports::transport();
+        t.set_playing(false);
+        t.set_bpm(120.0);
+        t.set_sample_rate(48_000);
+        t.set_time_signature(5, 4);
+        t.set_bar_origin(0.0);
+        t.set_free_samples(0);
+        let mut arr = Arranger::new(ArrangerSettings {
+            on: true,
+            text: text.into(),
+            ..Default::default()
+        });
+        assert!(arr.error().is_none(), "{:?}", arr.error());
+        arr.play();
+        let mut out = Vec::new();
+        let q = 24_000.0;
+        let at = |beat: f64| t.set_free_samples((beat * q) as u64);
+        let mut seen = Vec::new();
+        let mut beat = 0.0;
+        while beat < arr.beats() {
+            at(beat);
+            arr.tick(Instant::now(), &mut out);
+            if seen.last() != Some(&arr.own_meter()) {
+                seen.push(arr.own_meter());
+            }
+            beat += 0.1;
+        }
+        for want in [
+            (5, 4),
+            (3, 4),
+            (4, 4),
+            (2, 4),
+            (5, 8),
+            (7, 8),
+            (6, 8),
+            (9, 8),
+            (12, 8),
+            (6, 4),
+        ] {
+            assert!(seen.contains(&want), "never in {want:?}: {seen:?}");
+        }
+        let origin = arr.bar_origin_ppq().unwrap();
+        let bar = arr.view().bar - 1;
+        assert!(
+            ((arr.last_pos.unwrap() - origin) - (arr.at - arr.bar_starts[bar])).abs() < 1e-6,
+            "the origin is the bar's downbeat on the clock"
+        );
+        t.set_time_signature(4, 4);
+    }
+
+    /// **A style change is a bar change**, even when the click was still in
+    /// the last style's meter as it happened: a band baked in a waltz's 3
+    /// while the session said 3/4 moves to 4 once the session is back to 4/4,
+    /// instead of counting 3 under a panel that says 4/4.
+    #[test]
+    fn a_style_change_leaves_no_bar_behind() {
+        let _g = crate::test_locks::transport();
+        let t = choz_ports::transport();
+        t.set_time_signature(3, 4); // the click, still following a waltz
+        let mut arr = Arranger::new(ArrangerSettings {
+            on: true,
+            text: "style = strtrock\n| C | F |".into(),
+            ..Default::default()
+        });
+        assert_eq!(arr.view().beats_per_bar, 3.0, "baked in the click's 3/4");
+        t.set_time_signature(4, 4); // the click follows the new style
+        assert!(arr.retune_to_tempo(), "the bar the band counts moved");
+        assert_eq!(arr.view().beats_per_bar, 4.0);
+        assert_eq!(arr.meter(), (4, 4));
+        assert!(!arr.retune_to_tempo(), "and it settles");
+    }
+
+    /// **PLAY on the free clock, then the transport**: the downbeat it was
+    /// waiting for was on the other clock, and the band comes in on the
+    /// transport's — not bars later, where the free clock's number would be.
+    #[test]
+    fn play_follows_the_clock_it_ends_up_on() {
+        let _g = crate::test_locks::transport();
+        let t = choz_ports::transport();
+        t.set_sample_rate(48_000);
+        t.set_bpm(120.0);
+        t.set_time_signature(4, 4);
+        t.set_bar_origin(0.0);
+        t.set_playing(false);
+        t.set_free_samples(24_000 * 37); // the free clock, bars in
+        let mut arr = arranger(Role::Drums, 1);
+        arr.play();
+        let mut out = Vec::new();
+        arr.tick(Instant::now(), &mut out);
+        assert!(out.is_empty(), "waiting for the free clock's downbeat");
+        // The rack's PLAY: the transport rolls from the top.
+        t.set_playing(true);
+        t.set_position_beats(0.0);
+        arr.tick(Instant::now(), &mut out);
+        t.set_position_beats(0.05);
+        arr.tick(Instant::now(), &mut out);
+        assert!(
+            out.iter().any(|(_, e)| matches!(e, ArpEvent::On { .. })),
+            "the band came in on the transport's one"
+        );
+        t.set_playing(false);
+    }
+
+    /// **PLAY comes in on the downbeat it was pressed before**, whatever the
+    /// ticks land on. The wait used to be worked out again every tick and
+    /// moved on a bar whenever no tick hit the downbeat to the millionth of a
+    /// beat — at 285 the band never came in. And pressed on the one, it is
+    /// that bar.
+    #[test]
+    fn play_comes_in_on_the_next_downbeat_whatever_the_ticks() {
+        let _g = crate::test_locks::transport();
+        let t = choz_ports::transport();
+        t.set_playing(false);
+        t.set_sample_rate(48_000);
+        t.set_time_signature(4, 4);
+        t.set_bar_origin(0.0);
+        for (bpm, press, want) in [
+            (285.0f32, 13.37, 16.0),
+            (174.0, 13.37, 16.0),
+            (120.0, 16.05, 16.0),
+            (120.0, 16.3, 20.0),
+        ] {
+            t.set_bpm(bpm);
+            let spb = 48_000.0 * 60.0 / bpm as f64;
+            // The interface's own rate: a tick every 5 ms, never on a beat.
+            let step = 0.005 * bpm as f64 / 60.0;
+            let mut arr = arranger(Role::Drums, 1);
+            let mut beat = press;
+            t.set_free_samples((beat * spb) as u64);
+            arr.play();
+            let mut first = None;
+            let mut out = Vec::new();
+            while beat < press + 12.0 {
+                t.set_free_samples((beat * spb) as u64);
+                out.clear();
+                arr.tick(Instant::now(), &mut out);
+                if out.iter().any(|(_, e)| matches!(e, ArpEvent::On { .. })) {
+                    first = Some(beat);
+                    break;
+                }
+                beat += step;
+            }
+            let first = first.unwrap_or_else(|| panic!("{bpm} bpm: never came in"));
+            // On the downbeat, or at once when pressed on the one.
+            let due = f64::max(want, press);
+            assert!(
+                first >= due - 1e-9 && first - due < 2.0 * step + 1e-6,
+                "{bpm} bpm pressed at {press}: in at {first}, due at {due}"
+            );
+        }
+    }
+
+    /// **PLAY waits for the downbeat.** Pressed a beat and a bit into the
+    /// click's bar, the band's bar one starts on the next "one" — not at the
+    /// press, which put the arranger's bar anywhere inside the metronome's.
+    #[test]
+    fn play_comes_in_on_the_clicks_downbeat() {
+        let _g = crate::test_locks::transport();
+        let t = choz_ports::transport();
+        t.set_playing(false);
+        t.set_bpm(120.0);
+        t.set_sample_rate(48_000);
+        t.set_time_signature(4, 4);
+        let quarter = 24_000u64; // at 120 bpm
+        let at = |q: f64| t.set_free_samples((q * quarter as f64) as u64);
+        let mut arr = arranger(Role::Bass, 1);
+        at(1.3);
+        arr.play();
+        let mut out = Vec::new();
+        for step in 0..26 {
+            at(1.3 + step as f64 * 0.1); // up to 3.8
+            arr.tick(Instant::now(), &mut out);
+        }
+        assert!(out.is_empty(), "played before the downbeat: {out:?}");
+        at(4.0);
+        arr.tick(Instant::now(), &mut out);
+        at(4.05);
+        arr.tick(Instant::now(), &mut out);
+        assert!(!out.is_empty(), "the downbeat brought nothing in");
+        assert_eq!(arr.view().bar, 1, "and it is bar one");
+    }
+
     #[test]
     fn the_session_bar_and_its_grouping_reach_the_part() {
         // The tempo is a global and baking reads it: without the lock another

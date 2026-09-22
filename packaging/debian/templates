@@ -1,0 +1,11 @@
+Template: choz/replace-old-clap
+Type: boolean
+Default: true
+Description: Set aside the old choz CLAP plugins in home folders?
+ These copies were found: ${files}
+ .
+ A CLAP host (REAPER, Bitwig, Carla) loads them before the ones this package
+ installs in /usr/lib/clap, so it keeps running the old version.
+ .
+ If you accept, each one is renamed to *.bak, a name hosts do not load, so it
+ can be put back by hand.

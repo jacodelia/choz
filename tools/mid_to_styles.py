@@ -240,12 +240,24 @@ def style_of(path, rel):
     eighths, sixteenths = swing_of(d, 0.5), swing_of(d, 0.25)
     swing, swing_div = (eighths, 0.5) if eighths else (sixteenths, 0.25 if sixteenths else 0.5)
 
-    loud = [x for x in fold(drum, at, beats, ppq, SNARE) if x[2] >= 55]
     tri = swing > 0.0
-    kick = positions(fold(drum, at, beats, ppq, KICK), bars, tri) or [0.0]
+    # A groove two bars long says so on its drum track (`Var1 Drum 2bar`): its
+    # even bars are the first bar and its odd bars the answer. Opt-in, because
+    # plenty of one-bar grooves vary their odd bars and are not two-bar ones.
+    two_bar = any(n.split()[:2] == [order[0], "Drum"] and "2bar" in n.split()[2:]
+                  for n, _, _ in tracks)
+    bar_of = lambda x: int((x[0] - at) / ppq // beats)
+    even = [x for x in drum if bar_of(x) % 2 == 0] if two_bar else drum
+    odd = [x for x in drum if bar_of(x) % 2 == 1] if two_bar else []
+    half = max(bars // 2, 1) if two_bar else bars
+    loud = [x for x in fold(even, at, beats, ppq, SNARE) if x[2] >= 55]
+    kick = positions(fold(even, at, beats, ppq, KICK), half, tri) or [0.0]
     # The backbeat only: the quiet snares are the ghosts, and they are a rate
     # rather than a position — see `ghost` below.
-    snare = positions(loud, bars, tri)
+    snare = positions(loud, half, tri)
+    kick_b = positions(fold(odd, at, beats, ppq, KICK), half, tri) if two_bar else []
+    snare_b = positions([x for x in fold(odd, at, beats, ppq, SNARE) if x[2] >= 55],
+                        half, tri) if two_bar else []
     cym = sorted({snap(p, tri) for p, *_ in fold(drum, at, beats, ppq, HIHAT | RIDE)})
     gaps = [round(b - a, 4) for a, b in zip(cym, cym[1:]) if 0.1 <= b - a <= 2]
     hats = fold(drum, at, beats, ppq, HIHAT)
@@ -258,9 +270,38 @@ def style_of(path, rel):
     cf = fold(comp, at, beats, ppq)
     cpitch = [n for _, n, _, _ in comp] or [60]
 
+    def groove(sec_at, sec_label):
+        """One `Meter` section: how the rhythm plays a bar of that signature.
+        Half the bars have to agree, not a third — these come from a band
+        playing a piece rather than from a library loop, and a band varies."""
+        name_, n_bars = sec_label.split()[0], int(sec_label.split()[1].rstrip("bar"))
+        n_, d_ = (int(x) for x in sec_label.split()[2].split("/"))
+        beats_ = n_ * 4 / d_
+        end = sec_at + n_bars * beats_ * ppq
+
+        def sec_part(*want):
+            return sorted(x for name, notes, _ in tracks
+                          if name.split()[:1] == [name_] and len(name.split()) > 1
+                          and name.split()[1] in want
+                          for x in notes if sec_at <= x[0] < end)
+        dr, cp = sec_part("Drum", "Percussion"), sec_part("Chord1", "Chord2", "Chord3")
+        loud_ = [x for x in fold(dr, sec_at, beats_, ppq, SNARE) if x[2] >= 55]
+        return {
+            "meter": (n_, d_),
+            "kick": in_bar(positions(fold(dr, sec_at, beats_, ppq, KICK), n_bars, False, 0.5), beats_) or [0.0],
+            "snare": in_bar(positions(loud_, n_bars, False, 0.5), beats_),
+            "hits": in_bar(positions(fold(cp, sec_at, beats_, ppq), n_bars, False, 0.5), beats_),
+        }
+
+    # A heterometric rhythm: a `Meter<n>` section a signature it changes to.
+    meters = sorted((groove(a, n) for a, n in markers if n.split()[0].startswith("Meter")),
+                    key=lambda g: (g["meter"][1], g["meter"][0]))
+    meters = [g for g in meters if g["meter"] != (num, den)]
+
     return {
         "name": slug(rel),
         "tempo": round(bpm),
+        "meters": meters,
         "beats_per_bar": round(beats, 3),
         # The signature as written, which `beats_per_bar` cannot say: 6/8 and
         # 3/4 are both three quarter notes and are not the same bar.
@@ -288,6 +329,7 @@ def style_of(path, rel):
         },
         "drums": {
             "kick": in_bar(kick, beats) or [0.0], "snare": in_bar(snare, beats),
+            "kick_b": in_bar(kick_b, beats), "snare_b": in_bar(snare_b, beats),
             "cymbal": median(gaps) if gaps else 0.0,
             "ride": len(rides) > len(hats),
             # Quiet snares per bar, against the off-eighths there was room for.
@@ -326,7 +368,7 @@ WORDS = [
     ("unplgbld", "unplugged ballad"), ("strqrtet", "string quartet"),
     ("strd_pno", "stride piano"), ("fstbband", "fast big band"),
     ("midbband", "mid big band"), ("slwbband", "slow big band"),
-    ("amrcnrck", "american rock"), ("argcmbia", "argentine cumbia"),
+    ("drumnbass", "drum & bass"), ("tarkus", "tarkus (heterometric)"), ("amrcnrck", "american rock"), ("argcmbia", "argentine cumbia"),
     ("teccmbia", "techno cumbia"), ("grmnmrch", "german march"),
     ("pnrckbld", "piano rock ballad"), ("pianor_r", "piano rock & roll"),
     ("n_o_r_r", "new orleans rock & roll"), ("f_gospel", "fast gospel"),
@@ -417,13 +459,22 @@ def slice_(xs):
     return "&[" + ", ".join(f(x) for x in xs) + "]"
 
 
+def meters_(ms):
+    if not ms:
+        return "&[]"
+    return "&[" + ", ".join(
+        f"MeterGroove {{ meter: ({m['meter'][0]}, {m['meter'][1]}), kick: {slice_(m['kick'])}, "
+        f"snare: {slice_(m['snare'])}, hits: {slice_(m['hits'])} }}" for m in ms) + "]"
+
+
 def emit(styles, out):
     w = ["// Generated by tools/mid_to_styles.py. Do not edit.",
          "//",
          "// Every number is measured off the rhythm of the same name — see the",
          "// script for what each measurement is.",
          "",
-         "use super::style::{Bass, Comp, Drums, Style};",
+         "use super::style::{Bass, Comp, Drums, %sStyle};"
+         % ("MeterGroove, " if any(s.get("meters") for s in styles) else ""),
          "",
          f"pub const ALL: &[Style] = &[",
          ]
@@ -440,12 +491,13 @@ def emit(styles, out):
         human: {f(s['human'])},
         strum: {f(s['strum'])},
         bass: Bass {{ walking: {str(b['walking']).lower()}, density: {f(b['density'])}, approach: {f(b['approach'])}, passing: {f(b['passing'])}, pickup: {f(b['pickup'])}, octave_jump: {f(b['octave_jump'])}, low: {b['low']}, high: {b['high']} }},
-        drums: Drums {{ kick: {slice_(d['kick'])}, snare: {slice_(d['snare'])}, cymbal: {f(d['cymbal'])}, ride: {str(d['ride']).lower()}, ghost: {f(d['ghost'])}, fill_every: {d['fill_every']} }},
+        drums: Drums {{ kick: {slice_(d['kick'])}, snare: {slice_(d['snare'])}, kick_b: {slice_(d['kick_b'])}, snare_b: {slice_(d['snare_b'])}, cymbal: {f(d['cymbal'])}, ride: {str(d['ride']).lower()}, ghost: {f(d['ghost'])}, fill_every: {d['fill_every']} }},
         comp: Comp {{ hits: {slice_(c['hits'])}, density: {f(c['density'])}, hold: {f(c['hold'])}, low: {c['low']}, high: {c['high']} }},
         guitar: None,
         bass_gm: &{list(s['bass_gm'])},
         piano_gm: &{list(s['piano_gm'])},
         guitar_gm: &{list(s['guitar_gm'])},
+        meters: {meters_(s.get('meters', []))},
     }},""")
     w.append("];")
     w.append("")

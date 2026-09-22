@@ -597,6 +597,41 @@ impl std::fmt::Debug for LoopHandle {
 /// so eleven covers the whole range.
 pub const SPLIT_OCTAVES: usize = 11;
 
+/// Zones a [`ZoneMeter`] has room for — more than any source layers.
+pub const ZONE_METERS: usize = 16;
+
+/// The level of each keyboard zone of a layered source, as a linear peak of
+/// its last block: what a mixer strip for one musician of the arranger's band
+/// draws. Written by the audio thread, read by the interface, so atomics.
+pub struct ZoneMeter([std::sync::atomic::AtomicU32; ZONE_METERS]);
+
+impl ZoneMeter {
+    pub fn new() -> Self {
+        Self(std::array::from_fn(|_| {
+            std::sync::atomic::AtomicU32::new(0)
+        }))
+    }
+
+    pub fn publish(&self, zone: usize, peak: f32) {
+        if let Some(a) = self.0.get(zone) {
+            a.store(peak.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub fn get(&self, zone: usize) -> f32 {
+        self.0
+            .get(zone)
+            .map(|a| f32::from_bits(a.load(std::sync::atomic::Ordering::Relaxed)))
+            .unwrap_or(0.0)
+    }
+}
+
+impl Default for ZoneMeter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub trait AudioSource: Send {
     /// Fill `out` (interleaved stereo) with the next block. Returns frames
     /// written; a short/zero return means the source has finished.
@@ -682,6 +717,17 @@ pub trait AudioSource: Send {
     /// Zones are the rack's sound buttons, numbered from 0. Ignored by a source
     /// that answers `false` to [`AudioSource::layers_zones`].
     fn set_zone_program(&mut self, _zone: u8, _bank: u8, _preset: u8) {}
+
+    /// How loud zone `zone` goes into the source's own output, per side:
+    /// `(1.0, 1.0)` is as it plays, `(0.0, 0.0)` is muted. What a mixer strip
+    /// for one musician of a band in one tab moves. Ignored by a source that
+    /// does not layer zones.
+    fn set_zone_mix(&mut self, _zone: u8, _left: f32, _right: f32) {}
+
+    /// Where this source publishes each zone's level, for those strips.
+    fn zone_meter(&self) -> Option<std::sync::Arc<ZoneMeter>> {
+        None
+    }
 
     /// Which zone each octave of the keyboard plays, `None` for the source's
     /// own current program.
@@ -1132,6 +1178,12 @@ pub struct Transport {
     /// 3 over 4 halfway through a change to 6/8 would be reading a bar that
     /// never existed.
     time_sig: std::sync::atomic::AtomicU32,
+    /// Where bars are counted from, in quarter notes on
+    /// [`Transport::position_ppq`]'s scale — `f64` bits. Zero is the plain
+    /// grid every bar has always been on. A chart that changes meter moves it
+    /// to the downbeat of the bar that changed, so a 5/4 after three 4/4 bars
+    /// starts its one where it starts, and not where a fourth 4/4 would have.
+    bar_origin: std::sync::atomic::AtomicU64,
 }
 
 /// How long teardown waits for a lock the plugin's own GUI thread may be
@@ -1188,7 +1240,26 @@ impl Transport {
             sample_rate: std::sync::atomic::AtomicU32::new(48_000),
             playing: std::sync::atomic::AtomicBool::new(false),
             time_sig: std::sync::atomic::AtomicU32::new((4 << 16) | 4),
+            bar_origin: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Count bars from `ppq` on — see the field.
+    pub fn set_bar_origin(&self, ppq: f64) {
+        self.bar_origin
+            .store(ppq.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn bar_origin(&self) -> f64 {
+        f64::from_bits(self.bar_origin.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The downbeat at or before `pos` (quarter notes), on the bar grid that
+    /// starts at [`Self::bar_origin`].
+    pub fn bar_start_at(&self, pos: f64) -> f64 {
+        let bar = self.bar_quarters().max(0.25);
+        let origin = self.bar_origin();
+        origin + ((pos - origin) / bar + 1e-9).floor() * bar
     }
 
     /// Move the clock on by one block. Called from the audio callback, so:
@@ -1349,8 +1420,9 @@ impl Transport {
             return (1, 0.0);
         }
         let ppq = self.ppq();
-        let bars = (ppq / quarters).floor();
-        (bars as i32 + 1, bars * quarters)
+        let start = self.bar_start_at(ppq);
+        let bars = ((start - self.bar_origin()) / quarters).round();
+        (bars as i32 + 1, start)
     }
 }
 

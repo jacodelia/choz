@@ -641,7 +641,7 @@ impl Seq {
         // One grid for every artifact: the step number comes from the shared
         // position rather than from counting durations, so a stall skips a step
         // instead of firing a burst, and the click falls on these boundaries.
-        let Some((index, frac)) = self.grid_step() else {
+        let Some((index, frac, step)) = self.grid_step() else {
             return;
         };
         if self.grid == Some(index) {
@@ -650,12 +650,16 @@ impl Seq {
         // SWING, against a grid whose steps are counted rather than timed: the
         // off-beats are simply not due until they are `swing` of a step late.
         // Nothing is dropped — the step still fires, further in.
-        if index.rem_euclid(2) == 1 && frac < self.swing_offset() as f64 {
+        if step % 2 == 1 && frac < self.swing_offset() as f64 {
             return;
         }
         let first = self.grid.is_none();
         self.grid = Some(index);
-        let step = index.rem_euclid(self.settings.bar_steps() as i64) as usize;
+        if step >= self.settings.bar_steps() {
+            // Past the steps the grid has: a rest until the next downbeat.
+            self.silence(out);
+            return;
+        }
         // A wrap of the bar is a wrap of the part — but landing on step 0
         // because that is where the clock already was is not a wrap, it is where
         // the sequencer came in.
@@ -817,7 +821,14 @@ impl Seq {
     /// the position rather than from counting durations either way, so nothing
     /// drifts, a stall skips a step instead of firing a burst, and the
     /// metronome switched on halfway through lands on these same boundaries.
-    fn grid_step(&self) -> Option<(i64, f64)> {
+    ///
+    /// `(index, frac, step of the bar)`. **The steps are counted from each
+    /// downbeat of the bar the metronome clicks**, not off one grid from zero:
+    /// a bar that is not a whole number of steps (7/8 at quarter steps is 3.5)
+    /// ends on a short step, and the next "one" is the click's. Counted from
+    /// zero, step 0 walked off the downbeat by the leftover every bar — and a
+    /// bar with more steps than the grid holds (7/4 at 1/16) did the same.
+    fn grid_step(&self) -> Option<(i64, f64, usize)> {
         let transport = choz_ports::transport();
         // Started by the transport and the transport has not begun to roll:
         // wait for it rather than counting the free clock, which would play the
@@ -829,8 +840,19 @@ impl Seq {
         if step_q <= 0.0 {
             return None;
         }
-        let pos = transport.position_ppq() / step_q;
-        Some((pos.floor() as i64, pos - pos.floor()))
+        let bar_q = transport.bar_quarters().max(step_q);
+        // From the transport's bar origin: a chart that changed meter moved
+        // where the one is.
+        let pos = transport.position_ppq() - transport.bar_origin();
+        let bar = (pos / bar_q + 1e-9).floor();
+        let into = ((pos - bar * bar_q) / step_q).max(0.0);
+        let step = into.floor();
+        let per_bar = (bar_q / step_q - 1e-9).ceil() as i64;
+        Some((
+            bar as i64 * per_bar + step as i64,
+            into - step,
+            step as usize,
+        ))
     }
 }
 
@@ -863,6 +885,43 @@ mod tests {
         t.set_bpm(120.0);
         t.set_time_signature(4, 4);
         t.set_free_samples(0);
+    }
+
+    /// **The sequencer's "one" is the click's downbeat, in any meter.** A 7/8
+    /// bar at quarter steps is three and a half steps: counting the steps round
+    /// the bar walked step 0 off the downbeat by half a step every bar.
+    #[test]
+    fn step_one_lands_on_every_downbeat_in_seven_eight() {
+        let _g = crate::test_locks::transport();
+        stopped_at_120();
+        let t = choz_ports::transport();
+        t.set_time_signature(7, 8);
+        let mut seq = Seq::new(SeqSettings {
+            on: true,
+            div: crate::artifacts::arp::TimeDiv::Quarter,
+            ..Default::default()
+        });
+        seq.settings.parts[0][0] = 0b1; // step 0 only
+        seq.play();
+        let t0 = Instant::now();
+        let mut hits = Vec::new();
+        // 10 ms at a time for eight bars of 7/8 (1.75 s each at 120).
+        for ms in (0..14_000u64).step_by(10) {
+            let mut out = Vec::new();
+            seq.tick(clock_at(t0, ms), &mut out);
+            if out.iter().any(|e| matches!(e, ArpEvent::On { .. })) {
+                hits.push(t.position_ppq());
+            }
+        }
+        assert_eq!(hits.len(), 8, "one downbeat a bar: {hits:?}");
+        for (i, q) in hits.iter().enumerate() {
+            let bar = i as f64 * 3.5;
+            assert!(
+                (q - bar).abs() < 0.05,
+                "bar {i}'s one at {q}, the click's at {bar}"
+            );
+        }
+        t.set_time_signature(4, 4);
     }
 
     /// **PAUSE keeps the part and the place in the chain; PLAY starts the song

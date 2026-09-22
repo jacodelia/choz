@@ -9,7 +9,20 @@
 # "usually".
 set -e
 
+# Before anything is printed: debconf talks to this script over its stdout.
+if [ -e /usr/share/debconf/confmodule ]; then
+    . /usr/share/debconf/confmodule
+fi
+
 if [ "$1" = "configure" ]; then
+    # The old bundles the `config` script asked about — see `templates`.
+    if command -v db_get >/dev/null 2>&1 && db_get choz/replace-old-clap && [ "$RET" = true ]; then
+        for f in /root/.clap/choz.clap /root/.clap/choz-rack.clap \
+                 /home/*/.clap/choz.clap /home/*/.clap/choz-rack.clap; do
+            [ -f "$f" ] || continue
+            mv -f "$f" "$f.bak" && echo "choz: set aside $f as $f.bak" >&2
+        done
+    fi
     command -v update-desktop-database >/dev/null 2>&1 &&
         update-desktop-database -q /usr/share/applications || true
     command -v update-mime-database >/dev/null 2>&1 &&
@@ -20,4 +33,5 @@ if [ "$1" = "configure" ]; then
         gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor || true
 fi
 
+command -v db_stop >/dev/null 2>&1 && db_stop
 exit 0

@@ -61,6 +61,42 @@ pub fn set_embedded() {
     EMBEDDED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// **Polyphony**: how many voices one instrument may sound at once — a
+/// SoundFont tab and a sampler tab each. Settings → AUDIO sets it; it is read
+/// when an instrument is built, so a change applies to what is loaded next.
+///
+/// Why these three numbers:
+///
+/// * **256 by default** — FluidSynth's own default, and what a SoundFont tab
+///   needs once the arranger plays a whole band on it: four musicians, presets
+///   that layer two or three voices a note, and release tails that ring into
+///   the next chord. The old 64 was chosen for one hand on the sustain pedal.
+/// * **16 at least** — two hands of chords on a layered preset still fit, and
+///   below that a held pedal steals the notes being played.
+/// * **1024 at most** — a voice pool costs when it *fills*, and it fills with
+///   the pedal down: measured at 64 voices a block went from 233 µs to 330 µs
+///   once the pool was full; at 1024 that is sixteen times the voices on one
+///   tab, past what a 256-frame block leaves room for on a laptop. No GM file
+///   asks for more.
+pub const POLYPHONY_MIN: u16 = 16;
+pub const POLYPHONY_DEFAULT: u16 = 256;
+pub const POLYPHONY_MAX: u16 = 1024;
+static POLYPHONY: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(POLYPHONY_DEFAULT);
+
+/// Set the voices an instrument built from now on may sound — clamped to
+/// [`POLYPHONY_MIN`]..=[`POLYPHONY_MAX`].
+pub fn set_polyphony(voices: u16) {
+    POLYPHONY.store(
+        voices.clamp(POLYPHONY_MIN, POLYPHONY_MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub fn polyphony() -> u16 {
+    POLYPHONY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether spawning a child of this executable would start something that is
 /// not a choz worker.
 pub fn is_embedded() -> bool {
@@ -654,7 +690,19 @@ pub(crate) mod test_locks {
         t.set_playing(false);
         t.set_bpm(choz_ports::Transport::DEFAULT_BPM);
         t.set_time_signature(4, 4);
+        t.set_bar_origin(0.0);
         t.rewind();
+        // And the free clock: `rewind` is the transport's, and the free one is
+        // what a stopped test counts — left wherever the last render put it,
+        // "the first beat" landed mid-beat one run in six.
+        t.set_free_samples(0);
+        // The click is on the same clock and just as global: a test that
+        // switched it on and then failed left every render after it with a
+        // metronome in it — "an empty rack is silent", and a dozen more, all
+        // at once, one run in three.
+        let m = crate::artifacts::metronome::metronome();
+        m.set_on(false);
+        m.set_groups(&[]);
     }
 
     /// Held while a test reads or clears a meter — the output meter, which

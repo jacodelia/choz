@@ -209,6 +209,15 @@ pub struct AudioSettings {
     /// default.
     #[serde(default = "default_time_sig")]
     pub time_sig: (u16, u16),
+    /// While an arranger plays, the session counts **its** bar — the chart's
+    /// meter or the style's — so a waltz clicks in 3. `time_sig` stays the
+    /// player's own and comes back when the band stops. On by default.
+    #[serde(default = "default_true")]
+    pub follow_arranger: bool,
+    /// Voices one instrument may sound at once — see `choz_engine::polyphony`
+    /// for the bounds and why. Added later, hence the default.
+    #[serde(default = "default_polyphony")]
+    pub polyphony: u16,
     /// Whether the feedback guard is armed — see `choz_engine::feedback`. On
     /// by default, and added later, so an old `ui.json` gets it armed: a guard
     /// that is off because the file predates it is a guard nobody has.
@@ -240,6 +249,13 @@ fn default_true() -> bool {
     true
 }
 
+fn default_polyphony() -> u16 {
+    choz_engine::POLYPHONY_DEFAULT
+}
+
+/// The polyphony steps Settings offers, inside the engine's bounds.
+pub const POLYPHONY_STEPS: &[u16] = &[16, 32, 64, 128, 256, 512, 1024];
+
 fn default_time_sig() -> (u16, u16) {
     (4, 4)
 }
@@ -267,6 +283,8 @@ impl Default for AudioSettings {
             loop_budget_mib: default_loop_budget(),
             bpm: default_bpm(),
             time_sig: default_time_sig(),
+            follow_arranger: true,
+            polyphony: default_polyphony(),
             feedback_guard: true,
             direct_tabs: default_direct_tabs(),
         }
@@ -780,6 +798,7 @@ impl UiSettings {
     pub fn apply(&self) {
         choz_ports::transport().set_bpm(self.audio.bpm);
         choz_ports::transport().set_time_signature(self.audio.time_sig.0, self.audio.time_sig.1);
+        choz_engine::set_polyphony(self.audio.polyphony);
         crate::i18n::set_language(self.language);
         crate::views::theme::set_text_color(self.color());
         crate::views::theme::set_border_color(self.border());
