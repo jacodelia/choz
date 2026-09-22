@@ -20,5 +20,4 @@ required-features = ["pd"]
 
 [dependencies]
 anyhow.workspace = true
-choz-ports.workspace = true
 choz-plugin-sandbox.workspace = true

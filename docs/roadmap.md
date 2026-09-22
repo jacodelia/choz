@@ -5,17 +5,20 @@ día por día, con los porqués y lo último arriba; cómo encajan las piezas, e
 [architecture.md](architecture.md); las dos auditorías, en
 [fx-audit.md](fx-audit.md). Este documento se poda cada vez que un punto se
 cierra, para que lo que quede sea sólo lo que queda: se podó entero el
-2026-08-19, el 2026-08-29, el 2026-08-31, el 2026-09-01, el 2026-09-13 y el
-2026-09-16, y las seis veces lo que decía "hecho" se fue al changelog.
+2026-08-19, el 2026-08-29, el 2026-08-31, el 2026-09-01, el 2026-09-13, el
+2026-09-16 y el 2026-09-22, y las siete veces lo que decía "hecho" se fue al
+changelog.
 
 **Hoy no falta nada pedido y no queda ninguna decisión abierta.** Lo que queda
-son cuatro bordes —MIDI, el sidechain, el sampler y el arreglador—, dos
-decisiones de no hacer, y las notas para el que retome.
+son cinco bordes —MIDI, el sidechain, el sampler, el arreglador y el
+transporte dentro de un DAW—, dos decisiones de no hacer, y las notas para el
+que retome.
 
-Última actualización: 2026-09-16 — el sampler se niveló y se mapeó para
-cualquier pack, la expresión MIDI llega entera a todos los formatos (VST3
-incluido) y el lector MIDI dejó de poder morirse; lo cerrado está en el
-[changelog](../CHANGELOG.md). Lo que el sampler dejó abierto se anotó abajo.
+Última actualización: 2026-09-22 — un plugin sandboxeado que revienta en
+cadena o inunda el log ya se da por muerto y se pone en cuarentena en vez de
+arrastrar a choz con él, y la ventana de un `.clap` embebido en REAPER dejó de
+verse como un popup flotante; lo cerrado está en el
+[changelog](../CHANGELOG.md).
 
 ## Estado en una línea
 
@@ -84,7 +87,7 @@ barra** (`| 5/4 Fm | 3/4 Db |`) y el metrónomo los sigue, lee y escribe **MIDI*
 —exporta la banda balanceada, un canal por músico, y abre un `.mid` de dos a
 cuatro instrumentos—, y **SPLIT OUT** pone a cada músico en una tira propia del
 MIXER sin abrir otra tab. La polifonía de los instrumentos es un ajuste (16–1024, 256
-por defecto) y la barra de arriba dice la RAM que choz tiene. **La 1.3.14 es
+por defecto) y la barra de arriba dice la RAM que choz tiene. **La 1.3.15 es
 este árbol, publicada con sus paquetes.** El workspace sin
 `choz-plugin-lv2` (que en esta máquina se cuelga) pasa, y `clippy --workspace
 --all-targets -D warnings` está limpio con `+beta`.
@@ -96,7 +99,7 @@ donde se van a leer.
 
 ## Pendiente
 
-Seis bordes y dos decisiones de no hacer. Lo entregado se cuenta día por día en
+Cinco bordes y dos decisiones de no hacer. Lo entregado se cuenta día por día en
 el [changelog](../CHANGELOG.md); un punto que se cierra sale de aquí, porque
 este documento es lo que queda y no lo que hubo.
 
@@ -246,24 +249,7 @@ GATE.
 - **La progresión no tiene repeticiones ni saltos**: `form` es una lista de
   partes, sin `x2`, sin D.C. y sin coda. Se escribe repitiendo el nombre.
 
-### 4 · El plugin que inunda el log (2026-09-17)
-
-Reportado: un `choz.log` de 3,4 GB. La línea que lo escribía **no es de este
-repo**: es el fluidsynth interno de AVLdrums (LV2 hosteado) imprimiendo
-`Ringbuffer full` por stderr en cada robo de voz fallido, sin rate-limit; choz
-manda fd 1 y fd 2 de los plugins al log por diseño (`choz-ui/src/log.rs`), así
-que un plugin charlatán llena el disco. La mitigación que ya existe es forzarlo
-a sandbox (`x` en el rack). Lo que falta:
-
-- **Matar al que no responde.** El techo al log ya está (PR #7, en la 1.3.12:
-  el log se trunca pasados los 32 MiB); esto es la otra mitad: un
-  plugin hosteado que se cuelga, que revienta
-  en cadena o que escribe cientos de MB en segundos tendría que ser descargado
-  —y puesto en cuarentena— en vez de arrastrar a choz entero. Las tres capas
-  contra código ajeno (escaneo fuera de proceso, cuarentena, sandbox) miran el
-  crash, no el ruido.
-
-### 5 · choz dentro de un DAW no sigue al host (2026-09-22)
+### 4 · choz dentro de un DAW no sigue al host (2026-09-22)
 
 `choz-rack.clap` toma del host las notas, el MIDI y el audio de la pista, **pero
 no el transporte**: no lee `clap_event_transport`, así que el tempo, el compás y

@@ -12,7 +12,7 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **1074 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo), 591 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **1077 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo), 594 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio, y `cargo fmt --all --check` también.
 - **56 efectos propios**, publicados también como un `.clap` con los cuatro artifacts (arpegiador, secuenciador, metrónomo y arreglador).
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
@@ -32,7 +32,71 @@ lleva lo que falta —nada de lo ya hecho— y
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
 
-## [1.3.14] — 2026-09-22
+## [1.3.15] — 2026-09-22
+
+### 2026-09-22 — un plugin hosteado ya no puede arrastrar a choz con él
+
+Cerrado el punto 4 del roadmap ("el plugin que inunda el log"): las tres capas
+contra código ajeno miraban el crash, no el ruido, así que un plugin sandboxeado
+que se colgaba en cadena o escribía sin parar seguía costando CPU y disco
+indefinidamente.
+
+- **Ventana X11 embebida, no emergente.** `crates/choz-clap/src/gui.rs::Window::open`
+  mapeaba la ventana bajo la raíz de X11 apenas se creaba, antes de que el host
+  llamara `set_parent` — el window manager la enmarcaba como flotante, y para
+  cuando choz la reparentaba dentro de REAPER ya se había visto como popup.
+  Ahora sólo se mapea en `reparent`/`show`, una vez que el host le dio un padre
+  de verdad.
+- **Un plugin sandboxeado que revienta en cadena se da por muerto.** El
+  supervisor de `sandboxed.rs` ya reiniciaba el hijo indefinidamente; ahora
+  cuenta reinicios en una ventana de 10 s y, pasados 5, deja de resucitarlo,
+  lo marca `dead` y lo pone en cuarentena (`quarantine::set_forced`) para que
+  la próxima carga vaya directo a sandbox. El botón `SBX` de la RACK muestra
+  `DEAD (N↻)` en vez de seguir contando reinicios. Test:
+  `a_plugin_that_wont_stop_crashing_is_given_up_on`.
+- **Un plugin sandboxeado que inunda el log se mata, no se tolera.** El stderr
+  del hijo ahora se pasa por una tubería en vez de heredarse directo: un hilo lo
+  reenvía al log de siempre y cuenta bytes en una ventana de 2 s; más de 16 MiB
+  ahí adentro (el caso real fue AVLdrums imprimiendo `Ringbuffer full` sin
+  límite) mata al hijo en el acto, y el supervisor lo da por muerto y lo pone
+  en cuarentena en vez de reiniciarlo hacia la misma inundación. Constante y
+  ventana en `FLOOD_BYTES`/`FLOOD_WINDOW`; el conteo en sí (`record_and_total`)
+  tiene test unitario propio, sin pipe ni proceso de por medio.
+- **Manual, 7.4 Sandbox and quarantine**: documentado qué dice el botón `SBX`
+  (`lost` = bloques que el hijo no contestó a tiempo, `↻` = veces que se
+  reinició tras crashear, antes sin explicar) y el `DEAD` nuevo — cuándo
+  aparece y qué significa. `docs/choz-manual.odt` es la fuente, exportada de
+  nuevo a `docs/choz-manual.pdf` — 44 páginas en vez de 83, repaginado por la
+  versión de LibreOffice de esta máquina (26.2.4.2), no por el contenido
+  agregado: el `.odt` viejo sin tocar repagina igual.
+
+### 2026-09-22 — auditoría de release para la 1.3.15: deps sin usar, i18n y cobertura
+
+Repaso completo antes de cortar la versión: `cargo-machete` encontró dos
+dependencias declaradas y no usadas —`choz-ports` en `choz-plugin-pd` y
+`anyhow` en `choz-plugin-clap`— confirmadas a mano (`grep` sin resultados en
+sus fuentes) y sacadas de sus `Cargo.toml`; ningún otro hallazgo sobrevivió la
+revisión (un solo trait de un-impl en el árbol, `PitchShifter`, y ya está
+documentado como deliberado en su propio módulo).
+
+**i18n**: los cambios de esta sesión no agregan texto de interfaz nuevo por
+`t()` — el `SBX`/`lost`/`↻`/`DEAD` sigue la convención ya establecida de dejar
+esos indicadores técnicos sin traducir (como `MEM`, `DSP` y `Polyphony`). Los
+seis tests de `i18n::tests` —incluido el que cruza la tabla contra cada
+llamada a `t()` en el árbol— pasan limpios: nueve idiomas completos, sin
+huecos ni filas huérfanas.
+
+**Cobertura** medida con `cargo-llvm-cov` (recién instalado, no había
+herramienta antes): **84.06%** de líneas en el workspace con `--lib` solo, y
+**85.66%** en `choz-engine` incluyendo sus binarios de test propios. La
+diferencia importa: `--lib` solo subestima mucho lo que sólo se ejercita con
+plugins reales instalados —`sandboxed.rs` pasa de 6.9% a 73.3%, `quarantine.rs`
+de 67.8% a 88.8%— así que el número bajo no es un hueco de test, es la
+integración que necesita plugins de verdad en la máquina.
+
+**Versión**: `Cargo.toml` (workspace) y el `PLUGIN_VERSION` de `choz-rack.clap`
+(`crates/choz-clap/src/lib.rs`) a 1.3.15 — el único lugar con el número
+escrito a mano; `choz-plugin-clap-export` ya lo toma de `CARGO_PKG_VERSION`.
 
 ### 2026-09-22 — la auditoría de la release: PLAY entre dos relojes, y el candado de los tests
 

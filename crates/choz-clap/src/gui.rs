@@ -121,7 +121,10 @@ impl Window {
 
         let gc = conn.generate_id()?;
         conn.create_gc(gc, window, &CreateGCAux::new().font(font))?;
-        conn.map_window(window)?;
+        // Not mapped here: with no parent yet this would map straight onto the
+        // root window, and the window manager frames it as a floating popup
+        // before the host ever calls `set_parent`. `reparent`/`show` map it
+        // once the host has actually given it a home.
         conn.flush()?;
 
         let mapping = conn

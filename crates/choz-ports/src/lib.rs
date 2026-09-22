@@ -816,6 +816,11 @@ pub struct SandboxStatus {
     pub missed: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// How many times the plugin crashed and was restarted.
     pub restarts: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Set once the supervisor gives up: the child crashed too many times too
+    /// fast, so it is left dead instead of being restarted into another crash
+    /// a few milliseconds later. The slot stays silent, on purpose, rather
+    /// than dragging choz through a restart loop.
+    pub dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SandboxStatus {
@@ -825,6 +830,10 @@ impl SandboxStatus {
 
     pub fn restarts(&self) -> u64 {
         self.restarts.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn dead(&self) -> bool {
+        self.dead.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

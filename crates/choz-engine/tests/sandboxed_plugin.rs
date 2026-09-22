@@ -74,9 +74,63 @@ fn main() {
 
     a_plugin_that_cannot_be_destroyed_is_sandboxed_automatically();
     a_killed_child_comes_back_by_itself();
+    a_plugin_that_wont_stop_crashing_is_given_up_on();
     an_effect_processes_through_the_sandbox();
     a_plugin_the_user_asked_for_runs_out_of_process();
     only_the_sandbox_offers_an_editor_choz_itself_refuses();
+}
+
+/// The other half of "a killed child comes back": one that keeps dying, fast,
+/// is not chased forever. Past the crash-loop threshold the supervisor stops
+/// restarting it, marks it dead, and quarantines it so the next load goes
+/// straight to a sandbox instead of repeating the discovery.
+fn a_plugin_that_wont_stop_crashing_is_given_up_on() {
+    let fx = std::path::Path::new("/usr/lib/vst/ZamComp-vst.so");
+    if !fx.exists() {
+        return;
+    }
+    let state = std::env::temp_dir().join(format!("choz_crashloop_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&state);
+    std::fs::create_dir_all(&state).unwrap();
+    unsafe { std::env::set_var("XDG_STATE_HOME", &state) };
+
+    let mut plug = SandboxedPlugin::build(PluginFormat::Vst2, fx, "", SR, FRAMES)
+        .expect("plugin should start");
+    let mut out = vec![0.0f32; (FRAMES * 2) as usize];
+    plug.render(&mut out, SR);
+
+    // More kills than the supervisor tolerates in its window (5, see
+    // `CRASH_LOOP_RESTARTS`): each one lands well inside the 10 s window as
+    // long as the machine can spawn a child in a fraction of a second.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline && !plug.status().dead() {
+        let pid = plug.child_pid();
+        if pid > 0 {
+            // SAFETY: our own child.
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+        plug.render(&mut out, SR);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        plug.status().dead(),
+        "a plugin crashing this fast should have been given up on"
+    );
+    assert!(
+        choz_engine::quarantine::forced(PluginFormat::Vst2, fx, ""),
+        "giving up on it should quarantine it for next time"
+    );
+
+    // Dead means dead: rendering keeps working (silence), it does not spawn
+    // yet another child.
+    for _ in 0..10 {
+        plug.render(&mut out, SR);
+    }
+    assert!(out.iter().all(|s| s.is_finite()));
+
+    let _ = std::fs::remove_dir_all(&state);
+    drop(plug);
+    println!("test a_plugin_that_wont_stop_crashing_is_given_up_on ... ok");
 }
 
 /// guitarix's X11 UIs segfault whatever loads them, so choz's own process is

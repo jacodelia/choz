@@ -10,7 +10,7 @@ Built with Rust, ratatui and cpal. Provides a TUI for managing note inputs, inst
 
 ## Status
 
-**1.3.14.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
+**1.3.15.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
 LADSPA, DSSI, VST2, VST3 and Pure Data patches are really hosted** — instruments
 and audio effects, with their own parameters and their own windows — choz's own
 56 effects and all four artifacts — the arpeggiator, the step sequencer, the
@@ -323,7 +323,7 @@ headroom for plugin DSP at small buffer sizes.
 ## Architecture
 
 ```
-choz/                      11 crates, version 1.3.14
+choz/                      11 crates, version 1.3.15
 ├── crates/
 │   ├── choz-ports/         RT-safe traits every host implements: AudioSource,
 │   │                       FxProcessor, PluginEditor, PluginParam, SandboxStatus
@@ -381,7 +381,7 @@ ring so they are freed off the RT thread.
 
 | | |
 |---|---|
-| choz | **1.3.14** |
+| choz | **1.3.15** |
 | Rust edition | 2021 (`choz-plugin-lv2` is 2024) |
 | Toolchain tested | rustc 1.97.1 |
 | Platform | Linux. ALSA/JACK/PipeWire. Released for x86-64, aarch64 and armv7 |
