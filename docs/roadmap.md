@@ -5,14 +5,17 @@ día por día, con los porqués y lo último arriba; cómo encajan las piezas, e
 [architecture.md](architecture.md); las dos auditorías, en
 [fx-audit.md](fx-audit.md). Este documento se poda cada vez que un punto se
 cierra, para que lo que quede sea sólo lo que queda: se podó entero el
-2026-08-19, el 2026-08-29, el 2026-08-31 y el 2026-09-01, y las cuatro veces lo
-que decía "hecho" se fue al changelog.
+2026-08-19, el 2026-08-29, el 2026-08-31, el 2026-09-01, el 2026-09-13 y el
+2026-09-16, y las seis veces lo que decía "hecho" se fue al changelog.
 
-**Hoy no falta nada pedido.** Lo que queda son tres cosas sin cerrar —un test
-que no existe, una decisión de diseño y un fallo intermitente sin explicar—, dos
+**Hoy no falta nada pedido y no queda ninguna decisión abierta.** Lo que queda
+son cuatro bordes —MIDI, el sidechain, el sampler y el arreglador—, dos
 decisiones de no hacer, y las notas para el que retome.
 
-Última actualización: 2026-09-07 (1.3.11 publicada).
+Última actualización: 2026-09-16 — el sampler se niveló y se mapeó para
+cualquier pack, la expresión MIDI llega entera a todos los formatos (VST3
+incluido) y el lector MIDI dejó de poder morirse; lo cerrado está en el
+[changelog](../CHANGELOG.md). Lo que el sampler dejó abierto se anotó abajo.
 
 ## Estado en una línea
 
@@ -27,7 +30,7 @@ a notas), AutoTune, un arpegiador y un secuenciador por tab —y **dos tabs con
 secuenciador arrancan en el mismo groove**, con o sin transporte—; 56 efectos
 propios (**la suite está completa y auditada**: se apilan sin pasarse de escala,
 su dry/wet es una sola ley, y los 56 publican su lista entera de mandos), que
-además se publican como un `.clap` —los dos artifacts incluidos— para usarlos en
+además se publican como un `.clap` —los cuatro artifacts incluidos— para usarlos en
 cualquier otro host; un looper multipista con sus tiras de canal, exportación a
 WAV y **tomas que el proyecto guarda** —resampleadas si el equipo cambió de
 frecuencia—; hay guardia de acople en la entrada; el mixer tiene un
@@ -65,9 +68,21 @@ cliente y un solo hilo que nunca se para. Y choz **también se carga entero
 dentro de un DAW** como instrumento CLAP, con su ventana X11 y dieciséis
 salidas estéreo, una por tab. Una tab puede **salir del master
 por un puerto propio**, uno por tab en un lugar fijo y del ancho que la tab
-tenga, que es lo que Ardour graba pista por pista. **La 1.0.0 está publicada y
-sus paquetes verificados; la 1.3.11 es este árbol.**
-881 tests, `clippy --workspace --all-targets -D warnings` limpio.
+tenga, que es lo que Ardour graba pista por pista. El sampler de carpetas
+**corta por transientes, guarda su mapa en un `.smpreset` que se edita y se
+relinkea, y cambia de articulación por keyswitch**, **se nivela solo —contra el
+rack y nota por nota dentro de cada capa— y toca una nota grabada en cada tecla
+que alguna capa grabó**, con cualquier pack: un archivo suelto, nombres con
+guiones, capas `v1…vN`, la nota del chunk `smpl` o la otra convención de
+octava; el arreglador **tiene forma
+—partes, intro y final—, **210 estilos, todos medidos de los acompañamientos
+en `arranger/rhythms`** por `tools/mid_to_styles.py`, su progresión se arma
+dentro de la TUI —una grilla de
+compases, un acorde por subdivisión de la agrupación— y sale
+en el `.clap` como cuarto artifact.** **La 1.0.0 está publicada y
+sus paquetes verificados; la 1.3.12 es este árbol.**
+1045 tests (el workspace sin `choz-plugin-lv2`, que en esta máquina se cuelga),
+`clippy --workspace --all-targets -D warnings` limpio con `+beta`.
 
 Las comprobaciones con hardware delante quedaron dichas en los gotchas, que es
 donde se van a leer.
@@ -76,13 +91,9 @@ donde se van a leer.
 
 ## Pendiente
 
-**Ningún borde abierto.** Todo lo que se pidió está hecho y contado día por día
-en el [changelog](../CHANGELOG.md). Lo que queda son **tres cosas sin cerrar**
-—un test que no existe, una decisión que no es mía y un fallo que no supe
-reproducir—, los bordes que el sidechain deja fuera, y después las dos piezas
-que se decidió no hacer. Un
-punto que se cierra sale de aquí: este documento es lo que queda, no lo que
-hubo.
+Cinco bordes y dos decisiones de no hacer. Lo entregado se cuenta día por día en
+el [changelog](../CHANGELOG.md); un punto que se cierra sale de aquí, porque
+este documento es lo que queda y no lo que hubo.
 
 Las dos auditorías —la de DSP y la de guardado— viven enteras en
 [fx-audit.md](fx-audit.md), con el archivo y la línea de cada hallazgo: la
@@ -90,60 +101,18 @@ sección 6 tiene lo único que se midió y se decidió **no** arreglar (el peine
 shifter de voces), y la 7 lo que hay que saber antes de tocar el guardado de un
 efecto. No se repiten acá.
 
-### 0 · Nada comprueba que un `process_block` no alloca (abierto el 2026-09-01)
+### 0 · MIDI: los bordes que quedan (2026-09-16)
 
-**Falta un test, no una decisión.**
+- **VST3 sólo pide el mapa MIDI del bus 0, canal 0**, que es por donde choz
+  manda sus notas; un plugin que mapea distinto por canal no lo ve. Un CC que
+  llega por el mapa mueve el procesador, no la ventana del plugin.
+- **El orden de notas y controles de `drain_midi` no tiene test**: los tests de
+  la UI no levantan el motor, y verlo desde ahí pide un motor observable.
 
-La regla está escrita en [fx-audit.md](fx-audit.md) —"sin allocations en
-`process_block`"— y se rompió sin que nadie se enterara: tres de los diez
-efectos nuevos copiaban el bloque con `buf.to_vec()` para filtrarlo, y la suite
-entera pasaba en verde. Lo cazó la lectura del diff antes de publicar, que es
-exactamente el mecanismo que no escala.
+### 1 · Sidechain: lo que queda fuera del gate (2026-09-02)
 
-Lo que haría falta es un allocador de test que cuente asignaciones y un test que
-corra cada built-in un bloque con el contador armado. `std::alloc::System`
-envuelto en un `GlobalAlloc` propio detrás de un `#[cfg(test)]` es la forma
-barata; el detalle feo es que el contador es global al proceso y el harness
-corre en paralelo, así que hay que tomarlo con el mismo candado que el resto de
-los globales (`crate::test_locks`).
-
-Hasta entonces: **el patrón está en la sección 8 de fx-audit**, y copiarlo es lo
-que hay.
-
-### 1 · El CC 7 que llega al SoundFont (abierto desde el 2026-08-31)
-
-**Falta una decisión, no código.**
-
-`Sf2Synth::control_change` reparte cualquier CC entrante a los nueve canales de
-la tab. Con el CC 7 —volumen de canal GM— eso significa que **el slider de un
-teclado es un segundo control de volumen peleando con el fader VOL de la tab**,
-y peleando a escondidas: no se dibuja en ningún lado y no se guarda en el
-proyecto.
-
-Lo que se arregló el 2026-08-31 fue la mitad incoherente: el canal 0 se quedaba
-con el CC y las zonas volvían a 100 en el siguiente `push_split`, así que un
-sonido quedaba 15,2 dB por debajo de sus vecinos. Ahora los nueve pierden la
-pelea igual — el CC 7 dura hasta el próximo cambio de programa, en todos.
-
-Eso es coherente pero no es obviamente lo correcto. Lo que encaja con el resto
-de choz es que **el CC 7 no llegue al sintetizador**: el volumen de la tab es su
-fader, y un mando de un controlador se ata a lo que uno quiera con MIDI learn,
-como cualquier otro. Cambia comportamiento —quien hoy usa el slider de su
-teclado sobre una tab de SF2 lo perdería hasta aprenderlo— así que no se hizo
-solo.
-
-Las dos salidas, para el que retome:
-
-| | Qué pasa con el slider del teclado |
-|---|---|
-| **Como está** | Baja el SoundFont hasta el próximo cambio de sonido, y después vuelve solo. |
-| **Filtrando el CC 7** | No hace nada hasta que se lo aprende; aprendido, mueve lo que se le haya atado (el VOL de la tab, lo natural). |
-
-### 2 · Sidechain: lo que quedó fuera del gate (2026-09-02)
-
-El gate **ya mueve un mando** además del dry/wet — está contado en el
-[changelog](../CHANGELOG.md). Lo que sigue sin existir, dicho aquí para que no
-se vuelva a auditar desde cero:
+Lo que sigue sin existir, dicho aquí para que no se vuelva a auditar desde
+cero:
 
 - **No hay ruta de audio entre canales.** La entrada de una tab son jacks de
   captura (`set_slot_in`), la salida va a main o a uno de los cuatro grupos, y
@@ -167,35 +136,132 @@ Nota de nombres, que sigue en pie: `fx/sidechain.rs::SidechainDuck` se llama
 llama nadie** en todo el árbol—, mientras que lo que sí hace sidechain se llama
 GATE.
 
-### 3 · `cargo test --workspace` falla de a varios, de tanto en tanto
+### 2 · El sampler de carpetas (2026-09-16)
 
-**Visto dos veces, sin explicar y sin nombres**: una corrida con **14** tests de
-`choz-engine` fallando de golpe y otra con **7**. Las dos veces la corrida
-siguiente pasó limpia, y por crate (`-p choz-engine`) nunca falló.
+- **El streaming no tiene anillo por voz — y ya está medido.** Una página
+  desalojada cuesta un fault en el hilo de audio (`instruments/stream.rs` lo
+  dice de sí mismo). El 2026-09-16 dejó de ser teoría: el log cuenta los fallos
+  de página mayores de los bloques tardíos, y la sesión con la flauta de
+  Philharmonia dio 21 avisos, todos esperando al disco. Lo que falta es un hilo
+  lector con un anillo por voz y robo de voz cuando el disco no llega.
+- **`choz-sampler` no es un plugin CLAP propio.** Dentro de un DAW sólo existe
+  dentro del rack entero (el instrumento CLAP "choz"), con las mismas reglas
+  porque viven en `choz-engine`; el `.clap` de efectos y artifacts no lo trae.
+  Para cargarlo solo en cualquier DAW falta un plugin con la carpeta en su
+  estado y sus knobs como parámetros.
+- **Una capa fina se descarta entera** (`map::dense_layers`). Lo fino sería
+  conservarla en las teclas cercanas a sus notas y caer a la vecina en el
+  resto; pide una zona por tecla por capa, no por raíz.
+- **Del chunk `smpl` sólo se lee la nota**, y sólo en archivos sueltos: sus
+  puntos de loop no se usan y un WAV dentro de un `.zip` va al detector.
+- **Los loops no se buscan solos**: LOOP ST y LOOP END empiezan en toda la
+  región, y un sonido con ataque largo necesita que alguien corra los puntos a
+  la parte sostenida.
+- **Notas escritas como número MIDI** (`piano_060.wav`) no se leen, a propósito:
+  en los nombres un número suele ser una duración o una toma. Los canales más
+  allá del estéreo se descartan.
+- **La rueda de modulación es un vibrato fijo** (5,5 Hz, ±50 cents), sin
+  perillas propias.
+- **Los knobs son globales al instrumento.** `START`, `END`, `LOOP`, `LOOP ST`,
+  `LOOP END`, `XFADE` y la envolvente valen para todas las regiones a la vez. Falta
+  que vivan por región y que el editor los muestre; el `.smpreset` ya guarda
+  por región lo demás (raíz, rango, tune, start/end), así que el formato no es
+  el límite.
+- **No se pueden mezclar modos desde el editor**: "esta región sliceada y esta
+  estirada" hay que escribirlo a mano en el `.smpreset`; el modo se sigue
+  eligiendo para toda la carpeta al cargarla.
+- **Sólo zip.** Un pack en `.rar`, `.7z` o `.tar.gz` hay que descomprimirlo a
+  mano. `zip` es lo que usan las librerías libres; los demás se agregan en
+  `sampler::archive` cuando aparezca uno que importe.
 
-No es ninguno de los dos flakes que sí se cerraron el 2026-08-30 —el medidor de
-AutoTune y `capture_health`—: ésos fallaban **de a uno**.
+### 3 · El arreglador (2026-09-17)
 
-**El error de método, dicho para no repetirlo**: las dos veces se pidió la lista
-de nombres corriendo `cargo test` *de nuevo*, y esa corrida pasó, así que los
-nombres se perdieron. Hay que sacarlos de la misma corrida:
+- **Cinco nombres quedaron sin expandir** en el picker —`Scrswing`,
+  `Drngense`, `Ruchnsn1/2`, `Dongbeiy`, `Mus`—: la abreviatura podría ser dos
+  cosas y `tools/mid_to_styles.py` sólo expande lo que es seguro. Si alguien
+  sabe qué son, es una línea en `WORDS`.
+- **Más estilos** salen de más ritmos: se deja el `.mid` en
+  `crates/choz-engine/src/artifacts/arranger/rhythms`, se corre
+  `tools/mid_to_styles.py` y la tabla `arranger::styles::ALL` se vuelve a
+  escribir sola. No hay formato de estilo ni estilos escritos a mano, y choz no
+  lee la carpeta en runtime: sólo lleva la tabla. Un estilo que suena mal es una
+  medición que corregir en el script, no una constante que tocar. El formato que
+  tiene que tener un archivo está en `rhythms/README.md`.
+- **Lo que no se puede medir de un ritmo sobre un acorde**: `approach`,
+  `passing` y `human` salen de proxies (intervalos de semitono y de tono en el
+  bajo, y una constante para la soltura, porque los ritmos vienen cuadrados
+  sobre la grilla). Si el bajo suena cuadrado, es ahí.
+- **Los fills no dependen del estilo.** Son quince (`generate::FILLS`), sacados
+  de los 232 compases de fill de la librería de loops, y se eligen por lo que el
+  tempo permite y por cuánto compás sobra —no por el estilo—: un fill de bossa y
+  uno de heavy salen de la misma bolsa. Un fill de dos compases sigue sin caber
+  en la forma.
+- **El tempo se mira al hornear, no al tocar.** La batería se adelgaza sobre 190
+  y otra vez sobre 240 (`generate::FAST_BPM`), y `retune_to_tempo` vuelve a
+  hornear cuando el tempo cruza una de esas líneas — pero lo llama el loop de la
+  UI, no `tick`, porque `tick` es lo que corre el callback de un plugin. Un
+  `.clap` exportado del arreglador se queda con el tempo que tenía cuando se
+  horneó.
+- **El bajo es una nota por tiempo.** La librería de MIDI dice que un bajo real
+  toca entre siete y once notas por compás; acá la grilla del generador es de un
+  golpe por tiempo, así que `density` sólo puede sacar notas, nunca meterlas
+  entre dos. Sería un `step` por estilo, como el `cymbal` de la batería.
+- **La banda multitímbrica es sólo del SoundFont.** Con un SF2 de varios
+  programas cada rol tiene su zona y su banco (`push_arranger_band`), pero con
+  un plugin, el sampler o un SF2 de un preset la banda entera suena en un
+  timbre: esos instrumentos tienen un patch. Un plugin por rol pediría varias
+  instancias en una tab, que es lo que hoy son varias tabs.
+- **Con el arpegiador prendido la zona se pierde.** `ArpEvent` no lleva zona, así
+  que una banda que pasa por el arpegiador vuelve a ser un timbre. Nadie pidió
+  arpegiar una banda entera; está dicho acá para que no se audite de nuevo.
+- **Las zonas son ocho y se comparten con el split.** La banda las toma desde
+  arriba salteando las de los botones de sonido; una tab con ocho sonidos y una
+  banda de seis pide más canales de los que hay, y los que no entran se quedan
+  con el programa de la tab.
+- **No hay humanización por rol dentro del estilo**: que el funk quiera la
+  batería clavada y el bajo suelto no se puede decir.
+- **El comping no escucha a nadie, salvo en la duración.** La guitarra toca la
+  longitud contraria a la del piano (`generate::counter_hold`), pero las dos se
+  hornean por separado, así que sus voces pueden caer en la misma nota a la vez.
+  Con la melodía y el solo afuera, es el único par que queda.
+- **La matriz del panel muestra, no edita.** Cada compás es un botón que abre la
+  grilla con el cursor ahí; las subdivisiones dibujadas siguen siendo dibujo. La
+  grilla sí edita: la agrupación de cada compás y un acorde por subdivisión.
+  Acentuar o silenciar una subdivisión suelta todavía pediría un dato por celda
+  que no existe.
+- **Las secciones y el `form` no se editan en la grilla**: entran por archivo.
+  La notación sí es un switch (grados o letras) y el picker ofrece las dos.
+- **La progresión no tiene repeticiones ni saltos**: `form` es una lista de
+  partes, sin `x2`, sin D.C. y sin coda. Se escribe repitiendo el nombre.
 
-```bash
-cargo test --workspace > /tmp/ws.log 2>&1
-grep -E '^---- ' /tmp/ws.log      # los nombres, si falló
-```
+### 4 · El plugin que inunda el log (2026-09-17)
 
-La hipótesis es la máquina cargada —el workspace corre varios binarios de test a
-la vez y varios hacen `dlopen` de plugins reales, con la inicialización global
-que eso trae— pero **no está verificada**, y hasta tener los nombres no se puede
-verificar.
+Reportado: un `choz.log` de 3,4 GB. La línea que lo escribía **no es de este
+repo**: es el fluidsynth interno de AVLdrums (LV2 hosteado) imprimiendo
+`Ringbuffer full` por stderr en cada robo de voz fallido, sin rate-limit; choz
+manda fd 1 y fd 2 de los plugins al log por diseño (`choz-ui/src/log.rs`), así
+que un plugin charlatán llena el disco. La mitigación que ya existe es forzarlo
+a sandbox (`x` en el rack). Lo que falta:
+
+- **Techo al log — escrito, sin mergear.** Está resuelto en el PR #7
+  (`fix/plugin-log-runaway` → `develop`): `log::spawn_log_watchdog()` mira el
+  archivo cada 5 s y lo trunca pasados los 32 MiB, lo que es seguro debajo de
+  los fd ya duplicados porque ambos se abren `O_APPEND` (busca el fin de archivo
+  en cada escritura, no guarda offset). **`develop` todavía no lo tiene**:
+  `crates/choz-ui/src/log.rs` acá sigue sin watchdog. Lo que falta es mergearlo.
+- **Matar al que no responde.** El PR #7 no lo toca, y es la otra mitad: un
+  plugin hosteado que se cuelga, que revienta
+  en cadena o que escribe cientos de MB en segundos tendría que ser descargado
+  —y puesto en cuarentena— en vez de arrastrar a choz entero. Las tres capas
+  contra código ajeno (escaneo fuera de proceso, cuarentena, sandbox) miran el
+  crash, no el ruido.
 
 ## Las dos piezas que quedan fuera, por decisión
 
 ### El editor SF2 por zona (2026-08-30)
 
 Los once generadores de
-[`sf2_patch::EDITS`](../crates/choz-engine/src/sf2_patch.rs) se escriben hoy en
+[`sf2_patch::EDITS`](../crates/choz-engine/src/instruments/sf2_patch.rs) se escriben hoy en
 todos los canales a la vez (`Sf2Synth::set_param`, `for channel in 0..=ZONES`),
 así que el editor da forma al instrumento entero y no a media teclado.
 
@@ -237,14 +303,17 @@ Los globales del proceso son la causa de todo test que falla "a veces": el
 harness corre los tests de un crate en paralelo, y el transporte, los medidores
 y `capture_health` son singletons a propósito. `crate::test_locks` tiene **un
 candado por global**, y el que necesita dos los toma en el mismo orden que los
-demás (transporte y después medidor). En `choz-ui` el par es `ui_guard()` y
+demás (transporte y después medidor). **Tomar el candado no alcanza: hay que
+devolver el global.** El candado del transporte lo hace solo —deja el reloj
+parado, a 120, en 4/4 y en cero al tomarlo y al soltarlo—, y ése era el flake
+que fallaba de a varios: un test que renderizaba con el motor en play dejaba el
+transporte rodando, y el siguiente que contara su propio tiempo encontraba una
+grilla que seguir. Un global que se pueda ensuciar sin que nadie lo note quiere
+el mismo tratamiento. En `choz-ui` el par es `ui_guard()` y
 `UiRestore`: cargar un proyecto aplica su idioma y su color al proceso entero.
 
 Un test que lee un global para comprobar algo de *su* objeto está mal escrito:
 pregúntele al objeto. `AutoTune::reading()` existe por eso.
-
-Eso explica los flakes que **fallan de a uno**. El que falla de a varios sigue
-sin explicar — ver **Pendiente 2**.
 
 ### Y lo de siempre
 
@@ -260,8 +329,9 @@ contra una habitación.
   mandársela a los nueve: el CC 7 que se mandaba a las zonas en cada
   `push_split` y al canal 0 sólo al cargar dejaba el sonido propio de la tab
   15,2 dB por debajo en cuanto el teclado movía su slider de volumen
-  (2026-08-31). Lo que queda abierto de eso es una decisión, y está arriba, en
-  **Pendiente 1**.
+  (2026-08-31). **Desde el 2026-09-13 el CC 7 no llega al sintetizador**: el
+  volumen de una tab es su fader, y el slider de un controlador se ata con MIDI
+  learn a lo que se quiera. Los otros CC siguen yendo a los nueve.
 
 - **La ventana del shifter de voces está escrita como `2048 / 48` a propósito**
   (2026-08-28). Es tiempo, no samples, pero el número es el viejo conteo sobre
@@ -503,6 +573,11 @@ cargo test --workspace
 cargo +beta clippy --workspace --all-targets -- -D warnings
 cargo run --release --bin choz          # necesita una terminal real (tty)
 tail -f ~/.local/state/choz/choz.log    # ver errores/log en vivo
+
+# El sampler: lo que trabajó una vez y no vuelve a trabajar. Borrarlos cuesta
+# una carga lenta y nada más.
+du -sh ~/.local/state/choz/pcm          # el PCM crudo de los samples largos
+rm -rf ~/.local/state/choz/pcm          # y así se tira
 
 # lo que cuesta el detector de A→M dentro del callback (sube = xruns en TODO
 # el grafo, no sólo en choz)

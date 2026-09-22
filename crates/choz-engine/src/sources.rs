@@ -203,13 +203,17 @@ const SF2_MAX_FRAMES: usize = 4096;
 /// SoundFont is loaded once for all of them, so a zone costs a channel and no
 /// memory at all. Channel 0 stays the tab's own program, for every octave with
 /// no zone on it.
-const ZONES: usize = 8;
+pub const ZONES: usize = 8;
 
 /// The MIDI channel zone `z` plays on. Zone 0 is channel 1: channel 0 belongs
 /// to the tab itself.
 fn zone_channel(zone: u8) -> u8 {
     (zone as usize % ZONES) as u8 + 1
 }
+
+/// Channel volume, which this synth deliberately ignores — see
+/// [`Sf2Synth::control_change`].
+pub const CC_VOLUME: u8 = 7;
 
 impl Sf2Synth {
     /// The channel a note plays on: its octave's zone when that zone has been
@@ -299,12 +303,12 @@ impl Sf2Synth {
 /// nobody asked for.
 ///
 /// The rest is the SoundFont editor — the envelope, the filter, the tuning and
-/// the output, from [`crate::sf2_patch::EDITS`]. They are ordinary slot
+/// the output, from [`crate::instruments::sf2_patch::EDITS`]. They are ordinary slot
 /// parameters on purpose: that is what makes them movable by mouse, by arrow
 /// key and by a learned CC, and what puts them in the project file, without a
 /// second copy of any of that machinery.
 pub fn sf2_params() -> Vec<choz_ports::PluginParam> {
-    use crate::sf2_patch::{EDITS, NEUTRAL};
+    use crate::instruments::sf2_patch::{EDITS, NEUTRAL};
     let sends = ["SF2 Reverb", "SF2 Chorus"]
         .iter()
         .map(|name| choz_ports::PluginParam {
@@ -336,7 +340,7 @@ pub fn sf2_params() -> Vec<choz_ports::PluginParam> {
 
 /// An SF2 generator number as oxisynth names it.
 ///
-/// Only the ones [`crate::sf2_patch::EDITS`] uses: the numbering is the
+/// Only the ones [`crate::instruments::sf2_patch::EDITS`] uses: the numbering is the
 /// specification's and shared, but oxisynth's enum is not `repr`-convertible
 /// from a `u16`, and a wrong transmute here would move the wrong generator.
 fn sf2_generator(gen: u16) -> Option<oxisynth::GeneratorType> {
@@ -418,6 +422,26 @@ impl AudioSource for Sf2Synth {
         });
     }
 
+    /// A note aimed at one zone goes to that zone's channel, whatever octave it
+    /// is in: the arranger's band is six musicians in one tab, and which one is
+    /// playing is not something the pitch can say — a bass and a piano share
+    /// notes.
+    ///
+    /// A zone nobody has given a program to falls back to the split, which is
+    /// the same rule [`Sf2Synth::channel_for`] follows: routing to an empty
+    /// channel is silence.
+    fn note_on_zone(&mut self, note: u8, velocity: u8, zone: Option<u8>) {
+        let channel = zone
+            .filter(|z| self.zone_set.get(*z as usize % ZONES) == Some(&true))
+            .map(zone_channel)
+            .unwrap_or_else(|| self.channel_for(note));
+        let _ = self.synth.send_event(oxisynth::MidiEvent::NoteOn {
+            channel,
+            key: note,
+            vel: velocity,
+        });
+    }
+
     fn note_off(&mut self, note: u8) {
         // **The same channel the note went to.** The split can be re-drawn
         // while a key is held, so this is the one place it must not be
@@ -475,7 +499,19 @@ impl AudioSource for Sf2Synth {
 
     /// Pedals and wheels reach every zone: the sustain pedal holds the whole
     /// keyboard, not the half of it the last note happened to be in.
+    ///
+    /// **Channel volume does not reach it at all.** CC 7 is a second volume
+    /// control on top of the tab's own VOL fader, fighting it and doing so
+    /// invisibly: it is drawn nowhere and saved in no project. A controller's
+    /// volume slider is a knob like any other — bind it with MIDI learn to the
+    /// fader, or to whatever else it should move, and the binding is then a
+    /// thing you can see and the project keeps. Decided 2026-09-13, after the
+    /// 2026-08-31 fix that made the nine channels at least lose the fight
+    /// together.
     fn control_change(&mut self, cc: u8, value: u8) {
+        if cc == CC_VOLUME {
+            return;
+        }
         for channel in 1..=ZONES as u8 {
             let _ = self.synth.send_event(oxisynth::MidiEvent::ControlChange {
                 channel,
@@ -499,14 +535,30 @@ impl AudioSource for Sf2Synth {
         }
     }
 
+    /// Pressure as pressure: the SoundFont's own modulators decide what it
+    /// does, and most do nothing — which is right, and is not silence.
+    fn pressure(&mut self, note: Option<u8>, value: u8) {
+        let value = value.min(127);
+        for channel in 0..=ZONES as u8 {
+            let _ = self.synth.send_event(match note {
+                Some(key) => oxisynth::MidiEvent::PolyphonicKeyPressure {
+                    channel,
+                    key: key.min(127),
+                    value,
+                },
+                None => oxisynth::MidiEvent::ChannelPressure { channel, value },
+            });
+        }
+    }
+
     /// `0` = the SoundFont's own reverb send, `1` = its chorus send, both as
-    /// on/off; everything after them is one of [`crate::sf2_patch::EDITS`].
+    /// on/off; everything after them is one of [`crate::instruments::sf2_patch::EDITS`].
     ///
     /// RT-safe: `set_gen` writes a channel generator offset and re-derives the
     /// live voices from it. **Not** `set_chorus_params`, which rebuilds the
     /// chorus modulation table — 4.3 ms measured, an xrun every toggle.
     fn set_param(&mut self, index: usize, value: f32) {
-        if let Some((gen, offset)) = crate::sf2_patch::offset_of(index, value) {
+        if let Some((gen, offset)) = crate::instruments::sf2_patch::offset_of(index, value) {
             if let Some(g) = sf2_generator(gen) {
                 // Every zone: the editor shapes the instrument, not whichever
                 // half of the keyboard is being played at the time.
@@ -586,10 +638,14 @@ mod tests {
     /// The cause was a channel that nobody re-initialised. `set_zone_program`
     /// sends the GM channel volume every time `push_split` runs, which is on
     /// almost every interaction; channel 0 got it once, when the file loaded.
-    /// `control_change` forwards an incoming CC to *all* the channels, so the
+    /// `control_change` forwarded an incoming CC to *all* the channels, so the
     /// first CC 7 from a keyboard's volume slider stuck on channel 0 and was
     /// wiped from every zone at the next push — **15.2 dB** between the same
     /// note, on the same preset, at the same velocity.
+    ///
+    /// Since 2026-09-13 the CC 7 does not reach the synth at all (see
+    /// [`Sf2Synth::control_change`]), so this now checks both halves: the levels
+    /// match, **and** the slider changed nothing to match about.
     #[test]
     fn a_volume_cc_does_not_leave_the_tabs_own_sound_behind() {
         let path = std::path::Path::new("/usr/share/sounds/sf2/FluidR3_GM.sf2");
@@ -622,6 +678,7 @@ mod tests {
             (zone, own)
         };
 
+        let mut both = Vec::new();
         for after_cc in [false, true] {
             let (zone, own) = level(after_cc);
             assert!(zone > 1e-4 && own > 1e-4, "both have to sound");
@@ -630,7 +687,16 @@ mod tests {
                 db.abs() < 1.0,
                 "a zone and the tab's own sound differ by {db:+.1} dB (CC sent: {after_cc})"
             );
+            both.push(own);
         }
+        // …and the slider did not move the tab at all: the volume of a tab is
+        // its fader, and a controller's knob gets there through MIDI learn like
+        // any other.
+        let db = 20.0 * (both[1] / both[0]).log10();
+        assert!(
+            db.abs() < 0.5,
+            "the keyboard's volume slider moved the SoundFont by {db:+.1} dB"
+        );
     }
 
     /// **A SoundFont is in the same league as a hosted plugin.**
@@ -761,7 +827,7 @@ mod tests {
     /// exists: an offset is only big enough relative to what the file says.
     #[test]
     fn every_envelope_knob_changes_the_sound_in_the_direction_it_reads() {
-        use crate::sf2_patch::{NEUTRAL, SENDS};
+        use crate::instruments::sf2_patch::{NEUTRAL, SENDS};
         let path = std::path::Path::new("/usr/share/sounds/sf2/FluidR3_GM.sf2");
         if !path.exists() {
             return;

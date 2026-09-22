@@ -682,6 +682,30 @@ pub struct Load {
     /// The worst block's own **CPU** time, against the wall time in
     /// `peak_us`. See [`cpu_micros`].
     peak_cpu_us: AtomicU32,
+    /// Major page faults the audio thread took inside blocks that were late,
+    /// since the last read. See [`major_faults`].
+    late_faults: AtomicU32,
+}
+
+/// Major page faults this thread has taken: pages that had to come off the
+/// disk before the thread could go on.
+///
+/// The one thing the CPU/wall split cannot tell apart from being preempted. A
+/// streamed sample is a mapped file (see `instruments::stream`), and a page
+/// evicted under memory pressure is read back **on the audio thread** — which
+/// shows as a block that took real time and no CPU, exactly like a browser
+/// stealing the core. `getrusage(RUSAGE_THREAD)`: one syscall per block, no
+/// lock, nothing that waits. Zero where the platform has no such call.
+pub fn major_faults() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        // Safe: a zeroed `rusage` is valid, and the call only writes it.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) } == 0 {
+            return usage.ru_majflt as u64;
+        }
+    }
+    0
 }
 
 /// This thread's own CPU time, in microseconds.
@@ -718,6 +742,7 @@ pub fn load() -> &'static Load {
         worst_slot: AtomicU32::new(0),
         worst_slot_us: AtomicU32::new(0),
         peak_cpu_us: AtomicU32::new(0),
+        late_faults: AtomicU32::new(0),
     };
     &L
 }
@@ -761,6 +786,24 @@ impl Load {
         if budget_us > 0 && us > budget_us {
             self.over.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Page faults one block took, counted only when the block was late: a
+    /// fault inside a block that still made its deadline cost nothing audible.
+    pub fn publish_faults(&self, faults: u64, late: bool) {
+        if late && faults > 0 {
+            let n = faults.min(u32::MAX as u64) as u32;
+            let _ = self
+                .late_faults
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_add(n))
+                });
+        }
+    }
+
+    /// Major faults inside late blocks since the last read.
+    pub fn take_late_faults(&self) -> u32 {
+        self.late_faults.swap(0, Ordering::Relaxed)
     }
 
     /// Called per slot per block, from the audio thread: which tab this was and
@@ -869,8 +912,15 @@ mod tests {
             worst_slot: AtomicU32::new(0),
             worst_slot_us: AtomicU32::new(0),
             peak_cpu_us: AtomicU32::new(0),
+            late_faults: AtomicU32::new(0),
         };
         let budget = Duration::from_micros(1333);
+
+        // Faults count only where they cost a deadline.
+        load.publish_faults(3, false);
+        load.publish_faults(2, true);
+        assert_eq!(load.take_late_faults(), 2);
+        assert_eq!(load.take_late_faults(), 0, "read once");
 
         // A healthy block, then one that overran the deadline without doing any
         // more work: preempted, not slow.

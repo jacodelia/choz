@@ -876,7 +876,7 @@ static GUI: clap_plugin_gui = clap_plugin_gui {
 const PLUGIN_ID: &str = "com.choz.rack\0";
 const PLUGIN_NAME: &[u8] = b"choz\0";
 const PLUGIN_VENDOR: &[u8] = b"choz\0";
-const PLUGIN_VERSION: &[u8] = b"1.3.11\0";
+const PLUGIN_VERSION: &[u8] = b"1.3.12\0";
 const PLUGIN_DESCRIPTION: &[u8] = b"The whole rack, one stereo output per tab, inside the host.\0";
 
 /// `instrument` and `stereo`, which is what a host filters its browser by.
@@ -1006,7 +1006,18 @@ mod tests {
     }
 
     /// Open the plugin the way a host does: through the entry point, by id.
+    ///
+    /// In a state directory of the test's own. The rack inside the plugin is
+    /// the whole of choz, and it saves `ui.json`, the plugin paths and the scan
+    /// cache like the application does — which these tests did into the
+    /// user's `~/.local/state/choz`.
     unsafe fn open() -> *const clap_plugin {
+        if std::env::var_os("XDG_STATE_HOME").is_none() {
+            let tmp = std::env::temp_dir().join(format!("choz_clap_state_{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&tmp);
+            // SAFETY: tests only, and every test that opens one holds `guard`.
+            unsafe { std::env::set_var("XDG_STATE_HOME", &tmp) };
+        }
         let factory = unsafe { entry_get_factory(CLAP_PLUGIN_FACTORY_ID.as_ptr()) }
             as *const clap_plugin_factory;
         assert!(!factory.is_null(), "the factory is not published");
@@ -1359,6 +1370,60 @@ mod tests {
         drop(unsafe { Box::from_raw(source) });
         unsafe { plugin_deactivate(other) };
         unsafe { plugin_destroy(other) };
+        unsafe { plugin_deactivate(plugin) };
+        unsafe { plugin_destroy(plugin) };
+    }
+
+    /// The window's mouse reaches the panels. Keys had a path of their own
+    /// from the first day and the pointer's was wired later, so this pins the
+    /// half that was missing: a click on the menu bar has to open a menu, the
+    /// same as it does on a terminal. A grid with nothing new under the bar
+    /// after a click is a window the user can only look at.
+    #[test]
+    fn a_click_on_the_menu_bar_opens_the_menu() {
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let _g = guard();
+        let plugin = unsafe { open() };
+        assert!(unsafe { plugin_init(plugin) });
+        assert!(unsafe { plugin_activate(plugin, 48_000.0, 32, 128) });
+
+        let inst = unsafe { Instance::of(plugin) }.unwrap();
+        let app = inst.app.as_mut().unwrap();
+        let mut terminal = Terminal::new(Grid::new(gui::COLS, gui::ROWS)).unwrap();
+        app.draw(&mut terminal).unwrap();
+
+        // The first label on the bar, found rather than named: the titles are
+        // translated, and a test that spelled "FILE" would fail in Spanish.
+        let row = |grid: &Grid, y: u16| -> String {
+            let start = y as usize * grid.width as usize;
+            grid.cells[start..start + grid.width as usize]
+                .iter()
+                .map(|c| c.symbol.as_str())
+                .collect()
+        };
+        let bar = row(terminal.backend(), 0);
+        let column = bar
+            .chars()
+            .position(|c| !c.is_whitespace())
+            .expect("the menu bar drew nothing") as u16;
+
+        let under = |grid: &Grid| -> String { (1..6).map(|y| row(grid, y)).collect() };
+        let before = under(terminal.backend());
+
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.draw(&mut terminal).unwrap();
+        assert_ne!(
+            before,
+            under(terminal.backend()),
+            "the click on the menu bar dropped no menu"
+        );
+
         unsafe { plugin_deactivate(plugin) };
         unsafe { plugin_destroy(plugin) };
     }

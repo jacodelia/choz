@@ -37,6 +37,10 @@ pub struct ListModal {
     pub scroll: usize,
     /// Extra line above the buttons (e.g. the current directory).
     pub note: String,
+    /// A heading over the rows, for a list whose rows are columns: the chord
+    /// matrix names what each column is. Empty (the usual) draws nothing, and
+    /// the list takes the row back.
+    pub header: String,
     /// Extra buttons on the button row: `(label, the key they stand for)`.
     /// Clicking one is the same as pressing that key, so mouse and keyboard
     /// share a single handler.
@@ -209,6 +213,9 @@ pub struct SplitView<'a> {
     /// **note** rather than painting a zone, where nothing else on the keyboard
     /// says where the setting currently sits.
     pub highlight: Option<u8>,
+    /// Keys drawn in a colour of their own because something sounds there —
+    /// the sampler's audition picker marks the keys its samples are mapped to.
+    pub lit: &'a [(u8, Color)],
     /// Draw SELECT and CANCEL. SPLIT does not: it paints, and there is nothing
     /// to take back. A picker does, because a note tried by ear has to be
     /// possible to try and then not keep.
@@ -316,6 +323,9 @@ pub fn draw_split_modal(f: &mut Frame, area: Rect, v: SplitView) -> SplitRects {
         // on one that has them the key being set is the thing to see.
         if v.highlight == Some(n) {
             return Some(HEADER); // the chosen note wears the accent every heading here does
+        }
+        if let Some(&(_, c)) = v.lit.iter().find(|(k, _)| *k == n) {
+            return Some(c);
         }
         v.octaves
             .get(octave_of(n))
@@ -450,6 +460,18 @@ pub fn draw_list_modal(
             f.render_widget(Paragraph::new(Span::styled(label, st)), rect);
             x += w + 1;
         }
+        y += 1;
+    }
+    // A heading over the rows, in the hint colour: it is a label, not a row to
+    // pick, so nothing about it is selectable.
+    if !m.header.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                m.header.clone(),
+                Style::default().fg(HINT).add_modifier(Modifier::BOLD),
+            )),
+            Rect::new(content.x, y, content.width, 1),
+        );
         y += 1;
     }
 
@@ -703,6 +725,9 @@ mod tests {
 
     #[test]
     fn long_list_scrolls_with_the_cursor_and_shows_a_scrollbar() {
+        // The buttons it looks for are translated, and the language is a
+        // global: without the lock this reads whatever another test left set.
+        let _g = crate::views::theme::ui_guard();
         let items: Vec<String> = (0..50).map(|i| format!("item{i}")).collect();
         let mut m = ListModal::new("PICK", items);
         m.cursor = 49;

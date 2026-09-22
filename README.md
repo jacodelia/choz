@@ -10,10 +10,11 @@ Built with Rust, ratatui and cpal. Provides a TUI for managing note inputs, inst
 
 ## Status
 
-**1.3.11.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
+**1.3.12.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
 LADSPA, DSSI, VST2, VST3 and Pure Data patches are really hosted** — instruments
 and audio effects, with their own parameters and their own windows — choz's own
-56 effects and both artifacts — the arpeggiator and the step sequencer — are
+56 effects and all four artifacts — the arpeggiator, the step sequencer, the
+metronome and the arranger — are
 published as CLAP plugins for other hosts, and choz installs as a
 `.deb`, an `.rpm` or a script, with an entry in the desktop menu.
 
@@ -315,7 +316,7 @@ headroom for plugin DSP at small buffer sizes.
 ## Architecture
 
 ```
-choz/                      11 crates, version 1.3.6
+choz/                      11 crates, version 1.3.12
 ├── crates/
 │   ├── choz-ports/         RT-safe traits every host implements: AudioSource,
 │   │                       FxProcessor, PluginEditor, PluginParam, SandboxStatus
@@ -327,6 +328,10 @@ choz/                      11 crates, version 1.3.6
 │   │   ├── chord.rs        The chord being held, for the harmoniser's MIDI in
 │   │   ├── feedback.rs     Catches a microphone that starts to howl
 │   │   ├── maxpat.rs       Reads a Max/MSP patch and says what can be kept (no menu entry opens it)
+│   │   ├── artifacts/      The four generators: arpeggiator, step sequencer,
+│   │   │                   metronome, and the arranger — a backing band from a
+│   │   │                   chord progression, playing styles measured off the
+│   │   │                   rhythms in `artifacts/arranger/rhythms`
 │   │   ├── sources.rs      WAV, SF2 (oxisynth)
 │   │   ├── sfz.rs          SFZ parser + 32-voice sampler
 │   │   ├── paths.rs        Per-format search paths, Carla-style
@@ -340,7 +345,7 @@ choz/                      11 crates, version 1.3.6
 │   ├── choz-plugin-vst3/   VST3 host — pure-Rust COM bindings, no Steinberg SDK
 │   ├── choz-plugin-pd/     Pure Data patches as effects; `choz-pd-host` is the
 │   │                       only binary that links libpd (feature `pd`)
-│   ├── choz-plugin-clap-export/ choz's 56 effects + 2 artifacts, as one `.clap`
+│   ├── choz-plugin-clap-export/ choz's 56 effects + 4 artifacts, as one `.clap`
 │   ├── choz-clap/          choz *itself* as a CLAP instrument: the rack inside
 │   │                       a DAW, sixteen stereo outs, its own X11 window
 │   ├── choz-plugin-sandbox/ Shared-memory transport for out-of-process hosting
@@ -369,7 +374,7 @@ ring so they are freed off the RT thread.
 
 | | |
 |---|---|
-| choz | **1.3.11** |
+| choz | **1.3.12** |
 | Rust edition | 2021 (`choz-plugin-lv2` is 2024) |
 | Toolchain tested | rustc 1.97.1 |
 | Platform | Linux. ALSA/JACK/PipeWire. Released for x86-64, aarch64 and armv7 |

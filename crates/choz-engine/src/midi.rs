@@ -14,7 +14,9 @@
 //! and reconnecting is a subscription change made from outside — exactly what
 //! `aconnect` does. Output still goes through midir, which never reads.
 
-pub use crate::input::{BendMsg, CcMsg, ClockMsg, InputEvent, InputSource, NoteMsg, ProgramMsg};
+pub use crate::input::{
+    BendMsg, CcMsg, ClockMsg, InputEvent, InputSource, NoteMsg, PressureMsg, ProgramMsg,
+};
 
 use alsa::seq::{
     Addr, ClientIter, EventType, MidiEvent, PortCap, PortIter, PortSubscribe, PortType, Seq,
@@ -82,17 +84,34 @@ static ROUTES: Mutex<Routes> = Mutex::new(Routes {
     hw: Vec::new(),
 });
 
+/// The routing, whatever happened to the last holder of the lock.
+///
+/// **Never `lock().unwrap()`, and never `let Ok(..) else return`.** A thread
+/// that panicked holding this lock poisons it, and every later look then failed:
+/// `connect_inputs` returned no ports and the reader dropped every message —
+/// MIDI input dead until choz was restarted, with nothing saying so. The data
+/// behind the lock is a table of indices that is rewritten whole on every
+/// reconnect, so there is no half-written state to be protected from.
+fn routes() -> std::sync::MutexGuard<'static, Routes> {
+    ROUTES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Whether [`VIRTUAL_IN_PORT`] should be on the sequencer at all. Outside
 /// [`ROUTES`] on purpose: [`poke`] waits for the reader to act on it, and the
 /// reader needs that lock to do so.
 static VIRT_WANTED: AtomicBool = AtomicBool::new(true);
 
-/// The reader saying it has read [`VIRT_WANTED`] and done what it says.
+/// The reader saying it has read [`VIRT_WANTED`] and done what it says — with
+/// **what it did**: whether the port is on the sequencer now.
+///
+/// The answer carries the state because an answer on its own could be the
+/// wrong one: a poke that timed out under load gets its reply late, and that
+/// reply then satisfied the *next* poke before the reader had acted on it.
 ///
 /// ponytail: one slot, and a poke drains it before sending — a queue of acks
 /// would only ever be answering a question nobody is still asking.
-fn ack() -> &'static (flume::Sender<()>, flume::Receiver<()>) {
-    static ACK: OnceLock<(flume::Sender<()>, flume::Receiver<()>)> = OnceLock::new();
+fn ack() -> &'static (flume::Sender<bool>, flume::Receiver<bool>) {
+    static ACK: OnceLock<(flume::Sender<bool>, flume::Receiver<bool>)> = OnceLock::new();
     ACK.get_or_init(|| flume::bounded(1))
 }
 
@@ -122,8 +141,17 @@ fn poke(ctl: &Seq, ports: Ports) {
     }
     // Bounded: a reader that has stopped must not take the UI down with it. The
     // port list is redrawn either way, and one that is a beat stale is a far
-    // smaller problem than a rack that stops answering the keyboard.
-    let _ = ack().1.recv_timeout(std::time::Duration::from_millis(500));
+    // smaller problem than a rack that stops answering the keyboard. Within the
+    // bound, only the answer that matches the switch counts — see `ack`.
+    let want = VIRT_WANTED.load(Ordering::Relaxed);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+        match ack().1.recv_timeout(left) {
+            Ok(published) if published == want => return,
+            Ok(_) => continue,
+            Err(_) => return,
+        }
+    }
 }
 
 /// A sequencer client that only looks and wires. Opening one is cheap, and the
@@ -218,9 +246,7 @@ pub fn connect_inputs(tx: flume::Sender<InputEvent>, disabled: &[String]) -> Vec
         client: ports.client,
         port: ports.hw,
     };
-    let Ok(mut routes) = ROUTES.lock() else {
-        return Vec::new();
-    };
+    let mut routes = routes();
     routes.sink = Some(tx);
 
     // Drop what the last call wired: a port switched off, or unplugged, has to
@@ -316,9 +342,7 @@ fn republish(seq: &Seq, published: Option<i32>) -> Option<i32> {
         }
         (_, unchanged) => unchanged,
     };
-    if let Ok(mut routes) = ROUTES.lock() {
-        routes.published = published;
-    }
+    routes().published = published;
     published
 }
 
@@ -328,6 +352,10 @@ fn run(ready: std::sync::mpsc::Sender<Option<Ports>>) {
         let _ = ready.send(None);
         return;
     };
+    // The published port **before** "ready": the caller names it the moment
+    // this returns, and a name for a port that did not exist yet was a DAW, or
+    // a test, looking for it a few milliseconds too early.
+    let mut published = republish(&seq, None);
     let _ = ready.send(Some(ports));
 
     let Ok(coder) = MidiEvent::new(0) else { return };
@@ -343,7 +371,6 @@ fn run(ready: std::sync::mpsc::Sender<Option<Ports>>) {
     // whose queue is gone keeps the sender's tick stamp — the exact event midir
     // unwrapped on. One thread hop of jitter, averaged over 24 pulses.
     let start = std::time::Instant::now();
-    let mut published = republish(&seq, None);
     let mut input = seq.input();
     loop {
         let mut ev = match input.event_input() {
@@ -361,7 +388,7 @@ fn run(ready: std::sync::mpsc::Sender<Option<Ports>>) {
         // the answer goes out even when nothing had to change.
         if ev.get_type() == EventType::Usr0 {
             published = republish(&seq, published);
-            let _ = ack().0.try_send(());
+            let _ = ack().0.try_send(published.is_some());
             continue;
         }
         // A subscription coming or going is the sequencer talking about itself.
@@ -375,7 +402,7 @@ fn run(ready: std::sync::mpsc::Sender<Option<Ports>>) {
         // One look at the routing per message, and the channel comes out of the
         // same look: a reconnect swaps both at once, under this lock.
         let (index, sink) = {
-            let Ok(routes) = ROUTES.lock() else { continue };
+            let routes = routes();
             let index = match Some(ev.get_dest().port) == published {
                 // `None` is the published port switched off under MENU → MIDI
                 // IN; on the other side, a sender wired by somebody else or
@@ -591,7 +618,15 @@ enum Msg {
     /// Pitch bend, as the 14-bit value the wire carries: 0..16383, centred at
     /// 8192. Kept unsigned because that is what synths take.
     Bend {
+        channel: u8,
         value: u16,
+    },
+    /// Aftertouch — `note` is `Some` for polyphonic pressure. Its own message,
+    /// never CC 11: see `AudioSource::pressure`.
+    Pressure {
+        channel: u8,
+        note: Option<u8>,
+        value: u8,
     },
     /// Program change — the buttons on a controller keyboard usually send these
     /// (preceded by a Bank Select pair), not CCs.
@@ -645,16 +680,38 @@ pub fn event_of(data: &[u8], source: InputSource, bank: &mut u8) -> Option<Input
             bank: *bank,
             program,
         })),
-        Msg::Bend { value } => Some(InputEvent::Bend(BendMsg { source, value })),
+        Msg::Bend { channel, value } => Some(InputEvent::Bend(BendMsg {
+            source,
+            channel,
+            value,
+        })),
+        Msg::Pressure {
+            channel,
+            note,
+            value,
+        } => Some(InputEvent::Pressure(PressureMsg {
+            source,
+            channel,
+            note,
+            value,
+        })),
     }
 }
 
 /// Parse a raw MIDI message. Note-on with velocity 0 is the conventional
-/// note-off. Returns `None` for anything choz has no use for (clock, aftertouch,
-/// sysex).
+/// note-off. Returns `None` for anything choz has no use for (clock, sysex).
 fn parse(data: &[u8]) -> Option<Msg> {
     if data.len() < 2 {
         return None;
+    }
+    // Channel pressure is two bytes, like a program change: status and the
+    // pressure itself.
+    if data[0] & 0xF0 == 0xD0 {
+        return Some(Msg::Pressure {
+            channel: data[0] & 0x0F,
+            note: None,
+            value: data[1] & 0x7F,
+        });
     }
     // Program change is the one two-byte message choz uses; everything below
     // needs the second data byte.
@@ -685,8 +742,14 @@ fn parse(data: &[u8]) -> Option<Msg> {
             cc: data[1],
             value: data[2],
         }),
+        0xA0 => Some(Msg::Pressure {
+            channel,
+            note: Some(data[1] & 0x7F),
+            value: data[2] & 0x7F,
+        }),
         // LSB first, then MSB — both 7-bit.
         0xE0 => Some(Msg::Bend {
+            channel,
             value: (data[1] as u16 & 0x7F) | ((data[2] as u16 & 0x7F) << 7),
         }),
         _ => None,
@@ -839,25 +902,43 @@ mod tests {
     fn parses_pitch_bend_as_14_bit_lsb_first() {
         assert_eq!(
             parse(&[0xE0, 0, 64]),
-            Some(Msg::Bend { value: 8192 }),
+            Some(Msg::Bend {
+                channel: 0,
+                value: 8192
+            }),
             "wheel at rest is centre"
         );
         assert_eq!(
             parse(&[0xE0, 0, 0]),
-            Some(Msg::Bend { value: 0 }),
+            Some(Msg::Bend {
+                channel: 0,
+                value: 0
+            }),
             "fully down"
         );
         assert_eq!(
             parse(&[0xE0, 127, 127]),
-            Some(Msg::Bend { value: 16383 }),
+            Some(Msg::Bend {
+                channel: 0,
+                value: 16383
+            }),
             "fully up"
         );
         // The LSB is the *first* data byte: swapping them would read 8192 here.
-        assert_eq!(parse(&[0xE0, 64, 0]), Some(Msg::Bend { value: 64 }));
+        assert_eq!(
+            parse(&[0xE0, 64, 0]),
+            Some(Msg::Bend {
+                channel: 0,
+                value: 64
+            })
+        );
         assert_eq!(
             parse(&[0xE5, 0, 64]),
-            Some(Msg::Bend { value: 8192 }),
-            "channel is ignored"
+            Some(Msg::Bend {
+                channel: 5,
+                value: 8192
+            }),
+            "the channel is kept"
         );
     }
 
@@ -882,6 +963,23 @@ mod tests {
     /// cannot run at once.
     static PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Ask until it answers, for up to five seconds. The sequencer is another
+    /// thread and the kernel: on a loaded machine what `connect_inputs` asked
+    /// for can land after the half second it waits, and a test that looked once
+    /// failed on a busy build rather than on anything choz did.
+    fn wait_for<T>(mut look: impl FnMut() -> Option<T>) -> Option<T> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(v) = look() {
+                return Some(v);
+            }
+            if std::time::Instant::now() > deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn the_virtual_port_is_published_and_comes_first() {
         let _g = PORT.lock().unwrap_or_else(|e| e.into_inner());
@@ -902,10 +1000,14 @@ mod tests {
         let Some(ports) = *READER.get().expect("the reader is up") else {
             return;
         };
-        let seen = our_ports(ports.client);
+        let seen = wait_for(|| {
+            let seen = our_ports(ports.client);
+            seen.iter().any(|n| n == VIRTUAL_IN_PORT).then_some(seen)
+        });
         assert!(
-            seen.iter().any(|n| n == VIRTUAL_IN_PORT),
-            "the published port is not on the sequencer: {seen:?}"
+            seen.is_some(),
+            "the published port is not on the sequencer: {:?}",
+            our_ports(ports.client)
         );
     }
 
@@ -927,23 +1029,50 @@ mod tests {
             "a disabled port is still named: {names:?}"
         );
         assert_eq!(
-            ROUTES.lock().unwrap().virt,
+            routes().virt,
             None,
             "a disabled port still has an index to tag events with"
         );
         let Some(ports) = *READER.get().expect("the reader is up") else {
             return;
         };
-        let seen = our_ports(ports.client);
+        let gone = wait_for(|| {
+            (!our_ports(ports.client).iter().any(|n| n == VIRTUAL_IN_PORT)).then_some(())
+        });
         assert!(
-            !seen.iter().any(|n| n == VIRTUAL_IN_PORT),
-            "the port is still on the sequencer: {seen:?}"
+            gone.is_some(),
+            "the port is still on the sequencer: {:?}",
+            our_ports(ports.client)
         );
 
         // And switching it back on names it first again.
         let names = connect_inputs(tx, &[]);
         assert_eq!(names.first().map(String::as_str), Some(VIRTUAL_IN_PORT));
-        assert_eq!(ROUTES.lock().unwrap().virt, Some(0));
+        assert_eq!(routes().virt, Some(0));
+    }
+
+    /// A thread that panics holding the routing lock does not take MIDI input
+    /// down with it. It used to: every later `connect_inputs` returned no ports
+    /// and the reader dropped every message until choz was restarted.
+    #[test]
+    fn a_panic_under_the_routing_lock_does_not_kill_midi_input() {
+        let _g = PORT.lock().unwrap_or_else(|e| e.into_inner());
+        if control_client("choz-test-poison").is_none() {
+            return;
+        }
+        let _ = std::thread::spawn(|| {
+            let _held = routes();
+            panic!("poisoning the routing lock on purpose");
+        })
+        .join();
+        assert!(ROUTES.is_poisoned(), "the test did not poison anything");
+        let (tx, _rx) = flume::unbounded();
+        let names = connect_inputs(tx, &[]);
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some(VIRTUAL_IN_PORT),
+            "{names:?}"
+        );
     }
 
     /// The bug this whole module exists for: a note sent to the published port
@@ -962,7 +1091,7 @@ mod tests {
         let Some(ports) = *READER.get().expect("the reader is up") else {
             return;
         };
-        let published = ROUTES.lock().unwrap().published.expect("the port is up");
+        let published = wait_for(|| routes().published).expect("the port is up");
         let Ok(out) = daw.create_simple_port(
             c"out",
             PortCap::READ | PortCap::SUBS_READ,
@@ -996,5 +1125,37 @@ mod tests {
             }
             other => panic!("the reader dropped the note: {other:?}"),
         }
+    }
+
+    /// Aftertouch arrives as pressure and never as CC 11. As CC 11 a
+    /// SoundFont read it as expression — volume — and a keyboard easing off
+    /// the keys silenced every note after it. The channel is kept for routing,
+    /// and so is the key of polyphonic pressure. Pitch bend keeps its channel
+    /// too, so a multi-timbral rack bends the tab it was meant for.
+    #[test]
+    fn aftertouch_is_pressure_and_bend_keeps_its_channel() {
+        assert_eq!(
+            parse(&[0xD3, 64]),
+            Some(Msg::Pressure {
+                channel: 3,
+                note: None,
+                value: 64
+            })
+        );
+        assert_eq!(
+            parse(&[0xA1, 60, 120]),
+            Some(Msg::Pressure {
+                channel: 1,
+                note: Some(60),
+                value: 120
+            })
+        );
+        assert_eq!(
+            parse(&[0xE2, 0x00, 0x60]),
+            Some(Msg::Bend {
+                channel: 2,
+                value: 0x60 << 7
+            })
+        );
     }
 }

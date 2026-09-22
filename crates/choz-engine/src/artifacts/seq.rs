@@ -28,7 +28,7 @@
 //! upgrade path is to schedule against the grid the way `Arp::next_grid_step`
 //! does rather than to change anything here.
 
-use crate::arp::{ArpEvent, TimeDiv};
+use crate::artifacts::arp::{ArpEvent, TimeDiv};
 use std::time::{Duration, Instant};
 
 /// Tracks a part holds — the MMT-8's eight.
@@ -264,13 +264,12 @@ pub struct Seq {
     song_pos: usize,
     /// The step the editing cursor is on, as `(track, step)`.
     pub cursor: (usize, usize),
-    /// When the next step is due, and when the notes out now are released.
-    next_step: Option<Instant>,
+    /// When the notes out now are released.
     off_at: Option<Instant>,
     /// The notes this sequencer started and has not stopped yet.
     sounding: Vec<u8>,
-    /// The transport step last fired while following one, so the same one is
-    /// never played twice.
+    /// The step of the shared clock that last fired, so the same one is never
+    /// played twice.
     grid: Option<i64>,
     /// Started by the transport, so it counts nothing of its own — see
     /// [`Seq::play_on_transport`]. Not saved: it says what started this run.
@@ -308,7 +307,6 @@ impl Default for Seq {
             step: 0,
             song_pos: 0,
             cursor: (0, 0),
-            next_step: None,
             off_at: None,
             sounding: Vec::new(),
             grid: None,
@@ -374,7 +372,7 @@ impl Seq {
             beat: self.settings.steps_per_beat(),
             stops: self
                 .settings
-                .group_stops(&crate::metronome::metronome().groups()),
+                .group_stops(&crate::artifacts::metronome::metronome().groups()),
             focused: false,
         }
     }
@@ -387,13 +385,13 @@ impl Seq {
         }
         self.playing = true;
         self.follow = false;
-        // One before the top: the clock fires the step *after* this one, so
-        // starting at 0 would skip the downbeat — the one step a pattern is
-        // most likely to have something on.
+        // Where the first step lands is the clock's business, not this
+        // button's: `grid: None` means "come in on the next boundary of the
+        // shared grid", which is what puts a sequencer started now on the same
+        // beat as the metronome and as whatever else is already running.
         self.step = self.settings.bar_steps() - 1;
         self.song_pos = 0;
         self.grid = None;
-        self.next_step = Some(Instant::now());
         if let Some(first) = self.settings.song.first() {
             self.settings.part = (*first).min(PARTS - 1);
         }
@@ -415,39 +413,35 @@ impl Seq {
     pub fn play_on_transport(&mut self) {
         self.play();
         self.follow = true;
-        self.next_step = None;
     }
 
-    /// Start **in step with a sequencer that is already running**.
-    ///
-    /// Two tabs each running a pattern have to be one groove, not two: the
-    /// second one to start lands on the other's step boundary and on the same
-    /// step of the bar, so the downbeats agree from the first note.
-    ///
-    /// Only for the free-running clock. With the transport rolling both count
-    /// their steps off the song position and are already locked to it — and to
-    /// each other — whoever started first; this is the case where there is no
-    /// shared clock to count off, and every sequencer used to start its own on
-    /// the instant the key was pressed.
-    pub fn play_with(&mut self, running: &Seq) {
-        self.play();
-        if !running.playing {
-            return;
+    /// **PAUSE stops without losing the place.** Nothing is left sounding, but
+    /// the part being played and where in the song chain it is stay as they
+    /// were, so the next press carries on rather than starting the chain again.
+    pub fn pause(&mut self, out: &mut Vec<ArpEvent>) {
+        self.playing = false;
+        self.follow = false;
+        // Not the step, the part or the song position: those are the place.
+        // `grid` goes because the clock has moved on by the time it comes back,
+        // and the step it fires then is the one the clock is on.
+        self.grid = None;
+        self.pending.clear();
+        self.silence_all(out);
+    }
+
+    /// Carry on from where PAUSE left it.
+    pub fn resume(&mut self) {
+        self.playing = true;
+        self.follow = false;
+        self.grid = None;
+    }
+
+    /// The pause button: out, or back in on the same part.
+    pub fn toggle_pause(&mut self, out: &mut Vec<ArpEvent>) {
+        match self.playing {
+            true => self.pause(out),
+            false => self.resume(),
         }
-        self.next_step = running.next_step;
-        self.grid = running.grid;
-        // `step` is the step that last played: matching it makes the next one
-        // the same position in the bar, which is what puts the two downbeats
-        // together. A pattern with a shorter bar wraps inside the other's.
-        self.step = running
-            .step
-            .min(self.settings.bar_steps().saturating_sub(1));
-    }
-
-    /// Whether this one is running its own clock right now — what
-    /// [`Self::play_with`] needs to find one to follow.
-    pub fn is_running_free(&self) -> bool {
-        self.playing && self.settings.on && self.grid.is_none()
     }
 
     /// Stop, and take the notes out with it. Recording stops too: a REC left
@@ -459,7 +453,6 @@ impl Seq {
         self.step = 0;
         self.song_pos = 0;
         self.grid = None;
-        self.next_step = None;
         self.silence_all(out);
     }
 
@@ -645,67 +638,30 @@ impl Seq {
         // hit RANDOM pushed off the boundary. Before the step logic, because
         // both belong to the step that is already running.
         self.play_pending(now, out);
-        // Following the transport, the step number comes from the song position
-        // rather than from counting durations — so a stall skips a step instead
-        // of firing a burst to catch up, and nothing drifts.
-        if let Some((index, frac)) = self.grid_step() {
-            if self.grid == Some(index) {
-                return;
-            }
-            // SWING, against a grid whose steps are counted rather than timed:
-            // the off-beats are simply not due until they are `swing` of a step
-            // late. Nothing is dropped — the step still fires, further in.
-            if index.rem_euclid(2) == 1 && frac < self.swing_offset() as f64 {
-                return;
-            }
-            let first = self.grid.is_none();
-            self.grid = Some(index);
-            let step = index.rem_euclid(self.settings.bar_steps() as i64) as usize;
-            // A wrap of the bar is a wrap of the part, whoever is counting —
-            // but landing on step 0 because that is where the transport already
-            // was is not a wrap, it is where the sequencer came in.
-            if step == 0 && !first {
-                self.advance_song();
-            }
-            self.fire(step, now, out);
-            return;
-        }
-        // Started by the transport and the transport has not begun to roll:
-        // wait for it. Counting time here is what doubled the first step.
-        if self.follow {
-            return;
-        }
-        // Its own clock: a step is due when enough time has gone by.
-        self.grid = None;
-        let Some(due) = self.next_step else {
-            self.next_step = Some(now);
+        // One grid for every artifact: the step number comes from the shared
+        // position rather than from counting durations, so a stall skips a step
+        // instead of firing a burst, and the click falls on these boundaries.
+        let Some((index, frac)) = self.grid_step() else {
             return;
         };
-        if now < due {
+        if self.grid == Some(index) {
             return;
         }
-        let step = (self.step + 1) % self.settings.bar_steps();
-        if step == 0 {
+        // SWING, against a grid whose steps are counted rather than timed: the
+        // off-beats are simply not due until they are `swing` of a step late.
+        // Nothing is dropped — the step still fires, further in.
+        if index.rem_euclid(2) == 1 && frac < self.swing_offset() as f64 {
+            return;
+        }
+        let first = self.grid.is_none();
+        self.grid = Some(index);
+        let step = index.rem_euclid(self.settings.bar_steps() as i64) as usize;
+        // A wrap of the bar is a wrap of the part — but landing on step 0
+        // because that is where the clock already was is not a wrap, it is where
+        // the sequencer came in.
+        if step == 0 && !first {
             self.advance_song();
         }
-        // SWING: the step about to play decides how long it is. An even step
-        // sits on the beat and holds on longer, the odd one after it makes the
-        // time back — so a pair always adds up to two steps and the bar keeps
-        // its length however far the swing is pushed.
-        let sw = self.swing_offset();
-        let len = self.step_len().mul_f32(if step.is_multiple_of(2) {
-            1.0 + sw
-        } else {
-            1.0 - sw
-        });
-        // From `due`, not from `now`: a late tick must not push the grid, or a
-        // busy UI thread would drag the tempo down over time — and never so far
-        // behind that the next tick fires a burst to catch up.
-        self.next_step = Some(if due + len < now {
-            now + len
-        } else {
-            due + len
-        });
         self.fire(step, now, out);
     }
 
@@ -853,19 +809,27 @@ impl Seq {
         self.settings.swing.clamp(0.0, MAX_SWING)
     }
 
-    /// Which step of the transport's grid the playhead is on and how far into
-    /// it the transport is, or `None` when there is no transport rolling to
-    /// follow.
+    /// Which step of the shared grid the playhead is on and how far into it it
+    /// is.
+    ///
+    /// **One clock.** The transport while it rolls, the free clock otherwise —
+    /// see [`choz_ports::Transport::position_ppq`]. The step number comes from
+    /// the position rather than from counting durations either way, so nothing
+    /// drifts, a stall skips a step instead of firing a burst, and the
+    /// metronome switched on halfway through lands on these same boundaries.
     fn grid_step(&self) -> Option<(i64, f64)> {
         let transport = choz_ports::transport();
-        if !transport.playing() {
+        // Started by the transport and the transport has not begun to roll:
+        // wait for it rather than counting the free clock, which would play the
+        // first step twice.
+        if self.follow && !transport.playing() {
             return None;
         }
         let step_q = self.settings.div.quarters() as f64;
         if step_q <= 0.0 {
             return None;
         }
-        let pos = transport.ppq() / step_q;
+        let pos = transport.position_ppq() / step_q;
         Some((pos.floor() as i64, pos - pos.floor()))
     }
 }
@@ -876,6 +840,87 @@ mod tests {
 
     fn on(seq: &Seq, track: usize, step: usize) -> bool {
         seq.settings.step_on(track, step)
+    }
+
+    /// Drive the one clock forward the way the audio callback does, and give
+    /// back the instant that goes with it.
+    ///
+    /// The steps are counted off [`choz_ports::Transport::position_ppq`] now,
+    /// so moving time in a test means moving that — the instant is still what
+    /// the gates and the ratchets are measured in.
+    fn clock_at(t0: Instant, ms: u64) -> Instant {
+        let t = choz_ports::transport();
+        t.set_free_samples(ms * t.sample_rate() as u64 / 1000);
+        t0 + Duration::from_millis(ms)
+    }
+
+    /// 120 bpm on a 48 kHz stream, stopped: a step of 1/16 is 125 ms, which is
+    /// what the tests below count in.
+    fn stopped_at_120() {
+        let t = choz_ports::transport();
+        t.set_playing(false);
+        t.set_sample_rate(48_000);
+        t.set_bpm(120.0);
+        t.set_time_signature(4, 4);
+        t.set_free_samples(0);
+    }
+
+    /// **PAUSE keeps the part and the place in the chain; PLAY starts the song
+    /// again from the top of it.**
+    #[test]
+    fn pause_keeps_the_part_and_play_starts_the_chain_again() {
+        let _g = crate::test_locks::transport();
+        stopped_at_120();
+        let mut seq = Seq::new(SeqSettings {
+            on: true,
+            ..Default::default()
+        });
+        // Two parts in the chain, so there is a place to lose.
+        seq.settings.parts[0][0] = 0b0000_0000_0000_0001;
+        seq.settings.parts[1][0] = 0b0000_0000_0000_0001;
+        seq.chain(0);
+        seq.chain(1);
+        seq.play();
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        for i in 0..32u64 {
+            seq.tick(clock_at(t0, i * 125), &mut out);
+        }
+        // Wherever the chain got to by playing: what pause has to keep.
+        seq.advance_song();
+        let part = seq.settings.part;
+        let place = seq.song_pos;
+        assert!(!seq.settings.song.is_empty(), "no chain to keep a place in");
+
+        // Paused: the notes go, the place stays.
+        let mut offs = Vec::new();
+        seq.pause(&mut offs);
+        assert!(!seq.running(), "pause did not stop it");
+        assert!(
+            offs.iter().all(|e| matches!(e, ArpEvent::Off { .. })),
+            "pause sounded something: {offs:?}"
+        );
+        assert_eq!(seq.song_pos, place, "pause moved the song");
+        assert_eq!(seq.settings.part, part, "pause changed the part");
+
+        // Back in on the same part.
+        seq.resume();
+        assert!(seq.running());
+        assert_eq!(seq.song_pos, place);
+        assert_eq!(seq.settings.part, part);
+
+        // PLAY is the other button: the chain from its top.
+        seq.play();
+        assert_eq!(seq.song_pos, 0, "play did not start the chain again");
+        assert_eq!(
+            seq.settings.part, seq.settings.song[0],
+            "play came in mid-chain"
+        );
+        // And STOP is out and back to the top.
+        let mut out = Vec::new();
+        seq.stop(&mut out);
+        assert!(!seq.running());
+        assert_eq!(seq.song_pos, 0);
     }
 
     /// The rack's PLAY starts a pattern **once**.
@@ -928,6 +973,7 @@ mod tests {
         // And its own PLAY still runs free, which is what a box with no
         // transport under it has always done.
         t.set_playing(false);
+        stopped_at_120();
         let mut alone = Seq::new(SeqSettings {
             on: true,
             ..Default::default()
@@ -936,7 +982,7 @@ mod tests {
         alone.play();
         let mut free = Vec::new();
         for i in 0..40 {
-            alone.tick(now + Duration::from_millis(i), &mut free);
+            alone.tick(clock_at(now, i * 10), &mut free);
         }
         assert!(
             free.iter().any(|e| matches!(e, ArpEvent::On { .. })),
@@ -944,65 +990,67 @@ mod tests {
         );
     }
 
-    /// Two tabs, two patterns, one groove: the second sequencer to start lands
-    /// on the first one's step boundary instead of starting its own clock
-    /// where the key happened to be pressed.
+    /// Two tabs, two patterns, one groove: both sequencers count off the one
+    /// shared clock, so the second to start lands on the first one's boundaries
+    /// with nothing handed between them.
     #[test]
     fn a_second_sequencer_starts_in_step_with_the_first() {
         let _g = crate::test_locks::transport();
+        let t = choz_ports::transport();
+        t.set_playing(false);
+        t.set_bpm(120.0);
+        t.set_sample_rate(48_000);
         let settings = || SeqSettings {
             on: true,
             ..Default::default()
         };
-        let mut first = Seq::new(settings());
+        let beat = |q: f64| t.set_free_samples((q * 48_000.0 * 60.0 / 120.0) as u64);
         // Every step written, so each one is audible in the comparison below:
         // the question is *when* they fire, not what is on them.
-        for s in 0..STEPS {
-            first.toggle_step(0, s);
-        }
+        let written = || {
+            let mut seq = Seq::new(settings());
+            for s in 0..STEPS {
+                seq.toggle_step(0, s);
+            }
+            seq
+        };
+        beat(0.0);
+        let mut first = written();
         first.play();
-
-        // Half a step later, the other tab is started.
-        let step = first.step_len();
         let t0 = Instant::now();
         let mut out = Vec::new();
         first.tick(t0, &mut out);
-        let mut second = Seq::new(settings());
-        for s in 0..STEPS {
-            second.toggle_step(0, s);
-        }
-        second.play_with(&first);
 
-        // The two agree on when the next step is due, and on which one it is.
-        assert_eq!(
-            second.next_step, first.next_step,
-            "the newcomer took the running clock"
-        );
-        assert_eq!(second.step, first.step, "…and its place in the bar");
+        // Half a step later — an eighth of a beat at 1/16 — the other tab is
+        // started. Nothing is copied from the one already running.
+        beat(0.125);
+        let mut second = written();
+        second.play();
 
         // Played forward, they fire together rather than half a step apart.
-        let mut a = Vec::new();
-        let mut b = Vec::new();
-        let mut fired = (0, 0);
+        let mut fired = 0;
         for i in 1..=16 {
-            let now = t0 + step.mul_f32(i as f32 * 0.5);
-            a.clear();
-            b.clear();
+            beat(0.125 + i as f64 * 0.125);
+            let now = t0 + Duration::from_millis(i * 62);
+            let (mut a, mut b) = (Vec::new(), Vec::new());
             first.tick(now, &mut a);
             second.tick(now, &mut b);
             let hit = |v: &Vec<ArpEvent>| v.iter().any(|e| matches!(e, ArpEvent::On { .. }));
             if hit(&a) || hit(&b) {
                 assert_eq!(hit(&a), hit(&b), "one of them fired on its own at tick {i}");
-                fired = (fired.0 + hit(&a) as usize, fired.1 + hit(&b) as usize);
+                assert_eq!(first.step, second.step, "…on different steps of the bar");
+                fired += 1;
             }
         }
-        assert!(fired.0 > 0, "nothing played at all");
+        assert!(fired > 0, "nothing played at all");
+        t.set_free_samples(0);
     }
 
     /// A step written on track 0 plays its note, and the gate closes it.
     #[test]
     fn a_step_plays_its_note_and_lets_go() {
         let _g = crate::test_locks::transport();
+        stopped_at_120();
         let mut seq = Seq::new(SeqSettings {
             on: true,
             ..Default::default()
@@ -1013,11 +1061,12 @@ mod tests {
 
         let t0 = Instant::now();
         let mut out = Vec::new();
-        // Step 0 is empty, so the first due step says nothing…
-        seq.tick(t0 + Duration::from_secs(1), &mut out);
+        // Step 0 is empty, so the first step says nothing…
+        seq.tick(clock_at(t0, 0), &mut out);
         assert!(out.is_empty(), "step 0 has nothing on it: {out:?}");
-        // …and the next one plays the note that is there.
-        seq.tick(t0 + Duration::from_secs(2), &mut out);
+        // …and the next one — 125 ms on, a sixteenth at 120 — plays the note
+        // that is there.
+        seq.tick(clock_at(t0, 125), &mut out);
         assert_eq!(
             out,
             vec![ArpEvent::On {
@@ -1028,7 +1077,7 @@ mod tests {
         );
 
         out.clear();
-        seq.tick(t0 + Duration::from_secs(3), &mut out);
+        seq.tick(clock_at(t0, 250), &mut out);
         assert!(
             out.contains(&ArpEvent::Off { note, at: 0 }),
             "the gate has to close: {out:?}"
@@ -1040,6 +1089,7 @@ mod tests {
     #[test]
     fn stop_releases_what_is_sounding() {
         let _g = crate::test_locks::transport();
+        stopped_at_120();
         let mut seq = Seq::new(SeqSettings {
             on: true,
             ..Default::default()
@@ -1048,8 +1098,8 @@ mod tests {
         seq.play();
         let mut out = Vec::new();
         let t0 = Instant::now();
-        seq.tick(t0 + Duration::from_secs(1), &mut out);
-        seq.tick(t0 + Duration::from_secs(2), &mut out);
+        seq.tick(clock_at(t0, 0), &mut out);
+        seq.tick(clock_at(t0, 125), &mut out);
         out.clear();
         seq.stop(&mut out);
         assert_eq!(out.len(), 1, "one note out, one note off: {out:?}");
@@ -1167,6 +1217,7 @@ mod tests {
     fn the_playhead_wraps_on_the_bar() {
         let _g = crate::test_locks::transport();
         let t = choz_ports::transport();
+        stopped_at_120();
         t.set_time_signature(3, 4);
         let mut seq = Seq::new(SeqSettings {
             on: true,
@@ -1182,7 +1233,7 @@ mod tests {
         let mut played: Vec<u8> = Vec::new();
         for i in 1..40 {
             out.clear();
-            seq.tick(t0 + Duration::from_millis(i * 200), &mut out);
+            seq.tick(clock_at(t0, i * 125), &mut out);
             played.extend(out.iter().filter_map(|e| match e {
                 ArpEvent::On { note, .. } => Some(*note),
                 _ => None,
@@ -1215,6 +1266,7 @@ mod tests {
     #[test]
     fn probability_never_drops_a_written_step() {
         let _g = crate::test_locks::transport();
+        stopped_at_120();
         let count = |random: f32, prob: f32| {
             let mut seq = Seq::new(SeqSettings {
                 on: true,
@@ -1231,7 +1283,7 @@ mod tests {
             let mut n = 0;
             for i in 1..200 {
                 out.clear();
-                seq.tick(t0 + Duration::from_millis(i * 200), &mut out);
+                seq.tick(clock_at(t0, i * 125), &mut out);
                 n += out
                     .iter()
                     .filter(|e| matches!(e, ArpEvent::On { .. }))
@@ -1263,6 +1315,7 @@ mod tests {
     #[test]
     fn randomness_never_sounds_a_note_that_was_not_selected() {
         let _g = crate::test_locks::transport();
+        stopped_at_120();
         let notes = |random: f32, prob: f32| {
             let mut seq = Seq::new(SeqSettings {
                 on: true,
@@ -1281,7 +1334,7 @@ mod tests {
             let mut played: Vec<(u8, u8)> = Vec::new();
             for i in 1..600 {
                 out.clear();
-                seq.tick(t0 + Duration::from_millis(i * 20), &mut out);
+                seq.tick(clock_at(t0, i * 20), &mut out);
                 played.extend(out.iter().filter_map(|e| match e {
                     ArpEvent::On { note, vel, .. } => Some((*note, *vel)),
                     _ => None,
@@ -1327,6 +1380,7 @@ mod tests {
     #[test]
     fn randomness_repeats_notes_and_plays_off_the_written_steps() {
         let _g = crate::test_locks::transport();
+        stopped_at_120();
         let hits = |random: f32, prob: f32| {
             let mut seq = Seq::new(SeqSettings {
                 on: true,
@@ -1343,7 +1397,7 @@ mod tests {
             // Finer than a step, so a repeat *inside* one is visible at all.
             for i in 1..4000 {
                 out.clear();
-                seq.tick(t0 + Duration::from_millis(i * 3), &mut out);
+                seq.tick(clock_at(t0, i * 3), &mut out);
                 n += out
                     .iter()
                     .filter(|e| matches!(e, ArpEvent::On { .. }))
@@ -1418,6 +1472,7 @@ mod tests {
     #[test]
     fn swing_lengthens_the_beat_and_shortens_the_off_beat() {
         let _g = crate::test_locks::transport();
+        stopped_at_120();
         let mut seq = Seq::new(SeqSettings {
             on: true,
             swing: MAX_SWING,
@@ -1435,7 +1490,7 @@ mod tests {
         let mut last = None;
         for i in 1..400 {
             out.clear();
-            seq.tick(t0 + Duration::from_millis(i * 5), &mut out);
+            seq.tick(clock_at(t0, i * 5), &mut out);
             if out.iter().any(|e| matches!(e, ArpEvent::On { .. })) {
                 if let Some(prev) = last {
                     at.push(i * 5 - prev);

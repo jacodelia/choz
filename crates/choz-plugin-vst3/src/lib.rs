@@ -260,6 +260,14 @@ impl Vst3Instrument {
     }
 }
 
+impl Vst3Instrument {
+    /// Whether the plugin maps the bend wheel — see
+    /// [`Vst3RealInstance::maps_controller`].
+    pub fn maps_pitch_bend(&self) -> bool {
+        self.inst.maps_controller(129)
+    }
+}
+
 impl AudioSource for Vst3Instrument {
     fn render(&mut self, output: &mut [f32], _sample_rate: u32) -> usize {
         let mut done = 0;
@@ -280,6 +288,18 @@ impl AudioSource for Vst3Instrument {
 
     fn note_off(&mut self, note: u8) {
         self.inst.note_off(0, note);
+    }
+
+    fn control_change(&mut self, cc: u8, value: u8) {
+        self.inst.control_change(cc, value);
+    }
+
+    fn pitch_bend(&mut self, value: u16) {
+        self.inst.pitch_bend(value);
+    }
+
+    fn pressure(&mut self, note: Option<u8>, value: u8) {
+        self.inst.pressure(0, note, value);
     }
 
     fn set_param(&mut self, index: usize, value: f32) {

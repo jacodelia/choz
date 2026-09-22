@@ -201,6 +201,48 @@ fn installed_vst3_plugins_scan_host_and_sound() {
         eprintln!("no installed VST3 instrument publishes program lists; that half was skipped");
     }
 
+    // The wheels reach the sound. VST3 has no MIDI controllers of its own —
+    // the plugin maps them to parameters through `IMidiMapping` — so an
+    // instrument that publishes a mapping must *sound different* with the bend
+    // wheel all the way up. Two instances, same note, one bent.
+    let mut with_mapping = 0;
+    let mut mapped_any = false;
+    for info in found.iter().filter(|p| p.is_instrument) {
+        let play = |bend: Option<u16>| -> Option<(bool, Vec<f32>)> {
+            let mut inst = Vst3Instrument::build(&info.path, SR, BLOCK)?;
+            if let Some(b) = bend {
+                inst.pitch_bend(b);
+            }
+            inst.note_on(60, 110);
+            let mut out = Vec::new();
+            for _ in 0..40 {
+                let mut buf = vec![0.0f32; BLOCK as usize * 2];
+                inst.render(&mut buf, SR);
+                out.extend(buf);
+            }
+            Some((inst.maps_pitch_bend(), out))
+        };
+        let Some((mapped, straight)) = play(None) else {
+            continue;
+        };
+        mapped_any |= mapped;
+        if !mapped || straight.iter().all(|s| *s == 0.0) {
+            continue;
+        }
+        let (_, bent) = play(Some(16383)).expect("it loaded a moment ago");
+        if straight != bent {
+            with_mapping += 1;
+        }
+    }
+    // Not every synth that maps the wheel uses it (Nekobi here does not), so
+    // one that answers is enough — none is the host not delivering it.
+    if mapped_any {
+        assert!(
+            with_mapping > 0,
+            "no VST3 instrument that maps the bend wheel was bent by it"
+        );
+    }
+
     assert!(
         hosted > 0,
         "nothing among {} installed VST3 bundles could be hosted",

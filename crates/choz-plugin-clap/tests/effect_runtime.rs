@@ -14,12 +14,24 @@ fn plugin_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// First scannable non-instrument plugin on this machine, if any.
-fn find_effect() -> Option<choz_plugin_clap::ClapPluginInfo> {
+/// Every CLAP on this machine **except choz's own**.
+///
+/// `packaging/install.sh` puts `choz.clap` and `choz-rack.clap` in `~/.clap`,
+/// and from there they are what these tests find first. Hosting choz inside
+/// choz is not what any of this is testing: the rack publishes no parameters
+/// and starts empty, so it fails a window-feed check and a make-a-sound check
+/// by being exactly what it is.
+fn installed() -> Vec<choz_plugin_clap::ClapPluginInfo> {
     choz_plugin_clap::default_search_paths()
         .into_iter()
         .flat_map(|d| choz_plugin_clap::scan_directory(&d))
-        .find(|p| !p.is_instrument)
+        .filter(|p| !p.id.starts_with("com.choz.") && !p.id.starts_with("org.choz."))
+        .collect()
+}
+
+/// First scannable non-instrument plugin on this machine, if any.
+fn find_effect() -> Option<choz_plugin_clap::ClapPluginInfo> {
+    installed().into_iter().find(|p| !p.is_instrument)
 }
 
 /// Every hosted CLAP must offer the feed that reports what the user moves
@@ -30,10 +42,7 @@ fn find_effect() -> Option<choz_plugin_clap::ClapPluginInfo> {
 #[test]
 fn hosted_clap_plugins_offer_the_window_feed() {
     let _guard = plugin_lock();
-    let plugins: Vec<choz_plugin_clap::ClapPluginInfo> = choz_plugin_clap::default_search_paths()
-        .into_iter()
-        .flat_map(|d| choz_plugin_clap::scan_directory(&d))
-        .collect();
+    let plugins: Vec<choz_plugin_clap::ClapPluginInfo> = installed();
     if plugins.is_empty() {
         eprintln!("no CLAP plugins installed; skipping");
         return;
@@ -142,11 +151,7 @@ fn plugin_parameters_are_readable_and_settable() {
 #[test]
 fn hosted_instrument_sounds_on_note_on() {
     let _guard = plugin_lock();
-    let Some(info) = choz_plugin_clap::default_search_paths()
-        .into_iter()
-        .flat_map(|d| choz_plugin_clap::scan_directory(&d))
-        .find(|p| p.is_instrument)
-    else {
+    let Some(info) = installed().into_iter().find(|p| p.is_instrument) else {
         eprintln!("no CLAP instrument installed — skipping");
         return;
     };
@@ -176,11 +181,7 @@ fn hosted_instrument_sounds_on_note_on() {
 #[test]
 fn instrument_parameters_are_settable_while_playing() {
     let _guard = plugin_lock();
-    let Some(info) = choz_plugin_clap::default_search_paths()
-        .into_iter()
-        .flat_map(|d| choz_plugin_clap::scan_directory(&d))
-        .find(|p| p.is_instrument)
-    else {
+    let Some(info) = installed().into_iter().find(|p| p.is_instrument) else {
         return;
     };
     let params = choz_plugin_clap::read_params(&info.path, &info.id);
@@ -233,9 +234,8 @@ fn oversized_block_is_chunked() {
 #[test]
 fn every_installed_effect_is_safe_to_host() {
     let _guard = plugin_lock();
-    let effects: Vec<_> = choz_plugin_clap::default_search_paths()
+    let effects: Vec<_> = installed()
         .into_iter()
-        .flat_map(|d| choz_plugin_clap::scan_directory(&d))
         .filter(|p| !p.is_instrument)
         .collect();
     if effects.is_empty() {
@@ -267,12 +267,10 @@ fn every_installed_effect_is_safe_to_host() {
 #[test]
 fn a_clap_instruments_preset_browser_lists_and_loads() {
     let _guard = plugin_lock();
-    let instruments: Vec<choz_plugin_clap::ClapPluginInfo> =
-        choz_plugin_clap::default_search_paths()
-            .into_iter()
-            .flat_map(|d| choz_plugin_clap::scan_directory(&d))
-            .filter(|p| p.is_instrument)
-            .collect();
+    let instruments: Vec<choz_plugin_clap::ClapPluginInfo> = installed()
+        .into_iter()
+        .filter(|p| p.is_instrument)
+        .collect();
 
     let Some((info, list)) = instruments
         .iter()

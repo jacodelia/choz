@@ -407,6 +407,13 @@ impl AudioSource for SandboxedPlugin {
             .push_midi([0xE0, (v & 0x7F) as u8, (v >> 7) as u8]);
     }
 
+    fn pressure(&mut self, note: Option<u8>, value: u8) {
+        self.bridge.push_midi(match note {
+            Some(n) => [0xA0, n & 0x7F, value & 0x7F],
+            None => [0xD0, value & 0x7F, 0],
+        });
+    }
+
     fn set_param(&mut self, index: usize, value: f32) {
         self.bridge.push_param(index, value);
     }
@@ -637,6 +644,8 @@ fn serve_plugin(
                         0x90 | 0x80 => src.note_off(m[1]),
                         0xB0 => src.control_change(m[1], m[2]),
                         0xE0 => src.pitch_bend(u16::from(m[1]) | u16::from(m[2]) << 7),
+                        0xA0 => src.pressure(Some(m[1]), m[2]),
+                        0xD0 => src.pressure(None, m[1]),
                         _ => {}
                     }
                 }

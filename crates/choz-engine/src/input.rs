@@ -54,7 +54,19 @@ pub struct CcMsg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BendMsg {
     pub source: InputSource,
+    /// MIDI channel, 0-based — the bend belongs to the tab its channel does.
+    pub channel: u8,
     pub value: u16,
+}
+
+/// Aftertouch. `note` is `Some` for polyphonic pressure, `None` for channel
+/// pressure — see `AudioSource::pressure`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PressureMsg {
+    pub source: InputSource,
+    pub channel: u8,
+    pub note: Option<u8>,
+    pub value: u8,
 }
 
 /// A program change, with the bank the last Bank Select (CC 0 / CC 32) chose.
@@ -106,6 +118,7 @@ pub enum InputEvent {
     Cc(CcMsg),
     Program(ProgramMsg),
     Bend(BendMsg),
+    Pressure(PressureMsg),
     Control(ControlMsg),
 }
 

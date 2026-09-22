@@ -12,9 +12,9 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **894 tests** con harness en todo el workspace (780 entre `choz-engine` y `choz-ui`) + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
-- `cargo clippy --workspace --all-targets -D warnings` limpio.
-- **56 efectos propios**, publicados también como un `.clap` con los dos artifacts.
+- **1045 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo), 573 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- `cargo clippy --workspace --all-targets -D warnings` limpio, y `cargo fmt --all --check` también.
+- **56 efectos propios**, publicados también como un `.clap` con los cuatro artifacts (arpegiador, secuenciador, metrónomo y arreglador).
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
 - `cargo test --workspace` necesita `--no-fail-fast`: uno de los binarios con
   `harness = false` no reconoce los argumentos que cargo le pasa y aborta la
@@ -31,6 +31,1714 @@ lleva lo que falta —nada de lo ya hecho— y
   `choz-engine::test_locks` tiene un candado por global; en `choz-ui` el par es
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
+
+## [1.3.12] — 2026-09-21
+
+### 2026-09-21 — los estilos del arreglador dejan de escribirse a mano
+
+**Lo que había:** veinticinco `Style` escritos a mano en `style.rs`, mil
+trescientas líneas de constantes, más un formato `.style` para que un usuario
+escribiera los suyos en `~/.local/state/choz/styles`. Cuarenta números por
+estilo, puestos a ojo y defendidos en un comentario.
+
+**Lo que hay:** una tabla generada, `arranger::styles::ALL`, con **210 estilos
+medidos** de una librería de ritmos en MIDI. Un ritmo es un archivo por
+acompañamiento —sus secciones una detrás de otra, un marcador por sección
+(`Var1 4bar 4/4`) y cada pista nombrada con la parte que la toca—, y un estilo
+es lo que se puede medir de él:
+
+- la sección de variación se pliega compás a compás; una posición entra en el
+  patrón cuando vuelve en más de un tercio de los compases;
+- el backbeat son las caídas fuertes y `ghost` es la tasa de las flojas;
+- el swing es cuánto se atrasan las off-divisiones, **medido antes de
+  redondear**: redondear un shuffle a la grilla de semicorcheas es exactamente
+  lo que convierte un shuffle en una semicorchea. La grilla de tresillos sólo
+  se usa en los estilos que dieron swingueados;
+- el registro medido se ensancha hasta uno en el que un generador pueda
+  trabajar: lo que toca un ritmo son cuatro compases sobre un acorde, y en seis
+  semitonos no se conduce una voz;
+- los programas GM de cada rol salen del propio ritmo, y `Style::family` —que
+  los adivinaba por el nombre del estilo— se fue con las constantes.
+
+**Lo que no se puede medir** de unos compases sobre un acorde queda dicho en el
+script: `approach` y `passing` salen de los intervalos de semitono y de tono del
+bajo, y `human` es una constante porque los ritmos vienen cuadrados sobre la
+grilla.
+
+**Los acompañamientos viven con el arreglador**, en
+`crates/choz-engine/src/artifacts/arranger/rhythms`: un MIDI por estilo, con el
+nombre del estilo, y un `README.md` que dice qué forma tiene que tener un
+archivo para poder medirse. choz no lee esa carpeta en runtime —sólo lleva la
+tabla—, pero está en el repo para que `styles.rs` se regenere desde acá y para
+que el número que suena mal tenga una grabación que escuchar. Con eso se fueron
+también
+`style::parse`, `style::load_dir`, `arranger::styles_dir` y `load_styles`: no
+hay formato de estilo ni estilos escritos a mano.
+
+**Tests.** Los del arreglador nombraban constantes (`ROCK`, `FUNK`,
+`MAJOR_BLUES`) y ahora nombran estilos medidos con la propiedad que cada uno
+prueba. Dos que fallaban dijeron algo real y no se aflojaron sin explicarlo:
+
+- `the_guitar_plays_against_the_pianos_length`: la regla "si el piano sostiene
+  corto, la guitarra sostiene largo" no puede mostrarse cuando el comp ya
+  sostiene casi todo el hueco que tiene. Diez estilos caen ahí; el test los
+  saltea diciendo por qué.
+- `the_swing_is_in_the_styles_own_division` comparaba contra dos constantes
+  (0.0625 y 0.05). Ahora calcula lo que cada estilo debería correrse —su
+  división por su swing— y verifica que las dos divisiones no se confundan.
+
+### La salida elegida en el cajón OUT no se guardaba, y nada del ruteo se logueaba
+
+Salió de auditar una corrida que no sonó con el headset elegido. **El log no
+podía contestar por qué**, y eso es lo primero que se arregló.
+
+**Lo que decía el log** (penúltima corrida, 21:22:27): el banner de arranque
+—`out=10 ch, dev=default`—, el OSC, y sondas de nivel. Nada más. Ninguna línea
+sobre la salida: ni un error, ni un "quedó sin conectar", ni una confirmación.
+La corrida siguiente, dos minutos después, arrancó otra vez con `dev=default`.
+
+**Por qué:** `connect` y `jack_route_to` sólo hablaban cuando fallaban. Una
+corrida cableada al sink equivocado se veía **idéntica** a una cableada al
+correcto, y el log es lo único que queda para leer después. Ahora las dos
+dicen a dónde quedó la salida y cuántos puertos se ataron, **también cuando
+sale bien**; y una corrida sin dispositivo elegido dice que la dejó en lo que
+el grafo auto-conectó, que es el caso en el que choz suena por donde nadie
+pidió.
+
+**El bug de verdad:** el dispositivo se elige desde dos lados —el cajón OUT
+(F3) y AUDIO en settings— y **sólo settings lo escribía**. `out_select_side`
+llamaba a `set_output_device` y nada más, así que un headset elegido en el
+cajón se perdía al cerrar y choz volvía con lo que el grafo quisiera. Se ve en
+los datos: `ui.json` tenía `device: ""` y 119 de 120 arranques dicen
+`dev=default`. Ahora se guarda en el único camino por el que pasan los dos, y
+**después** de que el motor lo aceptó: un dispositivo que no abre no es un
+dispositivo al que volver.
+
+**Lo que esto no explica:** por qué esa corrida no sonó. Con `dev=default`
+choz ni siquiera llama a `connect` —queda donde PipeWire lo haya puesto— así
+que la causa pudo ser ésa o pudo ser el cajón no aplicando nada, y el log de
+entonces no distingue. El de la próxima sí.
+
+### El picker se puede leer, la caja cuenta el compás que toca, y la banda se mezcla
+
+Tres cosas que se vieron recién con doscientos diez estilos en la lista:
+
+- **El picker está numerado y con nombres legibles.** Un ritmo viene nombrado
+  como entraba en el panel de un teclado —`16btshfl`, `pnrckbld`— y doscientos
+  de ésos no son una lista. `Style` gana un `label` (`16 Beat Shuffle`, `Piano
+  Rock Ballad`) y cada fila lleva su número: "el 137" es algo que se puede
+  decir en voz alta. El `name` no cambia: es lo que escribe un chart y lo que
+  guarda un proyecto. Las abreviaturas que podrían ser dos cosas se quedan como
+  están —`Scrswing`, `Drngense`, `Ruchnsn1`, `Dongbeiy`, `Mus`—: un nombre
+  inventado con seguridad es peor que uno corto.
+
+- **La caja mostraba siempre 4/4.** Leía la firma del *transporte*, que es 4/4
+  en una sesión que nadie tocó, mientras la banda contaba el compás del estilo:
+  un vals sonaba en tres y decía cuatro. `Style` gana `meter` —la firma medida
+  del ritmo, que `beats_per_bar` no puede decir porque un 6/8 y un 3/4 son los
+  mismos tres negras— y la caja imprime `Arranger::meter()`: la de la sesión
+  cuando alguien puso una, la del estilo si no.
+
+- **La banda se mezcla sola** (`generate::balance`). El `vel` de un estilo se
+  mide de la batería, y darle ese mismo número a los cuatro roles eran cuatro
+  tocando encima del bajo. Peor: un instrumento de acordes pone cinco notas
+  donde el bajo pone una, así que un comp a la velocidad del bajo es cinco
+  veces su energía y la línea desaparece. Ahora el bajo es la referencia
+  (batería 0.82, piano 0.62, guitarra 0.55) y las notas que caen juntas se
+  reparten la sala por `1/√n` —no `1/n`, que sería un acorde más bajo que una
+  nota suya—. El fader de la caja sigue yendo encima de eso.
+
+  De paso quedó al descubierto que `a_band_plays_every_part_it_was_given`
+  filtraba el bombo **por altura**: un bajo en su Do más grave es MIDI 36, que
+  es el bombo. Ahora filtra también por rol.
+
+**De paso:** `real_host.rs` contaba `BUILT_IN_KINDS + 3` artifacts. Son cuatro
+desde que el arreglador viaja en el mismo `.clap` (`7a6f0c8`); el test estaba en
+rojo y no tenía nada que ver con esto.
+
+**Y de paso:** `METER` en japonés era `\u{62d}\u{5b50}` — una letra árabe *hah*
+seguida de 子 — en vez de 拍子 (`\u{62cd}`). Una auditoría de la tabla de i18n
+(180 filas, 8 idiomas) no encontró nada más: ninguna fila corta, ninguna clave
+repetida, y ningún `t("…")` sin fila. Cuatro archivos que `cargo fmt` venía
+arrastrando sin formatear desde antes de esta rama quedaron formateados, así
+que `cargo fmt --all --check` sale limpio.
+
+### 2026-09-20 — en la grilla, cada celda es un botón para el ratón
+
+**El bug:** agrupar un compás en cuatro y con el ratón sólo se podía editar el
+primer acorde. Una fila de la grilla era **una** opción para la lista de abajo:
+el clic elegía el compás y el cursor de celda se quedaba donde estaba, así que
+tres de los cuatro acordes no se podían alcanzar.
+
+- `ChartEdit::slot_at(bar, col)` traduce la columna del puntero a la celda,
+  con las mismas medidas con las que `rows()` las dibuja —número de compás,
+  ancho de celda, la línea entre dos celdas que no es de ninguna—, así que el
+  mapeo no puede desalinearse del dibujo.
+- El primer clic pone el cursor en la celda que hay debajo; un clic sobre la
+  celda que ya está bajo el cursor abre el diálogo de acorde, que es lo que un
+  segundo clic significa en todas las listas de choz.
+- Test `a_click_picks_the_cell_it_is_over`: lee del buffer dibujado dónde está
+  cada acorde y hace clic ahí, y comprueba los bordes —una columna a cada lado
+  de cada línea divisoria— para que un corrimiento de una sola columna lo haga
+  fallar (verificado corriéndolo con el desfase puesto a mano).
+
+### 2026-09-20 — el secuenciador toma el mismo transporte, y STOP se lleva el clic
+
+**Los tres botones, también en el secuenciador.** `▶` toca el patrón y arranca la
+cadena desde su tope, `⏸` sale y vuelve a entrar **en la misma parte** de la
+cadena, `■` corta y rebobina. `Seq::pause` / `resume` / `toggle_pause` conservan
+el step, la parte y el lugar en la cadena —eso es el lugar— y sueltan `grid`,
+porque el reloj corrió mientras estaba afuera y el step que dispara al volver es
+el que el reloj tiene ahora. La tecla `K` de la caja sigue siendo un toggle
+play/stop: la diferencia fina entre parar y pausar vive en los botones.
+
+**STOP se lleva el metrónomo.** Un clic sonando sobre un rack parado es un clic
+que nadie pidió. `App::stop_click_with_the_band` lo apaga desde los tres lugares
+donde se para algo —el `■` del secuenciador, el `■` del arreglador y el stop del
+rack, que es por donde entra el STOP del MIDI clock—, y **sólo si algo estaba
+andando**: con todo apagado, STOP no es una forma de alcanzar y apagar un clic
+que alguien puso para practicar. Pausar no lo toca: una pausa no es el final de
+la toma.
+
+- Tests: `the_sequencer_transport_stops_the_click_too` (los tres símbolos, el
+  recorrido con el ratón, y el clic en cada caso) y
+  `pause_keeps_the_part_and_play_starts_the_chain_again`.
+
+### 2026-09-20 — SELECT en el picker de acordes tiraba la edición, y el chart nace en letras
+
+**El bug, reportado desde el uso:** editar un acorde de la progresión y apretar
+SELECT dejaba la progresión igual que antes. SELECT del ratón corría el camino
+genérico —`modal_select()` y después `close_modal()`—, y en el picker de acordes
+`modal_select` **reabre la grilla** con el acorde ya puesto: el `close_modal()`
+que venía después cerraba esa grilla recién abierta, y la edición se iba con
+ella. Con el teclado no pasaba, porque Enter respeta el `false` que devuelve
+`modal_select` cuando el diálogo sigue abierto.
+
+- El picker de acordes es un paso *dentro* de la grilla: SELECT devuelve el
+  acorde a su celda, CANCEL —y Esc, y un clic afuera— vuelve a la grilla sin él.
+  Cerrar del todo era lo que tiraba el chart entero.
+- Test `select_keeps_the_chord_and_then_the_chart`, que hace el recorrido con el
+  ratón: acorde cambiado → SELECT → grilla → SELECT → el chart del tab lo tiene.
+
+**El arreglador nace en clave americana.** `DEFAULT_TEXT` pasa a estar escrito en
+letras (`|| C7 | F7 | …`) y `ArrangerSettings::default().roman` es `false`: lo que
+un músico lee de un chart es lo normal, y los grados son un botón. Un chart que
+llega en grados se sigue leyendo en grados — eso lo dice el texto, no el default.
+
+### 2026-09-20 — el transporte del arreglador, y por qué el acompañamiento era una pared
+
+**La auditoría, con números.** Se midió la polifonía del arreglador sobre cuatro
+compases, por rol y para la banda entera:
+
+| chart | guitarra | piano | banda |
+| ----- | -------- | ----- | ----- |
+| tríadas | 9 | 6 | 18 |
+| séptimas | 16 | 4 | 22 |
+| trecenas | **22** | 10 | **35** |
+
+Treinta y cinco notas sonando juntas no es un acompañamiento. Dos causas, las
+dos en `generate`:
+
+1. **El voicing era el deletreo del acorde.** Un `maj13` tiene siete u ocho
+   tonos y `voice()` los tocaba todos; un pianista toca cuatro. `hand()` recorta
+   por función —tercera, séptima, tensión alterada, sexta, oncena, y recién al
+   final fundamental y quinta, que son del bajista—, con `PIANO_NOTES = 4` y
+   `GUITAR_NOTES = 5`.
+2. **`Comp::hold` duraba más que el hueco hasta el golpe siguiente**, así que se
+   apilaban cuatro rasgueos. `damp()` corta cada acorde cuando el mismo
+   instrumento vuelve a tocar, con 0.02 de ligadura para que no quede seco; un
+   golpe es lo que empieza más de 0.1 de beat después, así el rasgueo sigue
+   siendo un acorde y no cuatro.
+
+Después: guitarra **22 → 5**, banda **35 → 16**. Tests nuevos
+`the_accompaniment_does_not_pile_up` (polifonía y notas por golpe, por rol, en
+tríadas, séptimas y trecenas) y `an_extended_chord_is_voiced_by_a_hand` (lo que
+toca sigue estando en el acorde, y la tercera nunca se va).
+
+**El transporte, en sus símbolos de siempre.** `▶` arranca la progresión desde
+el comienzo, `⏸` la deja donde está y vuelve a entrar **en el mismo compás**, `■`
+corta y rebobina. `Arranger::pause` / `resume` / `toggle_pause`: pausar suelta lo
+que está sonando —un acorde sostenido a través de una pausa es un drone— pero no
+mueve el playhead, y el reloj sigue corriendo mientras tanto (una banda no toca
+los compases que se sentó).
+
+- Con esto **PLAY deja de anclar la forma al compás del reloj**: el botón dice
+  desde dónde se toca. El reloj sigue siendo en qué *tiempo* cuenta la banda, que
+  es lo que no puede desalinearse.
+
+### 2026-09-20 — el acorde se construye, no se elige de una lista
+
+**Un menú de acordes armados no alcanza.** Un menor toma una ♭9 igual que un
+dominante, un disminuido toma novena, un aumentado toma séptima; las diecinueve
+filas de la tabla dejaban afuera todo lo demás, y listar cada combinación es una
+lista de miles. Ahora el modal **arma la especie** en un solo lugar
+(`ModalKind::ArrChord`, `chart_edit::ChordSpec`), una fila por decisión y las
+flechas ←→ girando el valor —la regla del metrónomo, con sus mismas teclas:
+
+```
+   Cm7b5       C Eb Gb Bb
+   ROOT      C
+   FAMILY    MIN
+   6 / 7     7
+ ▶ TENSION   —
+   9         —
+   11        —
+   13        —
+   5         ♭5
+```
+
+- Familias: `MAJ MIN DOM DIM AUG SUS2 SUS4`; sexta o séptima (`— 6 7 maj7`, que
+  es lo que hace decible `Cm(maj7)` y `Caug(maj7)`); tensión (`— 9 11 13`); y
+  una fila por alteración (`♭9 ♯9 add9`, `♯11`, `♭13`, `♭5 ♯5`). Más de 500
+  especies, y **un test construye todas y las parsea**: la tabla y la gramática
+  no pueden separarse.
+- El encabezado dice qué se escribe y **qué notas suenan**, deletreadas por lo
+  que son en el acorde: la quinta bemol de un `Cm7b5` es `Gb`, no `F#`
+  (`ChordSpec::notes`, `chord::pitch_class_name_flat`).
+- El modal abre sobre el acorde que ya está en la celda: `chord::root_and_quality`
+  lo parte y `ChordSpec::of` encuentra la combinación que lo escribe —una
+  búsqueda entre las combinaciones, no un segundo parser que se desincronice.
+- `h` deja la celda en hold, `n` gira la fundamental sin caminar a su fila, Enter
+  mete el acorde y vuelve a la grilla. Los dos modales anteriores (fundamental y
+  matriz de calidades) se fueron.
+
+### 2026-09-20 — la notación del chart es un switch
+
+**Grados o letras, y el texto es lo que se reescribe.** `I7` y `C7` son el mismo
+acorde; quién lo lee decide cuál quiere ver. El switch (`ArrangerSettings.roman`,
+botón `I–IV–V` / `C–F–G` en el panel y `r` dentro de la grilla) pasa el chart
+entero de una notación a la otra con `chord::respell_text`, que respeta headers,
+secciones, barras, espacios, comentarios y pesos: sólo cambian los símbolos.
+
+- `chord::respell` / `respell_text` / `is_roman` / `pitch_class_name_in_key`. La
+  notación **la dice el texto**, no una bandera al lado: `set_text` la infiere,
+  así que un chart abierto de un archivo en letras no deja el switch diciendo
+  grados.
+- Enarmonías: el bVII de C es `Bb`, no `A#`. Dos reglas —el lado bemol del
+  círculo escribe bemoles, y los grados que una progresión alcanza *bajando*
+  (`bII`, `bIII`, `bVI`, `bVII`) son bemoles en cualquier tonalidad— y lo que
+  queda es el `#IV`, que es sostenido.
+- `ListModal.header`: un encabezado sobre las filas, para una lista cuyas filas
+  son columnas.
+- Lo que la grilla escribe sale en la notación que está en pantalla. (El picker
+  de acordes de esta entrada —matriz de diecinueve variaciones más lista de
+  fundamentales— lo reemplazó el constructor de la entrada de arriba el mismo
+  día.)
+
+### 2026-09-20 — el chart como grilla: un acorde por subdivisión, y la banda agrupa el compás a su manera
+
+**El editor de texto de la progresión se fue.** Era lo último en choz que tomaba
+teclado —con caret, selección, pegado— y con eso se llevaba las letras que son el
+piano. En su lugar, el chart es una grilla: una fila por compás, una celda por
+subdivisión, y **como máximo un acorde por celda**. Cuántas celdas tiene un
+compás lo dice su agrupación, que es la regla que el texto nunca pudo enunciar:
+un chart escrito a mano podía poner cinco acordes en un compás de 4/4 y se leían
+como cinco pulsos iguales.
+
+- `ArrangerSettings.groups`: **la agrupación es de la banda**, no del clic. Un
+  tab puede tocar 3+2+2 contra un metrónomo que cuenta 2+2+3. Vacía sigue al
+  clic, que es lo que significa cualquier proyecto anterior. `Arranger::set_groups`
+  re-hornea sin mover la forma.
+- **Un peso por acorde en el texto**: `| Cm:3 F:2 Bb:2 |` es un 7/8 agrupado
+  3+2+2 —1.5 + 1 + 1 beats—, no tres tercios iguales. `chord::Bar` lleva
+  `weights`, `Progression::at` reparte por peso, y un compás sin pesos se divide
+  parejo como siempre. Los acentos de `generate::accent` salen de la agrupación
+  **de cada compás**, con la del tab como respaldo.
+- `Cm(maj7)` existe: el parser no tenía la menor con séptima mayor (la `m`
+  comía la `m` de `maj`). Escala melódica menor, y `Cmmaj7` es lo mismo escrito
+  más plano.
+- La grilla (`ModalKind::ArrChart` + `chart_edit`): flechas para caminar compases
+  y celdas, Enter abre dos listas —doce fundamentales y las diecinueve calidades
+  de la tabla americana, de `MAJ` a `DOM 7 ♭13`—, `g` cicla las agrupaciones del
+  compás (las de `musical_groupings`, las mismas que ofrece el metrónomo), `h`
+  deja la celda manteniendo el acorde anterior, `+`/`-` compases, `b` le pasa a
+  la banda el compás del cursor. F2 guarda, Esc deja todo como estaba.
+- Borrados: `text_edit.rs` entero, `arr_edit_key`, `paste_into_editor`,
+  `progression_of`, `draw_text_modal` y el evento de pegado. Nada en choz toma
+  texto: una copia de `text_edit.rs` quedó fuera del árbol por si hace falta.
+
+### 2026-09-20 — un solo reloj: el metrónomo, el secuenciador, el arpegiador y el arreglador cuentan lo mismo
+
+**El síntoma:** una secuencia arrancada primero y el metrónomo encendido después
+caían en fases distintas. **La causa:** con el transporte parado había cuatro
+relojes. El metrónomo contaba un contador de frames propio que volvía a cero en
+cada encendido (`Metronome::pos`, reiniciado en `set_on`), y el secuenciador, el
+arpegiador y el arreglador contaban cada uno su propio `Instant` desde el momento
+en que se los puso a andar. Con el transporte rodando los cuatro leían `ppq()` y
+sí estaban juntos; parado, ninguno.
+
+**El arreglo:** un reloj libre en `choz_ports::Transport` —`advance_free()`, que
+el callback de audio adelanta en **todos** los bloques, rodando o no— y una sola
+posición de la que todos cuentan, `Transport::position_ppq()`: la del transporte
+mientras rueda, la del reloj libre si no. `samples()` no cambió de significado,
+así que el sync de los plugins exportados sigue igual.
+
+- `Metronome::pos` borrado. Encender el clic ya no reinicia nada: entra en el
+  beat donde está la música, que es la diferencia entre sumarse a una banda y
+  contarla desde cero. También desaparece el salto de fase al apretar stop, que
+  venía de que el contador privado seguía corriendo mientras el transporte
+  manejaba el clic.
+- `Seq` perdió su reloj libre: un solo camino, el índice de paso sale de
+  `position_ppq()`. Con eso `play_with` / `is_running_free` dejaron de tener
+  sentido —dos secuenciadores ya caen en la misma grilla sin pasarse nada— y se
+  fueron, junto con el `next_step` que los sostenía.
+- `Arp`: el camino libre pasa a ser la misma grilla contada (la primera nota de
+  un acorde sigue sonando al apretar la tecla, lo de después va sobre la
+  grilla). Y el swing dejó de contradecirse: la paridad la decide el índice
+  absoluto de la grilla, no un contador privado que se desfasaba, y `swing_of`
+  alarga el paso **par** como el secuenciador —estaba al revés, que es por qué
+  la misma perilla se oía distinta en las dos cajas.
+- `Arranger`: `advance()` lee la posición compartida. (El anclaje de la forma a
+  `pos % total` que traía esta entrada lo sacó el transporte del mismo día: ▶
+  dice desde dónde se toca.)
+- Test nuevo, `the_click_lands_on_the_sequencers_steps`: secuencia arrancada a
+  tres octavos de beat, metrónomo encendido después, y cada clic tiene que caer
+  sobre un paso del secuenciador. Se verificó que falla con 3.000 frames de
+  corrimiento en el clic.
+
+**Lo que queda del audit y no se tocó:** las agrupaciones (`Metronome::groups`)
+las lee el arreglador para acentuar y el secuenciador sólo para dibujar los
+cortes; el arpegiador las ignora. Y `session_bar()` sigue devolviendo `None` en
+4/4 a propósito, así que un estilo que cuenta en 3 no comparte compás con el
+clic en una sesión en 4/4.
+
+### 2026-09-17 — el arreglador: una banda por tab, tres pickers y los patrones sacados de 52.000 MIDIs
+
+**Los números de la batería salieron de MIDI de verdad.** Se leyó la carpeta
+`Drums/` de una colección de 52.311 archivos —196 patrones GM— plegando cada
+archivo compás a compás sobre una grilla de semicorcheas: una posición entra al
+estilo cuando suena en más de un tercio de sus compases, y `ghost` es la tasa de
+redoblantes flojos (velocity < 55) por compás sobre los huecos que el patrón
+deja libres. Lo mismo con las pistas melódicas de arreglos completos, carpeta
+por género (Jazz, CountryMusic, Motown, ClassicRock, Dance_Techno), para las
+posiciones del comping. De ahí salieron el bombo del rock en el "y" de cuatro,
+el tren del country (redoblante en 1, 1½ y 3), el tumbao del latin, el clave del
+bossa, el comping del jazz que ahora también cae en el tiempo fuerte, y catorce
+`ghost` recalibrados. Las posiciones de los estilos swingueados se escriben
+*sin* el swing —un bombo medido en 2,75 se anota `2.5`— porque `swung()` es
+quien lo empuja. Está documentado en la cabecera de `style.rs`.
+
+- **Los fantasmas caen en la división del estilo**, no cada medio tiempo: un
+  funk que cuenta semicorcheas los pone ahí y un shuffle en corcheas
+  swingueadas. Nunca sobre un golpe que ya está ocupado ni en un tiempo pelado.
+  Era el punto "el groove de semicorcheas es medio groove" del roadmap.
+- **Ocho tablas de fill en vez de cuatro**: las cuatro nuevas son el último
+  tiempo de fills reales leídos de la misma librería.
+
+**Una banda entera en una tab.** `ArrangerSettings.parts` es un fader por rol
+(`[f32; 6]`): cada músico entra o sale con su botón y el volumen se mueve con la
+rueda o con ↑↓. Todos los roles prendidos se hornean juntos sobre la misma línea
+de tiempo y el fader escala la velocity. Un proyecto viejo (sin `parts`) sigue
+tocando su `role` solo. El último músico no se puede sacar: la banda vacía es
+para lo que está el switch de la caja. Y un `note off` sólo sale cuando nadie más
+sostiene esa nota —el bajo y el piano cayendo en la misma nota se cortaban entre
+ellos—.
+
+**El arreglador cuenta el compás de la sesión, con su agrupación.** `METER`
+abre el mismo diálogo que el METER del secuenciador —porque es el mismo compás—
+y lo que diga se toca: un 7/8 agrupado 3+2+2 son doce compases de 3,5 tiempos y
+la banda se apoya en el tiempo en que empieza cada grupo (`generate::accent`),
+que es toda la diferencia entre 3+2+2 y 2+2+3. Un 4/4 —lo que toda sesión es—
+deja al estilo contar lo suyo: un vals sigue en 3.
+
+**Y tiene los tres mandos del secuenciador**, en las mismas escalas y con los
+mismos significados: `SWING` se suma al del estilo, `RAND` es **cuánto** puede
+desviarse una nota y `PROB` **cada cuánto** lo hace. La rueda sobre la barra es
+el valor, las flechas también, y todo se re-hornea desde donde está.
+
+**La progresión se dibuja como matriz de compases.** Una celda por compás,
+subdividida en lo que el metro cuenta y partida donde parte la agrupación
+(`○·· ·· ··` para un 7/8 en 3+2+2), con el número de compás delante, el acorde
+debajo, el compás que suena encendido y el pulso dentro de él más brillante.
+**Cada compás es un botón**: el clic abre el chart con el cursor en ese compás.
+Donde el panel no tiene filas para la matriz, la progresión sigue siendo la
+línea de siempre — la regla que sigue todo este panel.
+
+**Los fills salieron de la librería de loops, y el tempo decide cuáles.** Los
+232 compases de fill de las 196 baterías de `Drums/` se plegaron sobre una
+grilla de semicorcheas y se contaron; las quince formas que más aparecen quedaron
+como están escritas —el tom que se contesta con el bombo abajo, el redoble que
+crece hasta el downbeat, el paradiddle con el bombo en el segundo golpe, el
+charles abierto que ahoga el redoblante—, cada una con su posición, su tambor y
+su parte de la velocity del estilo (`generate::Fill`). El fill se **elige antes**
+de tirar el groove, porque cuánto compás ocupa es lo que dice dónde para la mano:
+un turnaround de dos tiempos que arrancaba mientras el charles seguía contando
+eran dos bateristas.
+
+**Y arriba de 190 la batería toca lo que una batería puede tocar.** Una
+semicorchea a 190 son 79 ms: el charles pasa a corcheas, los fantasmas se van
+casi del todo y el fill sale de la mitad de la tabla que no tiene nada más rápido
+que una corchea; arriba de 240 el platillo cuenta el pulso y los fantasmas
+desaparecen. El bombo y el redoblante no se tocan —adelgazar una batería no es
+callarla—. `bake` recibe el tempo (sigue siendo función de sus argumentos) y
+`Arranger::retune_to_tempo` vuelve a hornear cuando el tempo cruza una de las dos
+líneas, **desde donde está**, llamado por el loop de la UI y no por `tick`.
+
+### Cuatro cosas que estaban mal
+
+- **Subir un fader tocaba una nota fuerte de la nada**, y agregar o sacar un
+  instrumento devolvía la secuencia al compás uno. Era lo mismo: hornear rebobinaba,
+  así que el cursor volvía al principio de una parte que ya estaba a mitad de
+  camino y el siguiente tick soltaba el primer compás entero de una vez.
+  `rebake_keeping_place` deja el playhead donde estaba y el cursor delante de la
+  nota que sigue; lo usan el fader, el alta y baja de músicos, la semilla y el
+  tempo.
+- **El selector de estilo no cambiaba el estilo** en dos casos que se ven igual
+  desde afuera: un chart con dos líneas `style` —lo que deja pegar uno encima de
+  otro— porque el lector toma la última y el escritor cambiaba la primera (ahora
+  las duplicadas se borran), y un chart con una errata más abajo, porque al no
+  parsear se quedaba con el estilo anterior (ahora el tono y el estilo se leen
+  igual: `chord::settings_of`).
+- **El modal de progresión tiene sólo la progresión.** Las líneas `key` y
+  `style` tienen sus propios diálogos, así que no se muestran; vuelven encima de
+  lo que se escriba, salvo que lo escrito las traiga —un chart pegado de otro
+  lado trae las suyas y son las que mandan—.
+- **Una fila de compases sin barra al final es cuatro compases**, no tres y
+  medio: el salto de línea es una barra. Escribir el chart en filas de cuatro
+  —que es como se escribe— unía el último compás de cada fila con el primero de
+  la siguiente, y doce compases se leían como diez.
+
+**Una banda en una tab suena con un banco por músico.** Si la tab tiene un
+SoundFont con más de un programa adentro, cada rol del arreglador se queda con
+una **zona** propia —el canal MIDI que el SF2 ya usaba para los splits— y con el
+programa que lo toca: bank 128 para la batería, el contrabajo para el bajo, el
+saxo para la melodía. Suenan **en paralelo**, en la misma tab, cada uno con su
+timbre.
+
+- `AudioSource::note_on_zone` es la única pieza nueva del camino de la nota:
+  un note-on apuntado a una zona. El note-**off** no se apunta (va a todos los
+  canales, como ya iba) porque las zonas se pueden repuntar con una nota
+  sostenida.
+- `App::push_arranger_band` reparte las zonas **desde arriba**, salteando las
+  que ya usan los botones de sonido de la tab (que son las del split, desde 0),
+  y se recalcula después de cada gesto del arreglador y en cada `push_split`.
+  Apagar el arreglador devuelve los canales.
+- `generate::Note` lleva el rol que la tocó y `Arranger::tick` lo emite con cada
+  evento: en una banda de seis en una línea de tiempo, el timbre no se puede
+  deducir de la altura —un bajo y un piano comparten notas—.
+- Sin SoundFont multi-programa (un plugin, el sampler, un SF2 de un solo
+  preset) todo sigue como antes: un timbre para toda la banda. Y con el
+  arpegiador prendido la zona se descarta, porque `ArpEvent` no lleva zona.
+
+**El transporte corre la banda.** Prender el arreglador la deja lista; lo que
+la arranca es el botón que arranca el rack —y **START, CONTINUE y STOP de MIDI
+clock, que llegan por la misma puerta**, que es lo que hace que la banda siga un
+reloj externo igual que el metrónomo—. `Arranger::play_on_transport` es la misma
+que tiene el secuenciador y por la misma razón: su reloj propio no cuenta hasta
+que el transporte se mueve, porque contarlo en el hueco anterior al primer
+bloque de audio tocaba el primer compás dos veces.
+
+**Se fueron MELODY y SOLO.** El arreglador es para lo que nadie en la sala va a
+tocar; la melodía es justamente lo que el que está ahí *sí* toca. Con los dos
+roles se fueron sus generadores (`lead`, `motif`, `solo_of`, `avoid`), el struct
+`Lead` y los doce números que cada uno de los 25 estilos le dedicaba. Compatible
+hacia atrás por los dos lados: un proyecto guardado con `role = Melody` abre como
+piano (`#[serde(alias)]`), y un `.style` con `lead.*` o `solo.*` sigue cargando
+—esas claves se leen y se descartan en vez de rechazar el archivo—. `parts` pasó
+de `[f32; 6]` a `Vec<f32>` por lo mismo: un proyecto con seis faders no puede
+dejar de abrir porque ahora hay cuatro.
+
+**El piano y la guitarra tocan duraciones contrapuestas.** Dos instrumentos de
+acordes con la misma longitud son uno solo con chorus: `generate::counter_hold`
+decide la de la guitarra a partir de la del piano, y la línea divisoria es el
+tiempo. Piano corto (≤ 1 tiempo) → la guitarra deja sonar el compás; piano
+sostenido → la guitarra contesta picada (0,2–0,75). El compás es el techo en los
+dos casos: un acorde que pasa al siguiente es un acorde tocado sobre el cambio.
+
+**Los tres artefactos viven dentro de un marco.** La fila de switches
+`ARP / SEQ / ARR` flotaba entre la caja del instrumento y la del FX chain sin
+pertenecer a ninguna de las dos; ahora hay un marco `ARTIFACTS` alrededor de la
+fila y de la caja que esté abierta, y se ilumina cuando el artefacto que muestra
+tiene las flechas. Las cajas de adentro (SEQ, los knobs del ARP) conservan el
+suyo, que es lo que dice cuál tiene las flechas. Se dibuja **después** de su
+contenido —un `Block` sin estilo propio pinta sus bordes y no toca lo de adentro,
+así que la sección no necesita saber cuánto mide antes de dibujarse— y **se
+omite donde el panel no tiene dos filas para gastar**: en una pantalla de cinco
+pulgadas los controles valen más que la línea que los rodea, que es la regla que
+este panel sigue en todos lados.
+
+**El switch ya no arranca tocando.** Prender el arreglador deja todo listo y
+espera; PLAY es de quien lo prendió. Arrancar antes de elegir tono, estilo,
+progresión y músicos era tocar los doce compases equivocados en la cara del que
+tocó el botón.
+
+**Tres pickers, uno por cosa, todos escribiendo en el texto** (que sigue siendo
+la única fuente: un tono guardado al lado del chart es un tono que puede
+contradecirlo):
+
+- **KEY** abre el piano de SPLIT y se enciende la tónica en *todas* sus octavas
+  —una tonalidad es un nombre de nota, no una tecla—. CANCEL devuelve la que
+  había.
+- **STYLE** abre la lista de todos los estilos (los de fábrica y los `.style`
+  del disco) con su compás, su swing y su soltura.
+- **La progresión no tiene botón: los compases escritos abajo de la caja
+  *son* el botón.** Un `PROGRESSION` al lado de los otros era un segundo lugar
+  donde apretar para lo que ya estaba escrito a la vista; hacer clic en el chart
+  es lo que cualquiera prueba primero, y las flechas lo alcanzan como un control
+  más (el último, que es el orden en que la caja los dibuja). El editor que abre
+  **acepta el portapapeles del sistema**: se prendió bracketed paste, `\r` se
+  descarta y `\n` abre línea, así que un chart copiado de cualquier lado entra
+  entero.
+- **Y el editor es un campo de texto, no una lista.** Se dibujaba con
+  `draw_list_modal`, que resalta la fila del cursor, le pone una barra de scroll
+  al lado y responde a la rueda scrolleando — tres cosas que dicen "elegí una de
+  estas" sobre un texto que alguien está tipeando. `draw_text_modal` dibuja las
+  líneas y nada más: la única marca es el caret, con SELECT y CANCEL sobre el
+  borde de abajo para que el mouse también tenga salida.
+- **SEED** dejó de ser un `+` a ciegas: la lista hornea las doce semillas y dice
+  qué hace cada una con la parte que esta tab toca —notas por compás y si la
+  línea camina, mezcla o salta—. Un número que nadie puede escuchar no es algo
+  entre lo que se pueda elegir.
+
+### 2026-09-16 — el sampler para cualquier pack, la expresión MIDI entera y un lector MIDI que no se muere
+
+Una sesión que empezó auditando la flauta de Philharmonia y terminó con reglas
+que no saben nada de Philharmonia. Todo en `6593e8f`.
+
+#### Los samples vuelven al escaneo
+
+La decisión anterior (abajo, "Los samples salen del escaneo") se revirtió: una
+librería de samples es un instrumento más y se edita en Ajustes → Plugin paths.
+
+- **`PluginFormat::SCANNED` incluye `Samples`**, con `~/Samples` y `~/samples`
+  por defecto, y un `plugin-paths.json` que ya nombraba una librería la conserva.
+- **Chip `SAMPLE`** en el selector de fuentes para las librerías; **`choz-sampler`
+  queda siempre bajo `CLAP`**, porque es un instrumento propio de choz.
+- **Una ruta de búsqueda que es ella misma el instrumento** —un `.zip` o un
+  `.wav`, que es lo que `LOAD` agrega— **se encuentra al reescanear.** Antes
+  `scan_dir` sólo miraba *dentro* de cada ruta: el pack estaba hasta el próximo
+  reescaneo y después desaparecía.
+- **El modal de Plugin paths dice qué hace cada fila**: encabezados con su
+  cantidad de carpetas, botones y nota según la fila (un formato agrega, una
+  carpeta se edita o se quita), y **al cerrar reescanea detrás de la barra de
+  progreso** en vez de bloquear la interfaz.
+
+#### Nivel: medido sobre quince instrumentos, aplicado a cualquiera
+
+Medido con ffmpeg sobre ~12.000 archivos: el pico mediano de Philharmonia va de
+−9 dBFS (tuba) a −28 dBFS (flauta), y el ajuste automático, con tope en +6 dB,
+nunca podía cerrar esos 19 dB. En el log: `tab 1 trimmed to 2.00 — peaking 0.03`.
+
+- **Una ganancia por instrumento** (`SfzSampler::normalize`): el pico mediano de
+  sus notas a −12 dBFS, salvo que eso lleve el décimo más fuerte por encima de
+  0 dBFS; gana la menor, acotada a −12…+24 dB. Los quince quedan a la misma
+  altura; la flauta pasó de RMS 0.019 a 0.061 y el ajuste termina en 0.95.
+- **Cada nota contra su capa**: la flauta forte sube ~18 dB de C4 a A6 y la
+  escala cromática salía como un crescendo contra la rodilla. Cada nota de una
+  capa afinada va a la mediana de la capa, dentro de ±18 dB; **las capas entre
+  sí no se tocan** (el pianissimo sigue más suave que el fortissimo) y **un kit
+  no se iguala** (una capa es afinada si estira alguna muestra sobre varias
+  teclas). Resultado: picos idénticos en las 42 notas grabadas de cada capa.
+- **El pico de cada archivo se guarda** junto al caché PCM (`.peak`): se lee una
+  vez por archivo, y la primera lectura de un caché viejo, además, trae sus
+  páginas a memoria.
+
+#### Mapa: cada tecla toca una nota grabada
+
+- **Una capa de velocidad con pocas notas no es una capa**: la flauta tiene 42
+  forte y 2 fortissimo, y desde velocidad 105 esas dos muestras se estiraban
+  sobre las 88 teclas y saturaban. Una capa necesita un tercio de las notas de
+  la más completa —la misma regla que las articulaciones— o su rango pasa a las
+  vecinas.
+- **Tecla por tecla, la nota grabada gana**: el oboe fortissimo termina en E6 y
+  estiraba esa muestra sobre F6…G6, así que la E6 cambiaba de color según la
+  fuerza con que el barrido la golpeaba. Ahora cada capa usa su propia nota
+  dentro de su alcance (la mitad de la distancia entre sus notas grabadas) y,
+  si no, la de la capa de velocidad más cercana que la tenga. Auditoría de 19
+  instrumentos: de 14 con teclas transpuestas dentro de su rango (trombón hasta
+  6 semitonos) a 0, salvo la guitarra, que no tiene 81–82 en ninguna capa. Las
+  tomas (round robin) se conservan.
+
+#### Cualquier pack, no una librería
+
+- **Un archivo suelto es un instrumento**, y LOAD lo ofrece (`.wav`, `.flac`,
+  `.aiff`, `.mp3`, `.ogg`; un test impide que el selector y el sampler dejen de
+  coincidir). Una grabación sola con tono se estira sobre el teclado; antes iba a
+  una tecla como un tambor.
+- **Nombres sólo con guiones** (`Cello-C3-f-rr2`) se leen, sin romper
+  `mezzo-forte` ni `arco-normal`. **`soft`/`medium`/`hard`** son dinámicas.
+- **`v1…vN` son capas, no velocidades**: si todas las velocidades del pack son
+  ≤16, se reparten sobre 1–127.
+- **La nota del chunk `smpl` de un WAV** gana sobre el detector, pero cuenta
+  como detectada (muchos exportadores escriben 60 en todo, y un kit no debe
+  volverse afinado).
+- **Convención de octava**: un pack nombrado con C3 = do central suena una
+  octava corrido. Se escuchan tres notas repartidas; si **las tres** coinciden en
+  un número entero de octavas, se mueve el pack. Queda en el caché del pack; en
+  los 20 instrumentos de Philharmonia no movió ninguna nota.
+- **STRETCH sobre sonidos sin tono** (la cabasa) los reparte desde C4 sobre las
+  128 teclas. **Todos los layouts de una carpeta escaneada se cargan**: la tabla
+  sólo tenía el id AUTO, y elegir STRETCH no hacía nada y no lo decía.
+
+#### Envolvente y loop
+
+- **Rangos**: ATTACK 5 s, DECAY 10 s, RELEASE 10 s, XFADE 1 s. Las perillas
+  guardan su posición, así que un proyecto previo abre con tiempos más largos.
+- **LOOP REL** (parámetro 10): el loop sigue durante el release, y una muestra
+  de 1,5 s se sostiene y se apaga en 9 s con el nivel parejo.
+- **Empalme sin clic y sin golpe**: el crossfade pasó de potencia constante
+  (+3 dB en material correlacionado) a ganancia constante; un loop desde el
+  primer frame corre el punto de retorno lo que dura el fundido; una ventana
+  cortada con END se apaga en 15 ms.
+- **Vibrato con la rueda de modulación** (5,5 Hz, ±50 cents); **sustain,
+  expresión, pitch bend (±2) y los CC 120/121/123** llegan al sampler, y una
+  tecla repetida suelta la nota anterior en vez de apilar voces.
+- **RESET en el sampler**, que además restaura articulación, audición y layout.
+  RESET cargaba el valor por defecto sin normalizar: XFADE volvía al máximo, y
+  en los SoundFonts pasaba lo mismo con cualquier parámetro de rango distinto a
+  0…1.
+- **El play suena en A4**, o en la tecla más cercana que el mapa toca (antes C4,
+  y un kit sin nada ahí quedaba en silencio). **El selector NOTE es un piano**
+  con los colores de SPLIT, las teclas con sonido en celeste y la elegida en
+  amarillo.
+
+#### MIDI: la expresión entera, en el orden en que se toca
+
+- **El aftertouch dejó de ser CC 11.** Un SoundFont lee CC 11 como volumen: al
+  aflojar la presión llegaba 0 y todas las notas siguientes quedaban mudas (el
+  KeyStep 32 y el Keystation Pro 88 mandan aftertouch). Ahora es
+  `AudioSource::pressure`, de canal o polifónico, hasta CLAP, VST2, LV2, DSSI, el
+  sandbox y oxisynth, y se puede asignar por MIDI learn como `AFTERTOUCH`.
+- **VST3 recibe CC, pitch bend y aftertouch** por `IMidiMapping`: antes no
+  recibía ninguno. Con los plugins instalados, Surge XT, TyrellN6, TripleCheese
+  y Kars cambian con el bend.
+- **Notas y controles en el orden en que llegaron**: `drain_midi` aplicaba
+  primero las notas y después los CC, y "pedal abajo, tecla, soltar" perdía el
+  sustain. **El bend respeta su canal** (en MULTI iba al tab equivocado).
+- **Latencia de entrada**: el loop esperaba hasta 50 ms entre la tecla y el
+  sonido; ahora 5 ms, con el dibujo limitado aparte.
+- **LV2 recibe 2 bytes** para program change y channel pressure.
+
+#### El lector MIDI no se muere
+
+Tres tests de `midi` fallaban juntos alrededor de una vez cada 25 corridas con
+la máquina cargada. No era el test:
+
+- **El puerto `choz MIDI IN` se publicaba después de avisar "listo"**, así que
+  por unos milisegundos se nombraba un puerto que no existía.
+- **Un pánico con el candado de rutas tomado lo envenenaba** y, desde ahí,
+  `connect_inputs` devolvía cero puertos y el lector descartaba todo: **entrada
+  MIDI muerta hasta reiniciar, sin decirlo.** Ahora se toma tolerando el
+  envenenamiento (`midi::routes`), con un test que lo provoca.
+- **Una confirmación atrasada del lector respondía al pedido siguiente**; ahora
+  lleva el estado publicado. 40 de 40 corridas cargadas pasan.
+
+#### Diagnóstico y carga
+
+- **Los bloques tardíos cuentan los fallos de página mayores del hilo de audio**
+  (`meter::major_faults`) y el log dice cuándo esperó al disco en vez de culpar
+  a "un navegador". La sesión del 16 lo confirmó: los 21 avisos con
+  `SAMPLES:flute` fueron lecturas de disco del streaming.
+- **La carga pendiente dibuja su cartel antes de bloquear**: el frame se limitaba
+  a 33 ms y un clic justo después de un frame cargaba sin cartel. Elegir una
+  carpeta de samples también escanea detrás del cartel.
+- **Los tests no escriben el estado del usuario**: los del motor, los de la UI y
+  los de `choz-clap` (que levantan el rack entero) guardaban `ui.json`, las rutas
+  y los cachés en `~/.local/state/choz`; ahí quedaron 197 cachés `choz-sampler-*`
+  y un `samples_dir` apuntando a `/tmp`.
+
+### Los samples salen del escaneo: entran por LOAD y por ningún otro lado
+
+Una librería de samples no está instalada en ningún lado donde una convención
+pueda apuntar —está donde la persona la dejó— y escanearla significa decodificar
+y analizar cientos de archivos para saber qué hay adentro. Eso no es un escaneo
+de plugins, es una espera.
+
+- **`PluginFormat::SCANNED`**: todo menos `Samples`. Es lo que recorre
+  `scan_all`, lo que arma `PluginPaths::default()` y lo que lista Ajustes →
+  Plugin paths — la sección SAMPLES ya no está ahí porque no hay nada que
+  escanear.
+- **Un `plugin-paths.json` viejo deja de escanear la librería**: al leerlo se
+  descartan las entradas de un formato que ya no se escanea. Si no, seguiría
+  caminando la carpeta de alguien en cada rescaneo y no habría nada en la
+  interfaz para editarlo.
+- **`LOAD` no agrega directorios de búsqueda.** Lo que entra a choz es lo que
+  alguien señaló, y el proyecto guarda la ruta de lo que quedó en una tab.
+- **Lo que sí se recuerda es dónde estaba el selector** (`ui.json`,
+  `samples_dir`), así que el próximo `LOAD` abre en la librería y no en `$HOME`.
+  Un `.zip` recuerda la carpeta que lo contiene, que es el estante donde está el
+  próximo pack.
+- **Un proyecto reabierto trae de vuelta sus carpetas**
+  (`adopt_project_samples`): lee **sólo** las rutas que el archivo nombra, que es
+  la diferencia entre reabrir una canción y caminar una librería. Una carpeta
+  que se movió lo dice una vez y la tab vuelve vacía, igual que un plugin que no
+  está instalado.
+
+### LOAD muestra los `.zip`: una librería son veinte archivos, no veinte carpetas
+
+`/home/jorge/repo/philharmonia/all-samples` son veinte `.zip`, uno por
+instrumento —comprobado: `cello.zip`, `tuba.zip`, `cor anglais.zip` dan un
+instrumento cada uno—. El selector de LOAD sólo sabía decir "usar esta
+carpeta", así que había que descomprimirlas a mano: justo el paso que el lector
+de archivos existe para evitar.
+
+- **`file_browser::DIR_OR_ZIP`**: el selector sigue ofreciendo "usar esta
+  carpeta" y ahora además lista los `.zip` de adentro, en cualquier caja
+  (`violin.zip`, `cello.ZIP`). Elegir uno lo carga como lo que es: un
+  instrumento. El selector de carpetas a secas (`DIR_PICK`) no cambió.
+- **Lo que se recuerda para el próximo escaneo es la carpeta, no el archivo**:
+  una librería son veinte packs en un directorio, y recordar el zip elegido
+  serían diecinueve que hay que volver a pedir.
+- Tests: el del explorador —carpetas, los dos zips, y nada de `notes.txt`, con
+  `DIR_PICK` intacto— y uno de punta a punta que arma un `.zip` de verdad, lo
+  elige desde el modal y comprueba que el pack entra al catálogo y que el
+  directorio recordado es el que lo contiene. `zip` entra como
+  **dev-dependency** de `choz-ui`: ya está en el árbol por el motor, y una
+  afirmación sobre un archivo real se prueba con un archivo real.
+- `the_real_library_reads_as_one_instrument_per_archive` (ignorado) lee la
+  librería de esta máquina cuando está: un test que necesita el disco de alguien
+  lo dice y se aparta.
+
+### Un acorde de notas largas ya no satura el sampler
+
+Lo dice el log de la última corrida: `tab 1 trimmed to 2.00 — peaking 0.13,
+RMS 0.060`. El auto-nivel mide **una** nota —eso es lo que toca la sonda— y deja
+el fader en 2,00; seis notas sostenidas del mismo sample suman seis veces lo que
+se midió, y con `LOOP` encendido no terminan solas: duran lo que dure la tecla.
+
+- **Headroom por polifonía**: la suma de voces se escala por `1/sqrt(n)`. Una
+  nota queda exactamente como estaba —que es lo que la sonda midió—, y un acorde
+  crece como la raíz de lo que tiene adentro: más fuerte, que es lo que un
+  acorde es, y no seis veces más fuerte. Se desliza a lo largo del bloque, así
+  que una nota que entra no es un escalón en el nivel de todo lo que ya suena.
+- **Rodilla blanda arriba de 0,9**, asintótica a escala completa: la salida
+  propia del sampler no puede salirse de `-1..1` con nada apretado. Una voz sola
+  de un sample normalizado paga 0,2 dB, y eso es todo el precio. Es la guarda,
+  no el tono: un `tanh` sin sobremuestreo, que para el pico de un acorde alcanza
+  —el waveshaper *de tono* está en `fx::utility` y sí sobremuestrea—.
+- **El loop tiene un largo mínimo** (`MIN_LOOP_FRAMES`, 64 cuadros ≈ 1,3 ms a
+  48 kHz). Dos marcas una encima de la otra no son un loop: son un oscilador a
+  la frecuencia de esos pocos samples, al nivel del sample y sin final.
+- **`XFADE` arranca en 10 ms** en vez de cero. Un loop cortado donde la onda no
+  pasa por cero chasquea una vez por vuelta, y un chasquido es un pico dentro de
+  un acorde que ya está sumando. Quien quiera el empalme a tope lo baja.
+- Test: `a_chord_of_long_notes_does_not_saturate` toca una nota, seis y las 32
+  voces del sampler sobre un sample a escala completa con `LOOP` encendido —una
+  sola nota sigue siendo ella misma, el acorde es más fuerte que una nota, y
+  ninguna combinación se sale de escala completa, ni recién tocada ni asentada.
+
+### Los botones del sampler con más de una respuesta abren una lista
+
+Pasear un valor a clics está bien para dos posiciones y es adivinanza para diez:
+`KIT` está a tres presiones de `AUTO` y el botón no dice qué hace la cuarta.
+
+- **Cinco botones abren su lista** (`ModalKind::SamplerChoice`, el mismo modal
+  que usan las listas del secuenciador): el layout, cuántas rebanadas, la
+  articulación, la tecla de la audición y su dinámica. El cursor abre donde el
+  valor está, así que la lista también dice en qué se está.
+- **`SLICE` lista "apagado" primero** y después los conteos: dejar de cortar era
+  la respuesta escondida pasada la última.
+- **La tecla de la audición lista las 128 por nombre, y marca las que suenan**
+  con un punto — una lista de ciento veintiocho filas es larga, y la que dice
+  cuáles hacen ruido es la que vale la pena recorrer. La dinámica lista ocho
+  bandas: una capa de velocity es una banda, no un número, y 127 filas para
+  elegir una de tres capas es una lista que nadie lee.
+- **La rueda sigue paseando** el mismo botón en el lugar: el clic abre la lista,
+  la rueda camina el valor. Probar una tecla tras otra es gesto de rueda; elegir
+  C#3 entre ciento veintiocho es una lista.
+- **Nada que elegir, nada que abrir**: un pack con una sola articulación o una
+  tab sin carpeta no abre una lista vacía — el botón hace lo que hacía, y en una
+  tab sin carpeta lo único que hay para hacer es `LOAD`.
+
+### El sampler se mira en un solo lugar: todo lo suyo dentro de INSTRUMENT, y una ventana START–END sobre la muestra
+
+Lo que estaba mal: la forma de onda y la envolvente se dibujaban **en la fila
+del nombre del instrumento**, al lado del botón SOURCE, entre botones que las
+cortaban; y LOOP estaba dos veces —botón en esa fila y knob en la caja—, que es
+la clase de duplicado que hace ilegible una fila.
+
+- **Todo lo del sampler vive dentro de la caja INSTRUMENT**: sus botones
+  —`LOAD`, `CLEAR`, `▶`, `SLICE n`, el layout, la nota y la dinámica de la
+  audición, `MAP` y la articulación— en la primera fila de la caja, y debajo sus
+  dos dibujos, arriba de los knobs de los que son dibujo. La fila del
+  instrumento se queda con `SOURCE`, que es lo que esa fila es: qué instrumento
+  tiene la tab. Con nueve botones del sampler ahí, `SOURCE` se iba de la línea y
+  todo leía como parte del selector.
+- **Los botones envuelven y la caja lo sabe**: `button_rows` cuenta a cuántas
+  líneas llega esa fila al ancho que hay, antes de que la caja reserve el
+  espacio — a 60 columnas son dos líneas y las dos están adentro.
+- Red de seguridad: si la caja no se dibujara (una lista de parámetros vacía),
+  los botones se dibujan en una fila propia en vez de desaparecer. `LOAD` es
+  todo lo que hay para hacer en una tab sin carpeta.
+- El dibujo se pinta **sólo en el rectángulo interior** de la caja. `draw_knob_box` acepta cuántas filas dejar libres al tope
+  de la caja y el que la llama pinta ahí; las filas se pintan sólo en el
+  rectángulo interior, no sobre los bordes.
+- **El botón LOOP se fue del todo**: es un knob en la caja como el resto de los
+  parámetros del sampler, y se prende clicando su celda. Un valor dibujado en dos
+  lugares es un valor que se contradice.
+- **`END`, el décimo knob**, con la misma ley que los tres anteriores: agregado
+  al final para que un proyecto viejo lea los suyos donde los dejó. START y END
+  son la **ventana** que toca la tecla: lo que está entre las dos marcas suena,
+  lo de afuera no. `END` en o por debajo de `START` es "nada dicho", y la nota
+  corre hasta el final de la región — que es lo que hacía antes de que existiera.
+- **La muestra se lee como en FL**: lo que está dentro de la ventana se dibuja
+  entero y lo de afuera apagado, START con el verde de siempre y **END con su
+  propio color** —dos marcas del mismo color son dos marcas que hay que contar
+  para distinguir—.
+- **Botón derecho pone END**, izquierdo pone START, sobre la misma tira. Dos
+  marcas, dos botones, y ningún modo en el que estar.
+- `panel_probe` (ignorado) imprime el panel a 110, 80 y 60 columnas, que es como
+  se miró que todo entra en la caja y no se come los bordes.
+- De paso: `long_list_scrolls_with_the_cursor_and_shows_a_scrollbar` toma
+  `ui_guard()`. Busca botones traducidos y el idioma es un global del proceso —
+  el flake de siempre, y el tratamiento de siempre.
+
+### El sampler ya no se lleva la librería entera a RAM
+
+Lo último grande que quedaba del [roadmap](docs/roadmap.md) para el sampler.
+`crates/choz-engine/src/instruments/stream.rs`.
+
+- **Un sample largo se decodifica una vez y se escribe crudo** —`f32`
+  intercalado, al sample rate del instrumento— en
+  `~/.local/state/choz/pcm/`; el `Vec` decodificado se suelta y el archivo se
+  **mapea** (`mmap` por `libc`, sin dependencia nueva). La memoria pico de
+  construir un instrumento pasa a ser **un sample**, no la librería, y la
+  segunda carga no decodifica nada.
+- **El kernel es el anillo**: `madvise(MADV_WILLNEED)` al mapear pide traer las
+  páginas, y el kernel puede tirarlas si hace falta memoria — que es justo lo que
+  se quería, porque la alternativa era tenerlo todo residente se toque o no.
+- **El arranque de una nota nunca espera**: los primeros `HEAD_FRAMES` (un cuarto
+  de segundo) se copian a RAM al mapear. El techo está escrito en el módulo: una
+  página desalojada cuesta un fault en el hilo de audio, y hacerlo imposible pide
+  un hilo lector con un anillo por voz y robo de voz cuando el disco no llega —
+  el paso siguiente, **midiéndolo con una librería de verdad delante**.
+- **Los cortos siguen igual**: nada por debajo de `THRESHOLD_FRAMES` (dos
+  segundos) se escribe ni se mapea. Una batería nunca fue lenta.
+- **Techo de disco de 8 GiB** (`stream::DISK_BUDGET`), contado una vez por
+  proceso: `f32` crudo es más grande que el archivo del que salió —cuatro veces
+  un MP3—, y un caché sin techo convertiría 3 GB de librería en 12 GB de disco
+  ajeno. Pasado el techo, el sample se queda en memoria como antes y se dice en
+  el log. Borrar `~/.local/state/choz/pcm` cuesta una carga lenta y nada más.
+- **El nombre del caché lleva ruta, sample rate, tamaño y mtime**: un sample que
+  cambió es otro archivo, no una entrada rancia. Se escribe a `.part` y se
+  renombra, así que un proceso que muere a mitad no deja medio sample para
+  siempre.
+- Tests: el round-trip del mapeo (cabeza en RAM, cola en el mapeo, fuera de rango
+  en silencio) y uno de punta a punta que **prueba que el caché se usa** —el wav
+  se deja ilegible conservando tamaño y mtime, y el instrumento sigue sonando un
+  segundo adentro, que sólo el sample largo puede—.
+
+### El CC 7 ya no llega al SoundFont: el volumen de una tab es su fader
+
+La decisión que estaba abierta desde el 2026-08-31, tomada el 2026-09-13.
+`Sf2Synth::control_change` reparte cualquier CC a los nueve canales de la tab, y
+con el CC 7 eso era **un segundo control de volumen peleando con el fader VOL** —
+y peleando a escondidas: no se dibujaba en ningún lado y no se guardaba en el
+proyecto.
+
+- **CC 7 filtrado** (`sources::CC_VOLUME`). Lo demás —sustain, sostenuto, soft,
+  expresión, rueda de modulación— sigue llegando a los nueve canales, que es lo
+  que hace que un pedal sostenga el teclado entero y no media octava.
+- El slider de un controlador **no deja de servir**: se ata con MIDI learn al
+  fader de la tab, o a lo que se quiera, y entonces es un binding que se ve y que
+  el proyecto guarda.
+- El test que cazó los 15,2 dB del 2026-08-31 ahora comprueba las dos mitades:
+  que una zona y el sonido propio de la tab sigan al mismo nivel, **y** que el
+  slider no haya movido nada (±0,5 dB).
+
+### El sampler de carpetas: keyswitches, mapa editable, presets y puntos de loop
+
+Lo que quedaba del [roadmap](docs/roadmap.md) para el sampler, menos el
+streaming de disco (ver abajo, y sigue en el roadmap).
+
+- **Keyswitch.** `map::articulation_groups` deja **todas** las articulaciones en
+  el mapa —no sólo la más grabada— y las teclas debajo del rango eligen entre
+  ellas (`SfzSampler::switch_base`): una tecla de switch selecciona y no suena.
+  Un pack con sustain y staccato era medio pack. Cuando el mapa llega hasta el
+  final del teclado, los switches se quedan con las teclas de abajo y lo
+  sombrean: nada se grabó ahí, y un switch al que no se llega es peor que tres
+  teclas que nadie toca.
+- **`.smpreset`** (`sampler::preset`): el mapa entero —regiones, raíces, rangos,
+  tune, articulaciones— escrito en JSON legible al lado de la carpeta. Cargar un
+  preset no escanea, no lee nombres y no analiza nada; el id lo dice con
+  `#preset`. Y **relink por nombre de archivo** para una librería que se movió:
+  lo que el nuevo raíz no tiene se queda como estaba y se reporta, en vez de
+  desaparecer.
+- **Editor de mapeo en la TUI** (botón `MAP`): una fila por región, cuatro
+  columnas —raíz, tecla baja, tecla alta, tune—, flechas para mover, PageUp/Down
+  por octava (que es como se equivoca una raíz), F2 guarda y recarga la tab
+  desde el preset, F3 relinkea, Esc descarta. Una raíz mal detectada ya es un
+  número que se corrige y que **sobrevive a reabrir**.
+- **`LOOP` con puntos propios y crossfade**: `LOOP ST`, `LOOP END` y `XFADE`
+  —tres knobs nuevos, agregados al final para que un proyecto viejo lea sus seis
+  donde los dejó—. Los puntos se leen contra la región, así que un slice loopea
+  dentro de sí mismo, y la vuelta se cruza con potencia constante: un sustain que
+  no cierra en cero ya no chasquea.
+- **`SLICE` con cuántos**: `sampler::SLICE_CHOICES` (8/16/24/32) viaja en el id
+  (`#slice24`), el botón lo pasea y el `#slice` pelado sigue siendo 16 —que es lo
+  que dicen los proyectos escritos antes—. Un break de veinte golpes ya no pierde
+  cuatro.
+- **El dibujo muestra los cortes** y es **el sample que la tecla toca**, no el
+  primero del mapa: `sampler::shape` devuelve picos y cortes de **un** decode
+  (eran dos), y `sample_for` dice qué archivo suena para esa nota, velocity y
+  articulación.
+- **La audición elige tecla y dinámica** (botones `NOTE` y `V`), que es justo lo
+  que se quiere probar en un pack con capas de velocity.
+- **La envolvente se arrastra**: el gráfico ADSR era de sólo lectura; ahora el
+  cuarto donde se hace clic es la etapa y la altura es su valor. Dos filas son
+  dos niveles —los knobs siguen ahí para un número exacto—.
+- **El zip se abre una vez por instrumento** (`archive::read_many`): eran una
+  apertura y un directorio central por región, 110 veces para un violín.
+- **El aftertouch ya hace algo**: presión de canal y presión polifónica llegan
+  como CC 11 (expresión), que todo instrumento de choz ya entiende. Lo que se
+  pierde —qué tecla se apretó— queda escrito con su ceiling en `midi.rs`.
+
+### El arreglador: forma, estilos por archivo, editor de progresión y el tercer `.clap`
+
+- **Forma (fase 4)**: el texto ahora tiene partes —`[intro]`, `[a]`, `[b]`,
+  `[end]`— y una línea `form = intro a a b a end`. El parser las expande a
+  compases planos, así que ningún generador sabe que una parte se toca dos veces;
+  sin `form`, las partes suenan en el orden en que se escribieron, y un texto sin
+  partes es exactamente lo que era. La caja dice en qué parte está.
+- **Veinticinco estilos**: los nueve de antes más latin, country, soul, reggae,
+  bebop, walking_bass y la tanda electrónica (organic/afro house, nu jazz,
+  melodic/live techno, trance vocal, liquid/live d&b, neoclassical ambient,
+  folktronica). Ninguno tocó el parser ni el motor.
+- **Estilos desde archivo**: `~/.local/state/choz/styles/*.style`, leídos al
+  arrancar. Un archivo dice sólo lo que cambia (`from = minor_blues`), y el
+  formato se lee a mano —`a.b = números`— porque una dependencia para esa
+  gramática es una dependencia para nada.
+- **Editor de progresión en la TUI** (`text_edit.rs` + botón `EDIT`): caret,
+  selección con marca (F3, porque los eventos de tecla acá no traen
+  modificadores), F4 selecciona todo, scroll que sigue al caret, F2 guarda, Esc
+  descarta. Se queda con **todas** las teclas imprimibles mientras está abierto:
+  o escribe el teclado o toca el piano, y el modal es lo que lo decide.
+- **El arreglador sale en el `.clap`** como tercer artifact (`org.choz.gen.arr`):
+  rol, estilo y semilla son parámetros; la progresión viaja en `clap.state`
+  —texto plano, que es lo que alguien querría leer en un diff—.
+- **Mapa de instrumentos por estilo**: `Style::programs(role)` da programas GM en
+  orden de preferencia por familia (tenor → alto → trompeta → piano) y
+  `pick_program` elige el primero que el SoundFont tenga; un banco sin ninguno
+  deja el sonido como estaba y lo registra. La batería es banco 128, no un
+  programa.
+- **Cómo toca**: el motivo **se desarrolla** (una nota se parte en dos, otra
+  sube, y sólo donde las dos mitades caen en semicorchea), el **solo escucha a la
+  melodía** —hornea su parte y se corre de los unísonos—, el bajo tiene **notas
+  de paso** y **anticipaciones**, `swing_div` hace que el feel viva en la
+  división que el estilo cuenta (funk en semicorcheas), el rasgueo alterna
+  sentido con palma y cada estilo tiene su ancho, y un estilo puede escribir su
+  propio `Lead` para el solo y su propio `Comp` para la guitarra (bebop y reggae
+  ya lo hacen).
+- **Un acorde sostenido es un acorde**: `| I7 - - IV7 |` ya no se le anuncia al
+  bajo como tres cambios; `Progression::at` une los slots iguales y el bajo
+  decide "acaba de caer" comparando con el acorde anterior.
+
+### El arreglador toca menos como una máquina: feel por rol, cuatro fills y la mano que vuelve
+
+Tres de los bordes que el [roadmap](docs/roadmap.md) le anotaba a la banda, y
+ninguno de los tres necesitó un generador nuevo.
+
+- **`Style::human` × `role_feel(role)`**: cuánto se despega del casillero es un
+  número del estilo escalado por el rol —batería 0,6, bajo 0,8, comping 1,0,
+  melodía 1,2, solo 1,4—, así que el baterista es el reloj y el solista es el
+  que se apoya en él. Antes eran ±0,03 y ±8 iguales para todos, escritos en
+  cuatro lugares distintos.
+- **El feel viaja en el `Rng`**, que ya se construye por rol y ya pasa por todos
+  los generadores: una firma más ancha en seis funciones para decir lo mismo era
+  el precio de no hacerlo. `funk` pide 0,5 y `jazz_swing` 1,2.
+- **Cuatro fills en vez de uno** (`generate::FILLS`), elegidos con el dado y con
+  la última semicorchea como la más fuerte: el mismo fill cada cuatro compases
+  es lo que delata a un baterista generado en un solo chorus.
+- **El rasgueo va y vuelve**: los golpes pares cruzan las cuerdas hacia arriba y
+  los impares hacia abajo, y la vuelta suena más corta y 16 de velocity más
+  abajo, que es la palma apoyándose. La alternancia cuenta los golpes que se
+  tocan, no los que `density` descartó.
+- **Tres tests**: `the_feel_is_one_knob` —con `human: 0.0` todo cae en la
+  grilla, y con el estilo entero no—, `the_fills_vary_and_the_hand_comes_back_up`
+  —tres fills de un chorus no son el mismo, y en la guitarra hay acordes que
+  suben y acordes que bajan—, y el `every_style_plays` de antes, que ahora lee
+  también el campo nuevo.
+
+### Siete estilos más para el arreglador, y uno de ellos en 3/4
+
+La fase 3 del arreglador decía que un estilo es un dato y que agregar uno no
+toca ni el parser ni los generadores. Ésta es la prueba: `jazz_swing`,
+`shuffle`, `straight_blues`, `rock`, `funk`, `bossa` y `jazz_waltz` son siete
+constantes en `artifacts/arranger/style.rs` y nada más — nueve estilos en total,
+elegibles desde el `style = ` de la progresión.
+
+- **`jazz_waltz` está en 3/4**, que es lo que `beats_per_bar` prometía y nada
+  había ejercido: la progresión, el bajo, la batería, el comping y las líneas ya
+  contaban en ese campo, así que el único cambio fue el número.
+- **El swing es un número, no un estilo**: `straight_blues` es el blues con
+  `swing: 0.0` y `funk` también, porque `swung()` empuja corcheas y un feel en
+  semicorcheas no existe todavía. Queda anotado en el
+  [roadmap](docs/roadmap.md), no escondido en una tabla.
+- **`Bass::walking` era un campo que no leía nadie.** Con `walking: false`
+  —`rock`, `funk`, `bossa`, `shuffle`— el bajo ya no camina: raíz donde el
+  acorde cae, quinta en los contratiempos, y `density` decide cuáles suenan. Un
+  campo documentado que el generador ignoraba es peor que no tenerlo.
+- **El tiempo en que el acorde cae siempre suena**, aunque `density` esté por
+  debajo de 1: adelgazar la línea no puede comerse la nota que dice qué acorde
+  es. Los estilos con `density: 1.0` no cambian una nota.
+- **`every_style_plays`** recorre los nueve × los seis roles: que el estilo se
+  elija por su nombre, que la forma dure lo que dicen sus compases, que nada
+  cuelgue del final, que la lista esté en orden de tiempo y que cada rol se
+  quede en su registro (el solo, una cuarta por encima de la melodía, como
+  `solo_of` lo pone). Un estilo nuevo es una constante y esta prueba lo lee.
+
+### Un allocador que cuenta: la regla del hilo de audio ya tiene quien la compruebe
+
+"Ningún `process_block` alloca" estaba escrito en
+[fx-audit](docs/fx-audit.md) y se rompió sin que la suite se enterara: tres de
+los efectos del 2026-09-01 copiaban el bloque con `buf.to_vec()` y los 900
+tests seguían en verde. Lo cazó leer el diff, que es el mecanismo que no
+escala.
+
+- **`choz_engine::alloc_count`**: un `GlobalAlloc` bajo `#[cfg(test)]` que
+  cuenta **por hilo**, no por proceso. El harness corre los tests de un crate
+  en paralelo, así que un contador global estaría contando las allocations de
+  los otros tests; siendo `thread_local` no hace falta candado, que es la
+  diferencia con todo lo que hay en `test_locks`.
+- El contador es un `Cell<Option<usize>>` con `const` init —nada que registre
+  destructor, nada que alloque al tocarlo por primera vez— y se lee con
+  `try_with`, porque una allocation puede caer mientras el TLS del hilo se está
+  destruyendo y pedirle una clave muerta al allocador es un panic donde nadie
+  lo agarra.
+- **`fx_chain::no_built_in_allocates_in_process_block`** corre los 56 built-ins
+  ocho bloques cada uno, con señal y no con silencio (un efecto que tome un
+  atajo en un bloque mudo nunca llegaría al código que esto vigila). El buffer
+  y el primer bloque quedan fuera de la cuenta: lo que un efecto dimensione la
+  primera vez que ve un bloque, en un host lo dimensiona en el `activate`.
+- **El test se comprueba a sí mismo dos veces**: adentro cuenta una allocation
+  conocida antes de empezar (un allocador que no cuenta nada aprobaría el
+  archivo entero), y se verificó a mano metiendo un `buf.to_vec()` en
+  `pan.rs` — reportó `Pan (pan): 8`, uno por bloque.
+
+Resultado: **los 56 pasan**. La regla ya no depende de que alguien lea el diff.
+
+### El sampler corta por donde le pegan, y la batería cae en su tecla de GM
+
+Dos de los bordes de la primera versión del sampler de carpetas, cerrados.
+
+- **`SLICE` cortaba en 16 pedazos iguales.** Un break que no se tocó contra una
+  grilla tiene los golpes en cualquier lado, y una rebanada que empieza a mitad
+  de un redoblante no la usa nadie. Ahora `analyze::onsets` escucha la subida
+  de RMS de un hop de 10 ms al siguiente —la subida y sólo la subida: la
+  energía que cae es la cola del golpe anterior, no uno nuevo—, descarta lo que
+  esté a menos de 50 ms del anterior quedándose con el más fuerte de los dos, y
+  si hay más golpes que teclas conserva los más fuertes **en orden de tiempo**.
+  Con menos de dos onsets contesta vacío, que quiere decir "no sé" y no "el
+  archivo está mudo": el mapa vuelve a los 16 pedazos iguales, que es lo que un
+  break cuantizado quería igual.
+- **El drum map era alfabético**: `hat` `kick` `snare` caían en 36, 37 y 38 por
+  orden de nombre, o sea tres sonidos equivocados en vez de ninguno. Ahora el
+  nombre del archivo elige la tecla de General MIDI —tabla de nombres largos
+  primero, así `open hat` no se lee como `hat` ni `ride bell` como `ride`, y con
+  las siglas que usan los packs (`BD`, `SD`, `CHH`, `OHH`)—. Dos archivos
+  pidiendo la misma tecla son una capa de velocity que el nombre no escribió:
+  el primero alfabéticamente se queda con la tecla de GM y el resto toman
+  teclas libres, así los dos se pueden tocar y ninguno se pierde. Una carpeta
+  con más sonidos que teclas —las 148 de `percussion.zip`— sigue repartiéndose
+  el teclado entero desde la 0, porque un sonido sin tecla es un sonido que no
+  se puede tocar.
+
+### La guitarra entra a la banda, y la progresión muestra el compás que suena
+
+- **`Role::Guitar`**, sexto y último de la lista. Es el comping del estilo
+  tocado en una guitarra: registro de posición abierta (40–72), el voicing
+  **con su fundamental** —el shell voicing sin fundamental ni quinta es del
+  piano, que se la deja al bajo; seis cuerdas bajo una mano son una forma, y la
+  forma tiene fundamental— y **rasgueo**: 30 ms entre cuerda y cuerda, que a
+  120 bpm es una púa cruzando y no un arpegio. El test compara los dos: el
+  piano tiene acordes que caen en un instante, la guitarra ninguno.
+- **La línea de la progresión enciende el compás que suena.** Antes lo decía un
+  número en la cabecera, que no es algo que nadie siga tocando. La ventana se
+  calcula **desde el playhead** cada cuadro —igual que `drawer::list_scroll`, y
+  por la misma razón: un offset guardado se desincroniza— así que en un panel
+  angosto la progresión corre sola y el compás encendido nunca se va de la
+  pantalla.
+
+### El arreglador toca la melodía y el solo: motivos, forma y la escala del acorde
+
+La banda tenía bajo, batería y piano. Ahora tiene las dos líneas que faltaban
+—`MELODY` y `SOLO`— y las dos salen del mismo generador, que es el punto: un
+solo no es otra teoría, es la misma tocada más apretada.
+
+- **Un motivo, no dados por compás.** Un `Motif` es un compás de forma sin
+  acorde todavía: cuándo suena cada nota, cuánto dura y a qué grado de la
+  escala está de la primera. La forma es `A A' B A''` cada cuatro compases —
+  `A'` responde una tercera arriba de la escala y empujada medio tiempo, `B` es
+  la otra figura, y `A''` vuelve y **cae en una nota del acorde**, que es lo que
+  hace que una frase termine. El test que lo sostiene compara el ritmo del
+  compás 1 con el del 4: si alguien vuelve a tirar los dados por compás, deja
+  de dar.
+- **`Chord::scale` por fin la lee alguien.** Estaba resuelta y probada desde el
+  parser y ningún generador la miraba. `scale_note` es el único sitio que la
+  lee: el acorde dice qué se puede tocar encima y la línea elige un peldaño de
+  esa escalera, contado desde la fundamental en la octava más cercana al centro
+  del registro y doblado de vuelta adentro cuando la caminata se sale.
+- **La nota antes del cambio se apoya a un semitono del acorde que viene**
+  (`chromatic` del estilo), que es todo el motivo por el que una línea suena
+  como si supiera lo que sigue.
+- **El solo se saca del estilo, no de otro estilo.** `solo_of` toma el `Lead`
+  de la melodía y le cambia el menú de duraciones, le baja los silencios, le
+  duplica el cromatismo y lo sube una cuarta. Marcado con `ponytail:`: el día
+  que un estilo quiera que las dos difieran en algo más que densidad, `Style`
+  crece un segundo campo y esa función se va.
+- **`Lead` es un dato más del estilo** —duraciones, silencio, cromatismo,
+  desplazamiento de la respuesta y registro—, así que los estilos que faltan lo
+  traen escrito y el generador no se toca.
+- **`Role` pasa de tres variantes a cinco, agregadas al final**: la posición de
+  la variante es lo que guardó un proyecto y de donde `Rng::new` siembra, así
+  que mover una cambia el rol con el que se reabre *y* lo que toca.
+
+Dos tests nuevos: que la frase vuelve con el mismo ritmo, y que el solo toca
+más notas que la melodía —si no, no hay razón para que existan los dos roles.
+
+### El arreglador ya está en la pestaña: switch, caja y progresión desde un archivo
+
+El motor de ayer sonaba sólo en los tests. Ahora es un artefacto más de la
+pestaña, al lado del arpegiador y del secuenciador:
+
+- **`ARR`, el tercer interruptor** de la fila de generadores. Encendido, la caja
+  del arreglador es la que está en pantalla y la que tiene las flechas — y apaga
+  los otros dos, porque **una pestaña toca un artefacto**, que es la regla que ya
+  seguían el arpegiador y el secuenciador entre ellos.
+- **Encender es empezar.** No hay nada que configurar antes: el texto por
+  defecto es un blues de doce compases en Do, así que `ARR` suena. Un PLAY que
+  hay que ir a buscar para que pase algo se lee como que no funcionó.
+- **La caja**: `PLAY/STOP`, el rol (`BASS` / `DRUMS` / `PIANO`), `SEED` y
+  `LOAD`, más una línea que dice qué salió del texto —estilo, cuántos compases,
+  cuál está sonando y cuántas notas tiene la parte— y otra con la progresión
+  misma. Si el texto no lee, esa línea es el error, en rojo, y **la parte
+  anterior sigue tocando**.
+- **Con el ratón y con el teclado.** Las flechas caminan los cuatro controles y
+  Enter aprieta el que esté seleccionado; `k` la trae al frente como ya trae al
+  arpegiador y al secuenciador.
+- **La progresión viene de un archivo** `.chord` o `.txt`, por el mismo
+  navegador que abre un `.wav` o un `.sf2`. ponytail: no hay entrada de texto en
+  ningún lado de este programa, y escribir una —cursor, selección, scroll, y las
+  teclas que ya son el piano— es más grande que el arreglador al que serviría.
+  Una progresión son doce compases de texto que viven mejor en un archivo; el
+  editor en el panel queda en el roadmap.
+- **El proyecto lo guarda** (`Slot.arranger`: el texto, el rol y la semilla),
+  con `default` para que todo proyecto anterior siga abriendo.
+- **Las notas viajan por donde viajan las del secuenciador**: al arpegiador de
+  la pestaña si lo tiene encendido, al instrumento si no. Un rol es una pestaña,
+  así que una banda son tres pestañas leyendo el mismo texto con la misma
+  semilla.
+- **La batería suena eligiendo un kit del banco 128** en la pestaña —el
+  SoundFont los lista como cualquier otro preset—. Acá no hay canal 10: las
+  notas de un artefacto van al instrumento de su pestaña, y el kit es la
+  elección de esa pestaña.
+- Cuatro entradas nuevas en las ocho traducciones (`ARR`, `BAR`, `BARS`,
+  `NOTHING TO PLAY`), que es lo que pide el test que compara la tabla con los
+  `t("…")` del código.
+
+Falta todavía, y está en el roadmap: el arreglador como tercer artefacto del
+`.clap` (el texto no entra en un parámetro `0..1`, hay que decidirlo con un host
+delante), el editor de texto en el panel, y las fases 2 a 4 del generador.
+
+### El flake de la corrida completa: era el transporte que quedaba rodando
+
+El punto 3 del roadmap —"`cargo test --workspace` falla de a varios, de tanto en
+tanto"— tenía nombre desde el 2026-09-09 y le faltaba el último culpable. Los
+tests nuevos del arreglador lo hicieron reproducible (1 de cada 2 corridas de
+`-p choz-engine --lib`) y con eso se pudo mirar: en el momento del fallo, el
+transporte estaba **rodando** dentro de un test del `seq` que toma el candado y
+cuenta su propio tiempo. Tomar el candado nunca alcanzó: hay que **devolver el
+reloj**. El que no lo devolvía es
+`an_embedded_rack_puts_each_tab_on_its_own_pair`, que renderiza con el motor en
+play —y `render()` publica ese estado en el transporte global— y no lo apagaba;
+el que se comía el problema era el siguiente test que el harness arrancara, casi
+siempre uno del `seq`, que encontraba una grilla que seguir donde no tenía que
+haber ninguna.
+
+El arreglo está en un solo sitio: `test_locks::transport()` devuelve un guard
+que **deja el reloj como estaba** —parado, a 120, en 4/4 y en cero— al tomarlo y
+al soltarlo. Cuarenta tests menos que tienen que acordarse, y la próxima fuga no
+es un bug de nadie. La frecuencia de muestreo no se toca: es del dispositivo, no
+del test. Cinco corridas seguidas de `-p choz-engine --lib` en verde, contra 1
+de cada 2 antes.
+
+### El arreglador: el motor, en notas (fase 1)
+
+Se escribe una progresión y sale una banda. El texto es lo que ya se pidió —una
+tonalidad, un estilo y los compases entre barras— y de ahí sale una parte por
+músico:
+
+```text
+key = C
+style = major_blues
+
+|| I7 | IV7 | I7 | I7 | IV7 | IV7 | I7 | VI7 | IIm7 | V7 | I7 V7 | I7 ||
+```
+
+`crates/choz-engine/src/artifacts/arranger/`, hermano de `arp` y `seq`, con los
+cuatro módulos que el roadmap pedía y ni uno más: `chord.rs` (el parser y toda
+la teoría), `style.rs` (los estilos como datos), `generate.rs` (los generadores)
+y `mod.rs` (el artefacto).
+
+**Un solo grammar para las dos escrituras.** Grados romanos (`I7`, `IIm7`,
+`IV#m7b5`, `VIIb7`, `I7b9`, `I7#11`) y cifrado americano (`C7`, `F#m7b5`,
+`Bbmaj9`, `Cm11`) entran por la misma puerta, y `I7` en Do es exactamente `C7`
+—hay un test que compara las dos listas de notas—. Un grado sin tonalidad es un
+error, no una suposición. Dos ambigüedades que costaron test propio: el
+accidental **pegado al numeral** mueve el grado (`VIIb7` es bVII con séptima) y
+uno más adentro es una tensión (`I7b9`); y la `b` pegada a la letra es **siempre**
+raíz —`Bb9` es un si bemol con novena, y el acorde con novena bemol se escribe
+`B7b9`, que es como lo escribe todo el mundo—.
+
+**La teoría vive en un solo sitio.** Un acorde sabe sus notas *y* su escala, y
+ni el bajo ni el comping inventan la suya: un dominante alterado trae la
+alterada, un `m7b5` la locria, un `maj7#11` la lidia. `dim` sin número es
+`dim7`, porque es lo que quiere decir en una progresión.
+
+**Los estilos son datos.** `Style` con `Bass`, `Drums` y `Comp` adentro, dos
+constantes (`major_blues`, `minor_blues`) y un `by_name` que ante un nombre que
+no conoce cae en el primero: un estilo mal escrito se escucha y se corrige, y
+callar no se escucha. Sin cargador de `.toml` —no hay un segundo origen de
+estilos todavía—, pero con la forma para que lo haya.
+
+**Lo que toca cada rol.** El bajo camina: fundamental donde cae el acorde, notas
+del acorde por adentro, aproximación cromática al siguiente un tiempo antes, y
+un salto de octava de vez en cuando; hay un test que lo que comprueba es que
+`C C C C` no pase. La batería es GM (36 bombo, 38 caja, 42/46 hats, 49 crash, 51
+ride) con patrón por estilo, ghost notes y un fill cada cuatro compases. El
+comping saca la tercera y la séptima —el bajo ya tiene la fundamental y la
+quinta— y elige **la inversión y la octava que menos mueven la voz de arriba**:
+`C7 (Bb E)` → `F7 (A Eb)`, un semitono, en vez de re-apilar desde la raíz y
+saltar una octava. El primer intento apilaba siempre desde la nota más grave y
+saltaba una novena en el compás 8; las inversiones son el arreglo.
+
+**Determinista por semilla, y todo el trabajo fuera del tick.** Parsear,
+resolver y generar pasan cuando cambia el texto, un parámetro o la semilla;
+`tick()` sólo camina una lista ya horneada contra el transporte, sin calcular
+música y sin allocar. Misma progresión + estilo + semilla = las mismas notas
+(hay test); otra semilla, otra interpretación (también). Un transporte que
+saltó más de un compás entre dos ticks no se toca entero de golpe: se sigue
+desde donde quedó.
+
+**Un rol por instancia, y ésa era la decisión abierta.** Un artefacto vive en
+una pestaña y toca *un* instrumento, así que la banda es una pestaña por músico
+leyendo el mismo texto con la misma semilla — que es como choz ya piensa el
+rack y lo que el host CLAP puede publicar. La otra salida —una instancia y un
+canal MIDI por rol— no la permite el bus de notas: `ArpEvent` no lleva canal.
+
+**Un error de tipeo no calla la banda**: si el texto no lee, se queda la última
+parte que sí leyó y el error queda para el panel.
+
+`Seq` no se tocó: `SeqSettings`, `Pattern` y `ArpEvent` siguen como estaban.
+
+Falta, y está en el roadmap: la pestaña (panel, persistencia y ruteo de las
+notas) y el tercer artefacto en el `.clap`, sin lo cual esto todavía no suena
+fuera de los tests; guitarra, melodía y solo (fase 2); el resto de los estilos
+(fase 3) y las secciones del arreglo (fase 4).
+
+De paso: `sampler::analyze::of_stereo` usaba `chunks_exact(2)`, que el clippy
+del runner —más nuevo que el de esta máquina— rechaza. Ya es `as_chunks`.
+
+### El sampler tiene panel: cargar, cortar, escuchar y verlo
+
+El sampler ya sonaba, pero desde la interfaz no había nada que tocar: la
+carpeta y el layout eran dos botones sin nombre en la fila `INSTR` y el resto
+—el punto de arranque, la envolvente, el loop— no existía. Ahora la pestaña que
+tiene el sampler trae su propio panel en el RACK:
+
+- **Botones**: `LOAD` (con la carpeta que está tocando, o vacío si todavía no
+  tiene ninguna), `CLEAR`, `▶`/`■` para escuchar sin teclado, `LOOP`, `SLICE` y
+  el layout (`AUTO`/`STRETCH`/`KIT`/`SLICE`).
+- **Dos dibujos, dos filas**: la forma del sample con el punto de arranque
+  marcado, y la envolvente que arman los knobs. Ninguno de los dos es una
+  medición: están para *ver* que el arranque cayó en silencio o que el ataque se
+  comió la nota.
+- **El scrub es el dibujo**: un clic en la forma de onda es donde empieza la
+  nota.
+
+**Los knobs son parámetros de instrumento, no controles aparte.** `START`,
+`LOOP`, `ATTACK`, `DECAY`, `SUSTAIN` y `RELEASE` salen de
+`sampler::params()` y entran por el mismo camino que los de un plugin
+(`read_plugin_params` → caja `INSTRUMENT` → `set_slot_param`), así que se
+guardan con el proyecto, se mueven con las flechas y se pueden aprender a un CC
+sin una línea de código extra. El motor los aplica en vivo: `SfzSampler` tiene
+una envolvente ADSR por voz —el release sale de donde estaba la envolvente, no
+de 1.0, así que soltar durante el ataque no sube el volumen— y un loop que sólo
+corre mientras la tecla está abajo.
+
+**`SLICE` es un layout más, no un modo aparte.** Corta el archivo más largo de
+la carpeta en 16 pedazos, uno por tecla desde C2, y cada pedazo suena a la
+velocidad grabada. No se escribe nada: las regiones ahora llevan `start`/`end`
+como fracciones del archivo y el pedazo es un rango sobre el mismo sample ya
+decodificado. Como cualquier layout, viaja en el id (`#slice`) y vuelve con el
+proyecto.
+
+### Una carpeta de samples es un instrumento: el sampler que se arma solo
+
+Apuntá choz a `~/Samples/Philharmonia/violin` y la carpeta aparece en el
+selector de instrumentos como cualquier plugin. No hay que mapear un `.wav` por
+tecla ni escribir un `.sfz`: los archivos ya dicen lo que son y esto los lee.
+
+El motor no es nuevo, y ese es el punto. `crates/choz-engine/src/sfz.rs` ya
+tenía un sampler multisample RT-safe —regiones con rango de tecla y de
+velocity, transposición por `pitch_keycenter`, robo de voces sin allocar— y
+`pitch.rs` ya tenía YIN, escrito para el conversor `A→M`. Lo que faltaba era
+todo lo de arriba: mirar una carpeta y decidir qué toca cada tecla. Eso es
+`crates/choz-engine/src/sampler/`.
+
+**El orden en que pregunta es lo que lo hace rápido.** El nombre del archivo
+primero, siempre: `violin_C4_mf_RR2.wav` dice la nota, la dinámica y la toma, y
+las dice exactas. Después las carpetas, para packs que ordenan por articulación
+en vez de nombrarla. El audio último y sólo para lo que quedó abierto —un
+decode más una detección de pitch por archivo—. Medido contra el violín entero
+de Philharmonia: **1502 archivos leídos en 24 ms, los 1502 por nombre, cero
+decodificados.**
+
+**Lo que sobra del nombre es la mejor parte.** Sacale a
+`violin_A3_15_mezzo-forte_arco-normal` la nota y la dinámica y queda
+`violin_15_arco-normal`, que nombra el *conjunto* al que ese archivo pertenece:
+arco normal, un segundo y medio. Todas las notas de ese conjunto son un
+instrumento, sus dinámicas son sus capas de velocity, y un conjunto con otro
+largo u otro arco es otro instrumento que vive en la misma carpeta. No hace
+falta ningún vocabulario de articulaciones para verlo, y por eso gana: sólo la
+Philharmonia trae `arco-normal`, `pizz-normal`, `arco-sul-ponticello`,
+`natural-harmonic` y veinte más.
+
+Cuál de los conjuntos suena se decide en tres preguntas, y el orden lo dictaron
+las 20 librerías:
+
+1. **Cuál llega a más teclas.** Un conjunto con huecos es un conjunto cuyos
+   huecos los tapa el vecino estirado.
+2. **Dentro de un décimo de eso, cuál es la nota común.** La mandolina trae
+   `normal` y `tremolo` en las mismas 39 notas; abrir en el trémolo es una
+   sorpresa cada vez.
+3. **Y de esos, cuál tiene los archivos más grandes**, que es lo mismo que decir
+   los más largos. El saxo cubre 41 notas a un cuarto de segundo y 40 a un
+   segundo y medio: por coverage estricto esa nota de más cuesta tres cuartos
+   del largo de todas las demás, y por eso la primera pregunta tiene tolerancia.
+
+Con eso, los 20 packs de Philharmonia eligen el conjunto que uno elegiría a
+mano: `violin_15_arco-normal`, `saxophone_15_normal`,
+`mandolin_very-long_normal`, `guitar_very-long_normal`.
+
+Detalles que costaron:
+
+- **Un número suelto nunca es la nota ni la toma.** Philharmonia escribe el
+  largo ahí: `violin_A4_15_forte_arco-normal` es un segundo y medio, no la
+  toma 15. Una toma tiene que estar deletreada (`RR2`, `take3`, `var1`).
+- **`mezzo-forte` se lee entero.** Partido por el guión daba `mezzo`, y
+  `mezzo-piano` caía en la misma capa que `mezzo-forte` —dos dinámicas de seis,
+  pisadas—. La dinámica se busca con el guión sacado, antes de partir el token.
+- **`short` y `long` no son articulaciones acá.** En estas librerías son el
+  *largo* de la nota (`very-long`, `15`, `025`), y el largo ya separa los
+  conjuntos por nombre. Leerlos como articulación hacía que
+  `guitar_C4_very-long_normal` saliera `Long` en vez de nota común, y una
+  carpeta tiene que abrir en la nota común.
+- **`C-1` es una nota y `-1` es su octava**, pero el guión también separa
+  `arco-normal` y `very-long`. La nota se busca antes de partir por guión; todo
+  lo demás, después.
+- **El primer token no es una dinámica.** `piano_C4_v80.wav` no está tocado a
+  velocity 48: `piano` ahí es el instrumento. Sólo el token inicial queda
+  exento, y sólo si hay más de uno.
+- **La ventana de análisis no arranca en el ataque.** Los primeros 50 ms de un
+  violín son ruido de arco y los de un piano son el martillo; un detector
+  corrido ahí devuelve el período del transitorio, que no es una nota. La
+  ventana se toma pasado el pico.
+- **Sin confianza, no hay nota.** Un bombo pasado por YIN siempre da *algún*
+  número. Por debajo de 0.55 de claridad el sample queda sin afinar.
+- **Y una nota detectada no es una nota dicha.** El bombo de Philharmonia lo
+  enseñó: YIN le encuentra período —cerca de 37 Hz, nota 25— y *no se equivoca*,
+  un bombo tiene fundamental. Pero dos golpes que dan los dos nota 25 no son el
+  multisample de nada, y estirarlos por el teclado es un kick que toca acordes.
+  La carpeta se lee como instrumento si sus notas están **dichas** en el nombre;
+  si no, tiene que parecerlo dos veces: que casi todos los archivos afinen
+  (cuatro de cada cinco) y que las notas abarquen al menos una octava. La
+  primera versión sólo miraba la octava, y la basura del detector sobre 18
+  golpes de bombo abarca más de una. Una carpeta que no pasa es un kit: un
+  archivo por tecla desde C2, cada uno a la velocidad a la que se grabó y sin
+  agrupar —no hay variantes de una nota entre las que elegir, hay sonidos
+  distintos y cada uno quiere su tecla.
+
+Los límites entre samples caen en el punto medio entre notas raíz —C3 (48) y C4
+(60) se cortan en 54—, y las capas de velocity se parten igual, entre las
+velocities que los nombres declararon. Dos archivos de la misma nota en la misma
+capa son round robin, los llame `RR` el pack o no: `SfzSampler` alterna entre
+ellos con un contador por tecla (un `[u32; 128]`, porque un mapa por nota
+allocaría en el hilo de audio la primera vez que suena una tecla nueva).
+
+Dos arreglos que se llevó puestos el camino:
+
+- **`note_off` ya no corta, hace fade.** Cortar un sample sostenido en un sample
+  arbitrario deja un escalón, y un escalón es un transitorio de banda completa:
+  cada nota soltada hacía *pop*. 15 ms de release, por debajo de lo que se nota
+  y muy por encima de la discontinuidad.
+- **`tune_cents` en la región.** El detector no sólo dice la nota, dice cuánto
+  se corre de ella; el sampler lo saca en la reproducción, así un sample grabado
+  30 cents bajo suena afinado. También parsea el opcode `tune` de SFZ, que antes
+  se ignoraba.
+
+El análisis se cachea en `$XDG_STATE_HOME/choz/samples/` por largo y mtime del
+archivo. **No hash de contenido**: hashear la librería entera para saber si hay
+que leer la librería entera es la operación que el cache existe para evitar. El
+hash se gana su lugar cuando llegue el relink, que necesita reconocer un archivo
+que se *movió*.
+
+Nada acá escribe en la carpeta de samples: ni renombra, ni mueve, ni convierte.
+Y ningún sample de Philharmonia entra al repo —los tests generan senos con
+`hound` y los borran—. Para probar contra una librería de verdad está
+`crates/choz-engine/tests/sample_folder.rs`, que se saltea solo si
+`CHOZ_SAMPLE_DIR` no está puesta:
+
+```bash
+CHOZ_SAMPLE_DIR=~/Samples/violin \
+    cargo test -p choz-engine --release --test sample_folder -- --nocapture
+```
+
+Exige lo que corresponde según lo que la carpeta resultó ser: un instrumento no
+puede dejar teclas muertas, un kit tiene que dejarlas —sus teclas son sus
+sonidos, uno por tecla, a su propia altura—.
+
+**`PluginFormat::Samples`** es el formato nuevo, y es el primero que no se
+reconoce por extensión: el *directorio* es el instrumento, y lo que decide es si
+adentro hay samples. Cae solo en el modal de rutas (`MENU → SETTINGS`), en el
+scan y en el selector, porque todos recorren `PluginFormat::ALL`. Los paths por
+defecto son `~/Samples` y `~/samples`; `CHOZ_SAMPLES_PATH` los pisa. `symphonia`
+suma `mp3`, `aiff` y `adpcm`, porque Philharmonia distribuye MP3.
+
+Lo que **no** hace todavía: una sola articulación suena a la vez (la más
+grabada de la carpeta gana, el resto queda en el mapa esperando keyswitches),
+los samples se decodifican enteros a RAM al cargar en vez de streamear, no hay
+editor manual del mapeo ni inspector de sample, y el aftertouch no está mapeado.
+
+### El metrónomo es un CLAP
+
+Tercer artefacto en el mismo bundle, al lado del arpegiador y el secuenciador:
+`org.choz.met`, "choz Metronome". No es un efecto —no procesa nada— ni un
+generador de notas: es un **instrumento** que hace audio del transporte del
+host. Cero puertos de entrada, un par estéreo de salida.
+
+Sus mandos son toda su configuración **menos las dos que el host ya tiene**:
+
+```
+On         encendido
+Level      volumen del click
+Sound      BEEP · CLICK · WOOD
+Grouping   cómo se cuenta el compás (7 como 2+2+3 o 3+2+2)
+```
+
+El tempo y el compás salen de `clap_event_transport` —un plugin que dejara
+poner un segundo tempo sería un plugin que le lleva la contra a la sesión— y el
+agrupamiento es un mando sobre la lista de maneras de contar el compás actual,
+igual que lo alcanza el panel de choz: la lista depende del numerador, así que
+un índice sobre ella es lo único que sigue significando algo cuando el compás
+cambia. Queda afuera el destino del click, que es ruteo del rack y acá no
+existe.
+
+**Un click por proceso**: el metrónomo es un singleton, como el transporte y el
+medidor, porque hay una sola salida donde poner un click. Dos instancias en un
+host son dos vistas del mismo.
+
+`Sort::is_generator` pasó a querer decir lo que dice —notas adentro, notas
+afuera, nada de audio— y los puertos salen de `Sort::audio_ports()`, que
+devuelve `(entradas, salidas)`: `(1,1)` un efecto, `(0,1)` el click, `(0,0)` los
+dos artefactos de notas. Antes "generador" era el nombre de "sin puertos de
+audio", que servía mientras los únicos dos que había no hicieran ruido.
+
+Test por el ABI: se abre por la fábrica, se comprueba que no publica entrada,
+se procesa un segundo de un compás a 120 y se exige que suene, que el mando de
+nivel cambie el pico y que apagado sea silencio exacto.
+
+### El sampler se abre desde el teclado, y el usuario decide el mapeo
+
+**El sampler se llama `choz-sampler` y está siempre en la lista de
+instrumentos**, bajo el chip CLAP, con o sin carpeta configurada. Es un instrumento que choz tiene, no algo que
+aparece cuando el directorio correcto casualmente está en una ruta de
+búsqueda — y una lista que sólo lo ofrece después de haberlo configurado es una
+lista donde nunca se configura. Elegirlo es lo que pregunta dónde están los
+samples.
+
+**Entra vacío y se llena después.** Elegirlo en la lista lo pone en la tab sin
+nada adentro: contesta las notas con silencio hasta que alguien diga dónde
+están los samples, que es la pregunta siguiente y se hace desde la tab que ya lo
+tiene. Elegirlo de nuevo en una tab que ya lo tiene *es* esa pregunta — el botón
+SOURCE abre el explorador de carpetas en vez de volver a cargarlo—, y al
+confirmar el directorio se cargan los sonidos. Es el orden en que se piensa:
+primero qué instrumento, después con qué.
+
+Y una vez que la tab está tocando una carpeta, **INSTR abre las opciones del
+sampler** en el mismo lugar donde un plugin muestra sus parámetros: qué carpeta
+y cómo se reparte en el teclado. Enter sobre la carpeta la vuelve a pedir;
+Enter sobre el mapeo lo pasa al siguiente y recarga.
+
+**SOURCE → F2** hace lo mismo desde el teclado: abre un explorador de carpetas —el mismo que ya usaban BANK y
+las rutas de plugins— apuntado a donde el usuario tenga sus samples. Una
+librería no se instala en ningún lado: está donde la persona la puso, así que
+apuntar choz a una tiene que hacerse desde donde se elige un instrumento, no
+desde una ruta tipeada en settings. El explorador arranca en la última carpeta
+de samples que se eligió.
+
+Lo que vuelve se escanea igual que escanea el scan: una carpeta con samples
+adentro es un instrumento, una carpeta de esas es un estante, y un `.zip` es
+cualquiera de las dos. Un solo instrumento entra directo en la tab —es lo que
+significa elegir una carpeta—; varios, y vuelve la lista SOURCE con el chip
+SAMPLES puesto, porque elegir entre ellos es lo siguiente que hay que hacer y la
+lista es donde eso se hace. La carpeta queda guardada en las rutas de SAMPLES,
+así que el próximo escaneo la encuentra sin que se la vuelvan a pedir. **No se
+dispara un rescan completo**: abrir los 1209 plugins de la máquina para mirar
+una carpeta es hacer esperar a alguien por nada.
+
+Un bug que se comió una versión: `adopt_samples_folder` llenaba `plugins` —lo
+que la lista muestra— pero no `synths`, que es donde el cargador busca lo que se
+eligió. Una carpeta con un solo instrumento aparecía y al elegirla no pasaba
+nada. Ahora se llenan las dos, con una entrada por mapeo, porque el mapeo es
+parte del id y esa tabla es donde tanto el cargador como un proyecto reabierto
+buscan un id.
+
+También sale de la lista **el propio choz**: instalado, sus bundles están en
+`~/.clap` como los de cualquiera y el scan los encuentra, así que el rack se
+ofrecía a cargar el rack entero en una tab de sí mismo. El plugin es para otros
+hosts; acá era un espejo contra un espejo.
+
+Los chips de SOURCE son **categorías, no formatos de archivo**: sirven para
+recortar mil instrumentos a los que vale mirar, y un chip que nadie se le
+ocurriría apretar es un chip estorbando. Se fueron `WAV` —un sample suelto se
+busca, no se filtra— y `SAMPLES`: una carpeta de samples es choz tocando un
+instrumento propio, que es lo que `CLAP` ya quiere decir para el que mira esta
+lista. Ahí aparece.
+
+**Y los chips del explorador son el mapeo**, que es la otra mitad de esto:
+
+```
+AUTO      lo que el sampler deduzca (lo de siempre)
+STRETCH   cada sample cubre las teclas de alrededor, transpuesto
+KIT       un sample por tecla, cada uno a la altura a la que se grabó
+```
+
+`AUTO` acierta con las librerías contra las que se escribió y no puede acertar
+con todas: un pack de stabs de un solo tono sin nombre **sí** está para tocarse
+por todo el teclado, y unos toms afinados no. El modo viaja pegado al id del
+instrumento —`~/Samples/toms#kit`—, que es lo que un proyecto guarda y lo que
+el rack vuelve a abrir; la ruta va aparte y sigue limpia, así que nadie intenta
+abrir un directorio llamado así.
+
+Y el kit dejó de tirar sonidos por el borde: con más samples que teclas arriba
+de C2 arranca en la tecla 0. `percussion.zip` entero leído como un solo kit son
+148 sonidos; eran 92 y ahora son 128.
+
+### `choz-engine/src` tiene carpetas para lo que hace ruido
+
+Como `fx/`, que ya tenía las 56:
+
+```
+instruments/   sfz.rs · sf2_patch.rs · sampler/     lo que suena sin ser un plugin ajeno
+artifacts/     arp.rs · seq.rs · metronome.rs       lo que genera notas sin que lo toquen
+```
+
+Nada cambió de contenido; los paths sí (`choz_engine::sfz` →
+`choz_engine::instruments::sfz`, `choz_engine::arp` →
+`choz_engine::artifacts::arp`), y `sources.rs` se queda donde está porque es el
+trait `AudioSource` además del sintetizador SF2.
+
+### El fondo no puede depender de desde dónde se arrancó choz
+
+`ui.json` guardaba `assets/wallpaper.png` **relativo**: la ruta que
+`wallpaper_dir()` devuelve cuando encuentra el checkout. Eso funciona desde la
+raíz del repo y en ningún otro lado —incluido un DAW, que arranca el plugin en
+el directorio que se le ocurra—. Ahora `wallpaper_dir()` devuelve rutas
+absolutas siempre, y al cargar los settings una ruta relativa se resuelve
+—contra el directorio actual si todavía la encuentra, contra la carpeta de
+wallpapers si no— y se guarda absoluta desde ahí. Una que no está en ningún
+lado se deja como está, en vez de apuntarla a algo que el usuario no eligió.
+
+### Dos tests escribían globales sin el candado
+
+`cargo test -p choz-engine` fallaba de a ratos en los tests del secuenciador
+—`the_playhead_wraps_on_the_bar`, `swing_lengthens_the_beat`,
+`probability_never_drops_a_written_step`—, siempre en corrida completa y nunca
+solos. Los del `seq` toman `test_locks::transport()`; el que no lo tomaba estaba
+en otro archivo:
+
+- `fx_chain::the_clock_can_drive_a_gate_with_no_tab_playing` le ponía tempo y
+  sample rate al transporte sin candado.
+- `metronome::a_bar_is_accented_where_its_groups_start` le cambiaba la
+  agrupación al metrónomo sin candado, y **el secuenciador le pregunta al
+  metrónomo dónde cae el compás**.
+
+Con los dos candados puestos la corrida completa pasó 6 de 7 veces contra
+aproximadamente una de cada dos antes. **No está cerrado**: la séptima falló, así
+que queda algún otro global sin proteger. El barrido que encontró estos dos
+—buscar tests que tocan `transport()` o `metronome()` sin
+`test_locks::transport()`— ya no encuentra ninguno, o sea que el que queda toca
+otra cosa.
+
+### Y los zips se leen donde están
+
+Las librerías no llegan como carpetas: llegan como un zip por instrumento.
+Philharmonia son 20. Pedirle a alguien que descomprima 350 MB antes de que choz
+mire la carpeta es un paso que no tiene ninguna razón —el directorio central de
+un zip lista todo lo que hay adentro y sacar una entrada es un seek y un
+inflate—.
+
+Un sample adentro de un archivo se llama de la forma obvia:
+`~/Samples/violin.zip/violin_A3_15_forte_arco-normal.mp3`. Es un path que
+ningún `open` va a aceptar y que todo el resto puede cargar sin enterarse: el
+scanner, el parser de nombres, el mapper y las regiones no saben que existen los
+zips. El único que lo desarma es `decode`, que en vez de abrir un archivo saca
+los bytes y decodifica desde memoria —la sonda, el hint y el decoder de
+symphonia son idénticos—. El cache le toma la huella al **zip**, no a la
+entrada: un zip que cambió es un zip cuyas entradas hay que volver a mirar
+todas, que es justo lo correcto.
+
+**Nada se descomprime a un cache en disco, nunca.** El diseño alternativo
+—extraer al cargar y tratarlo como carpeta— es menos código acá y cientos de
+megas del disco ajeno, en silencio, por una librería que la persona ya tiene.
+
+**Y un zip también puede ser un estante.** `percussion.zip` trae 39
+instrumentos en 39 carpetas: leído como uno solo es un kit de 148 sonidos
+peleando por 92 teclas, con 56 que se caen del borde del teclado por no tener
+dónde ir. La misma regla que ya valía para directorios ahora vale un nivel
+adentro del archivo: si los samples están sueltos arriba, el zip es el
+instrumento; si están ordenados en carpetas, cada carpeta lo es —y se la nombra
+`percussion.zip/bass drum`—.
+
+Un escaneo de `~/repo/philharmonia/all-samples` con los 20 zips sin tocar:
+**58 instrumentos en 322 ms** —19 melódicos más los 39 de percusión—. El violín
+sale igual desde el zip que desde la carpeta: 1502 samples en 13 ms,
+`violin_15_arco-normal`, 110 regiones, 49 notas, 6 capas.
+
+`zip 0.6` con `default-features = false` y sólo `deflate`: es lo que usa un zip
+de samples, y los otros códecs arrastran bzip2, zstd y una pila de AES al pedo.
+
+### Los tests de CLAP se saltean el propio choz
+
+`packaging/install.sh` deja `choz.clap` y `choz-rack.clap` en `~/.clap`, y desde
+ahí son lo primero que encuentra `effect_runtime.rs`. Hostear choz adentro de
+choz no es lo que prueba ninguno de esos tests: el rack no publica parámetros y
+arranca vacío, así que fallaba el chequeo de window feed y el de hacer ruido por
+ser exactamente lo que es. El scan de los tests ahora filtra `com.choz.*` y
+`org.choz.*`.
+
+### El MIDI monitor no se dibuja embebido
+
+Una ventana de plugin es un panel en la pantalla de otro, el host ya tiene con
+qué mirar el MIDI, y esas filas le sirven más al rack. Con `is_embedded()` el
+panel mide cero: no se dibuja, no registra rects y por lo tanto tampoco se le
+puede hacer click. En consola queda igual.
+
+### 2026-09-12 — el log ya no puede llenar el disco
+
+> De la PR #7. El merge de esta rama resolvió los conflictos como *ours* y se
+> llevó puesta esta entrada, que no estaba en conflicto con nada: el código
+> (`choz-ui/src/log.rs` y su línea en `lib.rs`) sí entró. Va de vuelta acá,
+> bajo el encabezado que usa este archivo.
+
+Un plugin de batería (AVLdrums, LV2, hosteado en el mismo proceso) se quedó
+retriggereando una nota en loop. Su fluidsynth interno imprimía "Ringbuffer
+full" en cada intento fallido de robar una voz, sin ningún límite — fd 1/2 de
+choz van directo a `choz.log` por diseño (así es como el usuario ve los
+banners y warnings de los plugins que hostea), así que el log se comió 3.4 GB
+en diez minutos mientras la CPU se ahogaba y el audio de todo el sistema
+(PipeWire) empezaba a fallar por falta de tiempo real.
+
+`log::spawn_log_watchdog` revisa cada 5 segundos y trunca el archivo si pasa
+los 32 MiB. Funciona sin tocar los fd ya duplicados: ambos se abren con
+`O_APPEND`, que busca el fin de archivo en cada escritura en lugar de guardar
+un offset, así que truncar el path por debajo alcanza.
+
+No arregla el plugin que se cuelga — eso es AVLdrums, ajeno a este repo — sólo
+evita que cualquier plugin así vuelva a llenar el disco. Para ese plugin en
+particular, forzarlo a la sandbox (`x` en el rack) lo aísla del proceso
+principal.
 
 ## [1.3.11] — 2026-09-07
 

@@ -66,6 +66,7 @@ impl jack::ProcessHandler for JackRt {
     fn process(&mut self, _: &Client, ps: &ProcessScope) -> Control {
         let started = std::time::Instant::now();
         let cpu_started = crate::meter::cpu_micros();
+        let faults_started = crate::meter::major_faults();
         let frames = ps.n_frames() as usize;
         self.state.apply_commands();
 
@@ -87,7 +88,13 @@ impl jack::ProcessHandler for JackRt {
         }
         self.read_midi(ps);
         self.write_midi(ps);
-        crate::engine::publish_load(started, cpu_started, frames, self.state.sample_rate);
+        crate::engine::publish_load(
+            started,
+            cpu_started,
+            faults_started,
+            frames,
+            self.state.sample_rate,
+        );
         Control::Continue
     }
 }
@@ -385,11 +392,24 @@ pub fn start(
     // client is live. A sink that went away is not fatal — choz still runs,
     // just unconnected, and the user can patch it anywhere.
     let mut wired_to = None;
-    if let Some(sink) = sink {
-        match connect(handle.as_client(), &our_outs, sink) {
-            Ok((name, wired)) => wired_to = Some((name, wired)),
+    match sink {
+        Some(sink) => match connect(handle.as_client(), &our_outs, sink) {
+            Ok((name, wired)) => {
+                // Logged on success too — see the note in `engine::jack_route_to`.
+                eprintln!(
+                    "choz: output wired to '{name}' — {wired} of {} ports",
+                    our_outs.len()
+                );
+                wired_to = Some((name, wired));
+            }
             Err(e) => eprintln!("choz: {e}"),
-        }
+        },
+        // **No device picked**: whatever the graph auto-connected us to is
+        // where the sound goes, and that is worth a line — it is the case
+        // where choz is playing into something nobody chose.
+        None => eprintln!(
+            "choz: no output device picked — left on whatever the graph              auto-connected us to. Pick one in the OUT drawer (F3)."
+        ),
     }
     // Capture: every input jack in the graph, wired one for one. A device that
     // vanished between the scan and here just fails to connect — but **say

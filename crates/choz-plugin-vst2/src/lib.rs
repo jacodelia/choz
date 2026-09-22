@@ -998,6 +998,13 @@ impl AudioSource for Vst2Instrument {
             .queue_midi([0xE0, (v & 0x7F) as u8, (v >> 7) as u8]);
     }
 
+    fn pressure(&mut self, note: Option<u8>, value: u8) {
+        self.inst.queue_midi(match note {
+            Some(n) => [0xA0, n & 0x7F, value & 0x7F],
+            None => [0xD0, value & 0x7F, 0],
+        });
+    }
+
     fn program_change(&mut self, _bank: u8, preset: u8) {
         self.inst.dispatch(
             opcode::SET_PROGRAM,

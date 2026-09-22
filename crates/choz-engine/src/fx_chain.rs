@@ -91,7 +91,7 @@ pub fn seq_hit() {
 
 /// The envelope of that step, on the same 0..1 scale a tab's level is read on.
 ///
-/// Same shape and length as [`crate::metronome::beat_pulse`], so a gate set up
+/// Same shape and length as [`crate::artifacts::metronome::beat_pulse`], so a gate set up
 /// against the clock reads the same wired to the sequencer.
 pub fn seq_pulse() -> f32 {
     let last = SEQ_HIT.load(std::sync::atomic::Ordering::Relaxed);
@@ -116,8 +116,8 @@ impl GateSource {
         match self {
             GateSource::Tab(i) => crate::meter::slot_levels().live(i),
             GateSource::Note(i) => crate::meter::note_levels().level(i),
-            GateSource::Metronome => crate::metronome::metronome().tap_level(),
-            GateSource::Clock => crate::metronome::beat_pulse(),
+            GateSource::Metronome => crate::artifacts::metronome::metronome().tap_level(),
+            GateSource::Clock => crate::artifacts::metronome::beat_pulse(),
             GateSource::Seq => seq_pulse(),
         }
     }
@@ -1049,6 +1049,56 @@ mod tests {
         BUILT_IN_KINDS.iter().map(|(id, _)| *id).collect()
     }
 
+    /// **No built-in allocates in `process_block`.** The rule is in
+    /// `docs/fx-audit.md`, it broke once without the suite noticing —three
+    /// effects copying the block with `buf.to_vec()`— and reading the diff is
+    /// not a mechanism that scales.
+    ///
+    /// An allocation on the audio thread is a lock on the audio thread: the
+    /// allocator's, held by whatever other thread happened to be in it, and
+    /// the block is late through no fault of the DSP.
+    #[test]
+    fn no_built_in_allocates_in_process_block() {
+        // The counter, checked against itself first: an allocator that counts
+        // nothing would pass this test however the effects behaved, and that
+        // is a green light nobody should trust.
+        let (_, seen) = crate::alloc_count::counted(|| vec![0u8; 64]);
+        assert!(seen > 0, "the counting allocator is not counting");
+
+        let defaults = [0.5f32; 16];
+        let mut guilty: Vec<String> = Vec::new();
+        for (kind, name) in BUILT_IN_KINDS {
+            let Some(mut proc) = build_processor(kind, &defaults, 48_000) else {
+                continue;
+            };
+            // Everything allocated up front and outside the count: the buffer,
+            // and whatever the effect sizes when it first sees one. An effect
+            // that grows a delay line on its first block is doing it at
+            // `activate` time in a host, not in the middle of a stream.
+            let mut buf = vec![0.0f32; 512];
+            proc.process_block(&mut buf, 48_000);
+            let (_, allocs) = crate::alloc_count::counted(|| {
+                for block in 0..8 {
+                    // Signal rather than silence: an effect that takes a
+                    // shortcut on a silent block would never reach the code
+                    // this is here to watch.
+                    for (i, s) in buf.iter_mut().enumerate() {
+                        *s = (((block * 512 + i) as f32) * 0.01).sin() * 0.5;
+                    }
+                    proc.process_block(&mut buf, 48_000);
+                }
+            });
+            if allocs > 0 {
+                guilty.push(format!("{name} ({kind}): {allocs}"));
+            }
+        }
+        assert!(
+            guilty.is_empty(),
+            "these allocate on the audio thread:\n  {}",
+            guilty.join("\n  ")
+        );
+    }
+
     /// A gate driven by notes opens for a tab that makes no sound worth
     /// metering — which is the whole reason that source exists.
     ///
@@ -1236,7 +1286,14 @@ mod tests {
     /// not — which is the point of having both.
     #[test]
     fn the_clock_can_drive_a_gate_with_no_tab_playing() {
-        let m = crate::metronome::metronome();
+        // **The transport is one object for the whole process** and this test
+        // sets its tempo and its rate. Without the lock it was doing that
+        // underneath whichever sequencer test happened to be running beside
+        // it, and the failure landed over there — `seq`'s playhead tests
+        // failing in a full run and passing on their own, which is what the
+        // roadmap had filed as an unexplained intermittent.
+        let _clock = crate::test_locks::transport();
+        let m = crate::artifacts::metronome::metronome();
         let t = choz_ports::transport();
         t.set_sample_rate(48_000);
         t.set_bpm(120.0);

@@ -36,7 +36,10 @@ patrones que hay que copiar al resto.
 Y una comprobación que pasa en todo el árbol: **ningún `process_block` alloca**,
 con una excepción (F6). Se rompió una vez —tres de los efectos nuevos del
 2026-09-01 copiaban el bloque para filtrarlo— y la auditoría del diff antes de
-publicar la 1.3.6 la restauró; ver la sección 8.
+publicar la 1.3.6 la restauró; ver la sección 8. Desde el 2026-09-12 **hay un
+test que lo comprueba**, `fx_chain::no_built_in_allocates_in_process_block`: un
+allocador que cuenta por hilo (`choz_engine::alloc_count`) y ocho bloques por
+cada built-in.
 
 ---
 
@@ -534,8 +537,10 @@ Nadie pide un all-pass como efecto, y por eso no está en la lista de mandos de
 Los tres efectos que necesitan una copia del bloque para filtrarla —de-esser,
 multiband, exciter/bass— la hacían con `buf.to_vec()` **dentro de
 `process_block`**: un `malloc` por bloque en el hilo de audio. Lo cazó la
-auditoría del diff antes de publicar la 1.3.6, con la suite entera en verde: no
-hay test que lo cubra, y escribir uno pide un allocador propio. El patrón que
+auditoría del diff antes de publicar la 1.3.6, con la suite entera en verde.
+**Ahora hay test** —`no_built_in_allocates_in_process_block`, con el allocador
+que cuenta de `choz_engine::alloc_count`— y se verificó que caza: con un
+`buf.to_vec()` puesto a mano en `pan.rs` reporta `Pan (pan): 8`. El patrón que
 quedó, y el que hay que copiar:
 
 ```rust

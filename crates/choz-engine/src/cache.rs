@@ -11,9 +11,17 @@ use crate::paths::FoundPlugin;
 /// `$XDG_STATE_HOME/choz`, else `~/.local/state/choz`, else `$TMPDIR/choz`.
 /// Shared with the UI's log file so both land in the same place.
 pub fn state_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")));
+    let base = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
+    // **A test never writes to the real one.** The sampler's end-to-end tests
+    // left a hundred `choz-sampler-e2e-*` caches and their decoded audio in
+    // `~/.local/state/choz`, beside the user's own. A test that wants a
+    // particular directory still sets `XDG_STATE_HOME`.
+    #[cfg(test)]
+    let base = base.or_else(|| {
+        Some(std::env::temp_dir().join(format!("choz-test-state-{}", std::process::id())))
+    });
+    let base =
+        base.or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")));
     match base {
         Some(b) => b.join("choz"),
         None => std::env::temp_dir().join("choz"),

@@ -63,16 +63,32 @@ impl FileBrowser {
     }
 }
 
+/// What says "this set picks a directory". Not an extension anything has.
+const DIR_MARK: &str = "<dir>";
+
 /// Extension set that means "pick a directory, not a file" — the browser then
 /// offers the current directory itself as the first entry.
-pub const DIR_PICK: &[&str] = &["<dir>"];
+pub const DIR_PICK: &[&str] = &[DIR_MARK];
+
+/// The same, for the sampler: a folder, one of the `.zip`s in it, **or a
+/// single recording** — the most ordinary thing to hand a sampler. The audio
+/// extensions are `sampler::EXTENSIONS`, spelled out because a `const` cannot
+/// be concatenated.
+///
+/// A sample library arrives as one archive per instrument — Philharmonia's is
+/// twenty of them in one directory — and choz reads an archive where it sits.
+/// The picker that could only answer "this directory" made the user unpack
+/// them first, which is the step the whole archive reader exists to avoid.
+pub const DIR_OR_ZIP: &[&str] = &[
+    DIR_MARK, "zip", "wav", "wave", "flac", "aiff", "aif", "mp3", "ogg",
+];
 
 /// What counts as a background image. Decoding is `image`'s problem; this is
 /// only what the browser lists.
 pub const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "gif", "webp"];
 
 fn is_dir_pick(exts: &[&str]) -> bool {
-    exts == DIR_PICK
+    exts.first() == Some(&DIR_MARK)
 }
 
 /// Directories first (with `..` on top), then matching files, each alphabetical.
@@ -117,7 +133,11 @@ fn scan(dir: &Path, exts: &[&str]) -> Vec<Entry> {
                     path,
                     is_dir: true,
                 });
-            } else if !is_dir_pick(exts) && exts.iter().any(|e| has_ext(&path, e)) {
+            // The marker is not an extension: a dir-pick set may still name
+            // real ones beside it, and then those files are listed and
+            // pickable — a folder of sample packs is a folder of `.zip`s, and
+            // "pick a folder" with nothing in the list is a dead end.
+            } else if exts.iter().any(|e| *e != DIR_MARK && has_ext(&path, e)) {
                 files.push(Entry {
                     label: name,
                     path,
@@ -168,5 +188,68 @@ mod tests {
         assert_eq!(labels, vec!["../", "sub/", "a.wav", "b.wav"]);
 
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Picking a folder of sample packs has to show the packs: a library is one
+    /// `.zip` per instrument in one directory, and a picker that only offered
+    /// "use this directory" made the user unpack them first — the step the
+    /// whole archive reader exists to avoid.
+    #[test]
+    fn the_sampler_picker_lists_folders_and_archives() {
+        let base = std::env::temp_dir().join(format!("choz_fb_zip_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("loose")).unwrap();
+        std::fs::write(base.join("violin.zip"), b"x").unwrap();
+        std::fs::write(base.join("cello.ZIP"), b"x").unwrap();
+        std::fs::write(base.join("notes.txt"), b"x").unwrap();
+        std::fs::write(base.join("take.wav"), b"x").unwrap();
+
+        let b = FileBrowser::open(&base, DIR_OR_ZIP);
+        let labels: Vec<&str> = b.entries.iter().map(|e| e.label.as_str()).collect();
+        assert!(labels[0].starts_with("[use "), "{labels:?}");
+        assert!(labels.contains(&"loose/"), "{labels:?}");
+        // Both archives, whatever case they spell their extension in.
+        assert!(labels.contains(&"violin.zip"), "{labels:?}");
+        assert!(labels.contains(&"cello.ZIP"), "{labels:?}");
+        // A single recording is an instrument too.
+        assert!(labels.contains(&"take.wav"), "{labels:?}");
+        // …and nothing else.
+        assert!(!labels.contains(&"notes.txt"), "{labels:?}");
+
+        // A zip resolves to "picked", not to "descend into".
+        let at = b
+            .entries
+            .iter()
+            .position(|e| e.label == "violin.zip")
+            .unwrap();
+        let mut b = b;
+        b.cursor = at;
+        assert!(matches!(b.select(), Some(Action::PickFile(p)) if p.ends_with("violin.zip")));
+
+        // The plain directory picker is what it was: folders only.
+        let plain = FileBrowser::open(&base, DIR_PICK);
+        assert!(
+            !plain.entries.iter().any(|e| e.label.ends_with(".zip")),
+            "the directory picker grew files"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The picker offers exactly the audio the sampler reads: a format added to
+    /// one list and not the other is a file that cannot be picked, or one that
+    /// is picked and then refused.
+    #[test]
+    fn the_sampler_picker_offers_every_format_the_sampler_reads() {
+        let offered: Vec<&str> = DIR_OR_ZIP
+            .iter()
+            .copied()
+            .filter(|e| *e != DIR_MARK && *e != "zip")
+            .collect();
+        assert_eq!(
+            offered,
+            choz_engine::instruments::sampler::EXTENSIONS,
+            "the picker and the sampler disagree about what a sample is"
+        );
     }
 }

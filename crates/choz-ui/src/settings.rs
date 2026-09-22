@@ -388,7 +388,25 @@ pub fn wallpaper_dir() -> Option<std::path::PathBuf> {
     candidates.push("/usr/local/share/choz/wallpapers".into());
     // A checkout: `cargo run` from the repository root.
     candidates.push("assets".into());
-    candidates.into_iter().find(|d| d.is_dir())
+    // Absolute, always: the last candidate is relative to wherever choz was
+    // started, and a path saved from there is a path that stops working the
+    // moment something else starts it — a DAW loading the plugin, a desktop
+    // launcher, `cd` anywhere.
+    candidates
+        .into_iter()
+        .find(|d| d.is_dir())
+        .and_then(|d| d.canonicalize().ok())
+}
+
+/// A relative wallpaper path made absolute: against the working directory if
+/// that still finds it, else against the directory the wallpapers ship in.
+fn absolute_wallpaper(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Ok(here) = path.canonicalize() {
+        return Some(here);
+    }
+    let name = path.file_name()?;
+    let candidate = wallpaper_dir()?.join(name);
+    candidate.is_file().then_some(candidate)
 }
 
 /// The image a fresh install opens with: the one this project ships as its own.
@@ -481,6 +499,13 @@ pub struct UiSettings {
     /// so an old `ui.json` still looks the way it did.
     #[serde(default)]
     pub border_color: Option<(u8, u8, u8)>,
+    /// The last folder `LOAD` was pointed at, so the picker opens where the
+    /// library is rather than at `$HOME`.
+    ///
+    /// Beside the plugin paths rather than in them: this is where the picker
+    /// was, which is not the same as a directory the scan walks.
+    #[serde(default)]
+    pub samples_dir: Option<std::path::PathBuf>,
     /// Name of the theme the colours came from, for the UI to show which row is
     /// active. Editing a colour afterwards just leaves it stale, which is why
     /// the drawing code never reads it.
@@ -539,6 +564,7 @@ impl Default for UiSettings {
             osc: OscSettings::default(),
             background: Background::default(),
             border_color: None,
+            samples_dir: None,
             theme_name: THEMES[0].name.to_string(),
             background_tint: default_tint(),
             panel_tint: None,
@@ -688,6 +714,20 @@ impl UiSettings {
         // Written while the keys could be coloured by MIDI channel: they are
         // coloured by rack tab now, which is the question the panel answers.
         self.key_colour = self.key_colour.effective();
+        // **A wallpaper is not allowed to depend on where choz was started
+        // from.** Settings written by a checkout kept the relative
+        // `assets/wallpaper.png` that [`wallpaper_dir`] handed them, so choz
+        // opened on its own background from the repository root and on a bare
+        // terminal from anywhere else — including from a DAW, which starts a
+        // plugin in whatever directory it feels like. Resolved here, once, and
+        // saved absolute from then on.
+        if let Background::Image { path, .. } = &mut self.background {
+            if path.is_relative() {
+                if let Some(found) = absolute_wallpaper(path) {
+                    *path = found;
+                }
+            }
+        }
         self
     }
 
@@ -860,5 +900,54 @@ mod tests {
         assert_eq!(back, s);
         assert_eq!(back.palette_index(), Some(2));
         assert_eq!(back.color(), Color::Rgb(240, 180, 90));
+    }
+
+    /// A wallpaper saved as `assets/wallpaper.png` worked from the repository
+    /// root and nowhere else — the plugin, started by a DAW in whatever
+    /// directory it likes, opened on a bare terminal. Loading resolves it.
+    #[test]
+    fn a_relative_wallpaper_is_made_absolute_when_it_is_loaded() {
+        let dir = std::env::temp_dir().join(format!("choz-wall-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("wallpaper.png");
+        std::fs::write(&image, b"not really a png").unwrap();
+        // `CHOZ_WALLPAPERS` is the first candidate `wallpaper_dir` tries, which
+        // is what lets this test point it somewhere it owns.
+        // SAFETY: single-threaded here, and the variable is read on demand.
+        unsafe { std::env::set_var("CHOZ_WALLPAPERS", &dir) };
+
+        let saved = UiSettings {
+            background: Background::Image {
+                path: "assets/wallpaper.png".into(),
+                fit: ImageFit::Stretch,
+            },
+            ..UiSettings::default()
+        }
+        .migrate();
+        match saved.background {
+            Background::Image { path, .. } => {
+                assert!(path.is_absolute(), "{} is still relative", path.display());
+                assert_eq!(path.file_name().unwrap(), "wallpaper.png");
+            }
+            other => panic!("the background stopped being an image: {other:?}"),
+        }
+
+        // One that is nowhere at all is left alone rather than pointed at
+        // something the user never chose.
+        let missing = UiSettings {
+            background: Background::Image {
+                path: "assets/nothing-here.png".into(),
+                fit: ImageFit::Stretch,
+            },
+            ..UiSettings::default()
+        }
+        .migrate();
+        assert!(matches!(
+            missing.background,
+            Background::Image { ref path, .. } if path == std::path::Path::new("assets/nothing-here.png")
+        ));
+
+        unsafe { std::env::remove_var("CHOZ_WALLPAPERS") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -20,6 +20,10 @@ pub enum PluginFormat {
     Clap,
     Sf2,
     Sfz,
+    /// A folder of samples, mapped to a keyboard by choz itself — see
+    /// [`crate::sampler`]. Not a file format at all: the *directory* is the
+    /// instrument, and what is in it decides what it plays.
+    Samples,
     /// Pure Data patches. Not a binary plugin: a text file Pd runs, hosted in
     /// a process of its own because libpd allows exactly one Pd per process.
     Pd,
@@ -36,8 +40,31 @@ impl PluginFormat {
         PluginFormat::Clap,
         PluginFormat::Sf2,
         PluginFormat::Sfz,
+        PluginFormat::Samples,
         PluginFormat::Pd,
     ];
+
+    /// The formats choz goes looking for on disk — every one of them,
+    /// `Samples` included: a sample library is an instrument like any other
+    /// and belongs in Settings → Plugin paths, where its folder can be pointed
+    /// at, switched off, or edited.
+    pub const SCANNED: &'static [PluginFormat] = &[
+        PluginFormat::Ladspa,
+        PluginFormat::Dssi,
+        PluginFormat::Lv2,
+        PluginFormat::Vst2,
+        PluginFormat::Vst3,
+        PluginFormat::Clap,
+        PluginFormat::Sf2,
+        PluginFormat::Sfz,
+        PluginFormat::Samples,
+        PluginFormat::Pd,
+    ];
+
+    /// Whether the scan walks directories of this format at all.
+    pub fn is_scanned(self) -> bool {
+        Self::SCANNED.contains(&self)
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -49,6 +76,7 @@ impl PluginFormat {
             PluginFormat::Clap => "CLAP",
             PluginFormat::Sf2 => "SF2",
             PluginFormat::Sfz => "SFZ",
+            PluginFormat::Samples => "SAMPLES",
             PluginFormat::Pd => "PD",
         }
     }
@@ -72,6 +100,7 @@ impl PluginFormat {
             PluginFormat::Clap => Some("CLAP_PATH"),
             PluginFormat::Sf2 => Some("SF2_PATH"),
             PluginFormat::Sfz => Some("SFZ_PATH"),
+            PluginFormat::Samples => Some("CHOZ_SAMPLES_PATH"),
             PluginFormat::Pd => Some("PD_PATH"),
         }
     }
@@ -86,13 +115,20 @@ impl PluginFormat {
             PluginFormat::Clap => (&["clap"], false),
             PluginFormat::Sf2 => (&["sf2", "sf3"], false),
             PluginFormat::Sfz => (&["sfz"], false),
+            // Neither an extension nor a shape: a sample instrument is a
+            // *folder* with samples in it or a **zip** with samples in it, and
+            // `is_plugin_entry` asks the sampler which.
+            PluginFormat::Samples => (&["zip"], true),
             PluginFormat::Pd => (&["pd"], false),
         }
     }
 
     /// True for real plugin formats — SF2/SFZ are soundbanks, loaded as files.
     pub fn is_plugin(self) -> bool {
-        !matches!(self, PluginFormat::Sf2 | PluginFormat::Sfz)
+        !matches!(
+            self,
+            PluginFormat::Sf2 | PluginFormat::Sfz | PluginFormat::Samples
+        )
     }
 
     /// True for formats choz can actually load today.
@@ -107,6 +143,7 @@ impl PluginFormat {
                 | PluginFormat::Vst3
                 | PluginFormat::Sf2
                 | PluginFormat::Sfz
+                | PluginFormat::Samples
                 | PluginFormat::Pd
         )
     }
@@ -135,6 +172,7 @@ impl PluginFormat {
                 PathBuf::from("/usr/share/soundfonts"),
             ],
             PluginFormat::Sfz => vec![PathBuf::from("/usr/share/sounds/sfz")],
+            PluginFormat::Samples => vec![],
             // Pd has no installed-patch convention the way plugins do: a patch
             // is a document. These are where people keep them.
             PluginFormat::Pd => vec![PathBuf::from("/usr/share/pd/patches")],
@@ -148,6 +186,7 @@ impl PluginFormat {
             PluginFormat::Clap => vec![user(".clap")],
             PluginFormat::Sf2 => vec![user(".local/share/sounds/sf2"), user(".sounds")],
             PluginFormat::Sfz => vec![user(".sfz")],
+            PluginFormat::Samples => vec![user("Samples"), user("samples")],
             PluginFormat::Pd => vec![user("pd"), user(".local/share/pd"), user("Documents/Pd")],
         };
         dirs.extend(user_dirs.into_iter().flatten());
@@ -219,6 +258,11 @@ impl<'de> Deserialize<'de> for PluginPaths {
             .entries
             .into_iter()
             .filter_map(|(label, dirs)| Some((PluginFormat::from_label(&label)?, dirs)))
+            // A format that is not scanned is dropped rather than kept: there
+            // would be nothing in Settings to see or edit it with, and the scan
+            // would still walk it. Every format is scanned today; this is what
+            // keeps the file honest if one stops being.
+            .filter(|(format, _)| format.is_scanned())
             .collect();
         // **A format the file has never heard of gets its defaults**, not an
         // empty list.
@@ -246,7 +290,9 @@ impl<'de> Deserialize<'de> for PluginPaths {
 impl Default for PluginPaths {
     fn default() -> Self {
         Self {
-            entries: PluginFormat::ALL
+            // Only what is scanned: a samples directory in this list would be a
+            // library walked at every rescan, and samples come in by `LOAD`.
+            entries: PluginFormat::SCANNED
                 .iter()
                 .map(|&f| {
                     let dirs = f
@@ -346,7 +392,18 @@ pub struct FoundPlugin {
 pub fn scan_dir(dir: &Path, format: PluginFormat) -> Vec<FoundPlugin> {
     let (exts, bundles) = format.matcher();
     let mut out = Vec::new();
-    scan_into(dir, format, exts, bundles, 0, &mut out);
+    // **A search path can itself be the instrument.** `LOAD` puts the archive
+    // or the recording it was pointed at on the list, and a scan that only
+    // looked *inside* each path found nothing in a `.zip` or a `.wav` — the
+    // pack was there until the next rescan and gone after it.
+    let itself = match format == PluginFormat::Samples {
+        true => found_samples(dir),
+        false => Vec::new(),
+    };
+    match itself.is_empty() {
+        true => scan_into(dir, format, exts, bundles, 0, &mut out),
+        false => out = itself,
+    }
     if format == PluginFormat::Pd {
         out.retain(pd_effect);
     }
@@ -374,19 +431,49 @@ fn pd_effect(found: &FoundPlugin) -> bool {
 /// the per-entry retry after a scan crash.
 pub fn scan_path(path: &Path, format: PluginFormat) -> Vec<FoundPlugin> {
     let (exts, bundles) = format.matcher();
-    let matches = path
-        .extension()
-        .is_some_and(|e| exts.iter().any(|x| e.eq_ignore_ascii_case(x)));
-    if matches && path.is_dir() == bundles {
+    if format == PluginFormat::Samples {
+        let found = found_samples(path);
+        if !found.is_empty() {
+            return found;
+        }
+        return scan_dir(path, format);
+    }
+    if is_plugin_entry(path, exts, bundles) {
         return vec![FoundPlugin {
             format,
             name: stem(path),
             id: path_id(path),
             path: path.to_path_buf(),
-            is_instrument: matches!(format, PluginFormat::Sf2 | PluginFormat::Sfz),
+            is_instrument: is_instrument(format),
         }];
     }
     scan_dir(path, format)
+}
+
+/// The sample instruments at `path`, which may be more than one: an archive of
+/// sorted folders holds an instrument per folder. Empty when `path` is a shelf
+/// the scan should walk into instead.
+fn found_samples(path: &Path) -> Vec<FoundPlugin> {
+    crate::instruments::sampler::instruments(path)
+        .into_iter()
+        .map(|instrument| FoundPlugin {
+            format: PluginFormat::Samples,
+            name: stem(&instrument),
+            id: path_id(&instrument),
+            path: instrument,
+            is_instrument: true,
+        })
+        .collect()
+}
+
+/// True for the formats that make sound on their own. Kept in one place
+/// because `scan_dir`, `scan_path` and the retry after a crash each build a
+/// `FoundPlugin` and each got this wrong separately.
+fn is_instrument(format: PluginFormat) -> bool {
+    matches!(
+        format,
+        PluginFormat::Sf2 | PluginFormat::Sfz | PluginFormat::Samples
+    )
 }
 
 /// What a file-based "plugin" is known by. There is no id inside an SFZ, an
@@ -414,22 +501,43 @@ fn scan_into(
     };
     for entry in rd.flatten() {
         let path = entry.path();
-        let matches = path
-            .extension()
-            .is_some_and(|e| exts.iter().any(|x| e.eq_ignore_ascii_case(x)));
         let is_dir = path.is_dir();
-        if matches && (is_dir == bundles) {
+        if format == PluginFormat::Samples {
+            let found = found_samples(&path);
+            match found.is_empty() {
+                false => out.extend(found),
+                // A shelf: walk in and look for the instruments on it.
+                true if is_dir => scan_into(&path, format, exts, bundles, depth + 1, out),
+                true => {}
+            }
+            continue;
+        }
+        if is_plugin_entry(&path, exts, bundles) {
             out.push(FoundPlugin {
                 format,
                 name: stem(&path),
                 id: path_id(&path),
                 path,
-                is_instrument: matches!(format, PluginFormat::Sf2 | PluginFormat::Sfz),
+                is_instrument: is_instrument(format),
             });
         } else if is_dir {
             scan_into(&path, format, exts, bundles, depth + 1, out);
         }
     }
+}
+
+/// Whether this entry *is* a plugin of `format`, rather than a directory to
+/// look inside: the right extension in the right shape — a file for VST2, a
+/// bundle directory for LV2.
+///
+/// Sample instruments do not come through here. They answer by content rather
+/// than by name, and one entry can hold several of them, so the scan asks
+/// [`found_samples`] instead.
+fn is_plugin_entry(path: &Path, exts: &[&str], bundles: bool) -> bool {
+    let named = path
+        .extension()
+        .is_some_and(|e| exts.iter().any(|x| e.eq_ignore_ascii_case(x)));
+    named && path.is_dir() == bundles
 }
 
 fn stem(path: &Path) -> String {
@@ -526,8 +634,9 @@ mod tests {
         assert_eq!(lv2.len(), 1);
         assert_eq!(lv2[0].path, Path::new("/opt/my-lv2"));
 
-        // And everything the file never mentioned has somewhere to look.
-        for &format in PluginFormat::ALL {
+        // And every **scanned** format the file never mentioned has somewhere
+        // to look — the sample library included, under `~/Samples`.
+        for &format in PluginFormat::SCANNED {
             assert!(
                 !paths.dirs(format).is_empty(),
                 "{} would search nowhere",
@@ -569,7 +678,7 @@ mod tests {
         let cfg: PluginPaths = serde_json::from_str(json).expect("unknown format must not fail");
         assert_eq!(
             cfg.entries.len(),
-            PluginFormat::ALL.len(),
+            PluginFormat::SCANNED.len(),
             "the unknown one is dropped and the known ones are all there"
         );
         assert_eq!(
@@ -642,5 +751,54 @@ mod tests {
         assert!(lv2[0].path.is_dir());
 
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// Samples are a scanned format: the library the user keeps them in is a
+    /// search directory like any other, editable in Settings → Plugin paths,
+    /// and a config that already named one keeps it.
+    /// A search path that is an archive, or a single recording, is found by
+    /// the scan: it is what `LOAD` puts on the list.
+    #[test]
+    fn an_archive_or_a_recording_on_the_search_list_is_found() {
+        let dir = std::env::temp_dir().join(format!("choz-scan-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("take.wav");
+        std::fs::write(&wav, b"x").unwrap();
+        let found = scan_dir(&wav, PluginFormat::Samples);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].path, wav);
+        // A folder of them is still one instrument, found by looking inside.
+        assert_eq!(scan_dir(&dir, PluginFormat::Samples).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn samples_are_scanned_and_an_old_config_keeps_its_library() {
+        assert!(PluginFormat::Samples.is_scanned());
+        assert!(!PluginPaths::default()
+            .dirs(PluginFormat::Samples)
+            .is_empty());
+
+        let json = r#"{"entries":[
+            ["SAMPLES",[{"path":"/home/me/philharmonia","enabled":true}]],
+            ["Lv2",[{"path":"/home/me/.lv2","enabled":true}]]
+        ]}"#;
+        let cfg: PluginPaths = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.dirs(PluginFormat::Samples)[0].path,
+            Path::new("/home/me/philharmonia")
+        );
+        assert!(
+            cfg.all_enabled()
+                .iter()
+                .any(|p| p == Path::new("/home/me/philharmonia")),
+            "the library the user named is not searched"
+        );
+        // …and what the file said about a scanned format is untouched.
+        assert_eq!(
+            cfg.dirs(PluginFormat::Lv2)[0].path,
+            Path::new("/home/me/.lv2")
+        );
     }
 }

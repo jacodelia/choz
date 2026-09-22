@@ -103,10 +103,10 @@ impl Slot {
 
     /// Play a note now, and remember it for `PANIC`.
     #[inline]
-    fn play(&mut self, note: u8, vel: u8, on: bool) {
+    fn play(&mut self, note: u8, vel: u8, on: bool, zone: Option<u8>) {
         if on {
             self.held |= 1u128 << (note & 0x7F);
-            self.source.note_on(note, vel);
+            self.source.note_on_zone(note, vel, zone);
         } else {
             self.held &= !(1u128 << (note & 0x7F));
             self.source.note_off(note);
@@ -114,18 +114,24 @@ impl Slot {
     }
 
     /// Take a note, now or later. `at == 0` is now.
-    fn schedule(&mut self, at: u64, note: u8, vel: u8, on: bool) {
+    fn schedule(&mut self, at: u64, note: u8, vel: u8, on: bool, zone: Option<u8>) {
         if at == 0 {
-            self.play(note, vel, on);
+            self.play(note, vel, on, zone);
             return;
         }
         if let Some(slot) = self.pending.iter_mut().find(|p| p.is_none()) {
-            *slot = Some(Scheduled { at, note, vel, on });
+            *slot = Some(Scheduled {
+                at,
+                note,
+                vel,
+                on,
+                zone,
+            });
             return;
         }
         // Full. A note slightly early is still the note; a dropped one is
         // silence, or worse, a note that never stops.
-        self.play(note, vel, on);
+        self.play(note, vel, on, zone);
     }
 
     /// The earliest pending note inside `[start, end)`, taken off the queue.
@@ -260,6 +266,9 @@ pub(crate) enum EngineCommand {
         slot: usize,
         note: u8,
         vel: u8,
+        /// The source zone the note is for, when it is for one — the band in a
+        /// tab, each musician on the program their own zone holds.
+        zone: Option<u8>,
         /// Transport sample the note is **for**. `0` means "as soon as it
         /// arrives", which is what every input that has no schedule of its own
         /// sends: a key, a MIDI port, OSC. A generator that knows when its next
@@ -286,6 +295,12 @@ pub(crate) enum EngineCommand {
     PitchBend {
         slot: usize,
         value: u16,
+    },
+    /// Aftertouch: `note` is `Some` for polyphonic pressure.
+    Pressure {
+        slot: usize,
+        note: Option<u8>,
+        value: u8,
     },
 }
 
@@ -587,10 +602,17 @@ impl EmbeddedRt {
     pub fn render(&mut self, frames: usize) {
         let started = std::time::Instant::now();
         let cpu_started = crate::meter::cpu_micros();
+        let faults_started = crate::meter::major_faults();
         let frames = frames.min(self.max_frames());
         self.rt.apply_commands();
         self.rt.render(frames);
-        publish_load(started, cpu_started, frames, self.rt.sample_rate);
+        publish_load(
+            started,
+            cpu_started,
+            faults_started,
+            frames,
+            self.rt.sample_rate,
+        );
     }
 
     /// The largest block this rack was built for.
@@ -664,6 +686,10 @@ struct Scheduled {
     note: u8,
     vel: u8,
     on: bool,
+    /// Which of the source's zones it is for — see
+    /// [`choz_ports::AudioSource::note_on_zone`]. `None` is the tab's own
+    /// program, which is what everything but the arranger's band sends.
+    zone: Option<u8>,
 }
 
 /// Smallest quantum choz will force on the graph. Forcing 64 frames onto a
@@ -2189,7 +2215,8 @@ impl AudioEngine {
             | crate::PluginFormat::Dssi
             | crate::PluginFormat::Vst2
             | crate::PluginFormat::Vst3
-            | crate::PluginFormat::Sfz => {
+            | crate::PluginFormat::Sfz
+            | crate::PluginFormat::Samples => {
                 Ok(self.add_slot(self.build_instrument(format, path, id)?))
             }
             _ => anyhow::bail!("{} hosting is not implemented yet", format.label()),
@@ -2241,7 +2268,8 @@ impl AudioEngine {
             | crate::PluginFormat::Dssi
             | crate::PluginFormat::Vst2
             | crate::PluginFormat::Vst3
-            | crate::PluginFormat::Sfz => {
+            | crate::PluginFormat::Sfz
+            | crate::PluginFormat::Samples => {
                 let inst = self.build_instrument(format, path, id)?;
                 self.set_slot_source(slot, inst);
                 Ok(())
@@ -2300,11 +2328,20 @@ impl AudioEngine {
 
     /// Send a note-on to one slot. Input→slot routing lives in the UI.
     pub fn note_on(&mut self, slot: usize, note: u8, vel: u8) {
+        self.note_on_zone_at(slot, note, vel, 0, None);
+    }
+
+    /// A note-on for one of the slot's zones — what a band in one tab sends, so
+    /// the drums land on the kit and the bass on the bass out of the same
+    /// SoundFont. `at` is the transport sample, `0` for "as soon as it
+    /// arrives"; `zone` of `None` is the tab's own program.
+    pub fn note_on_zone_at(&mut self, slot: usize, note: u8, vel: u8, at: u64, zone: Option<u8>) {
         self.send(EngineCommand::NoteOn {
             slot,
             note,
             vel,
-            at: 0,
+            at,
+            zone,
         });
     }
 
@@ -2321,12 +2358,7 @@ impl AudioEngine {
     /// and it is the only way its resolution stops being the interface's wake
     /// interval.
     pub fn note_on_at(&mut self, slot: usize, note: u8, vel: u8, at: u64) {
-        self.send(EngineCommand::NoteOn {
-            slot,
-            note,
-            vel,
-            at,
-        });
+        self.note_on_zone_at(slot, note, vel, at, None);
     }
 
     pub fn note_off_at(&mut self, slot: usize, note: u8, at: u64) {
@@ -2354,6 +2386,11 @@ impl AudioEngine {
         self.send(EngineCommand::PitchBend { slot, value });
     }
 
+    /// Send aftertouch to one slot — see [`AudioSource::pressure`].
+    pub fn pressure(&mut self, slot: usize, note: Option<u8>, value: u8) {
+        self.send(EngineCommand::Pressure { slot, note, value });
+    }
+
     pub fn set_playing(&self, play: bool) {
         self.playing.store(play, Ordering::Relaxed);
     }
@@ -2366,6 +2403,7 @@ impl AudioEngine {
 fn audio_callback(buf: &mut [f32], state: &mut RtState) {
     let started = std::time::Instant::now();
     let cpu_started = crate::meter::cpu_micros();
+    let faults_started = crate::meter::major_faults();
     state.apply_commands();
     let frames = buf.len() / 2;
     state.drain_capture(frames);
@@ -2374,7 +2412,13 @@ fn audio_callback(buf: &mut [f32], state: &mut RtState) {
         buf[f * 2] = state.mix[0][f];
         buf[f * 2 + 1] = state.mix[1][f];
     }
-    publish_load(started, cpu_started, frames, state.sample_rate);
+    publish_load(
+        started,
+        cpu_started,
+        faults_started,
+        frames,
+        state.sample_rate,
+    );
 }
 
 /// What this block cost against what it had — on the wall clock and on a CPU.
@@ -2382,13 +2426,20 @@ fn audio_callback(buf: &mut [f32], state: &mut RtState) {
 pub(crate) fn publish_load(
     started: std::time::Instant,
     cpu_started: u64,
+    faults_started: u64,
     frames: usize,
     sample_rate: u32,
 ) {
     let budget = std::time::Duration::from_secs_f64(frames as f64 / sample_rate.max(1) as f64);
     let cpu =
         std::time::Duration::from_micros(crate::meter::cpu_micros().saturating_sub(cpu_started));
-    crate::meter::load().publish(started.elapsed(), cpu, budget);
+    let took = started.elapsed();
+    let load = crate::meter::load();
+    load.publish(took, cpu, budget);
+    load.publish_faults(
+        crate::meter::major_faults().saturating_sub(faults_started),
+        took > budget,
+    );
 }
 
 impl RtState {
@@ -2590,9 +2641,10 @@ impl RtState {
                     note,
                     vel,
                     at,
+                    zone,
                 } => {
                     if let Some(s) = state.slots.get_mut(slot) {
-                        s.schedule(at, note, vel, true);
+                        s.schedule(at, note, vel, true, zone);
                         // What a gate driven by *playing* reads — see
                         // [`crate::meter::NoteLevels`]. Published where the
                         // note arrives and not where the slot renders, so a
@@ -2602,7 +2654,7 @@ impl RtState {
                 }
                 EngineCommand::NoteOff { slot, note, at } => {
                     if let Some(s) = state.slots.get_mut(slot) {
-                        s.schedule(at, note, 0, false);
+                        s.schedule(at, note, 0, false, None);
                     }
                 }
                 EngineCommand::Panic => {
@@ -2629,6 +2681,11 @@ impl RtState {
                 EngineCommand::PitchBend { slot, value } => {
                     if let Some(s) = state.slots.get_mut(slot) {
                         s.source.pitch_bend(value);
+                    }
+                }
+                EngineCommand::Pressure { slot, note, value } => {
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        s.source.pressure(note, value);
                     }
                 }
             }
@@ -2739,6 +2796,10 @@ impl RtState {
         if playing {
             transport.advance(frames);
         }
+        // The free clock never stops: it is the phase the metronome and every
+        // artifact with no transport to follow count off, and a phase that
+        // moved with the stop button would be four clocks again.
+        transport.advance_free(frames);
         let n = (frames * 2).min(scratch.len());
         let sr = *sample_rate;
 
@@ -2930,7 +2991,7 @@ impl RtState {
                         // segment that starts here is rendered.
                         while next_event < count && due[next_event].unwrap().0 <= at {
                             let ev = due[next_event].unwrap().1;
-                            slot.play(ev.note, ev.vel, ev.on);
+                            slot.play(ev.note, ev.vel, ev.on, ev.zone);
                             next_event += 1;
                         }
                         let end = due
@@ -3010,7 +3071,7 @@ impl RtState {
             let len = (n * 2).min(scratch.len());
             let sc = &mut scratch[..len];
             sc.fill(0.0);
-            let click = crate::metronome::metronome();
+            let click = crate::artifacts::metronome::metronome();
             click.render(sc, n, sr);
             match click.dest() {
                 Dest::Bus(b) if b < BUSES => {
@@ -3220,7 +3281,9 @@ fn jack_route_to(sink: &str, client_name: &str) -> Result<()> {
         anyhow::bail!("output '{sink}' has no playback ports");
     }
 
-    for (out, target) in pair_ports(&ours, &targets) {
+    let pairs = pair_ports(&ours, &targets);
+    let wired = pairs.len();
+    for (out, target) in pairs {
         // Tear the old wiring down first: a port left connected to two sinks
         // plays through both.
         if let Some(port) = client.port_by_name(out) {
@@ -3232,6 +3295,15 @@ fn jack_route_to(sink: &str, client_name: &str) -> Result<()> {
             .connect_ports_by_name(out, target)
             .with_context(|| format!("cannot connect {out} to {target}"))?;
     }
+    // **Said out loud even though it worked.** Picking an output and hearing
+    // nothing used to leave no line at all in the log: this path was silent on
+    // success, `connect` was silent on success, and a run that ended up wired
+    // to the wrong sink looked exactly like a run that was wired to the right
+    // one. The log is the only thing there is to read afterwards.
+    eprintln!(
+        "choz: output wired to '{sink}' — {wired} of {} ports",
+        ours.len()
+    );
     Ok(())
 }
 
@@ -3403,10 +3475,46 @@ pub fn build_instrument(
             .map(|i| Box::new(i) as Box<dyn crate::sources::AudioSource>),
         // Not a plugin at all: a text file pointing at samples, played by
         // choz's own sampler.
-        crate::PluginFormat::Sfz => match crate::sfz::SfzSampler::build(path, sr) {
+        crate::PluginFormat::Sfz => match crate::instruments::sfz::SfzSampler::build(path, sr) {
             Ok(s) => Some(Box::new(s) as Box<dyn crate::sources::AudioSource>),
             Err(e) => {
                 eprintln!("choz: SFZ {}: {e}", path.display());
+                None
+            }
+        },
+        // A folder of samples, mapped to the keyboard by what the files
+        // themselves say. Slow the first time — it may decode and analyse —
+        // and cached after that; either way it is a load, not a callback.
+        // No folder yet: the sampler goes into the tab empty and is pointed at
+        // one afterwards. That is the order the interface asks in.
+        crate::PluginFormat::Samples if id == crate::instruments::sampler::EMPTY_ID => {
+            Some(Box::new(crate::instruments::sampler::empty())
+                as Box<dyn crate::sources::AudioSource>)
+        }
+        // The id carries the layout the user chose, when they chose one — see
+        // `sampler::Mode`. The path is the folder either way.
+        // A saved map: no scan, no analysis, no name reading — the answer was
+        // worked out once and written down. See `sampler::preset`.
+        crate::PluginFormat::Samples if crate::instruments::sampler::is_preset_id(id) => {
+            match crate::instruments::sampler::preset::read(path)
+                .and_then(|p| crate::instruments::sampler::build_preset(&p, sr))
+            {
+                Ok(s) => Some(Box::new(s) as Box<dyn crate::sources::AudioSource>),
+                Err(e) => {
+                    eprintln!("choz: preset {}: {e:#}", path.display());
+                    None
+                }
+            }
+        }
+        crate::PluginFormat::Samples => match crate::instruments::sampler::build_id(
+            path,
+            sr,
+            crate::instruments::sampler::Mode::of_id(id),
+            crate::instruments::sampler::slices_of_id(id),
+        ) {
+            Ok(s) => Some(Box::new(s) as Box<dyn crate::sources::AudioSource>),
+            Err(e) => {
+                eprintln!("choz: samples {}: {e}", path.display());
                 None
             }
         },
@@ -3605,11 +3713,15 @@ mod tests {
         }
     }
 
+    /// One aftertouch message as a source received it: `(note, value)`.
+    type Pressed = (Option<u8>, u8);
+
     /// Records the pedal/wheel traffic a slot receives.
     #[derive(Default)]
     struct Expressive {
         ccs: std::sync::Arc<parking_lot::Mutex<Vec<(u8, u8)>>>,
         bends: std::sync::Arc<parking_lot::Mutex<Vec<u16>>>,
+        pressures: std::sync::Arc<parking_lot::Mutex<Vec<Pressed>>>,
     }
     impl AudioSource for Expressive {
         fn render(&mut self, out: &mut [f32], _sr: u32) -> usize {
@@ -3621,6 +3733,9 @@ mod tests {
         }
         fn pitch_bend(&mut self, value: u16) {
             self.bends.lock().push(value);
+        }
+        fn pressure(&mut self, note: Option<u8>, value: u8) {
+            self.pressures.lock().push((note, value));
         }
     }
 
@@ -4317,6 +4432,7 @@ mod tests {
                 note: 60,
                 vel: 100,
                 at: 9,
+                zone: None,
             })
             .unwrap();
         state.apply_commands();
@@ -4389,6 +4505,7 @@ mod tests {
                 note: 60,
                 vel: 100,
                 at: 4,
+                zone: None,
             })
             .unwrap();
         state.apply_commands();
@@ -4419,6 +4536,7 @@ mod tests {
                 note: 64,
                 vel: 100,
                 at: 0,
+                zone: None,
             })
             .unwrap();
         state.apply_commands();
@@ -4673,6 +4791,7 @@ mod tests {
                 note: 60,
                 vel: 100,
                 at: 0,
+                zone: None,
             })
             .unwrap();
 
@@ -4688,6 +4807,7 @@ mod tests {
                 note: 62,
                 vel: 100,
                 at: 0,
+                zone: None,
             })
             .unwrap();
         cmd_tx
@@ -4715,6 +4835,7 @@ mod tests {
         let played = Expressive::default();
         let (q_ccs, p_ccs) = (quiet.ccs.clone(), played.ccs.clone());
         let p_bends = played.bends.clone();
+        let p_pressures = played.pressures.clone();
 
         cmd_tx
             .push(EngineCommand::AddSlot(Box::new(quiet)))
@@ -4743,6 +4864,21 @@ mod tests {
                 value: 16383,
             })
             .unwrap();
+        // Aftertouch as itself — channel and polyphonic — and never as CC 11.
+        cmd_tx
+            .push(EngineCommand::Pressure {
+                slot: 1,
+                note: None,
+                value: 40,
+            })
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::Pressure {
+                slot: 1,
+                note: Some(60),
+                value: 70,
+            })
+            .unwrap();
         // Out-of-range targets are dropped, not panics.
         cmd_tx
             .push(EngineCommand::ControlChange {
@@ -4764,6 +4900,7 @@ mod tests {
             "sustain and mod wheel arrive unfiltered"
         );
         assert_eq!(&*p_bends.lock(), &[16383]);
+        assert_eq!(&*p_pressures.lock(), &[(None, 40), (Some(60), 70)]);
         assert!(
             q_ccs.lock().is_empty(),
             "a slot bound to another input stays untouched"
@@ -5268,7 +5405,7 @@ mod tests {
     fn the_click_goes_where_the_metronome_says() {
         let _clock = crate::test_locks::transport();
         let (mut cmd_tx, _retired, mut state) = mk_state_ch(4, 0);
-        let m = crate::metronome::metronome();
+        let m = crate::artifacts::metronome::metronome();
         m.set_on(true);
         m.set_gain(1.0);
         choz_ports::transport().set_bpm(120.0);
