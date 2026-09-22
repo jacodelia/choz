@@ -151,8 +151,7 @@ fn plugin_parameters_are_readable_and_settable() {
 #[test]
 fn hosted_instrument_sounds_on_note_on() {
     let _guard = plugin_lock();
-    let Some(info) = installed().into_iter().find(|p| p.is_instrument)
-    else {
+    let Some(info) = installed().into_iter().find(|p| p.is_instrument) else {
         eprintln!("no CLAP instrument installed — skipping");
         return;
     };
@@ -182,8 +181,7 @@ fn hosted_instrument_sounds_on_note_on() {
 #[test]
 fn instrument_parameters_are_settable_while_playing() {
     let _guard = plugin_lock();
-    let Some(info) = installed().into_iter().find(|p| p.is_instrument)
-    else {
+    let Some(info) = installed().into_iter().find(|p| p.is_instrument) else {
         return;
     };
     let params = choz_plugin_clap::read_params(&info.path, &info.id);

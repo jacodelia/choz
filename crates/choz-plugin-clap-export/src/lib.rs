@@ -109,7 +109,9 @@ enum Sort {
 }
 
 impl Sort {
-    /// Notes in and notes out, with no audio anywhere: the two artifacts.
+    /// Notes in and notes out, with no audio anywhere: the three generators.
+    /// The metronome is the fourth artifact and is not one of these — it makes
+    /// a click, which is audio.
     fn is_generator(self) -> bool {
         matches!(self, Sort::Arp | Sort::Seq | Sort::Arr)
     }
@@ -205,7 +207,7 @@ fn catalogue() -> &'static [Exported] {
                 })
             })
             .collect();
-        // The two artifacts. `note-effect` for both: CLAP has no separate
+        // The generators. `note-effect` for all of them: CLAP has no separate
         // feature for a sequencer, and what a host needs to know is that these
         // speak notes and not audio.
         out.push(Exported {
@@ -577,8 +579,8 @@ impl Generator {
         }
     }
 
-    /// The progression, for the host to save — empty for the two artifacts
-    /// that keep everything in their knobs.
+    /// The progression, for the host to save — empty for the generators that
+    /// keep everything in their knobs.
     fn state(&self) -> String {
         match self {
             Generator::Arr(arr) => arr.settings.text.clone(),

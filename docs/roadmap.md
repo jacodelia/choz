@@ -30,7 +30,7 @@ a notas), AutoTune, un arpegiador y un secuenciador por tab —y **dos tabs con
 secuenciador arrancan en el mismo groove**, con o sin transporte—; 56 efectos
 propios (**la suite está completa y auditada**: se apilan sin pasarse de escala,
 su dry/wet es una sola ley, y los 56 publican su lista entera de mandos), que
-además se publican como un `.clap` —los dos artifacts incluidos— para usarlos en
+además se publican como un `.clap` —los cuatro artifacts incluidos— para usarlos en
 cualquier otro host; un looper multipista con sus tiras de canal, exportación a
 WAV y **tomas que el proyecto guarda** —resampleadas si el equipo cambió de
 frecuencia—; hay guardia de acople en la entrada; el mixer tiene un
@@ -79,9 +79,9 @@ octava; el arreglador **tiene forma
 en `arranger/rhythms`** por `tools/mid_to_styles.py`, su progresión se arma
 dentro de la TUI —una grilla de
 compases, un acorde por subdivisión de la agrupación— y sale
-en el `.clap` como tercer artifact.** **La 1.0.0 está publicada y
-sus paquetes verificados; la 1.3.11 es este árbol.**
-1006 tests (el workspace sin `choz-plugin-lv2`, que en esta máquina se cuelga),
+en el `.clap` como cuarto artifact.** **La 1.0.0 está publicada y
+sus paquetes verificados; la 1.3.12 es este árbol.**
+1045 tests (el workspace sin `choz-plugin-lv2`, que en esta máquina se cuelga),
 `clippy --workspace --all-targets -D warnings` limpio con `+beta`.
 
 Las comprobaciones con hardware delante quedaron dichas en los gotchas, que es

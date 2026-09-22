@@ -217,7 +217,11 @@ mod tests {
         assert!(!labels.contains(&"notes.txt"), "{labels:?}");
 
         // A zip resolves to "picked", not to "descend into".
-        let at = b.entries.iter().position(|e| e.label == "violin.zip").unwrap();
+        let at = b
+            .entries
+            .iter()
+            .position(|e| e.label == "violin.zip")
+            .unwrap();
         let mut b = b;
         b.cursor = at;
         assert!(matches!(b.select(), Some(Action::PickFile(p)) if p.ends_with("violin.zip")));

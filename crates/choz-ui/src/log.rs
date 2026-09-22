@@ -152,7 +152,11 @@ mod tests {
         truncate_if_over(&small, 50);
 
         assert_eq!(std::fs::metadata(&big).unwrap().len(), 0, "over the cap");
-        assert_eq!(std::fs::metadata(&small).unwrap().len(), 10, "under the cap");
+        assert_eq!(
+            std::fs::metadata(&small).unwrap().len(),
+            10,
+            "under the cap"
+        );
 
         // An O_APPEND writer keeps writing after the cut — the mechanism the
         // watchdog actually relies on, not just the truncate call itself.

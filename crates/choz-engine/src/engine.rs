@@ -3300,7 +3300,10 @@ fn jack_route_to(sink: &str, client_name: &str) -> Result<()> {
     // success, `connect` was silent on success, and a run that ended up wired
     // to the wrong sink looked exactly like a run that was wired to the right
     // one. The log is the only thing there is to read afterwards.
-    eprintln!("choz: output wired to '{sink}' — {wired} of {} ports", ours.len());
+    eprintln!(
+        "choz: output wired to '{sink}' — {wired} of {} ports",
+        ours.len()
+    );
     Ok(())
 }
 

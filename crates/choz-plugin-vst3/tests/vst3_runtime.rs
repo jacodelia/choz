@@ -237,7 +237,10 @@ fn installed_vst3_plugins_scan_host_and_sound() {
     // Not every synth that maps the wheel uses it (Nekobi here does not), so
     // one that answers is enough — none is the host not delivering it.
     if mapped_any {
-        assert!(with_mapping > 0, "no VST3 instrument that maps the bend wheel was bent by it");
+        assert!(
+            with_mapping > 0,
+            "no VST3 instrument that maps the bend wheel was bent by it"
+        );
     }
 
     assert!(

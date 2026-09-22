@@ -12,9 +12,9 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **1006 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo), 555 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
-- `cargo clippy --workspace --all-targets -D warnings` limpio.
-- **56 efectos propios**, publicados también como un `.clap` con los dos artifacts.
+- **1045 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo), 573 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- `cargo clippy --workspace --all-targets -D warnings` limpio, y `cargo fmt --all --check` también.
+- **56 efectos propios**, publicados también como un `.clap` con los cuatro artifacts (arpegiador, secuenciador, metrónomo y arreglador).
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
 - `cargo test --workspace` necesita `--no-fail-fast`: uno de los binarios con
   `harness = false` no reconoce los argumentos que cargo le pasa y aborta la
@@ -32,7 +32,7 @@ lleva lo que falta —nada de lo ya hecho— y
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
 
-## Sin publicar
+## [1.3.12] — 2026-09-21
 
 ### 2026-09-21 — los estilos del arreglador dejan de escribirse a mano
 
@@ -155,6 +155,13 @@ Tres cosas que se vieron recién con doscientos diez estilos en la lista:
 **De paso:** `real_host.rs` contaba `BUILT_IN_KINDS + 3` artifacts. Son cuatro
 desde que el arreglador viaja en el mismo `.clap` (`7a6f0c8`); el test estaba en
 rojo y no tenía nada que ver con esto.
+
+**Y de paso:** `METER` en japonés era `\u{62d}\u{5b50}` — una letra árabe *hah*
+seguida de 子 — en vez de 拍子 (`\u{62cd}`). Una auditoría de la tabla de i18n
+(180 filas, 8 idiomas) no encontró nada más: ninguna fila corta, ninguna clave
+repetida, y ningún `t("…")` sin fila. Cuatro archivos que `cargo fmt` venía
+arrastrando sin formatear desde antes de esta rama quedaron formateados, así
+que `cargo fmt --all --check` sale limpio.
 
 ### 2026-09-20 — en la grilla, cada celda es un botón para el ratón
 
@@ -1707,6 +1714,31 @@ Una ventana de plugin es un panel en la pantalla de otro, el host ya tiene con
 qué mirar el MIDI, y esas filas le sirven más al rack. Con `is_embedded()` el
 panel mide cero: no se dibuja, no registra rects y por lo tanto tampoco se le
 puede hacer click. En consola queda igual.
+
+### 2026-09-12 — el log ya no puede llenar el disco
+
+> De la PR #7. El merge de esta rama resolvió los conflictos como *ours* y se
+> llevó puesta esta entrada, que no estaba en conflicto con nada: el código
+> (`choz-ui/src/log.rs` y su línea en `lib.rs`) sí entró. Va de vuelta acá,
+> bajo el encabezado que usa este archivo.
+
+Un plugin de batería (AVLdrums, LV2, hosteado en el mismo proceso) se quedó
+retriggereando una nota en loop. Su fluidsynth interno imprimía "Ringbuffer
+full" en cada intento fallido de robar una voz, sin ningún límite — fd 1/2 de
+choz van directo a `choz.log` por diseño (así es como el usuario ve los
+banners y warnings de los plugins que hostea), así que el log se comió 3.4 GB
+en diez minutos mientras la CPU se ahogaba y el audio de todo el sistema
+(PipeWire) empezaba a fallar por falta de tiempo real.
+
+`log::spawn_log_watchdog` revisa cada 5 segundos y trunca el archivo si pasa
+los 32 MiB. Funciona sin tocar los fd ya duplicados: ambos se abren con
+`O_APPEND`, que busca el fin de archivo en cada escritura en lugar de guardar
+un offset, así que truncar el path por debajo alcanza.
+
+No arregla el plugin que se cuelga — eso es AVLdrums, ajeno a este repo — sólo
+evita que cualquier plugin así vuelva a llenar el disco. Para ese plugin en
+particular, forzarlo a la sandbox (`x` en el rack) lo aísla del proceso
+principal.
 
 ## [1.3.11] — 2026-09-07
 
