@@ -10546,6 +10546,31 @@ impl App {
     ///
     /// Nothing happens while the transport is stopped — a lane is a position in
     /// a loop, and with no clock running there is no position.
+    /// Everything one turn of the interface loop does besides drawing and
+    /// reading keys. **One list for both loops** — the terminal's and the
+    /// plugin's ([`crate::embed::Embedded::tick`]): kept as two copies, the
+    /// plugin's lost `tick_arrangers` and its arranger never played a note.
+    pub(crate) fn tick_loop(&mut self) {
+        self.poll_scan();
+        self.poll_midi_hotplug();
+        self.poll_jack_midi();
+        self.drain_midi();
+        self.tick_arps();
+        self.tick_seqs();
+        self.tick_arrangers();
+        self.pump_loopers();
+        self.tick_notes();
+        self.publish_chord();
+        self.poll_editor();
+        self.poll_preset_list();
+        self.poll_instr_readback();
+        self.poll_preset_audition();
+        self.poll_capture_trim();
+        self.poll_plugin_touch();
+        self.poll_health();
+        self.tick_automation();
+    }
+
     fn tick_automation(&mut self) {
         if !self.playing {
             return;
@@ -16000,24 +16025,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Screen>>, app: &mut App) -> 
         app.run_pending_load();
 
         handle_events(app)?;
-        app.poll_scan();
-        app.poll_midi_hotplug();
-        app.poll_jack_midi();
-        app.drain_midi();
-        app.tick_arps();
-        app.tick_seqs();
-        app.tick_arrangers();
-        app.pump_loopers();
-        app.tick_notes();
-        app.publish_chord();
-        app.poll_editor();
-        app.poll_preset_list();
-        app.poll_instr_readback();
-        app.poll_preset_audition();
-        app.poll_capture_trim();
-        app.poll_plugin_touch();
-        app.poll_health();
-        app.tick_automation();
+        app.tick_loop();
     }
     Ok(())
 }

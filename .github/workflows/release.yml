@@ -80,6 +80,7 @@ jobs:
       - name: Build the CLAP bundle and the Pure Data host
         run: |
           cargo build --release --locked -p choz-plugin-clap-export
+          cargo build --release --locked -p choz-clap
           cargo build --release --locked -p choz-plugin-pd --features pd
 
       - name: Package tarball
@@ -101,6 +102,8 @@ jobs:
           cp -r assets "dist/${NAME}/"
           cp target/release/libchoz_plugin_clap_export.so "dist/${NAME}/"
           strip "dist/${NAME}/libchoz_plugin_clap_export.so"
+          cp target/release/libchoz_clap.so "dist/${NAME}/"
+          strip "dist/${NAME}/libchoz_clap.so"
           cp target/release/choz-pd-host "dist/${NAME}/"
           strip "dist/${NAME}/choz-pd-host"
           tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
@@ -159,7 +162,9 @@ jobs:
       # anything else — unlike `choz-pd-host`, which links libpd and is x86_64
       # only here. The `.deb` below lists this file, so it has to exist.
       - name: Build the CLAP bundle (cross)
-        run: cross build --release --locked --target ${{ matrix.target }} -p choz-plugin-clap-export
+        run: |
+          cross build --release --locked --target ${{ matrix.target }} -p choz-plugin-clap-export
+          cross build --release --locked --target ${{ matrix.target }} -p choz-clap
 
       - name: Package tarball
         shell: bash
@@ -178,6 +183,7 @@ jobs:
           # beside it.
           cp -r assets "dist/${NAME}/"
           cp "target/${{ matrix.target }}/release/libchoz_plugin_clap_export.so" "dist/${NAME}/"
+          cp "target/${{ matrix.target }}/release/libchoz_clap.so" "dist/${NAME}/"
           tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
           rm -rf "dist/${NAME}"
 

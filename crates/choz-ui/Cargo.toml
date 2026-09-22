@@ -90,6 +90,7 @@ assets = [
     # choz's own 45 effects, as a CLAP plugin for any other host. Installed
     # system-wide, which is a directory every CLAP host already searches.
     ["target/release/libchoz_plugin_clap_export.so", "usr/lib/clap/choz.clap", "644"],
+    ["target/release/libchoz_clap.so", "usr/lib/clap/choz-rack.clap", "644"],
     # The only binary that links libpd, and the one the engine looks for beside
     # choz itself when a tab runs a Pure Data patch.
     ["target/release/choz-pd-host", "usr/bin/", "755"],
@@ -130,6 +131,7 @@ assets = [
     ["../../assets/*.jpg", "usr/share/choz/wallpapers/", "644"],
     ["../../assets/*.png", "usr/share/choz/wallpapers/", "644"],
     ["target/release/libchoz_plugin_clap_export.so", "usr/lib/clap/choz.clap", "644"],
+    ["target/release/libchoz_clap.so", "usr/lib/clap/choz-rack.clap", "644"],
 ]
 
 [package.metadata.generate-rpm]
@@ -171,6 +173,7 @@ assets = [
     { source = "../../assets/*.jpg", dest = "/usr/share/choz/wallpapers/", mode = "644" },
     { source = "../../assets/*.png", dest = "/usr/share/choz/wallpapers/", mode = "644" },
     { source = "../../target/release/libchoz_plugin_clap_export.so", dest = "/usr/lib/clap/choz.clap", mode = "644" },
+    { source = "../../target/release/libchoz_clap.so", dest = "/usr/lib/clap/choz-rack.clap", mode = "644" },
     { source = "../../target/release/choz-pd-host", dest = "/usr/bin/choz-pd-host", mode = "755" },
 ]
 

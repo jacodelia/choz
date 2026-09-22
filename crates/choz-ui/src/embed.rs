@@ -74,23 +74,7 @@ impl Embedded {
     pub fn tick(&mut self) {
         let app = &mut self.app;
         app.run_pending_load();
-        app.poll_scan();
-        app.poll_midi_hotplug();
-        app.poll_jack_midi();
-        app.drain_midi();
-        app.tick_arps();
-        app.tick_seqs();
-        app.pump_loopers();
-        app.tick_notes();
-        app.publish_chord();
-        app.poll_editor();
-        app.poll_preset_list();
-        app.poll_instr_readback();
-        app.poll_preset_audition();
-        app.poll_capture_trim();
-        app.poll_plugin_touch();
-        app.poll_health();
-        app.tick_automation();
+        app.tick_loop();
     }
 
     /// Draw the whole interface through any ratatui backend — the plugin's

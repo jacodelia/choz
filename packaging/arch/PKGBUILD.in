@@ -72,6 +72,9 @@ package() {
   # already searches, and the Pure Data child (the only binary linking libpd).
   [ -f libchoz_plugin_clap_export.so ] &&
     install -Dm644 libchoz_plugin_clap_export.so "$pkgdir/usr/lib/clap/choz.clap"
+  # And choz itself as an instrument: the whole rack on a DAW track.
+  [ -f libchoz_clap.so ] &&
+    install -Dm644 libchoz_clap.so "$pkgdir/usr/lib/clap/choz-rack.clap"
   [ -f choz-pd-host ] && install -Dm755 choz-pd-host "$pkgdir/usr/bin/choz-pd-host"
 
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
