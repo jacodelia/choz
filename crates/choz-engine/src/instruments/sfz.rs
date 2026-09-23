@@ -403,7 +403,7 @@ const KNEE: f32 = 0.9;
 /// the peak of a held chord, which is a slow thing; a waveshaper for *tone*
 /// would need the oversampling the utility effect does — see `fx::utility`.
 #[inline]
-fn soft_knee(x: f32) -> f32 {
+pub(crate) fn soft_knee(x: f32) -> f32 {
     let over = x.abs() - KNEE;
     if over <= 0.0 {
         return x;

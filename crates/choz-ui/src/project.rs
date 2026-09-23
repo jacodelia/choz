@@ -618,6 +618,11 @@ mod tests {
                         };
                         4
                     ],
+                    // The bass on a program of its own, so the round trip has
+                    // a pick to lose.
+                    programs: vec![Some((0, 33)), None, None, None],
+                    // And a balance, so it has levels to lose.
+                    balance: vec![0.5, 1.0, 2.0, 1.0],
                 },
             }],
         }

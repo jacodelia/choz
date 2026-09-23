@@ -204,6 +204,11 @@ const GROUPS: usize = ZONES + 1;
 /// Max render block, in frames. cpal blocks are far smaller (256).
 const SF2_MAX_FRAMES: usize = 4096;
 
+/// Past this a SoundFont's output is not loud, it is broken: +18 dBFS, where
+/// a two-handed chord at oxisynth's gain of 0.5 stays under full scale and the
+/// whole arranger band peaked at 1.65. See [`Sf2Synth::render`].
+const RUNAWAY: f32 = 8.0;
+
 /// How many keyboard zones can sound at once.
 ///
 /// **One MIDI channel each, one font.** A split used to be a program change as
@@ -431,6 +436,7 @@ impl AudioSource for Sf2Synth {
         // turns its musician's dry sound down, not the room.
         let mut groups = [(0.0f32, 0.0f32); GROUPS];
         let mut peaks = [0.0f32; GROUPS];
+        let mut ran_away = false;
         for i in 0..frames {
             self.synth.read_next_groups(&mut groups);
             let (mut l, mut r) = (0.0, 0.0);
@@ -440,8 +446,26 @@ impl AudioSource for Sf2Synth {
                 r += gr * mr;
                 peaks[c] = peaks[c].max(gl.abs()).max(gr.abs());
             }
-            out[i * 2] = l;
-            out[i * 2 + 1] = r;
+            // **The band sums here with nothing over it.** A run of the
+            // arranger's six musicians on one font peaked 1.65 before the
+            // fader, and once — right as the chart was reloaded under held
+            // notes — 294298: a voice's filter gone unstable, which no fader
+            // answers. A sample like that is not a loud one, it is a broken
+            // one: it is dropped and the voices are cut, so the next note
+            // starts from a clean filter. Everything else goes through the
+            // same knee the SFZ sampler has, and the tab cannot leave -1..1.
+            for (x, slot) in [(l, i * 2), (r, i * 2 + 1)] {
+                out[slot] = match x.is_finite() && x.abs() <= RUNAWAY {
+                    true => crate::instruments::sfz::soft_knee(x),
+                    false => {
+                        ran_away = true;
+                        0.0
+                    }
+                };
+            }
+        }
+        if ran_away {
+            self.all_notes_off();
         }
         for zone in 0..ZONES {
             self.meter
@@ -738,6 +762,41 @@ mod tests {
             "and the tab's own piano is still there"
         );
         assert!(muted.meter.get(0) > 0.01, "the meter is before the strip");
+    }
+
+    /// **A SoundFont tab cannot leave full scale, and a runaway is cut.**
+    ///
+    /// From a run's log: the arranger's band on one font peaked 1.65 before its
+    /// fader, and once 294298. Pushed past full scale through the zone strips,
+    /// the sum bends under 1 instead of clipping; pushed into the absurd, the
+    /// samples are dropped rather than handed on as a full-scale burst, and
+    /// the voices that made them are gone.
+    #[test]
+    fn a_soundfont_tab_stays_under_full_scale_and_a_runaway_is_cut() {
+        let path = std::path::Path::new("/usr/share/sounds/sf2/TimGM6mb.sf2");
+        if !path.exists() {
+            return;
+        }
+        let mut s = Sf2Synth::load(path, 0, 0, 48_000).unwrap();
+        // Dry: the font's reverb rings on after its voices are cut, and that
+        // tail is the room, not the runaway.
+        s.set_param(0, 0.0);
+        s.set_param(1, 0.0);
+        s.set_zone_program(0, 0, 33);
+        s.set_zone_mix(0, 40.0, 40.0); // loud, not broken
+        s.note_on_zone(40, 127, Some(0));
+        let hot = peak(&mut s, 4800);
+        assert!(
+            hot > 0.9 && hot <= 1.0,
+            "a hot band is not bent under 1: {hot}"
+        );
+
+        s.set_zone_mix(0, 1e6, 1e6); // a filter gone unstable
+        let broken = peak(&mut s, 4800);
+        assert!(broken <= 1.0, "a runaway reached the output: {broken}");
+        s.set_zone_mix(0, 1.0, 1.0);
+        let after = peak(&mut s, 4800);
+        assert!(after < 1e-3, "the runaway voice is still sounding: {after}");
     }
 
     #[test]

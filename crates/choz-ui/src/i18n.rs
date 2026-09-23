@@ -131,6 +131,7 @@ static TABLE: &[Row] = &[
     ("MIX", ["MIX", "MIX", "MIX", "MIX", "MIX", "\u{41c}\u{418}\u{41a}\u{421}", "\u{30df}\u{30c3}\u{30af}\u{30b9}", "\u{6df7}\u{5408}"]),
     ("SOURCE",       ["FUENTE",      "FONTE",        "SOURCE",       "SORGENTE",     "QUELLE",       "\u{418}\u{421}\u{422}\u{41e}\u{427}\u{41d}\u{418}\u{41a}", "\u{97f3}\u{6e90}", "\u{97f3}\u{6e90}"]),
     ("BANK/PRESET",  ["BANCO/PRESET", "BANCO/PRESET", "BANQUE/PRESET", "BANCO/PRESET", "BANK/PRESET", "\u{411}\u{410}\u{41d}\u{41a}/\u{41f}\u{420}\u{415}\u{421}\u{415}\u{422}", "\u{30d0}\u{30f3}\u{30af}", "\u{97f3}\u{8272}\u{5e93}"]),
+    ("AUTO",         ["AUTO",        "AUTO",         "AUTO",         "AUTO",         "AUTO",         "\u{410}\u{412}\u{422}\u{41e}", "\u{81ea}\u{52d5}", "\u{81ea}\u{52a8}"]),
     ("MIDI LEARN",   ["APRENDER MIDI", "APRENDER MIDI", "APPRENTISSAGE MIDI", "APPRENDI MIDI", "MIDI LERNEN", "MIDI \u{41e}\u{411}\u{423}\u{427}\u{415}\u{41d}\u{418}\u{415}", "MIDI\u{30e9}\u{30fc}\u{30f3}", "MIDI\u{5b66}\u{4e60}"]),
     ("SCAN INPUTS",  ["ESCANEAR ENTRADAS", "ESCANEAR ENTRADAS", "SCANNER LES ENTR\u{c9}ES", "SCANSIONA INGRESSI", "EING\u{c4}NGE SUCHEN", "\u{421}\u{41a}\u{410}\u{41d} \u{412}\u{425}\u{41e}\u{414}\u{41e}\u{412}", "\u{5165}\u{529b}\u{3092}\u{30b9}\u{30ad}\u{30e3}\u{30f3}", "\u{626b}\u{63cf}\u{8f93}\u{5165}"]),
     ("FX CHAIN",     ["CADENA FX",   "CADEIA FX",    "CHA\u{ce}NE FX", "CATENA FX",   "FX-KETTE",     "\u{426}\u{415}\u{41f}\u{4c}\u{41a}\u{410} FX", "FX\u{30c1}\u{30a7}\u{30fc}\u{30f3}", "FX \u{94fe}"]),

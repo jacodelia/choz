@@ -337,9 +337,10 @@ fn split_root(sym: &str, key: Option<u8>) -> Result<(u8, &str)> {
         let root = (key as i32 + DEGREE[degree] + offset).rem_euclid(12) as u8;
         return Ok((root, rest));
     }
-    // American: a letter and its accidentals.
+    // American: a letter and **one** accidental.
     let len = sym
         .char_indices()
+        .take(2)
         .take_while(|(i, c)| *i == 0 || matches!(c, '#' | '♯' | 'b' | '♭'))
         .map(|(i, c)| i + c.len_utf8())
         .last()
@@ -348,6 +349,10 @@ fn split_root(sym: &str, key: Option<u8>) -> Result<(u8, &str)> {
     // `Bb9` is a B flat ninth, not a B with a flat nine. The chord that wants
     // that alteration is written `B7b9`, which is how everybody writes it and
     // what the loop below reads.
+    //
+    // Only one, though: `Abb9` in a chart is an A flat with a flat nine, and
+    // taking both flats made it a G9 — a double-flat root is a spelling of
+    // harmony exercises, not of lead sheets.
     Ok((pitch_class(&sym[..len])?, &sym[len..]))
 }
 
@@ -364,6 +369,9 @@ enum Alter {
     S9,
     S11,
     B13,
+    /// `7alt`: the altered dominant — flat and sharp nine over a sharp five,
+    /// and the altered scale under it.
+    Alt,
     Number(i32),
 }
 
@@ -413,6 +421,7 @@ fn quality(mut rest: &str) -> Result<(Vec<i32>, Vec<i32>), String> {
             ("sus4", Alter::Sus(5)),
             ("sus", Alter::Sus(5)),
             ("add9", Alter::Add9),
+            ("alt", Alter::Alt),
             ("b5", Alter::B5),
             ("♭5", Alter::B5),
             ("#5", Alter::S5),
@@ -449,6 +458,10 @@ fn quality(mut rest: &str) -> Result<(Vec<i32>, Vec<i32>), String> {
                 Alter::S9 => s9 = true,
                 Alter::S11 => s11 = true,
                 Alter::B13 => b13 = true,
+                Alter::Alt => {
+                    number = number.max(7);
+                    (b9, s9, s5) = (true, true, true);
+                }
                 Alter::Number(n) => number = number.max(n),
             }
             break;
@@ -504,11 +517,11 @@ fn quality(mut rest: &str) -> Result<(Vec<i32>, Vec<i32>), String> {
         tones.push(9);
     }
     if number >= 9 || b9 || s9 || add9 {
-        tones.push(match (b9, s9) {
-            (true, _) => 13,
-            (_, true) => 15,
-            _ => 14,
-        });
+        // Both at once is the altered dominant's pair, and both are played.
+        match (b9, s9) {
+            (false, false) => tones.push(14),
+            _ => tones.extend([(b9, 13), (s9, 15)].iter().filter(|t| t.0).map(|t| t.1)),
+        }
     }
     if number >= 11 || s11 {
         tones.push(if s11 { 18 } else { 17 });
@@ -644,9 +657,24 @@ pub struct Progression {
     /// `groups = 3+2+2`: how the bar is counted, in the metronome's notation.
     /// Empty leaves it to the tab and the click.
     pub groups: Vec<u8>,
+    /// `groups 7/8 = 2+2+3`: how a bar **of that meter** is counted, for a
+    /// chart that changes meter — one line a signature, since `groups` alone
+    /// can only speak for the one `meter` line.
+    pub meter_groups: Vec<((u16, u16), Vec<u8>)>,
 }
 
 impl Progression {
+    /// How a bar of `meter` is counted: its own `groups 7/8 =` line, else the
+    /// chart's `groups` when that is the chart's `meter`. Empty when the chart
+    /// says nothing about it.
+    pub fn groups_for(&self, meter: (u16, u16)) -> &[u8] {
+        match self.meter_groups.iter().find(|(m, _)| *m == meter) {
+            Some((_, g)) => g,
+            None if self.meter == Some(meter) => &self.groups,
+            None => &[],
+        }
+    }
+
     /// Whether any bar has a signature of its own — a chart that changes
     /// meter. Everything below takes the plain arithmetic when it does not.
     pub fn heterometric(&self) -> bool {
@@ -710,6 +738,32 @@ impl Progression {
         }
         let (start, len) = bar.slot(last, beats_per_bar);
         Some((&bar.chords[index], start + len - into))
+    }
+
+    /// Where each chord of bar `i` starts and how long it holds, in beats from
+    /// the top of the progression — a chord written held over the next slot
+    /// (`| C - G |`) is one span, not two. What makes sure every chord of a
+    /// bar is played: a pattern's hits land where the style put them, and a
+    /// chord that starts between two of them was never heard.
+    pub fn changes_in(&self, i: usize, beats_per_bar: f64) -> Vec<(f64, f64)> {
+        let Some(bar) = self.bars.get(i) else {
+            return Vec::new();
+        };
+        let from = self.bar_start(i, beats_per_bar);
+        let len = self.bar_beats(i, beats_per_bar);
+        let mut out: Vec<(f64, f64)> = Vec::new();
+        for (k, chord) in bar.chords.iter().enumerate() {
+            let (start, l) = bar.slot(k, len);
+            match k > 0 && bar.chords[k - 1] == *chord {
+                true => {
+                    if let Some(last) = out.last_mut() {
+                        last.1 += l;
+                    }
+                }
+                false => out.push((from + start, l)),
+            }
+        }
+        out
     }
 
     /// The chord that follows the one at `beat` — what a bass line has to know
@@ -785,6 +839,7 @@ pub fn parse_progression(text: &str) -> Result<Progression> {
     let mut form: Vec<String> = Vec::new();
     let mut meter = None;
     let mut groups = Vec::new();
+    let mut meter_groups: Vec<((u16, u16), Vec<u8>)> = Vec::new();
     // The sections, in the order they were written: `("", body)` for a text
     // that never opened one, which is every text written before sections
     // existed.
@@ -818,7 +873,25 @@ pub fn parse_progression(text: &str) -> Result<Progression> {
             // A header, unless the bar line happens to have one in it — which
             // it cannot, so anything before the first `|` with an `=` is one.
             if !name.contains('|') {
-                match name.trim().to_ascii_lowercase().as_str() {
+                let name = name.trim().to_ascii_lowercase();
+                // `groups 7/8 = 2+2+3`: the grouping of every bar in 7/8.
+                if let Some(sig) = name
+                    .strip_prefix("groups ")
+                    .or_else(|| name.strip_prefix("grouping "))
+                {
+                    let (num, den) = parse_meter(sig.trim())?;
+                    let g = parse_groups(value.trim())?;
+                    let sum: u16 = g.iter().map(|g| *g as u16).sum();
+                    if sum != num {
+                        bail!(
+                            "groups {num}/{den} add up to {sum}, and a {num}-beat bar needs {num}"
+                        );
+                    }
+                    meter_groups.retain(|(m, _)| *m != (num, den));
+                    meter_groups.push(((num, den), g));
+                    continue;
+                }
+                match name.as_str() {
                     "key" => key = Some(pitch_class(value.trim())?),
                     "style" => style = value.trim().to_ascii_lowercase(),
                     // The form: which parts are played, in which order.
@@ -886,6 +959,7 @@ pub fn parse_progression(text: &str) -> Result<Progression> {
         sections,
         meter,
         groups,
+        meter_groups,
     })
 }
 
@@ -1043,6 +1117,47 @@ mod tests {
         assert_eq!(pcs("IIm7", Some("C")), pcs("Dm7", None));
         assert_eq!(pcs("IV#m7b5", Some("C")), pcs("F#m7b5", None));
         assert_eq!(pcs("VIIb7", Some("C")), pcs("Bb7", None));
+    }
+
+    /// `G7alt` and `Galt` are the altered dominant: root, third, sharp five,
+    /// seventh, flat and sharp nine — and the altered scale for the band.
+    /// `groups 7/8 = 2+2+3` counts every bar of that meter, one line a meter;
+    /// a grouping that does not fill its bar is an error, and `groups` under a
+    /// `meter` still speaks for that meter.
+    #[test]
+    fn a_grouping_can_be_written_for_each_meter() {
+        let p =
+            parse_progression("groups 7/8 = 2+2+3\ngrouping 5/8 = 3 2\n| 7/8 C | 5/8 F | 4/4 G |")
+                .unwrap();
+        assert_eq!(p.groups_for((7, 8)), [2, 2, 3]);
+        assert_eq!(p.groups_for((5, 8)), [3, 2]);
+        assert!(p.groups_for((4, 4)).is_empty());
+        assert!(parse_progression("groups 7/8 = 3+3\n| 7/8 C |").is_err());
+        let p = parse_progression("meter = 7/8\ngroups = 3+2+2\n| C |").unwrap();
+        assert_eq!(p.groups_for((7, 8)), [3, 2, 2]);
+    }
+
+    /// One accidental is the root's, a second is the chord's: `Abb9` is A
+    /// flat with a flat nine, not G9.
+    #[test]
+    fn a_second_flat_belongs_to_the_quality() {
+        let c = parse("Abb9", None).unwrap();
+        assert_eq!(c.root, pitch_class("Ab").unwrap());
+        assert_eq!(c.tones, vec![0, 4, 7, 13]);
+        assert_eq!(parse("Bb9", None).unwrap().root, pitch_class("Bb").unwrap());
+        assert_eq!(
+            parse("F#m7", None).unwrap().root,
+            pitch_class("F#").unwrap()
+        );
+    }
+
+    #[test]
+    fn alt_is_the_altered_dominant() {
+        let c = parse("C7alt", None).unwrap();
+        assert_eq!(c.tones, vec![0, 4, 8, 10, 13, 15]);
+        assert_eq!(c.scale, vec![0, 1, 3, 4, 6, 8, 10]);
+        assert_eq!(parse("Calt", None).unwrap().tones, c.tones);
+        assert_eq!(pcs("V7alt", Some("C")), pcs("G7alt", None));
     }
 
     #[test]

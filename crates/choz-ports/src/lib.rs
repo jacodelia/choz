@@ -603,26 +603,68 @@ pub const ZONE_METERS: usize = 16;
 /// The level of each keyboard zone of a layered source, as a linear peak of
 /// its last block: what a mixer strip for one musician of the arranger's band
 /// draws. Written by the audio thread, read by the interface, so atomics.
-pub struct ZoneMeter([std::sync::atomic::AtomicU32; ZONE_METERS]);
+///
+/// And the loudest block **since it was last asked**, beside it: the last
+/// block is what a meter draws, and a block is a few milliseconds the
+/// interface mostly does not see. Levelling a musician on it is levelling on
+/// whichever block the screen happened to catch — see [`Self::take_held`].
+pub struct ZoneMeter {
+    last: [std::sync::atomic::AtomicU32; ZONE_METERS],
+    held: [std::sync::atomic::AtomicU32; ZONE_METERS],
+}
 
 impl ZoneMeter {
     pub fn new() -> Self {
-        Self(std::array::from_fn(|_| {
-            std::sync::atomic::AtomicU32::new(0)
-        }))
+        Self {
+            last: std::array::from_fn(|_| std::sync::atomic::AtomicU32::new(0)),
+            held: std::array::from_fn(|_| std::sync::atomic::AtomicU32::new(0)),
+        }
     }
 
     pub fn publish(&self, zone: usize, peak: f32) {
-        if let Some(a) = self.0.get(zone) {
-            a.store(peak.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Some(a) = self.last.get(zone) {
+            a.store(peak.to_bits(), Relaxed);
+        }
+        // A positive float's bits order the same way the float does, so the
+        // loudest block is an integer max — one instruction, no loop.
+        if let Some(a) = self.held.get(zone) {
+            a.fetch_max(peak.max(0.0).to_bits(), Relaxed);
         }
     }
 
     pub fn get(&self, zone: usize) -> f32 {
-        self.0
+        self.last
             .get(zone)
             .map(|a| f32::from_bits(a.load(std::sync::atomic::Ordering::Relaxed)))
             .unwrap_or(0.0)
+    }
+
+    /// The loudest block of `zone` since the last call, and start over.
+    pub fn take_held(&self, zone: usize) -> f32 {
+        self.held
+            .get(zone)
+            .map(|a| f32::from_bits(a.swap(0, std::sync::atomic::Ordering::Relaxed)))
+            .unwrap_or(0.0)
+    }
+}
+
+#[cfg(test)]
+mod zone_meter_tests {
+    use super::ZoneMeter;
+
+    /// The meter draws the last block; the held reading is the loudest since
+    /// it was last taken, and taking it starts over.
+    #[test]
+    fn the_loudest_block_is_held_until_it_is_taken() {
+        let m = ZoneMeter::new();
+        m.publish(2, 0.2);
+        m.publish(2, 0.9);
+        m.publish(2, 0.1);
+        assert_eq!(m.get(2), 0.1, "the last block");
+        assert_eq!(m.take_held(2), 0.9, "the loudest one");
+        assert_eq!(m.take_held(2), 0.0, "and it starts over");
+        assert_eq!(m.take_held(99), 0.0, "past the end is silence");
     }
 }
 

@@ -100,6 +100,10 @@ pub struct Comp {
 /// A style: the whole of what separates one accompaniment from another.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Style {
+    /// A number a chart can write instead of the name — `style = 42` — and
+    /// what the picker shows. Fixed per rhythm by `tools/style_ids.txt`: a
+    /// rhythm added later gets the next one, and nothing already written moves.
+    pub id: u16,
     /// What a chart writes, and what a project stores.
     pub name: &'static str,
     /// What a list shows. A rhythm is named the way an instrument's front panel
@@ -208,10 +212,16 @@ pub fn all() -> Vec<Style> {
 /// A style by the name a progression writes. Unknown names fall back to the
 /// first: a misspelt style plays the wrong feel, which is a thing you can hear
 /// and fix, rather than nothing at all.
+///
+/// The label the picker shows is a name too: `style = Drum & Bass` was read as
+/// the first style, because only `drumnbass` matched. And so is the id the
+/// picker shows beside it: `style = 42`.
 pub fn by_name(name: &str) -> Style {
     let name = name.trim().to_ascii_lowercase();
+    let id = name.parse::<u16>().ok();
     ALL.iter()
-        .find(|s| s.name == name)
+        .find(|s| s.name == name || Some(s.id) == id)
+        .or_else(|| ALL.iter().find(|s| s.label.eq_ignore_ascii_case(&name)))
         .copied()
         .unwrap_or(ALL[0])
 }

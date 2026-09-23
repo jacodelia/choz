@@ -1628,8 +1628,9 @@ fn draw_arranger_box(
                     // The part it is in, when the text named its parts: which
                     // bar of ninety-six you are on is not what a player is
                     // asking, "still in A" is.
-                    (n, Some(part)) => format!("{n} [{}]", part.to_uppercase()),
-                    (n, None) => n.to_string(),
+                    (n, Some(part)) =>
+                        format!("{n} [{}]{}", part.to_uppercase(), pass_of(&s.text, n)),
+                    (n, None) => format!("{n}{}", pass_of(&s.text, n)),
                 },
                 match arr.notes {
                     0 => format!("  {}", t("NOTHING TO PLAY")),
@@ -1665,18 +1666,26 @@ fn draw_arranger_box(
     // Drawn where there is room for it; on a panel with none, the chart stays
     // the one line it always was, which is the rule the rest of this panel
     // follows.
-    let bars = chart_bars(&s.text);
-    let cell_w = arr_cell_width(&bars, arr.cells, arr.groups);
+    // **Each bar once**, however often the form plays it: `form = turn turn
+    // turn` is one twelve-bar turn played three times, not thirty-six bars to
+    // read. The light goes back to the top when the part does.
+    let bars = shown_bars(&s.text);
+    let here = lit_bar(&s.text, arr.bar);
+    let labels: Vec<String> = bars.iter().map(|(b, _)| b.clone()).collect();
+    let cell_w = arr_cell_width(&labels, arr.cells, arr.groups);
     let per_row = ((inner.width.saturating_sub(1)) / cell_w.max(1)).max(1) as usize;
     let rows = bars.len().div_ceil(per_row.max(1)) as u16 * 2;
     let room = (inner.y + inner.height).saturating_sub(y);
-    if !bars.is_empty() && rows < room && cell_w < inner.width {
-        return draw_arranger_bars(f, inner, y, arr, &bars, cell_w, per_row, bg, layout);
+    // A form longer than the panel is still a matrix, scrolled to the bar that
+    // is sounding (see `draw_arranger_bars`): two rows of it are enough to
+    // follow. Only a panel with less than that falls back to the one line.
+    if !bars.is_empty() && rows.min(4) < room && cell_w < inner.width {
+        return draw_arranger_bars(f, inner, y, arr, here, &bars, cell_w, per_row, bg, layout);
     }
 
     let picked = arr.focused && arr.cursor == ARR_PROGRESSION;
     let width = inner.width.saturating_sub(1) as usize;
-    let spans: Vec<Span> = progression_pieces(&s.text, arr.bar, width)
+    let spans: Vec<Span> = progression_pieces(&labels, here.map_or(0, |h| h + 1), width)
         .into_iter()
         .map(|(text, playing)| {
             Span::styled(
@@ -1722,6 +1731,95 @@ pub fn chart_bars(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// The chart as it is **played**: every bar in the order the `form` line lays
+/// the parts out, each with its index in [`chart_bars`] — where the editor's
+/// caret goes when it is clicked.
+///
+/// What the panel draws. The written bars were drawn before, and a
+/// `form = A A B A` played thirty-two bars under a chart of sixteen: the
+/// playhead ran off the end of it at bar seventeen and nothing was lit again.
+/// Same rules as `arranger::chord::parse_progression` — the part before any
+/// `[name]` is `""`, a name written twice carries on the same part, and no
+/// `form` means every part in the order written — so the two cannot count the
+/// bars differently. A form naming a part that is not there drops it here; the
+/// parser is the one that says so.
+pub fn played_bars(text: &str) -> Vec<(String, usize)> {
+    let mut parts: Vec<(String, Vec<(String, usize)>)> = vec![(String::new(), Vec::new())];
+    let mut cur = 0usize;
+    let mut form: Vec<String> = Vec::new();
+    let mut written = 0usize;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            let name = name.trim().to_ascii_lowercase();
+            cur = match parts.iter().position(|(n, _)| *n == name) {
+                Some(at) => at,
+                None => {
+                    parts.push((name, Vec::new()));
+                    parts.len() - 1
+                }
+            };
+            continue;
+        }
+        if let Some((name, value)) = line.split_once('=') {
+            if name.trim().eq_ignore_ascii_case("form") {
+                form = value
+                    .split_whitespace()
+                    .map(str::to_ascii_lowercase)
+                    .collect();
+            }
+            continue;
+        }
+        for bar in line.split('|').map(str::trim).filter(|b| !b.is_empty()) {
+            parts[cur].1.push((bar.to_string(), written));
+            written += 1;
+        }
+    }
+    let order: Vec<String> = match form.is_empty() {
+        true => parts.iter().map(|(n, _)| n.clone()).collect(),
+        false => form,
+    };
+    order
+        .iter()
+        .filter_map(|name| parts.iter().find(|(n, _)| n == name))
+        .flat_map(|(_, bars)| bars.iter().cloned())
+        .collect()
+}
+
+/// The bars the panel draws: every bar the form plays, **once**, in the order
+/// it is first played — `(text, index in chart_bars)`. A part the form never
+/// asks for is not drawn: it is not in the song.
+pub fn shown_bars(text: &str) -> Vec<(String, usize)> {
+    let mut seen = std::collections::HashSet::new();
+    played_bars(text)
+        .into_iter()
+        .filter(|(_, written)| seen.insert(*written))
+        .collect()
+}
+
+/// Which of [`shown_bars`] to light for the one-based bar the band is on, `0`
+/// for stopped: the bar it is playing *as written*, so the third time round a
+/// turn lights the same twelve bars as the first.
+pub fn lit_bar(text: &str, bar: usize) -> Option<usize> {
+    let written = played_bars(text).get(bar.checked_sub(1)?)?.1;
+    shown_bars(text).iter().position(|(_, w)| *w == written)
+}
+
+/// ` 2/3` when the bar being played is one the form plays more than once: which
+/// time round this is. Empty for a bar played once, and for stopped.
+fn pass_of(text: &str, bar: usize) -> String {
+    let played = played_bars(text);
+    let Some(written) = bar.checked_sub(1).and_then(|i| played.get(i)).map(|b| b.1) else {
+        return String::new();
+    };
+    let total = played.iter().filter(|b| b.1 == written).count();
+    let pass = played[..bar].iter().filter(|b| b.1 == written).count();
+    match total > 1 {
+        true => format!(" {pass}/{total}"),
+        false => String::new(),
+    }
+}
+
 /// How wide one bar of the matrix is drawn: the widest chord in the chart, or
 /// the subdivisions with their group breaks, whichever needs more.
 fn arr_cell_width(bars: &[String], cells: usize, groups: &[u8]) -> u16 {
@@ -1754,23 +1852,29 @@ fn draw_arranger_bars(
     inner: Rect,
     mut y: u16,
     arr: crate::arranger::ArrangerView<'_>,
-    bars: &[String],
+    lit: Option<usize>,
+    bars: &[(String, usize)],
     cell_w: u16,
     per_row: usize,
     bg: Style,
     layout: &mut RackLayout,
 ) -> u16 {
     let floor = inner.y + inner.height;
-    let here = arr.bar.saturating_sub(1);
-    for (row, chunk) in bars.chunks(per_row).enumerate() {
+    let here = lit.unwrap_or(0);
+    // The rows that fit, slid so the one with the playing bar is the last of
+    // them once it would otherwise be below the floor — worked out from the
+    // playhead every frame, like `progression_pieces`, so it cannot drift.
+    let visible = (floor.saturating_sub(y) / 2).max(1) as usize;
+    let first = (here / per_row.max(1)).saturating_sub(visible - 1);
+    for (row, chunk) in bars.chunks(per_row).enumerate().skip(first) {
         if y + 1 >= floor {
             break;
         }
         let mut pulses: Vec<Span> = Vec::new();
         let mut names: Vec<Span> = Vec::new();
-        for (col, text) in chunk.iter().enumerate() {
+        for (col, (text, written)) in chunk.iter().enumerate() {
             let bar = row * per_row + col;
-            let playing = arr.bar > 0 && bar == here;
+            let playing = lit == Some(bar);
             let x = inner.x + 1 + col as u16 * cell_w;
             let rect = Rect::new(
                 x,
@@ -1778,7 +1882,9 @@ fn draw_arranger_bars(
                 cell_w.min((inner.x + inner.width).saturating_sub(x)),
                 2,
             );
-            layout.arr_bars.push((bar, rect));
+            // The caret goes to the bar as written: a part played three times
+            // is edited once.
+            layout.arr_bars.push((*written, rect));
             // The pulses of this bar, with a gap where the grouping breaks.
             let mut cells = String::new();
             for cell in 0..arr.cells {
@@ -1839,23 +1945,9 @@ fn draw_arranger_bars(
 /// screen, which is the whole point of lighting it. Not a scroll offset kept
 /// anywhere — it is worked out from the playhead every frame, the same as
 /// `drawer::list_scroll`, and so it can never drift out of step with it.
-fn progression_pieces(text: &str, bar: usize, width: usize) -> Vec<(String, bool)> {
-    let flat: String = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.contains('='))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let bars: Vec<&str> = flat
-        .split('|')
-        .map(str::trim)
-        .filter(|b| !b.is_empty())
-        .collect();
+fn progression_pieces(bars: &[String], bar: usize, width: usize) -> Vec<(String, bool)> {
     if bars.is_empty() {
-        return vec![(
-            format!(" {}", truncate(&flat, width.saturating_sub(1))),
-            false,
-        )];
+        return vec![(" \u{2013}".to_string(), false)];
     }
     let pieces: Vec<String> = bars.iter().map(|b| format!(" {b} |")).collect();
     // Where the window starts: back from the playing bar until the next step
@@ -5074,6 +5166,10 @@ mod tests {
     #[test]
     fn the_progression_line_follows_the_playhead() {
         let text = "key = C\nstyle = major_blues\n|| I7 | IV7 | I7 | I7 | IV7 | IV7 | I7 | VI7 | IIm7 | V7 | I7 V7 | I7 ||";
+        let text: &[String] = &played_bars(text)
+            .into_iter()
+            .map(|(b, _)| b)
+            .collect::<Vec<_>>();
         // Wide enough for the lot: every bar is there, and the third is lit.
         let all = progression_pieces(text, 3, 120);
         assert_eq!(all.len(), 13, "twelve bars and the opening bar line");
@@ -5091,6 +5187,52 @@ mod tests {
         let width: usize = narrow.iter().map(|(t, _)| t.chars().count()).sum();
         assert!(width <= 24, "{width} wide in a 24-column row: {narrow:?}");
         // A text with no bar lines in it still draws something.
-        assert!(!progression_pieces("key = C", 0, 40).is_empty());
+        assert!(!progression_pieces(&[], 0, 40).is_empty());
+    }
+
+    /// The panel counts the bars the band plays, not the ones written: a part
+    /// under a `form` that plays it three times is thirty-six bars on screen,
+    /// each pointing back at the bar the editor has to open, and the count
+    /// agrees with the parser's.
+    #[test]
+    fn the_chart_is_drawn_in_the_order_of_its_form() {
+        let text = "key = C\nstyle = shfblues\n\n[turn]\n| C7 | F7 | C7 | C7 |\n\
+                    | F7 | F7 | C7 | A7 |\n| Dm7 | G7 | C7 G7 | C7 |\n\nform = turn turn turn";
+        let bars = played_bars(text);
+        let parsed = crate::arranger::chord::parse_progression(text).unwrap();
+        assert_eq!(bars.len(), parsed.bars.len());
+        assert_eq!(bars.len(), 36);
+        assert_eq!(bars[12], ("C7".to_string(), 0), "bar 13 is the turn again");
+        assert_eq!(bars[35], ("C7".to_string(), 11));
+        // No form: the parts as written, and `[b]` is not a chord.
+        let ab = played_bars("[a]\n| C | F |\n[b]\n| G |\n[a]\n| Am |");
+        let names: Vec<&str> = ab.iter().map(|(b, _)| b.as_str()).collect();
+        assert_eq!(names, ["C", "F", "Am", "G"]);
+        // The form reorders and repeats; the written index stays the caret's.
+        let ba = played_bars("[a]\n| C |\n[b]\n| G |\nform = b a b");
+        assert_eq!(ba, [("G".into(), 1), ("C".into(), 0), ("G".into(), 1)]);
+    }
+
+    /// A part the form repeats is drawn once, and the light goes back to its
+    /// top each time round: bar 13 of `turn turn turn` is bar 1 again, and the
+    /// header says it is the second pass.
+    #[test]
+    fn a_repeated_part_is_drawn_once_and_comes_round() {
+        let text = "[turn]\n| C7 | F7 | C7 | C7 |\n| F7 | F7 | C7 | A7 |\n\
+                    | Dm7 | G7 | C7 G7 | C7 |\n[end]\n| C6 |\nform = turn turn turn end";
+        assert_eq!(
+            shown_bars(text).len(),
+            13,
+            "twelve of the turn and the ending"
+        );
+        assert_eq!(lit_bar(text, 0), None, "stopped");
+        assert_eq!(lit_bar(text, 1), Some(0));
+        assert_eq!(lit_bar(text, 12), Some(11));
+        assert_eq!(lit_bar(text, 13), Some(0), "the turn again, from its top");
+        assert_eq!(lit_bar(text, 37), Some(12), "the ending");
+        assert_eq!(pass_of(text, 13), " 2/3");
+        assert_eq!(pass_of(text, 37), "", "played once");
+        // A part never asked for is not in the song.
+        assert_eq!(shown_bars("[a]\n| C |\n[b]\n| G |\nform = a a").len(), 1);
     }
 }

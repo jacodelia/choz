@@ -49,7 +49,9 @@ pub const SEVENTHS: [&str; 4] = ["\u{2014}", "6", "7", "maj7"];
 /// How high it reaches. A ninth implies the seventh under it, the way a player
 /// reads it.
 pub const TENSIONS: [&str; 4] = ["\u{2014}", "9", "11", "13"];
-pub const NINTHS: [&str; 4] = ["\u{2014}", "\u{266D}9", "\u{266F}9", "add9"];
+/// `alt` is both ninths over a sharp five — the altered dominant, written the
+/// way a chart writes it rather than as `7#5b9#9`.
+pub const NINTHS: [&str; 5] = ["\u{2014}", "\u{266D}9", "\u{266F}9", "add9", "alt"];
 pub const ELEVENTHS: [&str; 2] = ["\u{2014}", "\u{266F}11"];
 pub const THIRTEENTHS: [&str; 2] = ["\u{2014}", "\u{266D}13"];
 pub const FIFTHS: [&str; 3] = ["\u{2014}", "\u{266D}5", "\u{266F}5"];
@@ -170,6 +172,7 @@ impl ChordSpec {
             1 => "b9",
             2 => "#9",
             3 => "add9",
+            4 => "alt",
             _ => "",
         });
         if self.eleventh % ELEVENTHS.len() == 1 {
@@ -776,7 +779,7 @@ mod tests {
     #[test]
     fn the_dialogue_opens_on_the_chord_that_is_there() {
         for sym in [
-            "Cm7b5", "C7#9", "Cm(maj7)", "Cdim9", "C7sus4", "C", "Cmaj13",
+            "Cm7b5", "C7#9", "Cm(maj7)", "Cdim9", "C7sus4", "C", "Cmaj13", "C7alt",
         ] {
             let (root, quality) = crate::arranger::chord::root_and_quality(sym, 0).expect(sym);
             let spec = ChordSpec::of(root, &quality);

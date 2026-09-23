@@ -709,6 +709,9 @@ enum ModalKind {
     /// The seeds, each with what it does to the part this tab is playing —
     /// a number nobody can hear is a number nobody can choose between.
     ArrSeed,
+    /// The SoundFont's programs, for one musician of the band (`Role::ALL`
+    /// place) — the right button on their button.
+    ArrProgram(usize),
     /// The sampler's map, region by region: which sample, which keys, which
     /// root, how much tune. The one place a detector's mistake can be put
     /// right — see [`choz_engine::instruments::sampler::preset`].
@@ -823,6 +826,24 @@ fn trim_gain(peak: f32, rms: f32, max: f32) -> (f32, bool) {
 
 /// Below this RMS a tab has not been played, and there is nothing to measure.
 const TRIM_FLOOR: f32 = 1e-3;
+
+/// Where [`App::level_band`] puts each musician's loudest moment: -10.5 dBFS,
+/// so four of them landing on the same beat still sit under the SoundFont's
+/// knee more often than not.
+const BAND_PEAK: f32 = 0.3;
+
+/// A musician's balance from the loudest they played: to [`BAND_PEAK`], and
+/// never past `max` — a part that is quiet because it is sparse is not made
+/// into a lead.
+fn band_gain(peak: f32, max: f32) -> f32 {
+    (BAND_PEAK / peak.max(1e-6)).clamp(0.1, max)
+}
+
+/// The fader a single-note probe may set on its own: unity. **It cuts, it
+/// does not boost.** Middle C on the tab's own program is one note of one
+/// instrument; a SoundFont probed at 0.05 went to 2.00 and then played a
+/// whole band through it.
+const PROBE_MAX_GAIN: f32 = 1.0;
 
 /// How much one arrow press moves the tint.
 const TINT_STEP: u8 = 5;
@@ -2031,6 +2052,13 @@ struct App {
     /// [`App::follow_arranger_meter`] — and is the player's own again when the
     /// band stops.
     meter_followed: bool,
+    /// The player set the bar by hand while a band was counting its own: the
+    /// click keeps the player's until that band stops, and then follows the
+    /// next one again. **Not** `follow_arranger`, which is saved: switching
+    /// that off from a BEATS press left every later session deaf to the
+    /// arranger's bar, which is how a log came to have it off with nobody
+    /// having asked for it.
+    meter_held: bool,
     /// The file this project was last saved to or loaded from — what plain
     /// "Save project" rewrites without asking anything.
     project_file: Option<std::path::PathBuf>,
@@ -2238,6 +2266,7 @@ impl App {
             path_edit: None,
             save_name: None,
             meter_followed: false,
+            meter_held: false,
             project_file: None,
             saved_project: None,
             port_edit: None,
@@ -4179,7 +4208,8 @@ impl App {
                 self.ui.audio.time_sig = (n, d);
                 // A bar set by hand is the player taking the count back: the
                 // band's would otherwise put it straight back on the next tick.
-                self.ui.audio.follow_arranger = false;
+                // For as long as that band plays, not for good.
+                self.meter_held = self.meter_followed;
                 self.meter_followed = false;
                 self.ui.save();
             }
@@ -7854,6 +7884,7 @@ impl App {
             | ModalKind::Harmonics => Vec::new(),
             ModalKind::ArrStyle => self.arr_style_rows(),
             ModalKind::ArrSeed => self.arr_seed_rows(),
+            ModalKind::ArrProgram(role) => self.arr_program_rows(role),
             ModalKind::Preset => {
                 // The counts move with the instrument, so the sidebar is rebuilt
                 // with the rows rather than only at open time.
@@ -8493,6 +8524,10 @@ impl App {
                 if let Some(seed) = ARR_SEEDS.get(i) {
                     self.edit_arranger(ArrEdit::SeedAt(*seed));
                 }
+                true
+            }
+            ModalKind::ArrProgram(role) => {
+                self.set_arr_program(role, i);
                 true
             }
             // Enter is SELECT: keep the note the lane is now on and leave.
@@ -11554,7 +11589,7 @@ impl App {
                 // fader can start where the tab already sits with the rest of
                 // the rack. From here it is the player's: nothing moves it
                 // again unless they ask.
-                self.auto_trim(slot);
+                self.trim_to(slot, PROBE_MAX_GAIN);
             }
             Err(e) => eprintln!("choz: {e}"),
         }
@@ -12669,27 +12704,46 @@ impl App {
     /// Inside a DAW too: `choz-rack.clap` does not read the host's transport,
     /// so the rack's bar is still its own to set.
     fn follow_arranger_meter(&mut self) {
-        if !self.ui.audio.follow_arranger {
+        let playing = self.slots.iter().any(|s| s.arranger.is_playing());
+        // **A chart that changes meter is followed whatever FOLLOW ARR says.**
+        // The switch chooses between the band's bar and the player's own for
+        // a chart in one meter — both are a bar. Against one that changes, a
+        // fixed click is not the player's bar, it is a click out of step from
+        // the first change on: `changes.chord` had no downbeat under its bars
+        // from the fourth on, with the switch left off by an older build.
+        let changes = self
+            .slots
+            .iter()
+            .any(|s| s.arranger.is_playing() && s.arranger.changes_meter());
+        if !self.ui.audio.follow_arranger && !changes && !self.meter_followed {
+            return;
+        }
+        if self.meter_held {
+            self.meter_held = playing;
             return;
         }
         let t = choz_ports::transport();
+        let follow = self.ui.audio.follow_arranger;
         let band = self
             .slots
             .get(self.active_slot)
             .filter(|s| s.arranger.is_playing())
             .or_else(|| self.slots.iter().find(|s| s.arranger.is_playing()))
+            .filter(|s| follow || s.arranger.changes_meter())
             .map(|s| {
-                let (_, written) = s.arranger.written_bar();
-                let groups = match written.is_empty() {
-                    true => s.arranger.settings.groups.clone(),
-                    false => written.to_vec(),
-                };
-                (s.arranger.own_meter(), groups, s.arranger.bar_origin_ppq())
+                (
+                    s.arranger.own_meter(),
+                    s.arranger.bar_groups(),
+                    s.arranger.bar_origin_ppq(),
+                )
             });
         let m = choz_engine::artifacts::metronome::metronome();
         match band {
             Some((meter, groups, origin)) => {
-                if t.time_signature() != meter {
+                // The grouping as well as the signature: a chart whose 4/4 is
+                // counted 3+3+2 starts in the session's 4/4 and still has to
+                // hand the click its accents.
+                if t.time_signature() != meter || m.groups() != groups {
                     t.set_time_signature(meter.0, meter.1);
                     m.set_groups(&groups);
                     // A chart that changes meter changes it on a downbeat of
@@ -12786,12 +12840,7 @@ impl App {
                 .rev()
                 .filter(|z| !taken.contains(z));
             for (role, _) in band {
-                let at = match role {
-                    // The kit is a bank, not a program — the same rule
-                    // [`Self::fit_arranger_instrument`] follows.
-                    arranger::generate::Role::Drums => presets.iter().position(|(b, _)| *b == 128),
-                    _ => arranger::pick_program(&presets, style.programs(role)),
-                };
+                let at = Self::arr_program_at(&slot.arranger.settings, &presets, &style, role);
                 let (Some(at), Some(zone)) = (at, free.next()) else {
                     continue;
                 };
@@ -12844,14 +12893,21 @@ impl App {
         let Some(slot) = self.slots.get(tab) else {
             return;
         };
+        let settings = &slot.arranger.settings;
         let mix: Vec<(u8, (f32, f32))> = (0..choz_engine::sources::ZONES as u8)
             .map(|z| {
-                let side = roles
+                let (l, r) = roles
                     .iter()
                     .find(|(_, zone)| *zone == z)
-                    .map(|(r, _)| slot.arranger.settings.strip(*r).sides())
+                    .map(|(r, _)| settings.strip(*r).sides())
                     .unwrap_or((1.0, 1.0));
-                (z, side)
+                // The balance `n` set, split out or not: it is the band's
+                // level, not a strip's.
+                let balance = arranger::generate::Role::ALL
+                    .iter()
+                    .find(|r| slot.arranger.is_on() && slot.arr_zones[**r as usize] == Some(z))
+                    .map_or(1.0, |r| settings.balance(*r));
+                (z, (l * balance, r * balance))
             })
             .collect();
         if let Some(engine) = self.audio_engine.as_mut() {
@@ -12859,6 +12915,112 @@ impl App {
                 engine.set_zone_mix(tab, zone, l, r);
             }
         }
+    }
+
+    /// Which of a SoundFont's programs `role` plays: the one picked for it by
+    /// hand when the font has it, else the style's — the kit for the drums
+    /// (bank 128 is where every SoundFont keeps it), and the first of the
+    /// style's programs the font has for the rest.
+    fn arr_program_at(
+        settings: &arranger::ArrangerSettings,
+        presets: &[(u8, u8)],
+        style: &arranger::style::Style,
+        role: arranger::generate::Role,
+    ) -> Option<usize> {
+        if let Some(at) = settings
+            .program(role)
+            .and_then(|p| presets.iter().position(|x| *x == p))
+        {
+            return Some(at);
+        }
+        match role {
+            arranger::generate::Role::Drums => presets.iter().position(|(b, _)| *b == 128),
+            _ => arranger::pick_program(presets, style.programs(role)),
+        }
+    }
+
+    /// The right button on a musician: the SoundFont's programs, the one they
+    /// play on under the cursor. Only a SoundFont has programs to give each
+    /// musician — anything else plays the whole band on its one patch.
+    fn open_arr_program(&mut self, role: usize) {
+        let Some(slot) = self.slots.get(self.active_slot) else {
+            return;
+        };
+        let Some(r) = arranger::generate::Role::ALL.get(role).copied() else {
+            return;
+        };
+        if !matches!(slot.source, AudioSource::Sf2 { .. }) || slot.presets.is_empty() {
+            eprintln!(
+                "choz: arranger {}: only a SoundFont tab has a program for each musician",
+                r.name()
+            );
+            return;
+        }
+        let presets: Vec<(u8, u8)> = slot.presets.iter().map(|p| (p.bank, p.preset)).collect();
+        let at = slot
+            .arranger
+            .settings
+            .program(r)
+            .and_then(|p| presets.iter().position(|x| *x == p))
+            .map_or(0, |i| i + 1);
+        let mut modal = Modal::new(
+            ModalKind::ArrProgram(role),
+            views::modal::ListModal::new(
+                format!("{} \u{00B7} {}", r.name(), i18n::t("BANK/PRESET")),
+                Vec::new(),
+            ),
+        );
+        modal.list.cursor = at;
+        self.modal = Some(modal);
+        self.refresh_modal();
+    }
+
+    /// Row 0 hands the choice back to the style and says what that is; the
+    /// rest are the font's programs, `bank:preset name`.
+    fn arr_program_rows(&self, role: usize) -> Vec<String> {
+        let Some(slot) = self.slots.get(self.active_slot) else {
+            return Vec::new();
+        };
+        let Some(r) = arranger::generate::Role::ALL.get(role).copied() else {
+            return Vec::new();
+        };
+        let presets: Vec<(u8, u8)> = slot.presets.iter().map(|p| (p.bank, p.preset)).collect();
+        let mut auto = slot.arranger.settings.clone();
+        auto.programs.clear();
+        let style_pick = Self::arr_program_at(&auto, &presets, slot.arranger.style(), r)
+            .and_then(|i| slot.presets.get(i))
+            .map(|p| p.label())
+            .unwrap_or_else(|| "\u{2013}".into());
+        std::iter::once(format!("{}  ({style_pick})", i18n::t("AUTO")))
+            .chain(slot.presets.iter().map(|p| p.label()))
+            .collect()
+    }
+
+    /// Row `row` of [`Self::arr_program_rows`] for `role`, applied: the band's
+    /// zones are pointed again, and the pick goes into the project.
+    fn set_arr_program(&mut self, role: usize, row: usize) {
+        let tab = self.active_slot;
+        let Some(r) = arranger::generate::Role::ALL.get(role).copied() else {
+            return;
+        };
+        let Some(slot) = self.slots.get_mut(tab) else {
+            return;
+        };
+        let pick = row
+            .checked_sub(1)
+            .and_then(|i| slot.presets.get(i))
+            .map(|p| (p.bank, p.preset));
+        slot.arranger.settings.set_program(r, pick);
+        self.push_arranger_band(tab);
+        // A band of one plays on the tab's own program, not on a zone.
+        if self
+            .slots
+            .get(tab)
+            .is_some_and(|s| s.arranger.settings.role == r)
+        {
+            self.fit_arranger_instrument(tab);
+        }
+        self.persist_active();
     }
 
     /// Switch a tab's arranger off and take its notes with it — the other half
@@ -13052,14 +13214,8 @@ impl App {
             return;
         }
         let role = slot.arranger.settings.role;
-        let wanted = slot.arranger.style().programs(role);
         let banks: Vec<(u8, u8)> = slot.presets.iter().map(|p| (p.bank, p.preset)).collect();
-        let at = match role {
-            // The kit is a bank, not a program: bank 128 is where every
-            // SoundFont keeps it.
-            arranger::generate::Role::Drums => banks.iter().position(|(b, _)| *b == 128),
-            _ => arranger::pick_program(&banks, wanted),
-        };
+        let at = Self::arr_program_at(&slot.arranger.settings, &banks, slot.arranger.style(), role);
         let Some(at) = at else {
             eprintln!(
                 "choz: arranger {}: this SoundFont has nothing to play it on, leaving the sound alone",
@@ -13225,8 +13381,7 @@ impl App {
             .unwrap_or("");
         arranger::style::all()
             .iter()
-            .enumerate()
-            .map(|(i, style)| {
+            .map(|style| {
                 let mark = match style.name == here {
                     true => '\u{25CF}',
                     false => ' ',
@@ -13235,9 +13390,11 @@ impl App {
                     true => format!("{} {:.0}%", i18n::t("SWING"), style.swing * 100.0),
                     false => i18n::t("STRAIGHT").to_string(),
                 };
+                // The id first: it is what a chart written by hand can say
+                // after `style =`, and it stays the same when rhythms are added.
                 format!(
                     "{mark} {:03} {:<24} {:.0}/4  {swing}  {} {:.0}%",
-                    i + 1,
+                    style.id,
                     style.label,
                     style.beats_per_bar,
                     i18n::t("FEEL"),
@@ -13996,6 +14153,76 @@ impl App {
     /// Something has to have been played: there is no measuring silence, and it
     /// says so rather than moving the fader on a reading of nothing.
     fn auto_trim(&mut self, tab: usize) {
+        if self.level_band(tab) {
+            return;
+        }
+        self.trim_to(tab, views::fx_chain_panel::MAX_GAIN);
+    }
+
+    /// **The band, levelled musician by musician**, from the loudest each one
+    /// played since the last time — then the tab at unity, since what it was
+    /// measured at is no longer what it plays. `false` when the tab has no
+    /// band on zones of its own, or nobody in it has played yet.
+    ///
+    /// From a log: the band on one SoundFont peaked 1.0 before its fader,
+    /// with the fader at 2.00 from a probe of one middle C — and measured on
+    /// its own, that font's kit sat at full scale while its piano sat 20 dB
+    /// under it. The tab's fader cannot fix that: it moves everybody.
+    fn level_band(&mut self, tab: usize) -> bool {
+        let Some(slot) = self.slots.get(tab) else {
+            return false;
+        };
+        if !slot.arranger.is_on() {
+            return false;
+        }
+        let zones: Vec<(arranger::generate::Role, u8)> = arranger::generate::Role::ALL
+            .iter()
+            .filter_map(|r| slot.arr_zones[*r as usize].map(|z| (*r, z)))
+            .collect();
+        if zones.len() < 2 {
+            return false;
+        }
+        let Some(engine) = self.audio_engine.as_ref() else {
+            return false;
+        };
+        let heard: Vec<(arranger::generate::Role, f32)> = zones
+            .iter()
+            .map(|(r, z)| (*r, engine.take_zone_held(tab, *z as usize)))
+            .filter(|(_, peak)| *peak >= TRIM_FLOOR)
+            .collect();
+        if heard.is_empty() {
+            return false;
+        }
+        let max = views::fx_chain_panel::MAX_GAIN;
+        let mut said = Vec::new();
+        if let Some(slot) = self.slots.get_mut(tab) {
+            for (role, peak) in &heard {
+                let g = band_gain(*peak, max);
+                slot.arranger.settings.set_balance(*role, g);
+                said.push(format!("{} {g:.2} (peak {peak:.2})", role.name()));
+            }
+        }
+        self.push_band_mix(tab);
+        let link = self.slots.get(tab).is_none_or(|s| s.link);
+        self.with_mix(tab, |s| {
+            s.gain = 1.0;
+            if link {
+                s.gain_r = 1.0;
+            }
+        });
+        choz_engine::meter::slot_levels().reset(tab);
+        eprintln!(
+            "choz: tab {} band levelled — {}; the tab at 1.00",
+            tab + 1,
+            said.join(", ")
+        );
+        self.persist_active();
+        true
+    }
+
+    /// Put a tab's fader where its loudest passage sits at [`TARGET_RMS`],
+    /// never above full scale, and never above `max`.
+    fn trim_to(&mut self, tab: usize, max: f32) {
         let (peak, rms) = choz_engine::meter::slot_levels().read(tab);
         if rms < TRIM_FLOOR {
             eprintln!(
@@ -14005,7 +14232,6 @@ impl App {
             );
             return;
         }
-        let max = views::fx_chain_panel::MAX_GAIN;
         let (g, held) = trim_gain(peak, rms, max);
         let Some(s) = self.slots.get(tab) else {
             return;
@@ -15301,7 +15527,7 @@ impl App {
                 }
                 // Same as a plugin: a SoundFont arrives at whatever level it
                 // was sampled at, and the tab starts level with the others.
-                self.auto_trim(slot);
+                self.trim_to(slot, PROBE_MAX_GAIN);
                 // A new instrument, so its zones have to be pointed again.
                 self.push_split(slot);
             }
@@ -18264,6 +18490,8 @@ enum MouseAction {
     SoundRecall(usize),
     /// Save what the tab is playing into that button — the right button on it.
     SoundSave(usize),
+    /// Right button on a musician of the arranger's band: pick their program.
+    ArrProgram(usize),
     /// One more sound button.
     SoundAdd,
 }
@@ -18640,6 +18868,13 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                 if let RackButton::Sound(i) = btn {
                     if rect.contains(pos) {
                         return MouseAction::SoundSave(i);
+                    }
+                }
+                // A musician's button: the left one puts them in or out of the
+                // band, the right one says what they play it on.
+                if let RackButton::ArrPart(i) = btn {
+                    if rect.contains(pos) {
+                        return MouseAction::ArrProgram(i);
                     }
                 }
             }
@@ -19230,6 +19465,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         // that is now the first row of the picker it opens, so the gesture
         // costs one more key and can also reach every preset in the bank.
         MouseAction::SoundSave(i) => app.open_sound_assign_modal(i),
+        MouseAction::ArrProgram(i) => app.open_arr_program(i),
         MouseAction::SoundAdd => app.add_sound_slot(app.active_slot),
         MouseAction::OpenFxGate => app.open_fx_gate_modal(),
         MouseAction::OpenChordInput => app.open_chord_input_modal(),
@@ -26426,6 +26662,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **Each meter of a chart is counted its own way.** `groups 7/8 =` and
+    /// `groups 5/8 =` hand the click the accents of the bar it is in, and a
+    /// bar the chart says nothing about gets the downbeat alone — a grouping
+    /// written for another meter would accent beats that bar does not have.
+    #[test]
+    fn the_click_counts_each_meter_of_a_chart_its_own_way() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let t = choz_ports::transport();
+        t.set_playing(false);
+        t.set_bpm(120.0);
+        t.set_sample_rate(48_000);
+        t.set_time_signature(4, 4);
+        t.set_bar_origin(0.0);
+        t.set_free_samples(0);
+        let m = choz_engine::artifacts::metronome::metronome();
+        m.set_groups(&[]);
+        let mut app = App::new();
+        app.ui.audio.follow_arranger = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        app.edit_arranger(ArrEdit::Toggle);
+        app.slots[0].arranger.set_text(
+            "style = drumnbass\ngroups 7/8 = 2+2+3\ngroups 5/8 = 3+2\n\
+             | 4/4 Cm | 7/8 Ab:4 G7:3 | 3/4 Fm | 5/8 G7 |",
+        );
+        assert!(app.slots[0].arranger.error().is_none());
+        app.edit_arranger(ArrEdit::Play);
+        let mut seen: Vec<((u16, u16), Vec<u8>)> = Vec::new();
+        let mut beat = 0.0;
+        while beat < 12.0 {
+            t.set_free_samples((beat * 24_000.0) as u64);
+            app.tick_arrangers();
+            let now = (t.time_signature(), m.groups());
+            if seen.last() != Some(&now) {
+                seen.push(now);
+            }
+            beat += 0.05;
+        }
+        assert_eq!(
+            seen[..4],
+            [
+                ((4, 4), vec![]),
+                ((7, 8), vec![2, 2, 3]),
+                ((3, 4), vec![]),
+                ((5, 8), vec![3, 2]),
+            ],
+            "{seen:?}"
+        );
+        app.edit_arranger(ArrEdit::Stop);
+        t.set_time_signature(4, 4);
+        t.set_bar_origin(0.0);
+        m.set_groups(&[]);
+    }
+
     /// **A chart that changes meter takes the click with it**, bar by bar:
     /// the session's signature is the bar's, the one moves to that bar's
     /// downbeat, and the grid editor writes the meters back as it read them.
@@ -26442,7 +26734,9 @@ mod tests {
         t.set_bar_origin(0.0);
         t.set_free_samples(0);
         let mut app = App::new();
-        app.ui.audio.follow_arranger = true;
+        // Off, the way an older build left it saved: a chart that changes
+        // meter takes the click anyway.
+        app.ui.audio.follow_arranger = false;
         app.slots.push(RackSlot::new(AudioSource::Midi));
         app.active_slot = 0;
         app.edit_arranger(ArrEdit::Toggle);
@@ -26656,11 +26950,18 @@ mod tests {
         assert_eq!(t.time_signature(), (3, 4));
         app.step_metronome_row(2, 1); // BEATS: 3 -> 4
         app.tick_arrangers();
-        assert!(
-            !app.ui.audio.follow_arranger,
-            "setting BEATS stops following"
-        );
         assert_eq!(t.time_signature(), (4, 4), "and the hand-set bar stays");
+        assert!(
+            app.ui.audio.follow_arranger,
+            "for this band only: the saved switch is not touched"
+        );
+
+        // The band stops and starts again: the click counts its bar again.
+        app.edit_arranger(ArrEdit::Stop);
+        app.tick_arrangers();
+        app.edit_arranger(ArrEdit::Play);
+        app.tick_arrangers();
+        assert_eq!(t.time_signature(), (3, 4), "the next band is followed");
 
         app.edit_arranger(ArrEdit::Stop);
         t.set_time_signature(4, 4);
@@ -26781,6 +27082,85 @@ mod tests {
             "the chart came back"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The right button on a musician picks what they play on.** On a
+    /// SoundFont tab it opens the font's programs for that musician, AUTO on
+    /// top; the pick is kept in the settings and is the program the band's
+    /// zone is given, and AUTO hands it back to the style.
+    #[test]
+    fn the_right_button_on_a_musician_picks_their_program() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        let path = std::path::PathBuf::from("/usr/share/sounds/sf2/TimGM6mb.sf2");
+        if !path.exists() {
+            return;
+        }
+        let mut app = App::new();
+        let mut slot = RackSlot::new(AudioSource::Sf2 {
+            path: path.clone(),
+            bank: 0,
+            preset: 0,
+        });
+        slot.presets = sources::list_sf2_presets(&path).unwrap();
+        app.slots.push(slot);
+        app.active_slot = 0;
+        app.edit_arranger(ArrEdit::Toggle);
+        let (_, rack) = render_rack(&mut app, 140, 40);
+        let (_, bass_btn) = rack
+            .buttons
+            .iter()
+            .find(|(b, _)| *b == RackButton::ArrPart(0))
+            .copied()
+            .expect("no bass button");
+        right_click(&mut app, bass_btn.x + 1, bass_btn.y);
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::ArrProgram(0))
+        );
+        let rows = app.arr_program_rows(0);
+        assert!(rows[0].starts_with(i18n::t("AUTO")), "{:?}", &rows[..2]);
+        assert_eq!(rows.len(), app.slots[0].presets.len() + 1);
+
+        // A fretless (0:35), by its row.
+        let row = app.slots[0]
+            .presets
+            .iter()
+            .position(|p| (p.bank, p.preset) == (0, 35))
+            .unwrap()
+            + 1;
+        app.set_arr_program(0, row);
+        let bass = arranger::generate::Role::Bass;
+        assert_eq!(app.slots[0].arranger.settings.program(bass), Some((0, 35)));
+        let presets: Vec<(u8, u8)> = app.slots[0]
+            .presets
+            .iter()
+            .map(|p| (p.bank, p.preset))
+            .collect();
+        let at = App::arr_program_at(
+            &app.slots[0].arranger.settings,
+            &presets,
+            app.slots[0].arranger.style(),
+            bass,
+        );
+        assert_eq!(at.map(|i| presets[i]), Some((0, 35)), "the zone plays it");
+
+        // AUTO: the style's again.
+        app.set_arr_program(0, 0);
+        assert_eq!(app.slots[0].arranger.settings.program(bass), None);
+    }
+
+    /// A musician is levelled to the same peak whatever the font does with
+    /// them, and never boosted past the fader's end.
+    #[test]
+    fn a_musician_is_levelled_to_the_band_peak() {
+        assert!(
+            (band_gain(1.0, 2.0) - BAND_PEAK).abs() < 1e-6,
+            "the kit comes down"
+        );
+        assert!((band_gain(0.3, 2.0) - 1.0).abs() < 1e-6, "on target stays");
+        assert_eq!(band_gain(0.02, 2.0), 2.0, "a quiet part is not made a lead");
+        assert_eq!(band_gain(0.0, 2.0), 2.0, "silence does not divide by zero");
     }
 
     /// The arranger's switch: on, and the box it belongs to is the one on
@@ -35171,7 +35551,12 @@ mod tests {
             screen.contains("\u{25CB}\u{00B7}\u{00B7}\u{00B7}"),
             "no four-beat bars:\n{screen}"
         );
-        assert_eq!(rack.arr_bars.len(), 12, "a cell a bar");
+        // A cell a bar of the default chart, each drawn once however often
+        // its form plays it.
+        let text = app.slots[0].arranger.view().settings.text.clone();
+        let shown = views::fx_chain_panel::shown_bars(&text).len();
+        let played = views::fx_chain_panel::played_bars(&text).len();
+        assert_eq!(rack.arr_bars.len(), shown, "a cell a bar");
         assert!(screen.contains("METER 4/4"), "{screen}");
 
         // Seven eighths counted 3+2+2: seven cells in three groups, and the
@@ -35186,8 +35571,8 @@ mod tests {
         );
         assert!(screen.contains("METER 7/8 3+2+2"), "{screen}");
         assert!(
-            (app.slots[0].arranger.beats() - 12.0 * 3.5).abs() < 1e-6,
-            "the form is not twelve bars of 7/8: {}",
+            (app.slots[0].arranger.beats() - played as f64 * 3.5).abs() < 1e-6,
+            "the form is not {played} bars of 7/8: {}",
             app.slots[0].arranger.beats()
         );
 
