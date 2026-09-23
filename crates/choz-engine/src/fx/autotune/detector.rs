@@ -119,6 +119,11 @@ pub struct PitchDetector {
     /// Takes the room out from under the signal, after decimating.
     rumble: [crate::fx::utility::Biquad; 2],
     window: Vec<f32>,
+    /// How many decimated samples the window holds, and how many arrive
+    /// between analyses — [`WINDOW`] and [`HOP`] unless the caller asked for
+    /// a shorter look (see [`Self::with_window`]).
+    len: usize,
+    hop: usize,
     write: usize,
     filled: usize,
     since: usize,
@@ -146,12 +151,36 @@ pub struct PitchDetector {
     pub voiced_threshold: f32,
     /// Previous accepted frequency, for the octave check.
     previous: f32,
+    /// Analyses in a row the octave check has overruled — see
+    /// [`OCTAVE_PATIENCE`].
+    overruled: u32,
 }
+
+/// How many analyses in a row the octave check may overrule before the new
+/// octave is believed. It stored its own correction as the last reading, so
+/// one wrong octave at an attack held every right reading after it an octave
+/// off for the rest of the note.
+const OCTAVE_PATIENCE: u32 = 3;
 
 impl PitchDetector {
     /// Every buffer is sized here, for the worst case the parameters allow, and
     /// never again: [`Self::process`] runs on the audio thread.
     pub fn new(sample_rate: f32) -> Self {
+        Self::with_window(sample_rate, WINDOW, HOP)
+    }
+
+    /// A detector that looks at `len` decimated samples every `hop` of them.
+    ///
+    /// **Shorter is sooner.** A new note is only heard once it fills most of
+    /// the window, so [`WINDOW`]'s 64 ms is 64 ms before anything downstream
+    /// knows the singer moved — what the harmoniser measured as 69 ms of the
+    /// old harmony on the new note. The window only has to hold two periods of
+    /// the lowest note looked for (`min_hz`), so a voice from 70 Hz fits in
+    /// half of it. Clamped to that: a window too short for its own range would
+    /// find the octave above every low note.
+    pub fn with_window(sample_rate: f32, len: usize, hop: usize) -> Self {
+        let len = len.clamp(256, WINDOW);
+        let hop = hop.clamp(16, len / 2);
         let sr = sample_rate.max(1.0);
         let decim = ((sr / WORK_RATE).round() as usize).max(1);
         Self {
@@ -162,12 +191,14 @@ impl PitchDetector {
             acc_n: 0,
             antialias: [crate::fx::utility::Biquad::lowpass(ANTIALIAS_HZ, sr, 0.707); 2],
             rumble: [crate::fx::utility::Biquad::highpass(RUMBLE_HZ, sr / decim as f32, 0.707); 2],
-            window: vec![0.0; WINDOW],
+            window: vec![0.0; len],
+            len,
+            hop,
             write: 0,
             filled: 0,
             since: 0,
-            diff: vec![0.0; WINDOW / 2],
-            linear: vec![0.0; WINDOW],
+            diff: vec![0.0; len / 2],
+            linear: vec![0.0; len],
             recent: [0.0; MEDIAN_ANALYSES],
             recent_n: 0,
             unvoiced_for: 0,
@@ -183,6 +214,7 @@ impl PitchDetector {
             max_hz: 1200.0,
             voiced_threshold: 0.55,
             previous: 0.0,
+            overruled: 0,
         }
     }
 
@@ -213,6 +245,7 @@ impl PitchDetector {
         self.unvoiced_for = 0;
         self.last = PitchEstimate::SILENT;
         self.previous = 0.0;
+        self.overruled = 0;
     }
 
     pub fn estimate(&self) -> PitchEstimate {
@@ -241,11 +274,11 @@ impl PitchDetector {
             self.window[self.write] = decimated;
             self.acc = 0.0;
             self.acc_n = 0;
-            self.write = (self.write + 1) % WINDOW;
-            self.filled = (self.filled + 1).min(WINDOW);
+            self.write = (self.write + 1) % self.len;
+            self.filled = (self.filled + 1).min(self.len);
             self.since += 1;
         }
-        if self.filled < WINDOW || self.since < HOP {
+        if self.filled < self.len || self.since < self.hop {
             return self.last;
         }
         self.since = 0;
@@ -261,7 +294,7 @@ impl PitchDetector {
             self.unvoiced_for = 0;
             return PitchEstimate::SILENT;
         }
-        let half = WINDOW / 2;
+        let half = self.len / 2;
         let min_lag = (self.work_rate / self.max_hz.max(1.0)) as usize;
         let max_lag = (self.work_rate / self.min_hz.max(1.0)) as usize;
         // Straightened out first: YIN's inner loop has no wrap in it when the
@@ -289,7 +322,12 @@ impl PitchDetector {
         // is within a few cents of double or half the last accepted one, the
         // continuous answer is the likelier one — a singer does not jump an
         // octave between two 5 ms hops and land exactly in tune.
-        if self.previous > 0.0 {
+        //
+        // **For a moment, not for good.** An octave that keeps being read
+        // after `OCTAVE_PATIENCE` looks is the octave: either the first reading
+        // was the wrong one, or the singer really did jump.
+        let mut overruled = false;
+        if self.previous > 0.0 && self.overruled < OCTAVE_PATIENCE {
             for factor in [0.5f32, 2.0] {
                 let candidate = hz * factor;
                 if (candidate / self.previous).log2().abs() < 0.03
@@ -297,10 +335,15 @@ impl PitchDetector {
                     && (self.min_hz..=self.max_hz).contains(&candidate)
                 {
                     hz = candidate;
+                    overruled = true;
                     break;
                 }
             }
         }
+        self.overruled = match overruled {
+            true => self.overruled + 1,
+            false => 0,
+        };
         if clarity < self.voiced_threshold {
             return self.hold_or_silence();
         }

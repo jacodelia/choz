@@ -60,6 +60,32 @@ pub fn chord() -> &'static Chord {
     &CHORD
 }
 
+static CHART: Chord = Chord {
+    notes: [
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+    ],
+    count: AtomicU8::new(0),
+    generation: AtomicU32::new(0),
+};
+
+/// The chord of a **chart** a harmoniser is following — a `.chord`
+/// progression played by the interface against the transport, beside the
+/// keyboard's chord rather than in it: a chart and a hand are two sources, and
+/// one overwriting the other would be a harmony nobody chose.
+///
+/// ponytail: one per process, like [`chord`]; a second harmoniser following a
+/// second chart would need one of these per effect.
+pub fn chart() -> &'static Chord {
+    &CHART
+}
+
 impl Chord {
     /// Publish what is held now. Called from the interface loop; `notes` is
     /// sorted low to high by the caller, because the lowest one is the root the

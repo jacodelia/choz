@@ -324,6 +324,9 @@ pub struct Arranger {
     /// `groups 7/8 = 2+2+3` lines: how each meter of a chart that changes
     /// meter is counted — see [`Arranger::bar_groups`].
     meter_groups: Vec<((u16, u16), Vec<u8>)>,
+    /// The progression as it last read — what [`Arranger::chord_now`] answers
+    /// from, for a follower that wants the chord rather than the band.
+    prog: Option<chord::Progression>,
     /// Where each bar starts and what it is in, for a chart that changes
     /// meter. Empty for one that does not — a bar is then `beats_per_bar`.
     bar_starts: Vec<f64>,
@@ -381,6 +384,7 @@ impl Default for Arranger {
             written_meter: None,
             written_groups: Vec::new(),
             meter_groups: Vec::new(),
+            prog: None,
             bar_starts: Vec::new(),
             bar_meters: Vec::new(),
             own_bpb: 4.0,
@@ -674,6 +678,16 @@ impl Arranger {
             .unwrap_or((self.style.meter.0 as u16, self.style.meter.1 as u16))
     }
 
+    /// The chord under the playhead, while playing — what the harmoniser
+    /// follows when it follows a chart. `None` stopped, or with no chart read.
+    pub fn chord_now(&self) -> Option<&chord::Chord> {
+        if !self.playing {
+            return None;
+        }
+        let prog = self.prog.as_ref()?;
+        prog.at(self.at, self.style.beats_per_bar).map(|(c, _)| c)
+    }
+
     /// Whether the chart changes meter: every bar then has a signature of its
     /// own, and a click that does not change with it is out of step by bar
     /// four.
@@ -805,6 +819,7 @@ impl Arranger {
                 self.written_meter = prog.meter;
                 self.written_groups = prog.groups.clone();
                 self.meter_groups = prog.meter_groups.clone();
+                self.prog = Some(prog.clone());
                 // The bar the chart names, or the one the session counts when
                 // somebody set one.
                 // A chart that changes meter keeps its own: the session follows

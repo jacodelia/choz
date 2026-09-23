@@ -850,6 +850,13 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         pd!("Res", 0.36),
         pd!("Speed", 0.20),
         pd!("Shift", 0.50),
+        // Follow the `.chord` chart the effect's own row plays. After the
+        // vocoder's knobs: appended, like everything since the first nine.
+        FxParamDesc {
+            name: Cow::Borrowed("Chart"),
+            default: 0.0,
+            shape: ParamShape::Toggle,
+        },
     ];
     /// Bands and carrier are lists of names; the rest are knobs.
     static VOCODER: &[FxParamDesc] = &[
@@ -1208,6 +1215,33 @@ pub struct AudioFxEntry {
     /// `None` is any of them, which is what a rig with one controller wants and
     /// what every project written before this said.
     pub chord_port: Option<String>,
+    /// The `.chord` chart a harmoniser follows, as text — saved with the
+    /// project, so the harmony it was set up to follow opens with it.
+    pub chart: Option<String>,
+    /// What the harmoniser's chart row draws: refreshed by the interface every
+    /// frame, never saved.
+    pub chart_view: Option<HarmChartView>,
+}
+
+/// The harmoniser's chart row, as it is to be drawn.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HarmChartView {
+    /// A chart is loaded and reads.
+    pub loaded: bool,
+    pub playing: bool,
+    /// The chord under the playhead, as written.
+    pub chord: String,
+    /// One-based bar, and how many there are.
+    pub bar: usize,
+    pub bars: usize,
+    /// The metronome's beat in its bar, and how many beats the bar has — the
+    /// same numbers the click is counting, so the light and the beep agree.
+    pub beat: usize,
+    pub beats: usize,
+    /// The click is sounding.
+    pub click: bool,
+    /// Why the chart did not read, when it did not.
+    pub error: Option<String>,
 }
 
 impl AudioFxEntry {
@@ -1230,6 +1264,8 @@ impl AudioFxEntry {
             state: Vec::new(),
             gate: None,
             chord_port: None,
+            chart: None,
+            chart_view: None,
             loops: Vec::new(),
             loop_frames: 0,
         }
@@ -1257,6 +1293,8 @@ impl AudioFxEntry {
             state: Vec::new(),
             gate: None,
             chord_port: None,
+            chart: None,
+            chart_view: None,
             loops: Vec::new(),
             loop_frames: 0,
         }
@@ -1754,6 +1792,8 @@ impl AudioFxEntry {
             state: Vec::new(),
             gate: None,
             chord_port: None,
+            chart: None,
+            chart_view: None,
             loops: Vec::new(),
             loop_frames: 0,
         })

@@ -13,11 +13,14 @@
 //! * **Voices** — one is a transposer, two is the classic double, four and
 //!   eight are the stacked-harmoniser sound. Each has its own interval.
 //! * **Diatonic**, and this is what makes it musical rather than parallel:
-//!   with a key and a scale set, an interval is a **number of scale steps**,
-//!   not a fixed number of semitones. A third above a C in C major is E (four
-//!   semitones); above a D it is F (three). Shifting everything by a constant
-//!   is the sound of a cheap pitch shifter, and it is wrong in exactly the
-//!   places a listener notices.
+//!   the note being sung is **detected** (the autotune's YIN detector), and
+//!   each voice is that note plus the shape's interval, moved onto the nearest
+//!   note of the scale — or of the chord, when a keyboard or a chart gives
+//!   one. A third above a C in C major is E (four semitones); above a D it is
+//!   F (three). Shifting everything by a constant is the sound of a cheap
+//!   pitch shifter, and it is wrong in exactly the places a listener notices.
+//!   It was that, for a while: the steps were walked from the key's tonic and
+//!   the same shift applied to every note sung.
 //! * **Micro-pitch** — a few cents of detune spread across the voices. Two
 //!   copies at exactly the same pitch are one louder copy; a few cents apart
 //!   they are two singers.
@@ -29,17 +32,20 @@
 //!
 //! # What it does not do, and why
 //!
-//! **The intervals do not come from MIDI.** An [`super::FxProcessor`] is handed
-//! audio and nothing else — there is no note input in an FX chain, by design
-//! (see the trait). Chord-driven harmony belongs in the input-algorithm
-//! section, where notes exist; the roadmap has it. What is here is the part
-//! that works with only a signal: a key, a scale, and intervals.
+//! **No note input.** An [`super::FxProcessor`] is handed audio and nothing
+//! else — there is no note port in an FX chain, by design (see the trait). The
+//! chords it follows arrive through two process-wide doors instead: the one the
+//! keyboard publishes ([`crate::chord::chord`], `MIDI`) and the one a `.chord`
+//! chart publishes as the interface plays it ([`crate::chord::chart`],
+//! `Chart`). The chart wins when both are on: it was started on purpose.
 
 use super::shift::VoiceShifter;
 use super::smooth::Smoothed;
+use crate::fx::autotune::PitchDetector;
 use crate::fx::autotune::{Scale, ScaleType, NOTE_NAMES};
 use crate::fx::vocoder::Vocoder;
 use crate::fx::FxProcessor as _;
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 /// What the effect does with the chord it is given.
 ///
@@ -72,6 +78,96 @@ impl Mode {
         match v >= 0.5 {
             true => Mode::Vocoder,
             false => Mode::Harmony,
+        }
+    }
+}
+
+/// What the harmoniser did since the log last asked, for the interface to
+/// write down: the notes it moved to, how often it rebuilt its voices, how
+/// loud its output got and whether any of it passed full scale. Atomics, so
+/// the audio thread writes without a lock; one set for the process, like the
+/// chord it follows.
+pub struct HarmStats {
+    blocks: AtomicU32,
+    notes: AtomicU32,
+    last_note: AtomicU32,
+    rebuilds: AtomicU32,
+    /// Peak of the output, as `f32` bits — a positive float's bits order the
+    /// way the float does, so the loudest block is an integer max.
+    peak: AtomicU32,
+    over: AtomicU32,
+    intervals: [AtomicU32; MAX_VOICES],
+    voices: AtomicU32,
+}
+
+/// One reading of [`HarmStats`], taken and reset.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct HarmReading {
+    pub blocks: u32,
+    pub notes: u32,
+    /// The note the voices are measured from, `None` before one is heard.
+    pub sung: Option<u8>,
+    pub rebuilds: u32,
+    pub peak: f32,
+    /// Samples that left the effect past full scale.
+    pub over: u32,
+    /// What each voice is set to, in semitones, `voices` of them.
+    pub intervals: [f32; MAX_VOICES],
+    pub voices: usize,
+}
+
+static STATS: HarmStats = HarmStats {
+    blocks: AtomicU32::new(0),
+    notes: AtomicU32::new(0),
+    last_note: AtomicU32::new(u32::MAX),
+    rebuilds: AtomicU32::new(0),
+    peak: AtomicU32::new(0),
+    over: AtomicU32::new(0),
+    intervals: [const { AtomicU32::new(0) }; MAX_VOICES],
+    voices: AtomicU32::new(0),
+};
+
+pub fn stats() -> &'static HarmStats {
+    &STATS
+}
+
+impl HarmStats {
+    fn note(&self, n: i32) {
+        self.notes.fetch_add(1, Relaxed);
+        self.last_note.store(n.clamp(0, 127) as u32, Relaxed);
+    }
+
+    fn forget(&self) {
+        self.last_note.store(u32::MAX, Relaxed);
+    }
+
+    fn rebuilt(&self, intervals: &[f32]) {
+        self.rebuilds.fetch_add(1, Relaxed);
+        for (slot, v) in self.intervals.iter().zip(intervals) {
+            slot.store(v.to_bits(), Relaxed);
+        }
+        self.voices.store(intervals.len() as u32, Relaxed);
+    }
+
+    fn block(&self, peak: f32, over: u32) {
+        self.blocks.fetch_add(1, Relaxed);
+        self.peak.fetch_max(peak.max(0.0).to_bits(), Relaxed);
+        self.over.fetch_add(over, Relaxed);
+    }
+
+    /// Everything since the last call, and start the counts over.
+    pub fn take(&self) -> HarmReading {
+        let note = self.last_note.load(Relaxed);
+        let voices = (self.voices.load(Relaxed) as usize).min(MAX_VOICES);
+        HarmReading {
+            blocks: self.blocks.swap(0, Relaxed),
+            notes: self.notes.swap(0, Relaxed),
+            sung: (note <= 127).then_some(note as u8),
+            rebuilds: self.rebuilds.swap(0, Relaxed),
+            peak: f32::from_bits(self.peak.swap(0, Relaxed)),
+            over: self.over.swap(0, Relaxed),
+            intervals: std::array::from_fn(|i| f32::from_bits(self.intervals[i].load(Relaxed))),
+            voices,
         }
     }
 }
@@ -149,6 +245,22 @@ impl Shape {
         }
     }
 
+    /// The same intervals in semitones, read against a **major** scale: a
+    /// third is four, a fifth seven, an octave twelve. What the voices aim at
+    /// before the scale or the chord moves them onto a note that belongs.
+    ///
+    /// Semitones rather than steps because a step means nothing outside a
+    /// seven-note scale: seven steps is an octave in major, an octave and a
+    /// second in a pentatonic, and a fifth in chromatic — which is what `OCT`
+    /// played there.
+    pub fn semitones(self) -> [i32; MAX_VOICES] {
+        const MAJOR: [i32; 7] = [0, 2, 4, 5, 7, 9, 11];
+        self.steps().map(|step| {
+            let octave = step.div_euclid(7);
+            MAJOR[step.rem_euclid(7) as usize] + 12 * octave
+        })
+    }
+
     pub fn to_norm(self) -> f32 {
         Self::ALL.iter().position(|s| *s == self).unwrap_or(0) as f32 / (Self::ALL.len() - 1) as f32
     }
@@ -176,6 +288,11 @@ struct Voice {
     /// recompute it *from*, and [`Harmonizer::intervals`] used to answer with
     /// the shape's intervals whatever the voices were really doing.
     semitones: f32,
+    /// Where the shifter actually is, gliding to `semitones`: a new harmony
+    /// arrives over a few milliseconds rather than in one sample, which is a
+    /// portamento rather than a click. `NaN` until the first build, which
+    /// lands on its target at once.
+    gliding: f32,
     level: f32,
     /// Constant-power pan, precomputed.
     gain: [f32; 2],
@@ -197,6 +314,7 @@ impl Voice {
         Self {
             shifter: VoiceShifter::new(),
             semitones: 0.0,
+            gliding: f32::NAN,
             level: 1.0,
             gain: [std::f32::consts::FRAC_1_SQRT_2; 2],
             delay_frames: 0.0,
@@ -248,6 +366,19 @@ pub struct Harmonizer {
     /// The chord generation this was last built from, so a rebuild only happens
     /// when the hand on the keyboard moves.
     chord_seen: u32,
+    /// Follow the chord a `.chord` chart publishes as it plays
+    /// ([`crate::chord::chart`]) — the harmony changes with the progression.
+    chart: bool,
+    chart_seen: u32,
+    /// What is being sung, and the note it was last heard as — the note every
+    /// voice is measured from. `None` until something voiced has been heard;
+    /// the key's tonic stands in until then.
+    detector: PitchDetector,
+    sung: Option<i32>,
+    /// A note heard but not yet believed, and for how many frames it has held.
+    candidate: Option<(i32, u32)>,
+    /// Frames since anything was heard: past [`FORGET_MS`] the note is let go.
+    silent: u32,
     /// Cents of detune spread across the voices.
     detune: f32,
     /// Milliseconds the last voice lags by; the rest are spread under it.
@@ -274,6 +405,9 @@ pub struct Harmonizer {
     /// as loud as the dry. Computed in [`Harmonizer::rebuild`] from the pans it
     /// just assigned — see there for why it is not a constant.
     makeup: f32,
+    /// Voices the last rebuild set up: the count, or the chord's size while a
+    /// chord with nothing sung over it is the harmony.
+    built_count: usize,
     mix: f32,
     sample_rate: f32,
     dirty: bool,
@@ -292,6 +426,12 @@ impl Harmonizer {
             midi: false,
             midi_channel: 1,
             chord_seen: 0,
+            chart: false,
+            chart_seen: 0,
+            detector: PitchDetector::with_window(sr, DETECT_WINDOW, DETECT_HOP),
+            sung: None,
+            candidate: None,
+            silent: 0,
             detune: 8.0,
             delay_ms: 18.0,
             env_amount: 0.5,
@@ -302,6 +442,7 @@ impl Harmonizer {
             mode: Mode::default(),
             voc: Vocoder::new(sample_rate),
             makeup: 1.0,
+            built_count: 2,
             mix: 0.5,
             sample_rate: sr,
             dirty: true,
@@ -334,6 +475,7 @@ impl Harmonizer {
         // before the two effects became one, so a project written against the
         // old harmoniser opens with its knobs still on their own controls.
         h.mode = Mode::from_norm(get(11, 0.0));
+        h.chart = get(CHART_PARAM, 0.0) >= 0.5;
         h.voc = Vocoder::with_params(sample_rate, &p[VOC_PARAM0.min(p.len())..]);
         h.voc.set_mix(1.0);
         h.rebuild();
@@ -388,36 +530,71 @@ impl Harmonizer {
     pub fn intervals(&self) -> Vec<f32> {
         self.voices
             .iter()
-            .take(self.count)
+            .take(self.built_count)
             .map(|v| v.semitones)
             .collect()
     }
 
-    /// A voice's shift in semitones.
-    ///
-    /// With a scale, the step is a **scale step**: walk that many degrees from
-    /// the root and take the distance. Without one it is a semitone count, and
-    /// the harmony is parallel — which is a sound, just not a musical one.
-    fn semitones_for(&self, step: i32, voice: usize) -> f32 {
-        // The scale is a set of pitch classes; a step is a move through it.
-        // Counting the degrees keeps a third a third whatever degree it starts
-        // on, which is the whole point — and under a chromatic scale every
-        // semitone is a degree, so this reduces to `step` on its own.
-        let root = self.key as i32 + 60;
-        let mut note = root;
-        let mut left = step.abs();
-        let dir = step.signum();
-        while left > 0 {
-            note += dir;
-            if self.scale.contains(note) {
-                left -= 1;
-            }
-            // Safety: a scale with no notes at all would loop for ever.
-            if (note - root).abs() > 96 {
-                break;
+    /// Whether this is following a chart right now, rather than a keyboard.
+    pub fn follows_chart(&self) -> bool {
+        self.chart
+    }
+
+    /// The note every voice is measured from: what is being sung, and the
+    /// key's tonic until something has been heard.
+    pub fn sung(&self) -> Option<i32> {
+        self.sung
+    }
+
+    /// Where a voice lands: `raw`, moved onto the nearest note `allowed` says
+    /// belongs, **towards the sung note on a tie** — a major third in a minor
+    /// key is the minor third, not the fourth. A voice that would land on the
+    /// sung note's own pitch class is moved on unless the shape asked for an
+    /// octave: two singers on one note is one louder singer.
+    fn snap(raw: i32, sung: i32, allowed: &dyn Fn(i32) -> bool, taken: &[i32]) -> i32 {
+        let octave = (raw - sung).rem_euclid(12) == 0;
+        let up = raw >= sung;
+        for d in 0..=12 {
+            let (toward, away) = match up {
+                true => (raw - d, raw + d),
+                false => (raw + d, raw - d),
+            };
+            for c in [toward, away] {
+                if allowed(c) && (octave || (c - sung).rem_euclid(12) != 0) && !taken.contains(&c) {
+                    return c;
+                }
             }
         }
-        let base = (note - root) as f32;
+        raw
+    }
+
+    /// A voice's shift in semitones from `sung`: the shape's interval, fitted
+    /// to the scale — or to `chord`'s pitch classes when there is a chord —
+    /// and the micro-pitch spread on top.
+    ///
+    /// **Not onto a note another voice already has** (`taken`): a third and a
+    /// fifth snapped to a three-note chord could both land on its fifth, and
+    /// two voices a few cents apart on one note is a beating chorus, which is
+    /// what the harmony sounded like on a chart — measured, `[4.92, 5.08]`.
+    fn semitones_for(
+        &self,
+        interval: i32,
+        voice: usize,
+        sung: i32,
+        chord: &[u8],
+        taken: &mut Vec<i32>,
+    ) -> f32 {
+        let raw = sung + interval;
+        let target = match chord.is_empty() {
+            true => Self::snap(raw, sung, &|n| self.scale.contains(n), taken),
+            false => Self::snap(
+                raw,
+                sung,
+                &|n| chord.iter().any(|c| (*c as i32 - n).rem_euclid(12) == 0),
+                taken,
+            ),
+        };
+        taken.push(target);
         // Micro-pitch: the voices fan out around the note rather than all
         // sitting a fixed distance off it, so an odd voice count is not
         // lopsided.
@@ -426,26 +603,40 @@ impl Harmonizer {
         } else {
             0.0
         };
-        base + spread * self.detune / 100.0
+        (target - sung) as f32 + spread * self.detune / 100.0
+    }
+
+    /// The chord the harmony follows, if any: the chart's when `Chart` is on
+    /// (it was started on purpose), else the keyboard's when `MIDI` is.
+    fn held(&self, out: &mut [u8; crate::chord::MAX_NOTES]) -> usize {
+        match (self.chart, self.midi) {
+            (true, _) => crate::chord::chart().read(out),
+            (false, true) => crate::chord::chord().read(out),
+            _ => 0,
+        }
     }
 
     /// Recompute what each voice does. Off the audio path: this walks scales
     /// and calls `powf`, and none of that belongs in a callback.
     fn rebuild(&mut self) {
         self.scale = Scale::new(self.key, self.kind);
-        // With MIDI on, the chord replaces the shape: the intervals are the
-        // ones being held, measured from the lowest note. Nothing held leaves
-        // the last chord standing — a harmoniser that stops the moment the
-        // hands come off the keys is one nobody can play.
         let mut held = [0u8; crate::chord::MAX_NOTES];
-        let chord = match self.midi {
-            true => crate::chord::chord().read(&mut held),
-            false => 0,
-        };
-        let steps = self.shape.steps();
-        let count = match chord > 1 {
+        let chord = self.held(&mut held);
+        let intervals = self.shape.semitones();
+        // **Nothing sung yet, and a chord to follow**: the chord itself is the
+        // harmony, measured from its lowest note — a harmoniser that waits for
+        // a voice before it says anything is one that cannot be checked with
+        // the singer silent. Once a note is heard the voices are fitted around
+        // *it*, which is what a harmony is.
+        let from_chord = chord > 1 && self.sung.is_none();
+        let count = match from_chord {
             true => (chord - 1).min(MAX_VOICES),
             false => self.count,
+        };
+        let sung = self.sung.unwrap_or(self.key as i32 + 60);
+        let pool: &[u8] = match chord > 0 && !from_chord {
+            true => &held[..chord],
+            false => &[],
         };
         let width = self.width;
         let delay_ms = self.delay_ms;
@@ -460,17 +651,28 @@ impl Harmonizer {
         // there and practically inaudible, and is what "the harmoniser does
         // nothing" turned out to mean.
         let level = 1.0 / (count as f32).max(1.0).sqrt();
+        let mut taken: Vec<i32> = Vec::with_capacity(MAX_VOICES);
         for i in 0..MAX_VOICES {
             // Chord: the interval from the root to the i-th note above it, in
             // semitones and needing no scale at all — the hand already chose
             // the notes. Otherwise the shape, walked through the key.
-            let semis = match chord > 1 && i + 1 < chord {
+            let semis = match from_chord && i + 1 < chord {
                 true => (held[i + 1] as i32 - held[0] as i32) as f32,
-                false => self.semitones_for(steps[i.min(steps.len() - 1)], i),
+                false => self.semitones_for(
+                    intervals[i.min(intervals.len() - 1)],
+                    i,
+                    sung,
+                    pool,
+                    &mut taken,
+                ),
             };
             let voice = &mut self.voices[i];
-            voice.shifter.set_semitones(semis);
+            // The target: `process_block` glides the shifter there.
             voice.semitones = semis;
+            if voice.gliding.is_nan() {
+                voice.gliding = semis;
+                voice.shifter.set_semitones(semis);
+            }
             voice.level = level;
             // Fanned across the image, and the odd one in the middle.
             let pan = if count > 1 {
@@ -510,10 +712,13 @@ impl Harmonizer {
         self.makeup = (1.0 / loudest.sqrt()).clamp(1.0, 4.0);
         self.dirty = false;
         self.chord_seen = crate::chord::chord().generation();
-        // The voice count follows the chord while it is driving.
-        if chord > 1 {
-            self.count = count;
+        self.chart_seen = crate::chord::chart().generation();
+        self.built_count = count;
+        let mut now = [0.0f32; MAX_VOICES];
+        for (slot, v) in now.iter_mut().zip(self.voices.iter()) {
+            *slot = v.semitones;
         }
+        stats().rebuilt(&now[..count]);
     }
 }
 
@@ -522,6 +727,39 @@ impl Harmonizer {
 /// has one, and it is `Wet` above.
 pub const VOC_PARAM0: usize = 12;
 pub const VOC_PARAMS: usize = 6;
+
+/// The `Chart` switch: after the vocoder's knobs, so nothing before it moved.
+pub const CHART_PARAM: usize = VOC_PARAM0 + VOC_PARAMS;
+
+/// What the harmoniser listens with: 32 ms of the voice, looked at every
+/// 4 ms. Half the autotune's window — enough for two periods of a 70 Hz note,
+/// which is below where anybody sings — and the harmony moves to a new note in
+/// under half the time it took with the autotune's 64 ms.
+const DETECT_WINDOW: usize = 512;
+const DETECT_HOP: usize = 64;
+
+/// How far, in semitones, the sung pitch has to move from the note it was
+/// heard as before the voices are moved: past the halfway point to the next
+/// note and a little more, so vibrato and scoops stay one note.
+const NOTE_HYSTERESIS: f32 = 0.65;
+
+/// How long a new note has to read the same before the voices move to it.
+/// Three of the detector's 4 ms looks: enough to sit out an attack's first
+/// wrong readings, short enough that the harmony still follows in under 50 ms.
+const STEADY_MS: f32 = 12.0;
+
+/// How clean a reading must be to count towards a new note at all.
+const STEADY_CONFIDENCE: f32 = 0.8;
+
+/// Where the envelope follower counts the voices as fully open, as a share of
+/// the recent peak: -20 dB. Under that is a gap, and the voices close with it.
+const OPEN_BELOW_PEAK: f32 = 0.1;
+
+/// How long a silence has to last before the note it followed is forgotten.
+const FORGET_MS: f32 = 1000.0;
+
+/// How long the voices take to move to a new harmony.
+const GLIDE_MS: f32 = 8.0;
 
 impl super::FxProcessor for Harmonizer {
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
@@ -541,6 +779,7 @@ impl super::FxProcessor for Harmonizer {
             for v in self.voices.iter_mut() {
                 v.shifter.set_sample_rate(sr);
             }
+            self.detector.set_sample_rate(sr);
             self.dirty = true;
         }
         // A hand that moved on the keyboard is a rebuild, and only that: the
@@ -548,12 +787,33 @@ impl super::FxProcessor for Harmonizer {
         if self.midi && crate::chord::chord().generation() != self.chord_seen {
             self.dirty = true;
         }
+        if self.chart && crate::chord::chart().generation() != self.chart_seen {
+            self.dirty = true;
+        }
         if self.dirty {
             self.rebuild();
         }
-        let count = self.count;
+        let count = self.built_count;
+        // The glide, a step a block: a block is a few milliseconds, the glide
+        // is `GLIDE_MS`, so a change of harmony is heard as the voices moving
+        // to it rather than as a jump in the shifter's speed.
+        let frames = (buf.len() / 2) as f32;
+        let step = 1.0 - (-frames / (GLIDE_MS * 0.001 * sr)).exp();
+        for v in self.voices.iter_mut().take(count) {
+            if v.gliding.is_nan() {
+                v.gliding = v.semitones;
+                v.shifter.set_semitones(v.gliding);
+            } else if (v.gliding - v.semitones).abs() > 1e-3 {
+                v.gliding += (v.semitones - v.gliding) * step;
+                if (v.gliding - v.semitones).abs() < 0.01 {
+                    v.gliding = v.semitones;
+                }
+                v.shifter.set_semitones(v.gliding);
+            }
+        }
         let mix = self.mix;
         let makeup = self.makeup;
+        let (mut block_peak, mut block_over) = (0.0f32, 0u32);
         let env_amount = self.env_amount;
         // Two seconds to fall by 1/e, as a per-sample coefficient.
         let peak_decay = (-1.0 / (2.0 * sr)).exp();
@@ -563,6 +823,7 @@ impl super::FxProcessor for Harmonizer {
             // One voice in, one signal to harmonise: a harmoniser fed a stereo
             // pair would be transposing two different signals into one chord.
             let mono = (dry_l + dry_r) * 0.5;
+            self.detector.process(std::slice::from_ref(&mono));
 
             let level = mono.abs().min(1.0);
             self.env.set_target(level);
@@ -576,9 +837,16 @@ impl super::FxProcessor for Harmonizer {
             };
             // How open the voices are: the fast envelope as a **fraction of how
             // loud this signal has been**, so a quiet microphone opens them as
-            // wide as a hot line does. Half of the recent peak counts as fully
-            // open — a syllable is well past that, a gap between them is not.
-            let reference = self.peak.max(1e-4) * 0.5;
+            // wide as a hot line does.
+            //
+            // **Fully open down to `OPEN_BELOW_PEAK` under the peak**, not
+            // half of it. The voices are copies of the input, so they already
+            // decay with it; closing them as well whenever it fell under half
+            // its peak made a piano's harmony die twice as fast as the piano —
+            // 5 dB under the dry at the default `Env`, 10 at full, which is
+            // "at 100 % wet I hear more of what goes in". What this is for is
+            // the gaps, and a gap is far further down than a decaying note.
+            let reference = self.peak.max(1e-4) * OPEN_BELOW_PEAK;
             let open = 1.0 - env_amount + env_amount * (e / reference).min(1.0);
 
             let mut wet = [0.0f32; 2];
@@ -598,6 +866,58 @@ impl super::FxProcessor for Harmonizer {
             let (wet_l, wet_r) = (wet[0] * makeup, wet[1] * makeup);
             frame[0] = dry_l + mix * (wet_l - dry_l);
             frame[1] = dry_r + mix * (wet_r - dry_r);
+            let loudest = frame[0].abs().max(frame[1].abs());
+            block_peak = block_peak.max(loudest);
+            block_over += (loudest > 1.0) as u32;
+        }
+        stats().block(block_peak, block_over);
+        // The note being sung, for the next block's voices. A new note is a
+        // rebuild; a note held through a consonant or a breath is kept, and so
+        // is one wobbling inside its own semitone — vibrato is not a new note.
+        //
+        // **And only a note that has held.** The first reading of an attack is
+        // the least believable one: a SoundFont's C4 was read as C3, a G4 went
+        // 67 → 39 → 43 → 67 in 18 ms, and every one of those moved the voices
+        // for a moment onto notes nobody sang — the "noise" in a harmony that
+        // was never clipping. A note has to read the same for `STEADY_MS`.
+        let e = self.detector.estimate();
+        let frames = (buf.len() / 2) as u32;
+        let voiced = e.voiced && e.frequency_hz > 0.0 && e.confidence >= STEADY_CONFIDENCE;
+        // **A silence forgets the note.** The last note heard stood as the
+        // reference for as long as nothing replaced it — minutes after the
+        // player stopped, the voices still moved round it on every chord and
+        // the log said "hears G2" over nothing. After `FORGET_MS` of nothing,
+        // there is no note: the next one is measured from itself.
+        self.silent = match voiced {
+            true => 0,
+            false => self.silent.saturating_add(frames),
+        };
+        if !voiced && self.sung.is_some() && self.silent as f32 >= FORGET_MS * 0.001 * sr {
+            self.sung = None;
+            self.dirty = true;
+            stats().forget();
+        }
+        if voiced {
+            let note = 69.0 + 12.0 * (e.frequency_hz / 440.0).log2();
+            let moved = self
+                .sung
+                .is_none_or(|s| (note - s as f32).abs() > NOTE_HYSTERESIS);
+            let heard = note.round() as i32;
+            self.candidate = match (moved, self.candidate) {
+                (false, _) => None,
+                (true, Some((n, held))) if n == heard => Some((n, held + frames)),
+                (true, _) => Some((heard, frames)),
+            };
+            if let Some((n, held)) = self.candidate {
+                if held as f32 >= STEADY_MS * 0.001 * sr {
+                    self.sung = Some(n);
+                    self.candidate = None;
+                    self.dirty = true;
+                    stats().note(n);
+                }
+            }
+        } else {
+            self.candidate = None;
         }
     }
 
@@ -610,6 +930,14 @@ impl super::FxProcessor for Harmonizer {
         }
         self.env.snap(0.0);
         self.peak = 0.0;
+        self.detector.reset();
+        self.sung = None;
+        self.candidate = None;
+        self.silent = 0;
+        for v in self.voices.iter_mut() {
+            v.gliding = f32::NAN;
+        }
+        self.dirty = true;
     }
 
     fn set_mix(&mut self, wet: f32) {
@@ -664,6 +992,15 @@ impl super::FxProcessor for Harmonizer {
         ]
         .into_iter()
         .chain(self.voc.params().into_iter().take(VOC_PARAMS))
+        // Appended after the vocoder's, for the same reason: follow the chart
+        // the interface plays.
+        .chain(std::iter::once(FxParam::new(
+            "Chart",
+            self.chart as u8 as f32,
+            0.0,
+            1.0,
+            "",
+        )))
         .collect()
     }
 
@@ -700,6 +1037,10 @@ impl super::FxProcessor for Harmonizer {
                 self.dirty = true;
             }
             11 => self.mode = Mode::from_norm(v),
+            CHART_PARAM => {
+                self.chart = v >= 0.5;
+                self.dirty = true;
+            }
             i if i >= VOC_PARAM0 => self.voc.set_param(i - VOC_PARAM0, v),
             _ => {}
         }
@@ -729,7 +1070,8 @@ mod tests {
         assert_eq!(params[8].name, "Wet");
         assert_eq!(params[9].name, "MIDI");
         assert_eq!(params[11].name, "Mode");
-        assert_eq!(params.len(), VOC_PARAM0 + VOC_PARAMS);
+        assert_eq!(params.len(), CHART_PARAM + 1);
+        assert_eq!(params[CHART_PARAM].name, "Chart");
         assert_eq!(params[VOC_PARAM0].name, "Bands");
 
         // Harmony by default; the mode knob swaps what the block does.
@@ -853,15 +1195,240 @@ mod tests {
             "the third of a minor scale is smaller: {minor} vs {from_c}"
         );
 
-        // Chromatic is the escape hatch: the step becomes a semitone count and
-        // the harmony is parallel, which is a sound and not a mistake.
+        // Chromatic is the escape hatch: every note belongs, so the interval
+        // is taken as it is — a major third, parallel, which is a sound and
+        // not a mistake. (It used to be two semitones: the step count read as
+        // semitones, so `3rds` sang seconds and `OCT` fifths.)
         h.set_scale(0.0);
         h.rebuild();
         assert!(
-            (h.intervals()[0] - 2.0).abs() < 0.5,
-            "chromatic takes the step as semitones: {}",
+            (h.intervals()[0] - 4.0).abs() < 0.5,
+            "chromatic takes the interval as written: {}",
             h.intervals()[0]
         );
+    }
+
+    /// **The third is measured from the note being sung**, not from the key.
+    /// A D sung in C major takes F above it — three semitones — and a C takes
+    /// E, four. It used to walk the steps from the tonic and apply the same
+    /// shift to every note, which is the parallel harmoniser this effect says
+    /// it is not.
+    #[test]
+    fn the_third_follows_the_note_being_sung() {
+        let third_over = |hz: f32| {
+            let mut h = Harmonizer::new(48_000);
+            h.set_voices(0.0);
+            h.shape = Shape::Thirds;
+            h.set_scale(1.0 / (ScaleType::ALL.len() - 1) as f32); // C major
+            h.set_key(0.0);
+            h.detune = 0.0;
+            let mut buf = tone(hz, 48_000.0, 24_000);
+            h.process_block(&mut buf, 48_000);
+            h.process_block(&mut [0.0f32; 64], 48_000);
+            (h.sung(), h.intervals()[0])
+        };
+        let (c, from_c) = third_over(261.63);
+        assert_eq!(c, Some(60), "C4 is heard as C4");
+        assert!((from_c - 4.0).abs() < 0.01, "E over C: {from_c}");
+        let (d, from_d) = third_over(293.66);
+        assert_eq!(d, Some(62), "D4 is heard as D4");
+        assert!((from_d - 3.0).abs() < 0.01, "F over D, not F#: {from_d}");
+    }
+
+    /// **The harmony moves with the singer, soon.** From C to D, the voices
+    /// are measured from the new note within 45 ms — it took 69 ms with the
+    /// autotune's 64 ms window, which is most of a sixteenth at 120 bpm of the
+    /// old harmony sung on the new note.
+    #[test]
+    fn a_new_note_is_heard_within_45_ms() {
+        let sr = 48_000.0f32;
+        let mut h = Harmonizer::new(48_000);
+        let mut phase = 0.0f32;
+        let mut feed = |h: &mut Harmonizer, hz: f32| {
+            let mut buf = Vec::with_capacity(512);
+            for _ in 0..256 {
+                let s = (phase * std::f32::consts::TAU).sin() * 0.4;
+                phase = (phase + hz / sr).fract();
+                buf.push(s);
+                buf.push(s);
+            }
+            h.process_block(&mut buf, 48_000);
+        };
+        for _ in 0..100 {
+            feed(&mut h, 261.63);
+        }
+        assert_eq!(h.sung(), Some(60));
+        let blocks = (1..=40)
+            .find(|_| {
+                feed(&mut h, 293.66);
+                h.sung() == Some(62)
+            })
+            .expect("D is heard at all");
+        let ms = blocks as f32 * 256.0 / 48.0;
+        assert!(ms <= 45.0, "the harmony took {ms:.1} ms to follow");
+        // And a low voice is still read at its own octave in the shorter window.
+        let mut h = Harmonizer::new(48_000);
+        for _ in 0..100 {
+            feed(&mut h, 82.41); // E2
+        }
+        assert_eq!(h.sung(), Some(40), "E2 is not the octave above");
+    }
+
+    /// **Two voices never share a note** — not the note each other has, and
+    /// not the sung one — whatever is sung over whatever chord. A third and a
+    /// fifth snapped onto a three-note chord both landed on its fifth, a few
+    /// cents apart, and the harmony beat like a chorus.
+    #[test]
+    fn two_voices_never_share_a_note() {
+        let _chart = crate::test_locks::chart();
+        let mut h = Harmonizer::new(48_000);
+        h.set_voices(0.667); // four
+        h.shape = Shape::Thirds;
+        h.detune = 0.0;
+        h.set_param(CHART_PARAM, 1.0);
+        for chord in [[48u8, 52, 55], [45, 48, 52], [41, 45, 48], [43, 47, 50]] {
+            crate::chord::chart().set(&chord);
+            for sung in 48..=72 {
+                h.sung = Some(sung);
+                h.rebuild();
+                let notes: Vec<i32> = h
+                    .intervals()
+                    .iter()
+                    .map(|s| sung + s.round() as i32)
+                    .collect();
+                let mut unique = notes.clone();
+                unique.sort_unstable();
+                unique.dedup();
+                assert_eq!(
+                    unique.len(),
+                    notes.len(),
+                    "{chord:?} over {sung}: {notes:?}"
+                );
+                assert!(
+                    !notes.contains(&sung),
+                    "a voice on the sung note: {notes:?}"
+                );
+            }
+        }
+        crate::chord::chart().clear();
+    }
+
+    /// The log's counters: what happened since the last reading, and a clean
+    /// start after it.
+    #[test]
+    fn the_stats_count_since_the_last_reading() {
+        let s = HarmStats {
+            blocks: AtomicU32::new(0),
+            notes: AtomicU32::new(0),
+            last_note: AtomicU32::new(u32::MAX),
+            rebuilds: AtomicU32::new(0),
+            peak: AtomicU32::new(0),
+            over: AtomicU32::new(0),
+            intervals: [const { AtomicU32::new(0) }; MAX_VOICES],
+            voices: AtomicU32::new(0),
+        };
+        assert_eq!(s.take().sung, None, "nothing heard yet");
+        s.note(64);
+        s.rebuilt(&[3.0, 7.0]);
+        s.block(0.4, 0);
+        s.block(1.2, 3);
+        let r = s.take();
+        assert_eq!(
+            (r.blocks, r.notes, r.sung, r.rebuilds, r.over),
+            (2, 1, Some(64), 1, 3)
+        );
+        assert!((r.peak - 1.2).abs() < 1e-6);
+        assert_eq!(&r.intervals[..r.voices], &[3.0, 7.0]);
+        let again = s.take();
+        assert_eq!((again.blocks, again.notes, again.over), (0, 0, 0));
+        assert_eq!(
+            again.sung,
+            Some(64),
+            "the note heard is kept, the counts are not"
+        );
+    }
+
+    /// **A second of silence forgets the note**; half a second between two
+    /// phrases does not.
+    #[test]
+    fn a_silence_forgets_the_note_it_followed() {
+        let sr = 48_000.0f32;
+        let mut h = Harmonizer::new(48_000);
+        let mut buf = tone(261.63, sr, 24_000);
+        h.process_block(&mut buf, 48_000);
+        assert_eq!(h.sung(), Some(60));
+        let quiet = |h: &mut Harmonizer, ms: usize| {
+            for _ in 0..ms * 48 / 256 {
+                h.process_block(&mut [0.0f32; 512], 48_000);
+            }
+        };
+        quiet(&mut h, 500);
+        assert_eq!(h.sung(), Some(60), "a breath between phrases keeps it");
+        quiet(&mut h, 700);
+        assert_eq!(h.sung(), None, "a second and more is nothing heard");
+    }
+
+    /// Octaves are octaves in every scale: twelve semitones, whatever the
+    /// scale has in it. Seven steps was a fifth in chromatic and an octave and
+    /// a second in a pentatonic.
+    #[test]
+    fn an_octave_is_an_octave_in_every_scale() {
+        for (i, _) in ScaleType::ALL.iter().enumerate() {
+            let mut h = Harmonizer::new(48_000);
+            h.set_voices(0.334);
+            h.shape = Shape::Octaves;
+            h.detune = 0.0;
+            h.set_scale(i as f32 / (ScaleType::ALL.len() - 1) as f32);
+            h.rebuild();
+            let iv = h.intervals();
+            assert_eq!(iv, vec![12.0, -12.0], "scale {i}: {iv:?}");
+        }
+    }
+
+    /// **A chart's chord decides the notes once something is sung**: the
+    /// voices land on the chord's tones nearest the shape's intervals, and a
+    /// new chord in the chart is a new harmony without anything played on a
+    /// keyboard.
+    #[test]
+    fn the_chart_chord_is_the_harmony_under_the_voice() {
+        let _chart = crate::test_locks::chart();
+        let mut h = Harmonizer::new(48_000);
+        h.set_voices(0.334); // two
+        h.shape = Shape::Thirds; // a third and a fifth above
+        h.detune = 0.0;
+        h.set_param(CHART_PARAM, 1.0);
+        assert!(h.follows_chart());
+        // Sing a G.
+        let mut buf = tone(392.0, 48_000.0, 24_000);
+        crate::chord::chart().set(&[48, 52, 55]); // C major
+        h.process_block(&mut buf, 48_000);
+        h.process_block(&mut [0.0f32; 64], 48_000);
+        assert_eq!(h.sung(), Some(67));
+        // Over G in C: a third above is B → nearest C-chord tone towards G is
+        // G itself, which is the sung note, so C; the fifth D → C or E, E.
+        let c = h.intervals();
+        let notes: Vec<i32> = c
+            .iter()
+            .map(|s| (67 + s.round() as i32).rem_euclid(12))
+            .collect();
+        assert!(
+            notes.iter().all(|n| [0, 4, 7].contains(n)),
+            "C-chord tones: {c:?}"
+        );
+        // The chart moves on to E minor: the voices move with it.
+        crate::chord::chart().set(&[52, 55, 59]);
+        h.process_block(&mut [0.0f32; 64], 48_000);
+        let e = h.intervals();
+        let notes: Vec<i32> = e
+            .iter()
+            .map(|s| (67 + s.round() as i32).rem_euclid(12))
+            .collect();
+        assert!(
+            notes.iter().all(|n| [4, 7, 11].contains(n)),
+            "Em tones: {e:?}"
+        );
+        assert_ne!(c, e, "a new chord is a new harmony");
+        crate::chord::chart().clear();
     }
 
     /// The voices actually sound, at the pitches they were told to.
@@ -884,7 +1451,6 @@ mod tests {
         let mut buf = tone(300.0, sr, 48_000);
         h.process_block(&mut buf, 48_000);
         let tail = &buf[24_000 * 2..];
-        // Chromatic `Octaves` is +7 and −7 semitones: a fifth up and down.
         //
         // Read against a frequency neither voice is at, rather than against an
         // absolute: the shifter's crossfade puts a slight warble on a held
@@ -892,8 +1458,9 @@ mod tests {
         // and makes every absolute number look small. What has to be true is
         // that there is energy where the voices are and none where they are
         // not.
-        let up = energy_at(tail, 300.0 * 2f32.powf(7.0 / 12.0), sr);
-        let down = energy_at(tail, 300.0 * 2f32.powf(-7.0 / 12.0), sr);
+        // Chromatic `Octaves` is ±12: an octave up and down.
+        let up = energy_at(tail, 600.0, sr);
+        let down = energy_at(tail, 150.0, sr);
         let nowhere = energy_at(tail, 1_500.0, sr);
         assert!(
             up > nowhere * 8.0 && down > nowhere * 8.0,

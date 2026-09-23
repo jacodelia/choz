@@ -12,7 +12,7 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **1091 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo), 602 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **1104 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo), 614 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio, y `cargo fmt --all --check` también.
 - **56 efectos propios**, publicados también como un `.clap` con los cuatro artifacts (arpegiador, secuenciador, metrónomo y arreglador).
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
@@ -31,6 +31,54 @@ lleva lo que falta —nada de lo ya hecho— y
   `choz-engine::test_locks` tiene un candado por global; en `choz-ui` el par es
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
+
+## [1.3.17] — 2026-09-23
+
+Release audit: `cargo test --workspace --exclude choz-plugin-lv2 --no-fail-fast` 1104 pasan y 0 fallan; `cargo clippy --workspace --all-targets -D warnings` y `cargo fmt --all --check` limpios; la UI nueva sólo usa claves i18n existentes (`BAR`, `CLICK`, `LOAD`, `OPEN`). Documentación: `docs/architecture.md` (el harmonizer que escucha, los cabezales del shifter), manual 6.5 (cómo canta el harmonizer, la fila del chart, sus teclas y su log) y a 1.3.17, README y roadmap.
+
+### 2026-09-23 — el harmonizer sigue un chart; auditoría de harmonizer, autotune y A→M
+
+**Harmonizer: lo que la auditoría encontró**
+
+- **No era diatónico respecto de la nota cantada.** Los pasos de `Shape` se recorrían desde la tónica de la tonalidad y el mismo desplazamiento se aplicaba a cualquier nota: una D cantada en do mayor con `3rds` daba F♯, no F. El test sólo medía desde la tónica. Ahora el harmonizer **detecta la nota cantada** (el mismo YIN de autotune, con histéresis de 0.65 semitonos para que el vibrato no cambie de nota) y cada voz es esa nota más el intervalo de la forma, llevada a la nota más cercana de la escala —o del acorde, cuando hay uno—, hacia la nota cantada en caso de empate (una tercera mayor en tonalidad menor es la menor). Test: `the_third_follows_the_note_being_sung`.
+- **`OCT` no era una octava fuera de mayor/menor.** Las formas contaban «7 pasos = octava», cierto sólo en escalas de siete notas: en cromática era una quinta y en pentatónica una octava y una segunda. Las formas ahora son intervalos en semitonos (`Shape::semitones`, leídos sobre la escala mayor) que la escala ajusta. Test: `an_octave_is_an_octave_in_every_scale`.
+- **Con un acorde del teclado**, las voces copiaban los intervalos del acorde desde su raíz. Con una nota cantada, ahora caen en las notas del acorde alrededor de ella; sin nada cantado, el acorde mismo sigue siendo la armonía (lo que se oye con el cantante en silencio).
+- `Voices`, `Scale` y `Key` se muestran bien (listas con nombre); sin cambios.
+
+**Harmonizer: seguir un chart `.chord`**
+
+- Fila nueva en el panel del harmonizer: **▶ ■ LOAD CLICK**, luces del compás y el acorde y la barra actuales (`▶ ■ LOAD ● CLICK ○ ●○○○ Am BAR 2/2`).
+- LOAD abre el mismo selector que el arreglador (`.chord` y `.mid`); un chart que no se lee se rechaza y se dice. El texto se guarda en el proyecto (`Fx::chart`).
+- ▶ toca el chart contra el transporte con un `Arranger` interno —el mismo tiempo de entrada, las barras de compás propio y la forma— y enciende el parámetro nuevo `Chart` del efecto; el acorde bajo el cursor se publica en un segundo acorde global, `choz_engine::chord::chart()`, que el harmonizer lee con prioridad sobre el teclado. ■ lo retira y apaga `Chart`.
+- **La luz sigue al click**: se calcula con la misma cifra y el mismo origen de compás que el metrónomo, así que luz y beep coinciden, también cuando el chart cambia de compás (el seguidor entra en `follow_arranger_meter` como un arreglador más).
+- **CLICK** es el interruptor del propio metrónomo.
+- Un solo harmonizer puede seguir un chart a la vez (un acorde global, como el del teclado). Test: `the_harmoniser_follows_a_chart_with_its_own_transport`, y en el motor `the_chart_chord_is_the_harmony_under_the_voice`.
+
+- **La armonía sigue al cantante en 37 ms, no en 69.** Medido de C a D: el detector de autotune mira 64 ms (dimensionado para 60 Hz) y hasta llenarlo el harmonizer cantaba la armonía vieja sobre la nota nueva. `PitchDetector::with_window` deja elegir ventana y salto; el harmonizer usa 32 ms cada 4 ms, que alcanza para dos periodos de 70 Hz (un E2 sigue leyéndose en su octava). Autotune sin cambios. Test: `a_new_note_is_heard_within_45_ms`.
+- **Teclado en la fila del chart**, con el harmonizer seleccionado: `y` ▶/■, `Y` LOAD, `o` CLICK; la línea de ayuda del panel los muestra.
+- **Manual**, 6.5: cómo canta el harmonizer (nota detectada, forma, escala o acorde) y la fila del chart con sus teclas.
+
+**Clicks y ruido en el harmonizer (reportado tras una prueba en vivo; el log no mostraba recortes)**
+
+- **El shifter hacía click en cada vuelta de sus cabezales.** `VoiceShifter::process` leía la segunda cabeza en `behind + win/2` sin envolverla: cuando la primera daba la vuelta, la segunda saltaba una ventana entera justo con ganancia máxima. Un click cada `win / |ratio − 1|` (85 ms en una quinta), casi a escala completa (0.94 contra 0.002 que permite un seno). Envuelta, su salto cae donde su ganancia es cero. El shifter es compartido: el shimmer también clickeaba, y su test de la segunda octava pasaba en parte gracias a esa energía (0.244 con clicks, 0.043 sin; el piso entre notas bajó de 0.015 a 0.008); ahora el test la mide contra ese piso. Con una melodía de SoundFont siguiendo un chart: 38 discontinuidades → 1. Tests: `the_heads_wrap_without_a_click`, `a_harmoniser_on_a_soundfont_adds_no_clicks` (falla con 20 clicks si se revierte).
+- **Una nota tiene que sostenerse 12 ms antes de mover las voces** (`STEADY_MS`, con confianza ≥ 0.8): el ataque de una nota se leía mal y las voces saltaban un instante a notas que nadie tocó.
+- **Dos voces nunca comparten nota**: una tercera y una quinta ajustadas a un acorde de tres notas caían en la misma, a pocos cents, y batían. Test: `two_voices_never_share_a_note`.
+- **Las voces se deslizan 8 ms** hacia una armonía nueva en vez de saltar.
+- **Log del harmonizer**: ▶ y ■ del chart, cada cambio de acorde (`harmoniser chart — bar 3: Am`), y una línea por segundo cuando algo cambió: la nota que oye, las notas nuevas, los cambios de voces y a qué intervalos, el pico de salida y las muestras sobre escala completa (`HarmStats`, atómicos sin lock). Test: `the_stats_count_since_the_last_reading`.
+
+**Tras la prueba con logs** (sin recortes ni bloques tarde; voces en notas del acorde en todos los casos revisados):
+
+- **Un error de octava ya no se queda pegado.** El log decía «hears C3» durante seis compases de C4. El `PitchDetector` corrige una lectura que cae justo una octava de la anterior (una voz no salta una octava en 4 ms) y guardaba la corrección como lectura anterior: una sola lectura equivocada en el ataque arrastraba todas las correctas a la octava equivocada hasta el final de la nota. Ahora la corrección dura como mucho `OCTAVE_PATIENCE` (3) análisis seguidos; una octava que se sigue leyendo es la octava. El detector es el de autotune: allí tenía el mismo defecto. La C4 del piano de DSoundFont se lee 60 (antes 48). Test: `one_octave_error_does_not_lock_the_octave`.
+- **Al 100 % de wet se oía más la entrada que la armonía** (log: pico de salida 0.01–0.04, y ~185 reconstrucciones de voces por segundo sin nada sonando). Tres causas:
+  - **El seguidor de envolvente cerraba las voces cuando la nota bajaba de la mitad de su ataque**, cosa que un piano hace enseguida; como las voces ya decaen con la entrada, la armonía moría el doble de rápido: −5 dB respecto del seco con `Env` por defecto, −10 dB al máximo. Ahora quedan abiertas hasta −20 dB del pico (`OPEN_BELOW_PEAK`); sólo los huecos las cierran. La salida ya no depende de `Env`: −2.2 dB con DSoundFont, −5.1 dB con el piano de FluidR3 (el harmonizer canta sobre la suma mono `(L+R)/2`, que pierde hasta 3 dB en un piano estéreo, más la pérdida propia del shifter). Test: `a_fully_wet_harmony_does_not_fade_faster_than_the_piano`.
+  - **Con `MIDI` encendido, la interfaz republicaba el acorde del teclado en cada cuadro** y el harmonizer reconstruía sus voces cada vez. Ahora sólo se publica cuando cambia.
+  - **`MIDI` seguía las mismas teclas que tocan el tab**: el acorde a seguir era lo que ya sonaba y las voces lo duplicaban. El log ahora lo avisa una vez, y sugiere elegir otro teclado con CHORD o apagar MIDI.
+- **Las luces del compás sólo se mueven con el chart en ▶**: detenido, muestran la forma del compás (`◉○○○`) sin avanzar con el reloj libre.
+- **Un segundo de silencio olvida la nota** (`FORGET_MS`): la última nota oída seguía siendo la referencia minutos después y las voces se movían alrededor de ella en cada acorde. El log dice «hears nothing». Test: `a_silence_forgets_the_note_it_followed`.
+
+**Autotune**: sólido (43 tests: detección, cuantización, corrección, presets, tasas, NaN). Un defecto: `params()` informaba siempre `Preset = 0`, así que un host del `.clap` exportado mostraba el primer preset sobre cualquier otro. Ahora recuerda el cargado.
+
+**A→M**: bien diseñado (decimación con anti-alias, histéresis, duración mínima de nota, velocity desde el gate). Un defecto: un cambio de tasa de muestreo reiniciaba el tracker **soltando la nota que sonaba sin mandar su Off**, y el synth la dejaba colgada (el grafo JACK pasando de 48 a 96 kHz, que aparece en el log). Ahora devuelve el Off antes de empezar de nuevo. Test: `a_rate_change_lets_go_of_the_note`.
 
 ## [1.3.16] — 2026-09-23
 

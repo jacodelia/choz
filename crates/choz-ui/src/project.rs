@@ -348,6 +348,9 @@ pub struct Fx {
     /// any of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chord_port: Option<String>,
+    /// The chart a harmoniser follows, as the `.chord` text. Absent is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chart: Option<String>,
     /// A looper's takes: the audio, which is the one thing about an effect that
     /// a knob position cannot say.
     ///
@@ -557,6 +560,7 @@ mod tests {
                     loops: Vec::new(),
                     gate: None,
                     chord_port: None,
+                    chart: None,
                     kind: "amberfang".into(),
                     enabled: true,
                     wet: 1.0,

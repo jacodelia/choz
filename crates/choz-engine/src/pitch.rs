@@ -264,9 +264,17 @@ impl PitchTracker {
     /// old one's release.
     pub fn process(&mut self, buf: &[f32], sample_rate: u32) -> ([Option<PitchEvent>; 2], usize) {
         if sample_rate != self.sample_rate {
+            // **The note sounding is let go of, not forgotten.** Starting over
+            // at the new rate dropped `sounding` with nothing sent, and the
+            // synth held that note for as long as the tab lived — a graph
+            // moving from 48 to 96 kHz under a guitar was a hung note.
+            let off = self.release();
             let gate = self.gate;
             *self = Self::new(sample_rate);
             self.gate = gate;
+            if let Some(off) = off {
+                return ([Some(off), None], 1);
+            }
         }
         // **The input is one jack.** A tab fed by a single channel has the same
         // signal on both sides, and one fed by two different ones has two
@@ -907,6 +915,29 @@ mod tests {
             }
         }
         assert_eq!(got, Some(55), "the left jack is the input, and it is a G");
+    }
+
+    /// A rate change mid-note sends the note's off: the tracker starts over at
+    /// the new rate, and the note it was sounding must not be left hanging on
+    /// the synth.
+    #[test]
+    fn a_rate_change_lets_go_of_the_note() {
+        let mut t = PitchTracker::new(48_000);
+        let mut src = Tone::new();
+        let mut on = None;
+        for _ in 0..200 {
+            let (ev, n) = t.process(&src.block(220.0, 48_000, 256, 0.3), 48_000);
+            for e in ev.iter().take(n).flatten() {
+                if let PitchEvent::On { note, .. } = e {
+                    on = Some(*note);
+                }
+            }
+        }
+        let note = on.expect("a steady A3 sounds");
+        assert_eq!(t.sounding(), Some(note));
+        let (ev, n) = t.process(&src.block(220.0, 96_000, 256, 0.3), 96_000);
+        assert_eq!((n, ev[0]), (1, Some(PitchEvent::Off { note })));
+        assert_eq!(t.sounding(), None);
     }
 
     #[test]

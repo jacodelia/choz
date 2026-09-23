@@ -831,6 +831,29 @@ nothing, paying for it with a light warble; it is what the shimmer's feedback
 loop and the harmoniser's voices share. Two shifters for two jobs, one
 implementation of each.
 
+`VoiceShifter` reads with two heads half a window apart and crossfades them so
+each one's wrap lands where it is silent. **Both heads wrap inside the
+window** — the second read `behind + win/2` unwrapped for a long time, so it
+jumped a whole window at full gain every time the first one wrapped: a click
+every `win / |ratio − 1|`, heard as noise in the harmoniser and inflating the
+shimmer's "second octave". `the_heads_wrap_without_a_click` holds it.
+
+**The harmoniser listens to what it harmonises.** It runs the autotune's
+`PitchDetector` on the mono fold of its input (`with_window(512, 64)`: 32 ms
+looked at every 4 ms, half the autotune's window, enough for 70 Hz), accepts a
+new note only once it has read the same for `STEADY_MS` and forgets it after
+`FORGET_MS` of silence. Each voice is that note plus the `Shape`'s interval in
+semitones, snapped onto the scale — or onto the chord it follows — towards the
+sung note on a tie, never onto a note another voice already has, and glided
+there over `GLIDE_MS`. The chord comes from one of two process-wide doors:
+`chord::chord()`, the keyboard (`MIDI`), or `chord::chart()`, a `.chord` the
+interface plays with an `Arranger` of its own against the transport (`Chart`;
+the chart wins). The detector's octave guard corrects a reading an octave from
+the last for at most `OCTAVE_PATIENCE` analyses: storing its own correction as
+the last reading once held a whole note an octave low. `harmonizer::stats()`
+is what the log line reads — atomics the audio thread writes, taken and reset
+once a second by the interface.
+
 `pitch::PitchTracker` (`A→M`) runs **inside the audio callback**, so what it
 costs comes out of the same budget as the instrument and the whole FX chain —
 and a callback that misses its deadline glitches the **graph**, not just choz.

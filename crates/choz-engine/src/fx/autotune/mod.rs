@@ -134,6 +134,10 @@ pub struct AutoTune {
     /// every other `AutoTune` in the process is also writing.
     level: f32,
     wet: f32,
+    /// The preset last loaded, so `params` can say which one it was — it said
+    /// the first, always, and a host showing the exported plugin's knobs
+    /// showed "Natural Vocal" over a Hard Auto-Tune.
+    preset: usize,
     pub params: AutoTuneParameters,
 }
 
@@ -162,6 +166,7 @@ impl AutoTune {
             target_hz: 0.0,
             level: 0.0,
             wet: 1.0,
+            preset: 0,
             params: AutoTuneParameters::default(),
         };
         me.apply_params();
@@ -178,6 +183,7 @@ impl AutoTune {
         let Some(&(_, retune, correction, humanize, mode)) = PRESETS.get(index) else {
             return;
         };
+        self.preset = index;
         self.params.retune_speed_ms = retune;
         self.params.correction = correction;
         self.params.humanize = humanize;
@@ -354,7 +360,13 @@ impl FxProcessor for AutoTune {
     fn params(&self) -> Vec<FxParam> {
         let p = &self.params;
         vec![
-            FxParam::new("Preset", 0.0, 0.0, (PRESETS.len() - 1) as f32, ""),
+            FxParam::new(
+                "Preset",
+                self.preset as f32 / (PRESETS.len() - 1) as f32,
+                0.0,
+                (PRESETS.len() - 1) as f32,
+                "",
+            ),
             FxParam::new(
                 "Retune",
                 norm(p.retune_speed_ms, 0.0, 1000.0),

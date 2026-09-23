@@ -697,6 +697,8 @@ enum ModalKind {
     SamplerChoice(SamplerPick),
     /// A progression for the tab's arranger: a `.chord`, or a `.mid`.
     ArrText,
+    /// A `.chord` chart for the selected harmoniser to follow.
+    HarmChart,
     /// Where the arranger's `.mid` is written.
     ArrExport,
     /// The tonic, picked on a piano — `(the key it came in with)`, so CANCEL
@@ -822,6 +824,20 @@ fn trim_gain(peak: f32, rms: f32, max: f32) -> (f32, bool) {
         false => max,
     };
     (want.min(ceiling).clamp(0.0, max), ceiling < want)
+}
+
+/// A chart file as text: a `.chord` as it is, a `.mid` read into one. What
+/// both the arranger's LOAD and the harmoniser's read.
+fn read_chart_file(path: &std::path::Path) -> anyhow::Result<String> {
+    let midi = path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("mid") || e.eq_ignore_ascii_case("midi"));
+    match midi {
+        true => std::fs::read(path)
+            .map_err(anyhow::Error::from)
+            .and_then(|b| arranger::smf::chart_of(&b)),
+        false => std::fs::read_to_string(path).map_err(anyhow::Error::from),
+    }
 }
 
 /// Below this RMS a tab has not been played, and there is nothing to measure.
@@ -1910,6 +1926,20 @@ impl HarmonicsState {
     }
 }
 
+/// A harmoniser following a `.chord` chart.
+///
+/// **The arranger does the counting**: the same downbeat PLAY waits for, the
+/// same bars of their own meter, the same form. Its band plays to nobody —
+/// the notes it would send are dropped — and what is read off it is the
+/// chord under the playhead, published for the harmoniser to sing on.
+struct HarmChart {
+    tab: usize,
+    fx: usize,
+    arr: arranger::Arranger,
+    /// The chord last published, so a chord held across a bar is one change.
+    last: Option<String>,
+}
+
 struct App {
     source: AudioSource,
     /// The note the sampler's audition button is holding, when it holds one.
@@ -1948,6 +1978,13 @@ struct App {
     /// Whether a chord is currently being published for a harmoniser, so it is
     /// cleared once rather than on every frame that has nothing to say.
     chord_published: bool,
+    /// The chord last published, so the same one is not published again: a
+    /// new publication is a new chord to the harmoniser, and it rebuilt its
+    /// voices on every one — 185 times a second, with nothing held.
+    chord_last: Vec<u8>,
+    /// The warning that the harmoniser is following the keys that play its own
+    /// tab has been given — once a switch-on, not once a frame.
+    chord_self_warned: bool,
 
     /// Rack slots (one per source). Slot at index i mirrors engine slot i.
     slots: Vec<RackSlot>,
@@ -2059,6 +2096,10 @@ struct App {
     /// arranger's bar, which is how a log came to have it off with nobody
     /// having asked for it.
     meter_held: bool,
+    /// The chart a harmoniser is following, when one is: which effect of which
+    /// tab, and the arranger that plays it against the transport. One at a
+    /// time — see [`choz_engine::chord::chart`].
+    harm_chart: Option<HarmChart>,
     /// The file this project was last saved to or loaded from — what plain
     /// "Save project" rewrites without asking anything.
     project_file: Option<std::path::PathBuf>,
@@ -2221,6 +2262,8 @@ impl App {
             synth_cursor: 0,
             fx_plugins: Vec::new(),
             chord_published: false,
+            chord_last: Vec::new(),
+            chord_self_warned: false,
             slots: Vec::new(),
             buses: [BusStrip::default(); choz_engine::BUSES],
             main: MainStrip::default(),
@@ -2267,6 +2310,7 @@ impl App {
             save_name: None,
             meter_followed: false,
             meter_held: false,
+            harm_chart: None,
             project_file: None,
             saved_project: None,
             port_edit: None,
@@ -4357,6 +4401,244 @@ impl App {
             .is_some_and(|s| !s.presets.is_empty() && s.preset_cursor < s.presets.len())
         {
             self.apply_preset_on(tab);
+        }
+    }
+
+    /// The selected effect, when it is a harmoniser.
+    fn selected_harmonizer(&self) -> Option<usize> {
+        self.fx_chain
+            .get(self.fx_slot)
+            .filter(|e| e.kind == source::AudioFxKind::Harmonizer && e.plugin.is_none())
+            .map(|_| self.fx_slot)
+    }
+
+    /// LOAD on the harmoniser's chart row: the same file picker the arranger
+    /// opens, the same `.chord` and `.mid`.
+    fn open_harm_chart(&mut self) {
+        if self.selected_harmonizer().is_none() {
+            return;
+        }
+        let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let mut modal = Modal::new(
+            ModalKind::HarmChart,
+            views::modal::ListModal::new(
+                format!("{} .{}", i18n::t("OPEN"), ARR_EXTS.join(" / .")),
+                Vec::new(),
+            ),
+        );
+        modal.browser = Some(file_browser::FileBrowser::open(&start, ARR_EXTS));
+        self.modal = Some(modal);
+        self.refresh_modal();
+    }
+
+    /// Read a chart into the selected harmoniser. One that does not parse is
+    /// said so and not kept: a harmony that follows nothing is worse than the
+    /// one that was there.
+    fn load_harm_chart(&mut self, path: std::path::PathBuf) {
+        let Some(fx) = self.selected_harmonizer() else {
+            return;
+        };
+        let text = match read_chart_file(&path) {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("choz: {}: {e}", path.display());
+                return;
+            }
+        };
+        if let Err(e) = arranger::chord::parse_progression(&text) {
+            eprintln!("choz: {}: {e}", path.display());
+            return;
+        }
+        eprintln!("choz: harmoniser follows {}", path.display());
+        self.fx_chain[fx].chart = Some(text.clone());
+        self.persist_active();
+        // Playing this very one: the new chart takes over where the form is.
+        if let Some(h) = self
+            .harm_chart
+            .as_mut()
+            .filter(|h| h.tab == self.active_slot && h.fx == fx)
+        {
+            h.arr.set_text(text);
+            h.last = None;
+        }
+    }
+
+    /// ▶ on the chart row: play the chart against the transport and switch the
+    /// harmoniser onto it. No chart yet is the picker, which is what ▶ with
+    /// nothing to play is asking for.
+    fn harm_play(&mut self) {
+        let Some(fx) = self.selected_harmonizer() else {
+            return;
+        };
+        let Some(text) = self.fx_chain[fx].chart.clone() else {
+            self.open_harm_chart();
+            return;
+        };
+        if self
+            .harm_chart
+            .as_ref()
+            .is_some_and(|h| h.tab == self.active_slot && h.fx == fx && h.arr.is_playing())
+        {
+            return;
+        }
+        self.harm_stop();
+        let mut arr = arranger::Arranger::new(arranger::ArrangerSettings {
+            on: true,
+            text,
+            ..Default::default()
+        });
+        if let Some(e) = arr.error() {
+            eprintln!("choz: harmoniser chart: {e}");
+            return;
+        }
+        arr.play();
+        eprintln!(
+            "choz: harmoniser \u{25B6} tab {} — a chart of {} bars, from the next downbeat",
+            self.active_slot + 1,
+            arr.bars()
+        );
+        self.set_harm_chart_param(fx, 1.0);
+        self.harm_chart = Some(HarmChart {
+            tab: self.active_slot,
+            fx,
+            arr,
+            last: None,
+        });
+    }
+
+    /// `y`: the chart row's ▶ and ■ on one key — playing this harmoniser's
+    /// chart stops it, anything else plays it.
+    fn harm_toggle(&mut self) {
+        let playing_here = self.harm_chart.as_ref().is_some_and(|h| {
+            h.tab == self.active_slot
+                && Some(h.fx) == self.selected_harmonizer()
+                && h.arr.is_playing()
+        });
+        match playing_here {
+            true => self.harm_stop(),
+            false => self.harm_play(),
+        }
+    }
+
+    /// ■: the chart stops, its chord is withdrawn and the harmoniser goes back
+    /// to its scale — or to the keyboard, if `MIDI` is on.
+    fn harm_stop(&mut self) {
+        let Some(mut h) = self.harm_chart.take() else {
+            return;
+        };
+        let mut out = Vec::new();
+        h.arr.stop(&mut out);
+        choz_engine::chord::chart().clear();
+        eprintln!(
+            "choz: harmoniser \u{25A0} tab {} — back on its scale",
+            h.tab + 1
+        );
+        if h.tab == self.active_slot {
+            self.set_harm_chart_param(h.fx, 0.0);
+        } else if let Some(e) = self
+            .slots
+            .get_mut(h.tab)
+            .and_then(|s| s.fx_chain.get_mut(h.fx))
+        {
+            // Another tab's: its stored switch, for the next time it is built;
+            // live it already sings on nothing, which is its scale.
+            if let Some(p) = e.params.get_mut(choz_engine::fx::harmonizer::CHART_PARAM) {
+                *p = 0.0;
+            }
+        }
+    }
+
+    /// The harmoniser's `Chart` switch, stored and sent.
+    fn set_harm_chart_param(&mut self, fx: usize, value: f32) {
+        let param = choz_engine::fx::harmonizer::CHART_PARAM;
+        if let Some(p) = self
+            .fx_chain
+            .get_mut(fx)
+            .and_then(|e| e.params.get_mut(param))
+        {
+            *p = value;
+        }
+        self.set_live_fx_param(fx, param, value);
+        self.persist_active();
+    }
+
+    /// The click on the chart row: the metronome's own switch — the beep is
+    /// the metronome's, and turning it off here turns it off everywhere.
+    fn harm_click(&mut self) {
+        let m = choz_engine::artifacts::metronome::metronome();
+        m.set_on(!m.on());
+    }
+
+    /// Play the chart one tick on, publish its chord when it changes, and
+    /// refresh what every harmoniser row on screen draws.
+    fn tick_harm_chart(&mut self, now: std::time::Instant) {
+        // The effect it was following went: removed, replaced, or its tab.
+        let gone = self.harm_chart.as_ref().is_some_and(|h| {
+            let chain = match h.tab == self.active_slot {
+                true => Some(&self.fx_chain),
+                false => self.slots.get(h.tab).map(|s| &s.fx_chain),
+            };
+            chain
+                .and_then(|c| c.get(h.fx))
+                .is_none_or(|e| e.kind != source::AudioFxKind::Harmonizer)
+        });
+        if gone {
+            self.harm_stop();
+        }
+        let mut shown = None;
+        if let Some(h) = self.harm_chart.as_mut() {
+            h.arr.retune_to_tempo();
+            // The band plays to nobody: nothing it sends is routed.
+            let mut out = Vec::new();
+            h.arr.tick(now, &mut out);
+            let chord = h.arr.chord_now().cloned();
+            let symbol = chord.as_ref().map(|c| c.symbol.clone());
+            if symbol != h.last {
+                let bar = h.arr.view().bar;
+                match &chord {
+                    Some(c) => {
+                        eprintln!("choz: harmoniser chart — bar {bar}: {}", c.symbol);
+                        let root = 48 + c.root as i32;
+                        let notes: Vec<u8> = c
+                            .tones
+                            .iter()
+                            .map(|t| (root + t).clamp(0, 127) as u8)
+                            .take(choz_engine::chord::MAX_NOTES)
+                            .collect();
+                        choz_engine::chord::chart().set(&notes);
+                    }
+                    None => choz_engine::chord::chart().clear(),
+                }
+                h.last = symbol.clone();
+            }
+            let view = h.arr.view();
+            shown = Some((h.tab, h.fx, h.arr.is_playing(), symbol, view.bar, view.bars));
+        }
+        // The metronome's beat, off the same numbers the click counts from.
+        let t = choz_ports::transport();
+        let (num, den) = t.time_signature();
+        let beats = num.max(1) as usize;
+        let beat_len = 4.0 / den.max(1) as f64;
+        let into = t.position_ppq() - t.bar_origin();
+        let beat = ((into / beat_len).floor() as i64).rem_euclid(beats as i64) as usize;
+        let click = choz_engine::artifacts::metronome::metronome().on();
+        let tab = self.active_slot;
+        for (i, e) in self.fx_chain.iter_mut().enumerate() {
+            if e.kind != source::AudioFxKind::Harmonizer {
+                continue;
+            }
+            let mine = shown.as_ref().filter(|s| s.0 == tab && s.1 == i);
+            e.chart_view = Some(source::HarmChartView {
+                loaded: e.chart.is_some(),
+                playing: mine.is_some_and(|s| s.2),
+                chord: mine.and_then(|s| s.3.clone()).unwrap_or_default(),
+                bar: mine.map_or(0, |s| s.4),
+                bars: mine.map_or(0, |s| s.5),
+                beat,
+                beats,
+                click,
+                error: None,
+            });
         }
     }
 
@@ -7982,7 +8264,11 @@ impl App {
                 .map(|m| m.list.items.clone())
                 .unwrap_or_default(),
             ModalKind::SamplerMap => self.sampler_map_rows(),
-            ModalKind::Browser | ModalKind::Wallpaper | ModalKind::Bank | ModalKind::ArrText => self
+            ModalKind::Browser
+            | ModalKind::Wallpaper
+            | ModalKind::Bank
+            | ModalKind::ArrText
+            | ModalKind::HarmChart => self
                 .modal
                 .as_ref()
                 .unwrap()
@@ -8688,10 +8974,15 @@ impl App {
                 }
                 true
             }
-            ModalKind::Browser | ModalKind::Wallpaper | ModalKind::Bank | ModalKind::ArrText => {
+            ModalKind::Browser
+            | ModalKind::Wallpaper
+            | ModalKind::Bank
+            | ModalKind::ArrText
+            | ModalKind::HarmChart => {
                 let wallpaper = m.kind == ModalKind::Wallpaper;
                 let bank = m.kind == ModalKind::Bank;
                 let progression = m.kind == ModalKind::ArrText;
+                let harm_chart = m.kind == ModalKind::HarmChart;
                 let action = self.modal.as_mut().and_then(|m| {
                     let b = m.browser.as_mut()?;
                     b.cursor = i;
@@ -8725,6 +9016,10 @@ impl App {
                     }
                     Some(file_browser::Action::PickFile(path)) if progression => {
                         self.load_arranger_text(path);
+                        true
+                    }
+                    Some(file_browser::Action::PickFile(path)) if harm_chart => {
+                        self.load_harm_chart(path);
                         true
                     }
                     Some(file_browser::Action::PickFile(path)) if bank => {
@@ -9170,6 +9465,7 @@ impl App {
                                 .map(|b| project::encode_state(&b))
                                 .unwrap_or_default(),
                             chord_port: e.chord_port.clone(),
+                            chart: e.chart.clone(),
                             // Filled in by the save, which is the only side
                             // that knows where the file is going and is the
                             // only side allowed to write megabytes of audio —
@@ -9581,6 +9877,7 @@ impl App {
                     let mut entry = self.project_fx(f)?;
                     entry.state = project::decode_state(&f.state).unwrap_or_default();
                     entry.chord_port = f.chord_port.clone();
+                    entry.chart = f.chart.clone();
                     entry.gate = f.gate.as_ref().map(|g| choz_engine::fx_chain::GateSpec {
                         source: g.source.to_engine(),
                         param: g.param,
@@ -11305,6 +11602,47 @@ impl App {
         self.pending_load = Some(PendingLoad::Project(path));
     }
 
+    /// What the harmoniser did in the last second, when it did something: the
+    /// note it heard, how often its voices moved and where to, how loud it
+    /// came out and whether any of that passed full scale. Silent while it
+    /// sings one note steadily and silent when there is none — a line a second
+    /// for a held note is a log nobody reads.
+    fn log_harmonizer(&mut self) {
+        let r = choz_engine::fx::harmonizer::stats().take();
+        if r.blocks == 0 || (r.notes == 0 && r.rebuilds == 0 && r.over == 0) {
+            return;
+        }
+        let note = |n: u8| {
+            format!(
+                "{}{}",
+                choz_engine::fx::autotune::NOTE_NAMES[(n % 12) as usize],
+                n as i32 / 12 - 1
+            )
+        };
+        let voices: Vec<String> = r.intervals[..r.voices]
+            .iter()
+            .map(|v| format!("{:+}", v.round() as i32))
+            .collect();
+        eprintln!(
+            "choz[{}]: harmoniser — hears {}, {} new note{}, {} voice change{}, voices {} semitones, peak {:.2}{}",
+            std::process::id(),
+            r.sung.map(|n| format!("{} ({n})", note(n))).unwrap_or_else(|| "nothing".into()),
+            r.notes,
+            if r.notes == 1 { "" } else { "s" },
+            r.rebuilds,
+            if r.rebuilds == 1 { "" } else { "s" },
+            match voices.is_empty() {
+                true => "\u{2013}".to_string(),
+                false => voices.join(" "),
+            },
+            r.peak,
+            match r.over {
+                0 => String::new(),
+                n => format!(", {n} samples over full scale"),
+            }
+        );
+    }
+
     /// Say in the log when the audio thread could not keep up.
     ///
     /// The symptom the user reports is always the same sentence — "the sound
@@ -11320,6 +11658,7 @@ impl App {
             return;
         }
         self.health_at = Instant::now();
+        self.log_harmonizer();
         let (peak, blocks, over) = choz_engine::meter::load().take();
         // Read straight after `take`, which is what resets the pair: the worst
         // block's own CPU time, beside the wall time it belongs to.
@@ -12692,6 +13031,7 @@ impl App {
         for (slot_index, role, event) in events {
             self.play_arranger_event(slot_index, role, event, now);
         }
+        self.tick_harm_chart(now);
         self.follow_arranger_meter();
     }
 
@@ -12704,17 +13044,19 @@ impl App {
     /// Inside a DAW too: `choz-rack.clap` does not read the host's transport,
     /// so the rack's bar is still its own to set.
     fn follow_arranger_meter(&mut self) {
-        let playing = self.slots.iter().any(|s| s.arranger.is_playing());
+        // Every arranger counting a bar: the tabs', and the one a harmoniser
+        // follows its chart with — the click has to count that chart's bar
+        // too, or the light on the harmoniser and the beep part ways.
+        let harm = self.harm_chart.as_ref().map(|h| &h.arr);
+        let arrangers = || self.slots.iter().map(|s| &s.arranger).chain(harm);
+        let playing = arrangers().any(|a| a.is_playing());
         // **A chart that changes meter is followed whatever FOLLOW ARR says.**
         // The switch chooses between the band's bar and the player's own for
         // a chart in one meter — both are a bar. Against one that changes, a
         // fixed click is not the player's bar, it is a click out of step from
         // the first change on: `changes.chord` had no downbeat under its bars
         // from the fourth on, with the switch left off by an older build.
-        let changes = self
-            .slots
-            .iter()
-            .any(|s| s.arranger.is_playing() && s.arranger.changes_meter());
+        let changes = arrangers().any(|a| a.is_playing() && a.changes_meter());
         if !self.ui.audio.follow_arranger && !changes && !self.meter_followed {
             return;
         }
@@ -12727,16 +13069,11 @@ impl App {
         let band = self
             .slots
             .get(self.active_slot)
-            .filter(|s| s.arranger.is_playing())
-            .or_else(|| self.slots.iter().find(|s| s.arranger.is_playing()))
-            .filter(|s| follow || s.arranger.changes_meter())
-            .map(|s| {
-                (
-                    s.arranger.own_meter(),
-                    s.arranger.bar_groups(),
-                    s.arranger.bar_origin_ppq(),
-                )
-            });
+            .map(|s| &s.arranger)
+            .filter(|a| a.is_playing())
+            .or_else(|| arrangers().find(|a| a.is_playing()))
+            .filter(|a| follow || a.changes_meter())
+            .map(|a| (a.own_meter(), a.bar_groups(), a.bar_origin_ppq()));
         let m = choz_engine::artifacts::metronome::metronome();
         match band {
             Some((meter, groups, origin)) => {
@@ -13667,16 +14004,7 @@ impl App {
     /// not parse leaves the part that was playing alone and says so on the box
     /// — the same rule the arranger itself follows.
     fn load_arranger_text(&mut self, path: std::path::PathBuf) {
-        let midi = path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("mid") || e.eq_ignore_ascii_case("midi"));
-        let read = match midi {
-            true => std::fs::read(&path)
-                .map_err(anyhow::Error::from)
-                .and_then(|b| arranger::smf::chart_of(&b)),
-            false => std::fs::read_to_string(&path).map_err(anyhow::Error::from),
-        };
-        let text = match read {
+        let text = match read_chart_file(&path) {
             Ok(text) => text,
             // The log, because the RACK has no status line — the same place
             // the loop export writes its failures to.
@@ -16136,9 +16464,30 @@ impl App {
             if self.chord_published {
                 choz_engine::chord::chord().clear();
                 self.chord_published = false;
+                self.chord_last.clear();
             }
+            self.chord_self_warned = false;
             return;
         };
+        // **Its own keys.** With no keyboard picked and the tab played from
+        // the keys rather than a microphone, the chord the harmoniser follows
+        // is the notes the instrument is already playing: every voice lands on
+        // one of them, and the effect doubles the input instead of adding to
+        // it — "at 100% wet I hear more of what goes in". Said once.
+        let own_keys = port.is_none()
+            && self
+                .slots
+                .get(self.active_slot)
+                .is_some_and(|s| s.in_pair.is_none());
+        if own_keys && !self.chord_self_warned {
+            eprintln!(
+                "choz: harmoniser MIDI follows the keys that play tab {} — its voices will \
+                 double the chord you play. Pick another keyboard with CHORD, or switch MIDI \
+                 off to harmonise on the scale or a chart.",
+                self.active_slot + 1
+            );
+            self.chord_self_warned = true;
+        }
         // The chosen keyboard, when one was chosen: with two controllers both
         // sending channel 1, the channel alone cannot say whose chord this is.
         let source = port.as_ref().and_then(|name| {
@@ -16156,7 +16505,11 @@ impl App {
         // else to identify the keyboard by, so the active tab stays the filter.
         let slot = source.is_none().then_some(self.active_slot);
         let held = self.keyboard.held_from(channel, slot, source);
+        if self.chord_published && held == self.chord_last {
+            return;
+        }
         choz_engine::chord::chord().set(&held);
+        self.chord_last = held;
         self.chord_published = true;
     }
 
@@ -17992,6 +18345,11 @@ fn handle_fx_keys(app: &mut App, key: KeyCode) {
         // instrument picker and `c` is the gate, so this is the shifted one:
         // it belongs to the same effect the gate does.
         KeyCode::Char('C') if !app.fx_chain.is_empty() => app.open_chord_input_modal(),
+        // The harmoniser's chart row, from the keyboard: ▶/■ on one key, the
+        // way PLAY is also PAUSE on the looper, and LOAD and the click beside it.
+        KeyCode::Char('y') if app.selected_harmonizer().is_some() => app.harm_toggle(),
+        KeyCode::Char('Y') if app.selected_harmonizer().is_some() => app.open_harm_chart(),
+        KeyCode::Char('o') if app.selected_harmonizer().is_some() => app.harm_click(),
         KeyCode::Char('d') if !app.fx_chain.is_empty() => app.delete_fx(),
         _ => {}
     }
@@ -18451,6 +18809,11 @@ enum MouseAction {
     /// keyboard its chord comes from.
     OpenFxGate,
     OpenChordInput,
+    /// The harmoniser's chart row: play, stop, load, and the click.
+    HarmPlay,
+    HarmStop,
+    HarmLoad,
+    HarmClick,
     ToggleEditor,
     /// Open the harmonics of the tab's instrument.
     OpenHarmonics,
@@ -18643,6 +19006,10 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                             // the picker its key opens.
                             RackButton::FxGate => MouseAction::OpenFxGate,
                             RackButton::FxChord => MouseAction::OpenChordInput,
+                            RackButton::HarmPlay => MouseAction::HarmPlay,
+                            RackButton::HarmStop => MouseAction::HarmStop,
+                            RackButton::HarmLoad => MouseAction::HarmLoad,
+                            RackButton::HarmClick => MouseAction::HarmClick,
                             // The ones with names open their list instead of
                             // walking it: on a panel too short for the knob
                             // box these buttons are the only way in, and
@@ -19469,6 +19836,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         MouseAction::SoundAdd => app.add_sound_slot(app.active_slot),
         MouseAction::OpenFxGate => app.open_fx_gate_modal(),
         MouseAction::OpenChordInput => app.open_chord_input_modal(),
+        MouseAction::HarmPlay => app.harm_play(),
+        MouseAction::HarmStop => app.harm_stop(),
+        MouseAction::HarmLoad => app.open_harm_chart(),
+        MouseAction::HarmClick => app.harm_click(),
         // Straight to the same funnel the computer keyboard's piano uses, so a
         // clicked key arpeggiates, splits and releases itself exactly as a
         // typed one does.
@@ -27084,6 +27455,167 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **The harmoniser follows a chart.** LOAD reads a `.chord` into the
+    /// effect, ▶ plays it against the transport and switches the effect's
+    /// `Chart` on, the chord under the playhead is published as the form goes,
+    /// the row lights the metronome's beat, CLICK is the metronome's own
+    /// switch, and ■ withdraws the chord and the switch.
+    #[test]
+    fn the_harmoniser_follows_a_chart_with_its_own_transport() {
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        sandbox_state_dir();
+        let t = choz_ports::transport();
+        t.set_playing(false);
+        t.set_bpm(120.0);
+        t.set_sample_rate(48_000);
+        t.set_time_signature(4, 4);
+        t.set_bar_origin(0.0);
+        t.set_free_samples(0);
+        let chart = choz_engine::chord::chart();
+        chart.clear();
+        let met = choz_engine::artifacts::metronome::metronome();
+        let was_on = met.on();
+
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        app.fx_chain
+            .push(AudioFxEntry::new(source::AudioFxKind::Harmonizer));
+        app.fx_slot = 0;
+
+        // ▶ with no chart asks for one.
+        app.harm_play();
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::HarmChart)
+        );
+        app.close_modal();
+
+        let dir = std::env::temp_dir().join(format!("choz-harm-chart-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("two.chord");
+        std::fs::write(&file, "| C | Am |").unwrap();
+        app.load_harm_chart(file);
+        assert!(
+            app.fx_chain[0].chart.is_some(),
+            "the chart is kept on the effect"
+        );
+        let bad = dir.join("bad.chord");
+        std::fs::write(&bad, "| Zq9 |").unwrap();
+        app.load_harm_chart(bad);
+        assert_eq!(
+            app.fx_chain[0].chart.as_deref(),
+            Some("| C | Am |"),
+            "a bad one is refused"
+        );
+
+        app.harm_play();
+        let param = choz_engine::fx::harmonizer::CHART_PARAM;
+        assert_eq!(
+            app.fx_chain[0].params[param], 1.0,
+            "the effect follows the chart"
+        );
+
+        // Bar one: C major on the chart. A beat is 24 000 frames at 120 bpm.
+        let mut held = [0u8; choz_engine::chord::MAX_NOTES];
+        // Ticked the way the interface ticks it — often — up to `beat`: a
+        // jump of beats at once is a seek, and a seek does not play.
+        let mut now = 0.0f64;
+        let mut pcs_at = |app: &mut App, beat: f64| {
+            while now < beat {
+                now = (now + 0.05).min(beat);
+                t.set_free_samples((now * 24_000.0) as u64);
+                app.tick_arrangers();
+            }
+            let n = chart.read(&mut held);
+            let mut pcs: Vec<u8> = held[..n].iter().map(|n| n % 12).collect();
+            pcs.sort_unstable();
+            pcs
+        };
+        assert_eq!(pcs_at(&mut app, 0.5), vec![0, 4, 7], "C");
+        let v = app.fx_chain[0].chart_view.clone().unwrap();
+        assert!(v.playing && v.chord == "C" && v.bars == 2, "{v:?}");
+        assert_eq!((v.beat, v.beats), (0, 4), "the first beat is lit");
+        // Beat three of bar one: the light has moved with the click.
+        pcs_at(&mut app, 2.5);
+        assert_eq!(app.fx_chain[0].chart_view.as_ref().unwrap().beat, 2);
+        let (screen, _) = render_rack(&mut app, 140, 40);
+        assert!(
+            screen.contains("\u{25C9}\u{25CB}\u{25CF}\u{25CB}"),
+            "beat three lit:\n{screen}"
+        );
+        // Bar two: the chart has moved on, and so has the chord.
+        assert_eq!(pcs_at(&mut app, 4.5), vec![0, 4, 9], "Am");
+        assert_eq!(app.fx_chain[0].chart_view.as_ref().unwrap().chord, "Am");
+        // On the panel: the transport, the lights and the chord.
+        let (screen, rack) = render_rack(&mut app, 140, 40);
+        for b in [
+            RackButton::HarmPlay,
+            RackButton::HarmStop,
+            RackButton::HarmLoad,
+            RackButton::HarmClick,
+        ] {
+            assert!(
+                rack.buttons.iter().any(|(x, _)| *x == b),
+                "{b:?} not drawn:\n{screen}"
+            );
+        }
+        assert!(screen.contains("Am") && screen.contains("2/2"), "{screen}");
+
+        // CLICK is the metronome's switch, both ways.
+        app.harm_click();
+        assert_ne!(met.on(), was_on);
+        app.harm_click();
+        assert_eq!(met.on(), was_on);
+
+        // The keys do what the buttons do: `o` the click, `y` ■ and ▶ again.
+        handle_fx_keys(&mut app, KeyCode::Char('o'));
+        assert_ne!(met.on(), was_on, "o is CLICK");
+        handle_fx_keys(&mut app, KeyCode::Char('o'));
+        handle_fx_keys(&mut app, KeyCode::Char('y'));
+        assert!(app.harm_chart.is_none(), "y stops a chart that plays");
+        handle_fx_keys(&mut app, KeyCode::Char('y'));
+        assert!(app.harm_chart.is_some(), "and plays one that does not");
+        handle_fx_keys(&mut app, KeyCode::Char('Y'));
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::HarmChart),
+            "Y is LOAD"
+        );
+        app.close_modal();
+
+        // ■: no chord, no switch, nothing playing.
+        app.harm_stop();
+        assert_eq!(chart.read(&mut held), 0, "the chord is withdrawn");
+        assert_eq!(app.fx_chain[0].params[param], 0.0);
+        app.tick_arrangers();
+        assert!(!app.fx_chain[0].chart_view.as_ref().unwrap().playing);
+        // Stopped, the lights stand still: no beat is lit, whatever the clock.
+        let (screen, _) = render_rack(&mut app, 140, 40);
+        assert!(
+            screen.contains("\u{25C9}\u{25CB}\u{25CB}\u{25CB}"),
+            "{screen}"
+        );
+        t.set_free_samples(48_000 * 3 / 2); // beat four of the free clock
+        app.tick_arrangers();
+        let (still, _) = render_rack(&mut app, 140, 40);
+        assert!(
+            still.contains("\u{25C9}\u{25CB}\u{25CB}\u{25CB}"),
+            "{still}"
+        );
+
+        // The chart travels with the project.
+        let saved = app.project_snapshot();
+        let mut fresh = App::new();
+        fresh.apply_project_rack(saved);
+        assert_eq!(
+            fresh.slots[0].fx_chain[0].chart.as_deref(),
+            Some("| C | Am |")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// **The right button on a musician picks what they play on.** On a
     /// SoundFont tab it opens the font's programs for that musician, AUTO on
     /// top; the pick is kept in the settings and is the program the band's
@@ -30183,6 +30715,13 @@ mod tests {
         app.publish_chord();
         assert_eq!(chord.read(&mut out), 3, "the chord reaches the effect");
         assert_eq!(&out[..3], &[60, 64, 67]);
+        // The same chord, frame after frame, is published once: every
+        // publication is a rebuild of the harmoniser's voices, and it was
+        // rebuilding 185 times a second with nothing moving under the hand.
+        let seen = chord.generation();
+        app.publish_chord();
+        app.publish_chord();
+        assert_eq!(chord.generation(), seen, "an unchanged chord is not news");
 
         // Another channel: the same keys are somebody else's.
         app.fx_chain[0].params[10] = 0.0;

@@ -130,10 +130,16 @@ impl VoiceShifter {
         // a fraction of a sample per sample — and a two-tap average is a
         // low-pass whose depth follows the fraction, so with linear reads a
         // held note is dulled by an amount that moves as the head does.
+        //
+        // **Both heads wrap inside the window.** The second one used to read
+        // `behind + win/2` as it stood, so when the first head wrapped the
+        // second jumped a whole window too — at the moment it was carrying
+        // the whole signal. Wrapped on its own, its jump lands half a window
+        // later, where its gain is zero, which is what the crossfade is for.
         let t = self.behind / win;
         let g = head_gain(t);
-        self.line.read_cubic(self.behind) * g
-            + self.line.read_cubic(self.behind + win * 0.5) * (1.0 - g)
+        let other = (self.behind + win * 0.5).rem_euclid(win);
+        self.line.read_cubic(self.behind) * g + self.line.read_cubic(other) * (1.0 - g)
     }
 }
 
@@ -175,6 +181,36 @@ mod tests {
             assert!(
                 there > here * 3.0,
                 "{semis} semitones should land at {expect} Hz: {there} vs {here} at the original"
+            );
+        }
+    }
+
+    /// **No click where the heads wrap.** Each head jumps a whole window when
+    /// it runs out, and the crossfade is there to make that jump where the
+    /// head is silent. The second head read `behind + win/2` unwrapped, so its
+    /// jump came exactly when the *first* one wrapped — which is where the
+    /// second one is loudest: a click every `win / |ratio − 1|`, 85 ms apart
+    /// on a fifth, measured as the harmoniser's "noise".
+    #[test]
+    fn the_heads_wrap_without_a_click() {
+        let sr = 48_000.0;
+        for semis in [4.0f32, 7.0, -5.0, 12.0] {
+            let mut sh = VoiceShifter::new();
+            sh.set_semitones(semis);
+            let out: Vec<f32> = (0..96_000)
+                .map(|i| sh.process((std::f32::consts::TAU * 220.0 * i as f32 / sr).sin() * 0.5))
+                .collect();
+            // A sine's second difference is bounded by its curvature; a jump
+            // in the read position is many times that.
+            let w = std::f32::consts::TAU * 220.0 * 2f32.powf(semis / 12.0) / sr;
+            let smooth = 0.5 * w * w * 3.0;
+            let worst = out[24_000..]
+                .windows(3)
+                .map(|x| (x[2] - 2.0 * x[1] + x[0]).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                worst < smooth,
+                "{semis} semitones: a step of {worst} where a sine allows {smooth}"
             );
         }
     }
