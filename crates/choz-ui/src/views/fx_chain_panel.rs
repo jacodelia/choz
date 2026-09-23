@@ -251,6 +251,11 @@ pub enum RackButton {
     /// Which keyboard the selected effect takes its chord from. Only the
     /// harmoniser has one, so only the harmoniser draws it.
     FxChord,
+    /// The harmoniser's chart row: ▶, ■, LOAD and the click's switch.
+    HarmPlay,
+    HarmStop,
+    HarmLoad,
+    HarmClick,
 }
 
 /// Every clickable area of the panel, filled in as it draws.
@@ -3609,6 +3614,78 @@ pub fn draw_fx_chain_panel(
         y = row.finish();
     }
 
+    // The harmoniser's chart: a `.chord` progression it follows, played
+    // against the transport like the arranger's, with its transport here —
+    // and a light on every beat of the metronome, so the chord changing is
+    // something seen as well as heard.
+    if let Some(v) = entry
+        .chart_view
+        .as_ref()
+        .filter(|_| entry.kind == crate::source::AudioFxKind::Harmonizer)
+    {
+        let on = |lit: bool| match lit {
+            true => Style::default()
+                .fg(Color::Black)
+                .bg(ON_COLOUR)
+                .add_modifier(Modifier::BOLD),
+            false => btn_style,
+        };
+        let mut row = ButtonRow::new(fx_box, bg, y, 2);
+        let rect = row.button(f, " \u{25B6} ".to_string(), on(v.playing));
+        layout.buttons.push((RackButton::HarmPlay, rect));
+        let rect = row.button(f, " \u{25A0} ".to_string(), btn_style);
+        layout.buttons.push((RackButton::HarmStop, rect));
+        let rect = row.button(
+            f,
+            format!(
+                " {} {} ",
+                t("LOAD"),
+                if v.loaded { "\u{25CF}" } else { "\u{25CB}" }
+            ),
+            on(v.loaded && !v.playing),
+        );
+        layout.buttons.push((RackButton::HarmLoad, rect));
+        let rect = row.button(
+            f,
+            format!(
+                " {} {} ",
+                t("CLICK"),
+                if v.click { "\u{25CF}" } else { "\u{25CB}" }
+            ),
+            on(v.click),
+        );
+        layout.buttons.push((RackButton::HarmClick, rect));
+        // The lights: the beat the click is on, the one brighter still.
+        // **Only while the chart plays.** Stopped, the lights are the bar's
+        // shape and nothing moves: a light walking with the free clock said
+        // "playing" when nothing was.
+        let lit = v.playing.then_some(v.beat);
+        let lights: String = (0..v.beats.min(16))
+            .map(|b| match (Some(b) == lit, b == 0) {
+                (true, _) => '\u{25CF}',
+                (false, true) => '\u{25C9}',
+                (false, false) => '\u{25CB}',
+            })
+            .collect();
+        let _ = row.button(
+            f,
+            format!(" {lights} "),
+            match lit == Some(0) {
+                true => Style::default().fg(ON_COLOUR).add_modifier(Modifier::BOLD),
+                false => Style::default().fg(HEADER),
+            },
+        );
+        let _ = row.button(
+            f,
+            match (v.playing, v.chord.is_empty()) {
+                (true, false) => format!(" {}  {} {}/{} ", v.chord, t("BAR"), v.bar, v.bars),
+                _ => " \u{2013} ".to_string(),
+            },
+            Style::default().fg(HEADER).add_modifier(Modifier::BOLD),
+        );
+        y = row.finish();
+    }
+
     // ── Selected FX: the same knob box, from the same helper ──────────────
     let descs = entry.param_descs();
     // A hosted effect's parameters are the plugin's own names, and a plugin
@@ -3909,6 +3986,14 @@ pub fn draw_fx_chain_panel(
     let hint_y = (inner.y + inner.height).saturating_sub(1).max(y);
     let hint = if focused && deck_drawn {
         "  k=box \u{2190}\u{2192}=channel \u{2191}\u{2193}=button enter=press \u{00B7} PLAY is also PAUSE \u{00B7} \u{2669} is choz's own click \u{00B7} [\u{00D7}] drops a channel \u{00B7} the pan and the level are grabbed, not walked"
+    } else if focused
+        && chain
+            .get(fx_slot)
+            .is_some_and(|e| e.kind == crate::source::AudioFxKind::Harmonizer && e.plugin.is_none())
+    {
+        // The chart row's keys, where the chart row is: a transport the
+        // keyboard cannot reach is one a player with a guitar on cannot use.
+        "  y=chart \u{25B6}/\u{25A0} Y=load chart o=click C=chord keyboard c=gate \u{00B7} a=add d=del \u{2190}\u{2192}=FX \u{2191}\u{2193}=param wheel=value \u{00B7} -/+=vol m=mute"
     } else if focused {
         "  1=source 2=bank/preset 3=learn 4=plugin window k=box p=instr P=fx preset x/X=sandbox \u{00B7} a=add d=del \u{2190}\u{2192}=FX \u{2191}\u{2193}=param wheel=value \u{00B7} -/+=vol ,/.=pan m=mute S=solo"
     } else {

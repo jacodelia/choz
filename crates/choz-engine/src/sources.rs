@@ -799,6 +799,112 @@ mod tests {
         assert!(after < 1e-3, "the runaway voice is still sounding: {after}");
     }
 
+    /// **A harmoniser on a SoundFont tab, following a chart, adds no clicks.**
+    /// What was heard as clipping and noise with nothing over full scale:
+    /// the shifter's second head jumped a whole window at full gain every
+    /// time the first one wrapped — 38 discontinuities in four seconds of a
+    /// piano melody, against none in what went in. Counted as second
+    /// differences many times the signal's own, the way a click shows.
+    #[test]
+    fn a_harmoniser_on_a_soundfont_adds_no_clicks() {
+        let _chart = crate::test_locks::chart();
+        let path = std::path::Path::new("/usr/share/sounds/sf2/FluidR3_GM.sf2");
+        if !path.exists() {
+            return;
+        }
+        use crate::fx::FxProcessor;
+        let sr = 48_000u32;
+        let mut s = Sf2Synth::load(path, 0, 73, sr).unwrap(); // a flute
+        let mut input = Vec::new();
+        let mut buf = vec![0f32; 512];
+        for n in [60u8, 62, 64, 65, 67, 69, 71, 72] {
+            s.note_on(n, 100);
+            for _ in 0..(sr as usize / 2) / 256 {
+                s.render(&mut buf, sr);
+                input.extend_from_slice(&buf);
+            }
+            s.note_off(n);
+        }
+        let clicks = |x: &[f32]| {
+            let l: Vec<f32> = x.iter().step_by(2).copied().collect();
+            let (mut n, mut i) = (0, 256);
+            while i < l.len() {
+                let rms = (l[i - 256..i].iter().map(|v| v * v).sum::<f32>() / 256.0)
+                    .sqrt()
+                    .max(1e-4);
+                if (l[i] - 2.0 * l[i - 1] + l[i - 2]).abs() > 0.5 * rms {
+                    n += 1;
+                    i += 240;
+                } else {
+                    i += 1;
+                }
+            }
+            n
+        };
+        let mut h = crate::fx::harmonizer::Harmonizer::new(sr);
+        h.set_mix(1.0);
+        h.set_param(crate::fx::harmonizer::CHART_PARAM, 1.0);
+        let chart = [[48u8, 52, 55], [45, 48, 52], [41, 45, 48], [43, 47, 50]];
+        let mut out = input.clone();
+        for (bi, block) in out.chunks_mut(512).enumerate() {
+            let second = bi * 256 / sr as usize;
+            crate::chord::chart().set(&chart[second % 4]);
+            h.process_block(block, sr);
+        }
+        crate::chord::chart().clear();
+        let (before, after) = (clicks(&input), clicks(&out));
+        assert!(after <= before + 3, "{after} clicks out of {before} in");
+    }
+
+    /// **Fully wet, a piano's harmony does not fade faster than the piano.**
+    /// The envelope follower closed the voices whenever a note fell under half
+    /// its attack — which a piano does within a fraction of a second — on top
+    /// of the voices already decaying with it: the harmony came out 5 dB under
+    /// the dry at the default `Env` and 10 dB at full, and "at 100 % wet I hear
+    /// more of what goes in". Now `Env` decides nothing while a note sounds.
+    ///
+    /// What is left is not the follower: the harmoniser sings a **mono** fold
+    /// of a stereo piano, `(L + R) / 2`, which loses up to 3 dB where the two
+    /// sides differ, and the shifter's crossfade loses a little more on a
+    /// sound that changes under it — hence the -6 dB floor.
+    #[test]
+    fn a_fully_wet_harmony_does_not_fade_faster_than_the_piano() {
+        let path = std::path::Path::new("/usr/share/sounds/sf2/FluidR3_GM.sf2");
+        if !path.exists() {
+            return;
+        }
+        use crate::fx::FxProcessor;
+        let sr = 48_000u32;
+        let level = |env: f32| {
+            // The rack's defaults, `Env` as given and `Wet` all the way up.
+            let p = [0.334, 1.0, 0.0, 0.2, 0.32, 0.36, env, 1.0, 1.0];
+            let mut h = crate::fx::harmonizer::Harmonizer::with_params(sr, &p);
+            let mut s = Sf2Synth::load(path, 0, 0, sr).unwrap();
+            s.note_on(60, 100);
+            let mut buf = vec![0f32; 512];
+            let (mut dry, mut wet) = (0.0f64, 0.0f64);
+            for k in 0..(sr as usize / 256) {
+                s.render(&mut buf, sr);
+                let mut b = buf.clone();
+                h.process_block(&mut b, sr);
+                if k > 40 {
+                    dry += buf.iter().map(|x| (*x as f64).powi(2)).sum::<f64>();
+                    wet += b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>();
+                }
+            }
+            10.0 * (wet / dry).log10()
+        };
+        let (open, default, full) = (level(0.0), level(0.5), level(1.0));
+        assert!(
+            (open - default).abs() < 0.5 && (open - full).abs() < 0.5,
+            "Env took the harmony down: {open:.1} / {default:.1} / {full:.1} dB"
+        );
+        assert!(
+            default > -6.0,
+            "the harmony is {default:.1} dB under the piano"
+        );
+    }
+
     #[test]
     fn a_volume_cc_does_not_leave_the_tabs_own_sound_behind() {
         let path = std::path::Path::new("/usr/share/sounds/sf2/FluidR3_GM.sf2");

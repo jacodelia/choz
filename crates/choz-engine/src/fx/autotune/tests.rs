@@ -828,6 +828,11 @@ fn every_parameter_is_reachable_and_survives_the_round_trip() {
         (at.params.input_gain_db + 24.0).abs() < 0.01,
         "InGain is param 10 now"
     );
+    // The preset knob reads back the preset that was loaded: it always said
+    // the first one, whatever had been picked.
+    at.set_param(0, 0.5);
+    let preset = at.params()[0].value;
+    assert!((preset - 0.5).abs() < 1e-6, "Preset reads {preset}");
     // An index nobody has is not a panic.
     at.set_param(99, 0.5);
 }
@@ -1228,4 +1233,37 @@ fn the_sensitivity_lifts_the_analysis_and_not_the_output() {
     };
     assert!(!voiced_at(0.0), "that quiet, it is under the gate");
     assert!(voiced_at(24.0), "and the sensitivity is what gets it over");
+}
+
+/// **One octave error does not lock the octave.** The detector corrects a
+/// reading that lands exactly an octave from the last one — a voice does not
+/// jump an octave between two hops — and it stored the corrected reading as the
+/// last one. So a single wrong reading at the attack (a SoundFont piano's C4
+/// heard once as C3) turned every right reading after it into C3 as well, for
+/// as long as the note lasted: the harmoniser's log said "hears C3" through six
+/// bars of C4. An octave that keeps being read is the octave.
+#[test]
+fn one_octave_error_does_not_lock_the_octave() {
+    let sr = 48_000.0;
+    let mut det = PitchDetector::new(sr);
+    let mut t = Tone::new();
+    let mut feed = |det: &mut PitchDetector, hz: f32| {
+        let stereo = t.block(hz, sr, 1024, 0.4);
+        let mono: Vec<f32> = stereo.as_chunks::<2>().0.iter().map(|f| f[0]).collect();
+        det.process(&mono);
+    };
+    // The wrong octave first — long enough to be believed — then the note.
+    for _ in 0..8 {
+        feed(&mut det, 130.81);
+    }
+    for _ in 0..30 {
+        feed(&mut det, 261.63);
+    }
+    let e = det.estimate();
+    assert!(e.voiced);
+    let note = 69.0 + 12.0 * (e.frequency_hz / 440.0).log2();
+    assert!(
+        (note - 60.0).abs() < 0.3,
+        "still reading {note:.1} after 600 ms of C4"
+    );
 }

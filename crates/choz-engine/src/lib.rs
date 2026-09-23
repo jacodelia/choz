@@ -654,6 +654,7 @@ pub(crate) mod test_locks {
 
     static TRANSPORT: Mutex<()> = Mutex::new(());
     static METER: Mutex<()> = Mutex::new(());
+    static CHART: Mutex<()> = Mutex::new(());
 
     /// Held while a test moves the transport (rewind, play, tempo).
     ///
@@ -710,5 +711,11 @@ pub(crate) mod test_locks {
     /// asserts exactly and another clears.
     pub(crate) fn meter() -> MutexGuard<'static, ()> {
         METER.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Held while a test publishes a chart chord ([`crate::chord::chart`]):
+    /// one per process, and three tests set it to different chords.
+    pub(crate) fn chart() -> MutexGuard<'static, ()> {
+        CHART.lock().unwrap_or_else(|e| e.into_inner())
     }
 }

@@ -366,6 +366,9 @@ mod tests {
         };
         let (up_during, _) = share(&buf[..48000 * 2]);
         let (up_after, second_after) = share(&buf[48000 * 2..48000 * 4]);
+        // What is between the notes: the floor the octaves have to stand on.
+        let tail = &buf[48000 * 2..48000 * 4];
+        let floor = energy_at(tail, 1234.0, sr) / energy_at(tail, 400.0, sr).max(1e-12);
         assert!(
             rms(&buf[48000 * 2..]) > 1e-5,
             "there should still be a tail"
@@ -375,10 +378,19 @@ mod tests {
             "the octave has to gain on the fundamental: {up_during:.3} while it sounds, \
              {up_after:.3} after"
         );
-        // And a second octave behind it, from the pass after that.
+        // And a second octave behind it, from the pass after that — standing
+        // clear of what is between the notes. It used to be measured against
+        // the first octave, and passed on the shifter's clicks: a head that
+        // jumped a window at full gain sprayed energy across the spectrum,
+        // 1600 Hz included (0.244 of the fundamental with the clicks, 0.043
+        // without, over a floor that halved from 0.015 to 0.008).
         assert!(
-            second_after > up_after * 0.5,
-            "the second pass should be up there too: {second_after:.3} against {up_after:.3}"
+            second_after > floor * 3.0,
+            "the second pass should be up there too: {second_after:.3} over a floor of {floor:.3}"
+        );
+        assert!(
+            floor < 0.012,
+            "the tail between the notes should be clean: {floor:.3}"
         );
     }
 
