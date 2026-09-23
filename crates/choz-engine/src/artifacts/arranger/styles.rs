@@ -7,6 +7,7 @@ use super::style::{Bass, Comp, Drums, MeterGroove, Style};
 
 pub const ALL: &[Style] = &[
     Style {
+        id: 1,
         name: "16_beat",
         label: "16 Beat",
         beats_per_bar: 4.0,
@@ -52,6 +53,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 2,
         name: "16bt_bld",
         label: "16 Beat Ballad",
         beats_per_bar: 4.0,
@@ -95,6 +97,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 3,
         name: "16btshfl",
         label: "16 Beat Shuffle",
         beats_per_bar: 4.0,
@@ -138,6 +141,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 4,
         name: "50_srock",
         label: "50s Rock",
         beats_per_bar: 4.0,
@@ -183,6 +187,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 5,
         name: "50spnrck",
         label: "50s Piano Rock",
         beats_per_bar: 4.0,
@@ -226,6 +231,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 6,
         name: "60_s_8bt",
         label: "60s 8 Beat",
         beats_per_bar: 4.0,
@@ -269,6 +275,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 7,
         name: "60_s_pop",
         label: "60s Pop",
         beats_per_bar: 4.0,
@@ -312,6 +319,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 8,
         name: "60_srock",
         label: "60s Rock",
         beats_per_bar: 4.0,
@@ -355,6 +363,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 9,
         name: "60_srock_2",
         label: "60s Rock 2",
         beats_per_bar: 4.0,
@@ -398,6 +407,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 10,
         name: "60_sshfl",
         label: "60s Shuffle",
         beats_per_bar: 4.0,
@@ -441,6 +451,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 11,
         name: "60_ssoul",
         label: "60s Soul",
         beats_per_bar: 4.0,
@@ -484,6 +495,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 12,
         name: "6_8_bld",
         label: "6/8 Ballad",
         beats_per_bar: 3.0,
@@ -527,6 +539,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 13,
         name: "6_8_enka",
         label: "6/8 Enka",
         beats_per_bar: 4.0,
@@ -572,6 +585,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 14,
         name: "6_8_pop",
         label: "6/8 Pop",
         beats_per_bar: 3.0,
@@ -615,6 +629,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 15,
         name: "6_8bld_1",
         label: "6/8 Ballad 1",
         beats_per_bar: 3.0,
@@ -658,6 +673,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 16,
         name: "6_8bld_2",
         label: "6/8 Ballad 2",
         beats_per_bar: 4.0,
@@ -701,6 +717,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 17,
         name: "6_8bld_3",
         label: "6/8 Ballad 3",
         beats_per_bar: 3.0,
@@ -744,6 +761,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 18,
         name: "6_8blues",
         label: "6/8 Blues",
         beats_per_bar: 3.0,
@@ -787,6 +805,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 19,
         name: "6_8rkbld",
         label: "6/8 Rock Ballad",
         beats_per_bar: 3.0,
@@ -830,6 +849,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 20,
         name: "90_s_bld",
         label: "90s Ballad",
         beats_per_bar: 4.0,
@@ -873,6 +893,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 21,
         name: "a_gt_pop",
         label: "Acoustic Guitar Pop",
         beats_per_bar: 4.0,
@@ -916,6 +937,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 22,
         name: "adani",
         label: "Adani",
         beats_per_bar: 4.0,
@@ -959,6 +981,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 23,
         name: "amrcnrck",
         label: "American Rock",
         beats_per_bar: 4.0,
@@ -1002,6 +1025,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 24,
         name: "argcmbia",
         label: "Argentine Cumbia",
         beats_per_bar: 4.0,
@@ -1045,6 +1069,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 25,
         name: "arpegio1",
         label: "Arpeggio 1",
         beats_per_bar: 4.0,
@@ -1088,6 +1113,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 26,
         name: "arpegio2",
         label: "Arpeggio 2",
         beats_per_bar: 4.0,
@@ -1131,6 +1157,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 27,
         name: "arpegio3",
         label: "Arpeggio 3",
         beats_per_bar: 4.0,
@@ -1174,6 +1201,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 28,
         name: "bachata",
         label: "Bachata",
         beats_per_bar: 4.0,
@@ -1217,6 +1245,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 29,
         name: "baladi",
         label: "Baladi",
         beats_per_bar: 4.0,
@@ -1260,6 +1289,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 30,
         name: "banda",
         label: "Banda",
         beats_per_bar: 4.0,
@@ -1303,6 +1333,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 31,
         name: "beguine",
         label: "Beguine",
         beats_per_bar: 4.0,
@@ -1346,6 +1377,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 32,
         name: "beijing",
         label: "Beijing",
         beats_per_bar: 2.0,
@@ -1389,6 +1421,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 33,
         name: "bhajan",
         label: "Bhajan",
         beats_per_bar: 4.0,
@@ -1434,6 +1467,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 34,
         name: "bhangra",
         label: "Bhangra",
         beats_per_bar: 4.0,
@@ -1477,6 +1511,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 35,
         name: "bluegras",
         label: "Bluegrass",
         beats_per_bar: 4.0,
@@ -1523,6 +1558,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 36,
         name: "bluesbld",
         label: "Blues Ballad",
         beats_per_bar: 6.0,
@@ -1566,6 +1602,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 37,
         name: "bolero",
         label: "Bolero",
         beats_per_bar: 4.0,
@@ -1609,6 +1646,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 38,
         name: "boogie",
         label: "Boogie",
         beats_per_bar: 4.0,
@@ -1652,6 +1690,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 39,
         name: "bosanova",
         label: "Bossa Nova",
         beats_per_bar: 4.0,
@@ -1695,6 +1734,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 40,
         name: "brushbld",
         label: "Brush Ballad",
         beats_per_bar: 4.0,
@@ -1738,6 +1778,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 41,
         name: "calypso",
         label: "Calypso",
         beats_per_bar: 4.0,
@@ -1784,6 +1825,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 42,
         name: "caucasia",
         label: "Caucasia",
         beats_per_bar: 4.0,
@@ -1831,6 +1873,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 43,
         name: "cha_cha",
         label: "Cha Cha",
         beats_per_bar: 4.0,
@@ -1874,6 +1917,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 44,
         name: "chinspop",
         label: "Chinese Pop",
         beats_per_bar: 4.0,
@@ -1917,6 +1961,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 45,
         name: "cnty_8bt",
         label: "Country 8 Beat",
         beats_per_bar: 4.0,
@@ -1960,6 +2005,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 46,
         name: "cnty_bld",
         label: "Country Ballad",
         beats_per_bar: 4.0,
@@ -2005,6 +2051,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 47,
         name: "cnty_pop",
         label: "Country Pop",
         beats_per_bar: 4.0,
@@ -2048,6 +2095,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 48,
         name: "cntyshfl",
         label: "Country Shuffle",
         beats_per_bar: 4.0,
@@ -2093,6 +2141,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 49,
         name: "cntywltz",
         label: "Country Waltz",
         beats_per_bar: 3.0,
@@ -2136,6 +2185,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 50,
         name: "cumbia_1",
         label: "Cumbia 1",
         beats_per_bar: 4.0,
@@ -2179,6 +2229,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 51,
         name: "cumbia_2",
         label: "Cumbia 2",
         beats_per_bar: 4.0,
@@ -2222,6 +2273,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 52,
         name: "dadra",
         label: "Dadra",
         beats_per_bar: 6.0,
@@ -2265,6 +2317,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 53,
         name: "daizu",
         label: "Daizu",
         beats_per_bar: 3.0,
@@ -2311,6 +2364,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 54,
         name: "dandiya",
         label: "Dandiya",
         beats_per_bar: 4.0,
@@ -2356,6 +2410,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 55,
         name: "dangdut",
         label: "Dangdut",
         beats_per_bar: 4.0,
@@ -2399,6 +2454,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 56,
         name: "discopop",
         label: "Disco Pop",
         beats_per_bar: 4.0,
@@ -2442,6 +2498,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 57,
         name: "dixie",
         label: "Dixie",
         beats_per_bar: 4.0,
@@ -2488,6 +2545,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 58,
         name: "dongbeiy",
         label: "Dongbeiy",
         beats_per_bar: 4.0,
@@ -2531,6 +2589,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 59,
         name: "drngense",
         label: "Drngense",
         beats_per_bar: 4.0,
@@ -2574,6 +2633,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 60,
         name: "drumnbass",
         label: "Drum & Bass",
         beats_per_bar: 4.0,
@@ -2617,6 +2677,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 61,
         name: "dscosoul",
         label: "Disco Soul",
         beats_per_bar: 4.0,
@@ -2664,6 +2725,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 62,
         name: "e_hiphop",
         label: "Electro Hip Hop",
         beats_per_bar: 4.0,
@@ -2707,6 +2769,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 63,
         name: "e_hiphop_2",
         label: "Electro Hip Hop 2",
         beats_per_bar: 4.0,
@@ -2750,6 +2813,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 64,
         name: "easy_bld",
         label: "Easy Ballad",
         beats_per_bar: 4.0,
@@ -2795,6 +2859,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 65,
         name: "elec_bld",
         label: "Electric Ballad",
         beats_per_bar: 4.0,
@@ -2838,6 +2903,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 66,
         name: "enka",
         label: "Enka",
         beats_per_bar: 4.0,
@@ -2881,6 +2947,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 67,
         name: "ep_bld_1",
         label: "Electric Piano Ballad 1",
         beats_per_bar: 4.0,
@@ -2924,6 +2991,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 68,
         name: "ep_bld_2",
         label: "Electric Piano Ballad 2",
         beats_per_bar: 4.0,
@@ -2967,6 +3035,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 69,
         name: "euro_pop",
         label: "Euro Pop",
         beats_per_bar: 4.0,
@@ -3010,6 +3079,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 70,
         name: "f_gospel",
         label: "Fast Gospel",
         beats_per_bar: 4.0,
@@ -3053,6 +3123,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 71,
         name: "fastsoul",
         label: "Fast Soul",
         beats_per_bar: 4.0,
@@ -3096,6 +3167,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 72,
         name: "fingcnty",
         label: "Fingerpicking Country",
         beats_per_bar: 4.0,
@@ -3139,6 +3211,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 73,
         name: "folklore",
         label: "Folklore",
         beats_per_bar: 4.0,
@@ -3182,6 +3255,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 74,
         name: "forro",
         label: "Forro",
         beats_per_bar: 4.0,
@@ -3225,6 +3299,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 75,
         name: "fox_trot",
         label: "Foxtrot",
         beats_per_bar: 4.0,
@@ -3268,6 +3343,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 76,
         name: "fr_waltz",
         label: "French Waltz",
         beats_per_bar: 3.0,
@@ -3311,6 +3387,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 77,
         name: "fstbband",
         label: "Fast Big Band",
         beats_per_bar: 4.0,
@@ -3354,6 +3431,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 78,
         name: "funk16bt",
         label: "Funk 16 Beat",
         beats_per_bar: 4.0,
@@ -3399,6 +3477,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 79,
         name: "funk_8bt",
         label: "Funk 8 Beat",
         beats_per_bar: 4.0,
@@ -3442,6 +3521,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 80,
         name: "funkshfl",
         label: "Funk Shuffle",
         beats_per_bar: 4.0,
@@ -3487,6 +3567,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 81,
         name: "garba",
         label: "Garba",
         beats_per_bar: 4.0,
@@ -3530,6 +3611,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 82,
         name: "grmnmrch",
         label: "German March",
         beats_per_bar: 4.0,
@@ -3575,6 +3657,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 83,
         name: "gtr_8bt",
         label: "Guitar 8 Beat",
         beats_per_bar: 4.0,
@@ -3618,6 +3701,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 84,
         name: "guangdon",
         label: "Guangdong",
         beats_per_bar: 4.0,
@@ -3661,6 +3745,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 85,
         name: "hawaiian",
         label: "Hawaiian",
         beats_per_bar: 4.0,
@@ -3704,6 +3789,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 86,
         name: "hip_hop1",
         label: "Hip Hop 1",
         beats_per_bar: 4.0,
@@ -3747,6 +3833,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 87,
         name: "hip_hop1_2",
         label: "Hip Hop 1 2",
         beats_per_bar: 4.0,
@@ -3790,6 +3877,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 88,
         name: "hip_hop2",
         label: "Hip Hop 2",
         beats_per_bar: 4.0,
@@ -3833,6 +3921,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 89,
         name: "hip_hop2_2",
         label: "Hip Hop 2 2",
         beats_per_bar: 4.0,
@@ -3876,6 +3965,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 90,
         name: "huangmei",
         label: "Huangmei",
         beats_per_bar: 4.0,
@@ -3919,6 +4009,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 91,
         name: "indipop1",
         label: "Indian Pop 1",
         beats_per_bar: 4.0,
@@ -3964,6 +4055,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 92,
         name: "indipop2",
         label: "Indian Pop 2",
         beats_per_bar: 4.0,
@@ -4010,6 +4102,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 93,
         name: "jhaptaal",
         label: "Jhaptaal",
         beats_per_bar: 10.0,
@@ -4056,6 +4149,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 94,
         name: "jiangnan",
         label: "Jiangnan",
         beats_per_bar: 4.0,
@@ -4099,6 +4193,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 95,
         name: "jingju",
         label: "Jingju",
         beats_per_bar: 4.0,
@@ -4142,6 +4237,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 96,
         name: "jz_waltz",
         label: "Jazz Waltz",
         beats_per_bar: 3.0,
@@ -4185,6 +4281,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 97,
         name: "jzcombo1",
         label: "Jazz Combo 1",
         beats_per_bar: 4.0,
@@ -4228,6 +4325,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 98,
         name: "jzcombo2",
         label: "Jazz Combo 2",
         beats_per_bar: 4.0,
@@ -4271,6 +4369,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 99,
         name: "jzcombo3",
         label: "Jazz Combo 3",
         beats_per_bar: 4.0,
@@ -4314,6 +4413,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 100,
         name: "keharwa",
         label: "Keharwa",
         beats_per_bar: 4.0,
@@ -4357,6 +4457,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 101,
         name: "khaliji",
         label: "Khaliji",
         beats_per_bar: 4.0,
@@ -4400,6 +4501,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 102,
         name: "kroncong",
         label: "Kroncong",
         beats_per_bar: 4.0,
@@ -4443,6 +4545,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 103,
         name: "kwaito",
         label: "Kwaito",
         beats_per_bar: 4.0,
@@ -4488,6 +4591,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 104,
         name: "kwaito_2",
         label: "Kwaito 2",
         beats_per_bar: 4.0,
@@ -4533,6 +4637,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 105,
         name: "ltinfusn",
         label: "Latin Fusion",
         beats_per_bar: 4.0,
@@ -4576,6 +4681,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 106,
         name: "ltinrock",
         label: "Latin Rock",
         beats_per_bar: 4.0,
@@ -4619,6 +4725,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 107,
         name: "malfouf",
         label: "Malfouf",
         beats_per_bar: 4.0,
@@ -4662,6 +4769,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 108,
         name: "mambo",
         label: "Mambo",
         beats_per_bar: 4.0,
@@ -4705,6 +4813,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 109,
         name: "march",
         label: "March",
         beats_per_bar: 4.0,
@@ -4748,6 +4857,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 110,
         name: "mdrn_bld",
         label: "Modern Ballad",
         beats_per_bar: 4.0,
@@ -4791,6 +4901,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 111,
         name: "mdrn_r_b",
         label: "Modern R&B",
         beats_per_bar: 4.0,
@@ -4834,6 +4945,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 112,
         name: "mdrncnty",
         label: "Modern Country",
         beats_per_bar: 4.0,
@@ -4877,6 +4989,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 113,
         name: "melow8bt",
         label: "Mellow 8 Beat",
         beats_per_bar: 4.0,
@@ -4920,6 +5033,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 114,
         name: "menggu",
         label: "Menggu",
         beats_per_bar: 4.0,
@@ -4963,6 +5077,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 115,
         name: "merengue",
         label: "Merengue",
         beats_per_bar: 4.0,
@@ -5006,6 +5121,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 116,
         name: "miaozu",
         label: "Miaozu",
         beats_per_bar: 4.0,
@@ -5051,6 +5167,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 117,
         name: "midbband",
         label: "Mid Big Band",
         beats_per_bar: 4.0,
@@ -5094,6 +5211,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 118,
         name: "mus",
         label: "Mus",
         beats_per_bar: 2.5,
@@ -5137,6 +5255,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 119,
         name: "n_o_r_r",
         label: "New Orleans Rock & Roll",
         beats_per_bar: 4.0,
@@ -5180,6 +5299,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 120,
         name: "norteno",
         label: "Norteno",
         beats_per_bar: 4.0,
@@ -5223,6 +5343,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 121,
         name: "ochswing",
         label: "Orchestral Swing",
         beats_per_bar: 4.0,
@@ -5266,6 +5387,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 122,
         name: "old_rock",
         label: "Old Rock",
         beats_per_bar: 4.0,
@@ -5309,6 +5431,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 123,
         name: "old_soul",
         label: "Old Soul",
         beats_per_bar: 4.0,
@@ -5352,6 +5475,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 124,
         name: "oldie8bt",
         label: "Oldies 8 Beat",
         beats_per_bar: 4.0,
@@ -5398,6 +5522,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 125,
         name: "orgnrock",
         label: "Organ Rock",
         beats_per_bar: 4.0,
@@ -5441,6 +5566,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 126,
         name: "pagode",
         label: "Pagode",
         beats_per_bar: 4.0,
@@ -5484,6 +5610,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 127,
         name: "pasillo",
         label: "Pasillo",
         beats_per_bar: 3.0,
@@ -5527,6 +5654,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 128,
         name: "pasodble",
         label: "Paso Doble",
         beats_per_bar: 4.0,
@@ -5570,6 +5698,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 129,
         name: "pianor_r",
         label: "Piano Rock & Roll",
         beats_per_bar: 4.0,
@@ -5613,6 +5742,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 130,
         name: "pno8beat",
         label: "Piano 8 Beat",
         beats_per_bar: 4.0,
@@ -5656,6 +5786,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 131,
         name: "pnobld_1",
         label: "Piano Ballad 1",
         beats_per_bar: 4.0,
@@ -5699,6 +5830,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 132,
         name: "pnobld_2",
         label: "Piano Ballad 2",
         beats_per_bar: 4.0,
@@ -5742,6 +5874,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 133,
         name: "pnomrch1",
         label: "Piano March 1",
         beats_per_bar: 4.0,
@@ -5785,6 +5918,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 134,
         name: "pnomrch2",
         label: "Piano March 2",
         beats_per_bar: 4.0,
@@ -5828,6 +5962,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 135,
         name: "pnowaltz",
         label: "Piano Waltz",
         beats_per_bar: 3.0,
@@ -5871,6 +6006,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 136,
         name: "pnrckbld",
         label: "Piano Rock Ballad",
         beats_per_bar: 4.0,
@@ -5914,6 +6050,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 137,
         name: "polka",
         label: "Polka",
         beats_per_bar: 4.0,
@@ -5957,6 +6094,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 138,
         name: "polwaltz",
         label: "Polka Waltz",
         beats_per_bar: 3.0,
@@ -6000,6 +6138,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 139,
         name: "pop",
         label: "Pop",
         beats_per_bar: 4.0,
@@ -6043,6 +6182,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 140,
         name: "pop_bld",
         label: "Pop Ballad",
         beats_per_bar: 4.0,
@@ -6086,6 +6226,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 141,
         name: "pop_rock",
         label: "Pop Rock",
         beats_per_bar: 4.0,
@@ -6131,6 +6272,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 142,
         name: "pop_shfl",
         label: "Pop Shuffle",
         beats_per_bar: 4.0,
@@ -6174,6 +6316,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 143,
         name: "popregae",
         label: "Pop Reggae",
         beats_per_bar: 4.0,
@@ -6217,6 +6360,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 144,
         name: "punta",
         label: "Punta",
         beats_per_bar: 4.0,
@@ -6260,6 +6404,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 145,
         name: "qinqiang",
         label: "Qinqiang",
         beats_per_bar: 4.0,
@@ -6303,6 +6448,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 146,
         name: "quickstp",
         label: "Quickstep",
         beats_per_bar: 4.0,
@@ -6346,6 +6492,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 147,
         name: "r_b",
         label: "R&B",
         beats_per_bar: 4.0,
@@ -6389,6 +6536,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 148,
         name: "r_b_bld",
         label: "R&B Ballad",
         beats_per_bar: 4.0,
@@ -6432,6 +6580,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 149,
         name: "r_r",
         label: "Rock & Roll",
         beats_per_bar: 4.0,
@@ -6475,6 +6624,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 150,
         name: "ragtime",
         label: "Ragtime",
         beats_per_bar: 4.0,
@@ -6518,6 +6668,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 151,
         name: "rckblues",
         label: "Rock Blues",
         beats_per_bar: 4.0,
@@ -6564,6 +6715,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 152,
         name: "regeton1",
         label: "Reggaeton 1",
         beats_per_bar: 4.0,
@@ -6609,6 +6761,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 153,
         name: "regeton2",
         label: "Reggaeton 2",
         beats_per_bar: 4.0,
@@ -6652,6 +6805,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 154,
         name: "reggae",
         label: "Reggae",
         beats_per_bar: 4.0,
@@ -6698,6 +6852,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 155,
         name: "rhumba",
         label: "Rhumba",
         beats_per_bar: 4.0,
@@ -6744,6 +6899,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 156,
         name: "rock",
         label: "Rock",
         beats_per_bar: 4.0,
@@ -6787,6 +6943,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 157,
         name: "rock_bld",
         label: "Rock Ballad",
         beats_per_bar: 4.0,
@@ -6832,6 +6989,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 158,
         name: "rockwltz",
         label: "Rock Waltz",
         beats_per_bar: 6.0,
@@ -6875,6 +7033,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 159,
         name: "ruchnsn1",
         label: "Ruchnsn1",
         beats_per_bar: 4.0,
@@ -6918,6 +7077,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 160,
         name: "ruchnsn2",
         label: "Ruchnsn2",
         beats_per_bar: 4.0,
@@ -6961,6 +7121,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 161,
         name: "rupak",
         label: "Rupak",
         beats_per_bar: 7.0,
@@ -7006,6 +7167,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 162,
         name: "s_gospel",
         label: "Slow Gospel",
         beats_per_bar: 6.0,
@@ -7049,6 +7211,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 163,
         name: "salsa_1",
         label: "Salsa 1",
         beats_per_bar: 4.0,
@@ -7092,6 +7255,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 164,
         name: "salsa_2",
         label: "Salsa 2",
         beats_per_bar: 4.0,
@@ -7137,6 +7301,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 165,
         name: "samba_1",
         label: "Samba 1",
         beats_per_bar: 4.0,
@@ -7180,6 +7345,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 166,
         name: "samba_2",
         label: "Samba 2",
         beats_per_bar: 4.0,
@@ -7225,6 +7391,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 167,
         name: "schlager",
         label: "Schlager",
         beats_per_bar: 4.0,
@@ -7268,6 +7435,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 168,
         name: "scrswing",
         label: "Scrswing",
         beats_per_bar: 4.0,
@@ -7311,6 +7479,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 169,
         name: "serenade",
         label: "Serenade",
         beats_per_bar: 4.0,
@@ -7354,6 +7523,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 170,
         name: "shfblues",
         label: "Shuffle Blues",
         beats_per_bar: 4.0,
@@ -7397,6 +7567,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 171,
         name: "shflrock",
         label: "Shuffle Rock",
         beats_per_bar: 4.0,
@@ -7440,6 +7611,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 172,
         name: "shouka_1",
         label: "Shouka 1",
         beats_per_bar: 4.0,
@@ -7483,6 +7655,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 173,
         name: "shouka_2",
         label: "Shouka 2",
         beats_per_bar: 3.0,
@@ -7526,6 +7699,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 174,
         name: "sirtaki",
         label: "Sirtaki",
         beats_per_bar: 4.0,
@@ -7569,6 +7743,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 175,
         name: "ska",
         label: "Ska",
         beats_per_bar: 4.0,
@@ -7612,6 +7787,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 176,
         name: "slow_bld",
         label: "Slow Ballad",
         beats_per_bar: 4.0,
@@ -7655,6 +7831,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 177,
         name: "slowbld1",
         label: "Slow Ballad 1",
         beats_per_bar: 4.0,
@@ -7698,6 +7875,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 178,
         name: "slowbld2",
         label: "Slow Ballad 2",
         beats_per_bar: 4.0,
@@ -7741,6 +7919,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 179,
         name: "slowrock",
         label: "Slow Rock",
         beats_per_bar: 4.0,
@@ -7784,6 +7963,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 180,
         name: "slowsoul",
         label: "Slow Soul",
         beats_per_bar: 3.0,
@@ -7827,6 +8007,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 181,
         name: "slwbband",
         label: "Slow Big Band",
         beats_per_bar: 4.0,
@@ -7870,6 +8051,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 182,
         name: "slwblues",
         label: "Slow Blues",
         beats_per_bar: 4.0,
@@ -7916,6 +8098,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 183,
         name: "slwbossa",
         label: "Slow Bossa",
         beats_per_bar: 4.0,
@@ -7959,6 +8142,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 184,
         name: "slwswing",
         label: "Slow Swing",
         beats_per_bar: 4.0,
@@ -8002,6 +8186,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 185,
         name: "slwwaltz",
         label: "Slow Waltz",
         beats_per_bar: 3.0,
@@ -8045,6 +8230,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 186,
         name: "strd_pno",
         label: "Stride Piano",
         beats_per_bar: 4.0,
@@ -8088,6 +8274,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 187,
         name: "strqrtet",
         label: "String Quartet",
         beats_per_bar: 4.0,
@@ -8131,6 +8318,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 188,
         name: "strt_8bt",
         label: "Straight 8 Beat",
         beats_per_bar: 4.0,
@@ -8174,6 +8362,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 189,
         name: "strtrock",
         label: "Straight Rock",
         beats_per_bar: 4.0,
@@ -8217,6 +8406,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 190,
         name: "swing",
         label: "Swing",
         beats_per_bar: 4.0,
@@ -8260,6 +8450,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 191,
         name: "synthpop",
         label: "Synth Pop",
         beats_per_bar: 4.0,
@@ -8303,6 +8494,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 192,
         name: "tango",
         label: "Tango",
         beats_per_bar: 4.0,
@@ -8346,6 +8538,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 193,
         name: "tarkus",
         label: "Tarkus (heterometric)",
         beats_per_bar: 5.0,
@@ -8447,6 +8640,7 @@ pub const ALL: &[Style] = &[
         ],
     },
     Style {
+        id: 194,
         name: "teccmbia",
         label: "Techno Cumbia",
         beats_per_bar: 4.0,
@@ -8490,6 +8684,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 195,
         name: "tech_pop",
         label: "Techno Pop",
         beats_per_bar: 4.0,
@@ -8533,6 +8728,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 196,
         name: "teentaal",
         label: "Teentaal",
         beats_per_bar: 4.0,
@@ -8576,6 +8772,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 197,
         name: "tex_mex",
         label: "Tex Mex",
         beats_per_bar: 4.0,
@@ -8619,6 +8816,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 198,
         name: "trance",
         label: "Trance",
         beats_per_bar: 4.0,
@@ -8665,6 +8863,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 199,
         name: "uk_beat",
         label: "UK Beat",
         beats_per_bar: 4.0,
@@ -8708,6 +8907,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 200,
         name: "unplgbld",
         label: "Unplugged Ballad",
         beats_per_bar: 4.0,
@@ -8751,6 +8951,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 201,
         name: "valenato",
         label: "Vallenato",
         beats_per_bar: 4.0,
@@ -8794,6 +8995,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 202,
         name: "vienwltz",
         label: "Viennese Waltz",
         beats_per_bar: 3.0,
@@ -8837,6 +9039,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 203,
         name: "waltz_1",
         label: "Waltz 1",
         beats_per_bar: 3.0,
@@ -8880,6 +9083,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 204,
         name: "waltz_2",
         label: "Waltz 2",
         beats_per_bar: 3.0,
@@ -8923,6 +9127,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 205,
         name: "waltz_3",
         label: "Waltz 3",
         beats_per_bar: 3.0,
@@ -8966,6 +9171,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 206,
         name: "waltz_4",
         label: "Waltz 4",
         beats_per_bar: 3.0,
@@ -9009,6 +9215,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 207,
         name: "xinjiang",
         label: "Xinjiang",
         beats_per_bar: 4.0,
@@ -9055,6 +9262,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 208,
         name: "xmassong",
         label: "Christmas Song",
         beats_per_bar: 4.0,
@@ -9098,6 +9306,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 209,
         name: "xmaswltz",
         label: "Christmas Waltz",
         beats_per_bar: 3.0,
@@ -9141,6 +9350,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 210,
         name: "yaozu",
         label: "Yaozu",
         beats_per_bar: 4.0,
@@ -9184,6 +9394,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 211,
         name: "yuju",
         label: "Yuju",
         beats_per_bar: 4.0,
@@ -9227,6 +9438,7 @@ pub const ALL: &[Style] = &[
         meters: &[],
     },
     Style {
+        id: 212,
         name: "zangzu",
         label: "Zangzu",
         beats_per_bar: 4.0,

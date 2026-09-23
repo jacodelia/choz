@@ -118,6 +118,18 @@ pub struct ArrangerSettings {
     /// place. Missing is a strip at unity, centred, unmuted.
     #[serde(default)]
     pub split_mix: Vec<BandStrip>,
+    /// The program each musician plays on a SoundFont tab, `(bank, preset)`
+    /// by `Role::ALL` place — picked with the right button on their button.
+    /// `None`, or missing, is the style's choice (see [`pick_program`]).
+    #[serde(default)]
+    pub programs: Vec<Option<(u8, u8)>>,
+    /// How loud each musician's channel of a SoundFont tab goes into the tab,
+    /// linear, by `Role::ALL` place; missing is `1.0`. Set by `n` from what
+    /// each one actually played — a font's kit can sit 15 dB over its piano,
+    /// and the velocity faders above cannot make up what the font does not
+    /// have. Under the split strips, not instead of them.
+    #[serde(default)]
+    pub balance: Vec<f32>,
 }
 
 /// One musician's strip in the mixer, when the band is split out: how loud
@@ -186,6 +198,31 @@ impl ArrangerSettings {
         &mut self.split_mix[role as usize]
     }
 
+    /// How loud `role`'s channel goes into the tab — see [`Self::balance`].
+    pub fn balance(&self, role: Role) -> f32 {
+        self.balance.get(role as usize).copied().unwrap_or(1.0)
+    }
+
+    pub fn set_balance(&mut self, role: Role, gain: f32) {
+        if self.balance.len() < Role::ALL.len() {
+            self.balance.resize(Role::ALL.len(), 1.0);
+        }
+        self.balance[role as usize] = gain.max(0.0);
+    }
+
+    /// The program `role` was given by hand, if it was.
+    pub fn program(&self, role: Role) -> Option<(u8, u8)> {
+        self.programs.get(role as usize).copied().flatten()
+    }
+
+    /// Give `role` a program of its own, or `None` for the style's.
+    pub fn set_program(&mut self, role: Role, program: Option<(u8, u8)>) {
+        if self.programs.len() < Role::ALL.len() {
+            self.programs.resize(Role::ALL.len(), None);
+        }
+        self.programs[role as usize] = program;
+    }
+
     pub fn gain(&self, role: Role) -> f32 {
         self.parts.get(role as usize).copied().unwrap_or(0.0)
     }
@@ -242,6 +279,8 @@ impl Default for ArrangerSettings {
             // Off until asked for: a band is one strip, like any tab.
             split: false,
             split_mix: Vec::new(),
+            programs: Vec::new(),
+            balance: Vec::new(),
         }
     }
 }
@@ -282,6 +321,9 @@ pub struct Arranger {
     /// a song in 7/8.
     written_meter: Option<(u16, u16)>,
     written_groups: Vec<u8>,
+    /// `groups 7/8 = 2+2+3` lines: how each meter of a chart that changes
+    /// meter is counted — see [`Arranger::bar_groups`].
+    meter_groups: Vec<((u16, u16), Vec<u8>)>,
     /// Where each bar starts and what it is in, for a chart that changes
     /// meter. Empty for one that does not — a bar is then `beats_per_bar`.
     bar_starts: Vec<f64>,
@@ -338,6 +380,7 @@ impl Default for Arranger {
             groups: Vec::new(),
             written_meter: None,
             written_groups: Vec::new(),
+            meter_groups: Vec::new(),
             bar_starts: Vec::new(),
             bar_meters: Vec::new(),
             own_bpb: 4.0,
@@ -631,6 +674,13 @@ impl Arranger {
             .unwrap_or((self.style.meter.0 as u16, self.style.meter.1 as u16))
     }
 
+    /// Whether the chart changes meter: every bar then has a signature of its
+    /// own, and a click that does not change with it is out of step by bar
+    /// four.
+    pub fn changes_meter(&self) -> bool {
+        !self.bar_meters.is_empty()
+    }
+
     /// The chart's bar before any change of meter in it: its `meter` line, or
     /// the style's own.
     pub fn default_meter(&self) -> (u16, u16) {
@@ -649,6 +699,28 @@ impl Arranger {
             None => return None,
         };
         Some(last - (self.at - start))
+    }
+
+    /// How the bar the playhead is in is counted, for the click: the chart's
+    /// grouping for that bar's meter (`groups 7/8 =`, or `groups` under a
+    /// matching `meter`), else the tab's own when it fits the bar. Empty is
+    /// the downbeat alone — a grouping written for another meter would accent
+    /// beats this bar does not have.
+    pub fn bar_groups(&self) -> Vec<u8> {
+        let meter = self.own_meter();
+        let written = match self.meter_groups.iter().find(|(m, _)| *m == meter) {
+            Some((_, g)) => g.clone(),
+            None if self.written_meter == Some(meter) => self.written_groups.clone(),
+            None => Vec::new(),
+        };
+        if !written.is_empty() {
+            return written;
+        }
+        let own = self.settings.groups.clone();
+        match own.iter().map(|g| *g as u16).sum::<u16>() == meter.0 {
+            true => own,
+            false => Vec::new(),
+        }
     }
 
     /// The `meter` and `groups` the chart names — what LOAD hands the session
@@ -732,6 +804,7 @@ impl Arranger {
                 self.own_bpb = self.style.beats_per_bar;
                 self.written_meter = prog.meter;
                 self.written_groups = prog.groups.clone();
+                self.meter_groups = prog.meter_groups.clone();
                 // The bar the chart names, or the one the session counts when
                 // somebody set one.
                 // A chart that changes meter keeps its own: the session follows
@@ -1116,6 +1189,13 @@ mod tests {
     use generate::gm;
     use std::time::Duration;
 
+    /// Beats in a chorus of [`DEFAULT_TEXT`], its form laid out: the file is
+    /// the user's to edit, so the tests read how long it is instead of
+    /// knowing it.
+    fn default_beats() -> u64 {
+        chord::parse_progression(DEFAULT_TEXT).unwrap().bars.len() as u64 * 4
+    }
+
     fn arranger(role: Role, seed: u32) -> Arranger {
         Arranger::new(ArrangerSettings {
             on: true,
@@ -1322,7 +1402,9 @@ mod tests {
         let _g = crate::test_locks::transport();
         let lengths: Vec<f64> = Role::ALL.map(|r| arranger(r, 42).beats()).to_vec();
         assert!(
-            lengths.iter().all(|l| (*l - 48.0).abs() < 1e-9),
+            lengths
+                .iter()
+                .all(|l| (*l - default_beats() as f64).abs() < 1e-9),
             "{lengths:?}"
         );
     }
@@ -1469,7 +1551,8 @@ mod tests {
 
         // A chorus of the transport, a beat at a time.
         t.set_playing(true);
-        for beat in 0..=48 {
+        let chorus = default_beats();
+        for beat in 0..=chorus {
             t.set_position_beats(beat as f64);
             a.tick(now + Duration::from_millis(beat * 10), &mut out);
         }
@@ -1504,7 +1587,7 @@ mod tests {
         // And the form comes round rather than stopping at the twelfth bar.
         a.play();
         out.clear();
-        for beat in 48..=60 {
+        for beat in chorus..=chorus + 12 {
             t.set_position_beats(beat as f64);
             a.tick(now + Duration::from_millis(beat * 10), &mut out);
         }
@@ -1690,6 +1773,100 @@ mod tests {
         assert!(hats >= 12, "sixteenth hats at 174: {hats}");
         // Other styles keep their one-bar groove.
         assert!(style::by_name("strtrock").drums.kick_b.is_empty());
+    }
+
+    /// A style is found by its name, its label or its id, and the ids are
+    /// one a style: two styles with the same id would be one chart playing
+    /// either.
+    #[test]
+    fn a_style_is_named_by_name_label_or_id() {
+        let ids: std::collections::HashSet<u16> = style::ALL.iter().map(|s| s.id).collect();
+        assert_eq!(ids.len(), style::ALL.len(), "an id used twice");
+        let dnb = style::by_name("drumnbass");
+        assert_eq!(style::by_name("Drum & Bass").name, dnb.name);
+        assert_eq!(style::by_name(&dnb.id.to_string()).name, dnb.name);
+        let text = format!("style = {}\n| C | F |", dnb.id);
+        let arr = Arranger::new(ArrangerSettings {
+            on: true,
+            text,
+            ..Default::default()
+        });
+        assert_eq!(arr.style().name, "drumnbass");
+    }
+
+    /// Every chart in `assets/` reads, and names a style that exists — by its
+    /// name or by the label the picker shows. A style nobody has is not an
+    /// error anywhere else: it plays the first one, and `changes.chord`
+    /// played a 16-beat for its `Drum & Bass` until this looked.
+    #[test]
+    fn every_chart_shipped_reads_and_names_a_style() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets");
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("chord") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let prog = chord::parse_progression(&text)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let style = style::by_name(&prog.style);
+            assert!(
+                prog.style.is_empty()
+                    || style.name == prog.style
+                    || style.label.eq_ignore_ascii_case(&prog.style)
+                    || prog.style.parse() == Ok(style.id),
+                "{}: no style {:?}",
+                path.display(),
+                prog.style
+            );
+            let arr = Arranger::new(ArrangerSettings {
+                on: true,
+                text,
+                ..Default::default()
+            });
+            assert!(
+                arr.error().is_none(),
+                "{}: {:?}",
+                path.display(),
+                arr.error()
+            );
+        }
+    }
+
+    /// **Every chord of a bar is played, by every style and every musician
+    /// that plays chords.** `| Dm7 G7 |` gave the G7 no hit at all on a style
+    /// whose comping pattern sat in the first half of the bar, and a bass
+    /// counting whole beats from the top of the chart arrived half a beat off
+    /// every bar after a 7/8.
+    #[test]
+    fn every_chord_of_a_bar_is_played_by_every_style() {
+        let _g = crate::test_locks::transport();
+        let text = "| Dm7 G7 | 7/8 Ab:3 G7:4 | 3/4 Gm7b5:2 C7:1 | 2/4 Cm7 Ab | 4/4 C |";
+        let prog = chord::parse_progression(text).unwrap();
+        for st in style::ALL {
+            let bpb = st.beats_per_bar;
+            for role in [Role::Bass, Role::Piano, Role::Guitar] {
+                for seed in [1, 7, 42] {
+                    let part = generate::bake(&prog, st, role, seed, &generate::Bake::at(110.0));
+                    for bar in 0..prog.bars.len() {
+                        for (at, span) in prog.changes_in(bar, bpb) {
+                            // Humanised: a note may land a hair either side.
+                            let heard = part.iter().any(|n| {
+                                n.start >= at - 0.06 - 0.5
+                                    && n.start < at + span - 0.06
+                                    && n.start + n.len > at + 0.05
+                            });
+                            assert!(
+                                heard,
+                                "{} {role:?} seed {seed}: bar {} has a chord at {at} nobody plays",
+                                st.name,
+                                bar + 1
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// **Tarkus is heterometric**: measured off `rhythms/tarkus.mid`, a 5/4
@@ -2123,7 +2300,7 @@ mod tests {
         );
         let a = Arranger::new(ArrangerSettings::default());
         assert!(a.error().is_none(), "{:?}", a.error());
-        assert_eq!(a.bars(), 12);
+        assert_eq!(a.bars() as u64, default_beats() / 4);
 
         // A chart that arrives in degrees is read as degrees: the file is what
         // says which, not this default.

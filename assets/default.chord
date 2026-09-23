@@ -1,4 +1,9 @@
 key = C
-style = shfblues
+style = 170
 
-|| C7 | F7 | C7 | C7 | F7 | F7 | C7 | A7 | Dm7 | G7 | C7 G7 | C7 ||
+[turn]
+| C7 | F7 | C7 | C7 |
+| F7 | F7 | C7 | A7 |
+| Dm7 | G7 | C7 G7 | C7 |
+
+form = turn turn turn

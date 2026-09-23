@@ -287,10 +287,25 @@ fn balance(out: &mut [Note], role: Role) {
         }
         let share = level / ((j - i) as f32).sqrt();
         for n in &mut out[i..j] {
-            n.vel = (n.vel as f32 * share).round().clamp(1.0, 127.0) as u8;
+            n.vel = (n.vel as f32 * vel_for_level(share))
+                .round()
+                .clamp(1.0, 127.0) as u8;
         }
         i = j;
     }
+}
+
+/// The velocity factor that makes a note `level` times as loud.
+///
+/// **Velocity is not amplitude.** A SoundFont turns it into attenuation on a
+/// curve — the specification's default is `40·log10(vel/127)` dB, so the
+/// amplitude goes with the *square* of the velocity. Scaling the velocity by
+/// the level itself squared every share: the piano's `0.62`, over a four-note
+/// chord, took 88 to 27 — -23 dB against the bass's -4 — and the band's comp
+/// was measured 20 dB under its bass on every font tried. The square root
+/// puts it where the numbers above say.
+fn vel_for_level(level: f32) -> f32 {
+    level.max(0.0).sqrt()
 }
 
 /// How far an off-division is pushed late, in beats. The sequencer's reading
@@ -441,17 +456,38 @@ fn bass(prog: &Progression, style: &Style, rng: &mut Rng, out: &mut Vec<Note>) {
     let mut prev_chord: Option<super::chord::Chord> = None;
     // Which way the line last moved, so a passing note carries on that way.
     let mut last_move: i32 = 1;
-    let mut beat = 0.0;
-    while beat < total - 1e-9 {
+    // **Where the line speaks: every beat of every bar, counted from that
+    // bar's own downbeat, and every place a chord changes.** Counted from zero
+    // instead, a chart that changes meter put the bass half a beat off every
+    // bar after its first 7/8, and a chord that changed between two beats —
+    // `| 7/8 Ab:3 G7:4 |` — was arrived at late or not at all.
+    let mut points: Vec<f64> = Vec::new();
+    for bar in 0..prog.bars.len() {
+        let from = prog.bar_start(bar, bpb);
+        let len = prog.bar_beats(bar, bpb);
+        let mut k = 0.0;
+        while k < len - 1e-9 {
+            points.push(from + k);
+            k += 1.0;
+        }
+        points.extend(prog.changes_in(bar, bpb).into_iter().map(|(at, _)| at));
+    }
+    points.sort_by(f64::total_cmp);
+    points.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+    let _ = total;
+    for (p, &beat) in points.iter().enumerate() {
         let Some((chord, left)) = prog.at(beat, bpb) else {
             break;
         };
+        // How long until the line speaks again: a beat, or less where a chord
+        // change cuts it short.
+        let step = points.get(p + 1).map_or(1.0, |n| n - beat).min(1.0);
         // "The chord has just landed" is "it is not the one that was sounding a
         // beat ago" — asking the bar how many slots it has got this wrong the
         // moment a chord was written held across two of them.
         let lands = prev_chord.as_ref() != Some(chord);
         prev_chord = Some(chord.clone());
-        let leaves = left <= 1.0 + 1e-6;
+        let leaves = left <= step + 1e-6;
         let next = prog.next_after(beat, bpb);
 
         let note = if lands {
@@ -498,8 +534,8 @@ fn bass(prog: &Progression, style: &Style, rng: &mut Rng, out: &mut Vec<Note>) {
                 },
                 // Walking: long enough to join up, short enough to articulate.
                 len: match early {
-                    true => 1.4,
-                    false => 0.9,
+                    true => 0.5 + 0.9 * step,
+                    false => 0.9 * step,
                 },
                 // Who plays it is stamped by `bake`, which knows.
                 ..Default::default()
@@ -514,7 +550,6 @@ fn bass(prog: &Progression, style: &Style, rng: &mut Rng, out: &mut Vec<Note>) {
             human(rng, &mut n, 0.03);
             out.push(n);
         }
-        beat += 1.0;
     }
 }
 
@@ -1021,12 +1056,30 @@ fn comp(
             },
             false => c.hits.to_vec(),
         };
-        for hit in bar_hits {
+        // **Every chord of the bar is played.** The pattern's hits land where
+        // the style put them: a bossa comps on 1 and the and of 2, so the G7
+        // of `| Dm7 G7 |` — from beat 3 — had no hit at all, and the density
+        // dice could drop the one a short chord did have. A chord with no hit
+        // is struck where it starts, and the first hit of each chord always
+        // speaks: density thins a chord, it does not remove it.
+        let mut bar_hits: Vec<(f64, bool)> = bar_hits.into_iter().map(|h| (h, false)).collect();
+        for (at, span) in prog.changes_in(bar, bpb) {
+            let (s, e) = (at - from, at - from + span);
+            match bar_hits
+                .iter_mut()
+                .find(|(h, _)| *h >= s - 1e-6 && *h < e - 1e-6)
+            {
+                Some(first) => first.1 = true,
+                None => bar_hits.push((s, true)),
+            }
+        }
+        bar_hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (hit, must) in bar_hits {
             let beat = from + hit;
             let Some((chord, left)) = prog.at(beat, bpb) else {
                 continue;
             };
-            if !rng.chance(c.density) {
+            if !must && !rng.chance(c.density) {
                 continue;
             }
             let voicing = voice(chord, prev_top, c.low, c.high, shell, max);
@@ -1248,5 +1301,34 @@ fn guitar_of(c: super::style::Comp) -> super::style::Comp {
         // damped, it is not held down.
         hold: (c.hold * 0.8).max(0.25),
         ..c
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A share of loudness is not a share of velocity.** A SoundFont's
+    /// amplitude goes with the square of the velocity, so a quarter of the
+    /// level is half the velocity — and a four-note piano chord comes out
+    /// where a comp sits under its bass, not 20 dB under it.
+    #[test]
+    fn the_band_is_balanced_in_loudness_not_in_velocity() {
+        assert!((vel_for_level(0.25) - 0.5).abs() < 1e-6);
+        assert_eq!(vel_for_level(1.0), 1.0);
+        let note = |start: f64| Note {
+            note: 60,
+            vel: 88,
+            start,
+            len: 1.0,
+            ..Default::default()
+        };
+        let mut chord: Vec<Note> = (0..4).map(|_| note(0.0)).collect();
+        balance(&mut chord, Role::Piano);
+        // 88 × sqrt(0.62 / sqrt(4)) = 49 — it was 27, -23 dB on a SoundFont.
+        assert!(chord.iter().all(|n| n.vel == 49), "{}", chord[0].vel);
+        let mut bass = vec![note(0.0)];
+        balance(&mut bass, Role::Bass);
+        assert_eq!(bass[0].vel, 88, "the bass is the reference");
     }
 }

@@ -1129,6 +1129,25 @@ note, the same velocity. Both paths send it now, and
 `a_volume_cc_does_not_leave_the_tabs_own_sound_behind` measures the two against
 each other.
 
+The channels are **summed in `Sf2Synth::render` with nothing over them**, and
+the arranger's band is six musicians on one font: a run of it peaked 1.65
+before the fader, and once — a filter going unstable as the chart was reloaded
+under held notes — 294298. So the sum now goes through the same soft knee the
+SFZ sampler has (`sfz::soft_knee`, nothing touched under 0.9), and a sample
+that is not finite or past `RUNAWAY` (8.0, +18 dBFS) is **dropped and every
+voice cut** (`all_notes_off`), so the next note starts from a clean filter
+instead of the tab handing on a full-scale burst.
+
+The band is levelled **per musician, not per tab**. A font's kit can sit 15 dB
+over its piano, and the band's faders scale velocity, which a SoundFont turns
+into attenuation on a curve and caps at 127. Each zone publishes its loudest
+block since it was last read (`ZoneMeter::take_held`), and `n` on a tab with a
+band sets `ArrangerSettings::balance` per musician from it — applied to the
+zone's mix whether the band is split out or not — and the tab back to unity.
+The single-note probe on load only ever cuts (`PROBE_MAX_GAIN = 1.0`): middle C
+on channel 0 is one note of one instrument, and trusting it to boost put a
+whole band through a fader at 2.0.
+
 #### LADSPA's step names are not in LADSPA
 
 The ABI has no call for them. A `LADSPA_Descriptor` says a port is `TOGGLED` or
@@ -1290,6 +1309,16 @@ transport stopped, which is exactly when it is wanted. Switching it on resets
 that counter, so the first beat is the beat you switched it on for. The downbeat
 is a different pitch rather than a louder one — on a stage, "louder" is the first
 thing the room takes away.
+
+**A chart that changes meter always takes the click with it.** While a band
+plays, `App::follow_arranger_meter` hands the transport the signature of the bar
+the playhead is in, moves the bar origin to that bar's downbeat, and hands the
+metronome that bar's grouping (`Arranger::bar_groups`: a `groups 7/8 = 2+2+3`
+line, or `groups` under a matching `meter`, or the downbeat alone). FOLLOW ARR
+only chooses between the band's bar and the player's for a chart in **one**
+meter; against one that changes, a fixed click is out of step from the first
+change on. A bar set by hand while a band counts its own holds only until that
+band stops (`meter_held`), and never turns the saved switch off.
 
 #### A window outliving its plugin is a deadlock
 

@@ -5,6 +5,9 @@
         crates/choz-engine/src/artifacts/arranger/styles.rs
     cargo fmt -p choz-engine
 
+Each style's `id` comes from tools/style_ids.txt (a name a line, the line
+number is the id), which this script only ever appends to.
+
 A rhythm is one type-1 MIDI file holding a whole accompaniment: its sections
 laid end to end, each opening with a marker naming the section, its bar count
 and its time signature (`Var1 4bar 4/4`), and every track named with the
@@ -481,6 +484,7 @@ def emit(styles, out):
     for s in styles:
         b, d, c = s["bass"], s["drums"], s["comp"]
         w.append(f"""    Style {{
+        id: {s['id']},
         name: "{s['name']}",
         label: "{label(s['name'], s['dup'])}",
         beats_per_bar: {f(s['beats_per_bar'])},
@@ -530,6 +534,18 @@ def main(argv):
         seen[s["name"]] = body
         styles.append(s)
     styles.sort(key=lambda s: s["name"])
+    # The ids a chart can write instead of a name (`style = 42`). **Kept, not
+    # counted**: a rhythm added later sorts into the middle of the list, and a
+    # position would move every style after it and every chart that named
+    # one. So the ids live in their own file, a name a line, and a new rhythm
+    # only ever gets the next line.
+    ids_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "style_ids.txt")
+    ids = open(ids_path).read().split() if os.path.exists(ids_path) else []
+    for s in styles:
+        if s["name"] not in ids:
+            ids.append(s["name"])
+        s["id"] = ids.index(s["name"]) + 1
+    open(ids_path, "w").write("\n".join(ids) + "\n")
     emit(styles, out)
     print(f"{len(styles)} styles -> {out}")
     return 0

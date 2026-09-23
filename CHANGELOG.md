@@ -12,7 +12,7 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **1077 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo), 594 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **1091 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo), 602 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio, y `cargo fmt --all --check` también.
 - **56 efectos propios**, publicados también como un `.clap` con los cuatro artifacts (arpegiador, secuenciador, metrónomo y arreglador).
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
@@ -31,6 +31,44 @@ lleva lo que falta —nada de lo ya hecho— y
   `choz-engine::test_locks` tiene un candado por global; en `choz-ui` el par es
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
+
+## [1.3.16] — 2026-09-23
+
+### 2026-09-23 — el arreglador: todos los acordes suenan, el click sigue la heterometría y la banda deja de saturar
+
+Una jornada de auditoría del arreglador contra el log real de uso (`~/.local/state/choz/choz.log`) y contra los charts de ejemplo, que ahora se versionan todos: `assets/default.chord`, `changes.chord`, `minorBlues.chord` y `tarkus.chord`.
+
+**Saturación y volúmenes de la banda**
+
+- **Una SoundFont ya no puede salir de -1..1.** El log tenía la banda a 1.65 antes del fader y, una vez, un pico de 294298 al recargar la progresión con notas sonando (un filtro de voz de oxisynth vuelto inestable). `Sf2Synth::render` pasa ahora la suma por el mismo knee que el sampler SFZ (`sfz::soft_knee`) y descarta toda muestra no finita o mayor que `RUNAWAY` (8.0, +18 dBFS), cortando las voces para que la siguiente nota arranque con el filtro limpio. Test: `a_soundfont_tab_stays_under_full_scale_and_a_runaway_is_cut`.
+- **La sonda al cargar sólo baja el fader, nunca lo sube** (`PROBE_MAX_GAIN = 1.0`). Un Do central del canal 0 medía 0.05 y dejaba el tab en 2.00; después sonaba la banda entera a través de ese fader.
+- **`n` sobre un tab con banda la nivela músico por músico.** Cada zona publica el bloque más fuerte desde la última lectura (`ZoneMeter::take_held`); `n` fija `ArrangerSettings::balance` por músico a un pico de 0.3 y deja el tab en 1.00. Medido con DSoundFontV4: la batería llegaba sola a 1.0 y el piano estaba 20 dB debajo del bajo.
+- **El balance interno de la banda era de velocity, no de volumen.** `generate::balance` escalaba la velocity por el nivel buscado, pero una SoundFont atenúa `40·log10(vel/127)` dB: el volumen va con el cuadrado de la velocity. El piano en acordes de cuatro quedaba en 27 (-23 dB); ahora `vel_for_level` usa la raíz y queda en 49. Piano en `changes.chord`: -39.4 → -28.9 dBFS RMS, a la par del bajo. Test: `the_band_is_balanced_in_loudness_not_in_velocity`.
+- **Programa por músico con el botón derecho** sobre BASS, DRUMS, PIANO o GUITAR: la lista de programas de la SoundFont, con AUTO (la elección del estilo) arriba. Se guarda en el proyecto (`ArrangerSettings::programs`). Test: `the_right_button_on_a_musician_picks_their_program`.
+
+**Todos los acordes de una barra suenan**
+
+- `| Dm7 G7 |`: la guitarra no tocaba el segundo acorde en ninguna barra de `changes.chord` y el piano faltaba en cuatro, porque sólo tocaban los golpes del patrón del estilo y el dado de densidad podía quitar el único que tenía un acorde corto. Ahora cada acorde recibe al menos un golpe (en su comienzo si el patrón no tiene ninguno) y el primero siempre suena. `Progression::changes_in` dice dónde empieza cada acorde.
+- El bajo contaba tiempos enteros desde el comienzo del chart: tras el primer 7/8 quedaba medio tiempo corrido en todas las barras, y un cambio a mitad de tiempo (`7/8 Ab:3 G7:4`) llegaba tarde. Ahora recorre cada barra desde su propio uno, más cada cambio de acorde.
+- Test: `every_chord_of_a_bar_is_played_by_every_style` (los 212 estilos × bajo, piano y guitarra × 3 seeds, con cambios de compás); falla sin el arreglo.
+- La misma seed suena distinto en las barras de más de un acorde.
+
+**El metrónomo y los cambios de compás**
+
+- **Un chart que cambia de compás arrastra al click siempre**, diga lo que diga FOLLOW ARR. Simulado de punta a punta a 96 kHz con `changes.chord`: con el interruptor apagado ninguna barra desde la cuarta tenía su tiempo fuerte. FOLLOW ARR sigue eligiendo sólo en charts de un compás.
+- **Fijar el compás a mano ya no apaga FOLLOW ARR para siempre.** Cambiar BEATS escribía `follow_arranger = false` en `ui.json`; ahora el compás propio vale mientras suene esa banda (`meter_held`).
+- **Agrupación por compás:** `groups 7/8 = 2+2+3`, una línea por compás; el click acentúa la agrupación de la barra que suena (`Arranger::bar_groups`). `changes.chord` y `tarkus.chord` la declaran. Tests: `a_grouping_can_be_written_for_each_meter`, `the_click_counts_each_meter_of_a_chart_its_own_way`.
+
+**Charts y estilos**
+
+- **Cada estilo tiene un id** (`tools/style_ids.txt`, sólo se agrega al final, así que un ritmo nuevo no mueve los ids existentes), visible en el modal STYLE. `style =` acepta el id, el nombre o la etiqueta: `style = Drum & Bass` se leía como el primer estilo sin avisar. Manual 9.4: tabla de los 212 estilos con id, nombre, compás y definición.
+- `7alt` (dominante alterado: b9, #9, #5) como calidad de acorde, también en el diálogo de acordes. `Abb9` es A♭ con ♭9 y no G9: la raíz toma una sola alteración.
+- **Una sección que la `form` repite se dibuja una vez** y la luz vuelve a su primera barra; la cabecera dice la vuelta (`BAR 13 [TURN] 2/3`). Antes el panel dibujaba las barras escritas y, con `form = turn turn turn`, nada quedaba iluminado desde la barra 13.
+- Test: `every_chart_shipped_reads_and_names_a_style` lee cada `.chord` de `assets/`.
+
+**i18n:** `AUTO` agregado a la tabla en los nueve idiomas; el título del modal usa la clave `BANK/PRESET` existente.
+
+**Documentación:** manual (9.3 y 9.4, tabla de estilos, ejemplo de instalación a 1.3.16), `docs/architecture.md` (protección de salida del SF2, balance por músico, el click y la heterometría), README y roadmap a 1.3.16.
 
 ## [1.3.15] — 2026-09-22
 

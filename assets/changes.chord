@@ -1,0 +1,14 @@
+key = Eb
+style = 060
+# How each meter is counted: the click accents where each group starts.
+groups 7/8 = 2+2+3
+groups 5/8 = 3+2
+
+[intro]
+| 4/4 cm  | Dm7 G7 | 7/8 AbMaj7:3 G7:4 | 3/4 Gm7b5:2 C7:1 |
+[turn]
+| 4/4 Fm7 | Gm7b5 C7 | Fm7 | Bm7b5 E7 |
+[choir]
+| 5/8 A7  | G7alt | 2/4 cm7 Abb9 | 4/4 Dm7b5 G7b9 |
+
+form = intro turn choir intro turn choir choir

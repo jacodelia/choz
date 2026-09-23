@@ -2119,6 +2119,16 @@ impl AudioEngine {
             .unwrap_or(0.0)
     }
 
+    /// Zone `zone` of `slot`'s loudest block since this was last asked — see
+    /// [`choz_ports::ZoneMeter::take_held`].
+    pub fn take_zone_held(&self, slot: usize, zone: usize) -> f32 {
+        self.zone_meters
+            .get(slot)
+            .and_then(|m| m.as_ref())
+            .map(|m| m.take_held(zone))
+            .unwrap_or(0.0)
+    }
+
     /// Which zone each octave of `slot`'s keyboard plays.
     pub fn set_split(&mut self, slot: usize, split: [Option<u8>; choz_ports::SPLIT_OCTAVES]) {
         if slot >= self.slot_count {
