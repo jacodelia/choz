@@ -43,6 +43,7 @@
 pub mod chord;
 pub mod generate;
 pub mod smf;
+pub mod spec;
 pub mod style;
 pub mod styles;
 

@@ -33,8 +33,27 @@ use super::FxProcessor;
 
 const MAX_DELAY_S: f32 = 2.0;
 /// Fixed RE-201-style head delay ratios and their relative gains.
-const HEAD_RATIOS: [f32; 3] = [1.0, 0.68, 0.40];
+///
+/// Equidistant, as on the machine: heads 1, 2 and 3 at a third, two thirds and
+/// all of the delay — so with Sync on, all three land on the grid.
+const HEAD_RATIOS: [f32; 3] = [1.0, 2.0 / 3.0, 1.0 / 3.0];
 const HEAD_GAINS: [f32; 3] = [1.0, 0.70, 0.45];
+
+/// The mode selector: which heads play, in `HEAD_RATIOS` order (longest
+/// first). Named the RE-201 way, head 1 being the shortest — seven echo
+/// combinations and then the spring on its own.
+pub const HEAD_MODES: [(&str, [bool; 3]); 8] = [
+    ("1", [false, false, true]),
+    ("2", [false, true, false]),
+    ("3", [true, false, false]),
+    ("1+2", [false, true, true]),
+    ("2+3", [true, true, false]),
+    ("1+3", [true, false, true]),
+    ("1+2+3", [true, true, true]),
+    ("REV", [false, false, false]),
+];
+/// All three heads — what it always was, and the knob's default.
+pub const HEADS_DEFAULT: f32 = 6.0 / 7.0;
 
 /// One-pole lowpass (tape HF loss / damping).
 #[derive(Clone, Copy)]
@@ -180,6 +199,19 @@ pub struct SpaceEcho {
 
     wow_phase: f32,
     flutter_phase: f32,
+    /// The delay the heads are at right now, in samples, gliding toward what
+    /// Time asks for — the way a tape machine's motor changes speed.
+    delay_now: f32,
+    /// Index into [`HEAD_MODES`].
+    heads: usize,
+    /// Index into [`super::sync::DIVISIONS`]; 0 is free-running Time.
+    sync: usize,
+    /// Output shelves on the effect sound, 0..1, 0.5 flat — the RE-201's Bass
+    /// and Treble. Tone stays what it was: the hi-cut inside the loop.
+    bass: f32,
+    treble: f32,
+    eq_lo: [OnePole; 2],
+    eq_hi: [OnePole; 2],
 }
 
 impl SpaceEcho {
@@ -233,6 +265,13 @@ impl SpaceEcho {
             combs,
             wow_phase: 0.0,
             flutter_phase: 0.3,
+            delay_now: (50.0 + time.clamp(0.0, 1.0) * 1450.0) / 1000.0 * sr as f32,
+            heads: 6,
+            sync: 0,
+            bass: 0.5,
+            treble: 0.5,
+            eq_lo: [OnePole::new(); 2],
+            eq_hi: [OnePole::new(); 2],
         }
     }
 
@@ -248,11 +287,18 @@ impl SpaceEcho {
         for (comb, n) in self.combs.iter_mut().zip([1557usize, 1116]) {
             comb.set_len(s(n));
         }
+        self.delay_now = self.delay_samps();
     }
 
+    /// The longest head's delay, in samples. Synced, head 1 — a third of it —
+    /// is the note value, so the three heads are one, two and three of them;
+    /// held under the tape's two seconds.
     fn delay_samps(&self) -> f32 {
-        let ms = 50.0 + self.time.clamp(0.0, 1.0) * 1450.0;
-        (ms / 1000.0) * self.sample_rate as f32
+        let sr = self.sample_rate as f32;
+        match super::sync::quarters(self.sync) {
+            Some(q) => (super::sync::samples(q, sr) * 3.0).min((MAX_DELAY_S - 0.05) * sr),
+            None => (50.0 + self.time.clamp(0.0, 1.0) * 1450.0) / 1000.0 * sr,
+        }
     }
 }
 
@@ -262,7 +308,10 @@ impl FxProcessor for SpaceEcho {
             self.retune(sample_rate);
         }
         let sr = self.sample_rate as f32;
-        let base = self.delay_samps();
+        let target = self.delay_samps();
+        // ~80 ms glide: turning Time bends the pitch of what is on the tape,
+        // as it does on the machine, instead of jumping the heads (a click).
+        let glide = 1.0 - (-1.0 / (0.08 * sr)).exp();
         // Tape colour: HF loss corner falls from 10 kHz (new) to ~1.8 kHz (worn);
         // `tone` adds an extra global hi-cut. LP applied in the feedback loop.
         let lp_hz = (1800.0 + (1.0 - self.age) * 8200.0) * (0.4 + 0.6 * self.tone);
@@ -273,9 +322,30 @@ impl FxProcessor for SpaceEcho {
         for c in self.combs.iter_mut() {
             c.damp.set_hz(2600.0, sr);
         }
+        // ±12 dB shelves: 250 Hz and under, 3 kHz and over. At 0.5 the gain is
+        // exactly 1 and the shelf adds exactly nothing.
+        let db = |v: f32| 10f32.powf((v.clamp(0.0, 1.0) - 0.5) * 24.0 / 20.0);
+        let (g_lo, g_hi) = (db(self.bass) - 1.0, db(self.treble) - 1.0);
+        for (lo, hi) in self.eq_lo.iter_mut().zip(self.eq_hi.iter_mut()) {
+            lo.set_hz(250.0, sr);
+            hi.set_hz(3000.0, sr);
+        }
 
         let fb = self.feedback.clamp(0.0, 1.0) * 1.1;
-        let sat_drive = 1.0 + self.age * 3.0;
+        let active = HEAD_MODES[self.heads.min(HEAD_MODES.len() - 1)].1;
+        // The loop is divided by the gain of the heads that are on. The three
+        // together read the tape back at up to 2.15× — fed back raw, that was
+        // a loop that oscillated from Feedback 0.45 on new tape and 0.2 on
+        // worn, where the knob promises it only past 1.0 — and normalising by
+        // the ones on keeps Feedback meaning the same whichever of them play.
+        let head_sum = HEAD_GAINS
+            .iter()
+            .zip(active)
+            .filter(|(_, on)| *on)
+            .map(|(g, _)| g)
+            .sum::<f32>()
+            .max(1e-6);
+        let sat_drive = 1.0 + self.age * 1.5;
         // Wow/flutter modulation depth, in samples.
         let wow_d = self.wow * 0.004 * sr; // up to ~4 ms slow
         let flut_d = self.flutter * 0.0009 * sr; // up to ~0.9 ms fast
@@ -294,22 +364,37 @@ impl FxProcessor for SpaceEcho {
             let mod_r =
                 (self.wow_phase + 1.7).sin() * wow_d + (self.flutter_phase + 0.9).sin() * flut_d;
 
-            // Sum the 3 heads per channel.
+            // Capped at half a sample a sample — the tape never runs past
+            // ±50 % of its speed — or a big turn of Time would be a squeal
+            // twelve times the pitch, which is a click spread over 80 ms.
+            self.delay_now += ((target - self.delay_now) * glide).clamp(-0.5, 0.5);
+            let base = self.delay_now;
+            // Sum the heads the mode selector has on.
             let mut echo_l = 0.0;
             let mut echo_r = 0.0;
-            for (ratio, gain) in HEAD_RATIOS.iter().zip(HEAD_GAINS.iter()) {
-                echo_l += self.tape_l.read(base * ratio + mod_l) * gain;
-                echo_r += self.tape_r.read(base * ratio + mod_r) * gain;
+            for ((ratio, gain), on) in HEAD_RATIOS.iter().zip(HEAD_GAINS.iter()).zip(active) {
+                if on {
+                    echo_l += self.tape_l.read(base * ratio + mod_l) * gain;
+                    echo_r += self.tape_r.read(base * ratio + mod_r) * gain;
+                }
             }
 
             // Feedback colour: HP → LP(age) → tanh(age), then back into the tape.
-            let col_l = (self.tape_l.lp.lp(self.tape_l.hp.hp(echo_l)) * sat_drive).tanh();
-            let col_r = (self.tape_r.lp.lp(self.tape_r.hp.hp(echo_r)) * sat_drive).tanh();
+            // The saturator is unity at low level (`tanh(d·x)/d`): age brings
+            // the clipping in sooner, it does not add gain to the loop. With
+            // the head sum normalised the loop gain is `fb` at most, so it
+            // only runs away past Feedback ≈ 0.91, as documented.
+            let sat = |x: f32| (x * sat_drive).tanh() / sat_drive;
+            let col_l = sat(self.tape_l.lp.lp(self.tape_l.hp.hp(echo_l / head_sum)));
+            let col_r = sat(self.tape_r.lp.lp(self.tape_r.hp.hp(echo_r / head_sum)));
             self.tape_l.write(dry_l + col_l * fb);
             self.tape_r.write(dry_r + col_r * fb);
 
-            // Spring reverb on the mono echo sum.
-            let mut spr = (echo_l + echo_r) * 0.5;
+            // Spring reverb on the input **and** the echoes: the RE-201's
+            // spring hears what comes in, which is what makes its REV-only
+            // position possible — with only the echoes feeding it, no heads
+            // meant no reverb.
+            let mut spr = (echo_l + echo_r + dry_l + dry_r) * 0.5;
             for ap in self.aps.iter_mut() {
                 spr = ap.process(spr);
             }
@@ -319,24 +404,37 @@ impl FxProcessor for SpaceEcho {
             }
             tail *= 0.5;
 
-            let wet_l = echo_l + tail * self.spring;
-            let wet_r = echo_r + tail * self.spring;
+            let mut wet = [echo_l + tail * self.spring, echo_r + tail * self.spring];
+            for (ch, w) in wet.iter_mut().enumerate() {
+                let low = self.eq_lo[ch].lp(*w);
+                let high = *w - self.eq_hi[ch].lp(*w);
+                *w += g_lo * low + g_hi * high;
+            }
+            let [wet_l, wet_r] = wet;
             buf[i * 2] = dry_l + self.wet * (wet_l - dry_l);
             buf[i * 2 + 1] = dry_r + self.wet * (wet_r - dry_r);
         }
     }
 
+    /// Silence, in place: rebuilding allocated ~3 MB of tape and dropped the
+    /// Wet back to its default.
     fn reset(&mut self) {
-        *self = SpaceEcho::new(
-            self.sample_rate,
-            self.time,
-            self.feedback,
-            self.wow,
-            self.flutter,
-            self.age,
-            self.spring,
-            self.tone,
-        );
+        for tape in [&mut self.tape_l, &mut self.tape_r] {
+            tape.buf.fill(0.0);
+            tape.hp.z = 0.0;
+            tape.lp.z = 0.0;
+        }
+        for ap in self.aps.iter_mut() {
+            ap.buf.fill(0.0);
+        }
+        for comb in self.combs.iter_mut() {
+            comb.buf.fill(0.0);
+            comb.damp.z = 0.0;
+        }
+        for f in self.eq_lo.iter_mut().chain(self.eq_hi.iter_mut()) {
+            f.z = 0.0;
+        }
+        self.delay_now = self.delay_samps();
     }
 
     fn set_mix(&mut self, wet: f32) {
@@ -357,11 +455,15 @@ impl FxProcessor for SpaceEcho {
             P::new("Spring", self.spring, 0.0, 1.0, ""),
             P::new("Tone", self.tone, 0.0, 1.0, ""),
             P::new("Wet", self.wet, 0.0, 1.0, ""),
+            P::new("Heads", self.heads as f32 / 7.0, 0.0, 1.0, ""),
+            P::new("Sync", super::sync::norm_of(self.sync), 0.0, 1.0, ""),
+            P::new("Bass", self.bass, -12.0, 12.0, "dB"),
+            P::new("Treble", self.treble, -12.0, 12.0, "dB"),
         ]
     }
 
-    /// Live param update — preserves the tape buffer + reverb tail (no rebuild),
-    /// so e.g. crossfading Time/Feedback or automating Wow stays click-free.
+    /// Live param update — preserves the tape buffer + reverb tail (no rebuild).
+    /// Time glides (see `delay_now`), so moving it bends rather than clicks.
     fn set_param(&mut self, index: usize, value: f32) {
         let v = value.clamp(0.0, 1.0);
         match index {
@@ -373,6 +475,10 @@ impl FxProcessor for SpaceEcho {
             5 => self.spring = v,
             6 => self.tone = v,
             7 => self.wet = v,
+            8 => self.heads = (v * 7.0).round() as usize,
+            9 => self.sync = super::sync::index_of(v),
+            10 => self.bass = v,
+            11 => self.treble = v,
             _ => {}
         }
     }
@@ -474,12 +580,199 @@ mod tests {
         }
     }
 
+    /// Below the top of its travel the echo dies away, on new tape and worn.
+    /// It used to grow on its own from Feedback 0.45 (new) and 0.2 (half
+    /// worn) — most of the knob was a runaway.
+    #[test]
+    fn the_echo_dies_away_below_full_feedback() {
+        for age in [0.0f32, 0.5, 1.0] {
+            let mut fx = SpaceEcho::new(48_000, 0.2, 0.75, 0.0, 0.0, age, 0.0, 1.0);
+            fx.set_mix(1.0);
+            let mut peaks = Vec::new();
+            for s in 0..8 {
+                let mut b = vec![0.0f32; 96_000];
+                if s == 0 {
+                    for i in 0..480 {
+                        let v = 0.3 * (i as f32 * 0.1).sin();
+                        b[i * 2] = v;
+                        b[i * 2 + 1] = v;
+                    }
+                }
+                fx.process_block(&mut b, 48_000);
+                peaks.push(b.iter().fold(0.0f32, |m, x| m.max(x.abs())));
+            }
+            assert!(
+                peaks[7] < peaks[1] * 0.1,
+                "age {age}: still ringing after 8 s: {peaks:?}"
+            );
+        }
+    }
+
+    /// Past 0.91 it may sing on its own — that is what the top of the knob is
+    /// for — but the saturator holds it.
+    #[test]
+    fn full_feedback_sings_but_stays_bounded() {
+        let mut fx = SpaceEcho::new(48_000, 0.2, 1.0, 0.3, 0.3, 0.5, 0.5, 1.0);
+        fx.set_mix(1.0);
+        let mut b: Vec<f32> = (0..96_000)
+            .map(|i| 0.5 * ((i / 2) as f32 * 0.03).sin())
+            .collect();
+        let mut peak = 0.0f32;
+        for _ in 0..10 {
+            fx.process_block(&mut b, 48_000);
+            assert!(b.iter().all(|x| x.is_finite()));
+            peak = b.iter().fold(peak, |m, x| m.max(x.abs()));
+            b.iter_mut().for_each(|x| *x = 0.0);
+        }
+        assert!(peak < 3.0, "peak {peak}");
+    }
+
+    /// Moving Time glides the heads: no sample-to-sample jump in the output
+    /// bigger than the signal itself makes.
+    #[test]
+    fn turning_time_does_not_click() {
+        let mut fx = SpaceEcho::new(48_000, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0);
+        fx.set_mix(1.0);
+        let tone = |k: usize| -> Vec<f32> {
+            (0..4096)
+                .map(|i| 0.5 * (((i / 2) + k * 2048) as f32 * 0.02).sin())
+                .collect()
+        };
+        for k in 0..30 {
+            fx.process_block(&mut tone(k), 48_000);
+        }
+        fx.set_param(0, 0.9);
+        let mut worst = 0.0f32;
+        let mut prev: Option<f32> = None;
+        for k in 30..40 {
+            let mut b = tone(k);
+            fx.process_block(&mut b, 48_000);
+            for x in b.iter().step_by(2) {
+                if let Some(p) = prev {
+                    worst = worst.max((x - p).abs());
+                }
+                prev = Some(*x);
+            }
+        }
+        // A 0.5 sine at 0.02 rad/sample moves ≤ 0.01 a sample; the three
+        // heads summed, ≤ ~0.03. A jump of the heads is an order more.
+        assert!(worst < 0.1, "biggest step {worst}");
+    }
+
+    /// The mode selector picks the heads, and its last position is the
+    /// spring alone — which only works because the spring hears the input.
+    #[test]
+    fn the_mode_selector_picks_heads_and_rev_is_spring_only() {
+        let echo_at = |mode: f32| {
+            let mut fx = SpaceEcho::new(48_000, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0);
+            fx.set_param(8, mode);
+            fx.set_mix(1.0);
+            let mut b = vec![0.0f32; 96_000];
+            b[0] = 1.0;
+            b[1] = 1.0;
+            fx.process_block(&mut b, 48_000);
+            b
+        };
+        // Time 0.2 → 340 ms; head 1 (the shortest) is a third of it: 113 ms.
+        let near = |b: &[f32], ms: f32| {
+            let at = (ms * 48.0) as usize * 2;
+            b[at - 40..at + 40]
+                .iter()
+                .fold(0.0f32, |m, x| m.max(x.abs()))
+        };
+        let one = echo_at(0.0);
+        assert!(
+            near(&one, 113.0) > 0.1 && near(&one, 340.0) < 1e-3,
+            "mode 1 is head 1 alone"
+        );
+        let three = echo_at(2.0 / 7.0);
+        assert!(
+            near(&three, 113.0) < 1e-3 && near(&three, 340.0) > 0.1,
+            "mode 3 is head 3 alone"
+        );
+
+        let mut fx = SpaceEcho::new(48_000, 0.2, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0);
+        fx.set_param(8, 1.0); // REV
+        fx.set_mix(1.0);
+        let mut b = vec![0.0f32; 96_000];
+        b[0] = 1.0;
+        b[1] = 1.0;
+        fx.process_block(&mut b, 48_000);
+        assert!(near(&b, 340.0) < 0.05, "no echo in REV");
+        assert!(
+            b[2_000..40_000].iter().any(|x| x.abs() > 1e-3),
+            "but a spring"
+        );
+    }
+
+    /// Synced to 1/8 at 120 bpm, head 1 is 250 ms and head 3 is 750.
+    #[test]
+    fn sync_puts_the_heads_on_the_grid() {
+        let _g = crate::test_locks::transport();
+        let t = choz_ports::transport();
+        let old = t.bpm();
+        t.set_bpm(120.0);
+        let mut fx = SpaceEcho::new(48_000, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0);
+        let eighth = super::super::sync::DIVISIONS
+            .iter()
+            .position(|(_, n)| *n == "1/8")
+            .unwrap();
+        fx.set_param(9, super::super::sync::norm_of(eighth));
+        fx.set_param(8, 0.0); // head 1 alone
+        fx.reset(); // land on the synced time instead of gliding there
+        fx.set_mix(1.0);
+        let mut b = vec![0.0f32; 96_000];
+        b[0] = 1.0;
+        b[1] = 1.0;
+        fx.process_block(&mut b, 48_000);
+        t.set_bpm(old);
+        let at = 250 * 48 * 2;
+        let peak = b[at - 80..at + 80]
+            .iter()
+            .fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(peak > 0.1, "head 1 is not at 250 ms: {peak}");
+    }
+
+    /// Bass and Treble at the middle change nothing; turned up, they lift
+    /// their end of the echo.
+    #[test]
+    fn bass_and_treble_shelve_the_echo() {
+        let run = |bass: f32, treble: f32, hz: f32| {
+            let mut fx = SpaceEcho::new(48_000, 0.1, 0.3, 0.0, 0.0, 0.0, 0.0, 1.0);
+            fx.set_param(10, bass);
+            fx.set_param(11, treble);
+            fx.set_mix(1.0);
+            let mut b: Vec<f32> = (0..96_000)
+                .map(|i| 0.2 * (std::f32::consts::TAU * hz * (i / 2) as f32 / 48_000.0).sin())
+                .collect();
+            fx.process_block(&mut b, 48_000);
+            b[48_000..].iter().map(|x| x * x).sum::<f32>()
+        };
+        assert!(
+            run(1.0, 0.5, 80.0) > run(0.5, 0.5, 80.0) * 4.0,
+            "bass lifts the lows"
+        );
+        assert!(
+            run(0.5, 1.0, 8000.0) > run(0.5, 0.5, 8000.0) * 4.0,
+            "treble lifts the highs"
+        );
+        assert!((run(0.5, 0.5, 80.0) - run(0.5, 0.5, 80.0)).abs() < 1e-9);
+    }
+
     #[test]
     fn space_echo_reset_clears_tail() {
         let mut fx = SpaceEcho::new(48000, 0.3, 0.7, 0.2, 0.2, 0.3, 0.3, 0.5);
         let mut block = vec![0.5f32; 256];
         fx.process_block(&mut block, 48000);
+        fx.set_mix(0.3);
+        let ptr = fx.tape_l.buf.as_ptr() as usize;
         fx.reset();
         assert!(fx.tape_l.buf.iter().all(|&v| v == 0.0));
+        assert_eq!(
+            ptr,
+            fx.tape_l.buf.as_ptr() as usize,
+            "rebuilt, so allocated"
+        );
+        assert_eq!(fx.wet, 0.3);
     }
 }

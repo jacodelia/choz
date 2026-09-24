@@ -435,6 +435,9 @@ pub struct AudioEngine {
     backend_pref: String,
     /// RT endpoints, taken by `start()` and moved into the callback.
     rt_endpoints: Option<RtEndpoints>,
+    /// `choz Mic` and `choz System FX`, made when the native JACK client
+    /// starts and taken away with the engine — see [`crate::virtual_devices`].
+    virtual_devices: Option<crate::virtual_devices::VirtualDevices>,
     _stream: Option<BackendHandle>,
     /// The live capture stream on the cpal backends. Held only to keep it
     /// alive; dropping it stops the input, which is the whole point.
@@ -842,6 +845,7 @@ impl AudioEngine {
             output_device: None,
             backend_pref: "AUTO".to_string(),
             rt_endpoints: Some(RtEndpoints { cmd_rx, retired_tx }),
+            virtual_devices: None,
             _stream: None,
             _input_stream: None,
             input_device: None,
@@ -1021,7 +1025,14 @@ impl AudioEngine {
         }
         request_pipewire_period(self.buffer_size, self.sample_rate, self.force_quantum);
 
-        let sink = self.output_device.clone().or_else(jack_current_sink);
+        // An output saved as one of choz's own virtual devices is no output
+        // at all — everything processed went into a speaker nobody hears.
+        let sink = self
+            .output_device
+            .clone()
+            .filter(|s| !crate::virtual_devices::is_ours(s))
+            .or_else(jack_current_sink)
+            .filter(|s| !crate::virtual_devices::is_ours(s));
         // An unknown sink still gets a stereo client: the user can patch it.
         let (outs, sink_ins) = sink
             .as_deref()
@@ -1031,6 +1042,11 @@ impl AudioEngine {
         // sink's own capture ports (what this used to ask for) are none at all
         // on PipeWire, where an interface is two nodes.
         let _ = sink_ins;
+        // Before the capture scan: `choz System FX` has to exist for its
+        // monitor to be one of the inputs listed.
+        if self.virtual_devices.is_none() {
+            self.virtual_devices = Some(crate::virtual_devices::VirtualDevices::ensure());
+        }
         let capture = crate::jack_backend::all_capture_ports();
         let ins = capture.len();
         // The sink's own channels, and the direct outs past them. `connect`
@@ -1313,7 +1329,14 @@ impl AudioEngine {
         // The sink may never have been named — PipeWire auto-connects us and
         // `output_device` stays empty until someone picks one. Reconnect to
         // whatever we are wired to now.
-        let sink = self.output_device.clone().or_else(jack_current_sink);
+        // An output saved as one of choz's own virtual devices is no output
+        // at all — everything processed went into a speaker nobody hears.
+        let sink = self
+            .output_device
+            .clone()
+            .filter(|s| !crate::virtual_devices::is_ours(s))
+            .or_else(jack_current_sink)
+            .filter(|s| !crate::virtual_devices::is_ours(s));
         self.restart_jack_native(sink.as_deref(), self.sink_channels)
             .map(|()| true)
     }
@@ -3065,9 +3088,7 @@ impl RtState {
                     }
                 }
             }
-            for fx in slot.fx.iter_mut() {
-                fx.process_block(sc, sr);
-            }
+            crate::fx_chain::run_chain(&mut slot.fx, sc, sr);
             // How loud this tab is on its own, **before** the strip: the
             // number auto-trim solves against, and the only way the health log
             // can name which tab clipped the mix.
@@ -3297,7 +3318,11 @@ fn jack_sinks() -> Vec<String> {
         let Some((owner, _)) = port.rsplit_once(':') else {
             continue;
         };
-        let ours = owner == CPAL_JACK_CLIENT || owner == crate::jack_backend::CLIENT_NAME;
+        let ours = owner == CPAL_JACK_CLIENT
+            || owner == crate::jack_backend::CLIENT_NAME
+            // choz's own virtual devices are not places for its output: see
+            // `virtual_devices::is_ours`.
+            || crate::virtual_devices::is_ours(owner);
         if !ours && !sinks.iter().any(|s| s == owner) {
             sinks.push(owner.to_string());
         }
@@ -3342,6 +3367,26 @@ fn jack_route_to(sink: &str, client_name: &str) -> Result<()> {
 
     let pairs = pair_ports(&ours, &targets);
     let wired = pairs.len();
+    // The device the main pair is leaving. Whatever of ours is still wired to
+    // it and is not rewired below — the direct outs, which an older version
+    // folded onto the sink — comes off it. Only off *that* device: a direct
+    // out patched into a DAW by hand stays where it was put.
+    let leaving = client
+        .port_by_name(&ours[0])
+        .and_then(|p| p.get_connections().into_iter().next())
+        .and_then(|c| c.rsplit_once(':').map(|(owner, _)| owner.to_string()));
+    if let Some(old) = leaving.filter(|old| old != sink) {
+        for out in ours.iter().skip(wired) {
+            let Some(port) = client.port_by_name(out) else {
+                continue;
+            };
+            for c in port.get_connections() {
+                if c.starts_with(&format!("{old}:")) {
+                    let _ = client.disconnect_ports_by_name(out, &c);
+                }
+            }
+        }
+    }
     for (out, target) in pairs {
         // Tear the old wiring down first: a port left connected to two sinks
         // plays through both.
@@ -3363,6 +3408,9 @@ fn jack_route_to(sink: &str, client_name: &str) -> Result<()> {
         "choz: output wired to '{sink}' — {wired} of {} ports",
         ours.len()
     );
+    // The rewire above dropped every connection of ours, the virtual
+    // microphone's included.
+    crate::jack_backend::wire_mic(&client, &ours);
     Ok(())
 }
 
@@ -3373,7 +3421,15 @@ fn pair_ports<'a>(ours: &'a [String], targets: &'a [String]) -> Vec<(&'a str, &'
     ours.iter()
         .enumerate()
         .filter_map(|(i, out)| {
-            let t = targets.get(i).or_else(|| targets.last())?;
+            // Folding is for the main pair onto a mono sink, and nothing else:
+            // past it are the direct outs, which belong to whoever patches
+            // them. Folded, all eight of them were summed into the sink's
+            // right channel.
+            let t = match targets.get(i) {
+                Some(t) => t,
+                None if i < 2 => targets.last()?,
+                None => return None,
+            };
             Some((out.as_str(), t.as_str()))
         })
         .collect()
@@ -3723,6 +3779,22 @@ mod tests {
         assert!(
             pair_ports(&ours, &[]).is_empty(),
             "a sink with no inputs wires nothing"
+        );
+    }
+
+    /// The direct outs past the main pair are never folded onto a sink with
+    /// fewer inputs: they belong to whatever patches them. Folded, all eight
+    /// were summed into a stereo device's right channel.
+    #[test]
+    fn direct_outs_are_not_folded_onto_the_sink() {
+        let ours: Vec<String> = (1..=10).map(|i| format!("choz:out_{i}")).collect();
+        let stereo = vec!["Headset:playback_FL".into(), "Headset:playback_FR".into()];
+        assert_eq!(pair_ports(&ours, &stereo).len(), 2);
+        let mono = vec!["Beeper:playback_MONO".into()];
+        assert_eq!(
+            pair_ports(&ours, &mono).len(),
+            2,
+            "the main pair folds, nothing else"
         );
     }
 

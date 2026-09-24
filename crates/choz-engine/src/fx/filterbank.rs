@@ -8,6 +8,11 @@ use crate::fx::FxProcessor;
 
 pub const BANDS: usize = 48;
 const Q_BANK: f32 = 4.0; // ~1/5-octave bandwidth per band
+/// How much neighbouring bands pile up. The bells are a fifth of an octave
+/// apart and a third of one wide, so a third of the bank at `g` dB each peaks
+/// at ~2.46·g — measured over the cascade's response at +1 dB a band. The
+/// knobs divide by it, so `High` at +24 dB is +24 dB and not the +74 dB it was.
+const STACK: f32 = 2.457;
 
 /// 48-band graphic EQ. Each band is a peaking (bell) biquad EQ.
 pub struct FilterBankFx {
@@ -107,7 +112,7 @@ impl FxProcessor for FilterBankFx {
     /// they move together, so any one of them answers for the group.
     fn params(&self) -> Vec<crate::fx::FxParam> {
         use crate::fx::FxParam;
-        let g = |third: usize| self.gains_db[third * (BANDS / 3)] / 48.0 + 0.5;
+        let g = |third: usize| self.gains_db[third * (BANDS / 3)] * STACK / 48.0 + 0.5;
         vec![
             FxParam::new("Low", g(0), -24.0, 24.0, "dB"),
             FxParam::new("Mid", g(1), -24.0, 24.0, "dB"),
@@ -128,7 +133,7 @@ impl FxProcessor for FilterBankFx {
         if index >= 3 {
             return;
         }
-        let db = (v - 0.5) * 48.0;
+        let db = (v - 0.5) * 48.0 / STACK;
         let width = BANDS / 3;
         for b in index * width..(index + 1) * width {
             self.set_band_gain(b, db);
@@ -238,6 +243,34 @@ mod tests {
             e_out < e_in * 0.5,
             "-12 dB all-band cut should reduce energy: ratio={:.2}",
             e_out / e_in.max(1e-9)
+        );
+    }
+
+    /// A knob at the top of its travel is +24 dB where it acts, not the
+    /// +74 dB sixteen overlapping bells at +24 dB each added up to.
+    #[test]
+    fn a_knob_at_full_boost_is_its_label() {
+        let mut fb = FilterBankFx::new(48000);
+        fb.set_param(1, 1.0); // Mid, +24 dB
+        let tone = |hz: f32| -> Vec<f32> {
+            (0..48000)
+                .flat_map(|i| {
+                    let s = 0.001 * (2.0 * std::f32::consts::PI * hz * i as f32 / 48000.0).sin();
+                    [s, s]
+                })
+                .collect()
+        };
+        let mut worst = f32::MIN;
+        for hz in [300.0f32, 600.0, 1000.0, 1500.0, 2000.0] {
+            let mut b = tone(hz);
+            fb.reset();
+            fb.process_block(&mut b, 48000);
+            let peak = b[48000..].iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            worst = worst.max(20.0 * (peak / 0.001).log10());
+        }
+        assert!(
+            (21.0..27.0).contains(&worst),
+            "Mid +24 dB peaks at {worst:.1} dB"
         );
     }
 

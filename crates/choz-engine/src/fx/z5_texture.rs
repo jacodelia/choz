@@ -14,6 +14,9 @@
 //! ```text
 //!   GRAIN : 0 Size  1 Density  2 Spray  3 Overlap  4 Pitch  5 RndPitch  6 Reverse  7 Spread
 //!   MOTION: 8 Freeze 9 Feedbk  10 Stretch 11 Position 12 Drift 13 Blur   14 BufLen  15 Wet
+//!   SHAPE : 16 Contour
+//!   LFO   : 17 LfoRate 18 LfoDepth 19 LfoShape 20 LfoDest
+//!   (added last, so older projects keep their knobs)
 //! ```
 //!
 //! Source = whatever audio is already on the slot's FX chain, i.e. the Pattern
@@ -27,7 +30,7 @@ use super::{FxParam, FxProcessor};
 
 const MAX_BUF_S: f32 = 4.0;
 const MAX_GRAINS: usize = 16;
-pub const Z5_PARAM_COUNT: usize = 16;
+pub const Z5_PARAM_COUNT: usize = 21;
 /// Number of downsampled waveform bins published to the UI scope.
 pub const Z5_WAVE_BINS: usize = 64;
 
@@ -84,78 +87,81 @@ struct Grain {
 
 /// Named preset param-sets (flat order above). Usable as future preset picks.
 pub const Z5_PRESETS: &[(&str, [f32; Z5_PARAM_COUNT]); 10] = &[
-    //                  Size Dens Spry Ovlp Pit  Rnd  Rev  Sprd | Frz  Fbk  Str  Pos  Drf  Blr  Buf  Wet
+    //                  Size Dens Spry Ovlp Pit  Rnd  Rev  Sprd | Frz  Fbk  Str  Pos  Drf  Blr  Buf  Wet | Ctr | LfoR LfoD LfoS LfoT
     (
         "Frozen Pad",
         [
             0.70, 0.50, 0.20, 0.60, 0.50, 0.05, 0.00, 0.40, 1.00, 0.30, 0.50, 0.30, 0.10, 0.30,
-            1.00, 0.60,
+            1.00, 0.60, 0.50, 0.35, 0.00, 0.00, 0.00,
         ],
     ),
     (
         "Cloud",
         [
             0.45, 0.65, 0.40, 0.50, 0.50, 0.10, 0.00, 0.60, 0.00, 0.25, 0.50, 0.50, 0.20, 0.20,
-            1.00, 0.55,
+            1.00, 0.55, 0.50, 0.35, 0.00, 0.00, 0.00,
         ],
     ),
     (
         "Broken Tape",
         [
             0.30, 0.40, 0.55, 0.40, 0.45, 0.15, 0.20, 0.30, 0.00, 0.45, 0.30, 0.50, 0.35, 0.15,
-            0.70, 0.60,
+            0.70, 0.60, 0.50, 0.35, 0.00, 0.00, 0.00,
         ],
     ),
     (
         "Microloop",
         [
             0.12, 0.80, 0.10, 0.70, 0.50, 0.05, 0.00, 0.30, 1.00, 0.55, 0.55, 0.40, 0.05, 0.10,
-            0.25, 0.70,
+            0.25, 0.70, 0.50, 0.35, 0.00, 0.00, 0.00,
         ],
     ),
     (
         "Reverse Rain",
         [
             0.25, 0.70, 0.60, 0.50, 0.55, 0.20, 0.80, 0.70, 0.00, 0.30, 0.20, 0.50, 0.30, 0.25,
-            0.90, 0.60,
+            0.90, 0.60, 0.50, 0.35, 0.00, 0.00, 0.00,
         ],
     ),
     (
         "Particle Swarm",
         [
             0.18, 0.90, 0.75, 0.30, 0.60, 0.40, 0.30, 0.85, 0.00, 0.35, 0.65, 0.45, 0.50, 0.10,
-            0.60, 0.65,
+            0.60, 0.65, 0.50, 0.35, 0.00, 0.00, 0.00,
         ],
     ),
     (
         "Digital Mist",
         [
             0.55, 0.55, 0.35, 0.55, 0.50, 0.10, 0.00, 0.50, 1.00, 0.20, 0.50, 0.50, 0.15, 0.40,
-            1.00, 0.50,
+            1.00, 0.50, 0.50, 0.35, 0.00, 0.00, 0.00,
         ],
     ),
     (
         "Infinite Drone",
         [
             0.80, 0.45, 0.15, 0.65, 0.50, 0.05, 0.00, 0.30, 1.00, 0.60, 0.50, 0.50, 0.05, 0.35,
-            1.00, 0.70,
+            1.00, 0.70, 0.50, 0.35, 0.00, 0.00, 0.00,
         ],
     ),
     (
         "Granular Delay",
         [
             0.35, 0.50, 0.30, 0.50, 0.50, 0.10, 0.00, 0.40, 0.00, 0.50, 0.50, 0.50, 0.10, 0.15,
-            0.50, 0.55,
+            0.50, 0.55, 0.50, 0.35, 0.00, 0.00, 0.00,
         ],
     ),
     (
         "Glitch Clouds",
         [
             0.15, 0.85, 0.85, 0.30, 0.55, 0.50, 0.50, 0.80, 0.00, 0.40, 0.70, 0.50, 0.60, 0.05,
-            0.40, 0.60,
+            0.40, 0.60, 0.50, 0.35, 0.00, 0.00, 0.00,
         ],
     ),
 ];
+
+/// What the LFO can move, in the order its Dest knob steps through them.
+pub const LFO_DESTS: [&str; 6] = ["Position", "Pitch", "Size", "Spray", "Density", "Spread"];
 
 /// Live granular texture processor.
 pub struct Z5Texture {
@@ -178,12 +184,29 @@ pub struct Z5Texture {
     blur: f32,
     buflen: f32,
     wet: f32,
+    /// Grain envelope: 0 percussive (instant attack, long fall), 0.5 Hann —
+    /// what every grain always was — 1 flat-topped. The S-4's *contour*.
+    contour: f32,
+    // ── LFO ── one oscillator, pointed at one of `LFO_DESTS`. Depth 0 is off.
+    lfo: super::lfo::Lfo,
+    lfo_rate: f32,
+    lfo_depth: f32,
+    lfo_wave: super::lfo::Wave,
+    lfo_dest: usize,
+    /// Where it is this sample, −1..1.
+    lfo_now: f32,
 
     buf_l: Vec<f32>,
     buf_r: Vec<f32>,
     write: usize,
-    scrub: f64,      // independent read head the grains cluster around
-    drift_walk: f64, // slow random-walk offset (Drift)
+    scrub: f64, // independent read head the grains cluster around
+    /// How far behind the write head the scrub sits, in samples. Stretch moves
+    /// it, Position sets it, un-freezing puts it back to zero (live).
+    lag: f64,
+    /// Position was turned since the last block — the scrub jumps there.
+    position_moved: bool,
+    was_frozen: bool,
+    drift_walk: f64, // slow random-walk offset (Drift), in samples
     blur_l: f32,     // one-pole smoothing state (Blur)
     blur_r: f32,
     grains: [Grain; MAX_GRAINS],
@@ -195,10 +218,22 @@ pub struct Z5Texture {
     /// Last published (normalised) head positions, held while idle.
     held_write: f32,
     held_scrub: f32,
+    /// Loudness of the cloud against how many grains overlap in it, smoothed.
+    cloud_norm: f32,
     meter: Arc<Z5Meter>,
 }
 
 impl Z5Texture {
+    /// A knob as the LFO leaves it: `base` swung by up to ±half its travel
+    /// when the LFO points at `dest`, untouched otherwise.
+    #[inline]
+    fn modded(&self, base: f32, dest: usize) -> f32 {
+        match self.lfo_dest == dest && self.lfo_depth > 0.0 {
+            true => (base + self.lfo_depth * self.lfo_now * 0.5).clamp(0.0, 1.0),
+            false => base,
+        }
+    }
+
     pub fn new(sr: u32) -> Self {
         let sr = sr.max(8000);
         let len = (MAX_BUF_S * sr as f32) as usize + 4;
@@ -230,10 +265,20 @@ impl Z5Texture {
             blur: 0.0,
             buflen: 1.0,
             wet: 0.55,
+            contour: 0.5,
+            lfo: super::lfo::Lfo::new(),
+            lfo_rate: 0.35,
+            lfo_depth: 0.0,
+            lfo_wave: super::lfo::Wave::Sine,
+            lfo_dest: 0,
+            lfo_now: 0.0,
             buf_l: vec![0.0; len],
             buf_r: vec![0.0; len],
             write: 0,
             scrub: 0.0,
+            lag: 0.0,
+            position_moved: false,
+            was_frozen: false,
             drift_walk: 0.0,
             blur_l: 0.0,
             blur_r: 0.0,
@@ -243,15 +288,20 @@ impl Z5Texture {
             in_level: 0.0,
             held_write: 0.0,
             held_scrub: 0.0,
+            cloud_norm: 1.0,
         }
     }
 
     /// Build with a flat param slice (as stored on the UI FX entry).
     pub fn with_params(sr: u32, params: &[f32]) -> Self {
         let mut s = Self::new(sr);
-        for i in 0..Z5_PARAM_COUNT {
-            s.set_param(i, params.get(i).copied().unwrap_or(0.0));
+        // Only what was given: a list from before a knob existed leaves that
+        // knob at its default (Contour's is the Hann every grain used to be).
+        for (i, v) in params.iter().take(Z5_PARAM_COUNT).enumerate() {
+            s.set_param(i, *v);
         }
+        // Building is not turning the knob: a preset starts live, at the head.
+        s.position_moved = false;
         s
     }
 
@@ -279,30 +329,44 @@ impl Z5Texture {
         let Some(idx) = self.grains.iter().position(|g| !g.active) else {
             return;
         };
-        let len = self.buf_l.len();
         let win = self.window_len();
         let sr = self.sample_rate as f32;
         // Sample distinct points around the scrub head — Spray scatters across the
         // WHOLE loop window (Torso-S-4-style multi-point granular texture). At
         // Spray=0 grains sit on the scrub head; at 1 they pick anywhere in the loop.
-        let spray_samps = self.spray * win as f32;
+        let spray_samps = self.modded(self.spray, 3) * win as f32;
         let offset = (self.rand() as f64) * spray_samps as f64;
-        let base = self.scrub.rem_euclid(win as f64);
-        let pos = (base - offset).rem_euclid(win as f64);
+        // The LFO on Position swings the grains up to half the loop either way.
+        let swing = match self.lfo_dest == 0 {
+            true => (self.lfo_depth * self.lfo_now * 0.5) as f64 * win as f64,
+            false => 0.0,
+        };
+        let base = (self.scrub - self.drift_walk - swing).rem_euclid(win as f64);
+        let mut pos = (base - offset).rem_euclid(win as f64);
         // Pitch: ±12 st from the knob + ±RndPitch jitter; Reverse with probability.
         let jitter = (self.rand() * 2.0 - 1.0) * self.rnd_pitch * 7.0;
-        let st = (self.pitch - 0.5) * 24.0 + jitter;
+        let st = (self.modded(self.pitch, 1) - 0.5) * 24.0 + jitter;
         let mut speed = 2.0_f64.powf(st as f64 / 12.0);
         if self.rand() < self.reverse {
             speed = -speed;
         }
         // Grain length 20..200 ms scaled by Size.
-        let grain_ms = 20.0 + self.size * 180.0;
+        let grain_ms = 20.0 + self.modded(self.size, 2) * 180.0;
         let life = ((grain_ms / 1000.0) * sr).max(2.0) as u32;
+        // A grain played faster than the tape gains on the write head. Started
+        // too close it overtakes it and reads the far end of the loop — a
+        // click on every sped-up grain near the head. So it starts far enough
+        // back to finish its life still behind.
+        if self.freeze <= 0.5 && speed > 1.0 {
+            let need = (speed - 1.0) * life as f64 + 2.0;
+            let behind = (self.write as f64 - 1.0 - pos).rem_euclid(win as f64);
+            if behind < need && need < win as f64 {
+                pos = (self.write as f64 - 1.0 - need).rem_euclid(win as f64);
+            }
+        }
         // Overlap lowers per-grain gain so dense clouds don't clip.
         let gain = 0.9 * (1.0 - 0.5 * self.overlap);
-        let pan = (self.rand() * 2.0 - 1.0) * self.spread;
-        let _ = len;
+        let pan = (self.rand() * 2.0 - 1.0) * self.modded(self.spread, 5);
         self.grains[idx] = Grain {
             pos,
             speed,
@@ -315,47 +379,80 @@ impl Z5Texture {
     }
 }
 
+/// A grain's envelope at `t` (0..1 of its life), for a Contour of `c`.
+///
+/// Both halves of the knob meet Hann at 0.5: below it the rise shortens (the
+/// grain gets a hit), above it both edges shorten around a flat middle (the
+/// grain gets a body). `sin²` rises everywhere, so no shape has a corner.
+#[inline]
+fn contour_env(t: f32, c: f32) -> f32 {
+    use std::f32::consts::FRAC_PI_2;
+    let t = t.clamp(0.0, 1.0);
+    if c <= 0.5 {
+        let rise = 0.03 + c / 0.5 * 0.47;
+        match t < rise {
+            true => (FRAC_PI_2 * t / rise).sin().powi(2),
+            false => (FRAC_PI_2 * (t - rise) / (1.0 - rise)).cos().powi(2),
+        }
+    } else {
+        let edge = 0.5 - (c - 0.5) / 0.5 * 0.4;
+        if t < edge {
+            (FRAC_PI_2 * t / edge).sin().powi(2)
+        } else if t > 1.0 - edge {
+            (FRAC_PI_2 * (1.0 - t) / edge).sin().powi(2)
+        } else {
+            1.0
+        }
+    }
+}
+
 impl FxProcessor for Z5Texture {
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
         if sample_rate != self.sample_rate {
-            let mut fresh = Z5Texture::new(sample_rate);
-            // carry controls
-            for (i, v) in [
-                self.size,
-                self.density,
-                self.spray,
-                self.overlap,
-                self.pitch,
-                self.rnd_pitch,
-                self.reverse,
-                self.spread,
-                self.freeze,
-                self.feedback,
-                self.stretch,
-                self.position,
-                self.drift,
-                self.blur,
-                self.buflen,
-                self.wet,
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                fresh.set_param(i, v);
-            }
-            fresh.meter = Arc::clone(&self.meter); // keep the UI's shared handle alive
-            *self = fresh;
+            // ponytail: no rebuild — that allocated 4 s of buffer on the audio
+            // thread. The buffer keeps its length in samples, so at a higher rate
+            // the longest loop is shorter in seconds (2 s at 96 kHz for one built
+            // at 48). Size it for `MAX_RATE`, as Space Echo does, if that matters.
+            self.sample_rate = sample_rate.max(8000);
+            self.reset();
         }
         let win = self.window_len();
         let sr = self.sample_rate as f32;
         let frozen = self.freeze > 0.5;
-        let density = 1.0 + self.density * 79.0; // 1..80 grains/sec
+        // The LFO moves Density a block at a time: it sets how often grains
+        // start, and a block is a few ms.
+        let density = 1.0 + self.modded(self.density, 4) * 79.0; // 1..80 grains/sec
+        let lfo_hz = 0.02 * 1000.0f32.powf(self.lfo_rate);
         let inter_spawn = (sr / density) as f64;
-        let drift_amt = ((self.stretch - 0.5) * 2.0) as f64; // scrub drift
+        // Stretch: how fast the scrub moves against the write head. 0.5 keeps
+        // pace (live), 0.25 stands still on the tape, 0 runs backwards at real
+        // time, 1 runs at 3×. Continuous through 0.5 — it used to jump from
+        // "live" to "almost stopped" a hair either side of it.
+        let rel = (self.stretch as f64 - 0.5) * 4.0;
+        // A slow wander whose spread is ~0.1 s at full Drift.
+        let drift_step = self.drift as f64 * 90.0 * sr as f64 / 48_000.0;
+        let drift_decay = 1.0 - 1.0 / sr as f64;
+        if self.was_frozen && !frozen {
+            self.lag = 0.0; // back to live, where the new audio is
+        }
+        self.was_frozen = frozen;
+        if std::mem::take(&mut self.position_moved) {
+            self.lag = self.position as f64 * win as f64;
+        }
         let fb = self.feedback.clamp(0.0, 0.95);
         // Blur one-pole coefficient (0 = no smoothing).
         let blur_a = self.blur.clamp(0.0, 0.98);
+        let contour = self.contour;
         let frames = buf.len() / 2;
+        // How many grains sound at once on average — density × grain length.
+        // They read the buffer at different points, so their powers add: the
+        // cloud is `√n` louder than one grain. Without this the level was the
+        // Density × Size knobs, and with Feedback up it measured 20× the input
+        // (+32 dB). From the *expected* overlap, not the count of the moment,
+        // so a grain starting or ending does not step the gain of the others.
+        let overlap_n = (density * (20.0 + self.modded(self.size, 2) * 180.0) / 1000.0)
+            .clamp(1.0, MAX_GRAINS as f32);
+        let norm_target = overlap_n.sqrt().recip();
 
         // Input activity (pre-process the dry buffer): the scope only animates while
         // audio is actually flowing. Frozen = drone still sounds → counts as active.
@@ -372,20 +469,21 @@ impl FxProcessor for Z5Texture {
             let dry_l = buf[i * 2];
             let dry_r = buf[i * 2 + 1];
 
-            // Slow random walk (Drift) added to the scrub head.
-            self.drift_walk += ((self.rand() as f64) * 2.0 - 1.0) * self.drift as f64 * 4.0;
-            self.drift_walk *= 0.9995;
-            let anchor = self.position as f64 * win as f64;
-
-            // Advance the scrub head. Static drift → follow just behind write (live);
-            // otherwise free-run from the Position anchor.
-            if drift_amt.abs() < 1e-4 && !frozen {
-                self.scrub = (self.write as f64 - 1.0 + self.drift_walk).rem_euclid(win as f64);
-            } else {
-                self.scrub = (self.scrub + drift_amt + self.drift_walk * 0.001 + anchor * 0.0)
-                    .rem_euclid(win as f64);
-                let _ = anchor;
+            if self.lfo_depth > 0.0 {
+                self.lfo_now = self.lfo.tick(self.lfo_wave, lfo_hz, sr, 0.0)[0];
             }
+
+            // Drift: a random walk the grains are placed around.
+            self.drift_walk =
+                (self.drift_walk + ((self.rand() as f64) * 2.0 - 1.0) * drift_step) * drift_decay;
+            self.drift_walk = self.drift_walk.clamp(-(win as f64) * 0.5, win as f64 * 0.5);
+
+            // The scrub, as a distance behind the write head. Frozen, the head
+            // keeps moving over a buffer that does not, so standing still on
+            // the tape means the distance grows.
+            self.lag += if frozen { 1.0 - rel } else { -rel };
+            self.lag = self.lag.rem_euclid(win as f64);
+            self.scrub = (self.write as f64 - 1.0 - self.lag).rem_euclid(win as f64);
 
             // Spawn grains on schedule.
             if self.spawn_timer <= 0.0 {
@@ -406,9 +504,7 @@ impl FxProcessor for Z5Texture {
                 let frac = g.pos.fract() as f32;
                 let sl = self.buf_l[p0] * (1.0 - frac) + self.buf_l[p1] * frac;
                 let sr_ = self.buf_r[p0] * (1.0 - frac) + self.buf_r[p1] * frac;
-                let env = (std::f32::consts::PI * g.age as f32 / g.life as f32)
-                    .sin()
-                    .powi(2);
+                let env = contour_env(g.age as f32 / g.life as f32, contour);
                 let mono = (sl + sr_) * 0.5;
                 let w = env * g.gain;
                 // Equal-power-ish pan.
@@ -422,6 +518,10 @@ impl FxProcessor for Z5Texture {
                     g.active = false;
                 }
             }
+
+            self.cloud_norm += (norm_target - self.cloud_norm) * 0.001;
+            gl *= self.cloud_norm;
+            gr *= self.cloud_norm;
 
             // Blur: smooth the grain cloud.
             self.blur_l = self.blur_l * blur_a + gl * (1.0 - blur_a);
@@ -494,6 +594,9 @@ impl FxProcessor for Z5Texture {
         self.buf_r.iter_mut().for_each(|v| *v = 0.0);
         self.write = 0;
         self.scrub = 0.0;
+        self.lag = 0.0;
+        self.lfo.reset();
+        self.lfo_now = 0.0;
         self.drift_walk = 0.0;
         self.blur_l = 0.0;
         self.blur_r = 0.0;
@@ -527,6 +630,14 @@ impl FxProcessor for Z5Texture {
             p("Blur", self.blur),
             p("BufLen", self.buflen),
             p("Wet", self.wet),
+            p("Contour", self.contour),
+            p("LfoRate", self.lfo_rate),
+            p("LfoDepth", self.lfo_depth),
+            p("LfoShape", self.lfo_wave.to_norm()),
+            p(
+                "LfoDest",
+                self.lfo_dest as f32 / (LFO_DESTS.len() - 1) as f32,
+            ),
         ]
     }
 
@@ -545,11 +656,22 @@ impl FxProcessor for Z5Texture {
             8 => self.freeze = v,
             9 => self.feedback = v,
             10 => self.stretch = v,
-            11 => self.position = v,
+            11 => {
+                self.position_moved |= (self.position - v).abs() > 1e-4;
+                self.position = v;
+            }
             12 => self.drift = v,
             13 => self.blur = v,
             14 => self.buflen = v,
             15 => self.wet = v,
+            16 => self.contour = v,
+            17 => self.lfo_rate = v,
+            18 => self.lfo_depth = v,
+            19 => self.lfo_wave = super::lfo::Wave::from_norm(v),
+            20 => {
+                self.lfo_dest =
+                    ((v * (LFO_DESTS.len() - 1) as f32).round() as usize).min(LFO_DESTS.len() - 1)
+            }
             _ => {}
         }
     }
@@ -590,6 +712,122 @@ mod tests {
             energy > 0.0,
             "frozen buffer should still emit grains on silence"
         );
+    }
+
+    /// The cloud stays near the level it was given, whatever Density, Size
+    /// and Feedback are doing. At the top of all three it used to reach 20×
+    /// the input.
+    #[test]
+    fn a_dense_cloud_with_feedback_does_not_blow_up() {
+        let mut fx = Z5Texture::with_params(
+            48000,
+            &[
+                1.0, 1.0, 0.3, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 1.0, 0.5, 0.5, 0.0, 0.0, 0.3, 1.0,
+            ],
+        );
+        let mut peak = 0.0f32;
+        for k in 0..200 {
+            let mut b: Vec<f32> = (0..1024)
+                .map(|i| 0.5 * ((i / 2 + k * 512) as f32 * 0.03).sin())
+                .collect();
+            fx.process_block(&mut b, 48000);
+            peak = b.iter().fold(peak, |m, x| m.max(x.abs()));
+        }
+        assert!(peak < 1.5, "0.5 in, {peak} out");
+    }
+
+    fn render(fx: &mut Z5Texture, blocks: usize) -> Vec<f32> {
+        let mut all = Vec::new();
+        for k in 0..blocks {
+            let mut b: Vec<f32> = (0..1024)
+                .map(|i| 0.5 * ((i / 2 + k * 512) as f32 * 0.01).sin())
+                .collect();
+            fx.process_block(&mut b, 48000);
+            all.extend(b);
+        }
+        all
+    }
+
+    /// Turning Position moves where the grains read. It used to be multiplied
+    /// by zero on its way in, so the knob changed nothing at all.
+    #[test]
+    fn position_moves_the_scrub() {
+        let mut a = Z5Texture::new(48000);
+        let mut b = Z5Texture::new(48000);
+        render(&mut a, 40);
+        render(&mut b, 40);
+        a.set_param(11, 0.1);
+        b.set_param(11, 0.6);
+        render(&mut a, 2);
+        render(&mut b, 2);
+        assert!((a.lag - b.lag).abs() > 1000.0, "{} vs {}", a.lag, b.lag);
+    }
+
+    /// A hair either side of 0.5 is a hair away from live — not a jump from
+    /// following the head to standing still.
+    #[test]
+    fn stretch_is_continuous_through_the_middle() {
+        let lag_after = |stretch: f32| {
+            let mut fx = Z5Texture::new(48000);
+            fx.set_param(10, stretch);
+            render(&mut fx, 20);
+            fx.lag.min(fx.window_len() as f64 - fx.lag)
+        };
+        let (at, near) = (lag_after(0.5), lag_after(0.501));
+        assert!(at < 1.0 && near < 100.0, "live {at}, a hair off {near}");
+    }
+
+    /// A new device rate does not ask the audio thread for memory.
+    #[test]
+    fn a_rate_change_does_not_allocate() {
+        let mut fx = Z5Texture::new(48000);
+        let before = (fx.buf_l.as_ptr() as usize, fx.buf_r.as_ptr() as usize);
+        fx.set_mix(0.3);
+        let mut b = vec![0.1f32; 512];
+        fx.process_block(&mut b, 96000);
+        assert_eq!(
+            before,
+            (fx.buf_l.as_ptr() as usize, fx.buf_r.as_ptr() as usize)
+        );
+        assert_eq!(fx.wet, 0.3);
+        assert!(b.iter().all(|x| x.is_finite()));
+    }
+
+    /// Contour 0.5 is exactly the Hann window every grain used to have, and
+    /// the ends of the knob are a hit and a plateau.
+    #[test]
+    fn contour_meets_hann_in_the_middle() {
+        for i in 0..=100 {
+            let t = i as f32 / 100.0;
+            let hann = (std::f32::consts::PI * t).sin().powi(2);
+            assert!((contour_env(t, 0.5) - hann).abs() < 1e-5, "t {t}");
+        }
+        assert!(
+            contour_env(0.05, 0.0) > 0.9,
+            "percussive peaks almost at once"
+        );
+        assert!(contour_env(0.3, 1.0) == 1.0, "flat-topped holds its middle");
+    }
+
+    /// The LFO moves what it points at, and at depth 0 it is not there.
+    #[test]
+    fn the_lfo_moves_its_destination() {
+        let mut fx = Z5Texture::new(48000);
+        fx.set_param(17, 0.8); // ~5 Hz
+        render(&mut fx, 10);
+        assert_eq!(fx.lfo_now, 0.0, "depth 0 leaves it off");
+        assert_eq!(fx.modded(0.4, 1), 0.4);
+
+        fx.set_param(18, 1.0);
+        fx.set_param(20, 1.0 / 5.0); // Pitch
+        let mut seen = (f32::MAX, f32::MIN);
+        for _ in 0..20 {
+            render(&mut fx, 1);
+            let p = fx.modded(0.5, 1);
+            seen = (seen.0.min(p), seen.1.max(p));
+        }
+        assert!(seen.1 - seen.0 > 0.4, "pitch swung {seen:?}");
+        assert_eq!(fx.modded(0.4, 2), 0.4, "and only the pitch");
     }
 
     #[test]

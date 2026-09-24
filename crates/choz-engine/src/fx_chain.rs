@@ -262,6 +262,22 @@ pub const BUILT_IN_KINDS: &[(&str, &str)] = &[
     ("bassenhance", "Bass Enhancer"),
 ];
 
+/// Run one tab's chain over its block, cleaning the audio at every door.
+///
+/// A NaN or an infinity — from a source, a hosted plugin or an effect that ran
+/// away — stops here instead of reaching the next effect. It has to stop
+/// *before* it gets in: a filter handed one keeps it in its state for ever, and
+/// most of the built-ins have a filter somewhere. Seventeen of them stayed
+/// silent-or-NaN until rebuilt, from a single bad sample.
+pub fn run_chain(chain: &mut [Box<dyn fx::FxProcessor>], buf: &mut [f32], sample_rate: u32) {
+    let clean = |buf: &mut [f32]| buf.iter_mut().for_each(|s| *s = fx::delay_line::safe(*s));
+    clean(buf);
+    for fx in chain.iter_mut() {
+        fx.process_block(buf, sample_rate);
+        clean(buf);
+    }
+}
+
 pub fn build_processor(
     kind: &str,
     params: &[f32],
@@ -272,7 +288,7 @@ pub fn build_processor(
     let proc: Box<dyn fx::FxProcessor> = match kind {
         "delay" => {
             let delay_ms = 10.0 + p(0) * 990.0;
-            let feedback = p(1);
+            let feedback = p(1) * 0.95;
             let damping = p(2);
             let mut d = fx::DelayLine::new(delay_ms, feedback, damping);
             d.set_ping_pong(p(3) > 0.5);
@@ -307,7 +323,7 @@ pub fn build_processor(
         }
         "grandelay" => Box::new(fx::GranularDelay::new(
             20.0 + p(0) * 980.0,
-            p(1),
+            p(1) * 0.95,
             (p(2) - 0.5) * 24.0,
             1.0 + p(3) * 31.0,
         )),
@@ -537,26 +553,39 @@ pub fn build_processor(
         }
         // Creative time/texture FX imported from seqterm: these take their
         // parameters normalised, in the same order `params()` reports them.
-        "protocosmos" => Box::new(fx::Protocosmos::new(
-            sample_rate,
-            p(0),
-            p(1),
-            p(2),
-            p(3),
-            p(4),
-            p(5),
-            p(6),
-        )),
-        "spaceecho" => Box::new(fx::SpaceEcho::new(
-            sample_rate,
-            p(0),
-            p(1),
-            p(2),
-            p(3),
-            p(4),
-            p(5),
-            p(6),
-        )),
+        "protocosmos" => {
+            use fx::FxProcessor as _;
+            let mut pc =
+                fx::Protocosmos::new(sample_rate, p(0), p(1), p(2), p(3), p(4), p(5), p(6));
+            // Added after the first eight, so a list that stops short keeps
+            // them where they were before they existed.
+            pc.set_param(
+                8,
+                params
+                    .get(8)
+                    .copied()
+                    .unwrap_or(fx::protocosmos::REPEATS_DEFAULT),
+            );
+            pc.set_param(9, params.get(9).copied().unwrap_or(1.0));
+            pc.set_param(10, params.get(10).copied().unwrap_or(0.0)); // Sync: free
+            Box::new(pc)
+        }
+        "spaceecho" => {
+            use fx::FxProcessor as _;
+            let mut se = fx::SpaceEcho::new(sample_rate, p(0), p(1), p(2), p(3), p(4), p(5), p(6));
+            se.set_param(
+                8,
+                params
+                    .get(8)
+                    .copied()
+                    .unwrap_or(fx::space_echo::HEADS_DEFAULT),
+            );
+            // Knobs added later default to what the echo did before them.
+            for (i, rest) in [(9, 0.0), (10, 0.5), (11, 0.5)] {
+                se.set_param(i, params.get(i).copied().unwrap_or(rest));
+            }
+            Box::new(se)
+        }
         "reversedelay" => Box::new(fx::ReverseDelay::new(sample_rate, p(0), p(1))),
         // Stompbox distortions: knobs are normalised, in `params()` order.
         "amberfang" => {
@@ -1041,6 +1070,64 @@ pub fn build_chain_from_specs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a knob reads back is a value it can be set to and read the same.
+    ///
+    /// A host (and the CLAP export) saves `params()[i].value` and restores it
+    /// through `set_param`. Where the two scaled differently — Compressor's
+    /// ratio read out of 1..100 and set into 1..20, Multi-tap's feedback read
+    /// 0.95 of itself — every save and restore moved the knob. A stepped knob
+    /// (a mode, a count) is fine: it reads back a step, and that step is stable.
+    #[test]
+    fn every_knob_reads_back_a_value_that_sets_it() {
+        let mut wrong = Vec::new();
+        for &(kind, _) in BUILT_IN_KINDS {
+            if kind == "looper" {
+                continue; // transport buttons, not values
+            }
+            let mut p = build_processor(kind, &[0.5; 64], 48_000).unwrap();
+            for i in 0..p.params().len() {
+                for v in [0.3f32, 0.7] {
+                    p.set_param(i, v);
+                    let read = p.params()[i].value;
+                    p.set_param(i, read);
+                    let again = p.params()[i].value;
+                    if (again - read).abs() > 1e-3 {
+                        wrong.push(format!(
+                            "{kind} {}: {v} → {read} → {again}",
+                            p.params()[i].name
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "knobs that drift on a round trip:\n  {}",
+            wrong.join("\n  ")
+        );
+    }
+
+    /// One bad sample into a chain of filters leaves every effect in it
+    /// working: the NaN never reaches their state.
+    #[test]
+    fn a_nan_does_not_poison_the_chain() {
+        let mut chain: Vec<Box<dyn fx::FxProcessor>> = ["filter", "graphiceq", "moogladder"]
+            .iter()
+            .map(|k| build_processor(k, &[0.5; 16], 48_000).unwrap())
+            .collect();
+        let mut buf = vec![0.1f32; 1024];
+        buf[10] = f32::NAN;
+        buf[11] = f32::INFINITY;
+        run_chain(&mut chain, &mut buf, 48_000);
+        for _ in 0..10 {
+            let mut buf: Vec<f32> = (0..1024).map(|i| 0.3 * (i as f32 * 0.05).sin()).collect();
+            run_chain(&mut chain, &mut buf, 48_000);
+            assert!(buf.iter().all(|s| s.is_finite()));
+            assert!(buf.iter().any(|s| s.abs() > 1e-3), "the chain went silent");
+        }
+    }
 
     /// The list under test is the one everything else walks — see
     /// [`BUILT_IN_KINDS`]. There used to be a second copy here, which is

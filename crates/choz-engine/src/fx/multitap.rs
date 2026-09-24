@@ -30,6 +30,8 @@ pub struct MultiTapDelay {
     line: [Line; 2],
     taps: [Tap; TAPS],
     time_ms: f32,
+    /// Where `Time` is right now, gliding toward `time_ms`.
+    time_now: f32,
     feedback: f32,
     wet: f32,
     sample_rate: f32,
@@ -64,6 +66,7 @@ impl MultiTapDelay {
                 },
             ],
             time_ms: 500.0,
+            time_now: 500.0,
             feedback: 0.25,
             wet: 0.4,
             sample_rate: sample_rate.max(8000) as f32,
@@ -75,6 +78,7 @@ impl MultiTapDelay {
         for (i, p) in params.iter().enumerate() {
             <Self as FxProcessor>::set_param(&mut d, i, *p);
         }
+        d.time_now = d.time_ms; // built there, not turned there
         d
     }
 }
@@ -130,7 +134,13 @@ impl FxProcessor for MultiTapDelay {
                 "",
             ));
         }
-        out.push(FxParam::new("Feedback", self.feedback, 0.0, 0.95, ""));
+        out.push(FxParam::new(
+            "Feedback",
+            self.feedback / 0.95,
+            0.0,
+            0.95,
+            "",
+        ));
         out.push(FxParam::new("Wet", self.wet, 0.0, 1.0, ""));
         out
     }
@@ -162,14 +172,20 @@ impl FxProcessor for MultiTapDelay {
         let sr = sample_rate.max(8000) as f32;
         self.sample_rate = sr;
         let cap = self.line[0].capacity() as f32 - 4.0;
+        // Time glides (~80 ms, and never faster than half a sample a sample on
+        // the longest tap), so turning it bends the repeats instead of jumping
+        // every head at once — a click on each.
+        let glide = 1.0 - (-1.0 / (0.08 * sr)).exp();
+        let max_step = 0.5 * 1000.0 / sr;
         for frame in buf.as_chunks_mut::<2>().0 {
+            self.time_now += ((self.time_ms - self.time_now) * glide).clamp(-max_step, max_step);
             let dry = [frame[0], frame[1]];
             let mut wet = [0.0f32; 2];
             // The last tap is the one that feeds back, so the whole figure
             // repeats rather than only its first head.
             let mut last = [0.0f32; 2];
             for tap in &self.taps {
-                let d = (self.time_ms * tap.frac * 0.001 * sr).clamp(1.0, cap);
+                let d = (self.time_now * tap.frac * 0.001 * sr).clamp(1.0, cap);
                 for ch in 0..2 {
                     let s = self.line[ch].read_cubic(d);
                     last[ch] = s;
@@ -204,6 +220,24 @@ impl FxProcessor for MultiTapDelay {
 mod tests {
     use super::*;
 
+    /// Feedback reads back what it was set to — it read 0.95 of it, so a
+    /// host saving and restoring the knob shrank it each time.
+    #[test]
+    fn feedback_reads_back_what_it_was_set_to() {
+        let mut fx = MultiTapDelay::new(48_000);
+        fx.set_param(13, 0.7);
+        assert!((fx.params()[13].value - 0.7).abs() < 1e-5);
+    }
+
+    /// Turning Time glides: the heads do not jump.
+    #[test]
+    fn time_glides() {
+        let mut fx = MultiTapDelay::new(48_000);
+        fx.set_param(0, 1.0);
+        fx.process_block(&mut [0.0f32; 96], 48_000);
+        assert!(fx.time_now < 501.0, "jumped to {}", fx.time_now);
+    }
+
     /// One click in, four echoes out, at the times the taps were set to.
     #[test]
     fn every_tap_arrives_when_it_was_told_to() {
@@ -216,6 +250,7 @@ mod tests {
         for i in 0..TAPS {
             fx.set_param(1 + i * 3 + 2, 0.5); // centre
         }
+        fx.time_now = fx.time_ms; // measuring the taps, not the glide
 
         let mut buf = vec![0.0f32; sr as usize / 2 * 2];
         buf[0] = 1.0;

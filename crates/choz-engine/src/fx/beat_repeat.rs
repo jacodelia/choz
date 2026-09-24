@@ -187,7 +187,12 @@ impl super::FxProcessor for BeatRepeat {
         // more than a millisecond, and the drift lands as an early boundary.
         let q0 = t.ppq();
         let q_per_frame = (t.bpm() / 60.0 / sr) as f64;
-        let want_grain = ((self.grain_q * 60.0 / t.bpm().max(1.0)) * sr) as usize;
+        // At most half the interval. A grain that fills it (or outlasts it)
+        // is still being captured when the next boundary starts the capture
+        // over, so it never gets to repeat at all — the effect went silent as
+        // an effect. Half leaves room for one repeat at least.
+        let grain_q = self.grain_q.min(self.interval_q * 0.5);
+        let want_grain = ((grain_q * 60.0 / t.bpm().max(1.0)) * sr) as usize;
         let want_grain = want_grain.clamp(1, ((MAX_GRAIN_S * sr) as usize).min(CAPACITY_FRAMES));
         let fade = self.fade();
         let mix = self.mix;
@@ -367,17 +372,18 @@ mod tests {
         let captured = |sr: u32| {
             with_transport(30.0, sr, || {
                 // 30 bpm: a quarter is 2 s, so a 1/2 grain asks for 4 s and
-                // meets the ceiling at both rates. The interval is short so a
-                // boundary — which is what sets the grain length — comes soon.
+                // meets the ceiling at both rates. The interval is as long as
+                // the grain (a grain is never longer than its interval), so
+                // the first real boundary is 4 s in.
                 let mut br = BeatRepeat::new(sr);
-                br.interval_q = 0.5;
+                br.interval_q = 2.0;
                 br.grain_q = 2.0;
                 br.chance = 1.0;
                 br.set_mix(1.0);
                 // One block, because the transport only advances when the
-                // engine renders and there is no engine here: two seconds of
-                // it crosses four intervals.
-                let mut buf = vec![0.1f32; sr as usize * 2 * 2];
+                // engine renders and there is no engine here: five seconds of
+                // it crosses the boundary at four.
+                let mut buf = vec![0.1f32; sr as usize * 5 * 2];
                 br.process_block(&mut buf, sr);
                 assert!(br.grain_len > 0, "no boundary was ever crossed");
                 br.grain_len as f32 / sr as f32
@@ -389,6 +395,23 @@ mod tests {
             (slow - fast).abs() < 1e-3,
             "the same grain is {slow} s at 48 kHz and {fast} s at 192"
         );
+    }
+
+    /// A grain longer than its interval still repeats: it is cut to the
+    /// interval. It used to be recaptured from scratch at every boundary and
+    /// never got to play back at all.
+    #[test]
+    fn a_grain_longer_than_the_interval_still_repeats() {
+        with_transport(120.0, 48_000, || {
+            let mut br = BeatRepeat::new(48_000);
+            br.interval_q = 0.5;
+            br.grain_q = 2.0;
+            br.chance = 1.0;
+            br.set_mix(1.0);
+            let mut buf = ramp(48_000);
+            br.process_block(&mut buf, 48_000);
+            assert!(br.repeating() || br.reps > 0, "it never repeated");
+        });
     }
 
     /// On the grid, a slice comes back: the ramp stops rising and repeats a

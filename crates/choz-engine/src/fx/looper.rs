@@ -263,6 +263,14 @@ struct Track {
     gain: f32,
     /// What this channel's take rounds to when it closes.
     quantise: Quantise,
+    /// Where the deck's playhead was when this take started. A take that joins
+    /// a running loop fills `start..end` and wraps to the top, so every frame
+    /// is stored at the position it was played at.
+    start: usize,
+    /// The level it is playing at right now, ramping toward what its fader,
+    /// mute, solo and transport ask for. A mute or a pause that jumps the level
+    /// in one sample is a click on every press.
+    level_now: f32,
 }
 
 impl Track {
@@ -276,12 +284,16 @@ impl Track {
             pan: 0.0,
             gain: 1.0,
             quantise: Quantise::default(),
+            start: 0,
+            level_now: 0.0,
         }
     }
 
     /// One frame of this track at `pos`, or silence where nothing was recorded.
+    /// Level and mute are the caller's (`level_now`): this is the take and its
+    /// place between the speakers.
     fn at(&self, pos: usize, chunk_frames: usize) -> (f32, f32) {
-        if self.muted || pos >= self.frames {
+        if pos >= self.frames {
             return (0.0, 0.0);
         }
         let Some(Some(chunk)) = self.chunks.get(pos / chunk_frames) else {
@@ -290,10 +302,7 @@ impl Track {
         let i = (pos % chunk_frames) * 2;
         // Balance, not a pan law: the same arithmetic the mixer's strips use,
         // so `L50` means the same thing on both panels.
-        let (gl, gr) = (
-            (1.0 - self.pan).min(1.0) * self.gain,
-            (1.0 + self.pan).min(1.0) * self.gain,
-        );
+        let (gl, gr) = ((1.0 - self.pan).min(1.0), (1.0 + self.pan).min(1.0));
         match (chunk.get(i), chunk.get(i + 1)) {
             (Some(l), Some(r)) => (*l as f32 / SCALE * gl, *r as f32 / SCALE * gr),
             _ => (0.0, 0.0),
@@ -308,6 +317,8 @@ impl Track {
         }
         self.state = LoopTrackState::Idle;
         self.frames = 0;
+        self.start = 0;
+        self.level_now = 0.0;
     }
 }
 
@@ -344,8 +355,13 @@ pub struct Looper {
     /// Empty chunks arriving from the interface, and full ones going home.
     supply: Option<rtrb::Consumer<LoopChunk>>,
     home: Option<rtrb::Producer<LoopFilled>>,
-    /// The chunk each recording track is filling, and how far into it.
+    /// The chunk each recording track is filling, and which chunk of the take
+    /// it is.
     writing: Vec<Option<LoopChunk>>,
+    writing_index: Vec<usize>,
+    /// The chunk a take started partway into, held back from home until the
+    /// take wraps round and fills its first half.
+    head: Vec<Option<LoopChunk>>,
     state: Arc<LoopState>,
     /// Handed out once, at build time.
     handle: Option<LoopHandle>,
@@ -381,6 +397,8 @@ impl Looper {
             supply: Some(supply),
             home: Some(home),
             writing: (0..LOOP_TRACKS).map(|_| None).collect(),
+            writing_index: vec![0; LOOP_TRACKS],
+            head: (0..LOOP_TRACKS).map(|_| None).collect(),
             state,
             handle: Some(handle),
             pending: Vec::with_capacity(LOOP_TRACKS * 2),
@@ -494,14 +512,13 @@ impl Looper {
                 if let Some(track) = self.tracks.get_mut(t) {
                     track.clear(&mut self.retired);
                 }
-                if let Some(chunk) = self.writing.get_mut(t).and_then(|c| c.take()) {
-                    self.retired.push(chunk);
-                }
-                // Track 1 owns the length: clearing it lets the next thing
-                // recorded define one again.
-                if t == 0 {
+                self.retire_writing(t);
+                // The length goes once nothing holds it — the same rule as
+                // `remove`. Clearing track 1 under takes still playing would
+                // silence them and let a new length disagree with them.
+                if !self.tracks.iter().any(|tr| tr.frames > 0) {
                     self.loop_frames = 0;
-                    self.pos = 0;
+                    self.rewind();
                 }
             }
             Cmd::Mute(t, on) => {
@@ -557,11 +574,11 @@ impl Looper {
             track.gain = 1.0;
         }
         self.retired = retired;
-        if let Some(chunk) = self.writing.get_mut(t).and_then(|c| c.take()) {
-            self.retired.push(chunk);
-        }
+        self.retire_writing(t);
         self.tracks[t..].rotate_left(1);
         self.writing[t..].rotate_left(1);
+        self.writing_index[t..].rotate_left(1);
+        self.head[t..].rotate_left(1);
         for block in [P_STATE, P_MUTE, P_QUANT, P_SOLO, P_PAN, P_VOL] {
             let end = block + LOOP_TRACKS;
             if end <= self.last_param.len() {
@@ -573,7 +590,7 @@ impl Looper {
         // now: it only goes away when there is nothing left holding it.
         if !self.tracks.iter().any(|tr| tr.frames > 0) {
             self.loop_frames = 0;
-            self.pos = 0;
+            self.rewind();
         }
     }
 
@@ -587,17 +604,50 @@ impl Looper {
             return;
         }
         let mut retired = std::mem::take(&mut self.retired);
+        // Track 1 starts the deck over; the others join the loop already running.
+        if t == 0 {
+            self.rewind();
+        }
+        let start = self.pos;
         if let Some(track) = self.tracks.get_mut(t) {
             track.clear(&mut retired);
             track.state = LoopTrackState::Recording;
+            track.start = start;
         }
         self.retired = retired;
-        if let Some(chunk) = self.writing.get_mut(t).and_then(|c| c.take()) {
-            self.retired.push(chunk);
+        self.retire_writing(t);
+    }
+
+    /// Back to the top. Everything sounding comes back in from silence: a
+    /// playhead that jumps under a take at full level is a click.
+    fn rewind(&mut self) {
+        self.pos = 0;
+        for t in self.tracks.iter_mut() {
+            t.level_now = 0.0;
         }
-        // Track 1 starts the deck over; the others join the loop already running.
-        if t == 0 {
-            self.pos = 0;
+    }
+
+    /// Whatever a track was filling goes home to be freed, unfinished.
+    fn retire_writing(&mut self, t: usize) {
+        for slot in [self.writing.get_mut(t), self.head.get_mut(t)] {
+            if let Some(chunk) = slot.and_then(|c| c.take()) {
+                self.retired.push(chunk);
+            }
+        }
+    }
+
+    /// A finished chunk into the take, and home for the interface to keep.
+    /// `clone` is a refcount bump — from here it is never written again.
+    fn send_home(&mut self, t: usize, index: usize, chunk: LoopChunk) {
+        if let Some(slot) = self.tracks[t].chunks.get_mut(index) {
+            *slot = Some(chunk.clone());
+        }
+        if let Some(home) = self.home.as_mut() {
+            let _ = home.push(LoopFilled {
+                track: t,
+                index,
+                chunk,
+            });
         }
     }
 
@@ -642,29 +692,23 @@ impl Looper {
         if track.state != LoopTrackState::Recording {
             track.state = LoopTrackState::Idle;
             if !self.deck_running() {
-                self.pos = 0;
+                self.rewind();
             }
             return;
-        }
-        // Whatever is half-written belongs to the take.
-        if let Some(chunk) = self.writing.get_mut(t).and_then(|c| c.take()) {
-            let index = track.frames.saturating_sub(1) / self.chunk_frames;
-            if let Some(slot) = track.chunks.get_mut(index) {
-                *slot = Some(chunk.clone());
-            }
-            if let Some(home) = self.home.as_mut() {
-                let _ = home.push(LoopFilled {
-                    track: t,
-                    index,
-                    chunk,
-                });
-            }
         }
         track.state = match then_play {
             true => LoopTrackState::Playing,
             false => LoopTrackState::Idle,
         };
-        let frames = track.frames;
+        let (frames, start) = (track.frames, track.start);
+        // Whatever is half-written belongs to the take, and so does the chunk
+        // it started in, if it never wrapped back round to finish it.
+        if let Some(chunk) = self.writing.get_mut(t).and_then(|c| c.take()) {
+            self.send_home(t, self.writing_index[t], chunk);
+        }
+        if let Some(chunk) = self.head.get_mut(t).and_then(|c| c.take()) {
+            self.send_home(t, start / self.chunk_frames, chunk);
+        }
         if t == 0 && self.loop_frames == 0 {
             // Rounded here and nowhere else: the length track 1 freezes is the
             // length every other track will be, so quantising it once quantises
@@ -672,15 +716,16 @@ impl Looper {
             // minutes must not round to five minutes and a bar.
             let rounded = self.quantise(0).round(frames, self.sample_rate);
             self.loop_frames = rounded.min(self.max_frames).max(1);
-            self.pos = 0;
+            self.rewind();
         }
         // Every track is the deck's length: a later take that came up short is
-        // silence to the end of the loop, not a loop of its own.
+        // silence where it was not played, not a loop of its own. One that
+        // joined partway is stored where it was played, so all of it counts.
         if let Some(track) = self.tracks.get_mut(t) {
-            track.frames = frames;
+            track.frames = if start > 0 { self.loop_frames } else { frames };
         }
         if !then_play && !self.deck_running() {
-            self.pos = 0;
+            self.rewind();
         }
     }
 
@@ -721,30 +766,34 @@ impl Looper {
         if frames >= ceiling {
             return false;
         }
-        let index = frames / self.chunk_frames;
-        let into = (frames % self.chunk_frames) * 2;
-        if into == 0 {
-            // A chunk boundary: send the one just filled home and take a fresh
-            // one. `clone` is a refcount bump — the interface reads the same
-            // memory, and from here it is never written again.
-            if let Some(full) = self.writing.get_mut(t).and_then(|c| c.take()) {
-                let done = index.saturating_sub(1);
-                if let Some(slot) = self.tracks[t].chunks.get_mut(done) {
-                    *slot = Some(full.clone());
-                }
-                if let Some(home) = self.home.as_mut() {
-                    let _ = home.push(LoopFilled {
-                        track: t,
-                        index: done,
-                        chunk: full,
-                    });
+        // Where in the loop this frame belongs: a take that joined at `start`
+        // fills the loop from there and wraps to the top.
+        let at = (self.tracks[t].start + frames) % ceiling;
+        let index = at / self.chunk_frames;
+        let into = (at % self.chunk_frames) * 2;
+        if self.writing[t].is_none() || self.writing_index[t] != index {
+            let start_chunk = self.tracks[t].start / self.chunk_frames;
+            if let Some(done) = self.writing[t].take() {
+                let left = self.writing_index[t];
+                // The chunk the take started partway into is only half
+                // written: hold it until the wrap comes back for the rest.
+                if left == start_chunk && !self.tracks[t].start.is_multiple_of(self.chunk_frames) {
+                    self.head[t] = Some(done);
+                } else {
+                    self.send_home(t, left, done);
                 }
             }
-            let Some(fresh) = self.supply.as_mut().and_then(|s| s.pop().ok()) else {
+            let back = match index == start_chunk {
+                true => self.head[t].take(),
+                false => None,
+            };
+            let Some(fresh) = back.or_else(|| self.supply.as_mut().and_then(|s| s.pop().ok()))
+            else {
                 self.state.set_starved(true);
                 return false;
             };
             self.writing[t] = Some(fresh);
+            self.writing_index[t] = index;
         }
         let Some(chunk) = self.writing[t].as_mut() else {
             return false;
@@ -755,9 +804,6 @@ impl Looper {
         let Some(audio) = Arc::get_mut(chunk) else {
             return false;
         };
-        if let (Some(a), Some(b)) = (audio.get_mut(into), None::<&mut i16>) {
-            let _ = (a, b);
-        }
         let clip = |v: f32| (v.clamp(-1.0, 1.0) * SCALE) as i16;
         if into + 1 < audio.len() {
             audio[into] = clip(l);
@@ -807,7 +853,7 @@ impl FxProcessor for Looper {
             t.state = LoopTrackState::Paused;
         }
         self.loop_frames = frames.min(self.max_frames);
-        self.pos = 0;
+        self.rewind();
         self.publish();
     }
 
@@ -847,15 +893,24 @@ impl FxProcessor for Looper {
         // the number a player sets their gain against.
         let peak = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
         self.state.set_in_peak(peak);
-        let recording: Vec<usize> = (0..self.tracks.len())
-            .filter(|t| self.tracks[*t].state == LoopTrackState::Recording)
-            .collect();
+        // No list of them: a `Vec` here would be an allocation every block.
+        let recording = self
+            .tracks
+            .iter()
+            .any(|t| t.state == LoopTrackState::Recording);
+        // Playing, or still fading out of it.
         let playing = self
             .tracks
             .iter()
-            .any(|t| t.state == LoopTrackState::Playing);
+            .any(|t| t.state == LoopTrackState::Playing || t.level_now > 0.0);
         let soloed = self.tracks.iter().any(|t| t.solo);
-        if recording.is_empty() && !playing {
+        // ~5 ms to reach a new level.
+        let ramp = 1.0 - (-1.0 / (0.005 * self.sample_rate as f32)).exp();
+        // The playhead runs while anything plays **or records into a loop that
+        // already has a length** — a take joining a paused deck is still
+        // stored where the playhead says.
+        let rolling = self.loop_frames > 0;
+        if !recording && !playing {
             for t in 0..self.tracks.len() {
                 self.state.set_track_level(t, 0.0, 0.0);
             }
@@ -882,7 +937,7 @@ impl FxProcessor for Looper {
             // The state is re-read every frame: a take that reached the deck's
             // length closed itself earlier in this same block, and asking it to
             // close a second time would take it from Playing to Idle.
-            for &t in recording.iter() {
+            for t in 0..self.tracks.len() {
                 if self.tracks[t].state != LoopTrackState::Recording {
                     continue;
                 }
@@ -897,16 +952,20 @@ impl FxProcessor for Looper {
             if playing && self.loop_frames > 0 {
                 let (mut sum_l, mut sum_r) = (0.0f32, 0.0f32);
                 for t in 0..self.tracks.len() {
-                    if self.tracks[t].state != LoopTrackState::Playing {
-                        continue;
-                    }
+                    let tr = &mut self.tracks[t];
                     // Solo is a mute of everything else, and only while
                     // something is soloed — no channel soloed is the deck as
                     // its mutes left it.
-                    if soloed && !self.tracks[t].solo {
+                    let heard =
+                        tr.state == LoopTrackState::Playing && !tr.muted && !(soloed && !tr.solo);
+                    let target = if heard { tr.gain } else { 0.0 };
+                    tr.level_now += (target - tr.level_now) * ramp;
+                    if target == 0.0 && tr.level_now < 1e-4 {
+                        tr.level_now = 0.0;
                         continue;
                     }
-                    let (l, r) = self.tracks[t].at(self.pos, self.chunk_frames);
+                    let (l, r) = tr.at(self.pos, self.chunk_frames);
+                    let (l, r) = (l * tr.level_now, r * tr.level_now);
                     if let Some(lv) = level.get_mut(t) {
                         note(lv, l, r);
                     }
@@ -920,6 +979,8 @@ impl FxProcessor for Looper {
                 // thing a looper must never do.
                 buf[i * 2] = dry_l + self.wet * sum_l;
                 buf[i * 2 + 1] = dry_r + self.wet * sum_r;
+            }
+            if rolling && self.loop_frames > 0 {
                 self.pos = (self.pos + 1) % self.loop_frames;
             }
         }
@@ -1336,6 +1397,86 @@ mod tests {
         );
     }
 
+    /// A take that joins a running loop is stored where it was **played**,
+    /// not from the top: something heard at the loop's 300th frame plays back
+    /// at its 300th frame. It used to land at frame 0 — every take after the
+    /// first came back early by however far into the loop REC was pressed.
+    ///
+    /// Started partway into a chunk and run across several, so the wrap back
+    /// to the top and the half-written first chunk are both exercised.
+    #[test]
+    fn a_later_take_plays_back_where_it_was_played() {
+        let (mut lp, mut h) = deck(8_000, 8);
+        let len = 20_000; // two and a half chunks
+        lp.record(0);
+        lp.process_block(&mut vec![0.0f32; len * 2], 8_000);
+        lp.toggle_record(0);
+        lp.process_block(&mut vec![0.0f32; 13_000 * 2], 8_000);
+        assert_eq!(lp.pos, 13_000);
+
+        lp.record(1);
+        let marks = [
+            (13_000usize, 0.9f32),
+            (19_999, 0.7),
+            (500, 0.5),
+            (12_999, 0.3),
+        ];
+        let mut input = vec![0.0f32; len * 2];
+        for (at, v) in marks {
+            let k = (at + len - 13_000) % len;
+            input[k * 2] = v;
+            input[k * 2 + 1] = v;
+        }
+        for piece in input.chunks_mut(2_000) {
+            h.pump(RING, usize::MAX);
+            lp.process_block(piece, 8_000);
+        }
+        // The frame after the loop's length is the one that closes it.
+        lp.process_block(&mut [0.0f32; 2], 8_000);
+        assert_eq!(lp.track_state(1), LoopTrackState::Playing);
+        for (at, v) in marks {
+            let (l, _) = lp.tracks[1].at(at, lp.chunk_frames);
+            assert!(
+                (l - v).abs() < 1e-3,
+                "deck frame {at}: stored {l}, played {v}"
+            );
+        }
+    }
+
+    /// Clearing track 1 under other takes keeps the deck's length: they are
+    /// that long, and a new track 1 of another length would disagree with
+    /// them. Only a deck with nothing left in it forgets its length.
+    #[test]
+    fn clearing_track_one_under_other_takes_keeps_the_length() {
+        let (mut lp, _h) = deck(8_000, 3);
+        take(&mut lp, 0, 0.5);
+        take(&mut lp, 1, 0.5);
+        lp.clear(0);
+        let mut out = vec![0.0f32; 512];
+        lp.process_block(&mut out, 8_000);
+        assert_eq!(lp.loop_frames(), 800);
+        assert!(out.iter().any(|s| s.abs() > 0.1), "track 2 still plays");
+    }
+
+    /// A mute fades over a few milliseconds instead of cutting in one sample.
+    #[test]
+    fn a_mute_fades_rather_than_cuts() {
+        let (mut lp, _h) = deck(48_000, 3);
+        lp.record(0);
+        lp.process_block(&mut vec![0.5f32; 96_000], 48_000);
+        lp.toggle_record(0);
+        lp.process_block(&mut vec![0.0f32; 2_048], 48_000);
+        lp.set_muted(0, true);
+        let mut out = vec![0.0f32; 4_096];
+        lp.process_block(&mut out, 48_000);
+        assert!(out[0] > 0.4, "it starts where it was: {}", out[0]);
+        let worst = out
+            .windows(2)
+            .fold(0.0f32, |m, w| m.max((w[1] - w[0]).abs()));
+        assert!(worst < 0.05, "a step of {worst}");
+        assert!(out[out.len() - 1].abs() < 1e-3, "and it ends silent");
+    }
+
     /// A take of a known level, for the tests below to fade, pan and solo.
     fn take(lp: &mut Looper, track: usize, level: f32) {
         lp.record(track);
@@ -1352,7 +1493,9 @@ mod tests {
         take(&mut lp, 0, 0.5);
         take(&mut lp, 1, 0.5);
         // Loud enough to tell apart, quiet enough not to clip the sum.
+        // Measured once the change has settled: levels ramp over ~5 ms.
         let sides = |lp: &mut Looper| {
+            lp.process_block(&mut [0.0f32; 2_048], 8_000);
             let mut out = vec![0.0f32; 512];
             lp.process_block(&mut out, 8_000);
             let peak = |off: usize| {

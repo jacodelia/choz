@@ -256,6 +256,10 @@ pub enum RackButton {
     HarmStop,
     HarmLoad,
     HarmClick,
+    /// The harmoniser's octave: opens the piano to pick it.
+    HarmOctave,
+    /// Follow the arranger's progression: its ▶ is the master.
+    HarmArrSync,
 }
 
 /// Every clickable area of the panel, filled in as it draws.
@@ -3610,6 +3614,22 @@ pub fn draw_fx_chain_panel(
                 on(entry.chord_port.is_some()),
             );
             layout.buttons.push((RackButton::FxChord, rect));
+            // Where the voices sing: AUTO, or the octave picked on the piano.
+            let octave = entry
+                .params
+                .get(choz_engine::fx::harmonizer::OCTAVE_PARAM)
+                .copied()
+                .and_then(choz_engine::fx::harmonizer::octave_of);
+            let rect = row.button(
+                f,
+                format!(
+                    " {} {} ",
+                    t("OCT"),
+                    choz_engine::fx::harmonizer::octave_label(octave)
+                ),
+                on(octave.is_some()),
+            );
+            layout.buttons.push((RackButton::HarmOctave, rect));
         }
         y = row.finish();
     }
@@ -3655,6 +3675,16 @@ pub fn draw_fx_chain_panel(
             on(v.click),
         );
         layout.buttons.push((RackButton::HarmClick, rect));
+        let rect = row.button(
+            f,
+            format!(
+                " {} {} ",
+                t("ARR"),
+                if v.arr_sync { "\u{25CF}" } else { "\u{25CB}" }
+            ),
+            on(v.following),
+        );
+        layout.buttons.push((RackButton::HarmArrSync, rect));
         // The lights: the beat the click is on, the one brighter still.
         // **Only while the chart plays.** Stopped, the lights are the bar's
         // shape and nothing moves: a light walking with the free clock said

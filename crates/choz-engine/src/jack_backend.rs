@@ -199,8 +199,9 @@ pub fn all_capture_ports() -> Vec<String> {
         jack::PortFlags::IS_OUTPUT,
     ) {
         // `monitor_*` carries back what we just played, and our own ports would
-        // feed the rack into itself.
-        if port.contains(":monitor") {
+        // feed the rack into itself. The one exception is `choz System FX`:
+        // its monitor *is* the system's sound, which is what it is for.
+        if port.contains(":monitor") && !is_system_fx(&port) {
             continue;
         }
         let Some((owner, _)) = port.rsplit_once(':') else {
@@ -249,9 +250,35 @@ fn source_ports(client: &Client, sink: &str) -> Vec<String> {
                 jack::PortFlags::IS_OUTPUT,
             )
             .into_iter()
-            .filter(|p| p.starts_with(&prefix) && !p.contains(":monitor"))
+            .filter(|p| p.starts_with(&prefix) && (!p.contains(":monitor") || is_system_fx(p)))
             .collect(),
     )
+}
+
+/// A port of `choz System FX`, the virtual speaker whose monitor choz reads.
+fn is_system_fx(port: &str) -> bool {
+    port.starts_with(&format!("{}:", crate::virtual_devices::SYSTEM_JACK))
+}
+
+/// Send the main pair — `out_1`/`out_2`, the mix in the headphones — to
+/// `choz Mic` as well, so a meeting hears what the player hears. Quietly
+/// nothing when the device is not there.
+pub(crate) fn wire_mic(client: &Client, our_outs: &[String]) {
+    let mic = crate::virtual_devices::MIC_JACK;
+    for (ours, side) in our_outs.iter().take(2).zip(["FL", "FR"]) {
+        let target = format!("{mic}:input_{side}");
+        if client.port_by_name(&target).is_none() {
+            return;
+        }
+        let already = client
+            .port_by_name(ours)
+            .is_some_and(|p| p.is_connected_to(&target).unwrap_or(false));
+        if !already {
+            if let Err(e) = client.connect_ports_by_name(ours, &target) {
+                eprintln!("choz: cannot wire '{ours}' -> '{target}': {e}");
+            }
+        }
+    }
 }
 
 /// Sort by the number the port name ends in, so channel 10 doesn't sort
@@ -411,6 +438,8 @@ pub fn start(
             "choz: no output device picked — left on whatever the graph              auto-connected us to. Pick one in the OUT drawer (F3)."
         ),
     }
+    // `choz Mic` carries the main mix whether or not an output was picked.
+    wire_mic(handle.as_client(), &our_outs);
     // Capture: every input jack in the graph, wired one for one. A device that
     // vanished between the scan and here just fails to connect — but **say
     // so**. Swallowing these is how choz ends up with input ports wired to
@@ -478,5 +507,8 @@ fn connect(client: &Client, our_outs: &[String], sink: &str) -> Result<(String, 
             Err(e) => eprintln!("choz: cannot wire '{ours}' -> '{target}': {e}"),
         }
     }
+    // Rewiring dropped every connection of ours; the virtual microphone gets
+    // the main pair back.
+    wire_mic(client, our_outs);
     Ok((name, wired))
 }

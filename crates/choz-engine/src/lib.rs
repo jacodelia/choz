@@ -27,6 +27,7 @@ pub mod preset_files;
 pub mod quarantine;
 pub mod sandboxed;
 pub mod sources;
+pub mod virtual_devices;
 
 pub use engine::{
     AudioBackend, AudioEngine, Dest, EmbeddedRt, BUSES, DEFAULT_DIRECT_PAIRS, MAX_DIRECT_PAIRS,
@@ -655,6 +656,7 @@ pub(crate) mod test_locks {
     static TRANSPORT: Mutex<()> = Mutex::new(());
     static METER: Mutex<()> = Mutex::new(());
     static CHART: Mutex<()> = Mutex::new(());
+    static CHORD: Mutex<()> = Mutex::new(());
 
     /// Held while a test moves the transport (rewind, play, tempo).
     ///
@@ -717,5 +719,13 @@ pub(crate) mod test_locks {
     /// one per process, and three tests set it to different chords.
     pub(crate) fn chart() -> MutexGuard<'static, ()> {
         CHART.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Held while a test sets or clears the held chord ([`crate::chord::chord`]):
+    /// one per process, and two harmoniser tests write it — one clearing it
+    /// and asserting silence while the other held a chord was a flake that
+    /// failed about one run in four.
+    pub(crate) fn chord() -> MutexGuard<'static, ()> {
+        CHORD.lock().unwrap_or_else(|e| e.into_inner())
     }
 }

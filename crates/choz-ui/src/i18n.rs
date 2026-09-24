@@ -287,6 +287,10 @@ static TABLE: &[Row] = &[
     ("BARS", ["COMPASES", "COMPASSOS", "MESURES", "BATTUTE", "TAKTE", "\u{422}\u{410}\u{41a}\u{422}\u{42b}", "\u{5c0f}\u{7bc0}", "\u{5c0f}\u{8282}"]),
     ("NOTHING TO PLAY", ["NADA QUE TOCAR", "NADA PARA TOCAR", "RIEN \u{c0} JOUER", "NIENTE DA SUONARE", "NICHTS ZU SPIELEN", "\u{41d}\u{415}\u{427}\u{415}\u{413}\u{41e} \u{418}\u{413}\u{420}\u{410}\u{422}\u{42c}", "\u{518d}\u{751f}\u{3059}\u{308b}\u{3082}\u{306e}\u{304c}\u{3042}\u{308a}\u{307e}\u{305b}\u{3093}", "\u{6ca1}\u{6709}\u{53ef}\u{64ad}\u{653e}\u{7684}\u{5185}\u{5bb9}"]),
     ("LOAD", ["CARGAR", "CARREGAR", "CHARGER", "CARICA", "LADEN", "\u{417}\u{410}\u{413}\u{420}\u{423}\u{417}\u{418}\u{422}\u{42c}", "\u{8aad}\u{307f}\u{8fbc}\u{307f}", "\u{52a0}\u{8f7d}"]),
+    ("OCT", ["OCT", "OIT", "OCT", "OTT", "OKT", "\u{41e}\u{41a}\u{422}", "\u{30aa}\u{30af}\u{30c8}", "\u{516b}\u{5ea6}"]),
+    ("OCTAVE", ["OCTAVA", "OITAVA", "OCTAVE", "OTTAVA", "OKTAVE", "\u{41e}\u{41a}\u{422}\u{410}\u{412}\u{410}", "\u{30aa}\u{30af}\u{30bf}\u{30fc}\u{30d6}", "\u{516b}\u{5ea6}"]),
+    ("OVER C:", ["SOBRE C:", "SOBRE C:", "SUR C :", "SU C:", "\u{dc}BER C:", "\u{41d}\u{410}\u{414} C:", "C\u{306e}\u{4e0a}:", "C\u{4e4b}\u{4e0a}:"]),
+    ("SYSTEM AUDIO", ["AUDIO DEL SISTEMA", "\u{c1}UDIO DO SISTEMA", "AUDIO SYST\u{c8}ME", "AUDIO DI SISTEMA", "SYSTEM-AUDIO", "\u{417}\u{412}\u{423}\u{41a} \u{421}\u{418}\u{421}\u{422}\u{415}\u{41c}\u{42b}", "\u{30b7}\u{30b9}\u{30c6}\u{30e0}\u{97f3}\u{58f0}", "\u{7cfb}\u{7edf}\u{97f3}\u{9891}"]),
     ("KEY", ["TONALIDAD", "TOM", "TONALIT\u{c9}", "TONALIT\u{c0}", "TONART", "\u{422}\u{41e}\u{41d}\u{410}\u{41b}\u{42c}\u{41d}\u{41e}\u{421}\u{422}\u{42c}", "\u{30ad}\u{30fc}", "\u{8c03}\u{6027}"]),
     ("STYLE", ["ESTILO", "ESTILO", "STYLE", "STILE", "STIL", "\u{421}\u{422}\u{418}\u{41b}\u{42c}", "\u{30b9}\u{30bf}\u{30a4}\u{30eb}", "\u{98ce}\u{683c}"]),
     ("FEEL", ["SOLTURA", "SOLTURA", "GROOVE", "GROOVE", "GROOVE", "\u{413}\u{420}\u{423}\u{412}", "\u{30ce}\u{30ea}", "\u{5f8b}\u{52a8}"]),
@@ -297,6 +301,7 @@ static TABLE: &[Row] = &[
     ("SPARSE", ["ESCASA", "ESPARSA", "A\u{c9}R\u{c9}", "RADA", "SPARSAM", "\u{420}\u{415}\u{414}\u{41a}\u{41e}", "\u{758e}", "\u{7a00}\u{758f}"]),
     ("STEADY", ["PAREJA", "REGULAR", "R\u{c9}GULIER", "REGOLARE", "GLEICHM\u{c4}SSIG", "\u{420}\u{41e}\u{412}\u{41d}\u{41e}", "\u{4e00}\u{5b9a}", "\u{5e73}\u{7a33}"]),
     ("BUSY", ["CARGADA", "CARREGADA", "DENSE", "FITTA", "DICHT", "\u{41f}\u{41b}\u{41e}\u{422}\u{41d}\u{41e}", "\u{5bc6}", "\u{7e41}\u{5bc6}"]),
+    ("  click a key: the voices sing in its octave \u{2014} A for AUTO (follow the tune)", ["  clic en una tecla: las voces cantan en su octava \u{2014} A para AUTO (sigue la melod\u{ed}a)", "  clique numa tecla: as vozes cantam na oitava dela \u{2014} A para AUTO (segue a melodia)", "  cliquez une touche : les voix chantent dans son octave \u{2014} A pour AUTO (suit la m\u{e9}lodie)", "  clicca un tasto: le voci cantano nella sua ottava \u{2014} A per AUTO (segue la melodia)", "  Taste anklicken: die Stimmen singen in ihrer Oktave \u{2014} A f\u{fc}r AUTO (folgt der Melodie)", "  \u{43d}\u{430}\u{436}\u{43c}\u{438}\u{442}\u{435} \u{43a}\u{43b}\u{430}\u{432}\u{438}\u{448}\u{443}: \u{433}\u{43e}\u{43b}\u{43e}\u{441}\u{430} \u{43f}\u{43e}\u{44e}\u{442} \u{432} \u{435}\u{451} \u{43e}\u{43a}\u{442}\u{430}\u{432}\u{435} \u{2014} A \u{434}\u{43b}\u{44f} AUTO (\u{441}\u{43b}\u{435}\u{434}\u{443}\u{44e}\u{442} \u{43c}\u{435}\u{43b}\u{43e}\u{434}\u{438}\u{438})", "  \u{9375}\u{76e4}\u{3092}\u{30af}\u{30ea}\u{30c3}\u{30af}:\u{58f0}\u{90e8}\u{306f}\u{305d}\u{306e}\u{30aa}\u{30af}\u{30bf}\u{30fc}\u{30d6}\u{3067}\u{6b4c}\u{3044}\u{307e}\u{3059} \u{2014} A \u{3067} AUTO(\u{30e1}\u{30ed}\u{30c7}\u{30a3}\u{306b}\u{8ffd}\u{5f93})", "  \u{70b9}\u{51fb}\u{4e00}\u{4e2a}\u{952e}:\u{58f0}\u{90e8}\u{5728}\u{5176}\u{516b}\u{5ea6}\u{5185}\u{6f14}\u{5531} \u{2014} A \u{4e3a} AUTO(\u{8ddf}\u{968f}\u{65cb}\u{5f8b})"]),
     ("  click a key to make it the tonic \u{2014} every octave of it lights up", ["  clic en una tecla para hacerla t\u{f3}nica \u{2014} se encienden todas sus octavas", "  clique numa tecla para torn\u{e1}-la t\u{f4}nica \u{2014} acendem todas as suas oitavas", "  cliquez une touche pour en faire la tonique \u{2014} toutes ses octaves s'allument", "  clicca un tasto per farlo tonica \u{2014} si accendono tutte le sue ottave", "  Taste anklicken, um sie zum Grundton zu machen \u{2014} alle Oktaven leuchten", "  \u{43d}\u{430}\u{436}\u{43c}\u{438}\u{442}\u{435} \u{43a}\u{43b}\u{430}\u{432}\u{438}\u{448}\u{443}, \u{447}\u{442}\u{43e}\u{431}\u{44b} \u{441}\u{434}\u{435}\u{43b}\u{430}\u{442}\u{44c} \u{435}\u{451} \u{442}\u{43e}\u{43d}\u{438}\u{43a}\u{43e}\u{439}", "  \u{30ad}\u{30fc}\u{3092}\u{30af}\u{30ea}\u{30c3}\u{30af}\u{3057}\u{3066}\u{4e3b}\u{97f3}\u{306b}\u{3057}\u{307e}\u{3059}", "  \u{70b9}\u{51fb}\u{7434}\u{952e}\u{5c06}\u{5176}\u{8bbe}\u{4e3a}\u{4e3b}\u{97f3}"]),
     ("SEED", ["SEMILLA", "SEMENTE", "GRAINE", "SEME", "STARTWERT", "\u{417}\u{415}\u{420}\u{41d}\u{41e}", "\u{30b7}\u{30fc}\u{30c9}", "\u{968f}\u{673a}\u{79cd}\u{5b50}"]),
     ("SWING", ["SWING", "SWING", "SWING", "SWING", "SWING", "\u{421}\u{412}\u{418}\u{41d}\u{413}", "\u{30b9}\u{30a4}\u{30f3}\u{30b0}", "\u{6447}\u{6446}"]),
@@ -435,17 +440,30 @@ mod tests {
         let calls = |text: &str| -> Vec<String> {
             let mut out = Vec::new();
             let bytes: Vec<char> = text.chars().collect();
-            let open: Vec<char> = "t(\"".chars().collect();
+            let open: Vec<char> = "t(".chars().collect();
+            let skip_space = |mut j: usize| {
+                while j < bytes.len() && bytes[j].is_whitespace() {
+                    j += 1;
+                }
+                j
+            };
             let mut i = 0;
             while i + open.len() < bytes.len() {
+                // A call rustfmt broke over lines — `t(`, the literal on the
+                // next line, a trailing comma — is a call all the same: the
+                // octave piano's hint went untranslated because this read
+                // only the one-line form.
+                let quote = skip_space(i + open.len());
                 let starts = bytes[i..i + open.len()] == open[..]
+                    && quote < bytes.len()
+                    && bytes[quote] == '"'
                     // `format!("…")` and `next("…")` are not `t("…")`.
                     && (i == 0 || !bytes[i - 1].is_alphanumeric() && bytes[i - 1] != '_');
                 if !starts {
                     i += 1;
                     continue;
                 }
-                let mut j = i + open.len();
+                let mut j = quote + 1;
                 let mut key = String::new();
                 while j < bytes.len() && bytes[j] != '"' {
                     if bytes[j] == '\\' && j + 1 < bytes.len() {
@@ -455,7 +473,12 @@ mod tests {
                     key.push(bytes[j]);
                     j += 1;
                 }
-                if j + 1 < bytes.len() && bytes[j] == '"' && bytes[j + 1] == ')' {
+                let mut close = skip_space(j + 1);
+                if close < bytes.len() && bytes[close] == ',' {
+                    close = skip_space(close + 1);
+                }
+                if j < bytes.len() && bytes[j] == '"' && close < bytes.len() && bytes[close] == ')'
+                {
                     out.push(key);
                 }
                 i = j.max(i + 1);

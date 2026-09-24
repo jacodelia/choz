@@ -55,7 +55,7 @@ impl GranularDelay {
         Self {
             line: [Line::with_ms(MAX_TIME_MS), Line::with_ms(MAX_TIME_MS)],
             delay_frames: ((delay_ms / 1000.0) * 48000.0) as usize,
-            feedback,
+            feedback: feedback.clamp(0.0, 0.95),
             scatter_st,
             density,
             wet: 0.7,
@@ -113,7 +113,7 @@ impl FxProcessor for GranularDelay {
         use crate::fx::FxParam;
         vec![
             FxParam::new("Size", (self.delay_ms - 20.0) / 980.0, 20.0, 1000.0, "ms"),
-            FxParam::new("Feedback", self.feedback, 0.0, 1.0, ""),
+            FxParam::new("Feedback", self.feedback / 0.95, 0.0, 0.95, ""),
             FxParam::new("Pitch", self.scatter_st / 24.0 + 0.5, -12.0, 12.0, "st"),
             FxParam::new("Density", (self.density - 1.0) / 31.0, 1.0, 32.0, "/s"),
             FxParam::new("Wet", self.wet, 0.0, 1.0, ""),
@@ -130,7 +130,8 @@ impl FxProcessor for GranularDelay {
                 self.delay_ms = 20.0 + v * 980.0;
                 self.delay_frames = self.frames_for(self.delay_ms);
             }
-            1 => self.feedback = v,
+            // Short of 1, like the Delay's: at 1 the repeats never die.
+            1 => self.feedback = v * 0.95,
             2 => self.scatter_st = (v - 0.5) * 24.0,
             3 => self.density = 1.0 + v * 31.0,
             4 => self.wet = v,
@@ -216,6 +217,26 @@ impl FxProcessor for GranularDelay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feedback at the top of its knob still dies away.
+    #[test]
+    fn full_feedback_dies_away() {
+        let mut fx = GranularDelay::new(100.0, 0.0, 0.0, 8.0);
+        fx.set_param(1, 1.0);
+        fx.set_mix(1.0);
+        let mut b: Vec<f32> = (0..9600)
+            .map(|i| 0.5 * ((i / 2) as f32 * 0.05).sin())
+            .collect();
+        fx.process_block(&mut b, 48000);
+        let mut last = 0.0f32;
+        for _ in 0..600 {
+            let mut s = vec![0.0f32; 1024];
+            fx.process_block(&mut s, 48000);
+            last = s.iter().fold(0.0, |m, x| m.max(x.abs()));
+        }
+        // 0.95 per 100 ms repeat is ~0.05 after 6 s: dying, not holding.
+        assert!(last < 0.02, "still {last} after 6 s");
+    }
 
     #[test]
     fn gran_delay_processes_without_panic() {
