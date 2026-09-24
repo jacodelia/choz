@@ -14,10 +14,10 @@ son cinco bordes —MIDI, el sidechain, el sampler, el arreglador y el
 transporte dentro de un DAW—, dos decisiones de no hacer, y las notas para el
 que retome.
 
-Última actualización: 2026-09-22 — un plugin sandboxeado que revienta en
-cadena o inunda el log ya se da por muerto y se pone en cuarentena en vez de
-arrastrar a choz con él, y la ventana de un `.clap` embebido en REAPER dejó de
-verse como un popup flotante; lo cerrado está en el
+Última actualización: 2026-09-24 — choz se ofrece al sistema como micrófono
+(`choz Mic`) y como parlante con efectos (`choz System FX`), el harmonizer canta
+con PSOLA y conduce sus voces como un coro, y la auditoría de los efectos
+propios cerró lo que encontró; lo cerrado está en el
 [changelog](../CHANGELOG.md).
 
 ## Estado en una línea
@@ -87,7 +87,7 @@ barra** (`| 5/4 Fm | 3/4 Db |`) y el metrónomo los sigue, lee y escribe **MIDI*
 —exporta la banda balanceada, un canal por músico, y abre un `.mid` de dos a
 cuatro instrumentos—, y **SPLIT OUT** pone a cada músico en una tira propia del
 MIXER sin abrir otra tab. La polifonía de los instrumentos es un ajuste (16–1024, 256
-por defecto) y la barra de arriba dice la RAM que choz tiene. **La 1.3.17 es
+por defecto) y la barra de arriba dice la RAM que choz tiene. **La 1.3.18 es
 este árbol, publicada con sus paquetes.** El workspace sin
 `choz-plugin-lv2` (que en esta máquina se cuelga) pasa, y `clippy --workspace
 --all-targets -D warnings` está limpio con `+beta`.

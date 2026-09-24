@@ -497,6 +497,10 @@ pub struct Reverb {
     /// shimmer calls `process_block` one frame at a time and an `exp` per
     /// block would then be an `exp` per sample.
     tilt_a: f32,
+    /// Audio has gone through. Until then the mix lands at once instead of
+    /// gliding: a reverb built and set to dry must be dry from its first
+    /// sample, and with a crossfade a glide from the default would not be.
+    running: bool,
     sample_rate: f32,
 }
 
@@ -583,6 +587,7 @@ impl Reverb {
             quality: Quality::High,
             freeze: false,
             tilt_a: one_pole(TILT_SPLIT_HZ, sr),
+            running: false,
             sample_rate: sr,
         };
         r.rebuild_tables();
@@ -931,6 +936,7 @@ impl FxProcessor for Reverb {
             self.snap();
         }
 
+        self.running = true;
         let n = self.quality.lines();
         let rot = self.quality.rotate();
         let n_diff_in = match self.quality {
@@ -1081,8 +1087,12 @@ impl FxProcessor for Reverb {
             let wet = self.s_wet.tick();
 
             // The dry goes out exactly as it came in.
-            buf[f * 2] = dry_l + soft_clip(mid + side, SOFT_CEIL) * wet;
-            buf[f * 2 + 1] = dry_r + soft_clip(mid - side, SOFT_CEIL) * wet;
+            // The mix law every effect keeps (see `FxProcessor::set_mix`): a
+            // crossfade. It used to add the reverb on top of an untouched dry,
+            // so Wet at full was the whole dry signal plus the room — a send
+            // level, and the one effect where the knob meant that.
+            buf[f * 2] = dry_l + (soft_clip(mid + side, SOFT_CEIL) - dry_l) * wet;
+            buf[f * 2 + 1] = dry_r + (soft_clip(mid - side, SOFT_CEIL) - dry_r) * wet;
         }
     }
 
@@ -1111,6 +1121,10 @@ impl FxProcessor for Reverb {
     fn set_mix(&mut self, wet: f32) {
         self.p_wet = wet.clamp(0.0, 1.0);
         self.update();
+        if !self.running {
+            let t = self.s_wet.target();
+            self.s_wet.snap(t);
+        }
     }
 
     fn name(&self) -> &str {
@@ -1201,8 +1215,8 @@ mod tests {
     }
 
     /// Run `frames` of `input` through `r` in blocks of `block`, and hand back
-    /// the **wet only** — the dry is subtracted, which is exact because the
-    /// reverb is documented to leave it alone.
+    /// what came out. At Wet 1 (see `wet`) that is the reverb alone: the mix
+    /// is a crossfade, so none of the dry is left in it.
     fn run(
         r: &mut Reverb,
         sr: u32,
@@ -1215,18 +1229,13 @@ mod tests {
         let mut done = 0;
         while done < frames {
             let n = block.min(frames - done);
-            let mut dry = Vec::with_capacity(n * 2);
             for i in 0..n {
                 let (l, rr) = input(done + i);
                 scratch[i * 2] = l;
                 scratch[i * 2 + 1] = rr;
-                dry.push(l);
-                dry.push(rr);
             }
             r.process_block(&mut scratch[..n * 2], sr);
-            for i in 0..n * 2 {
-                out.push(scratch[i] - dry[i]);
-            }
+            out.extend_from_slice(&scratch[..n * 2]);
             done += n;
         }
         out

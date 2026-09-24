@@ -706,6 +706,14 @@ enum ModalKind {
     /// wear the accent, every octave of them: a tonic is a note name and not
     /// one key of one octave.
     ArrKey(u8),
+    /// The register the selected harmoniser sings in, picked on a piano —
+    /// `(the knob step it came in with)`, 0 AUTO and then C1…C7, so CANCEL has
+    /// something to put back. The chosen octave's twelve keys are lit.
+    HarmOctave(u8),
+    /// The chord the harmoniser's CHORD shape sings, built one row at a time
+    /// with the arranger's chord dialogue — over the note being sung, so it
+    /// has no root row.
+    HarmChord,
     /// Every style the arranger has, as a list with what each one plays like.
     ArrStyle,
     /// The seeds, each with what it does to the part this tab is playing —
@@ -1038,6 +1046,7 @@ fn is_keyboard_modal(kind: ModalKind) -> bool {
         ModalKind::Split
             | ModalKind::SeqNote(..)
             | ModalKind::ArrKey(..)
+            | ModalKind::HarmOctave(..)
             | ModalKind::SamplerChoice(SamplerPick::Note)
     )
 }
@@ -2100,6 +2109,9 @@ struct App {
     /// tab, and the arranger that plays it against the transport. One at a
     /// time — see [`choz_engine::chord::chart`].
     harm_chart: Option<HarmChart>,
+    /// The arranger chord last published for a harmoniser following it —
+    /// `Some` while one is being followed, so its end clears the chord once.
+    arr_sync_last: Option<Option<String>>,
     /// The file this project was last saved to or loaded from — what plain
     /// "Save project" rewrites without asking anything.
     project_file: Option<std::path::PathBuf>,
@@ -2311,6 +2323,7 @@ impl App {
             meter_followed: false,
             meter_held: false,
             harm_chart: None,
+            arr_sync_last: None,
             project_file: None,
             saved_project: None,
             port_edit: None,
@@ -4412,6 +4425,120 @@ impl App {
             .map(|_| self.fx_slot)
     }
 
+    /// The selected harmoniser's octave, `None` for AUTO.
+    fn harm_octave(&self) -> Option<i32> {
+        let fx = self.selected_harmonizer()?;
+        let v = self
+            .fx_chain
+            .get(fx)
+            .and_then(|e| e.params.get(choz_engine::fx::harmonizer::OCTAVE_PARAM))
+            .copied()
+            .unwrap_or(0.0);
+        choz_engine::fx::harmonizer::octave_of(v)
+    }
+
+    /// Set the selected harmoniser's octave, stored and sent.
+    fn set_harm_octave(&mut self, octave: Option<i32>) {
+        let Some(fx) = self.selected_harmonizer() else {
+            return;
+        };
+        let param = choz_engine::fx::harmonizer::OCTAVE_PARAM;
+        let value = choz_engine::fx::harmonizer::octave_norm(octave);
+        if let Some(p) = self
+            .fx_chain
+            .get_mut(fx)
+            .and_then(|e| e.params.get_mut(param))
+        {
+            *p = value;
+        }
+        self.set_live_fx_param(fx, param, value);
+        self.persist_active();
+    }
+
+    /// ARR on the harmoniser's chart row: follow the arranger's progression,
+    /// or stop following it.
+    fn toggle_harm_arr_sync(&mut self) {
+        let Some(fx) = self.selected_harmonizer() else {
+            return;
+        };
+        let param = choz_engine::fx::harmonizer::ARR_SYNC_PARAM;
+        let on = self.fx_chain[fx]
+            .params
+            .get(param)
+            .is_some_and(|v| *v >= 0.5);
+        self.set_fx_param(fx, param, if on { 0.0 } else { 1.0 });
+        eprintln!(
+            "choz: harmoniser {} the arranger",
+            if on { "no longer follows" } else { "follows" }
+        );
+    }
+
+    /// The species the selected harmoniser's CHORD shape sings, off its knobs.
+    fn harm_spec(&self) -> Option<arranger::spec::ChordSpec> {
+        use choz_engine::fx::harmonizer::{spec_step, SPEC_PARAM0, SPEC_ROWS};
+        let fx = self.selected_harmonizer()?;
+        let p = &self.fx_chain.get(fx)?.params;
+        let row = |r: usize| {
+            spec_step(
+                p.get(SPEC_PARAM0 + r).copied().unwrap_or(0.0),
+                SPEC_ROWS[r].1,
+            )
+        };
+        Some(arranger::spec::ChordSpec {
+            root: 0,
+            family: row(0),
+            seventh: row(1),
+            tension: row(2),
+            ninth: row(3),
+            eleventh: row(4),
+            thirteenth: row(5),
+            fifth: row(6),
+        })
+    }
+
+    /// Write a species into the selected harmoniser's knobs.
+    fn set_harm_spec(&mut self, spec: arranger::spec::ChordSpec) {
+        use choz_engine::fx::harmonizer::{spec_norm, SPEC_PARAM0, SPEC_ROWS};
+        let Some(fx) = self.selected_harmonizer() else {
+            return;
+        };
+        let rows = [
+            spec.family,
+            spec.seventh,
+            spec.tension,
+            spec.ninth,
+            spec.eleventh,
+            spec.thirteenth,
+            spec.fifth,
+        ];
+        for (r, v) in rows.into_iter().enumerate() {
+            self.set_fx_param(fx, SPEC_PARAM0 + r, spec_norm(v, SPEC_ROWS[r].1));
+        }
+    }
+
+    /// The arranger's chord dialogue, for the harmoniser's CHORD shape.
+    fn open_harm_chord(&mut self) {
+        if self.selected_harmonizer().is_none() {
+            return;
+        }
+        let list = views::modal::ListModal::new(i18n::t("CHORD"), Vec::new());
+        self.modal = Some(Modal::new(ModalKind::HarmChord, list));
+        self.refresh_modal();
+    }
+
+    /// OCT on the harmoniser: the piano, to say which octave the voices sing
+    /// in. Clicking a key picks its octave; `A` is AUTO (follow the tune).
+    fn open_harm_octave(&mut self) {
+        if self.selected_harmonizer().is_none() {
+            return;
+        }
+        let was = self.harm_octave().unwrap_or(0) as u8;
+        self.modal = Some(Modal::new(
+            ModalKind::HarmOctave(was),
+            views::modal::ListModal::new(i18n::t("OCTAVE"), Vec::new()),
+        ));
+    }
+
     /// LOAD on the harmoniser's chart row: the same file picker the arranger
     /// opens, the same `.chord` and `.mid`.
     fn open_harm_chart(&mut self) {
@@ -4585,6 +4712,59 @@ impl App {
         if gone {
             self.harm_stop();
         }
+        // **The arranger as master.** Any harmoniser switched to it follows the
+        // progression of whichever tab's arranger is playing: its chord, as it
+        // changes, on the chart channel the harmoniser reads. When it stops,
+        // the chord goes, and the harmony is its scale again.
+        let arr_param = choz_engine::fx::harmonizer::ARR_SYNC_PARAM;
+        let syncs = |e: &source::AudioFxEntry| {
+            e.kind == source::AudioFxKind::Harmonizer
+                && e.params.get(arr_param).is_some_and(|v| *v >= 0.5)
+        };
+        let wants = self.fx_chain.iter().any(syncs)
+            || self.slots.iter().any(|s| s.fx_chain.iter().any(syncs));
+        let lead = match wants {
+            true => self.slots.iter().find(|s| s.arranger.is_playing()),
+            false => None,
+        };
+        let following = lead.map(|s| {
+            let v = s.arranger.view();
+            (s.arranger.chord_now().cloned(), v.bar, v.bars)
+        });
+        match &following {
+            Some((chord, bar, _)) => {
+                let symbol = chord.as_ref().map(|c| c.symbol.clone());
+                if self.arr_sync_last.as_ref() != Some(&symbol) {
+                    match chord {
+                        Some(c) => {
+                            eprintln!(
+                                "choz: harmoniser follows the arranger — bar {bar}: {}",
+                                c.symbol
+                            );
+                            let root = 48 + c.root as i32;
+                            let notes: Vec<u8> = c
+                                .tones
+                                .iter()
+                                .map(|t| (root + t).clamp(0, 127) as u8)
+                                .take(choz_engine::chord::MAX_NOTES)
+                                .collect();
+                            choz_engine::chord::chart().set(&notes);
+                        }
+                        None => choz_engine::chord::chart().clear(),
+                    }
+                    self.arr_sync_last = Some(symbol);
+                }
+            }
+            None => {
+                if self.arr_sync_last.take().is_some() {
+                    choz_engine::chord::chart().clear();
+                    // The harmoniser's own chart, if it plays, republishes.
+                    if let Some(h) = self.harm_chart.as_mut() {
+                        h.last = None;
+                    }
+                }
+            }
+        }
         let mut shown = None;
         if let Some(h) = self.harm_chart.as_mut() {
             h.arr.retune_to_tempo();
@@ -4593,7 +4773,8 @@ impl App {
             h.arr.tick(now, &mut out);
             let chord = h.arr.chord_now().cloned();
             let symbol = chord.as_ref().map(|c| c.symbol.clone());
-            if symbol != h.last {
+            // Following the arranger, its progression is the one published.
+            if symbol != h.last && following.is_none() {
                 let bar = h.arr.view().bar;
                 match &chord {
                     Some(c) => {
@@ -4628,12 +4809,20 @@ impl App {
                 continue;
             }
             let mine = shown.as_ref().filter(|s| s.0 == tab && s.1 == i);
+            let arr_sync = e.params.get(arr_param).is_some_and(|v| *v >= 0.5);
+            // Following the arranger, the row shows its progression.
+            let led = following.as_ref().filter(|_| arr_sync);
             e.chart_view = Some(source::HarmChartView {
                 loaded: e.chart.is_some(),
-                playing: mine.is_some_and(|s| s.2),
-                chord: mine.and_then(|s| s.3.clone()).unwrap_or_default(),
-                bar: mine.map_or(0, |s| s.4),
-                bars: mine.map_or(0, |s| s.5),
+                playing: led.is_some() || mine.is_some_and(|s| s.2),
+                chord: match led {
+                    Some((c, _, _)) => c.as_ref().map(|c| c.symbol.clone()).unwrap_or_default(),
+                    None => mine.and_then(|s| s.3.clone()).unwrap_or_default(),
+                },
+                bar: led.map_or(mine.map_or(0, |s| s.4), |l| l.1),
+                bars: led.map_or(mine.map_or(0, |s| s.5), |l| l.2),
+                arr_sync,
+                following: led.is_some(),
                 beat,
                 beats,
                 click,
@@ -8163,6 +8352,7 @@ impl App {
             ModalKind::Split
             | ModalKind::SeqNote(..)
             | ModalKind::ArrKey(..)
+            | ModalKind::HarmOctave(..)
             | ModalKind::Harmonics => Vec::new(),
             ModalKind::ArrStyle => self.arr_style_rows(),
             ModalKind::ArrSeed => self.arr_seed_rows(),
@@ -8255,6 +8445,24 @@ impl App {
                     m.list.note = format!("  \u{2190}\u{2192} {}", i18n::t("CHANGE"));
                 }
                 rows
+            }
+            // The harmoniser's chord: the same rows as the arranger's dialogue,
+            // no root — the root is whatever is being sung — and the heading
+            // is the chord as it would stand over a C, with its notes.
+            ModalKind::HarmChord => {
+                let Some(spec) = self.harm_spec() else {
+                    return;
+                };
+                let symbol = spec.symbol("C");
+                let notes = spec.notes("C", 0);
+                if let Some(m) = self.modal.as_mut() {
+                    m.list.header = format!(
+                        "   {} {symbol:<12}{notes}",
+                        i18n::t("OVER C:")
+                    );
+                    m.list.note = format!("  \u{2190}\u{2192} {}", i18n::t("CHANGE"));
+                }
+                spec.rows()
             }
             // Built when it opens, the same as the sequencer's lists: the rows
             // are what the tab said then, and nothing re-reads them.
@@ -8800,6 +9008,10 @@ impl App {
             ModalKind::Split => false,
             // The key is already written as it is clicked; Enter keeps it.
             ModalKind::ArrKey(..) => true,
+            // Same: the octave is set as it is clicked.
+            ModalKind::HarmOctave(..) => true,
+            // The rows are turned with the arrows; Enter is "this chord".
+            ModalKind::HarmChord => true,
             ModalKind::ArrStyle => {
                 if let Some(style) = arranger::style::all().get(i) {
                     self.edit_arranger(ArrEdit::Style(style.name));
@@ -8971,6 +9183,18 @@ impl App {
                     });
                 if let Some(v) = value {
                     self.set_fx_param(self.fx_slot, param, v);
+                }
+                // CHORD on the harmoniser's shape is a chord still to be said:
+                // straight on to the arranger's chord dialogue for it.
+                let chord_shape = self.selected_harmonizer() == Some(self.fx_slot)
+                    && param == 1
+                    && value.is_some_and(|v| {
+                        choz_engine::fx::harmonizer::Shape::from_norm(v)
+                            == choz_engine::fx::harmonizer::Shape::Chord
+                    });
+                if chord_shape {
+                    self.open_harm_chord();
+                    return false;
                 }
                 true
             }
@@ -11191,7 +11415,13 @@ impl App {
             let (owner, jack) = port.rsplit_once(':').unwrap_or(("", port.as_str()));
             if owner != card {
                 card = owner.to_string();
-                rows.push((InTarget::None, header(owner)));
+                // choz's own virtual speaker: what the system plays into it is
+                // what arrives here, so it is named for that.
+                let title = match owner == choz_engine::virtual_devices::SYSTEM_JACK {
+                    true => format!("{} \u{2014} choz System FX", i18n::t("SYSTEM AUDIO")),
+                    false => owner.to_string(),
+                };
+                rows.push((InTarget::None, header(&title)));
             }
             let tab = self
                 .slots
@@ -11602,6 +11832,46 @@ impl App {
         self.pending_load = Some(PendingLoad::Project(path));
     }
 
+    /// What `A→M` did in the last second: notes started, and every note that
+    /// ended with the rule that ended it — under the gate, no pitch left, or
+    /// faded far under its own peak (the speakers in the microphone). A note
+    /// still held says so with how long, so one that never lets go is in the
+    /// log in black and white instead of only in somebody's ears.
+    ///
+    /// Silent when nothing happened and nothing is held.
+    fn log_pitch_to_midi(&mut self) {
+        let r = choz_engine::pitch::stats().take();
+        let ended = r.quiet + r.unvoiced + r.faded;
+        // A held note is news every second only once it is long: a sustained
+        // sung note is two seconds, not ten.
+        let long_hold = r.sounding.is_some() && r.sounding_ms > 4_000.0;
+        if r.ons == 0 && ended == 0 && r.changed == 0 && !long_hold {
+            return;
+        }
+        let note = |n: u8| {
+            format!(
+                "{}{} ({n})",
+                choz_engine::fx::autotune::NOTE_NAMES[(n % 12) as usize],
+                n as i32 / 12 - 1
+            )
+        };
+        eprintln!(
+            "choz[{}]: A\u{2192}M — {} note{} on, {} changed, ended: {} quiet / {} no pitch / {} faded (speakers?), longest {:.0} ms, {}",
+            std::process::id(),
+            r.ons,
+            if r.ons == 1 { "" } else { "s" },
+            r.changed,
+            r.quiet,
+            r.unvoiced,
+            r.faded,
+            r.longest_ms,
+            match r.sounding {
+                Some(n) => format!("holding {} for {:.1} s", note(n), r.sounding_ms / 1000.0),
+                None => "nothing held".to_string(),
+            }
+        );
+    }
+
     /// What the harmoniser did in the last second, when it did something: the
     /// note it heard, how often its voices moved and where to, how loud it
     /// came out and whether any of that passed full scale. Silent while it
@@ -11659,6 +11929,7 @@ impl App {
         }
         self.health_at = Instant::now();
         self.log_harmonizer();
+        self.log_pitch_to_midi();
         let (peak, blocks, over) = choz_engine::meter::load().take();
         // Read straight after `take`, which is what resets the pair: the worst
         // block's own CPU time, beside the wall time it belongs to.
@@ -17577,6 +17848,15 @@ fn handle_modal_key(app: &mut App, key: KeyCode) {
         // arrows turn the row the cursor is on and the dialogue stays open, so a
         // species is built by walking down it — the metronome's rule, on the
         // metronome's keys.
+        KeyCode::Left | KeyCode::Right if kind == ModalKind::HarmChord => {
+            let delta = if key == KeyCode::Right { 1 } else { -1 };
+            if let Some(mut spec) = app.harm_spec() {
+                spec.step(cursor, delta);
+                app.set_harm_spec(spec);
+            }
+            app.refresh_modal();
+            return;
+        }
         KeyCode::Left | KeyCode::Right if kind == ModalKind::ArrChord => {
             let delta = if key == KeyCode::Right { 1 } else { -1 };
             if let Some(spec) = app.arr_chord.as_mut() {
@@ -17618,6 +17898,23 @@ fn handle_modal_key(app: &mut App, key: KeyCode) {
         KeyCode::Left | KeyCode::Right if kind == ModalKind::FxGate => {
             app.step_fx_gate_row(cursor, if key == KeyCode::Right { 1 } else { -1 });
             app.refresh_modal();
+        }
+        // The harmoniser's octave from the keys too: arrows step it, and
+        // falling off the bottom is AUTO.
+        KeyCode::Left | KeyCode::Right if matches!(kind, ModalKind::HarmOctave(_)) => {
+            use choz_engine::fx::harmonizer::OCTAVES;
+            let now = app.harm_octave();
+            let next = match (now, key == KeyCode::Right) {
+                (None, true) => Some(*OCTAVES.start()),
+                (None, false) => None,
+                (Some(o), true) => Some((o + 1).min(*OCTAVES.end())),
+                (Some(o), false) if o <= *OCTAVES.start() => None,
+                (Some(o), false) => Some(o - 1),
+            };
+            app.set_harm_octave(next);
+        }
+        KeyCode::Char('a') | KeyCode::Char('A') if matches!(kind, ModalKind::HarmOctave(_)) => {
+            app.set_harm_octave(None);
         }
         // The arrows choose the square the pointer paints with: the octaves
         // themselves are set by pointing at the keyboard.
@@ -18813,6 +19110,8 @@ enum MouseAction {
     HarmPlay,
     HarmStop,
     HarmLoad,
+    HarmOctave,
+    HarmArrSync,
     HarmClick,
     ToggleEditor,
     /// Open the harmonics of the tab's instrument.
@@ -19009,6 +19308,8 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                             RackButton::HarmPlay => MouseAction::HarmPlay,
                             RackButton::HarmStop => MouseAction::HarmStop,
                             RackButton::HarmLoad => MouseAction::HarmLoad,
+                            RackButton::HarmOctave => MouseAction::HarmOctave,
+                            RackButton::HarmArrSync => MouseAction::HarmArrSync,
                             RackButton::HarmClick => MouseAction::HarmClick,
                             // The ones with names open their list instead of
                             // walking it: on a panel too short for the knob
@@ -19839,6 +20140,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         MouseAction::HarmPlay => app.harm_play(),
         MouseAction::HarmStop => app.harm_stop(),
         MouseAction::HarmLoad => app.open_harm_chart(),
+        MouseAction::HarmOctave => app.open_harm_octave(),
+        MouseAction::HarmArrSync => app.toggle_harm_arr_sync(),
         MouseAction::HarmClick => app.harm_click(),
         // Straight to the same funnel the computer keyboard's piano uses, so a
         // clicked key arpeggiates, splits and releases itself exactly as a
@@ -20098,6 +20401,34 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
         // chart as it is clicked so the band is heard in it straight away.
         // CANCEL puts back the one the chart came in with — a key tried by ear
         // has to be possible to try and then not keep.
+        // The harmoniser's octave: the key clicked says which, set as it is
+        // clicked so it is heard; CANCEL puts back the one it came in with.
+        if let Some(ModalKind::HarmOctave(was)) = app.modal.as_ref().map(|m| m.kind) {
+            if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                return;
+            }
+            if split.select.is_some_and(|r| r.contains(pos)) {
+                app.modal = None;
+                return;
+            }
+            if split.cancel.is_some_and(|r| r.contains(pos)) {
+                app.set_harm_octave(choz_engine::fx::harmonizer::octave_of(
+                    was as f32 / (choz_engine::fx::harmonizer::OCTAVE_STEPS - 1) as f32,
+                ));
+                app.modal = None;
+                return;
+            }
+            if let Some(note) = split.keys.note_at(pos.x, pos.y) {
+                let o = (note as i32 / 12 - 1).clamp(
+                    *choz_engine::fx::harmonizer::OCTAVES.start(),
+                    *choz_engine::fx::harmonizer::OCTAVES.end(),
+                );
+                app.set_harm_octave(Some(o));
+            } else if split.area.is_some_and(|r| !r.contains(pos)) {
+                app.modal = None;
+            }
+            return;
+        }
         if let Some(ModalKind::ArrKey(was)) = app.modal.as_ref().map(|m| m.kind) {
             if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                 return;
@@ -20991,7 +21322,29 @@ fn ui(f: &mut Frame, app: &mut App) {
                 .collect(),
             None => lit,
         };
-        let sounds = match track.is_some() || audition.is_some() || arr_key.is_some() {
+        // The harmoniser's octave: its twelve keys lit; nothing lit is AUTO.
+        let harm_oct = match app.modal.as_ref().map(|m| m.kind) {
+            Some(ModalKind::HarmOctave(_)) => Some(app.harm_octave()),
+            _ => None,
+        };
+        let lit: Vec<(u8, Color)> = match harm_oct {
+            Some(Some(o)) => {
+                let base = (12 * (o + 1)).clamp(0, 116) as u8;
+                (base..base + 12)
+                    .map(|n| {
+                        let black = matches!(n % 12, 1 | 3 | 6 | 8 | 10);
+                        (n, key_shade(SOUND_COLOURS[2], black))
+                    })
+                    .collect()
+            }
+            Some(None) => Vec::new(),
+            None => lit,
+        };
+        let sounds = match track.is_some()
+            || audition.is_some()
+            || arr_key.is_some()
+            || harm_oct.is_some()
+        {
             true => Vec::new(),
             false => app.split_chips(),
         };
@@ -21002,6 +21355,18 @@ fn ui(f: &mut Frame, app: &mut App) {
             .unwrap_or([None; OCTAVES]);
         let chosen = app.modal.as_ref().map(|m| m.list.filter).unwrap_or(0);
         let (title, hint, highlight) = match track {
+            None if harm_oct.is_some() => (
+                format!(
+                    "{} \u{2014} {}",
+                    i18n::t("OCTAVE"),
+                    choz_engine::fx::harmonizer::octave_label(harm_oct.flatten())
+                ),
+                i18n::t(
+                    "  click a key: the voices sing in its octave \u{2014} A for AUTO (follow the tune)",
+                )
+                .to_string(),
+                None,
+            ),
             None if arr_key.is_some() => (
                 i18n::t("KEY").to_string(),
                 i18n::t("  click a key to make it the tonic — every octave of it lights up")
@@ -36586,6 +36951,154 @@ mod tests {
         click(&mut app, cancel.x + 1, cancel.y);
         assert!(app.modal.is_none());
         assert_eq!(app.slots[0].arranger.key(), 0, "back to C");
+    }
+
+    /// The harmoniser's shape list has no MAJ7 any more: it has CHORD, and
+    /// picking it opens the arranger's chord dialogue, whose arrows set the
+    /// species the voices sing.
+    #[test]
+    fn the_chord_shape_opens_the_arrangers_chord_dialogue() {
+        use choz_engine::fx::harmonizer::{spec_step, SPEC_PARAM0, SPEC_ROWS};
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        app.fx_chain
+            .push(AudioFxEntry::new(source::AudioFxKind::Harmonizer));
+        app.fx_slot = 0;
+
+        assert!(app.open_fx_choice(1), "Shape is a list");
+        let items = app.modal.as_ref().unwrap().list.items.clone();
+        assert!(
+            !items.iter().any(|i| i.contains("MAJ7")),
+            "no MAJ7: {items:?}"
+        );
+        let chord = items
+            .iter()
+            .position(|i| i == "CHORD")
+            .expect("CHORD is offered");
+        app.modal.as_mut().unwrap().list.cursor = chord;
+        assert!(!app.modal_select(), "the dialogue stays open");
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::HarmChord)
+        );
+        let rows = app.modal.as_ref().unwrap().list.items.clone();
+        assert_eq!(
+            rows.len(),
+            SPEC_ROWS.len(),
+            "a row a decision, no root: {rows:?}"
+        );
+
+        // FAMILY one step right: MAJ → MIN.
+        app.modal.as_mut().unwrap().list.cursor = 0;
+        handle_key(&mut app, KeyCode::Right);
+        let family = spec_step(app.fx_chain[0].params[SPEC_PARAM0], SPEC_ROWS[0].1);
+        assert_eq!(family, 1, "the arrow turned the family");
+        let header = app.modal.as_ref().unwrap().list.header.clone();
+        assert!(header.contains("Cm"), "the heading spells it: {header:?}");
+    }
+
+    /// ARR: with the arranger playing, its chord is the harmony — published
+    /// on the chart channel as it changes — and the row shows its bar.
+    #[test]
+    fn a_harmoniser_follows_the_arrangers_progression() {
+        use choz_engine::fx::harmonizer::ARR_SYNC_PARAM;
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        app.fx_chain
+            .push(AudioFxEntry::new(source::AudioFxKind::Harmonizer));
+        app.fx_slot = 0;
+        app.toggle_harm_arr_sync();
+        assert_eq!(app.fx_chain[0].params[ARR_SYNC_PARAM], 1.0);
+
+        app.slots[0].arranger.set_text("key = C\n|| Dm7 ||");
+        app.edit_arranger(ArrEdit::Toggle);
+        app.edit_arranger(ArrEdit::Play);
+        assert!(app.slots[0].arranger.is_playing());
+        app.tick_harm_chart(std::time::Instant::now());
+        let mut held = [0u8; choz_engine::chord::MAX_NOTES];
+        let n = choz_engine::chord::chart().read(&mut held);
+        let pcs: Vec<u8> = held[..n].iter().map(|n| n % 12).collect();
+        assert_eq!(pcs, vec![2, 5, 9, 0], "Dm7 is D F A C: {pcs:?}");
+        let v = app.fx_chain[0].chart_view.clone().unwrap();
+        assert!(v.following && v.arr_sync);
+        assert_eq!(v.chord, "Dm7");
+
+        // The master stops: the chord goes with it.
+        app.edit_arranger(ArrEdit::Stop);
+        app.tick_harm_chart(std::time::Instant::now());
+        assert_eq!(choz_engine::chord::chart().read(&mut held), 0);
+    }
+
+    /// The harmoniser's octave is picked on the same piano: OCT opens it,
+    /// a key clicked puts the voices in that key's octave, `A` is AUTO again,
+    /// the arrows step it, and CANCEL puts back the one it opened on.
+    #[test]
+    fn the_harmoniser_octave_is_picked_on_the_keyboard() {
+        use choz_engine::fx::harmonizer::{octave_norm, OCTAVE_PARAM};
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        app.fx_chain
+            .push(AudioFxEntry::new(source::AudioFxKind::Harmonizer));
+        app.fx_slot = 0;
+        let octave = |app: &App| app.fx_chain[0].params[OCTAVE_PARAM];
+        assert_eq!(octave(&app), 0.0, "AUTO until asked");
+
+        app.open_harm_octave();
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::HarmOctave(0))
+        );
+
+        let draw = |app: &mut App| -> views::modal::SplitRects {
+            let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
+            term.draw(|f| ui(f, app)).unwrap();
+            let r = app.layout.borrow().split_rects.clone();
+            r
+        };
+        let r = draw(&mut app);
+        assert!(r.keys.drawn() > 0, "the keyboard is drawn");
+        // An E in the third octave (MIDI 52), wherever the drawing put it.
+        let (x, y) = (r.keys.area.x..r.keys.area.x + r.keys.area.width)
+            .flat_map(|x| (r.keys.area.y..r.keys.area.y + r.keys.area.height).map(move |y| (x, y)))
+            .find(|(x, y)| r.keys.note_at(*x, *y) == Some(52))
+            .expect("E3 somewhere on it");
+        click(&mut app, x, y);
+        assert_eq!(
+            octave(&app),
+            octave_norm(Some(3)),
+            "the octave of the key clicked"
+        );
+
+        handle_key(&mut app, KeyCode::Right);
+        assert_eq!(octave(&app), octave_norm(Some(4)), "the arrows step it");
+        handle_key(&mut app, KeyCode::Char('a'));
+        assert_eq!(octave(&app), 0.0, "A is AUTO");
+        handle_key(&mut app, KeyCode::Right);
+        assert_eq!(
+            octave(&app),
+            octave_norm(Some(1)),
+            "and up from AUTO is the first"
+        );
+
+        let r = draw(&mut app);
+        let cancel = r.cancel.expect("a way out");
+        click(&mut app, cancel.x + 1, cancel.y);
+        assert!(app.modal.is_none());
+        assert_eq!(
+            octave(&app),
+            0.0,
+            "CANCEL puts back AUTO, which it opened on"
+        );
     }
 
     /// The key, the style and the seed are picked from their own dialogues, and

@@ -12,7 +12,7 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **1104 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo), 614 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **1083 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo) y sin los de `midi::` (`--skip midi`: abren los puertos ALSA reales y en la máquina de desarrollo tiran el hub USB del dock), 649 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio, y `cargo fmt --all --check` también.
 - **56 efectos propios**, publicados también como un `.clap` con los cuatro artifacts (arpegiador, secuenciador, metrónomo y arreglador).
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
@@ -31,6 +31,53 @@ lleva lo que falta —nada de lo ya hecho— y
   `choz-engine::test_locks` tiene un candado por global; en `choz-ui` el par es
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
+
+## [1.3.18] — 2026-09-24
+
+Release audit: `cargo test --workspace --exclude choz-plugin-lv2 --no-fail-fast -- --skip midi` 1083 pasan y 0 fallan (los tests de `midi::` abren los puertos ALSA reales y en la máquina de desarrollo tiran el hub USB del dock); `cargo clippy --workspace --all-targets -D warnings` y `cargo fmt --all --check` limpios. i18n: claves nuevas `OCT`, `OCTAVE`, `OVER C:`, `SYSTEM AUDIO` y la ayuda del piano de octava, que había quedado sin traducir porque el test de i18n no leía un `t(` partido en varias líneas por rustfmt; el test ahora lo lee. Documentación: `docs/architecture.md` (los dispositivos virtuales, PSOLA, la conducción de voces, `run_chain`, la sincronía al tempo), manual (4.5 los dispositivos virtuales, 6.3 los knobs nuevos, 6.5 el harmonizer: CHORD, OCT, ARR, Lead, PSOLA; 15 `CHOZ_NO_VIRTUAL_DEVICES`) y a 1.3.18, README y roadmap.
+
+### 2026-09-24 — choz como micrófono y como multiefecto del sistema; el harmonizer que canta con voz
+
+**Dispositivos virtuales (`virtual_devices.rs`)**
+
+- Con el backend JACK nativo, choz crea al arrancar dos null sinks de PipeWire (vía `pactl`) y los quita al cerrar: **`choz Mic`**, un micrófono virtual que lleva la mezcla principal (`out_1/out_2`), para elegirlo en Meet, Zoom, Teams o WhatsApp; y **`choz System FX`**, un parlante virtual cuyo monitor aparece en el cajón IN como **SYSTEM AUDIO — choz System FX**, para ponerle efectos al audio del sistema. Un par que dejó un choz caído se reutiliza y no se duplica; sólo se quita lo que esta ejecución creó. `CHOZ_NO_VIRTUAL_DEVICES=1` lo apaga.
+- **Por JACK, PipeWire nombra un nodo por su descripción** (`choz Mic:input_FL`), no por su nombre (`choz_mic`): cablear contra el nombre no conectaba nada y no decía nada. El test en vivo (`--ignored`) verifica los puertos JACK con los nombres que usa el cableado, y que el micrófono sea una fuente llamada `choz Mic` (la primera versión citaba mal el nombre y salía un parlante llamado «choz»).
+- **choz ya no se ofrece sus propios dispositivos como salida**: no aparecen en OUT, y una salida guardada como uno de ellos se ignora (se usa la del sistema). Elegido `choz System FX` como salida de choz, todo lo procesado iba a un parlante que nadie escucha y sólo se oía la voz sin efectos.
+- **Las salidas directas ya no se pliegan sobre el dispositivo.** `pair_ports` repetía el último puerto del destino para cada salida de más: `out_3`…`out_10` se sumaban en el canal derecho del dispositivo. Ahora sólo se pliega el par principal sobre un dispositivo mono, y lo que el bug dejó conectado se desconecta del dispositivo que se abandona (no lo que alguien conectó a mano, p. ej. a Ardour). Test: `direct_outs_are_not_folded_onto_the_sink`.
+
+**Harmonizer**
+
+- **Voces con PSOLA (`fx/psola.rs`)**, no con el shifter de estiramiento: cuanto más lejos iba una voz, más «dentro de un tubo» sonaba, porque estirar mueve también los formantes. Ahora los granos de dos periodos se centran en cada pulso de la voz y se recolocan al periodo nuevo; lo sordo (consonantes, respiraciones) se recoloca sin desplazar. Medido: una octava abajo un formante de 900 Hz queda en 900 Hz (antes 450); nivel dentro de ±3 dB de −24 a +24 semitonos en voces de 110, 160 y 250 Hz.
+- **Conducción de voces coral**: con un acorde a seguir, cada voz elige el tono del acorde que minimiza `2·|movimiento| + |distancia a su intervalo|`, a una quinta de su registro, sin unísonos. Con la melodía saltando una quinta sobre C: 5 semitonos de movimiento total en vez de 17. Con escala sola sigue el movimiento paralelo, que es lo pedido. Una frase nueva (1 s de silencio, `reset`) arranca de cero.
+- **OCT**: un botón en la fila GATE/CHORD abre el piano para elegir en qué octava cantan las voces (AUTO, C1…C7; ←→, `A` para AUTO, CANCEL restaura). Knob `Octave`, guardado con el proyecto. Ninguna voz se aleja más de ±24 semitonos de la nota cantada: con OCT en C1 y cantando C♯6 las voces pedían −51 semitonos, más allá del shifter y del parlante del headset.
+- **Shape CHORD en lugar de MAJ7**: abre el diálogo de acordes del arreglador (FAMILY, 6/7, TENSION, 9, 11, 13, 5) sin fila de raíz —la raíz es la nota cantada— y las voces cantan esa especie exacta. `ChordSpec` pasó del UI al engine (`arranger/spec.rs`); las ~6700 especies se precalculan fuera del hilo de audio. Por defecto maj7: un proyecto con MAJ7 suena igual. Knobs `ChFamily`…`Ch5`.
+- **ARR**: botón y knob `ArrSync`; mientras el arreglador de cualquier tab toca, su acorde es la armonía y la fila muestra su acorde y su barra. Al detenerse, el harmonizer vuelve a su escala (o a su propio chart).
+- **Lead**: knob nuevo, cuánto de la voz original sale junto con la armonía. **Por defecto 0**: con Wet 1 sólo salen las voces —por `choz Mic` la llamada oye el coro, no el micrófono debajo—. Proyectos anteriores abren en 0. Wet sigue siendo el crossfade de siempre. Tests: `lead_brings_back_the_singer_and_nothing_else`, y el de nivel verifica que la entrada no se filtra.
+- **Nivel**: cada voz al nivel de la entrada (compensada la pérdida del shifter), y el total normalizado al nivel de entrada. Wet por defecto en el rack: 1.0.
+- El harmonizer alocaba un `Vec` en el hilo de audio con cada nota nueva; ahora es un array en el stack. Dos tests escribían el acorde global en paralelo (flake 1 de 4): candado `test_locks::chord()`.
+
+**A→M**
+
+- **Una nota quedaba sonando para siempre** en silencio con el micrófono abierto: el ruido de fondo del H340 quedaba sobre el gate y no tiene altura, así que ni disparaba ni soltaba. Ahora ~100 ms seguidos sin altura clara sueltan la nota (sostener pide una lectura de 0.5, empezar una de 0.85).
+- **El micrófono que escucha a los monitores sostenía la nota**: el synth por los parlantes es la misma nota, limpia y sobre el gate. La nota se suelta 30 dB bajo su propio pico, y una nota nueva pide después un ataque real (+6 dB).
+- Activar A→M o cambiar la tasa alocaba ~10 KB en el callback de audio: el tracker usa arrays fijos.
+- Log: una línea por segundo cuando A→M hace algo, con la regla que soltó cada nota (`quiet / no pitch / faded (speakers?)`) y cualquier nota sostenida más de 4 s.
+
+**Auditoría de los efectos propios** (7 a mano; el resto con un arnés de parámetros, extremos, NaN, ganancia y cola)
+
+- **Looper**: las tomas 2–8 se grababan desde el índice 0 y no desde la posición del loop (sonaban adelantadas); `Clear(0)` dejaba mudas las otras tomas; un `collect` por bloque al grabar. Mute, Solo, Vol y Pausa hacen un fade de ~5 ms.
+- **Space Echo** se autooscilaba casi en todo el recorrido de Feedback (tres cabezas sumando 2.15 y el saturador aportando ganancia): normalizado, ahora pasa de ~0.91. Time se desliza como una cinta (~80 ms, velocidad ±50 %). **Heads**: 1, 2, 3, 1+2, 2+3, 1+3, 1+2+3 y REV (sólo resorte); cabezas equidistantes 1:2:3; **Bass** y **Treble** (±12 dB); el resorte escucha la entrada además de los ecos. `reset()` limpia sin alocar.
+- **Z5 Texture** llegaba a +32 dB con Feedback alto: se normaliza con la superposición media, suavizada. Position no hacía nada (`* 0.0`), Stretch era discontinuo en 0.5 (ahora 0 atrás, 0.25 quieto, 0.5 en vivo, 1 ×3), Drift casi no se oía. **Contour** (forma del grano; 0.5 es la Hann de siempre) y un **LFO** interno (Rate, Depth, Shape, Dest).
+- **Protocosmos**: saltos de ganancia al nacer/morir granos (normalización suavizada), perdía el Wet al cambiar la tasa, `reset()` dejaba la cola. **Repeats** (la realimentación, antes fija en 0.35) y **Filter** (pasabajos resonante sobre el wet).
+- **Sync** (`fx/sync.rs`) en Space Echo y Protocosmos: FREE y 13 divisiones hasta 1 compás, contra el transporte o el reloj libre al mismo tempo.
+- Z5 y Protocosmos: un grano con Pitch arriba nacido junto al cabezal lo pasaba y leía audio de hace 4 s (click). Ninguno aloca ya al cambiar la tasa.
+- **Filter Bank** sumaba hasta +75 dB (16 campanas en cascada): ahora +24 dB con un knob al máximo.
+- **Delay** y **Granular Delay**: el Feedback en vivo no tenía el tope de 0.95 y las repeticiones no se apagaban nunca.
+- **Multi-tap**: Time se desliza; Feedback devuelve el valor fijado. **Auto Pan**: Spread funciona (0 es el paneo de siempre) y un slew de 2 ms saca los clicks de Square y S&H. **Auto Filter**: cambiar de Mode hace un crossfade de 10 ms. **Beat Repeat**: con Grain ≥ Interval nunca repetía. **Shimmer**: pisaba el Size guardado.
+- **Rangos de `params()` distintos de `set_param`** en Compressor, Limiter, Gate, Shimmer, Chorus y Plate: el `.clap` exportado arrancaba con otros valores. Un test recorre ahora cada knob de cada efecto.
+- **Un NaN envenenaba 17 efectos para siempre**: `fx_chain::run_chain` limpia el audio antes de cada efecto.
+- **Reverb** sumaba el wet sobre el seco: Wet es ahora un crossfade como en todos (al 100 % sólo la sala). **Plate** aplicaba `decay` tres veces por medio tanque: la cola con Decay 0.5 pasa de ~1.2 s a ~1.8 s.
+- Knobs nuevos al final de cada lista, con valores por defecto que reproducen el sonido anterior. **Cambian de sonido** en proyectos guardados: Reverb, Plate, el resorte y las cabezas de Space Echo, Filter Bank, Stretch de Z5 y el Feedback del Delay.
 
 ## [1.3.17] — 2026-09-23
 

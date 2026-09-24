@@ -826,7 +826,8 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         pd!("Delay", 0.36),
         pd!("Env", 0.50),
         pd!("Width", 1.00),
-        pd!("Wet", 0.50),
+        // At 1 only the voices come out, each as loud as the input.
+        pd!("Wet", 1.00),
         // Follow a keyboard instead of the shape and key: a switch, and the
         // channel it listens on. The channel's list of names is built where the
         // other named shapes are — a `static` cannot hold one.
@@ -857,6 +858,27 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
             default: 0.0,
             shape: ParamShape::Toggle,
         },
+        // The register the voices sing in: AUTO follows the tune. Picked on
+        // a piano from the OCT button; a knob as well, like every setting.
+        pd!("Octave", 0.00),
+        // The chord the CHORD shape sings: the arranger's chord dialogue, a
+        // knob a row, starting on a major seventh (6/7 at its last step).
+        pd!("ChFamily", 0.00),
+        pd!("Ch6/7", 1.00),
+        pd!("ChTension", 0.00),
+        pd!("Ch9", 0.00),
+        pd!("Ch11", 0.00),
+        pd!("Ch13", 0.00),
+        pd!("Ch5", 0.00),
+        // Follow the arranger's progression while its ▶ plays.
+        FxParamDesc {
+            name: Cow::Borrowed("ArrSync"),
+            default: 0.0,
+            shape: ParamShape::Toggle,
+        },
+        // How much of the singer comes out with the harmony: 0 is the voices
+        // alone.
+        pd!("Lead", 0.00),
     ];
     /// Bands and carrier are lists of names; the rest are knobs.
     static VOCODER: &[FxParamDesc] = &[
@@ -1127,6 +1149,10 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
             pd!("Freeze", 0.00),
             pd!("Diffuse", 0.40),
             pd!("Wet", 0.60),
+            // 0.35 / 0.9: the feedback it had before it was a knob.
+            pd!("Repeats", 0.389),
+            pd!("Filter", 1.00),
+            pd!("Sync", 0.00),
         ],
         SpaceEcho => &[
             pd!("Time", 0.35),
@@ -1137,6 +1163,11 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
             pd!("Spring", 0.25),
             pd!("Tone", 0.50),
             pd!("Wet", 0.50),
+            // Mode selector, 8 positions: 1+2+3 (the 7th) is what it always was.
+            pd!("Heads", 0.857),
+            pd!("Sync", 0.00),
+            pd!("Bass", 0.50),
+            pd!("Treble", 0.50),
         ],
         ReverseDelay => &[pd!("Time", 0.35), pd!("Feedback", 0.30), pd!("Wet", 0.60)],
         // Stompboxes: knob names as they read on the pedal.
@@ -1169,6 +1200,11 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
             pd!("Blur", 0.20),
             pd!("BufLen", 1.00),
             pd!("Wet", 0.60),
+            pd!("Contour", 0.50),
+            pd!("LfoRate", 0.35),
+            pd!("LfoDepth", 0.00),
+            pd!("LfoShape", 0.00),
+            pd!("LfoDest", 0.00),
         ],
     }
 }
@@ -1242,6 +1278,10 @@ pub struct HarmChartView {
     pub click: bool,
     /// Why the chart did not read, when it did not.
     pub error: Option<String>,
+    /// Switched to follow the arranger (the `ArrSync` knob).
+    pub arr_sync: bool,
+    /// …and an arranger is playing, so what is shown is its progression.
+    pub following: bool,
 }
 
 impl AudioFxEntry {
@@ -1619,6 +1659,31 @@ impl AudioFxEntry {
                             // through them one arrow press at a time is what a
                             // picker is for.
                             "Ch" => named(d, (1..=16).map(|c| c.to_string()).collect()),
+                            // The chord rows, with the arranger dialogue's own
+                            // names for their values.
+                            "ChFamily" | "Ch6/7" | "ChTension" | "Ch9" | "Ch11" | "Ch13"
+                            | "Ch5" => {
+                                use choz_engine::artifacts::arranger::spec as s;
+                                let list: &[&str] = match d.name.as_ref() {
+                                    "ChFamily" => &s::FAMILIES,
+                                    "Ch6/7" => &s::SEVENTHS,
+                                    "ChTension" => &s::TENSIONS,
+                                    "Ch9" => &s::NINTHS,
+                                    "Ch11" => &s::ELEVENTHS,
+                                    "Ch13" => &s::THIRTEENTHS,
+                                    _ => &s::FIFTHS,
+                                };
+                                named(d, list.iter().map(|n| n.to_string()).collect())
+                            }
+                            "Octave" => {
+                                use choz_engine::fx::harmonizer::{octave_label, OCTAVES};
+                                named(
+                                    d,
+                                    std::iter::once(octave_label(None))
+                                        .chain(OCTAVES.map(|o| octave_label(Some(o))))
+                                        .collect(),
+                                )
+                            }
                             _ => {}
                         }
                     }
@@ -1660,6 +1725,46 @@ impl AudioFxEntry {
                     }
                     if let Some(d) = descs.iter_mut().find(|d| d.name == "Grain") {
                         d.shape = named(&GRAINS);
+                    }
+                }
+                // The knobs added to the three creative effects that step
+                // through names: a note value, a head combination, an LFO
+                // shape and where it points.
+                if matches!(
+                    self.kind,
+                    AudioFxKind::Protocosmos | AudioFxKind::SpaceEcho | AudioFxKind::Z5Texture
+                ) {
+                    use choz_engine::fx::z5_texture::LFO_DESTS;
+                    use choz_engine::fx::{lfo::Wave, space_echo::HEAD_MODES, sync::DIVISIONS};
+                    let named = |names: Vec<String>| {
+                        let last = names.len().saturating_sub(1).max(1) as f32;
+                        ParamShape::Named(
+                            names
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, n)| (i as f32 / last, n))
+                                .collect(),
+                        )
+                    };
+                    for d in descs.iter_mut() {
+                        match d.name.as_ref() {
+                            "Sync" => {
+                                d.shape =
+                                    named(DIVISIONS.iter().map(|(_, n)| n.to_string()).collect())
+                            }
+                            "Heads" => {
+                                d.shape =
+                                    named(HEAD_MODES.iter().map(|(n, _)| n.to_string()).collect())
+                            }
+                            "LfoShape" => {
+                                d.shape =
+                                    named(Wave::ALL.iter().map(|w| w.label().to_string()).collect())
+                            }
+                            "LfoDest" => {
+                                d.shape = named(LFO_DESTS.iter().map(|n| n.to_string()).collect())
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 if self.kind == AudioFxKind::Compressor {

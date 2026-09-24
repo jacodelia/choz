@@ -191,11 +191,17 @@ impl super::FxProcessor for Chorus {
     fn params(&self) -> Vec<crate::fx::FxParam> {
         use crate::fx::FxParam;
         vec![
-            FxParam::new("Rate", (self.rate / 5.0).clamp(0.0, 1.0), 0.0, 5.0, "Hz"),
+            FxParam::new(
+                "Rate",
+                ((self.rate - 0.05) / 4.95).clamp(0.0, 1.0),
+                0.05,
+                5.0,
+                "Hz",
+            ),
             FxParam::new(
                 "Depth",
-                (self.depth / 10.0).clamp(0.0, 1.0),
-                0.0,
+                ((self.depth - 0.5) / 9.5).clamp(0.0, 1.0),
+                0.5,
                 10.0,
                 "ms",
             ),

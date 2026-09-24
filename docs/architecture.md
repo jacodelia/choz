@@ -663,6 +663,28 @@ smoothing it here would put choz a beat behind whatever it is playing with. The
 is a switch on purpose — a port that sends clock all day would otherwise take
 the tempo over the moment it is plugged in.
 
+### choz as a device of the system (`virtual_devices.rs`)
+
+Under the native JACK client choz adds two PipeWire null sinks through the
+PulseAudio layer (`pactl`, two commands at start and two at exit — linking
+libpulse for that was not worth it), because that layer is where meeting apps
+look for microphones. `choz Mic` is a source (`media.class=Audio/Source/Virtual`)
+that `jack_backend::wire_mic` feeds from `out_1/out_2` after every rewire;
+`choz System FX` is a speaker whose `monitor_*` ports are the one monitor
+`all_capture_ports` lists. **PipeWire's JACK layer names a node by its
+description**, not its node name — `choz Mic:input_FL`, not `choz_mic:input_FL`
+— and wiring against the node name connected nothing, silently; both names are
+kept (`MIC`/`MIC_JACK`) and `is_ours` knows all four. Neither is a place for
+choz's output: they are left out of the OUT list and a saved output naming one
+is dropped. A pair left by a crashed choz is reused, and only what this run
+made is unloaded. `CHOZ_NO_VIRTUAL_DEVICES=1` skips all of it.
+
+`pair_ports` folds only the **main pair** onto a sink with fewer inputs (a mono
+device); the direct outs past it are never folded — folded, `out_3`…`out_10`
+were summed into a stereo device's right channel — and whatever of them an
+older version left on the device being abandoned is taken off it, but not what
+somebody patched elsewhere by hand.
+
 ### Audio in, notes out (`A→M`)
 
 A tab fed by a capture pair normally passes that audio through its FX. With `A→M`
@@ -803,6 +825,10 @@ everything else in the rack:
 - output bounded: an effect that can run away takes the mix bus with it, so a
   feedback loop is bounded **structurally** (a saturator) and not by a constant
   someone measured once;
+- **tempo from the transport, not a clock of its own**: `fx::sync` turns a
+  `Sync` knob (FREE and thirteen divisions up to a bar) into a period read off
+  the transport while it rolls and off the free clock at the same tempo while
+  it is stopped;
 - **`params()` publishes every knob the rack draws, in the same order, and
   `set_param` reaches every one of them.** The exported `.clap`'s parameter
   list *is* `params()`, so a knob missing there is a knob a DAW cannot move,
@@ -815,6 +841,13 @@ everything else in the rack:
   exempt from the second — the rack sends it as `FX_MIX_PARAM` — and so is a
   `Preset`, which `AudioFxEntry::apply_preset` resolves into the knobs below it.
 
+The chain itself is `fx_chain::run_chain`: it cleans the buffer before every
+effect, so a NaN or an infinity from a source, a plugin or an effect that ran
+away stops at the next door instead of living in a filter's state for ever —
+seventeen of the built-ins stayed silent-or-NaN after one bad sample. Every
+knob's published range is checked against the one `set_param` applies: six
+effects disagreed, and the exported `.clap` opened with other values.
+
 The test pattern each one follows: silence, an impulse, a sine, noise, mono and
 stereo, both ends of every parameter, a sample-rate change, tiny and huge
 blocks, automation, and NaN/Inf — plus whatever that effect specifically claims
@@ -823,12 +856,19 @@ delay time measured off an impulse, decay for a reverb).
 
 ### Pitch, and the two shifters
 
-There are two pitch shifters and that is deliberate.
+There are three pitch shifters and that is deliberate.
 `autotune::shifter::RetuneShifter` cuts its jumps on a **detected period**,
 which is what makes a corrector clean on a voice at ratios near 1 — it needs a
 detector behind it. `fx::shift::VoiceShifter` takes any ratio and needs
 nothing, paying for it with a light warble; it is what the shimmer's feedback
-loop and the harmoniser's voices share. Two shifters for two jobs, one
+loop uses. `fx::psola::Psola` is the harmoniser's: it cuts grains of two
+periods **centred on each pulse of the voice** (the detector already gives the
+period) and lays them down at the new period without stretching them, so the
+formants — the vowels — stay put and a voice an octave away is not the singer
+in a tube, which stretching did to it. Unvoiced input is laid down unshifted: a
+sibilant is not a note. Grains on a time grid instead of on the pulses doubled
+the pulses and jumped the level ±6 dB; on the pulses the level holds within
+±3 dB from −24 to +24 semitones. Three shifters for three jobs, one
 implementation of each.
 
 `VoiceShifter` reads with two heads half a window apart and crossfades them so
@@ -845,10 +885,23 @@ new note only once it has read the same for `STEADY_MS` and forgets it after
 `FORGET_MS` of silence. Each voice is that note plus the `Shape`'s interval in
 semitones, snapped onto the scale — or onto the chord it follows — towards the
 sung note on a tie, never onto a note another voice already has, and glided
-there over `GLIDE_MS`. The chord comes from one of two process-wide doors:
+there over `GLIDE_MS`. **With a chord to follow the voices are led, not
+recomputed**: each remembers its last note and takes the chord tone that
+minimises `2·|move| + |distance from its ideal interval|`, within a fifth of
+that interval — common tones held, steps preferred, a choir rather than a block
+moving in parallel. On the scale alone parallel motion *is* the harmony asked
+for, so it stays. `Shape::Chord` sings a species built with the arranger's own
+chord dialogue (`arranger::spec::ChordSpec`, moved into the engine for this);
+the parser allocates, so every species is tabled once on the thread that builds
+the effect and the audio thread only reads. `Octave` folds each voice into one
+octave, keeping its note, but never more than ±24 semitones from the singer.
+`Lead` is how much of the input rides along with the voices — 0 by default, so
+a fully wet harmoniser through `choz Mic` is the choir alone; the whole is then
+put back at the input's level (`balance`). The chord comes from one of two process-wide doors:
 `chord::chord()`, the keyboard (`MIDI`), or `chord::chart()`, a `.chord` the
 interface plays with an `Arranger` of its own against the transport (`Chart`;
-the chart wins). The detector's octave guard corrects a reading an octave from
+the chart wins) — or, with `ArrSync`, the chord of whichever tab's arranger is
+playing, which the interface publishes on the same chart door. The detector's octave guard corrects a reading an octave from
 the last for at most `OCTAVE_PATIENCE` analyses: storing its own correction as
 the last reading once held a whole note an octave low. `harmonizer::stats()`
 is what the log line reads — atomics the audio thread writes, taken and reset
@@ -859,8 +912,18 @@ costs comes out of the same budget as the instrument and the whole FX chain —
 and a callback that misses its deadline glitches the **graph**, not just choz.
 It is band-limited at both ends before it measures (60 Hz high-pass under the
 lowest note, 3.5 kHz low-pass before decimating), and its inner loop reads two
-plain slices rather than walking a ring. There is an `#[ignore]`d test that
-measures what one block costs; run it when the detector is touched.
+plain slices rather than walking a ring, and its buffers are fixed arrays: turning
+it on, or a rate change, allocated ~10 KB in the callback. There is an
+`#[ignore]`d test that measures what one block costs; run it when the detector
+is touched.
+
+A note ends on any of three rules, and the log line (once a second while `A→M`
+does anything) says which: **quiet** (under the gate), **no pitch** (~100 ms
+without a clear period — the H340's idle hiss sits over the gate and held a
+note for ever), and **faded** (30 dB under the note's own peak — a microphone
+hearing the synth through the monitors is the same note, clean and over the
+gate, and sustained itself). After a fade a new note needs a real attack
+(+6 dB), or the speakers would start the loop again.
 
 ### Measurement
 

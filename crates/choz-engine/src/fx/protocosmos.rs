@@ -29,34 +29,11 @@ use super::FxProcessor;
 
 const MAX_BUF_S: f32 = 4.0;
 const MAX_GRAINS: usize = 12;
-
-/// `1/√n`, for `n` grains sounding at once.
-///
-/// The grains read the buffer at offsets a spray apart, so they are
-/// uncorrelated: their **powers** add, not their amplitudes, and the sum of
-/// `n` of them is `√n` louder than one. Without this the effect's level was
-/// the density knob — measured at its defaults, 9.1 dB over the signal that
-/// went in, which is a cloud that clips on its own and takes anything stacked
-/// after it with it. Dividing by the root keeps the loudness of the cloud
-/// where the sound of it is, which is what `Density` should be moving.
-const INV_SQRT: [f32; MAX_GRAINS + 1] = {
-    let mut t = [1.0f32; MAX_GRAINS + 1];
-    // A const fn `sqrt` does not exist, so the roots are written out.
-    t[0] = 1.0;
-    t[1] = 1.0;
-    t[2] = std::f32::consts::FRAC_1_SQRT_2;
-    t[3] = 0.577_350_3;
-    t[4] = 0.5;
-    t[5] = 0.447_213_6;
-    t[6] = 0.408_248_3;
-    t[7] = 0.377_964_5;
-    t[8] = 0.353_553_4;
-    t[9] = 0.333_333_34;
-    t[10] = 0.316_227_77;
-    t[11] = 0.301_511_35;
-    t[12] = 0.288_675_14;
-    t
-};
+/// Repeats knob at rest: the 0.35 of feedback the effect always had.
+pub const REPEATS_DEFAULT: f32 = 0.35 / REPEATS_MAX;
+/// Ceiling of the feedback. The cloud is normalised before it goes back, so
+/// this is a loop gain under one: long sustain, never a runaway.
+const REPEATS_MAX: f32 = 0.9;
 
 struct Grain {
     pos: f64,   // fractional read index into the buffer
@@ -129,6 +106,19 @@ pub struct Protocosmos {
     freeze: f32,  // >0.5 = hold buffer
     diffuse: f32, // reverb/diffusion amount
     wet: f32,
+    /// How much of the cloud goes back into the buffer — the Microcosm's
+    /// Repeats. It was a fixed 0.35; the knob's default is that value.
+    repeats: f32,
+    /// Resonant low-pass on the wet, 0..1 (1 = open, and bypassed exactly).
+    filter: f32,
+    /// Its state, a channel each: Simper's SVF, `[ic1, ic2]`.
+    lp: [[f32; 2]; 2],
+    /// Index into [`super::sync::DIVISIONS`]: 0 spawns by Density, anything
+    /// else spawns one grain a note value, on the grid.
+    sync: usize,
+    /// The grid step the last frame was in; `None` until one is seen, so
+    /// switching sync on does not fire mid-step.
+    grid_step: Option<i64>,
 
     buf_l: Vec<f32>,
     buf_r: Vec<f32>,
@@ -136,6 +126,8 @@ pub struct Protocosmos {
     grains: [Grain; MAX_GRAINS],
     spawn_timer: f64,
     rng: u64,
+    /// Loudness of the cloud against how many grains overlap in it, smoothed.
+    cloud_norm: f32,
 
     aps: Vec<Allpass>,
     combs: Vec<Comb>,
@@ -182,6 +174,12 @@ impl Protocosmos {
             grains: [DEAD; MAX_GRAINS],
             spawn_timer: 0.0,
             rng: 0x1234_5678_9ABC_DEF0,
+            repeats: REPEATS_DEFAULT,
+            filter: 1.0,
+            lp: [[0.0; 2]; 2],
+            sync: 0,
+            grid_step: None,
+            cloud_norm: 1.0,
             aps: vec![
                 Allpass::new(s(441), 0.7),
                 Allpass::new(s(341), 0.7),
@@ -208,8 +206,7 @@ impl Protocosmos {
         let sr = self.sample_rate as f32;
         // Position: scatter back from the write head by up to `spray` * 0.5 s.
         let spray_samps = self.spray * 0.5 * sr;
-        let offset = (self.rand() as f64) * spray_samps as f64 + 1.0;
-        let pos = (self.write as f64 - offset).rem_euclid(len as f64);
+        let mut offset = (self.rand() as f64) * spray_samps as f64 + 1.0;
         // Pitch: ±12 semitones; reverse with probability `reverse`.
         let st = (self.pitch - 0.5) * 24.0;
         let mut speed = 2.0_f64.powf(st as f64 / 12.0);
@@ -219,6 +216,13 @@ impl Protocosmos {
         // Grain length 20..200 ms scaled by `size`.
         let grain_ms = 20.0 + self.size * 180.0;
         let life = ((grain_ms / 1000.0) * sr).max(2.0) as u32;
+        // A grain faster than the tape gains on the write head: started too
+        // close it overtakes it and reads four seconds ago — a click. Far
+        // enough back to finish its life still behind.
+        if self.freeze <= 0.5 && speed > 1.0 {
+            offset = offset.max((speed - 1.0) * life as f64 + 2.0);
+        }
+        let pos = (self.write as f64 - offset).rem_euclid(len as f64);
         self.grains[idx] = Grain {
             pos,
             speed,
@@ -233,45 +237,74 @@ impl Protocosmos {
 impl FxProcessor for Protocosmos {
     fn process_block(&mut self, buf: &mut [f32], sample_rate: u32) {
         if sample_rate != self.sample_rate {
-            *self = Protocosmos::new(
-                sample_rate,
-                self.size,
-                self.density,
-                self.pitch,
-                self.spray,
-                self.reverse,
-                self.freeze,
-                self.diffuse,
-            );
+            // ponytail: no rebuild — that allocated the buffer and the reverb on
+            // the audio thread, and dropped the Wet back to 0.6. The buffer keeps
+            // its length in samples (a shorter reach in seconds at a higher rate)
+            // and the diffusion its lengths (tuned a little off). Size for
+            // `MAX_RATE`, as Space Echo does, if either is heard.
+            self.sample_rate = sample_rate.max(8000);
+            self.reset();
         }
         let len = self.buf_l.len();
         let sr = self.sample_rate as f32;
         let frozen = self.freeze > 0.5;
         let density = 1.0 + self.density * 79.0; // 1..80 grains/sec
         let inter_spawn = (sr / density) as f64;
-        let fb = 0.35; // texture-sustain feedback (fixed, bounded)
+        // Synced: one grain per note value, on the session's grid.
+        let grid = super::sync::quarters(self.sync).map(|q| {
+            let per_frame = (choz_ports::transport().bpm() / 60.0 / sr) as f64;
+            (super::sync::position(), per_frame, q as f64)
+        });
+        if grid.is_none() {
+            self.grid_step = None;
+        }
+        let fb = self.repeats * REPEATS_MAX;
+        // Filter: 20 kHz down to 150 Hz, exponential, with a little resonance
+        // (Q ≈ 1.4). At the top of the knob it is skipped outright, so a
+        // project from before it existed sounds exactly as it did.
+        let filtering = self.filter < 0.999;
+        let cutoff = (150.0 * (20_000.0f32 / 150.0).powf(self.filter)).min(sr * 0.45);
+        let g = (std::f32::consts::PI * cutoff / sr).tan();
+        let k = 0.7;
+        let a1 = 1.0 / (1.0 + g * (g + k));
+        let (a2, a3) = (g * a1, g * g * a1);
+        // The grains read the buffer a spray apart, so they are uncorrelated:
+        // their powers add, and `n` of them are `√n` louder than one. Divided
+        // by the *expected* overlap — density × grain length — and smoothed.
+        // It used to be the count of the moment, which stepped the gain of the
+        // whole cloud every time one grain started or ended.
+        let overlap_n =
+            (density * (20.0 + self.size * 180.0) / 1000.0).clamp(1.0, MAX_GRAINS as f32);
+        let norm_target = overlap_n.sqrt().recip();
         let frames = buf.len() / 2;
 
         for i in 0..frames {
             let dry_l = buf[i * 2];
             let dry_r = buf[i * 2 + 1];
 
-            // Spawn grains on schedule.
-            if self.spawn_timer <= 0.0 {
-                self.spawn();
-                self.spawn_timer += inter_spawn;
+            // Spawn grains on schedule: on the grid when synced, by Density
+            // otherwise.
+            if let Some((q0, per_frame, div)) = grid {
+                let step = ((q0 + i as f64 * per_frame) / div).floor() as i64;
+                if self.grid_step.is_some_and(|last| last != step) {
+                    self.spawn();
+                }
+                self.grid_step = Some(step);
+            } else {
+                if self.spawn_timer <= 0.0 {
+                    self.spawn();
+                    self.spawn_timer += inter_spawn;
+                }
+                self.spawn_timer -= 1.0;
             }
-            self.spawn_timer -= 1.0;
 
             // Sum active grains (Hann-windowed, fractional read).
             let mut gl = 0.0f32;
             let mut gr = 0.0f32;
-            let mut sounding = 0usize;
             for g in self.grains.iter_mut() {
                 if !g.active {
                     continue;
                 }
-                sounding += 1;
                 let p0 = g.pos as usize % len;
                 let p1 = (p0 + 1) % len;
                 let frac = g.pos.fract() as f32;
@@ -290,12 +323,11 @@ impl FxProcessor for Protocosmos {
                 }
             }
 
-            // Loudness of the cloud against how many grains happen to be in
-            // it — see [`INV_SQRT`]. Applied before the feedback path reads it,
-            // so density cannot drive the loop either.
-            let norm = INV_SQRT[sounding.min(MAX_GRAINS)];
-            gl *= norm;
-            gr *= norm;
+            // Before the feedback path reads it, so density cannot drive the
+            // loop either.
+            self.cloud_norm += (norm_target - self.cloud_norm) * 0.001;
+            gl *= self.cloud_norm;
+            gr *= self.cloud_norm;
 
             // Write input (+ grain feedback) into the buffer, unless frozen.
             if !frozen {
@@ -315,8 +347,18 @@ impl FxProcessor for Protocosmos {
             }
             tail *= 0.5 * self.diffuse;
 
-            let wet_l = gl + tail;
-            let wet_r = gr + tail;
+            let mut wet = [gl + tail, gr + tail];
+            if filtering {
+                for (x, st) in wet.iter_mut().zip(self.lp.iter_mut()) {
+                    let v3 = *x - st[1];
+                    let v1 = a1 * st[0] + a2 * v3;
+                    let v2 = st[1] + a2 * st[0] + a3 * v3;
+                    st[0] = 2.0 * v1 - st[0];
+                    st[1] = 2.0 * v2 - st[1];
+                    *x = v2;
+                }
+            }
+            let [wet_l, wet_r] = wet;
             buf[i * 2] = dry_l + self.wet * (wet_l - dry_l);
             buf[i * 2 + 1] = dry_r + self.wet * (wet_r - dry_r);
         }
@@ -328,6 +370,15 @@ impl FxProcessor for Protocosmos {
         self.write = 0;
         self.grains.iter_mut().for_each(|g| g.active = false);
         self.spawn_timer = 0.0;
+        self.lp = [[0.0; 2]; 2];
+        // The reverb's tail too — a reset that leaves it ringing is not one.
+        for ap in self.aps.iter_mut() {
+            ap.buf.fill(0.0);
+        }
+        for cb in self.combs.iter_mut() {
+            cb.buf.fill(0.0);
+            cb.z = 0.0;
+        }
     }
 
     fn set_mix(&mut self, wet: f32) {
@@ -348,6 +399,9 @@ impl FxProcessor for Protocosmos {
             P::new("Freeze", self.freeze, 0.0, 1.0, ""),
             P::new("Diffuse", self.diffuse, 0.0, 1.0, ""),
             P::new("Wet", self.wet, 0.0, 1.0, ""),
+            P::new("Repeats", self.repeats, 0.0, 1.0, ""),
+            P::new("Filter", self.filter, 0.0, 1.0, ""),
+            P::new("Sync", super::sync::norm_of(self.sync), 0.0, 1.0, ""),
         ]
     }
 
@@ -364,6 +418,9 @@ impl FxProcessor for Protocosmos {
             5 => self.freeze = v,
             6 => self.diffuse = v,
             7 => self.wet = v,
+            8 => self.repeats = v,
+            9 => self.filter = v,
+            10 => self.sync = super::sync::index_of(v),
             _ => {}
         }
     }
@@ -382,6 +439,122 @@ mod tests {
             assert!(block.iter().all(|s| s.is_finite()));
             assert!(block.iter().all(|s| s.abs() < 8.0));
         }
+    }
+
+    /// A reset is silence, reverb included; a new device rate keeps the Wet
+    /// and the buffers where they were.
+    #[test]
+    fn reset_is_silent_and_a_rate_change_keeps_the_mix() {
+        let mut fx = Protocosmos::new(48000, 0.5, 0.6, 0.5, 0.4, 0.0, 0.0, 1.0);
+        fx.set_mix(0.2);
+        let mut b: Vec<f32> = (0..8192).map(|i| 0.5 * (i as f32 * 0.05).sin()).collect();
+        fx.process_block(&mut b, 48000);
+        fx.reset();
+        let mut s = vec![0.0f32; 4096];
+        fx.process_block(&mut s, 48000);
+        assert!(s.iter().all(|x| *x == 0.0), "the tail survived the reset");
+
+        let ptr = fx.buf_l.as_ptr() as usize;
+        fx.process_block(&mut s, 44100);
+        assert_eq!(fx.wet, 0.2);
+        assert_eq!(
+            ptr,
+            fx.buf_l.as_ptr() as usize,
+            "rebuilt on the audio thread"
+        );
+    }
+
+    /// The cloud's gain moves smoothly: no step when a grain comes or goes.
+    #[test]
+    fn the_cloud_gain_does_not_step() {
+        let mut fx = Protocosmos::new(48000, 0.3, 0.5, 0.5, 0.5, 0.0, 0.0, 0.0);
+        fx.set_mix(1.0);
+        let mut b = vec![0.0f32; 8192];
+        for _ in 0..20 {
+            b.iter_mut().for_each(|x| *x = 0.3);
+            fx.process_block(&mut b, 48000);
+        }
+        let before = fx.cloud_norm;
+        fx.process_block(&mut b, 48000);
+        assert!((fx.cloud_norm - before).abs() < 1e-3);
+    }
+
+    /// Repeats is the feedback: at zero the cloud dies with its input, turned
+    /// up it keeps going. The knob's default is the fixed 0.35 it replaced.
+    #[test]
+    fn repeats_sustain_the_cloud() {
+        let tail = |repeats: f32| {
+            let mut fx = Protocosmos::new(48000, 0.5, 0.8, 0.5, 0.2, 0.0, 0.0, 0.0);
+            fx.set_param(8, repeats);
+            fx.set_mix(1.0);
+            let mut b: Vec<f32> = (0..48_000).map(|i| 0.5 * (i as f32 * 0.05).sin()).collect();
+            fx.process_block(&mut b, 48000);
+            let mut s = vec![0.0f32; 96_000];
+            fx.process_block(&mut s, 48000);
+            s[48_000..].iter().map(|x| x * x).sum::<f32>()
+        };
+        assert!(
+            tail(1.0) > tail(0.0) * 10.0,
+            "{} vs {}",
+            tail(1.0),
+            tail(0.0)
+        );
+        assert!((REPEATS_DEFAULT * REPEATS_MAX - 0.35).abs() < 1e-6);
+    }
+
+    /// Filter closes the top of the cloud; open, it is not there at all.
+    #[test]
+    fn the_filter_darkens_and_open_is_a_bypass() {
+        let run = |filter: f32| {
+            let mut fx = Protocosmos::new(48000, 0.5, 0.8, 0.5, 0.2, 0.0, 0.0, 0.0);
+            fx.set_param(9, filter);
+            fx.set_mix(1.0);
+            let mut b: Vec<f32> = (0..48_000).map(|i| 0.3 * (i as f32 * 0.6).sin()).collect();
+            fx.process_block(&mut b, 48000);
+            b
+        };
+        let energy = |b: &[f32]| b[24_000..].iter().map(|x| x * x).sum::<f32>();
+        assert!(
+            energy(&run(0.2)) < energy(&run(1.0)) * 0.1,
+            "a 4.6 kHz tone through a closed filter"
+        );
+        let mut plain = Protocosmos::new(48000, 0.5, 0.8, 0.5, 0.2, 0.0, 0.0, 0.0);
+        plain.set_mix(1.0);
+        let mut b: Vec<f32> = (0..48_000).map(|i| 0.3 * (i as f32 * 0.6).sin()).collect();
+        plain.process_block(&mut b, 48000);
+        assert_eq!(b, run(1.0), "open is exactly the effect without it");
+    }
+
+    /// Synced, grains start on the grid and nowhere else: one per 1/8 at
+    /// 120 bpm is one every 250 ms.
+    #[test]
+    fn synced_grains_start_on_the_grid() {
+        let _g = crate::test_locks::transport();
+        let t = choz_ports::transport();
+        let (old_bpm, old_play) = (t.bpm(), t.playing());
+        t.set_bpm(120.0);
+        t.set_playing(false);
+        t.set_free_samples(0);
+        let mut fx = Protocosmos::new(48000, 0.5, 1.0, 0.5, 0.0, 0.0, 0.0, 0.0);
+        let eighth = super::super::sync::DIVISIONS
+            .iter()
+            .position(|(_, n)| *n == "1/8")
+            .unwrap();
+        fx.set_param(10, super::super::sync::norm_of(eighth));
+        let mut starts = 0;
+        // The free clock only moves when the engine renders; step it by hand.
+        for _ in 0..(48_000 / 256) {
+            let mut b = vec![0.1f32; 512];
+            fx.process_block(&mut b, 48000);
+            t.advance_free(256);
+            // Started inside this block of 256 frames.
+            starts += fx.grains.iter().filter(|g| g.active && g.age < 256).count();
+        }
+        t.set_bpm(old_bpm);
+        t.set_playing(old_play);
+        // Density is at its top (80 a second) and would start ~80; the grid
+        // starts three (the first step is skipped) or four in one second.
+        assert!((2..=5).contains(&starts), "{starts} grains in a second");
     }
 
     #[test]

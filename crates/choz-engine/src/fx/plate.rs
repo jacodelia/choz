@@ -203,7 +203,7 @@ impl FxProcessor for PlateReverb {
     fn params(&self) -> Vec<FxParam> {
         vec![
             FxParam::new("PreDelay", self.pre_ms / 200.0, 0.0, 200.0, "ms"),
-            FxParam::new("Decay", self.decay, 0.0, 1.0, ""),
+            FxParam::new("Decay", self.decay / 0.98, 0.0, 0.98, ""),
             FxParam::new("Damping", self.damp, 0.0, 1.0, ""),
             FxParam::new("Tone", self.bandwidth, 0.0, 1.0, ""),
             FxParam::new("Wet", self.wet, 0.0, 1.0, ""),
@@ -258,7 +258,11 @@ impl FxProcessor for PlateReverb {
             b = self.tank_ap[3].tick(b * self.decay);
             let out_b = self.tank_delay[3].tick(b, self.damp);
 
-            self.cross = [out_a * self.decay, out_b * self.decay];
+            // Stored as it came out: the decay is applied where it goes back
+            // in. It was applied here **and** there **and** mid-loop — decay³
+            // a half, not Dattorro's decay² — so the tails ran far shorter
+            // than the knob said (Decay 0.5 rang ~1.2 s instead of ~3.6).
+            self.cross = [out_a, out_b];
 
             // The taps, which is where the two channels come from.
             let read = |i: usize, at: f32, delays: &[Damped; 4]| -> f32 {
@@ -305,6 +309,24 @@ mod tests {
     /// A click in has to come back as a tail that lasts, is dense from the
     /// start (no gap where a room's early reflections would be), and is not the
     /// same in both channels — a mono plate is a plate nobody would use.
+    /// Decay 0.5 is Dattorro's decay² a half — about 1.8 s to −60 dB — and
+    /// not the decay³ (~1.2 s) of when it was applied three times a half.
+    #[test]
+    fn half_decay_rings_for_seconds() {
+        let mut p = PlateReverb::with_params(48_000, &[0.0, 0.5 / 0.98, 0.3, 1.0, 1.0]);
+        let mut buf = vec![0.0f32; 48_000 * 2];
+        buf[0] = 1.0;
+        buf[1] = 1.0;
+        p.process_block(&mut buf, 48_000);
+        let peak = |b: &[f32]| b.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let early = peak(&buf[..9_600]);
+        let mut late = vec![0.0f32; 48_000 * 2];
+        p.process_block(&mut late, 48_000);
+        // Still above −60 dB between 1.3 and 1.6 s.
+        let window = &late[28_800..57_600];
+        assert!(peak(window) > early * 1e-3, "{} vs {early}", peak(window));
+    }
+
     #[test]
     fn a_click_becomes_a_dense_stereo_tail() {
         let sr = 48_000u32;

@@ -58,10 +58,12 @@ pub mod pedal;
 pub mod pitch_shift;
 pub mod plate;
 pub mod protocosmos;
+pub mod psola;
 pub mod reverse;
 pub mod shift;
 pub mod shimmer;
 pub mod space_echo;
+pub mod sync;
 pub mod vibrato;
 pub mod z5_texture;
 

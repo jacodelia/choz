@@ -26,9 +26,13 @@ pub struct Tremolo {
     rate_hz: f32,
     /// How far the LFO moves it, 0..1.
     depth: Smoothed,
-    /// How far the right channel runs behind the left, in cycles.
+    /// How far the right channel runs behind the left, in cycles. For the
+    /// auto-pan it is counted **from opposition** (see `phase_offset`).
     spread: f32,
     lfo: Lfo,
+    /// The LFO after a 2 ms slew: Square and S&H step, and a step in gain is
+    /// a click. Too short to round off anything a sine can do at 20 Hz.
+    slewed: [f32; 2],
     mix: f32,
     sample_rate: f32,
 }
@@ -41,13 +45,9 @@ impl Tremolo {
             wave: Wave::Sine,
             rate_hz: 4.0,
             depth: Smoothed::new(0.5, 20.0, sr),
-            // An auto-pan with both channels in phase is a tremolo, so that is
-            // what it starts as: the two channels in opposition.
-            spread: match target {
-                ModTarget::Tremolo => 0.0,
-                ModTarget::AutoPan => 0.5,
-            },
+            spread: 0.0,
             lfo: Lfo::new(),
+            slewed: [0.0; 2],
             mix: 1.0,
             sample_rate: sr,
         }
@@ -60,14 +60,7 @@ impl Tremolo {
         t.set_rate(get(0, 0.35));
         t.set_depth(get(1, 0.5));
         t.wave = Wave::from_norm(get(2, 0.0));
-        t.spread = get(
-            3,
-            match target {
-                ModTarget::Tremolo => 0.0,
-                ModTarget::AutoPan => 0.5,
-            },
-        )
-        .clamp(0.0, 1.0);
+        t.spread = get(3, 0.0).clamp(0.0, 1.0);
         t
     }
 
@@ -95,11 +88,23 @@ impl super::FxProcessor for Tremolo {
         }
         let wave = self.wave;
         let rate = self.rate_hz;
-        let spread = self.spread;
+        // The rack shares the tremolo's knobs and starts both at Spread 0, and
+        // every saved auto-pan has 0 there. An auto-pan with its channels in
+        // phase is a tremolo, so for it 0 means **in opposition** — the plain
+        // sweep — and turning Spread up moves the right side off it.
+        let spread = match self.target {
+            ModTarget::Tremolo => self.spread,
+            ModTarget::AutoPan => (self.spread + 0.5).fract(),
+        };
         let mix = self.mix;
+        let slew = 1.0 - (-1.0 / (0.002 * sr)).exp();
 
         for frame in buf.as_chunks_mut::<2>().0 {
-            let m = self.lfo.tick(wave, rate, sr, spread);
+            let raw = self.lfo.tick(wave, rate, sr, spread);
+            for (m, r) in self.slewed.iter_mut().zip(raw) {
+                *m += (r - *m) * slew;
+            }
+            let m = self.slewed;
             let depth = self.depth.tick();
             let (dry_l, dry_r) = (frame[0], frame[1]);
 
@@ -112,14 +117,17 @@ impl super::FxProcessor for Tremolo {
                     1.0 - depth * 0.5 * (1.0 - m[1]),
                 ),
                 // Constant power, so a sweep across the image does not dip in
-                // the middle the way a linear pan does.
+                // the middle the way a linear pan does. Each channel reads its
+                // own phase of the LFO: at the default Spread (half a cycle)
+                // that is the plain balance sweep, and Spread 0 moves both
+                // together — the tremolo the header promises. It used to read
+                // only the left phase, so Spread did nothing.
                 ModTarget::AutoPan => {
-                    let p = (m[0] * depth).clamp(-1.0, 1.0);
-                    let angle = (p + 1.0) * std::f32::consts::FRAC_PI_4;
-                    (
-                        angle.cos() * std::f32::consts::SQRT_2,
-                        angle.sin() * std::f32::consts::SQRT_2,
-                    )
+                    let gain = |m: f32| {
+                        let p = (m * depth).clamp(-1.0, 1.0);
+                        ((p + 1.0) * std::f32::consts::FRAC_PI_4).cos() * std::f32::consts::SQRT_2
+                    };
+                    (gain(m[0]), gain(m[1]))
                 }
             };
 
@@ -130,6 +138,7 @@ impl super::FxProcessor for Tremolo {
 
     fn reset(&mut self) {
         self.lfo.reset();
+        self.slewed = [0.0; 2];
         self.depth.snap(self.depth.target());
     }
 
@@ -246,6 +255,41 @@ mod tests {
 
     /// Constant power: whatever the position, the two channels together carry
     /// the same energy. A pan that dips in the middle is a tremolo by accident.
+    /// Spread reaches the auto-pan. At 0 — where the rack starts it and
+    /// every saved one sits — it is the plain opposite sweep; at 0.5 both
+    /// channels move together. It read only the left phase, so the knob did
+    /// nothing.
+    #[test]
+    fn spread_reaches_the_auto_pan() {
+        let run = |spread: f32| {
+            let mut t = Tremolo::with_params(ModTarget::AutoPan, 48000, &[1.0, 1.0, 0.0, spread]);
+            envelope(&mut t, 4800, 48000)
+        };
+        let (l, r) = run(0.5);
+        assert!(l.iter().zip(&r).all(|(a, b)| (a - b).abs() < 1e-5));
+        let (l, r) = run(0.0);
+        let apart = l
+            .iter()
+            .zip(&r)
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(apart > 1.0, "Spread 0 is the opposite sweep: {apart}");
+    }
+
+    /// A square wave switches over a couple of milliseconds, not in one
+    /// sample — a step in gain is a click.
+    #[test]
+    fn a_square_does_not_click() {
+        for target in [ModTarget::Tremolo, ModTarget::AutoPan] {
+            let mut t = Tremolo::new(target, 48000);
+            t.set_param(0, 0.6);
+            t.set_param(1, 1.0);
+            t.set_param(2, Wave::Square.to_norm());
+            let (l, _) = envelope(&mut t, 48000, 48000);
+            let worst = l.windows(2).fold(0.0f32, |m, w| m.max((w[1] - w[0]).abs()));
+            assert!(worst < 0.1, "{target:?}: a step of {worst} in one sample");
+        }
+    }
+
     #[test]
     fn the_auto_pan_keeps_its_power_constant() {
         let mut t = Tremolo::new(ModTarget::AutoPan, 48000);

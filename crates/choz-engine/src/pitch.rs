@@ -46,6 +46,82 @@
 //! *and* has held for [`STEADY_ANALYSES`] readings. Vibrato inside a semitone
 //! is one note held, which is what a keyboard would have sent.
 
+/// Why a note ended — counted, so a log can say which rule let go of it (or
+/// that none did, and for how long).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Release {
+    /// Under the gate.
+    Quiet,
+    /// Over the gate, but no pitch in it: room noise.
+    Unvoiced,
+    /// Still pitched, but far under where the note peaked: what reaches the
+    /// microphone from the speakers, or a room's tail.
+    Faded,
+}
+
+/// What every `A→M` tracker has done since the last reading. One set for the
+/// process, like the harmoniser's: the log line is about the feature.
+pub struct PitchStats {
+    ons: std::sync::atomic::AtomicU32,
+    quiet: std::sync::atomic::AtomicU32,
+    unvoiced: std::sync::atomic::AtomicU32,
+    faded: std::sync::atomic::AtomicU32,
+    changed: std::sync::atomic::AtomicU32,
+    /// Longest a note was held before it ended, in analyses.
+    longest: std::sync::atomic::AtomicU32,
+    /// The note sounding now and how long it has been, in analyses; `u32::MAX`
+    /// for none.
+    sounding: std::sync::atomic::AtomicU32,
+    sounding_for: std::sync::atomic::AtomicU32,
+}
+
+/// One reading of [`PitchStats`], taken and reset (the counts; what is
+/// sounding now is not a count and stays).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PitchReading {
+    pub ons: u32,
+    pub quiet: u32,
+    pub unvoiced: u32,
+    pub faded: u32,
+    pub changed: u32,
+    pub longest_ms: f32,
+    pub sounding: Option<u8>,
+    pub sounding_ms: f32,
+}
+
+static STATS: PitchStats = PitchStats {
+    ons: std::sync::atomic::AtomicU32::new(0),
+    quiet: std::sync::atomic::AtomicU32::new(0),
+    unvoiced: std::sync::atomic::AtomicU32::new(0),
+    faded: std::sync::atomic::AtomicU32::new(0),
+    changed: std::sync::atomic::AtomicU32::new(0),
+    longest: std::sync::atomic::AtomicU32::new(0),
+    sounding: std::sync::atomic::AtomicU32::new(u32::MAX),
+    sounding_for: std::sync::atomic::AtomicU32::new(0),
+};
+
+pub fn stats() -> &'static PitchStats {
+    &STATS
+}
+
+impl PitchStats {
+    pub fn take(&self) -> PitchReading {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ms = |a: u32| a as f32 * HOP as f32 / WORK_RATE * 1000.0;
+        let sounding = self.sounding.load(Relaxed);
+        PitchReading {
+            ons: self.ons.swap(0, Relaxed),
+            quiet: self.quiet.swap(0, Relaxed),
+            unvoiced: self.unvoiced.swap(0, Relaxed),
+            faded: self.faded.swap(0, Relaxed),
+            changed: self.changed.swap(0, Relaxed),
+            longest_ms: ms(self.longest.swap(0, Relaxed)),
+            sounding: (sounding != u32::MAX).then_some(sounding as u8),
+            sounding_ms: ms(self.sounding_for.load(Relaxed)),
+        }
+    }
+}
+
 /// What the tracker decided about one block.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PitchEvent {
@@ -129,16 +205,20 @@ pub struct PitchTracker {
     /// end of the same idea.
     rumble: [crate::fx::utility::Biquad; 2],
     /// Ring of recent decimated samples: the window the detector works on.
-    window: Vec<f32>,
+    ///
+    /// Arrays, not `Vec`s, here and below: the tracker is built when `A→M` is
+    /// switched on and dropped when it is switched off, and both happen in the
+    /// audio callback, where the three `Vec`s were an allocation and a free.
+    window: [f32; WINDOW],
     write: usize,
     filled: bool,
     /// New samples since the last analysis; one lands every `HOP`.
     since: usize,
     /// Scratch for the difference function, sized once.
-    diff: Vec<f32>,
+    diff: [f32; WINDOW / 2],
     /// The ring, straightened out. Copying 1024 floats once an analysis buys a
     /// difference-function loop with no wrap in it — see `yin`.
-    linear: Vec<f32>,
+    linear: [f32; WINDOW],
     /// The note currently sounding, if any.
     sounding: Option<u8>,
     /// How far the heard pitch is from the note being played, in cents. Never
@@ -152,6 +232,14 @@ pub struct PitchTracker {
     held_for: u32,
     /// Analyses the signal has been under the gate; a few in a row end the note.
     quiet: u32,
+    /// Analyses in a row with no clear pitch in them, while a note sounds.
+    unvoiced: u32,
+    /// The loudest the note now sounding has been, window RMS.
+    note_peak: f32,
+    /// Analyses in a row it has been under `RELEASE_BELOW_PEAK` of that.
+    faded: u32,
+    /// Set when a note faded out: a new one must start over this level.
+    rearm_above: Option<f32>,
     /// How loud the last analysed window was, for velocity.
     level: f32,
     /// Below this RMS there is no note. Adjustable: a single-coil through an
@@ -190,6 +278,36 @@ const MIN_VELOCITY_RANGE_DB: f32 = 24.0;
 const ONSET_CLARITY: f32 = 0.85;
 const CHANGE_CLARITY: f32 = 0.90;
 
+/// How clear a reading has to be to count as *the note still sounding*. Lower
+/// than starting one: a decaying string gets noisier and is still the note.
+const HOLD_CLARITY: f32 = 0.5;
+
+/// Analyses in a row without a pitch that end the note: 12 × 8 ms ≈ 100 ms.
+///
+/// The gate alone cannot do it. A microphone left open after the note sits at
+/// its own noise floor, and a headset at full gain puts that at ~−51 dBFS —
+/// over a −61 gate, so the note it had been playing never ended. Noise has no
+/// period; a held note does. Long enough to ride out a pick scraping, short
+/// enough that a note stopped is a note stopped.
+const RELEASE_UNVOICED: u32 = 12;
+
+/// How far under its own peak a note may fall and still be the note: −30 dB.
+///
+/// The case it is for: the synth `A→M` drives comes out of speakers, and the
+/// microphone hears it. That is a clean pitch, over the gate, and it is the
+/// note being played — so neither rule above ends it, and the note holds
+/// itself up for ever. What gives it away is level: a voice into a headset
+/// microphone is tens of dB over what reaches it from a speaker across the
+/// room. A sung note does not swing 30 dB inside itself; a string that has
+/// decayed that far has nothing left a synth should still be sustaining.
+const RELEASE_BELOW_PEAK: f32 = 0.031_6;
+
+/// After a note has faded out, how much louder than where it ended the next
+/// one has to start: +6 dB. Without it the speakers' own tail, still pitched
+/// and still over the gate, reads as a fresh note and the loop starts again.
+/// Real silence (under the gate) clears it.
+const REARM_ABOVE: f32 = 2.0;
+
 /// Default gate, -61 dBFS.
 ///
 /// Lower than it looks it should be, on purpose: the level this is compared
@@ -217,17 +335,21 @@ impl PitchTracker {
                 sr as f32 / decim as f32,
                 0.707,
             ); 2],
-            window: vec![0.0; WINDOW],
+            window: [0.0; WINDOW],
             write: 0,
             filled: false,
             since: 0,
-            diff: vec![0.0; WINDOW / 2],
-            linear: vec![0.0; WINDOW],
+            diff: [0.0; WINDOW / 2],
+            linear: [0.0; WINDOW],
             sounding: None,
             cents: 0,
             candidate: None,
             held_for: 0,
             quiet: 0,
+            unvoiced: 0,
+            note_peak: 0.0,
+            faded: 0,
+            rearm_above: None,
             level: 0.0,
             gate: DEFAULT_GATE,
         }
@@ -246,6 +368,14 @@ impl PitchTracker {
     /// Stop whatever is sounding, e.g. when the feature is switched off.
     pub fn release(&mut self) -> Option<PitchEvent> {
         self.candidate = None;
+        self.unvoiced = 0;
+        self.faded = 0;
+        self.rearm_above = None;
+        if self.sounding.is_some() {
+            STATS
+                .sounding
+                .store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+        }
         self.held_for = 0;
         self.cents = 0;
         self.sounding.take().map(|note| PitchEvent::Off { note })
@@ -315,28 +445,83 @@ impl PitchTracker {
 
     /// One look at the window. Everything expensive lives here, and it runs
     /// once a hop rather than once a block.
+    /// End the note sounding, if there is one, and say why.
+    fn end(&mut self, why: Release) -> ([Option<PitchEvent>; 2], usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(note) = self.sounding.take() else {
+            return ([None, None], 0);
+        };
+        let counter = match why {
+            Release::Quiet => &STATS.quiet,
+            Release::Unvoiced => &STATS.unvoiced,
+            Release::Faded => &STATS.faded,
+        };
+        counter.fetch_add(1, Relaxed);
+        STATS.longest.fetch_max(self.held_for, Relaxed);
+        STATS.sounding.store(u32::MAX, Relaxed);
+        self.cents = 0;
+        self.held_for = 0;
+        self.candidate = None;
+        self.faded = 0;
+        ([Some(PitchEvent::Off { note }), None], 1)
+    }
+
     fn analyse(&mut self) -> ([Option<PitchEvent>; 2], usize) {
         const NONE: [Option<PitchEvent>; 2] = [None, None];
         let rms = rms_of(&self.window);
         self.level = rms.min(1.0);
         if rms < self.gate {
             self.quiet += 1;
+            // Real silence: whatever faded out is over, and the next note is a
+            // note from nothing.
+            self.rearm_above = None;
             // Two quiet analyses, not one: a plucked string dips through zero
             // every period, and cutting the note there would stutter it.
             self.candidate = None;
-            if self.quiet >= 2 {
-                if let Some(note) = self.sounding.take() {
-                    self.cents = 0;
-                    self.held_for = 0;
-                    return ([Some(PitchEvent::Off { note }), None], 1);
-                }
+            if self.quiet >= 2 && self.sounding.is_some() {
+                return self.end(Release::Quiet);
             }
             return (NONE, 0);
         }
         self.quiet = 0;
         self.held_for = self.held_for.saturating_add(1);
+        if self.sounding.is_some() {
+            STATS
+                .sounding_for
+                .store(self.held_for, std::sync::atomic::Ordering::Relaxed);
+            self.note_peak = self.note_peak.max(rms);
+            // Far under its own peak: what is left is the speakers or the room.
+            match rms < self.note_peak * RELEASE_BELOW_PEAK {
+                true => self.faded += 1,
+                false => self.faded = 0,
+            }
+            if self.faded >= 2 {
+                self.rearm_above = Some(rms * REARM_ABOVE);
+                return self.end(Release::Faded);
+            }
+        } else if let Some(floor) = self.rearm_above {
+            // After a fade, only an attack starts a note: something louder
+            // than the tail that was let go of.
+            if rms < floor {
+                self.candidate = None;
+                return (NONE, 0);
+            }
+            self.rearm_above = None;
+        }
 
-        let Some((freq, clarity)) = self.detect() else {
+        let reading = self.detect();
+        // Over the gate is not the same as a note. With nothing periodic in
+        // the window for long enough, whatever is sounding stops.
+        match reading.is_some_and(|(_, clarity)| clarity >= HOLD_CLARITY) {
+            true => self.unvoiced = 0,
+            false => {
+                self.unvoiced = self.unvoiced.saturating_add(1);
+                if self.unvoiced >= RELEASE_UNVOICED && self.sounding.is_some() {
+                    return self.end(Release::Unvoiced);
+                }
+            }
+        }
+        let Some((freq, clarity)) = reading else {
             return (NONE, 0);
         };
         // While the window still holds the previous note, the dip is shallow —
@@ -413,7 +598,19 @@ impl PitchTracker {
         self.cents = ((exact - note as f32) * 100.0).round() as i32;
         // The off goes first: the other order lets the old note's release cut
         // the new one short.
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            STATS.ons.fetch_add(1, Relaxed);
+            if self.sounding.is_some() {
+                STATS.changed.fetch_add(1, Relaxed);
+                STATS.longest.fetch_max(self.held_for, Relaxed);
+            }
+            STATS.sounding.store(note as u32, Relaxed);
+            STATS.sounding_for.store(0, Relaxed);
+        }
         self.held_for = 0;
+        self.note_peak = rms;
+        self.faded = 0;
         let off = self
             .sounding
             .replace(note)
@@ -940,6 +1137,15 @@ mod tests {
         assert_eq!(t.sounding(), None);
     }
 
+    /// Switching `A→M` on builds a tracker and switching it off drops one, both
+    /// in the audio callback — so it owns no heap memory to ask for or free.
+    #[test]
+    fn a_tracker_owns_no_heap() {
+        // The window, the straightened copy and the scratch live inside the
+        // struct: as `Vec`s it was 3 pointers, well under a single window.
+        assert!(std::mem::size_of::<PitchTracker>() >= (WINDOW * 2 + WINDOW / 2) * 4);
+    }
+
     #[test]
     fn a_note_and_a_frequency_are_the_same_thing() {
         assert_eq!(freq_to_note(440.0), 69, "A4");
@@ -1037,6 +1243,96 @@ mod tests {
         }
         assert_eq!(off, Some(PitchEvent::Off { note: 55 }));
         assert_eq!(t.sounding(), None);
+    }
+
+    /// A microphone left open after the note: room noise **above the gate**
+    /// but with no pitch in it. The note has to stop anyway. It used to wait
+    /// for the level to fall under the gate, and a mic whose floor sits over
+    /// it — a headset at full gain is ~−51 dBFS against a −61 gate — held the
+    /// note for ever.
+    #[test]
+    fn a_note_ends_when_its_pitch_does_even_over_the_gate() {
+        let sr = 48_000;
+        let mut t = PitchTracker::new(sr);
+        let mut tone = Tone::new();
+        for _ in 0..60 {
+            t.process(&tone.block(196.0, sr, 256, 0.5), sr);
+        }
+        assert_eq!(t.sounding(), Some(55));
+
+        // White noise at an RMS of ~0.004 (−48 dBFS): well over the gate.
+        let mut seed = 0x1234_5678u32;
+        let mut off = None;
+        let mut waited_ms = 0.0f32;
+        for _ in 0..200 {
+            let block: Vec<f32> = (0..256)
+                .flat_map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let v = ((seed >> 8) as f32 / (1 << 24) as f32 * 2.0 - 1.0) * 0.007;
+                    [v, v]
+                })
+                .collect();
+            let (events, n) = t.process(&block, sr);
+            waited_ms += 256.0 / 48.0;
+            if n > 0 {
+                off = events[0];
+                break;
+            }
+        }
+        assert_eq!(
+            off,
+            Some(PitchEvent::Off { note: 55 }),
+            "still sounding after {waited_ms} ms"
+        );
+        assert!(waited_ms < 300.0, "it took {waited_ms} ms");
+        assert_eq!(t.sounding(), None);
+    }
+
+    /// The speakers feed the microphone the synth's own note: clean, pitched,
+    /// over the gate. Neither the gate nor the pitch rule can end it, and it
+    /// held itself up for ever — "notes that stay stuck". It ends because it
+    /// is far under what was sung, and the bleed does not start it again; a
+    /// real attack does.
+    #[test]
+    fn the_speakers_in_the_microphone_do_not_hold_the_note() {
+        let sr = 48_000;
+        let mut t = PitchTracker::new(sr);
+        let mut tone = Tone::new();
+        let events = |t: &mut PitchTracker, tone: &mut Tone, amp: f32, blocks: usize| {
+            drain(t, tone, 196.0, sr, blocks, amp)
+        };
+        let sung = events(&mut t, &mut tone, 0.3, 60);
+        assert_eq!(
+            sung,
+            vec![PitchEvent::On {
+                note: 55,
+                velocity: sung_velocity(&sung)
+            }]
+        );
+
+        // The singer stops; what is left is the speakers, 35 dB down, same
+        // pitch, for two seconds.
+        let bleed = events(&mut t, &mut tone, 0.3 * 0.0178, 375);
+        assert_eq!(
+            bleed,
+            vec![PitchEvent::Off { note: 55 }],
+            "ends once, restarts never"
+        );
+        assert_eq!(t.sounding(), None);
+
+        // And singing again is a note again.
+        let again = events(&mut t, &mut tone, 0.3, 60);
+        assert!(
+            matches!(again.as_slice(), [PitchEvent::On { note: 55, .. }]),
+            "a real attack starts it: {again:?}"
+        );
+    }
+
+    fn sung_velocity(events: &[PitchEvent]) -> u8 {
+        match events.first() {
+            Some(PitchEvent::On { velocity, .. }) => *velocity,
+            _ => 0,
+        }
     }
 
     /// A new pitch replaces the old one, and the off comes first — the other

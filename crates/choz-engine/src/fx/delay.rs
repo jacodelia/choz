@@ -209,9 +209,9 @@ impl FxProcessor for DelayLine {
         vec![
             FxParam::new(
                 "Time",
-                (self.delay_ms / 2000.0).clamp(0.0, 1.0),
-                0.0,
-                2000.0,
+                ((self.delay_ms - 10.0) / 990.0).clamp(0.0, 1.0),
+                10.0,
+                1000.0,
                 "ms",
             ),
             FxParam::new("Feedback", self.feedback / 0.95, 0.0, 0.95, ""),
@@ -234,7 +234,9 @@ impl FxProcessor for DelayLine {
         let v = value.clamp(0.0, 1.0);
         match index {
             0 => self.set_delay_ms(10.0 + v * 990.0),
-            1 => self.feedback = v,
+            // The same 0..0.95 the builder and `params` use. Raw, the knob's top
+            // was a feedback of 1.0: repeats that never die.
+            1 => self.set_feedback(v * 0.95),
             2 => self.damp = v,
             3 => self.ping_pong = v >= 0.5,
             4 => self.wet = v,
@@ -252,6 +254,20 @@ mod tests {
 
     /// Slamming the time end to end must not step the read head: the head
     /// walks there, which is a glide and not a click.
+    /// Every knob reads back what it was set to, and Feedback's top is the
+    /// 0.95 ceiling, live as well as built.
+    #[test]
+    fn the_knobs_read_back_and_feedback_stops_short_of_one() {
+        use crate::fx::FxProcessor;
+        let mut dl = DelayLine::new(200.0, 0.5, 0.2);
+        for (i, v) in [(0usize, 0.3f32), (1, 0.7)] {
+            dl.set_param(i, v);
+            assert!((dl.params()[i].value - v).abs() < 1e-4, "knob {i}");
+        }
+        dl.set_param(1, 1.0);
+        assert!(dl.feedback <= 0.95);
+    }
+
     #[test]
     fn moving_the_time_does_not_click() {
         let sr = 48_000u32;

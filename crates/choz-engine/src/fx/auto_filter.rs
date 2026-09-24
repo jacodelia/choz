@@ -83,23 +83,30 @@ impl SvfChannel {
         self.a3 = g * self.a2;
     }
 
+    /// One sample in, and the output as two modes read it: the one playing and
+    /// the one fading out. Same state, so asking for both costs nothing.
     #[inline]
-    fn process(&mut self, x: f32, mode: FilterMode) -> f32 {
+    fn process(&mut self, x: f32, modes: [FilterMode; 2]) -> [f32; 2] {
         let v3 = x - self.ic2;
         let v1 = self.a1 * self.ic1 + self.a2 * v3;
         let v2 = self.ic2 + self.a2 * self.ic1 + self.a3 * v3;
         self.ic1 = 2.0 * v1 - self.ic1;
         self.ic2 = 2.0 * v2 - self.ic2;
-        match mode {
+        modes.map(|mode| match mode {
             FilterMode::Lowpass => v2,
             FilterMode::Bandpass => v1,
             FilterMode::Highpass => x - self.k * v1 - v2,
-        }
+        })
     }
 }
 
 pub struct AutoFilter {
     mode: FilterMode,
+    /// The mode being faded out, and how much of it is left (1 → 0). LP, BP and
+    /// HP are three taps of one filter, so a switch is a crossfade between two
+    /// of its outputs rather than a jump from one to the other — a click.
+    fading: FilterMode,
+    fade: f32,
     /// Where the cutoff sits with nothing modulating it, in Hz.
     base_hz: f32,
     resonance: f32,
@@ -126,6 +133,8 @@ impl AutoFilter {
         let sr = sample_rate.max(8000) as f32;
         let mut f = Self {
             mode: FilterMode::Lowpass,
+            fading: FilterMode::Lowpass,
+            fade: 0.0,
             base_hz: 800.0,
             resonance: 0.4,
             wave: Wave::Sine,
@@ -204,8 +213,10 @@ impl super::FxProcessor for AutoFilter {
             self.env.set_sample_rate(sr);
             self.countdown = 0;
         }
-        let (mode, wave, rate, spread) = (self.mode, self.wave, self.rate_hz, self.spread);
+        let (wave, rate, spread) = (self.wave, self.rate_hz, self.spread);
+        let modes = [self.mode, self.fading];
         let mix = self.mix;
+        let fade_step = 1.0 / (0.01 * sr); // 10 ms
 
         for frame in buf.as_chunks_mut::<2>().0 {
             let (dry_l, dry_r) = (frame[0], frame[1]);
@@ -231,8 +242,11 @@ impl super::FxProcessor for AutoFilter {
             }
             self.countdown -= 1;
 
-            let mut wl = self.left.process(dry_l, mode);
-            let mut wr = self.right.process(dry_r, mode);
+            let [nl, ol] = self.left.process(dry_l, modes);
+            let [nr, or] = self.right.process(dry_r, modes);
+            let mut wl = nl + (ol - nl) * self.fade;
+            let mut wr = nr + (or - nr) * self.fade;
+            self.fade = (self.fade - fade_step).max(0.0);
             // A resonant filter handed a non-finite sample stays non-finite
             // for ever: clear it and pass the dry signal rather than poison
             // the bus.
@@ -296,7 +310,14 @@ impl super::FxProcessor for AutoFilter {
         match index {
             0 => self.set_freq(v),
             1 => self.resonance = v * 0.98,
-            2 => self.mode = FilterMode::from_norm(v),
+            2 => {
+                let next = FilterMode::from_norm(v);
+                if next != self.mode {
+                    self.fading = self.mode;
+                    self.fade = 1.0;
+                    self.mode = next;
+                }
+            }
             3 => self.set_rate(v),
             4 => self.depth_oct = v * 4.0,
             5 => self.wave = Wave::from_norm(v),
@@ -320,6 +341,26 @@ mod tests {
                 [s, s]
             })
             .collect()
+    }
+
+    /// LP to HP mid-note fades over 10 ms: no one-sample jump in the output.
+    #[test]
+    fn switching_mode_does_not_click() {
+        let mut f = AutoFilter::new(48000);
+        f.set_param(4, 0.0); // no LFO: only the switch moves anything
+        let mut b = tone(100.0, 48000, 4800);
+        f.process_block(&mut b, 48000);
+        let last = b[b.len() - 2];
+        f.set_param(2, 1.0);
+        let mut b = tone(100.0, 48000, 4800);
+        f.process_block(&mut b, 48000);
+        let mut prev = last;
+        let worst = b.iter().step_by(2).fold(0.0f32, |m, x| {
+            let d = (x - prev).abs();
+            prev = *x;
+            m.max(d)
+        });
+        assert!(worst < 0.05, "a step of {worst}");
     }
 
     fn rms(buf: &[f32]) -> f32 {

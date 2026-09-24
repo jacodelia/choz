@@ -111,7 +111,9 @@ impl ShimmerReverb {
     pub fn with_params(sample_rate: u32, p: &[f32]) -> Self {
         let get = |i: usize, d: f32| p.get(i).copied().unwrap_or(d);
         let mut s = Self::new(sample_rate);
-        s.reverb.set_room_size(0.55);
+        // The saved Size, not a constant: this line used to set 0.55 whatever
+        // the project said, so the knob came back somewhere else on reload.
+        s.reverb.set_room_size(get(0, 0.55));
         s.set_predelay(get(1, 0.25));
         s.set_shift(get(2, 1.0));
         s.set_feedback(get(3, 0.5));
@@ -194,10 +196,16 @@ impl FxProcessor for ShimmerReverb {
             // sample, whatever block the caller brought: handing the reverb a
             // chunk and feeding back one value for all of it made the result
             // depend on the block size, which is the definition of a bug.
+            let sent = self.scratch;
             self.reverb.process_block(&mut self.scratch, sample_rate);
 
             for (ch, dry_ch) in dry.iter().enumerate() {
-                let wet = self.scratch[ch];
+                // What went in, plus the room. The inner reverb used to add its
+                // input back itself (its Wet was a send level); it crossfades
+                // now, like every effect, and the shimmer's sound — the
+                // pre-delayed input and the tail both going round the shifter —
+                // is kept by adding it here.
+                let wet = self.scratch[ch] + sent[ch];
                 // Round the loop: shift, then damp, then saturate.
                 let shifted = self.shifter[ch].process(wet);
                 self.damp_state[ch] = shifted + damp_coeff * (self.damp_state[ch] - shifted);
@@ -259,7 +267,7 @@ impl FxProcessor for ShimmerReverb {
                 24.0,
                 "st",
             ),
-            FxParam::new("Feedback", self.feedback / 0.85, 0.0, 1.0, ""),
+            FxParam::new("Feedback", self.feedback / 0.6, 0.0, 1.0, ""),
             FxParam::new("Damping", self.damp, 0.0, 1.0, ""),
             FxParam::new("Width", self.reverb.width() / 2.0, 0.0, 2.0, ""),
             FxParam::new("Wet", self.mix, 0.0, 1.0, ""),
