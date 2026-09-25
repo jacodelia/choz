@@ -96,6 +96,10 @@ pub const SUPPORTED_UI_FEATURES: &[&str] = &[
     "http://lv2plug.in/ns/extensions/ui#idleInterface",
     "http://lv2plug.in/ns/extensions/ui#showInterface",
     "http://lv2plug.in/ns/extensions/ui#noUserResize",
+    // `editor.rs` has passed this one to every UI since it learnt to size the
+    // window from the UI's request; it was only never added here, so a UI that
+    // *requires* it (DrumGizmo's) was turned away before it could ask.
+    "http://lv2plug.in/ns/extensions/ui#resize",
     "http://lv2plug.in/ns/ext/urid#map",
     "http://lv2plug.in/ns/ext/options#options",
 ];
@@ -110,6 +114,21 @@ pub const SUPPORTED_UI_FEATURES: &[&str] = &[
 /// it. An *embedded* UI stays as strict as it was: a Qt editor asking for the
 /// instance is a different bargain, and one nobody has measured here.
 pub const SUPPORTED_OWN_WINDOW_UI_FEATURES: &[&str] = &["http://lv2plug.in/ns/ext/instance-access"];
+
+/// Plugins whose *embedded* X11 UI is offered `instance-access` all the same.
+///
+/// The exception to the rule above, by name, for the same reason the own-window
+/// UIs get it: DrumGizmo's UI lives in the plugin's own `drumgizmo.so`, reads
+/// the engine through the lock-free settings the plugin publishes for exactly
+/// this, and requires the pointer — without it there is no way to pick a kit
+/// or a midimap from choz at all. Ardour and Carla both pass it. choz still
+/// never dereferences it.
+const INSTANCE_ACCESS_UI_PREFIXES: &[&str] = &["http://drumgizmo.org/lv2"];
+
+/// Whether `plugin_uri`'s UI may be handed the live instance.
+fn ui_gets_instance(plugin_uri: &str, owns_window: bool) -> bool {
+    owns_window || INSTANCE_ACCESS_UI_PREFIXES.iter().any(|p| plugin_uri.starts_with(p))
+}
 
 /// Plugin families whose X11 UI segfaults the host on `instantiate`.
 ///
@@ -360,7 +379,8 @@ fn resolve_ui(
 
     for uri in required_features_of(graph, &ui_uri) {
         let ok = SUPPORTED_UI_FEATURES.contains(&uri.as_str())
-            || (owns_window && SUPPORTED_OWN_WINDOW_UI_FEATURES.contains(&uri.as_str()));
+            || (ui_gets_instance(plugin_uri, owns_window)
+                && SUPPORTED_OWN_WINDOW_UI_FEATURES.contains(&uri.as_str()));
         if !ok {
             debug!("LV2: UI {ui_uri} needs unsupported feature {uri}; no editor");
             return None;
@@ -571,6 +591,51 @@ mod tests {
         let ui = find_ui(&graph, "urn:choz:test:amp").expect("the editor is declared");
         assert_eq!(ui.binary_path, so);
         assert!(!ui.owns_window, "an X11 UI goes in choz's own window");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// DrumGizmo's embedded X11 UI requires `ui:resize` and `instance-access`
+    /// (this is its manifest, trimmed). It used to be refused for both, and
+    /// `g` answered "this plugin has no window" — while any other embedded UI
+    /// asking for the instance is still turned away.
+    #[test]
+    fn drumgizmos_embedded_ui_is_offered() {
+        let dir = std::env::temp_dir().join(format!("choz_lv2_dg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let so = dir.join("drumgizmo.so");
+        std::fs::write(&so, b"not really a library").unwrap();
+        let ttl_path = dir.join("manifest.ttl");
+        let manifest = |plugin: &str| {
+            format!(
+                r#"@prefix lv2: <http://lv2plug.in/ns/lv2core#> .
+@prefix ui:  <http://lv2plug.in/ns/extensions/ui#> .
+
+<{plugin}#ui> a ui:X11UI ;
+    lv2:requiredFeature ui:resize ;
+    lv2:requiredFeature ui:idleInterface ;
+    lv2:requiredFeature <http://lv2plug.in/ns/ext/instance-access> ;
+    ui:binary <drumgizmo.so> .
+
+<{plugin}> a lv2:Plugin ;
+    lv2:binary <drumgizmo.so> ;
+    ui:ui <{plugin}#ui> .
+"#
+            )
+        };
+
+        std::fs::write(&ttl_path, manifest("http://drumgizmo.org/lv2")).unwrap();
+        let graph = ttl::Graph::parse_file(&ttl_path).unwrap();
+        let ui = find_ui(&graph, "http://drumgizmo.org/lv2").expect("DrumGizmo has a window");
+        assert!(!ui.owns_window, "it embeds into choz's window");
+
+        std::fs::write(&ttl_path, manifest("urn:choz:test:other")).unwrap();
+        let graph = ttl::Graph::parse_file(&ttl_path).unwrap();
+        assert!(
+            find_ui(&graph, "urn:choz:test:other").is_none(),
+            "instance-access stays refused to other embedded UIs"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
