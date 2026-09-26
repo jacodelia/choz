@@ -8,29 +8,7 @@ Built with Rust, ratatui and cpal. Provides a TUI for managing note inputs, inst
 
 ---
 
-## Status
-
-**1.3.18.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
-LADSPA, DSSI, VST2, VST3 and Pure Data patches are really hosted** — instruments
-and audio effects, with their own parameters and their own windows — choz's own
-56 effects and all four artifacts — the arpeggiator, the step sequencer, the
-metronome and the arranger — are
-published as CLAP plugins for other hosts, and choz installs as a
-`.deb`, an `.rpm` or a script, with an entry in the desktop menu.
-
-choz is a **citizen of the JACK/PipeWire graph**, not only of ALSA:
-`choz:midi_in` and `choz:midi_out` are ports on the client it already had, so a
-DAW on the same graph plays a rack tab, sends it the clock and receives what the
-arpeggiator puts out — no `a2jmidid`, which bridges the other way. On ALSA it
-**publishes a port of its own**, `choz MIDI IN`: a DAW picks it out of its MIDI
-output list and plays a tab with no loopback module and no graph at all. And a tab can
-**leave the master mix through a port of its own**: one direct out per tab, at a
-fixed place and as wide as the tab is, which is what a DAW records track by
-track. A mono jack stays one channel all the way through — one fader on the
-mixer, one port on the graph — until something in its chain has a reason to pull
-the two sides apart.
-
-### Plugin formats
+## Plugin formats
 
 | Format | Scan | Instrument | Effect | Native window |
 |---|---|---|---|---|
@@ -44,75 +22,7 @@ the two sides apart.
 | **SFZ**    | ✅ | ✅ | — | — |
 | **SF2**    | ✅ | ✅ (oxisynth) | — | — |
 
-Plus **56 built-in DSP effects** — including a real-time pitch corrector, a pitch shifter, a Dattorro plate reverb, a Moog ladder filter and a three-band compressor on a Linkwitz-Riley crossover — and WAV playback as a rack source.
-
-Plugin windows embed into a real X11 window on choz's editor thread — no suil,
-no Steinberg SDK. Verified by counting the parent window's actual X11 children,
-not by trusting return values: **20 of 20 CLAP** and **20 of 21 VST3** plugins
-installed here open at the size they ask for (Surge XT included), and **254 of
-259 LV2 editors** in a full sweep with no crashes (the other 5 do not
-instantiate at all — sequencers with no audio output).
-
-Whatever a plugin's window can do, choz can do without opening it: every
-parameter is a knob in the RACK, and MIDI learn binds to those knobs directly.
-What is drawn comes from the plugin, including the two things it is easy to get
-wrong: a parameter it says cannot be automated is **not** a knob (Surge XT
-publishes 191 `MIDI CC` rows that do nothing), and a parameter whose whole range
-only ever reads as two words is a **switch**, not a fader, even when the plugin
-reports no steps at all — which Surge does for all 800 of its parameters.
-
-A parameter whose positions have **names** opens its list rather than counting.
-LV2, CLAP, VST3 and VST2 report them; LADSPA and DSSI cannot — the ABI has no
-call that says how a value reads — so choz reads them where every other host
-does, from the `.rdf` installed beside the plugin. That is `tap_reverb`'s 43
-reverb types, caps' 25 cabinets and nine tonestacks, as names instead of
-numbers.
-
-A synth with more parameters than the box can show (Surge XT has hundreds) gets
-`◀` `▶` on the box's top edge, and **the CCs already learned move with the
-box**: the fader on the first knob of one page is on the first knob of the next,
-so eight faders reach every parameter the plugin has instead of eight of them
-for good. That happens however the box moved — the arrows, `PgUp` / `PgDn`, a
-CC bound to either (they are learn targets like every other button), the cursor
-walking off the edge, a resize. A plugin whose patches are **files** rather than
-programs has them found by name: the bank button opens straight onto the
-categories its own window shows — `Basses`, `Leads`, `Pads` for Surge XT's 637
-`.fxp`, `01 Basses`, `02 Leads` for TyrellN6's 669 `.h2p` (u-he's text patches
-*are* the plugin's state, so they load like any other) — and any other folder is
-one pick away, saved with the project. A plugin that publishes 128 slots called
-`Program 0` is treated as publishing nothing, because it is.
-Parameters moved *inside* the plugin's window are followed too (VST3
-`IComponentHandler`, VST2 `audioMasterAutomate`, CLAP output events, the LV2 UI
-write callback), so "move that knob, then move a fader" is a complete binding.
-
-Projects save what a parameter list cannot: the plugin's **own state** — the
-patch picked in its browser — through VST2 chunks, VST3 `IComponent::getState`,
-`clap.state` and LV2 `state#interface`. And what no parameter can hold at all:
-the looper's **takes**, written as WAVs into `<project>.loops/` beside the file,
-so moving a project is moving the `.yml` and its directory. A take recorded at
-another sample rate is resampled to the device's on load, keeping its pitch and
-its length in seconds. The project stays a YAML you can read, diff and commit;
-the audio lives next to it.
-
-Playing rather than patching: a **MIXER** tab at the bottom shows every rack tab
-at once as channel strips — **one vertical fader per output channel** with a
-link between them (tied by default, broken to trim one side against the other),
-pan, and an `O M S` row under the fader — where the tab sums, mute, solo — each
-editable where it is drawn instead of one tab at a time, moved by the wheel or
-the arrows in the same step the RACK's `VOL` uses, and paging with `◀ ▶` when
-the rack is wider than the panel. **The arrows walk the whole desk**: past the
-last tab come the four groups and the main, so a machine that is played rather
-than pointed at can reach every fader; a **metronome** beside the LIVE/MULTI switch clicks off the same
-transport every synced plugin reads (tempo, time signature, three sounds), and
-it keeps counting with the transport stopped, which is when a metronome is
-wanted; every tab carries a **step sequencer built like an Alesis MMT-8** —
-eight tracks, sixteen steps, eight parts and a song chain, drawn above the
-instrument because that is the order the notes travel in, with `REC` writing what
-you play quantised to the step the playhead is on, and every step handed to the
-tab's arpeggiator when it has one running; and the arpeggiator's **HOLD** works
-the way a Keystep's does — let go
-and the chord keeps playing, and the next key pressed with nothing down starts a
-new one rather than piling onto the old.
+More on what choz does: [`docs/overview.md`](docs/overview.md).
 
 ---
 
@@ -175,97 +85,13 @@ cargo build --release
 
 Every plugin host is compiled in — there are no feature flags to remember.
 
-### What it needs at runtime
-
-Different from what it needs to *build*. The binary links two things and opens a
-third by hand:
-
-| Library | Needed? | If missing |
-|---|---|---|
-| `libc` | yes | nothing runs |
-| `libasound.so.2` (ALSA) | yes | choz starts but opens no audio device |
-| `libjack.so.0` | **optional** — `dlopen`ed at runtime; normally PipeWire's (`pipewire-jack`), jack2's works the same | choz uses ALSA; no JACK/PipeWire routing, no per-channel outputs |
-| `libpd` (Pure Data) | **optional** — linked only by `choz-pd-host`, from `libpd-dev` (not `puredata-dev`) | choz installs and runs; Pure Data patches cannot be hosted |
-| X11 | not linked | plugin windows go through `x11rb`, which speaks the protocol itself |
-
-That is why the `.deb` declares only `libasound2t64` and `libc6`: JACK is a
-runtime choice, not a build-time dependency. **The packages refuse to install
-without ALSA**, and that is read off the built packages rather than intended:
-`dpkg-deb -f` shows `Depends: libasound2t64 (>= 1.0.29), libc6 (>= 2.43)`, and
-the `.rpm` requires `libasound.so.2()(64bit)` down to its `ALSA_0.9` symbol
-versions, so `apt` and `rpm -i` both stop. JACK is a `Recommends` in both:
-`pipewire-jack` first on Debian/Ubuntu (jack2's library still satisfies it), and
-the `libjack.so.0` soname on Fedora, which PipeWire's JACK provides. On Arch it
-is an `optdepends` on `pipewire-jack`.
-
-`install.sh` checks all three before it copies anything. **A missing ALSA stops
-the install** — a choz that starts and then opens no device looks like a bug in
-choz, not a missing package — and it prints the command for your distribution. A
-missing JACK is only a note; a missing libpd is a note **and** it decides what
-gets built: without it choz installs without the Pure Data half rather than
-failing over it. `--skip-deps-check` installs anyway, which is right when you are
-staging an install for a machine that is not this one.
-
 ### Install
 
-**From a release** — no toolchain needed. Every tag publishes a `.tar.gz` per
-architecture (x86-64, aarch64, armv7), a `.deb`, an `.rpm` and a `PKGBUILD` for
-Arch, plus `SHA256SUMS.txt`:
-
 ```bash
-tar xzf choz-1.3.6-x86_64-unknown-linux-gnu.tar.gz
-cd choz-1.3.6-x86_64-unknown-linux-gnu
-./install.sh            # uses the binary shipped beside it — no cargo involved
+./packaging/install.sh
 ```
 
-The tarball carries the binary, the launcher, the desktop entry, every icon size,
-the MIME type, the wallpapers, choz's own effects and artifacts as a CLAP plugin
-and the Pure
-Data host — the same set the `.deb` installs. On ARM, remember that **plugins are
-native binaries**: a Raspberry Pi loads plugins built for ARM, not the x86 ones.
-
-**What an install puts down besides choz itself:**
-
-| What | Where | Why |
-|---|---|---|
-| `choz.clap` | `~/.clap` (script) or `/usr/lib/clap` (packages) | choz's own 56 effects plus the arpeggiator and step sequencer as note effects, usable from Bitwig, Reaper, Carla or any CLAP host. Every effect publishes its full knob list, so all of them are automatable and saveable from the host. `--no-clap` skips it. |
-| `choz-rack.clap` | the same places | **choz itself**, as a CLAP instrument: the whole rack on a track in the DAW, with its own window and **sixteen stereo outputs** — put a tab on pair 4 in the rack and it arrives on the host's fourth output, on its own track, the way a sampler's individual outs do. The track's own audio arrives as `host:in_1`/`in_2`, so a tab can process it and the rack is an effect chain too. The rack is saved with the host's session. It takes the host's notes and MIDI but **not its transport**: tempo, meter and play are choz's own. Ardour does not load CLAP — record choz there through JACK/PipeWire and the direct outs (manual, section 2.5). |
-| Wallpapers | `<prefix>/share/choz/wallpapers` | A fresh install opens on the image choz ships with, and the picker starts there. |
-| `choz-pd-host` | next to `choz` | The only binary that links libpd — installed when libpd is present. |
-
-**From a checkout** — the same script builds first:
-
-```bash
-./packaging/install.sh                    # build, then install into ~/.local
-./packaging/install.sh --prefix /usr/local
-./packaging/install.sh --binary target/release/choz   # skip the build
-./packaging/install.sh --skip-deps-check   # install without checking ALSA
-./packaging/install.sh --no-clap          # skip the CLAP plugin (effects + artifacts)
-./packaging/install.sh --uninstall
-```
-
-The script replaces an older copy before putting the new one down — it looks in
-`~/.local/bin`, `/usr/local/bin` and `/usr/bin`, and asks each one its
-`choz --version`. It also installs the desktop entry, the icon and the
-`*.choz.yml` file association, so choz shows up in the menu — under multimedia,
-beside the other audio applications — and a project opens with a double click.
-
-**What no uninstall ever removes: `~/.local/state/choz`.** The projects, the
-plugin paths and the settings are yours, not the package's.
-
-For distributions, `.deb` and `.rpm` are built from the same assets and replace
-the previous version by package name:
-
-```bash
-cargo build --release --bin choz          # both read target/release/choz
-cargo deb -p choz-ui --no-build           # → target/debian/choz_*.deb
-cargo generate-rpm -p crates/choz-ui      # → target/generate-rpm/choz-*.rpm
-```
-
-Because choz is a TUI, the desktop entry runs `choz-launcher`, which opens the
-first terminal it finds — **kitty first**, since that is where the wallpaper is
-drawn at real pixel resolution — at 120×40 cells. Below about 100×30 the RACK
-does not fit.
+Runtime dependencies, release tarballs, `.deb` / `.rpm` and every install flag: [`docs/install.md`](docs/install.md).
 
 ---
 
@@ -323,57 +149,43 @@ headroom for plugin DSP at small buffer sizes.
 ## Architecture
 
 ```
-choz/                      11 crates, version 1.3.18
-├── crates/
-│   ├── choz-ports/         RT-safe traits every host implements: AudioSource,
-│   │                       FxProcessor, PluginEditor, PluginParam, SandboxStatus
-│   ├── choz-engine/        Audio thread, rack, mixer, FX chain, MIDI/OSC input,
-│   │                       plugin scan cache, quarantine, sandbox policy
-│   │   ├── engine.rs       RT callback, slots, EngineCommand ring
-│   │   ├── jack_backend.rs Native JACK client — one port per device channel
-│   │   ├── fx/             56 built-in DSP effects
-│   │   ├── chord.rs        The chord being held, for the harmoniser's MIDI in
-│   │   ├── feedback.rs     Catches a microphone that starts to howl
-│   │   ├── maxpat.rs       Reads a Max/MSP patch and says what can be kept (no menu entry opens it)
-│   │   ├── artifacts/      The four generators: arpeggiator, step sequencer,
-│   │   │                   metronome, and the arranger — a backing band from a
-│   │   │                   chord progression, playing styles measured off the
-│   │   │                   rhythms in `artifacts/arranger/rhythms`
-│   │   ├── sources.rs      WAV, SF2 (oxisynth)
-│   │   ├── sfz.rs          SFZ parser + 32-voice sampler
-│   │   ├── paths.rs        Per-format search paths, Carla-style
-│   │   ├── quarantine.rs   Probe a plugin in a child before trusting it
-│   │   └── sandboxed.rs    AudioSource/FxProcessor that talk to a child process
-│   ├── choz-plugin-clap/   CLAP host (clack-host)
-│   ├── choz-plugin-lv2/    LV2 host — own Turtle parser + the C ABI, no lilv
-│   ├── choz-plugin-ladspa/ LADSPA + DSSI (they share a descriptor); step names
-│   │                       come from the `.rdf` beside the plugin, not the ABI
-│   ├── choz-plugin-vst2/   VST2 host — the published binary interface, no SDK
-│   ├── choz-plugin-vst3/   VST3 host — pure-Rust COM bindings, no Steinberg SDK
-│   ├── choz-plugin-pd/     Pure Data patches as effects; `choz-pd-host` is the
-│   │                       only binary that links libpd (feature `pd`)
-│   ├── choz-plugin-clap-export/ choz's 56 effects + 4 artifacts, as one `.clap`
-│   ├── choz-clap/          choz *itself* as a CLAP instrument: the rack inside
-│   │                       a DAW, sixteen stereo outs, its own X11 window
-│   ├── choz-plugin-sandbox/ Shared-memory transport for out-of-process hosting
-│   │                       (audio blocks and the plugin's window)
-│   └── choz-ui/            The `choz` binary: TUI, rack, modals, drawers,
-│                           projects, settings, i18n, plugin windows
-├── packaging/              install.sh, the desktop entry, the icon, the MIME type
+choz/
+├── crates/                     The Cargo workspace: 11 crates
+│   ├── choz-ports/             RT-safe traits every host implements
+│   ├── choz-engine/            Audio thread, rack, mixer, MIDI/OSC input, scan, sandbox policy
+│   │   └── src/
+│   │       ├── fx/             The 56 built-in DSP effects
+│   │       ├── artifacts/      Arpeggiator, step sequencer, metronome, arranger
+│   │       └── instruments/    Built-in sources: SF2, SFZ sampler, streamed audio
+│   ├── choz-plugin-clap/       CLAP host
+│   ├── choz-plugin-lv2/        LV2 host (own Turtle parser, no lilv)
+│   ├── choz-plugin-ladspa/     LADSPA + DSSI host
+│   ├── choz-plugin-vst2/       VST2 host
+│   ├── choz-plugin-vst3/       VST3 host
+│   ├── choz-plugin-pd/         Pure Data patches as effects
+│   │   └── src/bin/            choz-pd-host, the only binary that links libpd
+│   ├── choz-plugin-clap-export/ choz's effects and artifacts as one .clap
+│   ├── choz-clap/              choz itself as a CLAP instrument
+│   ├── choz-plugin-sandbox/    Shared-memory transport for out-of-process plugins
+│   └── choz-ui/                The choz binary: TUI, modals, projects, settings
+│       └── src/views/          The panels drawn on screen
+├── packaging/                  install.sh, desktop entry, icon, MIME type
+├── assets/                     Wallpapers and sample .chord charts
 ├── examples/
-│   └── esp32s3-touch/      A touchscreen control surface that drives choz over OSC
-└── docs/
-    ├── architecture.md     How the pieces fit
-    ├── roadmap.md          What is still missing, and the gotchas worth knowing
-    └── fx-audit.md         The DSP audit of the built-in suite, and the save
-                            audit, finding by finding
+│   └── esp32s3-touch/          Touchscreen control surface that drives choz over OSC
+├── tools/                      Scripts that build the arranger's styles from MIDI files
+├── vendor/
+│   └── oxisynth/               Patched SoundFont synth (see License)
+└── docs/                       Architecture, install, testing, roadmap, FX audit, manual
 ```
 
-### Realtime contract
-
-The audio callback allocates nothing, takes no locks, and never blocks.
-Commands reach it over an `rtrb` ring; dropped objects go back over a second
-ring so they are freed off the RT thread.
+- **`crates/`** holds all the code. `choz-ports` defines the contracts, `choz-engine` runs the audio, one `choz-plugin-*` crate per plugin format hosts third-party plugins, and `choz-ui` is the application on top.
+- **`packaging/`** turns a build into an installed app.
+- **`assets/`** is the data choz ships with.
+- **`examples/`** has programs that talk to choz from outside.
+- **`tools/`** has offline scripts. They are not part of the build.
+- **`vendor/`** holds dependencies that carry local changes.
+- **`docs/`** is the long-form documentation. How the pieces fit together is in [`docs/architecture.md`](docs/architecture.md).
 
 ---
 
@@ -393,80 +205,10 @@ See [`CHANGELOG.md`](CHANGELOG.md) for what has landed so far.
 ## Tests
 
 ```bash
-cargo test --workspace              # 894 tests
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-| Crate | Tests | Covers |
-|---|---|---|
-| `choz-engine` | 450 | 56 FX processors, mixer, sources, SFZ parser, preset files and where a plugin keeps them, the transport and the metronome, the looper deck and its takes on disk, plugin paths, scan cache, quarantine, sandbox, OSC socket |
-| `choz-ui` | 330 | Rack layout, parameter controls, modals, mouse hit-testing, MIDI learn (including the knob box paging under it), the mixer strips, note routing in both modes, project save/load, i18n, themes, background rendering, drawing at every terminal size, the installer script |
-| `choz-plugin-lv2` | 34 | TTL parsing, hosting installed effects, `worker#schedule`, X11 editor discovery, state round-trip, `patch:Set` atoms from the UI |
-| `choz-plugin-ladspa` | 14 | LADSPA + DSSI descriptors and runtime, step names from the `.rdf` sidecar |
-| `choz-plugin-clap` | 13 | Effect and instrument runtime against installed plugins, window feed |
-| `choz-clap` | 10 | choz as an instrument: sixteen stereo outs offered to the host, the track's audio reaching the rack's input, an empty rack rendering silence, the rack saved and restored as the host's state, the X11 window with the panels drawn in it, keys, the pointer and colours crossing from X, no child of the host ever spawned, and a real host scanning the built bundle |
-| `choz-plugin-clap-export` | 9 | The bundle choz publishes: catalogue, parameters, a real host loading it |
-| `choz-plugin-vst3` | 9 | Factory info, parameter changes reaching the processor, run loop, runtime |
-| `choz-ports` | 8 | The shared types: parameter ranges, meters, the loop chunk |
-| `choz-plugin-sandbox` | 6 | Shared-memory handshake, deadline behaviour, window request |
-| `choz-plugin-vst2` | 6 | Host callback transport, automation feed, runtime |
-| `choz-plugin-pd` | 4 | Pure Data patch discovery and hosting |
-
-**Globals are why a test flakes.** The harness runs a crate's tests in parallel
-in one process, and the transport, the meters and `capture_health` are
-singletons by design. `choz-engine::test_locks` has **one lock per global** and
-a test that needs two takes them in the same order as everything else; in
-`choz-ui` the pair is `ui_guard()` and `UiRestore`, because loading a project
-applies its language and colour process-wide. A test that reads a global to
-check something about *its own* object is written wrong — ask the object.
-
-Four suites use `harness = false`, because the test binary itself has to be able
-to act as a worker process: `quarantine`, `sandboxed_plugin`, `scan_isolation`
-(choz-engine) and `across_a_process` (choz-plugin-sandbox).
-
-Runtime tests run against whatever plugins are installed on the machine and skip
-themselves when a format has none, so a plugin-less CI stays green.
-
-### Long sweeps
-
-Hosting *every* installed plugin of a format is `#[ignore]`d — it takes minutes:
-
-```bash
-cargo test --release -p choz-plugin-lv2 -- --ignored
-cargo test --release -p choz-plugin-ladspa -- --ignored
-```
-
-### Diagnostic examples
-
-Not tests — small programs that measure something against the real machine:
-
-```bash
-cargo run -p choz-plugin-lv2  --example ui_probe    # open every LV2 X11 editor
-cargo run -p choz-plugin-clap --example clap_gui_probe   # same for CLAP
-cargo run -p choz-engine      --example latency_probe
-cargo run -p choz-engine      --example devlist
-cargo run --release -p choz-engine --example sf2_voices -- <sf2> 96000 128   # what a pedalful of notes costs
-cargo run --release -p choz-engine --example pedal_bench -- <sf2> <vst3> [sandbox|inproc] [busy threads]
-cargo run --release -p choz-engine --example param_shapes -- <vst3>          # what a plugin says vs what choz draws
-```
-
----
-
-## Environment variables
-
-| Variable | Effect |
-|---|---|
-| `PIPEWIRE_LATENCY` / `PIPEWIRE_QUANTUM` | Set by choz from the configured buffer size before opening the JACK client — the placement matters, they are read when the client opens. |
-| `CHOZ_CLAP_STRICT_TEARDOWN=1` | Destroy CLAP plugins properly instead of leaking the ones known to crash. For debugging. |
-| `CHOZ_LV2_STRICT_TEARDOWN=1` | Same for LV2 — this is how the quarantine probe finds out in the first place. |
-| `CHOZ_KITTY_BG=0` | Draw the wallpaper as cell colours instead of using kitty's graphics protocol. |
-| `CHOZ_SANDBOX_GUI=1` | Isolate every plugin that has a window, not only the ones that crashed. Safer against a GUI segfault, and it costs most of an audio block per plugin — which is what used to break the sound up. |
-| `CHOZ_PROBE_RUNS=N` | How many times a plugin is probed before it is believed to be safe (default 3 — some crashes are races). |
-| `CHOZ_VST2_DIR=<dir>` | Extra directory for the VST2 runtime tests, where the machine's instruments live. |
-| `LV2_PATH`, `VST_PATH`, `VST3_PATH`, `CLAP_PATH`, `LADSPA_PATH`, `DSSI_PATH`, `SF2_PATH`, `SFZ_PATH` | Override the search path for that format. |
-
-State lives in `~/.local/state/choz/`: `choz.log`, `plugins.json` (scan cache),
-`plugin-paths.json`, `plugin-verdicts.json`, `plugin-sandbox.json`, `ui.json`.
+Per-crate coverage, long sweeps and diagnostic examples: [`docs/testing.md`](docs/testing.md). Environment variables: [`docs/environment.md`](docs/environment.md).
 
 ---
 ### Layout
