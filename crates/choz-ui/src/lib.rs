@@ -243,6 +243,12 @@ struct RackSlot {
     channel: u8,
     /// Turn this tab's audio input into notes for its own instrument.
     pitch_to_midi: bool,
+    /// …and let that instrument follow the input between notes as well: its
+    /// level as CC 11, its bends as pitch bend. `FOLLOW`, beside `WET`.
+    pitch_follow: bool,
+    /// When the sampler's `REC` started on this tab; `None` when it is not
+    /// recording.
+    recording: Option<std::time::Instant>,
     /// Trim on the audio coming in, and how loud it has to be before `A→M`
     /// hears a note. A guitar into a preamp is nowhere near a synth's level,
     /// so without the trim the two are stuck wherever the interface left them.
@@ -385,6 +391,8 @@ impl RackSlot {
             channel: ANY_CHANNEL,
             midi_out: None,
             pitch_to_midi: false,
+            pitch_follow: false,
+            recording: None,
             in_gain: 1.0,
             awaiting_trim: false,
             in_gate: choz_engine::pitch::DEFAULT_GATE,
@@ -1633,6 +1641,10 @@ struct Modal {
     browser: Option<file_browser::FileBrowser>,
     /// Which FX parameter a [`ModalKind::FxChoice`] is picking a position for.
     fx_param: usize,
+    /// For a [`ModalKind::FxChoice`] filed into categories: each sidebar
+    /// section's label and which of the parameter's positions it holds. Empty
+    /// is one flat list.
+    choice_groups: Vec<(String, Vec<usize>)>,
     /// What is being typed into the picker, when it is one that searches.
     ///
     /// `None` is "not searching", which is not the same as an empty string: an
@@ -1657,6 +1669,7 @@ impl Modal {
             targets: Vec::new(),
             browser: None,
             fx_param: 0,
+            choice_groups: Vec::new(),
             search: None,
             split_undo: None,
         }
@@ -2708,14 +2721,92 @@ impl App {
             .shape
             .step_at(entry.params.get(param).copied().unwrap_or(0.0));
         let title = format!("{} \u{00B7} {}", entry.label(), desc.name);
+        // The harmoniser's shapes are filed: stacks, intervals, the chord —
+        // fifteen names in a row read as one list of unrelated things.
+        let groups: Vec<(String, Vec<usize>)> =
+            match self.selected_harmonizer() == Some(self.fx_slot) && param == 1 {
+                true => {
+                    use choz_engine::fx::harmonizer::Shape;
+                    Shape::GROUPS
+                        .iter()
+                        .map(|g| {
+                            let members = (0..Shape::ALL.len())
+                                .filter(|i| Shape::ALL[*i].group() == *g)
+                                .collect();
+                            (g.to_string(), members)
+                        })
+                        .collect()
+                }
+                false => Vec::new(),
+            };
         let mut modal = Modal::new(
             ModalKind::FxChoice,
             views::modal::ListModal::new(title, items),
         );
-        modal.list.cursor = here.map(|(k, _)| k).unwrap_or(0);
+        let at = here.map(|(k, _)| k).unwrap_or(0);
+        modal.list.cursor = at;
+        match groups.iter().position(|(_, m)| m.contains(&at)) {
+            Some(g) => {
+                modal.list.sidebar_cursor = g;
+                modal.list.cursor = groups[g].1.iter().position(|i| *i == at).unwrap_or(0);
+            }
+            None => modal.list.cursor = at,
+        }
+        modal.choice_groups = groups;
         modal.fx_param = param;
         self.modal = Some(modal);
+        self.refresh_modal();
         true
+    }
+
+    /// The names of the positions a [`ModalKind::FxChoice`] is choosing
+    /// between, in the parameter's own order.
+    fn fx_choice_names(&self) -> Vec<String> {
+        let Some(param) = self.modal.as_ref().map(|m| m.fx_param) else {
+            return Vec::new();
+        };
+        match self
+            .fx_chain
+            .get(self.fx_slot)
+            .and_then(|e| e.param_descs().get(param).cloned())
+            .map(|d| d.shape)
+        {
+            Some(source::ParamShape::Named(points)) => points.into_iter().map(|(_, n)| n).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The wheel over a harmoniser's list: move one row and **use it** — the
+    /// list stays open, so a shape or a scale is tried by ear rather than
+    /// picked blind. Enter or SELECT keeps it, as before.
+    fn wheel_fx_choice(&mut self, delta: isize) {
+        let Some(m) = self.modal.as_mut() else {
+            return;
+        };
+        m.list.sidebar_focused = false;
+        m.list.move_cursor(delta);
+        let param = m.fx_param;
+        let row = m.list.cursor;
+        let point = match m.choice_groups.get(m.list.sidebar_cursor) {
+            Some((_, members)) => members.get(row).copied(),
+            None => Some(row),
+        };
+        let value = point.and_then(|p| {
+            match self
+                .fx_chain
+                .get(self.fx_slot)?
+                .param_descs()
+                .get(param)?
+                .shape
+                .clone()
+            {
+                source::ParamShape::Named(points) => points.get(p).map(|(v, _)| *v),
+                _ => None,
+            }
+        });
+        if let Some(v) = value {
+            self.set_fx_param(self.fx_slot, param, v);
+        }
     }
 
     /// Press instrument parameter `param`: a switch **flips**, and anything
@@ -3365,6 +3456,7 @@ impl App {
             .map(|s| s.in_pair.is_some() && s.pitch_to_midi)
             .collect();
         let mixes: Vec<f32> = self.slots.iter().map(|s| s.pitch_mix).collect();
+        let follows: Vec<bool> = self.slots.iter().map(|s| s.pitch_follow).collect();
         let trims: Vec<(f32, f32)> = self.slots.iter().map(|s| (s.in_gain, s.in_gate)).collect();
         let Some(ref mut engine) = self.audio_engine else {
             return;
@@ -3380,6 +3472,9 @@ impl App {
         }
         for (i, mix) in mixes.into_iter().enumerate() {
             engine.set_slot_pitch_mix(i, mix);
+        }
+        for (i, on) in follows.into_iter().enumerate() {
+            engine.set_slot_pitch_follow(i, on);
         }
         // The trim goes last: it carries the gate, and the tracker it sets the
         // gate on only exists once `set_slot_pitch_to_midi(true)` has run.
@@ -4437,11 +4532,67 @@ impl App {
         choz_engine::fx::harmonizer::octave_of(v)
     }
 
-    /// Set the selected harmoniser's octave, stored and sent.
+    /// Whether the selected harmoniser's `OCT` is on AUTO.
+    fn harm_oct_auto(&self) -> bool {
+        self.selected_harmonizer()
+            .and_then(|fx| {
+                self.fx_chain[fx]
+                    .params
+                    .get(choz_engine::fx::harmonizer::OCT_AUTO_PARAM)
+            })
+            .is_some_and(|v| *v >= 0.5)
+    }
+
+    /// `OCT`, clicked: ON → OFF → AUTO → ON. Landing on ON opens the piano, so
+    /// the octave is picked on the way in; CANCEL there goes back to AUTO.
+    fn cycle_harm_octave(&mut self) {
+        let Some(fx) = self.selected_harmonizer() else {
+            return;
+        };
+        let auto = choz_engine::fx::harmonizer::OCT_AUTO_PARAM;
+        match (self.harm_oct_auto(), self.harm_octave()) {
+            // ON → OFF.
+            (false, Some(_)) => self.set_harm_octave(None),
+            // OFF → AUTO.
+            (false, None) => self.set_fx_param(fx, auto, 1.0),
+            // AUTO → ON: the piano, with the last octave it sang in or C4.
+            (true, _) => {
+                self.open_harm_octave();
+                let at = self.harm_octave().unwrap_or(4);
+                self.set_harm_octave(Some(at));
+            }
+        }
+        self.persist_active();
+    }
+
+    /// RESET on the harmoniser: every knob back to how a new one opens. The
+    /// chart it follows and the keyboard it listens to are wiring, not knobs,
+    /// and stay.
+    fn reset_harmonizer(&mut self) {
+        let Some(fx) = self.selected_harmonizer() else {
+            return;
+        };
+        let defaults = source::AudioFxEntry::new(source::AudioFxKind::Harmonizer).params;
+        for (i, v) in defaults.into_iter().enumerate() {
+            self.set_fx_param(fx, i, v);
+        }
+        self.persist_active();
+    }
+
+    /// Set the selected harmoniser's octave, stored and sent. An octave, or
+    /// OFF, is never AUTO: the two are the button's other states.
     fn set_harm_octave(&mut self, octave: Option<i32>) {
         let Some(fx) = self.selected_harmonizer() else {
             return;
         };
+        let auto = choz_engine::fx::harmonizer::OCT_AUTO_PARAM;
+        if self.fx_chain[fx]
+            .params
+            .get(auto)
+            .is_some_and(|v| *v >= 0.5)
+        {
+            self.set_fx_param(fx, auto, 0.0);
+        }
         let param = choz_engine::fx::harmonizer::OCTAVE_PARAM;
         let value = choz_engine::fx::harmonizer::octave_norm(octave);
         if let Some(p) = self
@@ -4532,7 +4683,11 @@ impl App {
         if self.selected_harmonizer().is_none() {
             return;
         }
-        let was = self.harm_octave().unwrap_or(0) as u8;
+        // `u8::MAX` is "it was on AUTO", which is where CANCEL goes back to.
+        let was = match self.harm_oct_auto() {
+            true => u8::MAX,
+            false => self.harm_octave().unwrap_or(0) as u8,
+        };
         self.modal = Some(Modal::new(
             ModalKind::HarmOctave(was),
             views::modal::ListModal::new(i18n::t("OCTAVE"), Vec::new()),
@@ -5896,6 +6051,168 @@ impl App {
         // the way to the instrument. They are different questions, so this
         // switch retires nothing and nothing retires it — a tab can convert a
         // guitar and arpeggiate the result.
+    }
+
+    /// `FOLLOW`: the converted instrument also follows the input's level and
+    /// bends, not only its notes — what a recorded sound needs to breathe with
+    /// whatever plays it.
+    fn toggle_pitch_follow(&mut self) {
+        let slot = self.active_slot;
+        let Some(s) = self.slots.get_mut(slot) else {
+            return;
+        };
+        s.pitch_follow = !s.pitch_follow;
+        let on = s.pitch_follow;
+        if let Some(engine) = self.audio_engine.as_mut() {
+            engine.set_slot_pitch_follow(slot, on);
+        }
+    }
+
+    /// The sampler's `REC`: record the tab's input, and on the second press
+    /// stop — the take arrives in [`Self::poll_recording`], which cuts it at
+    /// its silences and loads it into this sampler.
+    fn toggle_sample_record(&mut self) {
+        let slot = self.active_slot;
+        let Some(s) = self.slots.get_mut(slot) else {
+            return;
+        };
+        if s.in_pair.is_none() {
+            eprintln!("choz: REC needs an input on this tab (IN drawer, F2)");
+            return;
+        }
+        let Some(engine) = self.audio_engine.as_mut() else {
+            return;
+        };
+        match s.recording.take() {
+            None => {
+                engine.start_slot_record(slot, sampler::capture::MAX_SECS);
+                s.recording = Some(std::time::Instant::now());
+                eprintln!("choz: tab {} recording", slot + 1);
+            }
+            Some(_) => engine.stop_slot_record(slot),
+        }
+    }
+
+    /// Once a frame: stop a take that reached its length, and turn one that
+    /// came back into the tab's sampler.
+    fn poll_recording(&mut self) {
+        let full = std::time::Duration::from_secs(sampler::capture::MAX_SECS as u64);
+        for i in 0..self.slots.len() {
+            if self.slots[i].recording.is_some_and(|t| t.elapsed() >= full) {
+                self.slots[i].recording = None;
+                if let Some(engine) = self.audio_engine.as_mut() {
+                    engine.stop_slot_record(i);
+                }
+            }
+        }
+        let Some((slot, audio, rate)) = self.audio_engine.as_mut().and_then(|e| e.take_recording())
+        else {
+            return;
+        };
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Unsaved until SAVE: see `sampler::capture`.
+        let dir = sampler::capture::unsaved_dir().join(format!("rec-{stamp}"));
+        match sampler::capture::save(&audio, rate, &dir) {
+            Ok(0) => eprintln!("choz: tab {} recorded only silence", slot + 1),
+            Ok(n) => {
+                eprintln!(
+                    "choz: tab {} recorded {n} sounds into {}",
+                    slot + 1,
+                    dir.display()
+                );
+                self.adopt_recording(slot, dir);
+            }
+            Err(e) => eprintln!("choz: recording not saved: {e}"),
+        }
+    }
+
+    /// A folder `REC` just wrote, into the sampler of the tab that recorded it.
+    fn adopt_recording(&mut self, slot: usize, dir: std::path::PathBuf) {
+        let found = choz_engine::paths::scan_path(&dir, choz_engine::PluginFormat::Samples);
+        let Some(only) = found.first().cloned() else {
+            return;
+        };
+        self.register_samples(&found);
+        self.active_slot = slot.min(self.slots.len().saturating_sub(1));
+        self.load_plugin_source(only.format, &only.path, &only.id);
+    }
+
+    /// SAVE on the sampler: the take it plays moves out of the scratch folder
+    /// into `~/.local/state/choz/recordings`, as the WAVs `REC` wrote, and the
+    /// sampler reloads it from there in the same layout.
+    ///
+    /// The recordings root is a search path of its own — added once — so a
+    /// project that plays a saved take finds it again on the next start, and
+    /// SOURCE lists every one.
+    fn save_recording(&mut self) {
+        let Some((dir, mode)) = self.active_sampler() else {
+            return;
+        };
+        if !sampler::capture::is_unsaved(&dir) {
+            return;
+        }
+        let kept = match sampler::capture::keep(&dir) {
+            Ok(kept) => kept,
+            Err(e) => {
+                eprintln!("choz: recording not saved: {e}");
+                return;
+            }
+        };
+        eprintln!("choz: recording saved to {}", kept.display());
+        let root = sampler::capture::recordings_dir();
+        let dirs = self.plugin_paths.dirs(choz_engine::PluginFormat::Samples);
+        if !dirs.iter().any(|d| d.path == root) {
+            self.plugin_paths
+                .dirs_mut(choz_engine::PluginFormat::Samples)
+                .push(choz_engine::SearchDir {
+                    path: root,
+                    enabled: true,
+                });
+            self.plugin_paths.save();
+        }
+        let found = choz_engine::paths::scan_path(&kept, choz_engine::PluginFormat::Samples);
+        let Some(only) = found.first().cloned() else {
+            return;
+        };
+        self.register_samples(&found);
+        let id = format!("{}{}", only.id, mode.suffix());
+        self.load_plugin_source(only.format, &only.path, &id);
+    }
+
+    /// Unsaved takes nothing plays any more are deleted, and forgotten: their
+    /// folder and its analysis on disk, their rows in the instrument tables in
+    /// memory. The decoded audio went when the instrument playing it was
+    /// replaced — the engine hands the old one back to be dropped.
+    ///
+    /// Run after every load (another instrument, CLEAR, a project) and after a
+    /// tab is closed, which are the ways a take stops being played.
+    fn sweep_recordings(&mut self) {
+        let playing: Vec<std::path::PathBuf> = self
+            .slots
+            .iter()
+            .filter_map(|s| match &s.source {
+                AudioSource::Plugin { id, format, .. }
+                    if format == choz_engine::PluginFormat::Samples.label() =>
+                {
+                    Some(std::path::PathBuf::from(sampler::Mode::strip(id)))
+                }
+                _ => None,
+            })
+            .collect();
+        let gone = |p: &std::path::Path| {
+            sampler::capture::is_unsaved(p) && !playing.iter().any(|d| d == p)
+        };
+        for take in sampler::capture::takes(&sampler::capture::unsaved_dir()) {
+            if gone(&take) {
+                sampler::capture::discard(&take);
+                eprintln!("choz: unsaved recording discarded ({})", take.display());
+            }
+        }
+        self.plugins.retain(|p| !gone(&p.path));
+        self.synths.retain(|s| !gone(&s.path));
     }
 
     /// How much of a converting tab's output is the instrument.
@@ -8163,6 +8480,10 @@ impl App {
             audition: slot
                 .map(|s| s.sampler_audition)
                 .unwrap_or((AUDITION_NOTE, 100)),
+            recording: slot
+                .and_then(|s| s.recording)
+                .map(|t| t.elapsed().as_secs()),
+            unsaved: sampler::capture::is_unsaved(&dir),
         })
     }
 
@@ -8378,6 +8699,28 @@ impl App {
             // The list was built when the modal opened and the parameter has
             // not moved since; rebuilding it here would only re-read the same
             // names.
+            // Filed into categories: the rows are the section's, rebuilt when
+            // the section moves.
+            ModalKind::FxChoice
+                if self
+                    .modal
+                    .as_ref()
+                    .is_some_and(|m| !m.choice_groups.is_empty()) =>
+            {
+                let names = self.fx_choice_names();
+                let m = self.modal.as_mut().unwrap();
+                m.list.sidebar = m
+                    .choice_groups
+                    .iter()
+                    .map(|(g, members)| (g.clone(), members.len()))
+                    .collect();
+                let section = m.list.sidebar_cursor.min(m.choice_groups.len() - 1);
+                m.choice_groups[section]
+                    .1
+                    .iter()
+                    .filter_map(|i| names.get(*i).cloned())
+                    .collect()
+            }
             ModalKind::FxChoice
             | ModalKind::FxPreset
             | ModalKind::ArpChoice
@@ -9170,6 +9513,11 @@ impl App {
             }
             ModalKind::FxChoice => {
                 let param = m.fx_param;
+                // A filed list's row is a position of its section.
+                let i = match m.choice_groups.get(m.list.sidebar_cursor) {
+                    Some((_, members)) => members.get(i).copied().unwrap_or(i),
+                    None => i,
+                };
                 // The list is the parameter's own positions, so the value is
                 // wherever the chosen one sits — not `i / len`, which would be
                 // a uniform grid the parameter never had.
@@ -9746,6 +10094,7 @@ impl App {
                     instrument,
                     mixer: project::Mixer {
                         pitch_to_midi: slot.pitch_to_midi,
+                        pitch_follow: slot.pitch_follow,
                         pitch_mix: Some(slot.pitch_mix),
                         in_gain: Some(slot.in_gain),
                         in_gate: Some(slot.in_gate),
@@ -10145,6 +10494,7 @@ impl App {
             rack.dest = choz_engine::Dest::from_index(slot.mixer.dest.unwrap_or(0));
             rack.in_pair = resolve_in_pair(&self.in_ports, &slot.mixer);
             rack.pitch_to_midi = slot.mixer.pitch_to_midi;
+            rack.pitch_follow = slot.mixer.pitch_follow;
             rack.pitch_mix = slot.mixer.pitch_mix.unwrap_or(1.0).clamp(0.0, 1.0);
             rack.in_gain = slot.mixer.in_gain.unwrap_or(1.0).clamp(0.0, MAX_IN_GAIN);
             rack.in_gate = slot
@@ -12098,6 +12448,7 @@ impl App {
         if self.pending_load.is_none() {
             self.loading = None;
         }
+        self.sweep_recordings();
     }
 
     fn load_synth(&mut self, i: usize) {
@@ -14686,6 +15037,8 @@ impl App {
         self.fx_param = 0;
         // Solo/mute are index-based on the engine side; re-push after the shift.
         self.push_mix();
+        // A take only that tab was playing is not kept.
+        self.sweep_recordings();
     }
 
     /// Push every slot's mixer strip to the engine. Solo is resolved here: when
@@ -17012,8 +17365,12 @@ pub fn run() -> Result<()> {
 
     let mut app = App::new();
     app.ui.apply();
+    // What a choz that crashed left in the scratch folder.
+    sampler::capture::discard_stale();
 
     let result = run_app(&mut terminal, &mut app);
+    // Takes nobody saved do not outlive the session.
+    sampler::capture::discard_all();
 
     disable_raw_mode()?;
     // The wallpaper is the terminal's, not the buffer's: leaving the alternate
@@ -17250,6 +17607,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Screen>>, app: &mut App) -> 
         // The frame above is the one that says "loading": the work below blocks
         // this thread, so it has to come after a draw and not before one.
         app.run_pending_load();
+        app.poll_recording();
 
         handle_events(app)?;
         app.tick_loop();
@@ -17915,6 +18273,10 @@ fn handle_modal_key(app: &mut App, key: KeyCode) {
         }
         KeyCode::Char('a') | KeyCode::Char('A') if matches!(kind, ModalKind::HarmOctave(_)) => {
             app.set_harm_octave(None);
+            if let Some(fx) = app.selected_harmonizer() {
+                app.set_fx_param(fx, choz_engine::fx::harmonizer::OCT_AUTO_PARAM, 1.0);
+            }
+            app.modal = None;
         }
         // The arrows choose the square the pointer paints with: the octaves
         // themselves are set by pointing at the keyboard.
@@ -18525,14 +18887,20 @@ fn handle_fx_keys(app: &mut App, key: KeyCode) {
             app.fx_slot += 1;
             app.fx_param = 0;
         }
+        // Past the knobs the grid does not draw: the cursor goes where the
+        // eye can follow it.
         KeyCode::Up => {
-            app.fx_param = app.fx_param.saturating_sub(1);
+            if let Some(entry) = app.fx_chain.get(app.fx_slot) {
+                if let Some(p) = (0..app.fx_param).rev().find(|i| !entry.hidden(*i)) {
+                    app.fx_param = p;
+                }
+            }
         }
         KeyCode::Down => {
             if let Some(entry) = app.fx_chain.get(app.fx_slot) {
                 let max = entry.param_descs().len();
-                if app.fx_param + 1 < max {
-                    app.fx_param += 1;
+                if let Some(p) = (app.fx_param + 1..max).find(|i| !entry.hidden(*i)) {
+                    app.fx_param = p;
                 }
             }
         }
@@ -19064,6 +19432,9 @@ enum MouseAction {
     /// Kill every sounding note, everywhere.
     /// Turn the active tab's audio input into notes for its instrument.
     TogglePitchToMidi,
+    TogglePitchFollow,
+    ToggleSampleRecord,
+    SaveRecording,
     /// Step the `A→M` dry/wet through its quarters, or nudge it with the wheel.
     PitchMixCycle,
     PitchMixAdjust(f32),
@@ -19111,6 +19482,7 @@ enum MouseAction {
     HarmStop,
     HarmLoad,
     HarmOctave,
+    HarmReset,
     HarmArrSync,
     HarmClick,
     ToggleEditor,
@@ -19286,6 +19658,9 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                             RackButton::SampleMap => MouseAction::OpenSamplerMap,
                             RackButton::PitchToMidi => MouseAction::TogglePitchToMidi,
                             RackButton::PitchMix => MouseAction::PitchMixCycle,
+                            RackButton::PitchFollow => MouseAction::TogglePitchFollow,
+                            RackButton::SampleRecord => MouseAction::ToggleSampleRecord,
+                            RackButton::SampleSave => MouseAction::SaveRecording,
                             RackButton::Gui => MouseAction::ToggleEditor,
                             RackButton::Harmonics => MouseAction::OpenHarmonics,
                             RackButton::Sandbox => MouseAction::ToggleSandbox,
@@ -19309,6 +19684,7 @@ fn mouse_action(col: u16, row: u16, layout: &UiLayout, kind: MouseEventKind) -> 
                             RackButton::HarmStop => MouseAction::HarmStop,
                             RackButton::HarmLoad => MouseAction::HarmLoad,
                             RackButton::HarmOctave => MouseAction::HarmOctave,
+                            RackButton::HarmReset => MouseAction::HarmReset,
                             RackButton::HarmArrSync => MouseAction::HarmArrSync,
                             RackButton::HarmClick => MouseAction::HarmClick,
                             // The ones with names open their list instead of
@@ -19963,6 +20339,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             app.fx_param = old_param;
         }
         MouseAction::TogglePitchToMidi => app.toggle_pitch_to_midi(),
+        MouseAction::TogglePitchFollow => app.toggle_pitch_follow(),
+        MouseAction::ToggleSampleRecord => app.toggle_sample_record(),
+        MouseAction::SaveRecording => app.save_recording(),
         MouseAction::PitchMixCycle => app.step_pitch_mix(-0.25, true),
         MouseAction::PitchMixAdjust(d) => app.step_pitch_mix(d, false),
         MouseAction::MonitorTab(tab) => app.monitor_tab = tab,
@@ -20140,7 +20519,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         MouseAction::HarmPlay => app.harm_play(),
         MouseAction::HarmStop => app.harm_stop(),
         MouseAction::HarmLoad => app.open_harm_chart(),
-        MouseAction::HarmOctave => app.open_harm_octave(),
+        MouseAction::HarmOctave => app.cycle_harm_octave(),
+        MouseAction::HarmReset => app.reset_harmonizer(),
         MouseAction::HarmArrSync => app.toggle_harm_arr_sync(),
         MouseAction::HarmClick => app.harm_click(),
         // Straight to the same funnel the computer keyboard's piano uses, so a
@@ -20404,17 +20784,30 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
         // The harmoniser's octave: the key clicked says which, set as it is
         // clicked so it is heard; CANCEL puts back the one it came in with.
         if let Some(ModalKind::HarmOctave(was)) = app.modal.as_ref().map(|m| m.kind) {
-            if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                return;
+            // The wheel steps the octave, as the arrows do.
+            match mouse.kind {
+                MouseEventKind::ScrollUp => return handle_modal_key(app, KeyCode::Right),
+                MouseEventKind::ScrollDown => return handle_modal_key(app, KeyCode::Left),
+                MouseEventKind::Down(MouseButton::Left) => {}
+                _ => return,
             }
             if split.select.is_some_and(|r| r.contains(pos)) {
                 app.modal = None;
                 return;
             }
             if split.cancel.is_some_and(|r| r.contains(pos)) {
-                app.set_harm_octave(choz_engine::fx::harmonizer::octave_of(
-                    was as f32 / (choz_engine::fx::harmonizer::OCTAVE_STEPS - 1) as f32,
-                ));
+                match was {
+                    u8::MAX => {
+                        app.set_harm_octave(None);
+                        if let Some(fx) = app.selected_harmonizer() {
+                            let auto = choz_engine::fx::harmonizer::OCT_AUTO_PARAM;
+                            app.set_fx_param(fx, auto, 1.0);
+                        }
+                    }
+                    _ => app.set_harm_octave(choz_engine::fx::harmonizer::octave_of(
+                        was as f32 / (choz_engine::fx::harmonizer::OCTAVE_STEPS - 1) as f32,
+                    )),
+                }
                 app.modal = None;
                 return;
             }
@@ -20550,7 +20943,7 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
             if app
                 .modal
                 .as_ref()
-                .is_some_and(|m| m.kind == ModalKind::Metronome) =>
+                .is_some_and(|m| matches!(m.kind, ModalKind::Metronome | ModalKind::HarmChord)) =>
         {
             if let Some(&(row, _)) = rects.rows.iter().find(|(_, r)| r.contains(pos)) {
                 if let Some(m) = app.modal.as_mut() {
@@ -20564,10 +20957,32 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                 match app.modal.as_ref().map(|m| m.kind) {
                     Some(ModalKind::FxGate) => app.step_fx_gate_row(row, delta),
                     Some(ModalKind::SeqMeter) => app.step_seq_meter_row(row, delta),
+                    // The chord dialogue's rows are values, like the arrows
+                    // treat them: the wheel turns the one under the pointer.
+                    Some(ModalKind::HarmChord) => {
+                        if let Some(mut spec) = app.harm_spec() {
+                            spec.step(row, delta);
+                            app.set_harm_spec(spec);
+                        }
+                    }
                     _ => app.step_metronome_row(row, delta),
                 }
                 app.refresh_modal();
             }
+        }
+        // A harmoniser's list is a value being chosen: the wheel moves one row
+        // and uses it, so it is heard before it is kept.
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            if app
+                .modal
+                .as_ref()
+                .is_some_and(|m| m.kind == ModalKind::FxChoice)
+                && app.selected_harmonizer() == Some(app.fx_slot)
+                && rects.list.is_some_and(|r| r.contains(pos)) =>
+        {
+            let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+            app.wheel_fx_choice(if up { -1 } else { 1 });
+            app.refresh_modal();
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
@@ -20724,6 +21139,10 @@ struct SamplerPanel {
     end: f32,
     start: f32,
     env: [f32; 4],
+    /// Seconds into a `REC` take, while one is running on this tab.
+    recording: Option<u64>,
+    /// It plays a take that has not been saved: SAVE is offered.
+    unsaved: bool,
 }
 
 impl SamplerPanel {
@@ -20743,6 +21162,8 @@ impl SamplerPanel {
             start: self.start,
             end: self.end,
             env: self.env,
+            recording: self.recording,
+            unsaved: self.unsaved,
         }
     }
 }
@@ -21090,6 +21511,9 @@ fn ui(f: &mut Frame, app: &mut App) {
             .get(app.active_slot)
             .map(|s| s.pitch_mix)
             .unwrap_or(1.0),
+        app.slots
+            .get(app.active_slot)
+            .is_some_and(|s| s.pitch_follow),
         &app.instr_knobs(),
         app.instr_section(),
         app.instr_param,
@@ -22833,6 +23257,9 @@ mod tests {
                     .get(app.active_slot)
                     .map(|s| s.pitch_mix)
                     .unwrap_or(1.0),
+                app.slots
+                    .get(app.active_slot)
+                    .is_some_and(|s| s.pitch_follow),
                 &app.instr_knobs(),
                 app.instr_section(),
                 app.instr_param,
@@ -24458,6 +24885,9 @@ mod tests {
                     .get(app.active_slot)
                     .map(|s| s.pitch_mix)
                     .unwrap_or(1.0),
+                app.slots
+                    .get(app.active_slot)
+                    .is_some_and(|s| s.pitch_follow),
                 &app.instr_knobs(),
                 app.instr_section(),
                 app.instr_param,
@@ -31005,6 +31435,7 @@ mod tests {
             in_pair: Some((0, 1)),
             in_ports: ports.map(|(l, r)| (l.to_string(), r.to_string())),
             pitch_to_midi: false,
+            pitch_follow: false,
             pitch_mix: None,
             in_gain: None,
             in_gate: None,
@@ -37035,12 +37466,144 @@ mod tests {
         assert_eq!(choz_engine::chord::chart().read(&mut held), 0);
     }
 
-    /// The harmoniser's octave is picked on the same piano: OCT opens it,
-    /// a key clicked puts the voices in that key's octave, `A` is AUTO again,
-    /// the arrows step it, and CANCEL puts back the one it opened on.
+    /// The shape list is filed — stacks, intervals, the chord — and every
+    /// harmoniser modal answers the wheel with its value: the list moves a row
+    /// and uses it, the chord dialogue turns the row under the pointer, the
+    /// piano steps the octave.
+    #[test]
+    fn the_harmoniser_modals_are_filed_and_turn_with_the_wheel() {
+        use choz_engine::fx::harmonizer::{octave_norm, Shape, OCTAVE_PARAM, SPEC_PARAM0};
+        let _g = ui_guard();
+        let _restore = UiRestore;
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        app.fx_chain
+            .push(AudioFxEntry::new(source::AudioFxKind::Harmonizer));
+        app.fx_slot = 0;
+        let draw = |app: &mut App| {
+            let mut term = Terminal::new(TestBackend::new(160, 50)).unwrap();
+            term.draw(|f| ui(f, app)).unwrap();
+            app.layout.borrow().modal_rects.clone()
+        };
+        let wheel = |app: &mut App, up: bool, x: u16, y: u16| {
+            handle_mouse(
+                app,
+                MouseEvent {
+                    kind: if up {
+                        MouseEventKind::ScrollUp
+                    } else {
+                        MouseEventKind::ScrollDown
+                    },
+                    column: x,
+                    row: y,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+            )
+        };
+        let shape = |app: &App| Shape::from_norm(app.fx_chain[0].params[1]);
+
+        // Opens on CHORD, in its own section.
+        assert!(app.open_fx_choice(1));
+        let m = app.modal.as_ref().unwrap();
+        let labels: Vec<&str> = m.list.sidebar.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["STACKS", "INTERVALS", "CHORD"]);
+        assert_eq!(m.list.items, ["CHORD"]);
+        // The intervals, and the third row of them picked.
+        app.modal.as_mut().unwrap().list.sidebar_cursor = 1;
+        app.refresh_modal();
+        assert_eq!(
+            app.modal.as_ref().unwrap().list.items[..3],
+            ["2m", "2M", "3m"]
+        );
+        app.modal.as_mut().unwrap().list.cursor = 2;
+        assert!(app.modal_select());
+        assert_eq!(shape(&app), Shape::Min3);
+
+        // The wheel over the list moves a row and is heard.
+        assert!(app.open_fx_choice(1));
+        let r = draw(&mut app).list.expect("the list is drawn");
+        wheel(&mut app, false, r.x + 2, r.y);
+        assert_eq!(shape(&app), Shape::Maj3, "one row down, and used");
+        assert!(app.modal.is_some(), "and the list stays open");
+        app.modal = None;
+
+        // The chord dialogue: the wheel turns the row under it.
+        app.open_harm_chord();
+        let rows = draw(&mut app).rows;
+        let (_, family) = rows[0];
+        let before = app.fx_chain[0].params[SPEC_PARAM0];
+        wheel(&mut app, true, family.x + 2, family.y);
+        assert_ne!(app.fx_chain[0].params[SPEC_PARAM0], before);
+        app.modal = None;
+
+        // The piano: the wheel steps the octave.
+        app.set_harm_octave(Some(3));
+        app.open_harm_octave();
+        draw(&mut app);
+        let keys = app.layout.borrow().split_rects.keys.area;
+        wheel(&mut app, true, keys.x + 1, keys.y);
+        assert_eq!(app.fx_chain[0].params[OCTAVE_PARAM], octave_norm(Some(4)));
+    }
+
+    /// RESET puts every knob back, and the chord rows its CHORD dialogue sets
+    /// are off the knob grid — drawn nowhere, walked over by the cursor.
+    #[test]
+    fn the_harmoniser_resets_and_hides_what_its_chord_dialogue_sets() {
+        use choz_engine::fx::harmonizer::{SPEC_PARAM0, SPEC_PARAMS};
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        app.fx_chain
+            .push(AudioFxEntry::new(source::AudioFxKind::Harmonizer));
+        app.fx_slot = 0;
+        app.rack_focus = RackFocus::Fx;
+        let fresh = app.fx_chain[0].params.clone();
+
+        // The chord rows are not on the grid, and the cursor walks past them.
+        let (_, rack) = render_rack(&mut app, 160, 60);
+        let drawn: Vec<usize> = rack.params.iter().map(|(i, _)| *i).collect();
+        assert!(!drawn.is_empty());
+        assert!(
+            drawn
+                .iter()
+                .all(|i| !(SPEC_PARAM0..SPEC_PARAM0 + SPEC_PARAMS).contains(i)),
+            "{drawn:?}"
+        );
+        app.fx_param = SPEC_PARAM0 - 1;
+        handle_key(&mut app, KeyCode::Down);
+        assert_eq!(
+            app.fx_param,
+            SPEC_PARAM0 + SPEC_PARAMS,
+            "over the chord rows"
+        );
+        handle_key(&mut app, KeyCode::Up);
+        assert_eq!(app.fx_param, SPEC_PARAM0 - 1, "and back");
+
+        // RESET: everything moved goes back to how a new one opens.
+        app.set_fx_param(0, 0, 1.0);
+        app.set_fx_param(0, 3, 0.5);
+        app.set_fx_param(0, SPEC_PARAM0, 1.0);
+        let reset = rack
+            .buttons
+            .iter()
+            .find(|(b, _)| *b == views::fx_chain_panel::RackButton::HarmReset)
+            .map(|(_, r)| *r)
+            .expect("RESET on the harmoniser's row");
+        click(&mut app, reset.x + 1, reset.y);
+        assert_eq!(app.fx_chain[0].params, fresh);
+        assert_eq!(fresh[3], 0.0, "which is chromatic");
+    }
+
+    /// The harmoniser's octave is picked on the same piano: a key clicked puts
+    /// the voices in that key's octave, the arrows step it, `A` is AUTO, and
+    /// the OCT button walks ON (the piano opens) → OFF → AUTO; CANCEL puts
+    /// back the state it opened on.
     #[test]
     fn the_harmoniser_octave_is_picked_on_the_keyboard() {
-        use choz_engine::fx::harmonizer::{octave_norm, OCTAVE_PARAM};
+        use choz_engine::fx::harmonizer::{octave_norm, OCTAVE_PARAM, OCT_AUTO_PARAM};
         let _g = ui_guard();
         let _restore = UiRestore;
         let mut app = App::new();
@@ -37051,7 +37614,7 @@ mod tests {
             .push(AudioFxEntry::new(source::AudioFxKind::Harmonizer));
         app.fx_slot = 0;
         let octave = |app: &App| app.fx_chain[0].params[OCTAVE_PARAM];
-        assert_eq!(octave(&app), 0.0, "AUTO until asked");
+        assert_eq!(octave(&app), 0.0, "OFF until asked");
 
         app.open_harm_octave();
         assert_eq!(
@@ -37081,24 +37644,32 @@ mod tests {
 
         handle_key(&mut app, KeyCode::Right);
         assert_eq!(octave(&app), octave_norm(Some(4)), "the arrows step it");
+        let auto = |app: &App| app.fx_chain[0].params[OCT_AUTO_PARAM] >= 0.5;
         handle_key(&mut app, KeyCode::Char('a'));
-        assert_eq!(octave(&app), 0.0, "A is AUTO");
-        handle_key(&mut app, KeyCode::Right);
-        assert_eq!(
-            octave(&app),
-            octave_norm(Some(1)),
-            "and up from AUTO is the first"
-        );
+        assert!(auto(&app) && octave(&app) == 0.0, "A is AUTO");
+        assert!(app.modal.is_none(), "and AUTO has nothing to pick");
 
+        // The button's three states: AUTO → ON (the piano opens) → OFF → AUTO.
+        app.cycle_harm_octave();
+        assert!(!auto(&app));
+        assert_eq!(octave(&app), octave_norm(Some(4)), "ON, on C4");
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::HarmOctave(u8::MAX)),
+            "and the piano opened by itself"
+        );
         let r = draw(&mut app);
         let cancel = r.cancel.expect("a way out");
         click(&mut app, cancel.x + 1, cancel.y);
         assert!(app.modal.is_none());
-        assert_eq!(
-            octave(&app),
-            0.0,
-            "CANCEL puts back AUTO, which it opened on"
-        );
+        assert!(auto(&app), "CANCEL puts back AUTO, which it opened on");
+
+        app.cycle_harm_octave();
+        app.modal = None;
+        app.cycle_harm_octave();
+        assert!(!auto(&app) && octave(&app) == 0.0, "ON → OFF");
+        app.cycle_harm_octave();
+        assert!(auto(&app), "OFF → AUTO");
     }
 
     /// The key, the style and the seed are picked from their own dialogues, and
@@ -38263,6 +38834,120 @@ mod tests {
         assert_eq!(app.ui.samples_dir.as_deref(), Some(base.as_path()));
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A take `REC` wrote is kept only if it is saved. Unsaved, it goes — its
+    /// folder, its rows in the instrument tables — the moment the sampler
+    /// stops playing it; SAVE moves it to the recordings and it stays.
+    #[test]
+    fn an_unsaved_take_goes_when_nothing_plays_it_and_a_saved_one_stays() {
+        let _g = ui_guard();
+        let tone: Vec<f32> = (0..24_000)
+            .flat_map(|i| {
+                let s = 0.5 * (std::f32::consts::TAU * 220.0 * i as f32 / 48_000.0).sin();
+                [s, s]
+            })
+            .collect();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        // No audio engine in a test, so the load is what the engine would
+        // have done: the tab's instrument becomes the folder.
+        let play = |app: &mut App, dir: &std::path::Path| {
+            app.pending_load = None;
+            app.slots[0].source = AudioSource::Plugin {
+                id: choz_engine::paths::path_id(dir),
+                format: choz_engine::PluginFormat::Samples.label().to_string(),
+                name: sampler::NAME.into(),
+            };
+            app.sweep_recordings();
+        };
+        let stop = |app: &mut App| {
+            app.slots[0].source = AudioSource::Midi;
+            app.sweep_recordings();
+        };
+
+        let first = sampler::capture::unsaved_dir().join("rec-ui-test-1");
+        assert_eq!(sampler::capture::save(&tone, 48_000, &first).unwrap(), 1);
+        app.adopt_recording(0, first.clone());
+        assert!(app.synths.iter().any(|s| s.path == first), "registered");
+        play(&mut app, &first);
+        assert!(first.exists(), "playing, so kept for now");
+        stop(&mut app);
+        assert!(!first.exists(), "nothing plays it, so it is deleted");
+        assert!(!app.synths.iter().any(|s| s.path == first), "and forgotten");
+        assert!(!app.plugins.iter().any(|p| p.path == first));
+
+        let second = sampler::capture::unsaved_dir().join("rec-ui-test-2");
+        sampler::capture::save(&tone, 48_000, &second).unwrap();
+        app.adopt_recording(0, second.clone());
+        play(&mut app, &second);
+        app.save_recording();
+        let kept = sampler::capture::recordings_dir().join("rec-ui-test-2");
+        assert!(!second.exists() && kept.join("rec_take1.wav").exists());
+        assert!(
+            app.synths.iter().any(|s| s.path == kept),
+            "reloaded from there"
+        );
+        play(&mut app, &kept);
+        stop(&mut app);
+        assert!(kept.exists(), "a saved take stays when nothing plays it");
+        let _ = std::fs::remove_dir_all(&kept);
+    }
+
+    /// `REC` sits with the sampler's other buttons, and on a tab with no input
+    /// it does nothing: there is nothing to hear.
+    #[test]
+    fn the_sampler_records_only_what_a_tab_can_hear() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Plugin {
+            id: sampler::EMPTY_ID.into(),
+            format: choz_engine::PluginFormat::Samples.label().to_string(),
+            name: sampler::NAME.into(),
+        }));
+        app.active_slot = 0;
+        let (_, rack) = render_rack(&mut app, 140, 30);
+        let rec = rack
+            .buttons
+            .iter()
+            .find(|(b, _)| *b == views::fx_chain_panel::RackButton::SampleRecord)
+            .map(|(_, r)| *r)
+            .expect("REC is on the sampler's panel");
+        // No input on the tab: there is nothing to record, and nothing starts.
+        click(&mut app, rec.x + 1, rec.y);
+        assert!(app.slots[0].recording.is_none());
+    }
+
+    /// `FOLLOW` comes with the converter, like `WET`, and travels with the
+    /// project: it is part of how the tab plays.
+    #[test]
+    fn follow_comes_with_the_converter_and_is_saved() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.active_slot = 0;
+        app.slots[0].in_pair = Some((0, 1));
+        let follow = |app: &mut App| {
+            let (_, rack) = render_rack(app, 140, 30);
+            rack.buttons
+                .iter()
+                .find(|(b, _)| *b == RackButton::PitchFollow)
+                .map(|&(_, r)| r)
+        };
+        assert!(
+            follow(&mut app).is_none(),
+            "no converter, nothing to follow"
+        );
+        app.toggle_pitch_to_midi();
+        let r = follow(&mut app).expect("FOLLOW comes with the converter");
+        click(&mut app, r.x + 1, r.y);
+        assert!(app.slots[0].pitch_follow);
+        let saved = app.project_snapshot();
+        assert!(saved.rack[0].mixer.pitch_follow);
+        let yaml = serde_yaml::to_string(&saved).unwrap();
+        let back: project::Project = serde_yaml::from_str(&yaml).unwrap();
+        assert!(back.rack[0].mixer.pitch_follow, "and reads back");
     }
 
     /// The sampler's setup is **on the rack panel**, not buried behind a key.

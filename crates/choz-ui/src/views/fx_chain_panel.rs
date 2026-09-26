@@ -100,6 +100,10 @@ pub struct SamplerView<'a> {
     pub audition: (u8, u8),
     /// The START knob, 0..1: where in the sample a note begins.
     pub start: f32,
+    /// Seconds into a `REC` take, while one runs on this tab.
+    pub recording: Option<u64>,
+    /// It plays a take nobody has saved: SAVE is offered.
+    pub unsaved: bool,
     /// …and the END knob: where it stops. At or below `start` it means "to the
     /// end of the sample", which is what the player does with it too.
     pub end: f32,
@@ -137,6 +141,12 @@ pub enum RackButton {
     /// Step which articulation the pack is played with — the keyswitch, for a
     /// pack that ships more than one.
     SampleArticulation,
+    /// Record the tab's input into the sampler: cut at its silences, one
+    /// sample per sound. Lit while recording.
+    SampleRecord,
+    /// Keep the take `REC` recorded: only on a sampler playing one that has not
+    /// been saved, which is otherwise deleted when nothing plays it any more.
+    SampleSave,
     /// Step the key the audition plays.
     SampleNote,
     /// …and how hard it plays it.
@@ -147,6 +157,9 @@ pub enum RackButton {
     /// How much of a converting tab's output is the instrument and how much is
     /// the audio that drove it.
     PitchMix,
+    /// Whether the converted instrument also follows the input's level and
+    /// bends (CC 11, pitch bend), not only its notes.
+    PitchFollow,
     /// Open (or close) the plugin's own window.
     Gui,
     /// Open the harmonics of the instrument's oscillator — for a synth that
@@ -256,8 +269,10 @@ pub enum RackButton {
     HarmStop,
     HarmLoad,
     HarmClick,
-    /// The harmoniser's octave: opens the piano to pick it.
+    /// The harmoniser's octave: OFF → ON (the piano opens to pick it) → AUTO.
     HarmOctave,
+    /// Every knob of the harmoniser back to how it opens.
+    HarmReset,
     /// Follow the arranger's progression: its ▶ is the master.
     HarmArrSync,
 }
@@ -1087,6 +1102,8 @@ fn is_sampler_button(btn: RackButton) -> bool {
     matches!(
         btn,
         RackButton::SampleFolder
+            | RackButton::SampleRecord
+            | RackButton::SampleSave
             | RackButton::SampleClear
             | RackButton::SamplePlay
             | RackButton::SampleSlice
@@ -1346,6 +1363,12 @@ fn draw_knob_box(
                     let (top, bottom) = vertical_bar(val, 5);
                     (format!(" {top}"), format!(" {bottom} {val:4.2}"), KNOB)
                 }
+                // A count on a slider says the count, not where the slider is.
+                (ParamShape::Fader(unit), _) if unit == "voices" => (
+                    fader_track(val, 10),
+                    format!(" {:>2}", 1 + (val * 9.0).round() as u32),
+                    KNOB,
+                ),
                 (ParamShape::Fader(_), _) => (fader_track(val, 10), format!(" {val:4.2}"), KNOB),
                 _ => (
                     format!("[{}]", knob_arc(val, 8)),
@@ -2343,6 +2366,8 @@ pub fn draw_fx_chain_panel(
     pitch_to_midi: Option<bool>,
     // How much of a converting tab is the instrument: 1 = only the instrument.
     pitch_mix: f32,
+    // Whether that instrument follows the input's level and bends too.
+    pitch_follow: bool,
     // The instrument's own parameters: name and 0..1 position, in plugin order.
     // Carla's "generic UI": every plugin gets knobs whether or not it has a
     // window, so a CC can be learned without opening one.
@@ -2629,6 +2654,20 @@ pub fn draw_fx_chain_panel(
                 false => format!(" {} {} ", t("LOAD"), truncate(s.dir, 14)),
             }),
         ),
+        // Record what comes in, and it becomes what this sampler plays.
+        (
+            RackButton::SampleRecord,
+            sampler.map(|s| match s.recording {
+                Some(secs) => format!(" \u{25CF} {} {secs}s ", t("REC")),
+                None => format!(" {} ", t("REC")),
+            }),
+        ),
+        (
+            RackButton::SampleSave,
+            sampler
+                .filter(|s| s.unsaved)
+                .map(|_| format!(" {} ", t("SAVE"))),
+        ),
         (
             RackButton::SampleClear,
             sampler.map(|_| format!(" {} ", t("CLEAR"))),
@@ -2705,6 +2744,13 @@ pub fn draw_fx_chain_panel(
                 )
             }),
         ),
+        (
+            RackButton::PitchFollow,
+            (pitch_to_midi == Some(true)).then(|| {
+                let mark = if pitch_follow { '\u{25CF}' } else { '\u{25CB}' };
+                format!(" {}{mark} ", t("FOLLOW"))
+            }),
+        ),
         // In MULTI the channel is what decides whether this tab sounds at all,
         // so it sits on the same line as the instrument it selects.
         // Channel 0 is "any": a tab that takes whatever its port sends.
@@ -2734,6 +2780,9 @@ pub fn draw_fx_chain_panel(
         let Some(text) = text else { continue };
         let lit = match btn {
             RackButton::SamplePlay => sampler.is_some_and(|s| s.playing),
+            RackButton::SampleRecord => sampler.is_some_and(|s| s.recording.is_some()),
+            RackButton::SampleSave => true,
+            RackButton::PitchFollow => pitch_follow,
             RackButton::SampleSlice => sampler.is_some_and(|s| s.layout == "SLICE"),
             _ => false,
         };
@@ -3614,22 +3663,32 @@ pub fn draw_fx_chain_panel(
                 on(entry.chord_port.is_some()),
             );
             layout.buttons.push((RackButton::FxChord, rect));
-            // Where the voices sing: AUTO, or the octave picked on the piano.
+            // Where the voices sing: OFF, the octave picked on the piano, or
+            // AUTO — three states on one button.
             let octave = entry
                 .params
                 .get(choz_engine::fx::harmonizer::OCTAVE_PARAM)
                 .copied()
                 .and_then(choz_engine::fx::harmonizer::octave_of);
+            let auto = entry
+                .params
+                .get(choz_engine::fx::harmonizer::OCT_AUTO_PARAM)
+                .is_some_and(|v| *v >= 0.5);
             let rect = row.button(
                 f,
-                format!(
-                    " {} {} ",
-                    t("OCT"),
-                    choz_engine::fx::harmonizer::octave_label(octave)
-                ),
-                on(octave.is_some()),
+                match auto {
+                    true => format!(" {} AUTO ", t("OCT")),
+                    false => format!(
+                        " {} {} ",
+                        t("OCT"),
+                        choz_engine::fx::harmonizer::octave_label(octave)
+                    ),
+                },
+                on(auto || octave.is_some()),
             );
             layout.buttons.push((RackButton::HarmOctave, rect));
+            let rect = row.button(f, BTN_RESET.to_string(), btn_style);
+            layout.buttons.push((RackButton::HarmReset, rect));
         }
         y = row.finish();
     }
@@ -3817,6 +3876,21 @@ pub fn draw_fx_chain_panel(
         None => false,
     };
 
+    // Knobs set somewhere better (the harmoniser's chord rows, in its CHORD
+    // dialogue) are left off the grid; `keep` maps what is drawn back to the
+    // parameter it is.
+    let keep: Vec<usize> = (0..entry.params.len())
+        .filter(|i| !entry.hidden(*i))
+        .collect();
+    fn pick<T: Clone>(keep: &[usize], v: &[T]) -> Vec<T> {
+        keep.iter().filter_map(|i| v.get(*i).cloned()).collect()
+    }
+    let (params, names, shapes) = (
+        pick(&keep, &entry.params),
+        pick(&keep, &names),
+        pick(&keep, &shapes),
+    );
+    let cursor = keep.iter().position(|i| *i == fx_param).unwrap_or(0);
     let (rects, next) = if drawn || deck_drawn {
         (Vec::new(), y)
     } else {
@@ -3836,10 +3910,10 @@ pub fn draw_fx_chain_panel(
                     None => String::new(),
                 }
             ),
-            &entry.params,
+            &params,
             &names,
             &shapes,
-            fx_param,
+            cursor,
             fx_focused,
             usize::MAX,
             5,
@@ -3848,7 +3922,7 @@ pub fn draw_fx_chain_panel(
         )
     };
     if !drawn {
-        layout.params = rects;
+        layout.params = rects.into_iter().map(|(i, r)| (keep[i], r)).collect();
     }
     y = next;
 

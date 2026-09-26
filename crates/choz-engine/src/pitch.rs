@@ -387,6 +387,26 @@ impl PitchTracker {
         self.cents
     }
 
+    /// What `FOLLOW` sends between notes: `(CC 11, pitch bend)`.
+    ///
+    /// **Expression is the note against its own peak**, not against the gate:
+    /// the attack already went out as velocity, so what is left to say is how
+    /// far the note has fallen since. 40 dB under its peak is 0. Nothing
+    /// sounding is 127 — rest, so the next note starts at its velocity alone.
+    ///
+    /// **The bend is the drift the display already shows**, over the ±2
+    /// semitones General MIDI (and choz's sampler) bend by. Hysteresis keeps a
+    /// note within 70 cents of itself, so it always fits.
+    pub fn follow(&self) -> (u8, u16) {
+        if self.sounding.is_none() {
+            return (127, 8192);
+        }
+        let fall_db = 20.0 * (self.level.max(1e-9) / self.note_peak.max(1e-9)).log10();
+        let expression = ((1.0 + fall_db / 40.0).clamp(0.0, 1.0) * 127.0).round() as u8;
+        let bend = 8192.0 + self.cents as f32 / 200.0 * 8192.0;
+        (expression, bend.round().clamp(0.0, 16383.0) as u16)
+    }
+
     /// Feed one interleaved stereo block and get back what changed.
     ///
     /// Returns at most two events, and in the order they must be sent: a note

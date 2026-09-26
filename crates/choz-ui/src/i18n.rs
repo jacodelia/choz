@@ -266,6 +266,7 @@ static TABLE: &[Row] = &[
     ("EMPTY", ["VAC\u{cd}O", "VAZIO", "VIDE", "VUOTO", "LEER", "\u{41f}\u{423}\u{421}\u{422}\u{41e}", "\u{7a7a}", "\u{7a7a}"]),
     ("EXPORT", ["EXPORTAR", "EXPORTAR", "EXPORTER", "ESPORTA", "EXPORTIEREN", "\u{42d}\u{41a}\u{421}\u{41f}\u{41e}\u{420}\u{422}", "\u{66f8}\u{304d}\u{51fa}\u{3057}", "\u{5bfc}\u{51fa}"]),
     ("CHANNEL", ["CANAL", "CANAL", "CANAL", "CANALE", "KANAL", "\u{41a}\u{410}\u{41d}\u{410}\u{41b}", "\u{30c1}\u{30e3}\u{30f3}\u{30cd}\u{30eb}", "\u{901a}\u{9053}"]),
+    ("FOLLOW", ["SEGUIR", "SEGUIR", "SUIVRE", "SEGUI", "FOLGEN", "\u{421}\u{41b}\u{415}\u{414}", "\u{8ffd}\u{5f93}", "\u{8ddf}\u{968f}"]),
     ("REC", ["GRAB", "GRAV", "ENR", "REG", "AUFN", "\u{417}\u{410}\u{41f}", "\u{9332}\u{97f3}", "\u{5f55}\u{97f3}"]),
     ("PAUSE", ["PAUSA", "PAUSA", "PAUSE", "PAUSA", "PAUSE", "\u{41f}\u{410}\u{423}\u{417}\u{410}", "\u{4e00}\u{6642}\u{505c}\u{6b62}", "\u{6682}\u{505c}"]),
     ("CLEAR", ["BORRAR", "LIMPAR", "EFFACER", "CANCELLA", "L\u{d6}SCHEN", "\u{421}\u{422}\u{415}\u{420}\u{415}\u{422}\u{42c}", "\u{6d88}\u{53bb}", "\u{6e05}\u{9664}"]),

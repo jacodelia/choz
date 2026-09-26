@@ -33,6 +33,7 @@
 pub mod analyze;
 pub mod archive;
 pub mod cache;
+pub mod capture;
 pub mod map;
 pub mod name;
 pub mod preset;

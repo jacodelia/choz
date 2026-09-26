@@ -741,6 +741,21 @@ Surge XT like a keyboard would.
   and the level that means "a note" is the player's decision. It rides on the
   same command as the input trim (`SetSlotInTrim`), because both are answers to
   the same question: how loud is what is coming in.
+- **`FOLLOW`** (off by default, saved as `mixer.pitch_follow`) makes the
+  instrument follow the input *between* notes too: `PitchTracker::follow`
+  gives the note's fall from its own peak as **CC 11** (40 dB under is 0) and
+  its drift in cents as **pitch bend** (±2 semitones). Only what changed is
+  sent; switching it off puts CC 11 back to 127 and the bend to centre.
+- **`REC` on the sampler records the tab's input, untrimmed.** The buffer is
+  allocated on the UI thread with room for 60 s (`SetSlotRecord`) and the
+  callback only pushes within its capacity; the take comes back on the
+  `Retired` ring (`Retired::Recording`, `AudioEngine::take_recording`).
+  `sampler::capture` cuts it at its silences into one WAV per sound under a
+  per-process scratch folder (`recordings-unsaved/<pid>/`); the sampler reads
+  each file's pitch off its audio. `SAVE` moves the take to `recordings/`, a
+  sample path of its own; an unsaved take is deleted as soon as nothing plays
+  it, at exit, and at the next start if choz died (`discard_stale`, by pid).
+  `discard` refuses any path outside the scratch folder, `..` included.
 
 ### What the output sounds like (`meter.rs`)
 
@@ -893,8 +908,18 @@ moving in parallel. On the scale alone parallel motion *is* the harmony asked
 for, so it stays. `Shape::Chord` sings a species built with the arranger's own
 chord dialogue (`arranger::spec::ChordSpec`, moved into the engine for this);
 the parser allocates, so every species is tabled once on the thread that builds
-the effect and the audio thread only reads. `Octave` folds each voice into one
-octave, keeping its note, but never more than ±24 semitones from the singer.
+the effect and the audio thread only reads. Every `Shape` but `Chord` is a
+cell of semitones repeated per octave (stacks: `3rds 5ths OCT 4THS`; the
+intervals `2m`…`7M`), capped at three octaves, and **`Place`** decides where
+its voices go: ABOVE, BELOW, MIDDLE (the default, alternating up and down) or
+CLUSTER (each voice folded to its nearest octave, within a tritone of the
+singer). `Chord` keeps its own voicing. `Voices` runs 1..=10 (`MAX_VOICES`).
+The OCT button cycles ON → OFF → AUTO: `Octave` folds each voice into one
+octave, keeping its note, but never more than ±24 semitones from the singer;
+`OctAuto` folds each voice to within an octave of the sung note. A new
+harmoniser opens chromatic (no key); the CHORD dialogue's knobs
+(`SPEC_PARAM0..`) stay parameters but are left off the knob grid
+(`AudioFxEntry::hidden`).
 `Lead` is how much of the input rides along with the voices — 0 by default, so
 a fully wet harmoniser through `choz Mic` is the choir alone; the whole is then
 put back at the input's level (`balance`). The chord comes from one of two process-wide doors:
