@@ -275,6 +275,9 @@ pub struct Mixer {
     /// Audio in, notes out. Added later, hence the default.
     #[serde(default)]
     pub pitch_to_midi: bool,
+    /// With `A→M`, the instrument follows the input's level and bends too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pitch_follow: bool,
     /// How much of a converting tab is the instrument rather than the audio
     /// that drove it. Added later; `None` means "all instrument", which is
     /// what it did before there was a choice.
@@ -552,6 +555,7 @@ mod tests {
                     in_pair: None,
                     in_ports: None,
                     pitch_to_midi: false,
+                    pitch_follow: false,
                     pitch_mix: None,
                     in_gain: None,
                     in_gate: None,

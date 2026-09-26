@@ -172,46 +172,62 @@ impl HarmStats {
     }
 }
 
-/// The most voices, and the width of everything sized per voice.
-pub const MAX_VOICES: usize = 8;
+/// The most voices, and the width of everything sized per voice. The `Voices`
+/// slider runs 1..=this.
+pub const MAX_VOICES: usize = 10;
 
-/// How the voices are spread out, as scale steps (or semitones when there is
-/// no scale) from the note being played.
+/// Which intervals the voices take, in semitones from the note being played —
+/// read against a major scale and moved onto the key's notes (or the chord's)
+/// afterwards, so `3M` in a minor key sings the minor third.
 ///
-/// Named shapes rather than eight interval knobs: eight knobs is a matrix, and
-/// the shapes below are what people actually stack. The list is read in order
-/// and truncated to the voice count, so two voices of `Thirds` are the first
-/// two of it.
+/// Every shape but [`Shape::Chord`] is a **cell** of intervals above the note,
+/// repeated an octave up for as many voices as there are, and [`Place`] then
+/// decides where they go: all above, all below, or alternating tight around
+/// the note. `CHORD` is a chord picked by name and keeps its own voicing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Shape {
-    /// A third and a fifth above, then their octaves: the standard stack.
+    /// Stacked thirds: third, fifth, seventh, ninth, eleventh, thirteenth.
     Thirds,
     /// Fifths and octaves — open, and the safest against a wrong key.
     Fifths,
-    /// Octaves only, up and down. No key needed to be right.
+    /// Octaves only. No key needed to be right.
     Octaves,
-    /// Above and below in pairs: the "two more singers" shape.
-    Above,
-    /// Everything below the note, for weight.
-    Below,
-    /// Tight, for the chorus-of-one sound rather than a chord.
-    Cluster,
+    Min2,
+    Maj2,
+    Min3,
+    Maj3,
+    Fourth,
+    Fifth,
+    Min6,
+    Maj6,
+    Min7,
+    Maj7,
+    /// A quartal chord: fourths stacked, so three voices over C are F, B♭ and
+    /// E♭ — the four-voice chord of fourths.
+    Fourths,
     /// **A chord of the player's choosing** over the note being sung — any
-    /// species the arranger's chord dialogue can build (family, sixth or
-    /// seventh, tensions, alterations), set with the `Ch…` knobs. The default,
-    /// set to a major seventh: the shape a harmoniser is reached for.
+    /// species the arranger's chord dialogue can build, set with the `Ch…`
+    /// knobs. The default, set to a major seventh.
     #[default]
     Chord,
 }
 
 impl Shape {
-    pub const ALL: [Shape; 7] = [
+    pub const ALL: [Shape; 15] = [
         Shape::Thirds,
         Shape::Fifths,
         Shape::Octaves,
-        Shape::Above,
-        Shape::Below,
-        Shape::Cluster,
+        Shape::Min2,
+        Shape::Maj2,
+        Shape::Min3,
+        Shape::Maj3,
+        Shape::Fourth,
+        Shape::Fifth,
+        Shape::Min6,
+        Shape::Maj6,
+        Shape::Min7,
+        Shape::Maj7,
+        Shape::Fourths,
         Shape::Chord,
     ];
 
@@ -220,47 +236,78 @@ impl Shape {
             Shape::Thirds => "3rds",
             Shape::Fifths => "5ths",
             Shape::Octaves => "OCT",
-            Shape::Above => "ABOVE",
-            Shape::Below => "BELOW",
-            Shape::Cluster => "CLUSTER",
+            Shape::Min2 => "2m",
+            Shape::Maj2 => "2M",
+            Shape::Min3 => "3m",
+            Shape::Maj3 => "3M",
+            Shape::Fourth => "4th",
+            Shape::Fifth => "5th",
+            Shape::Min6 => "6m",
+            Shape::Maj6 => "6M",
+            Shape::Min7 => "7m",
+            Shape::Maj7 => "7M",
+            Shape::Fourths => "4THS",
             Shape::Chord => "CHORD",
         }
     }
 
-    /// The interval each voice takes, in **scale steps** when a scale is in
-    /// use and in semitones when it is not. Eight of them; the voice count
-    /// decides how many are read.
-    pub fn steps(self) -> [i32; MAX_VOICES] {
+    /// The intervals above the note, in semitones, that the shape repeats an
+    /// octave at a time. A single interval is a cell of one: `3M` with three
+    /// voices is the third, and the third an octave and two octaves up.
+    fn cell(self) -> &'static [i32] {
         match self {
-            Shape::Thirds => [2, 4, -3, 7, 9, -7, 11, 14],
-            Shape::Fifths => [4, -4, 7, 11, -7, 14, 18, -11],
-            // Octaves are octaves in any scale: seven steps is one, and it is
-            // the one shape that cannot be out of key.
-            Shape::Octaves => [7, -7, 14, -14, 7, -7, 21, -21],
-            Shape::Above => [2, 4, 6, 8, 10, 12, 14, 16],
-            Shape::Below => [-2, -4, -6, -7, -9, -11, -14, -16],
-            Shape::Cluster => [1, -1, 2, -2, 3, -3, 4, -4],
-            // Scale steps, so in a major key these are the major third, the
-            // fifth and the major seventh, then the same chord an octave up.
-            // A major seventh in steps; the chosen species replaces it — see
-            // `Harmonizer::intervals_now`.
-            Shape::Chord => [2, 4, 6, 9, 11, 13, -3, -5],
+            Shape::Thirds => &[4, 7, 11, 14, 17, 21],
+            Shape::Fifths => &[7, 12],
+            Shape::Octaves => &[12],
+            Shape::Min2 => &[1],
+            Shape::Maj2 => &[2],
+            Shape::Min3 => &[3],
+            Shape::Maj3 => &[4],
+            Shape::Fourth => &[5],
+            Shape::Fifth => &[7],
+            Shape::Min6 => &[8],
+            Shape::Maj6 => &[9],
+            Shape::Min7 => &[10],
+            Shape::Maj7 => &[11],
+            Shape::Fourths => &[5, 10, 15, 20, 25, 30],
+            // Only reached when the chosen species has no tones at all.
+            Shape::Chord => &[4, 7, 11, 14, 17, 21],
         }
     }
 
-    /// The same intervals in semitones, read against a **major** scale: a
-    /// third is four, a fifth seven, an octave twelve. What the voices aim at
-    /// before the scale or the chord moves them onto a note that belongs.
+    /// Each voice's interval, in semitones, placed by `place`: the cell above
+    /// the note, then an octave further for the voices after it — mirrored
+    /// below for `Below`, and alternating above and below for `Cluster`.
     ///
-    /// Semitones rather than steps because a step means nothing outside a
-    /// seven-note scale: seven steps is an octave in major, an octave and a
-    /// second in a pentatonic, and a fifth in chromatic — which is what `OCT`
-    /// played there.
-    pub fn semitones(self) -> [i32; MAX_VOICES] {
-        const MAJOR: [i32; 7] = [0, 2, 4, 5, 7, 9, 11];
-        self.steps().map(|step| {
-            let octave = step.div_euclid(7);
-            MAJOR[step.rem_euclid(7) as usize] + 12 * octave
+    /// **Never past three octaves**, which is as far as the shifter reaches:
+    /// a voice that would be is brought back an octave at a time.
+    pub fn semitones(self, place: Place) -> [i32; MAX_VOICES] {
+        let cell = self.cell();
+        let above = |k: usize| {
+            let mut x = cell[k % cell.len()] + 12 * (k / cell.len()) as i32;
+            while x > MAX_REACH {
+                x -= 12;
+            }
+            x
+        };
+        let around = |i: usize| match i % 2 {
+            0 => above(i / 2),
+            _ => -above(i / 2),
+        };
+        std::array::from_fn(|i| match place {
+            Place::Middle => around(i),
+            Place::Above => above(i),
+            Place::Below => -above(i),
+            // The same notes, each folded to the nearest octave of it: within
+            // a tritone either side of the note sung.
+            Place::Cluster => {
+                let x = around(i).rem_euclid(12);
+                if x > 6 {
+                    x - 12
+                } else {
+                    x
+                }
+            }
         })
     }
 
@@ -273,12 +320,57 @@ impl Shape {
         let i = (v.clamp(0.0, 1.0) * (n - 1) as f32).round() as usize;
         Self::ALL[i.min(n - 1)]
     }
+
+    /// How the picker files the shapes: stacks, single intervals, the chord.
+    pub fn group(self) -> &'static str {
+        match self {
+            Shape::Thirds | Shape::Fifths | Shape::Octaves | Shape::Fourths => "STACKS",
+            Shape::Chord => "CHORD",
+            _ => "INTERVALS",
+        }
+    }
+
+    /// The groups, in the order the picker lists them.
+    pub const GROUPS: [&'static str; 3] = ["STACKS", "INTERVALS", "CHORD"];
 }
 
-/// Voice counts the knob steps through. Not 1..8 continuously: three voices
-/// and five voices are not sounds anybody asks for, and a stepped knob says
-/// what it will do before it is turned.
-pub const VOICE_COUNTS: [usize; 4] = [1, 2, 4, 8];
+/// The furthest a shape places a voice from the note: three octaves.
+const MAX_REACH: i32 = 36;
+
+/// Where the shape's voices go around the note. Every shape but `CHORD`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Place {
+    /// Both sides: one above, one below, then the next pair further out.
+    #[default]
+    Middle,
+    Above,
+    Below,
+    /// The same notes as `Middle`, gathered into one octave around the note —
+    /// each voice folded to within a tritone of it.
+    Cluster,
+}
+
+impl Place {
+    pub const ALL: [Place; 4] = [Place::Middle, Place::Above, Place::Below, Place::Cluster];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Place::Middle => "MIDDLE",
+            Place::Above => "ABOVE",
+            Place::Below => "BELOW",
+            Place::Cluster => "CLUSTER",
+        }
+    }
+
+    pub fn to_norm(self) -> f32 {
+        Self::ALL.iter().position(|p| *p == self).unwrap_or(0) as f32 / (Self::ALL.len() - 1) as f32
+    }
+
+    pub fn from_norm(v: f32) -> Self {
+        let n = Self::ALL.len();
+        Self::ALL[((v.clamp(0.0, 1.0) * (n - 1) as f32).round() as usize).min(n - 1)]
+    }
+}
 
 /// The longest a voice can lag, in samples: 50 ms at 96 kHz, which is the
 /// delay knob's top at the highest rate choz opens.
@@ -356,6 +448,8 @@ pub struct Harmonizer {
     voices: Vec<Voice>,
     count: usize,
     shape: Shape,
+    /// See [`PLACE_PARAM`].
+    place: Place,
     /// Key and scale. `ScaleType::Chromatic` **is** "no key": every semitone
     /// belongs to it, so walking a step is walking a semitone and the harmony
     /// comes out parallel. One representation, not an `Option` beside an enum
@@ -381,6 +475,8 @@ pub struct Harmonizer {
     chart: bool,
     /// See [`OCTAVE_PARAM`].
     octave: Option<i32>,
+    /// See [`OCT_AUTO_PARAM`].
+    oct_auto: bool,
     /// See [`SPEC_PARAM0`].
     spec: crate::artifacts::arranger::spec::ChordSpec,
     /// See [`ARR_SYNC_PARAM`].
@@ -446,14 +542,18 @@ impl Harmonizer {
             voices: (0..MAX_VOICES).map(|_| Voice::new()).collect(),
             count: 2,
             shape: Shape::default(),
-            scale: Scale::new(0, ScaleType::Major),
+            place: Place::default(),
+            // Chromatic, which is "no key": a harmoniser that opens in C major
+            // sings wrong notes over anything that is not.
+            scale: Scale::new(0, ScaleType::Chromatic),
             key: 0,
-            kind: ScaleType::Major,
+            kind: ScaleType::Chromatic,
             midi: false,
             midi_channel: 1,
             chord_seen: 0,
             chart: false,
             octave: None,
+            oct_auto: false,
             spec: default_spec(),
             arr_sync: false,
             chart_seen: 0,
@@ -488,7 +588,7 @@ impl Harmonizer {
     pub fn with_params(sample_rate: u32, p: &[f32]) -> Self {
         let get = |i: usize, d: f32| p.get(i).copied().unwrap_or(d);
         let mut h = Self::new(sample_rate);
-        h.set_voices(get(0, 0.334));
+        h.set_voices(get(0, 1.0 / (MAX_VOICES - 1) as f32));
         h.shape = Shape::from_norm(get(1, 0.0));
         h.set_key(get(2, 0.0));
         h.set_scale(get(3, 0.0));
@@ -530,6 +630,8 @@ impl Harmonizer {
         }
         h.arr_sync = get(ARR_SYNC_PARAM, 0.0) >= 0.5;
         h.lead = get(LEAD_PARAM, 0.0).clamp(0.0, 1.0);
+        h.place = Place::from_norm(get(PLACE_PARAM, 0.0));
+        h.oct_auto = get(OCT_AUTO_PARAM, 0.0) >= 0.5;
         h.voc = Vocoder::with_params(sample_rate, &p[VOC_PARAM0.min(p.len())..]);
         h.voc.set_mix(1.0);
         h.rebuild();
@@ -551,10 +653,14 @@ impl Harmonizer {
         self.midi.then_some(self.midi_channel)
     }
 
+    /// The `Voices` slider: 1..=[`MAX_VOICES`], evenly across the knob.
     pub fn set_voices(&mut self, v: f32) {
-        let n = VOICE_COUNTS.len();
-        let i = (v.clamp(0.0, 1.0) * (n - 1) as f32).round() as usize;
-        self.count = VOICE_COUNTS[i.min(n - 1)];
+        let n = 1 + (v.clamp(0.0, 1.0) * (MAX_VOICES - 1) as f32).round() as usize;
+        self.set_voice_count(n);
+    }
+
+    pub fn set_voice_count(&mut self, n: usize) {
+        self.count = n.clamp(1, MAX_VOICES);
         self.dirty = true;
     }
 
@@ -624,11 +730,11 @@ impl Harmonizer {
     /// nearest chord tones above, and eight fill the chord both sides.
     fn intervals_now(&self) -> [i32; MAX_VOICES] {
         if self.shape != Shape::Chord {
-            return self.shape.semitones();
+            return self.shape.semitones(self.place);
         }
         let tones = self.spec.tones();
         if tones.is_empty() {
-            return self.shape.semitones();
+            return self.shape.semitones(Place::Above);
         }
         let mut out = [0i32; MAX_VOICES];
         for (i, v) in out.iter_mut().enumerate() {
@@ -832,7 +938,21 @@ impl Harmonizer {
                 }
             };
             // The register asked for: the same note, folded into the octave.
-            let (semis, note) = match self.octave {
+            let (semis, note) = match self.octave.filter(|_| !self.oct_auto) {
+                // AUTO: every voice within an octave of the voice, on the side
+                // the shape put it — ten voices of a wide shape stay where a
+                // singer is instead of spreading over three octaves.
+                None if self.oct_auto => {
+                    let at = note.unwrap_or(sung + semis.round() as i32);
+                    let mut folded = at;
+                    while folded - sung > 12 {
+                        folded -= 12;
+                    }
+                    while folded - sung < -12 {
+                        folded += 12;
+                    }
+                    (semis + (folded - at) as f32, note.map(|_| folded))
+                }
                 None => (semis, note),
                 Some(o) => {
                     let base = 12 * (o + 1);
@@ -958,6 +1078,15 @@ pub const ARR_SYNC_PARAM: usize = SPEC_PARAM0 + SPEC_PARAMS;
 /// and 1 is the voice with its harmony.
 pub const LEAD_PARAM: usize = ARR_SYNC_PARAM + 1;
 
+/// Where the shape's voices go: above the note, below it, or tight around it.
+/// Every shape but `CHORD`, which is voiced by the chord.
+pub const PLACE_PARAM: usize = LEAD_PARAM + 1;
+
+/// `OCT`'s third state. Off, with [`OCTAVE_PARAM`] at `OFF`, the voices sit
+/// wherever the shape puts them; on, each is folded to within an octave of the
+/// voice; and with an octave picked (`ON`) they all sing in that octave.
+pub const OCT_AUTO_PARAM: usize = PLACE_PARAM + 1;
+
 /// The chord rows as knob names, and how many values each has.
 pub const SPEC_ROWS: [(&str, usize); SPEC_PARAMS] = {
     use crate::artifacts::arranger::spec as s;
@@ -1018,7 +1147,7 @@ pub fn octave_norm(octave: Option<i32>) -> f32 {
 /// What the knob says: `AUTO`, or the octave's C (`C3`).
 pub fn octave_label(octave: Option<i32>) -> String {
     match octave {
-        None => "AUTO".to_string(),
+        None => "OFF".to_string(),
         Some(o) => format!("C{o}"),
     }
 }
@@ -1276,11 +1405,7 @@ impl super::FxProcessor for Harmonizer {
 
     fn params(&self) -> Vec<crate::fx::FxParam> {
         use crate::fx::FxParam;
-        let voice_norm = VOICE_COUNTS
-            .iter()
-            .position(|c| *c == self.count)
-            .unwrap_or(1) as f32
-            / (VOICE_COUNTS.len() - 1) as f32;
+        let voice_norm = (self.count - 1) as f32 / (MAX_VOICES - 1) as f32;
         let scale_norm = ScaleType::ALL
             .iter()
             .position(|s| *s == self.kind)
@@ -1350,6 +1475,20 @@ impl super::FxProcessor for Harmonizer {
         .chain(std::iter::once(FxParam::new(
             "Lead", self.lead, 0.0, 1.0, "",
         )))
+        .chain(std::iter::once(FxParam::new(
+            "Place",
+            self.place.to_norm(),
+            0.0,
+            1.0,
+            "",
+        )))
+        .chain(std::iter::once(FxParam::new(
+            "OctAuto",
+            self.oct_auto as u8 as f32,
+            0.0,
+            1.0,
+            "",
+        )))
         .collect()
     }
 
@@ -1413,6 +1552,14 @@ impl super::FxProcessor for Harmonizer {
                 self.lead = v;
                 self.dirty = true;
             }
+            PLACE_PARAM => {
+                self.place = Place::from_norm(v);
+                self.dirty = true;
+            }
+            OCT_AUTO_PARAM => {
+                self.oct_auto = v >= 0.5;
+                self.dirty = true;
+            }
             ARR_SYNC_PARAM => {
                 self.arr_sync = v >= 0.5;
                 self.dirty = true;
@@ -1447,7 +1594,9 @@ mod tests {
         assert_eq!(params[8].name, "Wet");
         assert_eq!(params[9].name, "MIDI");
         assert_eq!(params[11].name, "Mode");
-        assert_eq!(params.len(), LEAD_PARAM + 1);
+        assert_eq!(params.len(), OCT_AUTO_PARAM + 1);
+        assert_eq!(params[PLACE_PARAM].name, "Place");
+        assert_eq!(params[OCT_AUTO_PARAM].name, "OctAuto");
         assert_eq!(params[LEAD_PARAM].name, "Lead");
         assert_eq!(params[SPEC_PARAM0].name, "ChFamily");
         assert_eq!(params[ARR_SYNC_PARAM].name, "ArrSync");
@@ -1564,7 +1713,7 @@ mod tests {
     #[test]
     fn a_third_is_a_scale_step_not_a_fixed_distance() {
         let mut h = Harmonizer::new(48_000);
-        h.set_voices(0.0); // one voice
+        h.set_voice_count(1); // one voice
         h.shape = Shape::Thirds; // its first step is a third
         h.set_scale(1.0 / (ScaleType::ALL.len() - 1) as f32); // major
         h.set_key(0.0); // C
@@ -1606,7 +1755,7 @@ mod tests {
     fn the_third_follows_the_note_being_sung() {
         let third_over = |hz: f32| {
             let mut h = Harmonizer::new(48_000);
-            h.set_voices(0.0);
+            h.set_voice_count(1);
             h.shape = Shape::Thirds;
             h.set_scale(1.0 / (ScaleType::ALL.len() - 1) as f32); // C major
             h.set_key(0.0);
@@ -1671,7 +1820,7 @@ mod tests {
     fn two_voices_never_share_a_note() {
         let _chart = crate::test_locks::chart();
         let mut h = Harmonizer::new(48_000);
-        h.set_voices(0.667); // four
+        h.set_voice_count(4); // four
         h.shape = Shape::Thirds;
         h.detune = 0.0;
         h.set_param(CHART_PARAM, 1.0);
@@ -1757,6 +1906,75 @@ mod tests {
         assert_eq!(h.sung(), None, "a second and more is nothing heard");
     }
 
+    /// The shapes are intervals, `Place` puts them above, below or around the
+    /// note for every shape but `CHORD`, and the rest of the new settings do
+    /// what they say: chromatic by default, zero voices is none, and `OCT`
+    /// AUTO keeps every voice within an octave of the singer.
+    #[test]
+    fn shapes_are_placed_and_the_chord_keeps_its_voicing() {
+        let built = |shape: Shape, place: Place, count: usize| {
+            let mut h = Harmonizer::new(48_000);
+            h.detune = 0.0;
+            h.shape = shape;
+            h.place = place;
+            h.set_voice_count(count);
+            h.rebuild();
+            h.intervals()
+        };
+        assert_eq!(Harmonizer::new(48_000).kind, ScaleType::Chromatic);
+        assert_eq!(
+            ScaleType::ALL[0],
+            ScaleType::Chromatic,
+            "and its knob is at 0"
+        );
+        // C, F, B♭, E♭: the four-voice chord of fourths.
+        assert_eq!(
+            built(Shape::Fourths, Place::Above, 3),
+            vec![5.0, 10.0, 15.0]
+        );
+        assert_eq!(built(Shape::Maj3, Place::Below, 2), vec![-4.0, -16.0]);
+        assert_eq!(built(Shape::Min3, Place::Middle, 2), vec![3.0, -3.0]);
+        assert_eq!(Place::default(), Place::Middle);
+        // A fifth either side of the note, gathered into its octave: the fifth
+        // above is the fourth below; a major seventh is a semitone under.
+        assert_eq!(built(Shape::Fifth, Place::Cluster, 2), vec![-5.0, 5.0]);
+        assert_eq!(built(Shape::Maj7, Place::Cluster, 1), vec![-1.0]);
+        let tight = built(Shape::Thirds, Place::Cluster, 10);
+        assert!(tight.iter().all(|s| s.abs() <= 7.0), "{tight:?}");
+        assert_eq!(built(Shape::Min2, Place::Above, 1), vec![1.0]);
+        assert_eq!(
+            built(Shape::Chord, Place::Below, 3),
+            built(Shape::Chord, Place::Above, 3),
+            "a chord picked by name keeps its own voicing"
+        );
+        assert_eq!(
+            built(Shape::Thirds, Place::Above, 0).len(),
+            1,
+            "one at least"
+        );
+        let ten = built(Shape::Thirds, Place::Above, 10);
+        assert_eq!(ten.len(), 10);
+        assert!(ten.iter().all(|s| s.abs() <= 36.0), "{ten:?}");
+
+        let mut h = Harmonizer::new(48_000);
+        h.detune = 0.0;
+        h.shape = Shape::Thirds;
+        h.set_voice_count(6);
+        h.set_param(OCT_AUTO_PARAM, 1.0);
+        h.rebuild();
+        let iv = h.intervals();
+        assert!(iv.iter().all(|s| s.abs() <= 12.0), "AUTO folds: {iv:?}");
+        assert_eq!(
+            Harmonizer::with_params(
+                48_000,
+                &h.params().iter().map(|p| p.value).collect::<Vec<_>>()
+            )
+            .intervals(),
+            iv,
+            "and reads back from its knobs"
+        );
+    }
+
     /// Octaves are octaves in every scale: twelve semitones, whatever the
     /// scale has in it. Seven steps was a fifth in chromatic and an octave and
     /// a second in a pentatonic.
@@ -1764,8 +1982,9 @@ mod tests {
     fn an_octave_is_an_octave_in_every_scale() {
         for (i, _) in ScaleType::ALL.iter().enumerate() {
             let mut h = Harmonizer::new(48_000);
-            h.set_voices(0.334);
+            h.set_voice_count(2);
             h.shape = Shape::Octaves;
+            h.place = Place::Middle;
             h.detune = 0.0;
             h.set_scale(i as f32 / (ScaleType::ALL.len() - 1) as f32);
             h.rebuild();
@@ -1782,7 +2001,7 @@ mod tests {
     fn the_chart_chord_is_the_harmony_under_the_voice() {
         let _chart = crate::test_locks::chart();
         let mut h = Harmonizer::new(48_000);
-        h.set_voices(0.334); // two
+        h.set_voice_count(2); // two
         h.shape = Shape::Thirds; // a third and a fifth above
         h.detune = 0.0;
         h.set_param(CHART_PARAM, 1.0);
@@ -1827,7 +2046,7 @@ mod tests {
         // the two is the singer, and nothing else.
         let run = |lead: f32| {
             let mut h = Harmonizer::new(48_000);
-            h.set_voices(0.334);
+            h.set_voice_count(2);
             h.shape = Shape::Octaves;
             h.set_mix(1.0);
             h.set_param(LEAD_PARAM, lead);
@@ -1862,8 +2081,9 @@ mod tests {
     fn the_voices_are_there_and_in_tune() {
         let sr = 48_000.0;
         let mut h = Harmonizer::new(48_000);
-        h.set_voices(0.334); // two
+        h.set_voice_count(2); // two
         h.shape = Shape::Octaves;
+        h.place = Place::Middle;
         h.set_scale(0.0); // chromatic: steps are semitones, so ±7 is a fifth
         h.detune = 0.0;
         h.delay_ms = 0.0;
@@ -1951,7 +2171,7 @@ mod tests {
     fn the_envelope_follower_closes_the_voices() {
         let sr = 48_000.0;
         let mut h = Harmonizer::new(48_000);
-        h.set_voices(0.334);
+        h.set_voice_count(2);
         h.env_amount = 1.0;
         h.delay_ms = 50.0;
         h.set_mix(1.0);
@@ -2062,7 +2282,7 @@ mod tests {
     fn over_a_chord_the_voices_move_the_least_they_can() {
         let _chart = crate::test_locks::chart();
         let mut h = Harmonizer::new(48_000);
-        h.set_voices(0.334); // two
+        h.set_voice_count(2); // two
         h.shape = Shape::Thirds;
         h.detune = 0.0;
         h.set_param(CHART_PARAM, 1.0);
@@ -2113,7 +2333,7 @@ mod tests {
     #[test]
     fn a_far_octave_does_not_bury_the_voices() {
         let mut h = Harmonizer::new(48_000);
-        h.set_voices(0.334);
+        h.set_voice_count(2);
         h.shape = Shape::Thirds;
         h.detune = 0.0;
         h.set_param(OCTAVE_PARAM, octave_norm(Some(1)));
@@ -2132,8 +2352,9 @@ mod tests {
     fn the_octave_puts_every_voice_in_its_register() {
         let voiced = |octave: f32, sung: i32| -> Vec<i32> {
             let mut h = Harmonizer::new(48_000);
-            h.set_voices(0.334); // two
+            h.set_voice_count(2); // two
             h.shape = Shape::Thirds;
+            h.place = Place::Above;
             h.detune = 0.0;
             h.set_param(OCTAVE_PARAM, octave);
             h.sung = Some(sung);
@@ -2149,7 +2370,7 @@ mod tests {
         let c3 = voiced(octave_norm(Some(3)), 64);
         assert!(
             auto.iter().all(|n| (64..=76).contains(n)),
-            "AUTO follows the tune: {auto:?}"
+            "OFF follows the tune: {auto:?}"
         );
         for (a, c) in auto.iter().zip(&c3) {
             assert_eq!(
@@ -2175,7 +2396,7 @@ mod tests {
     #[test]
     fn the_chord_shape_sings_the_chosen_species() {
         let voices = |h: &mut Harmonizer| -> Vec<i32> {
-            h.set_voices(0.667); // four
+            h.set_voice_count(4); // four
             h.detune = 0.0;
             h.sung = Some(60);
             h.dirty = true;

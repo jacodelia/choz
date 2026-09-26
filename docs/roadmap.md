@@ -2,8 +2,8 @@
 
 Qué falta. **Lo cerrado no vive aquí**: está en [CHANGELOG.md](../CHANGELOG.md),
 día por día, con los porqués y lo último arriba; cómo encajan las piezas, en
-[architecture.md](architecture.md); las dos auditorías, en
-[fx-audit.md](fx-audit.md). Este documento se poda cada vez que un punto se
+[architecture.md](architecture.md); las dos auditorías, fuera del árbol desde 1.3.19
+(`git show v1.3.18:docs/fx-audit.md`). Este documento se poda cada vez que un punto se
 cierra, para que lo que quede sea sólo lo que queda: se podó entero el
 2026-08-19, el 2026-08-29, el 2026-08-31, el 2026-09-01, el 2026-09-13, el
 2026-09-16 y el 2026-09-22, y las siete veces lo que decía "hecho" se fue al
@@ -87,7 +87,7 @@ barra** (`| 5/4 Fm | 3/4 Db |`) y el metrónomo los sigue, lee y escribe **MIDI*
 —exporta la banda balanceada, un canal por músico, y abre un `.mid` de dos a
 cuatro instrumentos—, y **SPLIT OUT** pone a cada músico en una tira propia del
 MIXER sin abrir otra tab. La polifonía de los instrumentos es un ajuste (16–1024, 256
-por defecto) y la barra de arriba dice la RAM que choz tiene. **La 1.3.18 es
+por defecto) y la barra de arriba dice la RAM que choz tiene. **La 1.3.19 es
 este árbol, publicada con sus paquetes.** El workspace sin
 `choz-plugin-lv2` (que en esta máquina se cuelga) pasa, y `clippy --workspace
 --all-targets -D warnings` está limpio con `+beta`.
@@ -103,8 +103,8 @@ Cinco bordes y dos decisiones de no hacer. Lo entregado se cuenta día por día 
 el [changelog](../CHANGELOG.md); un punto que se cierra sale de aquí, porque
 este documento es lo que queda y no lo que hubo.
 
-Las dos auditorías —la de DSP y la de guardado— viven enteras en
-[fx-audit.md](fx-audit.md), con el archivo y la línea de cada hallazgo: la
+Las dos auditorías —la de DSP y la de guardado— se retiraron del árbol en
+1.3.19 y siguen enteras en `git show v1.3.18:docs/fx-audit.md`, con el archivo y la línea de cada hallazgo: la
 sección 6 tiene lo único que se midió y se decidió **no** arreglar (el peine del
 shifter de voces), y la 7 lo que hay que saber antes de tocar el guardado de un
 efecto. No se repiten acá.

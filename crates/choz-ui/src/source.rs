@@ -816,12 +816,14 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
     ];
     /// Voices, shape, key and scale are lists of names; the rest are knobs.
     static HARMONIZER: &[FxParamDesc] = &[
-        pd!("Voices", 0.334),
+        // Two: the slider runs 1..=10 voices, so two is its first ninth.
+        pd!("Voices", 0.1111),
         // MAJ7, which is last in the list of shapes: a harmoniser reached for
         // in a hurry should already be making the chord people expect.
         pd!("Shape", 1.00),
         pd!("Key", 0.00),
-        pd!("Scale", 0.20),
+        // Chromatic — no key — until one is chosen.
+        pd!("Scale", 0.00),
         pd!("Detune", 0.32),
         pd!("Delay", 0.36),
         pd!("Env", 0.50),
@@ -879,6 +881,14 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         // How much of the singer comes out with the harmony: 0 is the voices
         // alone.
         pd!("Lead", 0.00),
+        // Where the shape's voices go: above, below or around the note.
+        pd!("Place", 0.00),
+        // OCT's third state, AUTO: every voice within an octave of the singer.
+        FxParamDesc {
+            name: Cow::Borrowed("OctAuto"),
+            default: 0.0,
+            shape: ParamShape::Toggle,
+        },
     ];
     /// Bands and carrier are lists of names; the rest are knobs.
     static VOCODER: &[FxParamDesc] = &[
@@ -1505,6 +1515,16 @@ impl AudioFxEntry {
 
     /// Parameters this entry exposes: all of the plugin's own plus dry/wet for
     /// a hosted effect, or the static table for a built-in.
+    /// Knobs that are set somewhere better and left off the knob grid: the
+    /// harmoniser's chord rows live in its CHORD dialogue. Still parameters —
+    /// saved, learnable, reachable from the parameter list.
+    pub fn hidden(&self, param: usize) -> bool {
+        use choz_engine::fx::harmonizer::{SPEC_PARAM0, SPEC_PARAMS};
+        self.plugin.is_none()
+            && self.kind == AudioFxKind::Harmonizer
+            && (SPEC_PARAM0..SPEC_PARAM0 + SPEC_PARAMS).contains(&param)
+    }
+
     pub fn param_descs(&self) -> Vec<FxParamDesc> {
         match &self.plugin {
             Some(c) => c
@@ -1625,7 +1645,7 @@ impl AudioFxEntry {
                 // names. A knob at 0.4 does not say "four voices in D minor".
                 if self.kind == AudioFxKind::Harmonizer {
                     use choz_engine::fx::autotune::{ScaleType, NOTE_NAMES};
-                    use choz_engine::fx::harmonizer::{Shape, VOICE_COUNTS};
+                    use choz_engine::fx::harmonizer::{Place, Shape};
                     let named = |d: &mut FxParamDesc, items: Vec<String>| {
                         let last = items.len().saturating_sub(1).max(1) as f32;
                         d.shape = ParamShape::Named(
@@ -1638,9 +1658,12 @@ impl AudioFxEntry {
                     };
                     for d in descs.iter_mut() {
                         match d.name.as_ref() {
-                            "Voices" => {
-                                named(d, VOICE_COUNTS.iter().map(|c| c.to_string()).collect())
-                            }
+                            // A slider, and the cell says the count.
+                            "Voices" => d.shape = ParamShape::Fader("voices".into()),
+                            "Place" => named(
+                                d,
+                                Place::ALL.iter().map(|p| p.label().to_string()).collect(),
+                            ),
                             "Shape" => named(
                                 d,
                                 Shape::ALL.iter().map(|s| s.label().to_string()).collect(),

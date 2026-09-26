@@ -32,6 +32,47 @@ lleva lo que falta —nada de lo ya hecho— y
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
 
+## [1.3.19] — 2026-09-26
+
+Release audit: `cargo test --workspace --exclude choz-plugin-lv2 --no-fail-fast -- --skip midi` 1094 pasan y 0 fallan; `cargo clippy --workspace --all-targets -D warnings` y `cargo fmt --all --check` limpios. i18n: la única clave nueva que pasa por `t(` es `FOLLOW`, en los ocho idiomas (`SAVE`, `REC` y `OCT` ya estaban); las etiquetas del motor (shapes, `Place`, STACKS/INTERVALS, RESET) siguen sin traducir, como el resto de los nombres de parámetros. Auditoría: `capture::is_unsaved` aceptaba una ruta con `..` (`starts_with` compara componentes) y las rutas pueden venir de un proyecto cargado: ahora la rechaza, con su assert en `an_unsaved_take_is_kept_or_thrown_away`. Documentación: `docs/fx-audit.md` sale del árbol (sigue en `git show v1.3.18:docs/fx-audit.md`, y el roadmap apunta ahí); `docs/architecture.md` (FOLLOW, REC/SAVE y las tomas sin guardar, Shape/Place/OCT AUTO); manual (4.5 FOLLOW, 5.6 REC y SAVE, 6.5 shapes, Place y OCT de tres estados), re-exportado a `docs/choz-manual.pdf`; README, overview y roadmap a 1.3.19.
+
+### 2026-09-26 — el harmonizer: intervalos, dónde van las voces, OCT de tres estados; las tomas se guardan o se van
+
+**Harmonizer**
+
+- **Abre en escala cromática** (sin tonalidad): el motor (`Harmonizer::new`) y el knob `Scale` por defecto (antes Major / 0.20).
+- **RESET** en la fila GATE/CHORD/OCT (`RackButton::HarmReset`): todos los knobs vuelven a como abre uno nuevo; el chart y el teclado que sigue quedan.
+- **`Voices` es un slider de 0 a 10** (`MAX_VOICES` 8 → 10, `ParamShape::Fader("voices")`, la celda dice el número). 0 es sin armonía. *Cambia de sonido en proyectos guardados*: el knob antes pasaba por 1/2/4/8.
+- **Shapes**: `3rds`, `5ths`, `OCT`, los intervalos `2m 2M 3m 3M 4th 5th 6m 6M 7m 7M`, **`4THS`** (acorde de cuartas: con tres voces sobre C, F-B♭-E♭) y `CHORD`. Cada shape es una celda en semitonos que se repite por octava, con tope de tres octavas.
+- **`Place`** (knob nuevo): ABOVE / BELOW / CLUSTER dejan de ser shapes y pasan a decidir dónde van las voces de **toda** shape salvo `CHORD`, que conserva su voicing. *Los shapes guardados se releen distinto* (la lista cambió de 7 a 15).
+- **OCT de tres estados** (el botón, en ciclo ON → OFF → AUTO): ON abre solo el piano para elegir la octava (CANCEL vuelve al estado anterior); OFF deja las voces donde las pone la shape (el AUTO de antes); **AUTO** (knob nuevo `OctAuto`) pliega cada voz a una octava de la voz cantada. En el piano, `A` pasa a AUTO y lo cierra.
+- **Los knobs del diálogo CHORD (`ChFamily`…`Ch5`) salen de la grilla** (`AudioFxEntry::hidden`); siguen siendo parámetros (se guardan y se aprenden) y el cursor los saltea.
+- Tests: `shapes_are_placed_and_the_chord_keeps_its_voicing`, `the_harmoniser_resets_and_hides_what_its_chord_dialogue_sets`, y el de la octava reescrito para los tres estados.
+- **Voices va de 1 a 10** (ya no hay 0).
+- **`Place`: MIDDLE, por defecto**, reparte las voces arriba y abajo alternando. **CLUSTER** usa las mismas notas pero dobla cada una a su octava más cercana, a un tritono como mucho de la nota cantada, así que todas quedan dentro de una octava alrededor de ella.
+- **El listado de SHAPE va por categorías**, en el sidebar: STACKS (`3rds 5ths OCT 4THS`), INTERVALS (`2m…7M`) y CHORD.
+- **La rueda del mouse funciona en los modals del harmonizer**. En los listados baja o sube una fila y la aplica sin cerrar, así se prueba de oído. En el diálogo CHORD cambia el valor de la fila que queda bajo el puntero. En el piano de OCT cambia la octava.
+- Test: `the_harmoniser_modals_are_filed_and_turn_with_the_wheel`. Los tests de engine que llaman a `render` (`rec_takes…`, `follow_sends…`) ahora toman también `test_locks::meter()`: con sus 750 bloques, `meter::tests::a_block_becomes_a_level_and_a_shape` fallaba de vez en cuando.
+
+**Sampler: SAVE, y lo no guardado se borra**
+
+- `REC` escribe en una carpeta temporal por proceso (`~/.local/state/choz/recordings-unsaved/<pid>/`). **`SAVE`** (sólo en un sampler que toca una toma sin guardar) la mueve, en WAV, a `~/.local/state/choz/recordings/`, que se agrega como ruta de samples, y recarga el sampler desde ahí.
+- **Una toma sin guardar se borra en cuanto nada la toca**: otro instrumento, CLEAR, un proyecto cargado o el tab cerrado (`sweep_recordings`). Se borran la carpeta y su análisis en caché, y se sacan sus filas de las tablas de instrumentos en memoria. El audio decodificado se libera cuando el engine devuelve el instrumento reemplazado. Al salir de choz se borran las que queden (`capture::discard_all`), y al arrancar, las de un choz que se cayó (`discard_stale`, por pid vivo en `/proc`).
+- `discard` se niega a borrar nada fuera de la carpeta temporal. Tests: `an_unsaved_take_is_kept_or_thrown_away`, `an_unsaved_take_goes_when_nothing_plays_it_and_a_saved_one_stays`.
+- Límite: un proyecto guardado mientras toca una toma sin guardar la pierde al cerrar choz; hay que hacer SAVE antes.
+
+### 2026-09-26 — el sampler graba: cualquier sonido, tocado por cualquier entrada
+
+Escalón 0+ del informe de clonado de timbre (`timbre-clone-audit`, fuera del repo), puntos 1 a 4, sin redes.
+
+- **`REC` en el panel del sampler** (`RackButton::SampleRecord`): graba la entrada del tab, **sin el trim** (el trim es para el detector de A→M, no para la toma), hasta 60 s. El buffer se aloca en el hilo de la UI y el callback sólo empuja dentro de su capacidad (`EngineCommand::SetSlotRecord`); la toma vuelve por el anillo `Retired` (`Retired::Recording`, `AudioEngine::take_recording`). Sin entrada en el tab no hace nada y lo dice en el log.
+- **Corte por silencios** (`sampler/capture.rs`): ventanas de 10 ms; silencio es 40 dB bajo la ventana más fuerte de la toma (nunca más de −60 dBFS); un hueco de menos de 60 ms queda dentro del sonido y un sonido de menos de 80 ms se descarta; fundidos de 2 y 10 ms. Un WAV por sonido, `rec_take<n>.wav`, en una carpeta `rec-<hora>/` que se carga en el sampler del tab (dónde queda: ver la entrada de arriba).
+- **Sin layout nuevo**: los archivos no llevan nota en el nombre, así que el sampler detecta el tono y los cents de cada uno del audio, reparte los que tienen altura por el teclado y arma un kit con los que no. Dos tomas de la misma nota son round robin. El plan del reporte pedía un layout `PITCHED`, pero un archivo por sonido lo hace innecesario.
+- **La carpeta `recordings` se agrega una vez como ruta de samples**, así un proyecto que toca una toma la encuentra al reabrir y SOURCE las lista todas.
+- **`FOLLOW` junto a `WET`** (con A→M activo): el instrumento sigue a la entrada también entre notas. La caída del nivel respecto del pico de la nota sale como **CC 11** (40 dB bajo el pico es 0) y la desviación en cents como **pitch bend** (±2 semitonos). Sólo se manda lo que cambia; apagarlo vuelve a CC 11 = 127 y bend al centro, y sólo si estaba encendido. Se guarda con el proyecto (`mixer.pitch_follow`). Apagado por defecto: A→M sigue siendo nota a nota, como antes.
+- i18n: `FOLLOW`. Tests: `a_take_is_cut_at_its_silences`, `the_files_read_back_as_one_instrument_at_the_notes_played`, `rec_takes_the_input_and_hands_it_back`, `follow_sends_expression_and_bend_only_when_asked`, `the_sampler_records_only_what_a_tab_can_hear`, `follow_comes_with_the_converter_and_is_saved`.
+- Límites que siguen: monofónico (A→M); el disparo por golpes (punto 5) y el escalón C no están hechos; una frase sin silencios queda como un solo sonido.
+
 ## [1.3.18] — 2026-09-24
 
 Release audit: `cargo test --workspace --exclude choz-plugin-lv2 --no-fail-fast -- --skip midi` 1083 pasan y 0 fallan (los tests de `midi::` abren los puertos ALSA reales y en la máquina de desarrollo tiran el hub USB del dock); `cargo clippy --workspace --all-targets -D warnings` y `cargo fmt --all --check` limpios. i18n: claves nuevas `OCT`, `OCTAVE`, `OVER C:`, `SYSTEM AUDIO` y la ayuda del piano de octava, que había quedado sin traducir porque el test de i18n no leía un `t(` partido en varias líneas por rustfmt; el test ahora lo lee. Documentación: `docs/architecture.md` (los dispositivos virtuales, PSOLA, la conducción de voces, `run_chain`, la sincronía al tempo), manual (4.5 los dispositivos virtuales, 6.3 los knobs nuevos, 6.5 el harmonizer: CHORD, OCT, ARR, Lead, PSOLA; 15 `CHOZ_NO_VIRTUAL_DEVICES`) y a 1.3.18, README y roadmap.

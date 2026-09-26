@@ -104,6 +104,12 @@ pub fn read(dir: &Path) -> (HashMap<PathBuf, Sample>, Option<i8>) {
     (samples, cached.octave)
 }
 
+/// Drop the folder's analysis, for a folder that is being deleted: a cache
+/// entry for audio that no longer exists is only clutter.
+pub fn forget(dir: &Path) {
+    let _ = std::fs::remove_file(path_for(dir));
+}
+
 /// Write the folder's analysis back. A cache that cannot be written is not an
 /// error worth stopping a load for — it costs the next scan its time, nothing
 /// more.

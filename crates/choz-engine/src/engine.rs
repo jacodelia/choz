@@ -65,6 +65,18 @@ pub(crate) struct Slot {
     /// doubled by a synth is the sound most people are after, and it needs the
     /// guitar still there.
     pitch_mix: f32,
+    /// With `A→M` on, whether the instrument also follows the input *between*
+    /// notes: its level as CC 11 and its drift from the note as pitch bend.
+    /// Off, a note is a note — which is what a synth played from a guitar
+    /// wants; on, a recorded sound breathes and bends with whatever drives it.
+    pitch_follow: bool,
+    /// The CC 11 and bend last sent, so a steady input sends nothing.
+    follow_sent: (u8, u16),
+    /// The tab's input being recorded for the sampler's `REC`: allocated on
+    /// the UI thread with room for the whole take and only ever pushed into
+    /// within that capacity here, so recording never allocates. `None` when
+    /// nothing is being recorded.
+    rec: Option<Vec<f32>>,
     /// Notes with a time on them, waiting for the block that contains it.
     ///
     /// Fixed size and never grown: this is the audio thread. A queue that
@@ -96,6 +108,9 @@ impl Slot {
             guard: crate::feedback::FeedbackGuard::new(48_000.0),
             pitch: None,
             pitch_mix: 1.0,
+            pitch_follow: false,
+            follow_sent: (127, 8192),
+            rec: None,
             pending: [None; MAX_SCHEDULED],
             held: 0,
         }
@@ -203,6 +218,18 @@ pub(crate) enum EngineCommand {
     SetSlotPitchMix {
         slot: usize,
         mix: f32,
+    },
+    /// A converting tab's instrument follows the input's level (CC 11) and
+    /// its bends (pitch bend) as well as its notes.
+    SetSlotPitchFollow {
+        slot: usize,
+        on: bool,
+    },
+    /// Start recording the slot's input into `buf` (`Some`, empty, with the
+    /// capacity of the longest take), or stop and send it back (`None`).
+    SetSlotRecord {
+        slot: usize,
+        buf: Option<Vec<f32>>,
     },
     /// Where a slot sums: a device pair, or one of the subgroups.
     SetSlotDest {
@@ -324,6 +351,10 @@ pub(crate) enum Retired {
     Slot(Slot),
     Fx(FxChain),
     Source(Source),
+    /// A finished `REC` take coming back to the UI: slot, interleaved stereo,
+    /// the rate it was recorded at. Not garbage — [`AudioEngine::take_recording`]
+    /// keeps it.
+    Recording(usize, Vec<f32>, u32),
 }
 
 /// Max rack slots before the slot Vec would reallocate on the RT thread.
@@ -428,6 +459,8 @@ pub struct AudioEngine {
     cmd_tx: rtrb::Producer<EngineCommand>,
     /// RT → UI: retired slots/chains to drop off the audio thread.
     retired_rx: rtrb::Consumer<Retired>,
+    /// `REC` takes that came back on the retired ring, until the UI takes them.
+    recordings: Vec<(usize, Vec<f32>, u32)>,
     /// Name of the output device in use (set once the stream is open).
     output_device: Option<String>,
     /// Backend the user asked for: `AUTO`, `JACK`, `PIPEWIRE` or `ALSA`.
@@ -842,6 +875,7 @@ impl AudioEngine {
             fx_latency: Vec::new(),
             cmd_tx,
             retired_rx,
+            recordings: Vec::new(),
             output_device: None,
             backend_pref: "AUTO".to_string(),
             rt_endpoints: Some(RtEndpoints { cmd_rx, retired_tx }),
@@ -1696,7 +1730,10 @@ impl AudioEngine {
 
     fn drain_retired(&mut self) {
         while let Ok(retired) = self.retired_rx.pop() {
-            drop(retired);
+            match retired {
+                Retired::Recording(slot, audio, rate) => self.recordings.push((slot, audio, rate)),
+                other => drop(other),
+            }
         }
     }
 
@@ -2014,6 +2051,41 @@ impl AudioEngine {
             return;
         }
         self.send(EngineCommand::SetSlotPitchMix { slot, mix });
+    }
+
+    /// Let a converting tab's instrument follow the input between notes too:
+    /// level as CC 11, drift as pitch bend. See [`Slot::pitch_follow`].
+    pub fn set_slot_pitch_follow(&mut self, slot: usize, on: bool) {
+        if slot >= self.slot_count {
+            return;
+        }
+        self.send(EngineCommand::SetSlotPitchFollow { slot, on });
+    }
+
+    /// Start recording the tab's audio input, for at most `max_secs`. The
+    /// buffer is allocated here, on this thread, so the callback only fills
+    /// it. Nothing happens on a tab without an input: there is nothing to hear.
+    pub fn start_slot_record(&mut self, slot: usize, max_secs: usize) {
+        if slot >= self.slot_count {
+            return;
+        }
+        let buf = Vec::with_capacity(max_secs * self.sample_rate as usize * 2);
+        self.send(EngineCommand::SetSlotRecord {
+            slot,
+            buf: Some(buf),
+        });
+    }
+
+    /// Stop recording; the take arrives through [`Self::take_recording`].
+    pub fn stop_slot_record(&mut self, slot: usize) {
+        self.send(EngineCommand::SetSlotRecord { slot, buf: None });
+    }
+
+    /// A take the callback has finished with: `(slot, interleaved stereo,
+    /// sample rate)`. Polled by the UI after [`Self::stop_slot_record`].
+    pub fn take_recording(&mut self) -> Option<(usize, Vec<f32>, u32)> {
+        self.drain_retired();
+        self.recordings.pop()
     }
 
     /// Trim the slot's audio input (linear `gain`) and set how loud it must be
@@ -2651,6 +2723,32 @@ impl RtState {
                         s.pitch_mix = mix.clamp(0.0, 1.0);
                     }
                 }
+                EngineCommand::SetSlotPitchFollow { slot, on } => {
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        // Back to rest, so switching it off leaves no note
+                        // quietened or detuned — and only when it was on: a
+                        // project reopening with it off sends nothing.
+                        let was = std::mem::replace(&mut s.pitch_follow, on);
+                        if was && !on {
+                            s.source.control_change(11, 127);
+                            s.source.pitch_bend(8192);
+                            s.follow_sent = (127, 8192);
+                        }
+                    }
+                }
+                EngineCommand::SetSlotRecord { slot, buf } => {
+                    let sr = state.sample_rate;
+                    if let Some(s) = state.slots.get_mut(slot) {
+                        // A new take replaces one still running; either way the
+                        // old buffer goes back to the UI thread to be freed.
+                        if let Some(done) = s.rec.take() {
+                            let _ = state.retired_tx.push(Retired::Recording(slot, done, sr));
+                        }
+                        s.rec = buf;
+                    } else if let Some(buf) = buf {
+                        let _ = state.retired_tx.push(Retired::Recording(slot, buf, sr));
+                    }
+                }
                 EngineCommand::SetSlotInTrim { slot, gain, gate } => {
                     if let Some(s) = state.slots.get_mut(slot) {
                         s.in_gain = gain.clamp(0.0, 8.0);
@@ -2962,6 +3060,15 @@ impl RtState {
                                 if keep_dry {
                                     dry[f * 2 + ch] = raw;
                                 }
+                                // Untrimmed: the trim is how loud the pitch
+                                // detector hears it, not how loud the take is.
+                                // Within capacity, so this never allocates; a
+                                // full buffer just stops taking.
+                                if let Some(rec) = slot.rec.as_mut() {
+                                    if rec.len() < rec.capacity() {
+                                        rec.push(raw);
+                                    }
+                                }
                                 let x = raw * g;
                                 sc[f * 2 + ch] = if x.abs() > 1.0 {
                                     clipped = true;
@@ -3005,6 +3112,16 @@ impl RtState {
                             tracker.cents(),
                             tracker.level(),
                         );
+                        if slot.pitch_follow {
+                            let now = tracker.follow();
+                            if now.0 != slot.follow_sent.0 {
+                                slot.source.control_change(11, now.0);
+                            }
+                            if now.1 != slot.follow_sent.1 {
+                                slot.source.pitch_bend(now.1);
+                            }
+                            slot.follow_sent = now;
+                        }
                         // How much of the input comes back. `dry` already
                         // holds it, untrimmed, from the loop above.
                         let wet = slot.pitch_mix;
@@ -4178,6 +4295,133 @@ mod tests {
             "the microphone reached the mix: {:?}",
             &state.mix[0][..8]
         );
+    }
+
+    /// `REC` fills the buffer it was handed, never past its capacity — the
+    /// callback must not allocate — and the take comes back on the retired
+    /// ring when it stops, untrimmed.
+    #[test]
+    fn rec_takes_the_input_and_hands_it_back() {
+        let _clock = crate::test_locks::transport();
+        // `render` writes the output meter, which another test reads exactly.
+        let _meter = crate::test_locks::meter();
+        let (mut cmd_tx, mut retired, mut state) = mk_state_ch(2, 2);
+        cmd_tx
+            .push(EngineCommand::AddSlot(Box::new(crate::sources::Silence)))
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotIn {
+                slot: 0,
+                pair: Some((0, 1)),
+            })
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotInTrim {
+                slot: 0,
+                gain: 4.0,
+                gate: 0.0,
+            })
+            .unwrap();
+        cmd_tx
+            .push(EngineCommand::SetSlotRecord {
+                slot: 0,
+                buf: Some(Vec::with_capacity(24)),
+            })
+            .unwrap();
+        state.apply_commands();
+        for ch in state.capture.iter_mut() {
+            ch.fill(0.25);
+        }
+        state.render(8);
+        state.render(8);
+        cmd_tx
+            .push(EngineCommand::SetSlotRecord { slot: 0, buf: None })
+            .unwrap();
+        state.apply_commands();
+        match retired.pop() {
+            Ok(Retired::Recording(0, audio, 48_000)) => {
+                assert_eq!(audio.len(), 24, "full at its capacity, and no further");
+                assert_eq!(audio.capacity(), 24, "and never grown");
+                assert!(
+                    audio.iter().all(|s| (*s - 0.25).abs() < 1e-6),
+                    "not trimmed"
+                );
+            }
+            _ => panic!("the take did not come back"),
+        }
+    }
+
+    /// `FOLLOW` sends the instrument CC 11 and pitch bend while a note sounds;
+    /// without it, a note is a note and nothing else arrives.
+    #[test]
+    fn follow_sends_expression_and_bend_only_when_asked() {
+        let _clock = crate::test_locks::transport();
+        // `render` writes the output meter, which another test reads exactly.
+        let _meter = crate::test_locks::meter();
+        #[derive(Default)]
+        struct Seen {
+            cc11: usize,
+            bends: usize,
+        }
+        struct Spy(Arc<std::sync::Mutex<Seen>>);
+        impl AudioSource for Spy {
+            fn render(&mut self, out: &mut [f32], _sr: u32) -> usize {
+                out.fill(0.0);
+                out.len() / 2
+            }
+            fn plays_on_transport_stop(&self) -> bool {
+                true
+            }
+            fn control_change(&mut self, cc: u8, _value: u8) {
+                if cc == 11 {
+                    self.0.lock().unwrap().cc11 += 1;
+                }
+            }
+            fn pitch_bend(&mut self, _value: u16) {
+                self.0.lock().unwrap().bends += 1;
+            }
+        }
+        let run = |follow: bool| -> (usize, usize) {
+            let seen = Arc::new(std::sync::Mutex::new(Seen::default()));
+            let (mut cmd_tx, _retired, mut state) = mk_state_ch(2, 2);
+            for cmd in [
+                EngineCommand::AddSlot(Box::new(Spy(seen.clone()))),
+                EngineCommand::SetSlotIn {
+                    slot: 0,
+                    pair: Some((0, 1)),
+                },
+                EngineCommand::SetSlotPitchToMidi { slot: 0, on: true },
+                EngineCommand::SetSlotPitchFollow {
+                    slot: 0,
+                    on: follow,
+                },
+            ] {
+                assert!(cmd_tx.push(cmd).is_ok());
+            }
+            state.apply_commands();
+            // Half a second of A3 that fades, 13 cents sharp: a note to lock
+            // on, a level that moves and a drift to bend by.
+            let hz = 220.0 * 2f32.powf(0.13 / 12.0);
+            for block in 0..750 {
+                for f in 0..32 {
+                    let i = block * 32 + f;
+                    let amp = 0.5 * (1.0 - i as f32 / 24_000.0);
+                    let s = amp * (std::f32::consts::TAU * hz * i as f32 / 48_000.0).sin();
+                    state.capture[0][f] = s;
+                    state.capture[1][f] = s;
+                }
+                state.render(32);
+            }
+            let seen = seen.lock().unwrap();
+            (seen.cc11, seen.bends)
+        };
+        assert_eq!(run(false), (0, 0), "without FOLLOW only notes are sent");
+        let (cc11, bends) = run(true);
+        assert!(
+            cc11 > 3,
+            "the fade reaches the instrument as CC 11 ({cc11})"
+        );
+        assert!(bends >= 1, "the 13 cents reach it as a bend ({bends})");
     }
 
     /// The converter's dry/wet: how much of the input comes back with the
