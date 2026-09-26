@@ -127,7 +127,10 @@ const INSTANCE_ACCESS_UI_PREFIXES: &[&str] = &["http://drumgizmo.org/lv2"];
 
 /// Whether `plugin_uri`'s UI may be handed the live instance.
 fn ui_gets_instance(plugin_uri: &str, owns_window: bool) -> bool {
-    owns_window || INSTANCE_ACCESS_UI_PREFIXES.iter().any(|p| plugin_uri.starts_with(p))
+    owns_window
+        || INSTANCE_ACCESS_UI_PREFIXES
+            .iter()
+            .any(|p| plugin_uri.starts_with(p))
 }
 
 /// Plugin families whose X11 UI segfaults the host on `instantiate`.
