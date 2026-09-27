@@ -11,6 +11,7 @@
 #   • choz-<ver>-x86_64-unknown-linux-gnu.tar.gz  + .deb + .rpm
 #   • choz-<ver>-aarch64-unknown-linux-gnu.tar.gz + arm64 .deb   (Pi 3/4/5)
 #   • choz-<ver>-armv7-unknown-linux-gnueabihf.tar.gz + armhf .deb (Pi 2 / Zero 2 W)
+#   • choz-manual.pdf (built from docs/choz-manual.fodt)
 #   • SHA256SUMS.txt
 #
 # Linux only, and that is not an oversight: choz opens plugin windows through
@@ -216,16 +217,25 @@ jobs:
     # Only on a real tag: a manual dry-run has no release to attach to.
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
+      - uses: actions/checkout@v5
+
       - name: Download all artifacts
         uses: actions/download-artifact@v5
         with:
           path: artifacts
 
-      - name: Flatten + checksum
+      # The manual's source is docs/choz-manual.fodt (flat ODF, diffable);
+      # the PDF is built here and never committed.
+      - name: Install LibreOffice
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libreoffice-writer-nogui
+
+      - name: Flatten + manual + checksum
         shell: bash
         run: |
           mkdir -p release
           find artifacts -type f -exec cp {} release/ \;
+          soffice --headless --convert-to pdf --outdir release docs/choz-manual.fodt
+          test -s release/choz-manual.pdf
           cd release
           sha256sum * > SHA256SUMS.txt
           ls -la

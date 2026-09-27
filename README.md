@@ -150,7 +150,7 @@ headroom for plugin DSP at small buffer sizes.
 
 ```
 choz/
-├── crates/                     The Cargo workspace: 11 crates
+├── crates/                     The Cargo workspace: 12 crates
 │   ├── choz-ports/             RT-safe traits every host implements
 │   ├── choz-engine/            Audio thread, rack, mixer, MIDI/OSC input, scan, sandbox policy
 │   │   └── src/
@@ -173,19 +173,19 @@ choz/
 ├── assets/                     Wallpapers and sample .chord charts
 ├── examples/
 │   └── esp32s3-touch/          Touchscreen control surface that drives choz over OSC
-├── tools/                      Scripts that build the arranger's styles from MIDI files
+├── tools/                      Builds the arranger's styles from the MIDI files in midi-styles
 ├── vendor/
 │   └── oxisynth/               Patched SoundFont synth (see License)
-└── docs/                       Architecture, install, testing, roadmap, FX audit, manual
+└── docs/                       Architecture, install, testing, roadmap, manual (.fodt)
 ```
 
 - **`crates/`** holds all the code. `choz-ports` defines the contracts, `choz-engine` runs the audio, one `choz-plugin-*` crate per plugin format hosts third-party plugins, and `choz-ui` is the application on top.
 - **`packaging/`** turns a build into an installed app.
 - **`assets/`** is the data choz ships with.
 - **`examples/`** has programs that talk to choz from outside.
-- **`tools/`** has offline scripts. They are not part of the build.
+- **`tools/`** has offline scripts. They are not part of the build. The arranger's source rhythms live in their own repository, [midi-styles](https://github.com/jacodelia/midi-styles); `tools/mid_to_styles.py` reads a clone of it and writes `arranger/styles.rs`.
 - **`vendor/`** holds dependencies that carry local changes.
-- **`docs/`** is the long-form documentation. How the pieces fit together is in [`docs/architecture.md`](docs/architecture.md).
+- **`docs/`** is the long-form documentation. The user manual's source is `docs/choz-manual.fodt` (LibreOffice, flat XML so git can diff it); the PDF is built by the release workflow — download it from the [latest release](https://github.com/jacodelia/choz/releases/latest/download/choz-manual.pdf). How the pieces fit together is in [`docs/architecture.md`](docs/architecture.md).
 
 ---
 
@@ -193,7 +193,7 @@ choz/
 
 | | |
 |---|---|
-| choz | **1.3.19** |
+| choz | **1.3.20** |
 | Rust edition | 2021 (`choz-plugin-lv2` is 2024) |
 | Toolchain tested | rustc 1.97.1 |
 | Platform | Linux. ALSA/JACK/PipeWire. Released for x86-64, aarch64 and armv7 |

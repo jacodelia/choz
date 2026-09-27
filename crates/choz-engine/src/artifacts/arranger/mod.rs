@@ -1743,8 +1743,8 @@ mod tests {
     }
 
     /// **Drum & bass is a two-bar two-step at 174**, measured off
-    /// `rhythms/drumnbass.mid`: bar A has the kick on one and the and-of-three,
-    /// bar B answers with a kick on the "a" of two and a snare picking up into
+    /// `drumnbass.mid` (midi-styles): bar A has the kick on one and the
+    /// and-of-three, bar B answers with a kick on the "a" of two and a snare picking up into
     /// the next bar; the hats run in sixteenths, so the ghosts land somewhere
     /// else every bar. The comp is a Rhodes — a pad's slow attack never opened
     /// at this tempo, and the chord came and went.
@@ -1885,7 +1885,7 @@ mod tests {
         }
     }
 
-    /// **Tarkus is heterometric**: measured off `rhythms/tarkus.mid`, a 5/4
+    /// **Tarkus is heterometric**: measured off `tarkus.mid` (midi-styles), a 5/4
     /// of its own and a groove for each signature the piece changes to. In a
     /// chart that changes meter every bar is as long as its signature, plays
     /// the groove measured for it, and the arranger says which bar — and which

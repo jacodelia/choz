@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The arranger's rhythms -> its style table, as Rust.
 
-    tools/mid_to_styles.py crates/choz-engine/src/artifacts/arranger/rhythms \
+    git clone https://github.com/jacodelia/midi-styles ../midi-styles
+    tools/mid_to_styles.py ../midi-styles \
         crates/choz-engine/src/artifacts/arranger/styles.rs
     cargo fmt -p choz-engine
 

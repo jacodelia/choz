@@ -79,7 +79,7 @@ que alguna capa grabó**, con cualquier pack: un archivo suelto, nombres con
 guiones, capas `v1…vN`, la nota del chunk `smpl` o la otra convención de
 octava; el arreglador **tiene forma
 —partes, intro y final—, **212 estilos, todos medidos de los acompañamientos
-en `arranger/rhythms`** por `tools/mid_to_styles.py`, su progresión se arma
+en [midi-styles](https://github.com/jacodelia/midi-styles)** por `tools/mid_to_styles.py`, su progresión se arma
 dentro de la TUI —una grilla de
 compases, un acorde por subdivisión de la agrupación— y sale
 en el `.clap` como cuarto artifact**; sus charts **cambian de compás barra por
@@ -87,7 +87,7 @@ barra** (`| 5/4 Fm | 3/4 Db |`) y el metrónomo los sigue, lee y escribe **MIDI*
 —exporta la banda balanceada, un canal por músico, y abre un `.mid` de dos a
 cuatro instrumentos—, y **SPLIT OUT** pone a cada músico en una tira propia del
 MIXER sin abrir otra tab. La polifonía de los instrumentos es un ajuste (16–1024, 256
-por defecto) y la barra de arriba dice la RAM que choz tiene. **La 1.3.19 es
+por defecto) y la barra de arriba dice la RAM que choz tiene. **La 1.3.20 es
 este árbol, publicada con sus paquetes.** El workspace sin
 `choz-plugin-lv2` (que en esta máquina se cuelga) pasa, y `clippy --workspace
 --all-targets -D warnings` está limpio con `+beta`.
@@ -99,7 +99,7 @@ donde se van a leer.
 
 ## Pendiente
 
-Cinco bordes y dos decisiones de no hacer. Lo entregado se cuenta día por día en
+Seis bordes y dos decisiones de no hacer. Lo entregado se cuenta día por día en
 el [changelog](../CHANGELOG.md); un punto que se cierra sale de aquí, porque
 este documento es lo que queda y no lo que hubo.
 
@@ -188,13 +188,13 @@ GATE.
   `Drngense`, `Ruchnsn1/2`, `Dongbeiy`, `Mus`—: la abreviatura podría ser dos
   cosas y `tools/mid_to_styles.py` sólo expande lo que es seguro. Si alguien
   sabe qué son, es una línea en `WORDS`.
-- **Más estilos** salen de más ritmos: se deja el `.mid` en
-  `crates/choz-engine/src/artifacts/arranger/rhythms`, se corre
-  `tools/mid_to_styles.py` y la tabla `arranger::styles::ALL` se vuelve a
+- **Más estilos** salen de más ritmos: se agrega el `.mid` a
+  [midi-styles](https://github.com/jacodelia/midi-styles), se corre
+  `tools/mid_to_styles.py <clon de midi-styles> …/arranger/styles.rs` y la tabla `arranger::styles::ALL` se vuelve a
   escribir sola. No hay formato de estilo ni estilos escritos a mano, y choz no
-  lee la carpeta en runtime: sólo lleva la tabla. Un estilo que suena mal es una
+  lee los `.mid` en runtime: sólo lleva la tabla. Un estilo que suena mal es una
   medición que corregir en el script, no una constante que tocar. El formato que
-  tiene que tener un archivo está en `rhythms/README.md`.
+  tiene que tener un archivo está en el `README.md` de midi-styles.
 - **Lo que no se puede medir de un ritmo sobre un acorde**: `approach`,
   `passing` y `human` salen de proxies (intervalos de semitono y de tono en el
   bajo, y una constante para la soltura, porque los ritmos vienen cuadrados
@@ -259,6 +259,36 @@ hacen ellos: tomar tempo, compás, posición y play del evento de transporte en
 cada bloque y ponerlos en `choz_ports::transport()` —con lo que el metrónomo y
 el seguimiento de compás del arreglador pasarían a ser del host dentro de un
 DAW—. El manual (2.5) lo dice como límite hasta entonces.
+
+### 5 · La estructura de archivos (2026-09-26)
+
+Auditoría del árbol. Lo de afuera está en orden (`crates/` el código, `vendor/`
+lo de terceros fuera del workspace, `docs/`, `packaging/`, `tools/`); lo que
+queda está adentro. Ya hecho: los 212 `.mid` del arreglador salieron de
+`arranger/rhythms/` a [midi-styles](https://github.com/jacodelia/midi-styles),
+que es lo que lee `tools/mid_to_styles.py`; choz nunca los leyó en runtime.
+
+- **`choz-ui/src/lib.rs` tiene 39 107 líneas**: ~22 000 de código, casi todo un
+  solo `impl App` (desde la línea 2264), y ~16 300 de tests (`mod tests`, desde
+  la 22775). Es la mitad del crate. Se parte sin cambiar comportamiento, un
+  `impl App` por área en `app/{rack,mixer,modals,harmonizer,sampler,input}.rs`
+  y los tests junto a cada una. Lo mismo, más chico:
+  `views/fx_chain_panel.rs` (5 427) y `views/midi_monitor.rs` (3 668).
+- **`assets/` lleva dos imágenes que nada usa**: `background.jpg` y
+  `vaporwave-background-vector.jpg`. `minorBlues.chord` tampoco se referencia,
+  pero sirve de ejemplo de chart.
+- **Binarios en git**: `docs/layout.png` (1,8 MB) se vuelve a guardar cada vez
+  que cambia. El manual ya no: su fuente es `docs/choz-manual.fodt` (XML plano,
+  git lo comprime por diferencias) y el PDF lo arma `release.yml` y lo adjunta
+  al release. Las 7 versiones del PDF que quedan en el historial (39,5 MB) no se
+  recuperan sin reescribirlo, y no vale la pena.
+- **Tres crates CLAP con nombres que se confunden**: `choz-clap` (choz dentro de
+  un DAW), `choz-plugin-clap` (choz hospeda CLAP) y `choz-plugin-clap-export`
+  (los efectos de choz como `.clap`). Renombrar toca rutas y artifacts del
+  release; sólo si molesta. `choz-ports` es el único sin `description`.
+- **`choz-engine/src` tiene 21 módulos sueltos en la raíz** (`midi`, `osc`,
+  `jack_backend`, `virtual_devices`, `quarantine`, `sandboxed`…). Agruparlos en
+  `io/` y `plugins/` es cosmético: cuando se toque la zona.
 
 ## Las dos piezas que quedan fuera, por decisión
 

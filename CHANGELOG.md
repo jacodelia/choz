@@ -32,6 +32,16 @@ lleva lo que falta —nada de lo ya hecho— y
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
 
+## [1.3.20] — 2026-09-26
+
+Release audit: `cargo test --workspace --exclude choz-plugin-lv2 --no-fail-fast -- --skip midi` 1094 pasan y 0 fallan; `cargo clippy --workspace --all-targets -D warnings` y `cargo fmt --all --check` limpios. Los cambios de código de esta versión son sólo comentarios: no hay claves de i18n nuevas. Los ritmos que salieron del árbol se verificaron dos veces: los 213 archivos de [midi-styles](https://github.com/jacodelia/midi-styles) tienen el mismo SHA de blob que los que estaban en `arranger/rhythms/`, y `tools/mid_to_styles.py` corrido sobre un clon de ese repo reescribe `arranger/styles.rs` byte por byte igual (212 estilos). El paso nuevo de `release.yml` que arma el manual corre por primera vez con este tag. Documentación: README, overview y roadmap a 1.3.20; `docs/install.md` cuenta el manual entre lo que publica cada release.
+
+### 2026-09-26 — los ritmos del arreglador viven en su propio repo
+
+- Los 212 `.mid` de `crates/choz-engine/src/artifacts/arranger/rhythms/` (y su `README.md`) pasan a [midi-styles](https://github.com/jacodelia/midi-styles), idénticos blob por blob. choz nunca los leyó en runtime: el arreglador usa `arranger::styles::ALL`, que `tools/mid_to_styles.py` escribe a partir de ellos. El script ahora se corre sobre un clon de ese repo; `style.rs`, `mod.rs`, el README y el roadmap apuntan ahí.
+- **El manual se versiona por su fuente, no por el PDF.** `docs/choz-manual.fodt` (ODF plano: un XML que git comprime por diferencias y que `git diff` lee) reemplaza al `.odt` que `.gitignore` ignoraba por un `*.odt` perdido en la sección de Nix; `docs/choz-manual.pdf` sale del árbol (siete versiones ya pesaban 39,5 MB en el historial) y `release.yml` lo arma con `soffice --headless` y lo adjunta a cada release, dentro de `SHA256SUMS.txt`. El README lo enlaza en `releases/latest/download/choz-manual.pdf`.
+- Auditoría de la estructura de archivos: lo que queda (partir `choz-ui/src/lib.rs`, imágenes sin uso en `assets/`, binarios en git, nombres de los crates CLAP) está en la sección 5 del roadmap.
+
 ## [1.3.19] — 2026-09-26
 
 Release audit: `cargo test --workspace --exclude choz-plugin-lv2 --no-fail-fast -- --skip midi` 1094 pasan y 0 fallan; `cargo clippy --workspace --all-targets -D warnings` y `cargo fmt --all --check` limpios. i18n: la única clave nueva que pasa por `t(` es `FOLLOW`, en los ocho idiomas (`SAVE`, `REC` y `OCT` ya estaban); las etiquetas del motor (shapes, `Place`, STACKS/INTERVALS, RESET) siguen sin traducir, como el resto de los nombres de parámetros. Auditoría: `capture::is_unsaved` aceptaba una ruta con `..` (`starts_with` compara componentes) y las rutas pueden venir de un proyecto cargado: ahora la rechaza, con su assert en `an_unsaved_take_is_kept_or_thrown_away`. Documentación: `docs/fx-audit.md` sale del árbol (sigue en `git show v1.3.18:docs/fx-audit.md`, y el roadmap apunta ahí); `docs/architecture.md` (FOLLOW, REC/SAVE y las tomas sin guardar, Shape/Place/OCT AUTO); manual (4.5 FOLLOW, 5.6 REC y SAVE, 6.5 shapes, Place y OCT de tres estados), re-exportado a `docs/choz-manual.pdf`; README, overview y roadmap a 1.3.19.

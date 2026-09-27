@@ -37,11 +37,12 @@ staging an install for a machine that is not this one.
 
 **From a release** — no toolchain needed. Every tag publishes a `.tar.gz` per
 architecture (x86-64, aarch64, armv7), a `.deb`, an `.rpm` and a `PKGBUILD` for
-Arch, plus `SHA256SUMS.txt`:
+Arch, the user manual (`choz-manual.pdf`, built from `docs/choz-manual.fodt`),
+plus `SHA256SUMS.txt`:
 
 ```bash
-tar xzf choz-1.3.6-x86_64-unknown-linux-gnu.tar.gz
-cd choz-1.3.6-x86_64-unknown-linux-gnu
+tar xzf choz-1.3.20-x86_64-unknown-linux-gnu.tar.gz
+cd choz-1.3.20-x86_64-unknown-linux-gnu
 ./install.sh            # uses the binary shipped beside it — no cargo involved
 ```
 
