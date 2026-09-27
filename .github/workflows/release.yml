@@ -11,6 +11,7 @@
 #   • choz-<ver>-x86_64-unknown-linux-gnu.tar.gz  + .deb + .rpm
 #   • choz-<ver>-aarch64-unknown-linux-gnu.tar.gz + arm64 .deb   (Pi 3/4/5)
 #   • choz-<ver>-armv7-unknown-linux-gnueabihf.tar.gz + armhf .deb (Pi 2 / Zero 2 W)
+#   • choz-manual.pdf (built from docs/choz-manual.fodt)
 #   • SHA256SUMS.txt
 #
 # Linux only, and that is not an oversight: choz opens plugin windows through

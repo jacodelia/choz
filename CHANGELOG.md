@@ -32,7 +32,9 @@ lleva lo que falta —nada de lo ya hecho— y
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
 
-## [Unreleased]
+## [1.3.20] — 2026-09-26
+
+Release audit: `cargo test --workspace --exclude choz-plugin-lv2 --no-fail-fast -- --skip midi` 1094 pasan y 0 fallan; `cargo clippy --workspace --all-targets -D warnings` y `cargo fmt --all --check` limpios. Los cambios de código de esta versión son sólo comentarios: no hay claves de i18n nuevas. Los ritmos que salieron del árbol se verificaron dos veces: los 213 archivos de [midi-styles](https://github.com/jacodelia/midi-styles) tienen el mismo SHA de blob que los que estaban en `arranger/rhythms/`, y `tools/mid_to_styles.py` corrido sobre un clon de ese repo reescribe `arranger/styles.rs` byte por byte igual (212 estilos). El paso nuevo de `release.yml` que arma el manual corre por primera vez con este tag. Documentación: README, overview y roadmap a 1.3.20; `docs/install.md` cuenta el manual entre lo que publica cada release.
 
 ### 2026-09-26 — los ritmos del arreglador viven en su propio repo
 
