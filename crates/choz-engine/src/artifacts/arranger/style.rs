@@ -6,7 +6,8 @@
 //!
 //! # Where the numbers come from
 //!
-//! Every one of them is **measured**, off the rhythms in `arranger/rhythms` —
+//! Every one of them is **measured**, off the rhythms in
+//! <https://github.com/jacodelia/midi-styles> —
 //! one MIDI file per accompaniment, named after the style it becomes, its
 //! sections laid end to end and each track named with the part that plays it.
 //! `tools/mid_to_styles.py` is what measures them and [`super::styles`] is
@@ -20,8 +21,8 @@
 //! Nothing is hand-written here any more, and there is no style file format:
 //! the library is the source, the script is the reader, and a style that is
 //! wrong is a measurement to fix rather than a constant to tune. choz itself
-//! reads no MIDI to do it: the folder is the source, the table is what ships,
-//! and `arranger/rhythms/README.md` says what a file has to look like to be
+//! reads no MIDI to do it: that repository is the source, the table is what
+//! ships, and its `README.md` says what a file has to look like to be
 //! measured.
 
 /// How a style wants its bass played.
@@ -57,7 +58,8 @@ pub struct Drums {
     /// The **second bar** of a groove that is two bars long — the two-step's
     /// answer — played on every other bar. Empty is a one-bar groove, which is
     /// every rhythm that does not ask for two (a drum track named `… Drum
-    /// 2bar`, see `rhythms/README.md`).
+    /// 2bar`, see the `README.md` of
+    /// midi-styles).
     pub kick_b: &'static [f64],
     pub snare_b: &'static [f64],
     /// How often the cymbal speaks, in beats. `0.5` is eighths.
@@ -72,8 +74,9 @@ pub struct Drums {
 
 /// How a style plays a bar of **another** signature than its own — what a
 /// heterometric rhythm measures for each meter it changes to (a `Meter`
-/// section of the rhythm, see `rhythms/README.md`). A meter with none of these
-/// gets the style's own bar cut to length, or carried on into the extra beats.
+/// section of the rhythm, see the `README.md` of midi-styles). A meter with
+/// none of these gets the style's own bar cut to length, or carried on into the
+/// extra beats.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MeterGroove {
     pub meter: (u8, u8),

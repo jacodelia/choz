@@ -123,5 +123,10 @@ session.json
 # =========================================================
 # Optional: Nix
 # =========================================================
-*.odt
 result
+
+# =========================================================
+# The manual: docs/choz-manual.fodt is the source; the PDF is built by the
+# release workflow and attached to each GitHub Release.
+# =========================================================
+docs/*.pdf
