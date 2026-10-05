@@ -32,6 +32,12 @@ lleva lo que falta —nada de lo ya hecho— y
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
 
+## [Sin publicar]
+
+### 2026-10-05 — CI en Rust 1.99
+
+- `cargo clippy -D warnings` en CI (stable 1.99) fallaba en `main` después de 1.3.21: `AtomicU32::fetch_update` quedó deprecado a favor de `try_update` (`meter.rs`, `publish_faults`). `try_update` ya existe en 1.97, así que el cambio compila en los dos. El paquete de `v1.3.21` no se vio afectado: `release.yml` no corre clippy. Verificado con `cargo +beta clippy --workspace --all-targets -D warnings` (1.99) y con stable 1.97.
+
 ## [1.3.21] — 2026-10-05
 
 Release audit: `cargo test --workspace --exclude choz-plugin-lv2 --no-fail-fast -- --skip midi` 1097 pasan y 0 fallan (los 1094 de 1.3.20 más los tres nuevos); `cargo clippy --workspace --all-targets -D warnings` y `cargo fmt --all --check` limpios. i18n: una sola clave nueva, `ALL` (los botones del deck), en los ocho idiomas (TODO, TUDO, TOUT, TUTTO, ALLE, ВСЁ, 全部, 全部); `the_table_and_the_call_sites_are_the_same_list` y `every_row_translates_something` pasan. Auditoría del diff: `draw_loop_deck` devolvía `y + 1` aunque la fila se partiera en dos en un panel angosto (más probable con los dos botones nuevos), y lo que venía debajo se dibujaba encima: ahora devuelve dónde terminó la fila (`ButtonRow::finish`). Documentación: manual (6.3, párrafo del looper: ▶/▌▌ ALL, ■ ALL y REC antes de que exista el largo del loop); README, overview, roadmap e install a 1.3.21.
