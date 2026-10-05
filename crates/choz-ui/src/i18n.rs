@@ -269,6 +269,7 @@ static TABLE: &[Row] = &[
     ("FOLLOW", ["SEGUIR", "SEGUIR", "SUIVRE", "SEGUI", "FOLGEN", "\u{421}\u{41b}\u{415}\u{414}", "\u{8ffd}\u{5f93}", "\u{8ddf}\u{968f}"]),
     ("REC", ["GRAB", "GRAV", "ENR", "REG", "AUFN", "\u{417}\u{410}\u{41f}", "\u{9332}\u{97f3}", "\u{5f55}\u{97f3}"]),
     ("PAUSE", ["PAUSA", "PAUSA", "PAUSE", "PAUSA", "PAUSE", "\u{41f}\u{410}\u{423}\u{417}\u{410}", "\u{4e00}\u{6642}\u{505c}\u{6b62}", "\u{6682}\u{505c}"]),
+    ("ALL", ["TODO", "TUDO", "TOUT", "TUTTO", "ALLE", "\u{412}\u{421}\u{401}", "\u{5168}\u{90e8}", "\u{5168}\u{90e8}"]),
     ("CLEAR", ["BORRAR", "LIMPAR", "EFFACER", "CANCELLA", "L\u{d6}SCHEN", "\u{421}\u{422}\u{415}\u{420}\u{415}\u{422}\u{42c}", "\u{6d88}\u{53bb}", "\u{6e05}\u{9664}"]),
     ("EXPORT LOOPS", ["EXPORTAR LOOPS", "EXPORTAR LOOPS", "EXPORTER LES BOUCLES", "ESPORTA I LOOP", "LOOPS EXPORTIEREN", "\u{42d}\u{41a}\u{421}\u{41f}\u{41e}\u{420}\u{422} \u{41b}\u{423}\u{41f}\u{41e}\u{412}", "\u{30eb}\u{30fc}\u{30d7}\u{3092}\u{66f8}\u{304d}\u{51fa}\u{3059}", "\u{5bfc}\u{51fa}\u{5faa}\u{73af}"]),
     // The arranger's box: the switch on the generator row, and what the box

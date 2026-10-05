@@ -813,9 +813,20 @@ impl Looper {
         true
     }
 
-    fn publish(&self) {
+    fn publish(&mut self) {
         for t in 0..self.tracks.len() {
-            self.state.set_track(t, self.tracks[t].state);
+            let now = self.tracks[t].state;
+            self.state.set_track(t, now);
+            // **The edge follows the deck.** A take closes itself at the
+            // loop's length, and a REC with no length yet is refused — both
+            // leave the state knob's last value saying REC while the channel
+            // is not recording, and the next REC press was the same value and
+            // got swallowed: a channel that would not record at all.
+            if let Some(last) = self.last_param.get_mut(P_STATE + t) {
+                if last.is_nan() || state_of(*last) != now {
+                    *last = param_of(now);
+                }
+            }
         }
         self.state.set_frames(self.loop_frames);
         self.state.set_pos(self.pos);
@@ -1257,6 +1268,49 @@ mod tests {
         let mut lp = Looper::new(48_000);
         assert!(lp.loopdeck().is_some());
         assert!(lp.loopdeck().is_none(), "there is only one of them");
+    }
+
+    /// A REC the deck refused, or a take that closed itself at the loop's
+    /// length, must not swallow the next REC on that channel. The knob acts on
+    /// edges, and its last value used to stay at REC — a channel that would
+    /// not record again, however many times it was pressed.
+    #[test]
+    fn a_rec_the_deck_did_not_keep_does_not_swallow_the_next_one() {
+        let (mut lp, _h) = deck(8_000, 4);
+        let rec = |lp: &mut Looper, t: usize| {
+            FxProcessor::set_param(lp, P_STATE + t, P_REC);
+            let mut buf = ramp(1_000, 0.3);
+            lp.process_block(&mut buf, 8_000);
+        };
+        // Channel 2 armed while channel 1 is still taking: no length, refused.
+        rec(&mut lp, 0);
+        rec(&mut lp, 1);
+        assert_eq!(lp.track_state(1), LoopTrackState::Idle, "refused");
+        FxProcessor::set_param(&mut lp, P_STATE, P_PLAY);
+        lp.process_block(&mut ramp(100, 0.0), 8_000);
+        assert!(lp.loop_frames() > 0);
+        rec(&mut lp, 1);
+        assert_eq!(
+            lp.track_state(1),
+            LoopTrackState::Recording,
+            "the second REC lands"
+        );
+
+        // Run it to the loop's length: it closes itself, and REC works again.
+        for _ in 0..8 {
+            lp.process_block(&mut ramp(1_000, 0.3), 8_000);
+        }
+        assert_eq!(
+            lp.track_state(1),
+            LoopTrackState::Playing,
+            "closed at the length"
+        );
+        rec(&mut lp, 1);
+        assert_eq!(
+            lp.track_state(1),
+            LoopTrackState::Recording,
+            "and records again"
+        );
     }
 
     /// Record a take, close it, hear it back.
