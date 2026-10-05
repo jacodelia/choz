@@ -41,8 +41,8 @@ Arch, the user manual (`choz-manual.pdf`, built from `docs/choz-manual.fodt`),
 plus `SHA256SUMS.txt`:
 
 ```bash
-tar xzf choz-1.3.20-x86_64-unknown-linux-gnu.tar.gz
-cd choz-1.3.20-x86_64-unknown-linux-gnu
+tar xzf choz-1.3.21-x86_64-unknown-linux-gnu.tar.gz
+cd choz-1.3.21-x86_64-unknown-linux-gnu
 ./install.sh            # uses the binary shipped beside it — no cargo involved
 ```
 

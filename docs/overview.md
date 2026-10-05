@@ -2,7 +2,7 @@
 
 What choz does today, in more detail than the README's feature table.
 
-**1.3.20.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
+**1.3.21.** The FX engine, the rack and the TUI are real and working, **CLAP, LV2,
 LADSPA, DSSI, VST2, VST3 and Pure Data patches are really hosted** — instruments
 and audio effects, with their own parameters and their own windows — choz's own
 56 effects and all four artifacts — the arpeggiator, the step sequencer, the
