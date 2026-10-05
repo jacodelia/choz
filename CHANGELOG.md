@@ -12,7 +12,7 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **1083 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo) y sin los de `midi::` (`--skip midi`: abren los puertos ALSA reales y en la máquina de desarrollo tiran el hub USB del dock), 649 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **1097 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo) y sin los de `midi::` (`--skip midi`: abren los puertos ALSA reales y en la máquina de desarrollo tiran el hub USB del dock), 649 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio, y `cargo fmt --all --check` también.
 - **56 efectos propios**, publicados también como un `.clap` con los cuatro artifacts (arpegiador, secuenciador, metrónomo y arreglador).
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
@@ -31,6 +31,19 @@ lleva lo que falta —nada de lo ya hecho— y
   `choz-engine::test_locks` tiene un candado por global; en `choz-ui` el par es
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
+
+## [1.3.21] — 2026-10-05
+
+Release audit: `cargo test --workspace --exclude choz-plugin-lv2 --no-fail-fast -- --skip midi` 1097 pasan y 0 fallan (los 1094 de 1.3.20 más los tres nuevos); `cargo clippy --workspace --all-targets -D warnings` y `cargo fmt --all --check` limpios. i18n: una sola clave nueva, `ALL` (los botones del deck), en los ocho idiomas (TODO, TUDO, TOUT, TUTTO, ALLE, ВСЁ, 全部, 全部); `the_table_and_the_call_sites_are_the_same_list` y `every_row_translates_something` pasan. Auditoría del diff: `draw_loop_deck` devolvía `y + 1` aunque la fila se partiera en dos en un panel angosto (más probable con los dos botones nuevos), y lo que venía debajo se dibujaba encima: ahora devuelve dónde terminó la fila (`ButtonRow::finish`). Documentación: manual (6.3, párrafo del looper: ▶/▌▌ ALL, ■ ALL y REC antes de que exista el largo del loop); README, overview, roadmap e install a 1.3.21.
+
+### 2026-10-05 — un efecto apagado ya no corre los índices; BANK en su tab; el looper graba en todos sus canales
+
+- **Un knob detrás de un efecto apagado llegaba al efecto equivocado.** Desde `e32b858` (27-ago) el motor guarda un efecto apagado como `Bypass` *en su lugar* (`build_chain_from_specs`), pero la UI seguía contando sólo los encendidos para traducir la posición: con un harmonizer en OFF delante, el `Semi` del PITCH SHIFT iba al bypass y el tono no se movía nunca ("se queda pegado en la barra semi"). Corregido en los cinco lugares que hacían esa cuenta: `engine_fx_index`, `set_background_fx_param`, el estado de los plugins al guardar y al reconstruir el rack, y el export de las tomas del looper (`tab{n}-fx{m}` ahora es la posición del rack). Test: `an_effect_behind_a_switched_off_one_keeps_its_engine_index`.
+- **BANK ◀ ▶ aprendido en la tab del Keystation cambiaba el sonido de la tab que estuviera al frente.** `fire_trigger_on` recibía la tab dueña del botón pero `PresetPrev/Next` llamaba a `step_preset` sobre la activa: con la tab del KeyStep al frente (mismo SF2, otro sonido) el botón del Keystation se la cambiaba. Ahora `step_preset_on(tab, …)` y `apply_preset_on(tab)`. Test: `a_bank_button_steps_its_own_tabs_soundfont`.
+- **Un canal del looper que no grababa más.** El parámetro de estado actúa por flancos (`last_param`), y el deck cambia de estado solo: una toma se cierra al llegar al largo del loop, y un REC sin largo todavía (canal 1 grabando) se rechaza. En los dos casos el último valor quedaba en REC y el REC siguiente en ese canal era "el mismo valor" y se tragaba. `publish` ahora iguala `last_param` al estado real en cada bloque. Una automatización de host que deje REC fijo vuelve a armar el canal después de cada vuelta del loop. Test: `a_rec_the_deck_did_not_keep_does_not_swallow_the_next_one` (falla sin el arreglo).
+- **Looper: ▶ ALL / ▌▌ ALL y ■ ALL** al principio de la fila del deck (`LoopBtn::AllPlay`, `AllStop`, `App::loop_all`): PLAY arranca cada canal con toma; con algo sonando pausa todo en su lugar (un canal grabando se cierra y queda sonando); STOP para todo. Entran en el recorrido con teclado de la fila. Sin test automático: necesitan el motor de audio corriendo.
+- **KEYS desproporcionado con un solo cajón abierto.** `piano_lines` daba todas las celdas sobrantes a las primeras teclas: los graves salían una celda más anchos que los agudos cada vez que el ancho no era múltiplo de 52, y las etiquetas de octava usaban un ancho fijo y se corrían de su Do. Ahora el sobrante se reparte parejo y cada etiqueta mide lo que su tecla. Test: `a_leftover_width_is_spread_across_the_keyboard`.
+- La rueda del mouse en el diálogo CHORD del harmonizer y `Scale` abriendo en cromática ya estaban desde 1.3.19; los reportes venían de un binario anterior (`/usr/bin/choz` del 23-sep).
 
 ## [1.3.20] — 2026-09-26
 

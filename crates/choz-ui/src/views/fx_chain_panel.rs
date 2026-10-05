@@ -423,6 +423,11 @@ pub enum LoopBtn {
     /// transport the quantise rounds to.
     Metro,
     Export,
+    /// Every channel at once: PLAY on whatever holds a take, or PAUSE on
+    /// everything playing — the deck's own transport, one press for the band.
+    AllPlay,
+    /// Every channel stopped.
+    AllStop,
     /// One more channel strip, up to [`choz_ports::LOOP_TRACKS`].
     AddChan,
     PagePrev,
@@ -449,7 +454,9 @@ impl LoopBtn {
     /// The deck's own row, under the strips — one more stop on the same walk,
     /// so `+`, the page arrows, CLEAR and EXPORT are all reachable without a
     /// mouse.
-    pub const DECK: [LoopBtn; 5] = [
+    pub const DECK: [LoopBtn; 7] = [
+        LoopBtn::AllPlay,
+        LoopBtn::AllStop,
         LoopBtn::PagePrev,
         LoopBtn::PageNext,
         LoopBtn::AddChan,
@@ -4516,6 +4523,27 @@ fn draw_loop_deck(
         let rect = row.button(f, text, style);
         layout.loop_deck.push((btn, rect));
     };
+    // The deck's transport first, where a player's eye starts the row.
+    let any_playing = v
+        .state
+        .is_some_and(|s| (0..chans).any(|t| s.track(t) == choz_ports::LoopTrackState::Playing));
+    hit(
+        f,
+        &mut row,
+        LoopBtn::AllPlay,
+        match any_playing {
+            true => format!(" \u{258C}\u{258C} {} ", t("ALL")),
+            false => format!(" \u{25B6} {} ", t("ALL")),
+        },
+        btn_style,
+    );
+    hit(
+        f,
+        &mut row,
+        LoopBtn::AllStop,
+        format!(" \u{25A0} {} ", t("ALL")),
+        btn_style,
+    );
     if pages > 1 {
         hit(
             f,
@@ -4582,8 +4610,9 @@ fn draw_loop_deck(
         },
         Style::default().fg(LABEL),
     );
-    row.finish();
-    y + 1
+    // Wherever the row really ended: on a narrow panel it wraps, and `y + 1`
+    // drew whatever comes next over its second line.
+    row.finish()
 }
 
 /// The AutoTune strip: level, the note heard, the note aimed at, the error, and

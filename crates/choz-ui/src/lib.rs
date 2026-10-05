@@ -3004,8 +3004,8 @@ impl App {
     /// pan, a ping-pong delay. A hosted plugin counts as stereo because nothing
     /// here can know what it does.
     ///
-    /// Only *enabled* effects count — a bypassed reverb is not in the engine's
-    /// chain at all.
+    /// Only *enabled* effects count — a bypassed reverb is a wire in the
+    /// engine's chain.
     fn tab_is_mono(&self, tab: usize) -> bool {
         let Some(slot) = self.slots.get(tab) else {
             return false;
@@ -7672,18 +7672,13 @@ impl App {
             return;
         };
         for (slot, tab) in project.rack.iter_mut().enumerate() {
-            // The engine holds only the *enabled* effects, the same arithmetic
-            // the states and the meters use.
-            let mut engine_fx = 0usize;
-            for fx in tab.fx.iter_mut() {
-                // A disabled effect is not in the engine's chain at all, so
-                // it has no deck and no index of its own — its takes are gone
-                // the moment it was switched off, the same as any other.
+            // The engine keeps every effect at its rack position, a disabled
+            // one as a bypass — which has no deck, so its takes are gone the
+            // moment it was switched off, the same as any other.
+            for (at, fx) in tab.fx.iter_mut().enumerate() {
                 if !fx.enabled {
                     continue;
                 }
-                let at = engine_fx;
-                engine_fx += 1;
                 let Some(handle) = engine.fx_looper(slot, at) else {
                     continue;
                 };
@@ -10011,13 +10006,9 @@ impl App {
                     .enumerate()
                     .map(|(ui_fx, e)| {
                         let spec = e.to_spec();
-                        // The engine only holds the *enabled* entries, so the
-                        // index of this one there is how many enabled ones come
-                        // before it — the same arithmetic `engine_fx_index`
-                        // does for the active tab.
-                        let engine_fx = e
-                            .enabled
-                            .then(|| slot.fx_chain[..ui_fx].iter().filter(|x| x.enabled).count());
+                        // Same position in the engine (a switched-off unit is
+                        // a bypass there), but only a running one has state.
+                        let engine_fx = e.enabled.then_some(ui_fx);
                         project::Fx {
                             // Hosted effects record their host format instead
                             // of a built-in FX id.
@@ -11158,8 +11149,11 @@ impl App {
             _ => {}
         }
         match action {
-            TriggerAction::PresetPrev => self.step_preset(-1),
-            TriggerAction::PresetNext => self.step_preset(1),
+            // The button's own tab, not the one in front: BANK learned on the
+            // Keystation's tab stepped whichever tab was showing, so with the
+            // KeyStep's tab up it changed that one's sound instead.
+            TriggerAction::PresetPrev => self.step_preset_on(tab, -1),
+            TriggerAction::PresetNext => self.step_preset_on(tab, 1),
             TriggerAction::InstrPagePrev => self.page_instr(-1),
             TriggerAction::InstrReset => self.reset_instr_params(),
             TriggerAction::InstrPageNext => self.page_instr(1),
@@ -13353,7 +13347,46 @@ impl App {
             }
             LoopBtn::Clear => self.clear_loop_track(self.loop_cursor.0),
             LoopBtn::Export => self.open_loop_export(),
+            LoopBtn::AllPlay => self.loop_all(true),
+            LoopBtn::AllStop => self.loop_all(false),
             _ => {}
+        }
+    }
+
+    /// The deck's transport: every channel at once. PLAY starts whatever holds
+    /// a take — or, with anything playing, pauses it all in place (a take
+    /// being recorded is closed, which is what PLAY on its strip does too).
+    /// STOP stops everything.
+    fn loop_all(&mut self, play: bool) {
+        use choz_engine::fx::looper as deck;
+        use choz_ports::LoopTrackState as S;
+        let Some(state) = self.loop_state() else {
+            return;
+        };
+        let (slot, fx) = (self.active_slot, self.fx_slot);
+        let has_take: Vec<bool> = match self
+            .audio_engine
+            .as_mut()
+            .and_then(|e| e.fx_looper(slot, fx))
+        {
+            Some(h) => (0..choz_ports::LOOP_TRACKS)
+                .map(|t| !h.take(t).is_empty())
+                .collect(),
+            None => return,
+        };
+        let chans = self.loop_chans();
+        let any_playing = (0..chans).any(|t| state.track(t) == S::Playing);
+        for (t, &has_take) in has_take.iter().enumerate().take(chans) {
+            let now = state.track(t);
+            let want = match (play, any_playing, now) {
+                (false, _, S::Idle) => continue,
+                (false, _, _) => S::Idle,
+                (true, true, S::Playing) => S::Paused,
+                (true, true, S::Recording) => S::Playing,
+                (true, false, S::Idle | S::Paused) if has_take => S::Playing,
+                _ => continue,
+            };
+            self.set_fx_param_at(deck::P_STATE + t, deck::param_of(want));
         }
     }
 
@@ -15599,8 +15632,7 @@ impl App {
                     if entry.state.is_empty() || !entry.enabled {
                         continue;
                     }
-                    let engine_fx = slot.fx_chain[..ui_fx].iter().filter(|x| x.enabled).count();
-                    engine.set_fx_state(i, engine_fx, &entry.state);
+                    engine.set_fx_state(i, ui_fx, &entry.state);
                 }
             }
         }
@@ -15810,19 +15842,23 @@ impl App {
     /// Step the active tab's program by `delta` and apply it. This is what the
     /// RACK's `\u{25C0}` / `\u{25B6}` buttons (and their MIDI bindings) do.
     fn step_preset(&mut self, delta: isize) {
-        let last = self.preset_labels(self.active_slot).len() as isize - 1;
+        self.step_preset_on(self.active_slot, delta)
+    }
+
+    fn step_preset_on(&mut self, tab: usize, delta: isize) {
+        let last = self.preset_labels(tab).len() as isize - 1;
         if last < 0 {
             return;
         }
         // Inside the bank, not across the whole list: stepping out of "Factory"
         // into somebody's third-party pack is not what the next patch means,
         // and with 3008 of them it is not even findable again.
-        let bank: Option<String> = self.slots.get(self.active_slot).and_then(|s| {
+        let bank: Option<String> = self.slots.get(tab).and_then(|s| {
             s.plugin_presets
                 .get(s.preset_cursor)
                 .map(|e| Self::preset_bank(e).to_string())
         });
-        if let Some(slot) = self.slots.get_mut(self.active_slot) {
+        if let Some(slot) = self.slots.get_mut(tab) {
             let mut at = slot.preset_cursor as isize;
             match &bank {
                 Some(bank) if !bank.is_empty() => {
@@ -15855,7 +15891,7 @@ impl App {
             }
             slot.preset_cursor = at.clamp(0, last) as usize;
         }
-        self.apply_selected_preset();
+        self.apply_preset_on(tab);
     }
 
     /// What the active tab plays, for the RACK's instrument line.
@@ -16232,14 +16268,12 @@ impl App {
         } else {
             param
         };
-        // The engine numbers only the units that are switched on, exactly as
-        // [`App::engine_fx_index`] does for the tab in front.
-        let engine_fx = self.slots.get(slot).and_then(|s| {
-            s.fx_chain
-                .get(fx)?
-                .enabled
-                .then(|| s.fx_chain[..fx].iter().filter(|e| e.enabled).count())
-        });
+        // Same position as in the rack, exactly as [`App::engine_fx_index`]
+        // does for the tab in front.
+        let engine_fx = self
+            .slots
+            .get(slot)
+            .and_then(|s| s.fx_chain.get(fx)?.enabled.then_some(fx));
         if let (Some(engine_fx), Some(engine)) = (engine_fx, self.audio_engine.as_mut()) {
             engine.set_fx_param(slot, engine_fx, idx, value);
         }
@@ -16378,13 +16412,18 @@ impl App {
         }
     }
 
-    /// Position of UI FX `fx_idx` in the engine's chain, which only holds the
-    /// enabled entries. `None` when that entry is disabled (nothing to update).
+    /// Position of UI FX `fx_idx` in the engine's chain. `None` when that entry
+    /// is disabled (a bypass there: nothing to update).
     fn engine_fx_index(&self, fx_idx: usize) -> Option<usize> {
         if !self.fx_chain.get(fx_idx)?.enabled {
             return None;
         }
-        Some(self.fx_chain[..fx_idx].iter().filter(|e| e.enabled).count())
+        // **The rack's own position.** The engine keeps a switched-off unit as
+        // a bypass in its place (see `build_chain_from_specs`); counting only
+        // the enabled ones sent every knob after an OFF effect to its
+        // neighbour — a pitch shifter behind a switched-off harmoniser sent
+        // its Semi to the harmoniser's bypass, and the pitch never moved.
+        Some(fx_idx)
     }
 
     /// Push a **background** tab's stored chain to its engine slot.
@@ -31301,6 +31340,23 @@ mod tests {
         assert!(app.fx_dirty, "the looper deck is still built, not set");
     }
 
+    /// A knob reaches the effect at its own rack position, OFF effects ahead
+    /// of it included: the engine keeps those as bypasses in place, and
+    /// counting only the enabled ones sent a pitch shifter's Semi behind a
+    /// switched-off harmoniser to the harmoniser's bypass.
+    #[test]
+    fn an_effect_behind_a_switched_off_one_keeps_its_engine_index() {
+        let mut app = App::new();
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.fx_chain
+            .push(AudioFxEntry::new(source::AudioFxKind::Harmonizer));
+        app.fx_chain
+            .push(AudioFxEntry::new(source::AudioFxKind::PitchShifter));
+        app.fx_chain[0].enabled = false;
+        assert_eq!(app.engine_fx_index(0), None, "OFF has nothing to set");
+        assert_eq!(app.engine_fx_index(1), Some(1));
+    }
+
     /// The ENVELOPE effect writes a contour onto the FX chain, and its five
     /// stages are drawn as one bank of vertical faders — five numbers in a row
     /// do not have a shape, and the shape is the whole control.
@@ -34775,6 +34831,46 @@ mod tests {
             "the level is the player's from here"
         );
         assert!(before < 1.5);
+    }
+
+    /// BANK ◀ ▶ learned on the Keystation's tab steps **that** tab's
+    /// SoundFont, whichever tab is in front — the same file loaded on the
+    /// KeyStep's tab with another sound kept its own.
+    #[test]
+    fn a_bank_button_steps_its_own_tabs_soundfont() {
+        use choz_engine::input::InputSource;
+        let mut app = App::new();
+        app.midi_connected = vec!["Keystation Pro 88".into(), "KeyStep 32".into()];
+        for tab in 0..2 {
+            app.push_slot(AudioSource::Midi);
+            app.slots[tab].presets = (0..4)
+                .map(|p| choz_engine::sources::Sf2Preset {
+                    bank: 0,
+                    preset: p,
+                    name: format!("p{p}"),
+                })
+                .collect();
+        }
+        app.slots[0].input = Some(InputRef::Midi("Keystation Pro 88".into()));
+        app.slots[1].input = Some(InputRef::Midi("KeyStep 32".into()));
+        app.slots[1].preset_cursor = 2;
+        app.pc_bindings.push(PcBinding {
+            program: 1,
+            target: LearnTarget::Trigger(TriggerAction::PresetNext),
+            source: Some(InputRef::Midi("Keystation Pro 88".into())),
+            tab: Some(0),
+        });
+
+        app.active_slot = 1;
+        app.apply_program_button(InputSource::Midi(0), 1);
+        assert_eq!(
+            app.slots[0].preset_cursor, 1,
+            "the Keystation's tab stepped"
+        );
+        assert_eq!(
+            app.slots[1].preset_cursor, 2,
+            "the KeyStep's tab kept its sound"
+        );
     }
 
     /// The Keystation's **buttons** recall sounds on the Keystation's tab.

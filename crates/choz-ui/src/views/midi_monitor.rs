@@ -890,13 +890,16 @@ fn piano_lines(
         )
     };
     // How wide each key is drawn, joins included. Every key is at least
-    // `key_w + 1`; the cells left over go to the first ones, which is what
-    // makes the row end where the panel does.
+    // `key_w + 1`; the cells left over are spread evenly along the row, which
+    // is what makes it end where the panel does. Handing them all to the
+    // first keys drew the bass end a cell wider per key than the treble — a
+    // keyboard visibly lopsided whenever one drawer was open and the other not.
     let n = whites.len().max(1);
     let cap = n * (KEY_W_MAX + 1);
     let total = room.min(cap).max(n * (key_w + 1));
-    let (base, extra) = (total / n, total % n);
-    let widths: Vec<usize> = (0..n).map(|i| base + usize::from(i < extra)).collect();
+    let widths: Vec<usize> = (0..n)
+        .map(|i| (i + 1) * total / n - i * total / n)
+        .collect();
     let mut cells: Vec<(u16, u16)> = Vec::with_capacity(n);
     let mut at = 0u16;
     for w in &widths {
@@ -943,15 +946,17 @@ fn piano_lines(
     // to carry it, and the bare octave digit when it is not. C4 is middle C, as
     // everywhere else.
     let mut labels = Vec::with_capacity(whites.len() * 2);
-    for &w in whites {
+    for (i, &w) in whites.iter().enumerate() {
+        // Each label as wide as the key above it, or they drift off their Cs.
+        let kw = widths[i].saturating_sub(1).max(1);
         let text = match w % 12 == 0 {
-            false => " ".repeat(key_w),
+            false => " ".repeat(kw),
             true => {
                 let oct = (w as i32 / 12) - 1;
                 let full = format!("C{oct}");
-                match full.chars().count() <= key_w {
-                    true => format!("{full:<key_w$}"),
-                    false => format!("{:<key_w$}", oct.rem_euclid(10)),
+                match full.chars().count() <= kw {
+                    true => format!("{full:<kw$}"),
+                    false => format!("{:<kw$}", oct.rem_euclid(10)),
                 }
             }
         };
@@ -3019,6 +3024,21 @@ mod tests {
         assert_eq!(auto_key_w(104), 1, "52 keys and their seams, exactly");
         assert_eq!(auto_key_w(156), 2);
         assert_eq!(auto_key_w(4000), KEY_W_MAX, "and it stops growing");
+    }
+
+    /// The cells left over after a whole number of keys are spread along the
+    /// row, not piled on its bass end: one drawer open is a width that does not
+    /// divide by 52, and the low octaves came out a cell wider per key.
+    #[test]
+    fn a_leftover_width_is_spread_across_the_keyboard() {
+        let k = KeyboardState::default();
+        for w in [130, 150, 190, 230] {
+            let map = keyboard_lines(&k, KeyColor::Channel, w, 6).1;
+            let widths: Vec<u16> = map.cells.iter().map(|c| c.1).collect();
+            let half = widths.len() / 2;
+            let (lo, hi): (u16, u16) = (widths[..half].iter().sum(), widths[half..].iter().sum());
+            assert!(lo.abs_diff(hi) <= 1, "{w} cells: bass {lo} vs treble {hi}");
+        }
     }
 
     /// Lit keys change colour — the whole point of the panel. Both colours of
