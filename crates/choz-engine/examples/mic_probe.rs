@@ -3,10 +3,10 @@
 //!
 //! Starts the engine on the native JACK client wired to `sink`, plays one SF2
 //! note, and records `choz_mic` through the PulseAudio layer at 48 kHz — the
-//! way a browser or Zoom opens it. Checks that the main pair reaches both the
-//! interface and the microphone, that the microphone's own ports are not
-//! offered as a choz input (a feedback loop), and that the take is not silent
-//! or clipped, in stereo and summed to mono.
+//! way a browser or Zoom opens it. Checks that the main pair reaches the
+//! interface and only `mic_L/R` reach the microphone, that the microphone's own
+//! ports are not offered as a choz input (a feedback loop), and that the take
+//! is not silent, stays under the ceiling, and survives the mono sum.
 //!
 //! `cargo run -p choz-engine --example mic_probe -- [sink]` (no sink: list them)
 
@@ -63,9 +63,13 @@ fn main() -> anyhow::Result<()> {
             .collect()
     };
     let out1 = under("choz:out_1");
-    println!("choz:out_1 -> {out1:?}");
-    if !out1.iter().any(|p| p == "choz Mic:input_FL") {
-        failed.push("out_1 does not reach choz Mic");
+    let mic = under("choz:mic_L");
+    println!("choz:out_1 -> {out1:?}\nchoz:mic_L -> {mic:?}");
+    if !mic.iter().any(|p| p == "choz Mic:input_FL") {
+        failed.push("mic_L does not reach choz Mic");
+    }
+    if out1.iter().any(|p| p.starts_with("choz Mic:")) {
+        failed.push("out_1 (with the click) reaches choz Mic");
     }
     if !out1.iter().any(|p| !p.starts_with("choz Mic:")) {
         failed.push("out_1 does not reach the interface");
@@ -116,8 +120,9 @@ fn main() -> anyhow::Result<()> {
     if l.max(r) < 1e-3 {
         failed.push("choz Mic is silent");
     }
-    if l.max(r) >= 1.0 {
-        failed.push("choz Mic clips");
+    // The mic's limiter sits at -1 dBFS.
+    if l.max(r) > 0.9 {
+        failed.push("choz Mic over its ceiling");
     }
     // A stereo patch summed to mono losing more than 6 dB is phase trouble.
     if db(mono) < db(l.max(r)) - 6.0 {

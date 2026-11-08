@@ -18,6 +18,7 @@ mod jack_backend;
 pub mod layered;
 pub mod maxpat;
 pub mod meter;
+mod mic_feed;
 pub mod midi;
 pub mod osc;
 pub mod param_shape;

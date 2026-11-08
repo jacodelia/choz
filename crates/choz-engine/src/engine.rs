@@ -718,6 +718,9 @@ pub(crate) struct RtState {
     /// lock-free ring is the only thing that may pass between two audio
     /// threads.
     pub(crate) capture_rx: Option<rtrb::Consumer<f32>>,
+    /// What `choz Mic` gets: the main pair without the click, folded and
+    /// limited for a meeting app. `None` where there is no `choz Mic` (cpal).
+    pub(crate) mic: Option<crate::mic_feed::MicFeed>,
     pub(crate) sample_rate: u32,
 }
 
@@ -1228,6 +1231,7 @@ impl AudioEngine {
             main_mute: false,
             capture: vec![vec![0.0; frames]; ins],
             capture_rx,
+            mic: None,
             sample_rate: self.sample_rate,
         }
     }
@@ -2957,6 +2961,7 @@ impl RtState {
             capture,
             playing,
             sample_rate,
+            mic,
             ..
         } = self;
         let last = mix.len().saturating_sub(1);
@@ -3262,6 +3267,12 @@ impl RtState {
             }
         }
 
+        // `choz Mic`'s copy, taken here: everything but the click, which is the
+        // player's reference and not something the other end of a call needs.
+        if let (Some(feed), true) = (mic.as_mut(), mix.len() >= 2) {
+            feed.take(&mix[0], &mix[1], frames);
+        }
+
         // The click, on top of everything and through no tab's FX: a metronome
         // that a reverb smears is a metronome you cannot play to. Where it
         // lands is the metronome's own setting — the point of a subgroup is
@@ -3310,6 +3321,9 @@ impl RtState {
                     *s *= g;
                 }
             }
+        }
+        if let Some(feed) = mic.as_mut() {
+            feed.finish(main, frames, *sample_rate);
         }
 
         // What went out, for whoever draws it. The first pair is the one the
@@ -3458,11 +3472,12 @@ fn jack_current_sink() -> Option<String> {
         .ports(None, Some(JACK_AUDIO), jack::PortFlags::IS_OUTPUT)
         .into_iter()
         .find(|p| {
-            p.starts_with(&format!("{}:", crate::jack_backend::CLIENT_NAME))
-                || p.starts_with(&format!("{CPAL_JACK_CLIENT}:"))
+            (p.starts_with(&format!("{}:", crate::jack_backend::CLIENT_NAME))
+                || p.starts_with(&format!("{CPAL_JACK_CLIENT}:")))
+                && !crate::jack_backend::is_mic_port(p)
         })?;
-    // `out_1` always reaches `choz Mic` too; that is a copy for meetings, not
-    // where the audio is going.
+    // Nothing of choz's own is an answer: a port patched into `choz Mic` by
+    // hand is a copy for a meeting, not where the audio is going.
     client
         .port_by_name(&out)?
         .get_connections()
@@ -3480,7 +3495,9 @@ fn jack_route_to(sink: &str, client_name: &str) -> Result<()> {
         client
             .ports(None, Some(JACK_AUDIO), jack::PortFlags::IS_OUTPUT)
             .into_iter()
-            .filter(|p| p.starts_with(&format!("{client_name}:")))
+            .filter(|p| {
+                p.starts_with(&format!("{client_name}:")) && !crate::jack_backend::is_mic_port(p)
+            })
             .collect(),
     );
     if ours.is_empty() {
@@ -3536,7 +3553,7 @@ fn jack_route_to(sink: &str, client_name: &str) -> Result<()> {
     );
     // The rewire above dropped every connection of ours, the virtual
     // microphone's included.
-    crate::jack_backend::wire_mic(&client, &ours);
+    crate::jack_backend::wire_mic(&client);
     Ok(())
 }
 
@@ -4030,6 +4047,7 @@ mod tests {
             main_mute: false,
             capture: vec![vec![0.0; 32]; ins],
             capture_rx: None,
+            mic: None,
             sample_rate: 48_000,
         };
         (cmd_tx, retired_rx, state)
@@ -5814,6 +5832,25 @@ mod tests {
 
         m.set_dest(Dest::Direct);
         m.set_on(false);
+    }
+
+    /// The click is the player's reference: in the headphones, not in the call.
+    #[test]
+    fn the_click_stays_out_of_choz_mic() {
+        let _clock = crate::test_locks::transport();
+        let (_cmd_tx, _retired, mut state) = mk_state_ch(2, 0);
+        state.mic = Some(crate::mic_feed::MicFeed::new(48_000, 32));
+        let m = crate::artifacts::metronome::metronome();
+        m.set_dest(Dest::Direct);
+        m.set_on(true);
+        m.set_gain(1.0);
+        choz_ports::transport().set_bpm(120.0);
+        state.render(8);
+        m.set_on(false);
+        let click = (0..8).fold(0.0f32, |acc, f| acc.max(state.mix[0][f].abs()));
+        assert!(click > 0.01, "the click is in the main pair: {click}");
+        let feed = &state.mic.as_ref().unwrap().buf[..16];
+        assert!(feed.iter().all(|s| s.abs() < 1e-6), "and not in the mic");
     }
 
     #[test]
