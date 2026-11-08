@@ -34,6 +34,19 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## [Sin publicar]
 
+## [1.3.22] — 2026-11-08
+
+Release audit: `cargo test --workspace --exclude choz-plugin-lv2 --no-fail-fast -- --skip midi` 1097 pasan y 0 fallan; `cargo clippy --workspace --all-targets -D warnings` y `cargo fmt --all --check` limpios. Sin claves de i18n nuevas. Documentación: README, overview, roadmap e install a 1.3.22.
+
+### 2026-11-08 — `choz Mic` para clases por Zoom/Meet
+
+- **`choz Mic` aparecía como entrada de choz.** El null-sink publica `choz Mic:capture_FL/FR`, y `all_capture_ports` sólo excluía al propio cliente: el cajón IN lo ofrecía y `start()` lo cableaba a `choz:in_*`. Una tab ligada a esa entrada es `out_1/2` realimentado en el rack (acople). Excluido por nombre de cliente.
+- **Sin salida elegida, choz decía que la salida era `choz Mic`.** `jack_current_sink` tomaba la primera conexión de `out_1`, que siempre incluye la copia al micrófono virtual; ahora salta los dispositivos de choz (`virtual_devices::is_ours`).
+- `runtime_dir()` sin `XDG_RUNTIME_DIR` usaba el PID como UID (`/run/user/<pid>`) y no detectaba PipeWire; ahora toma el UID dueño de `/proc/self`.
+- El aviso "no output device picked" salía con una tira de espacios en el medio (faltaba el `\` de continuación).
+- **`examples/mic_probe`**: arranca el motor contra una salida real, toca un Do de SF2 y graba `choz_mic` por la capa PulseAudio a 48 kHz, como lo abre una app de reuniones. Verifica que `out_1` llega a la interfaz y al mic, que el mic no se ofrece como entrada, y nivel estéreo/mono sin silencio ni clip. Pasado con la **UMC1820** (12 de 20 puertos, grafo a 96 kHz) y la **tarjeta integrada** (`Ryzen HD Audio Controller Speaker`): L −20,0 / R −20,1 / mono −23,4 dBFS en las dos. Latencia agregada por el null-sink medida con `jack_iodelay`: 1024 frames a 96 kHz, 10,7 ms ida y vuelta.
+- Comprobado y **no** corregido: un contenido en antifase grabado en mono (lo que hacen Meet y Zoom por defecto) da silencio total; el main llega a +6 dB sin techo antes de `choz Mic`; el metrónomo en el par principal llega a la llamada.
+
 ### 2026-10-05 — CI en Rust 1.99
 
 - `cargo clippy -D warnings` en CI (stable 1.99) fallaba en `main` después de 1.3.21: `AtomicU32::fetch_update` quedó deprecado a favor de `try_update` (`meter.rs`, `publish_faults`). `try_update` ya existe en 1.97, así que el cambio compila en los dos. El paquete de `v1.3.21` no se vio afectado: `release.yml` no corre clippy. Verificado con `cargo +beta clippy --workspace --all-targets -D warnings` (1.99) y con stable 1.97.
