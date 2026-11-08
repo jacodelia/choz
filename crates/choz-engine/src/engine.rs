@@ -823,7 +823,10 @@ fn runtime_dir() -> std::path::PathBuf {
     std::env::var("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
-            let uid = std::process::id(); // not perfect but avoids libc
+            // `/proc/self` is owned by our uid — the uid without libc. The PID
+            // used here before pointed at a directory that never exists.
+            use std::os::unix::fs::MetadataExt;
+            let uid = std::fs::metadata("/proc/self").map_or(0, |m| m.uid());
             std::path::PathBuf::from(format!("/run/user/{uid}"))
         })
 }
@@ -3458,9 +3461,15 @@ fn jack_current_sink() -> Option<String> {
             p.starts_with(&format!("{}:", crate::jack_backend::CLIENT_NAME))
                 || p.starts_with(&format!("{CPAL_JACK_CLIENT}:"))
         })?;
-    let connected = client.port_by_name(&out)?.get_connections();
-    let (owner, _) = connected.first()?.rsplit_once(':')?;
-    Some(owner.to_string())
+    // `out_1` always reaches `choz Mic` too; that is a copy for meetings, not
+    // where the audio is going.
+    client
+        .port_by_name(&out)?
+        .get_connections()
+        .iter()
+        .filter_map(|p| p.rsplit_once(':').map(|(owner, _)| owner))
+        .find(|owner| !crate::virtual_devices::is_ours(owner))
+        .map(str::to_string)
 }
 
 /// Point our playback ports at `sink`'s inputs, dropping whatever they were

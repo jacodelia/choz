@@ -207,7 +207,12 @@ pub fn all_capture_ports() -> Vec<String> {
         let Some((owner, _)) = port.rsplit_once(':') else {
             continue;
         };
-        if owner == CLIENT_NAME || owner == super::engine::CPAL_JACK_CLIENT {
+        // `choz Mic`'s capture ports carry `out_1/2` back: an input bound to
+        // them is the rack fed into itself, a howl one keypress away.
+        if owner == CLIENT_NAME
+            || owner == super::engine::CPAL_JACK_CLIENT
+            || owner == crate::virtual_devices::MIC_JACK
+        {
             continue;
         }
         if !owners.iter().any(|o| o == owner) {
@@ -435,7 +440,8 @@ pub fn start(
         // where the sound goes, and that is worth a line — it is the case
         // where choz is playing into something nobody chose.
         None => eprintln!(
-            "choz: no output device picked — left on whatever the graph              auto-connected us to. Pick one in the OUT drawer (F3)."
+            "choz: no output device picked — left on whatever the graph \
+             auto-connected us to. Pick one in the OUT drawer (F3)."
         ),
     }
     // `choz Mic` carries the main mix whether or not an output was picked.
