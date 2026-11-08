@@ -12,7 +12,7 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **1097 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo) y sin los de `midi::` (`--skip midi`: abren los puertos ALSA reales y en la máquina de desarrollo tiran el hub USB del dock), 649 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **1101 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo) y sin los de `midi::` (`--skip midi`: abren los puertos ALSA reales y en la máquina de desarrollo tiran el hub USB del dock), 660 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio, y `cargo fmt --all --check` también.
 - **56 efectos propios**, publicados también como un `.clap` con los cuatro artifacts (arpegiador, secuenciador, metrónomo y arreglador).
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
@@ -33,6 +33,23 @@ lleva lo que falta —nada de lo ya hecho— y
   *su* objeto está mal escrito: pregúntele al objeto.
 
 ## [Sin publicar]
+
+## [1.3.22] — 2026-11-08
+
+Release audit: `cargo test --workspace --exclude choz-plugin-lv2 --no-fail-fast -- --skip midi` 1101 pasan y 0 fallan (los 1097 de 1.3.21 más los cuatro nuevos); `cargo clippy --workspace --all-targets -D warnings` y `cargo fmt --all --check` limpios. Sin claves de i18n nuevas. Documentación: README, overview, roadmap e install a 1.3.22; `architecture.md` y el manual (párrafo de `choz Mic`) cuentan el par `mic_L/R`.
+
+### 2026-11-08 — `choz Mic` para clases por Zoom/Meet
+
+- **`choz Mic` aparecía como entrada de choz.** El null-sink publica `choz Mic:capture_FL/FR`, y `all_capture_ports` sólo excluía al propio cliente: el cajón IN lo ofrecía y `start()` lo cableaba a `choz:in_*`. Una tab ligada a esa entrada es `out_1/2` realimentado en el rack (acople). Excluido por nombre de cliente.
+- **Sin salida elegida, choz decía que la salida era `choz Mic`.** `jack_current_sink` tomaba la primera conexión de `out_1`, que siempre incluye la copia al micrófono virtual; ahora salta los dispositivos de choz (`virtual_devices::is_ours`).
+- `runtime_dir()` sin `XDG_RUNTIME_DIR` usaba el PID como UID (`/run/user/<pid>`) y no detectaba PipeWire; ahora toma el UID dueño de `/proc/self`.
+- El aviso "no output device picked" salía con una tira de espacios en el medio (faltaba el `\` de continuación).
+- **`examples/mic_probe`**: arranca el motor contra una salida real, toca un Do de SF2 y graba `choz_mic` por la capa PulseAudio a 48 kHz, como lo abre una app de reuniones. Verifica que `out_1` llega a la interfaz y al mic, que el mic no se ofrece como entrada, y nivel estéreo/mono sin silencio ni clip. Pasado con la **UMC1820** (12 de 20 puertos, grafo a 96 kHz) y la **tarjeta integrada** (`Ryzen HD Audio Controller Speaker`): L −20,0 / R −20,1 / mono −23,4 dBFS en las dos. Latencia agregada por el null-sink medida con `jack_iodelay`: 1024 frames a 96 kHz, 10,7 ms ida y vuelta.
+- **`choz Mic` tiene su propio par, `choz:mic_L/R`** (`mic_feed.rs`), en vez de colgar de `out_1/2`:
+  - **Plegado mono en cuadratura.** Meet y Zoom graban el micrófono en mono, y `(L + R) / 2` borraba lo que un widener, un chorus o un ping-pong ponen en antifase (medido: −180 dBFS). El side pasa 90° respecto del mid (el par Hilbert de `freq_shift`) antes de sumarse: `|M + jS|² = |M|² + |S|²`, nada se cancela, una fuente centrada queda igual y una paneada a un lado baja 3 dB parejo. Sale el mismo mono por los dos canales; `CHOZ_MIC_STEREO=1` deja el estéreo (Zoom con estéreo activado). Tests: `antiphase_survives_the_mono_a_meeting_makes`, `a_centred_source_keeps_its_level`.
+  - **Limitador a −1 dBFS** (`Compressor::limiter`, 2 ms de lookahead) después del fader main, que llega a +6 dB: la app convierte a 16 bits y lo que pasaba de 0 dBFS era un clip duro. Test: `the_main_fader_past_full_scale_stops_at_the_ceiling`.
+  - **Sin click.** La copia se toma antes de sumar el metrónomo al par principal: el profesor lo oye, la llamada no. Test: `the_click_stays_out_of_choz_mic`.
+  - `is_mic_port` deja esos dos puertos fuera de `jack_route_to` y de `jack_current_sink`. `mic_probe` ahora exige que `out_1` **no** llegue a `choz Mic`: con la UMC1820 y con la integrada da L/R/mono −18,1 dBFS (el mono antes perdía 5,3 dB con el mismo SF2).
 
 ### 2026-10-05 — CI en Rust 1.99
 

@@ -669,7 +669,14 @@ Under the native JACK client choz adds two PipeWire null sinks through the
 PulseAudio layer (`pactl`, two commands at start and two at exit — linking
 libpulse for that was not worth it), because that layer is where meeting apps
 look for microphones. `choz Mic` is a source (`media.class=Audio/Source/Virtual`)
-that `jack_backend::wire_mic` feeds from `out_1/out_2` after every rewire;
+that `jack_backend::wire_mic` feeds from choz's own `mic_L/mic_R` ports after
+every rewire. Those carry `mic_feed.rs`: the main pair copied **before the
+click** is summed in, through the main fader, folded to mono **in quadrature**
+(the side 90° from the mid via `freq_shift`'s Hilbert pair, so antiphase
+content survives the mono a meeting app records instead of cancelling) and
+limited at -1 dBFS (`Compressor::limiter`, 2 ms lookahead) — the main fader
+reaches +6 dB and the app converts to 16-bit. `CHOZ_MIC_STEREO=1` skips the
+fold. `is_mic_port` keeps those two out of every output wiring;
 `choz System FX` is a speaker whose `monitor_*` ports are the one monitor
 `all_capture_ports` lists. **PipeWire's JACK layer names a node by its
 description**, not its node name — `choz Mic:input_FL`, not `choz_mic:input_FL`

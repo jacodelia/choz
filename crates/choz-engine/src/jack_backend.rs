@@ -48,6 +48,8 @@ pub struct JackRt {
     state: RtState,
     out: Vec<Port<AudioOut>>,
     inp: Vec<Port<AudioIn>>,
+    /// `mic_L`/`mic_R`: what `choz Mic` is wired to — see [`crate::mic_feed`].
+    mic: [Port<AudioOut>; 2],
     /// The graph's MIDI in: another application's notes, controllers and clock.
     midi_in: Port<MidiIn>,
     /// The graph's MIDI out: what a tab pointed at `choz:midi_out` plays.
@@ -83,6 +85,18 @@ impl jack::ProcessHandler for JackRt {
             let n = frames.min(buf.len());
             match self.state.mix.get(i) {
                 Some(src) => buf[..n].copy_from_slice(&src[..n]),
+                None => buf[..n].fill(0.0),
+            }
+        }
+        for (ch, port) in self.mic.iter_mut().enumerate() {
+            let buf = port.as_mut_slice(ps);
+            let n = frames.min(buf.len());
+            match self.state.mic.as_ref() {
+                Some(feed) => {
+                    for (f, s) in buf[..n].iter_mut().enumerate() {
+                        *s = feed.buf.get(f * 2 + ch).copied().unwrap_or(0.0);
+                    }
+                }
                 None => buf[..n].fill(0.0),
             }
         }
@@ -207,7 +221,12 @@ pub fn all_capture_ports() -> Vec<String> {
         let Some((owner, _)) = port.rsplit_once(':') else {
             continue;
         };
-        if owner == CLIENT_NAME || owner == super::engine::CPAL_JACK_CLIENT {
+        // `choz Mic`'s capture ports carry `out_1/2` back: an input bound to
+        // them is the rack fed into itself, a howl one keypress away.
+        if owner == CLIENT_NAME
+            || owner == super::engine::CPAL_JACK_CLIENT
+            || owner == crate::virtual_devices::MIC_JACK
+        {
             continue;
         }
         if !owners.iter().any(|o| o == owner) {
@@ -260,13 +279,20 @@ fn is_system_fx(port: &str) -> bool {
     port.starts_with(&format!("{}:", crate::virtual_devices::SYSTEM_JACK))
 }
 
-/// Send the main pair — `out_1`/`out_2`, the mix in the headphones — to
-/// `choz Mic` as well, so a meeting hears what the player hears. Quietly
-/// nothing when the device is not there.
-pub(crate) fn wire_mic(client: &Client, our_outs: &[String]) {
+/// Whether `port` is one of choz's microphone ports, which carry a copy for
+/// `choz Mic` and are never wired to an output device.
+pub(crate) fn is_mic_port(port: &str) -> bool {
+    port.starts_with(&format!("{CLIENT_NAME}:mic_"))
+}
+
+/// Wire `mic_L`/`mic_R` — the main mix without the click, folded and limited
+/// for a meeting (see [`crate::mic_feed`]) — to `choz Mic`. Quietly nothing
+/// when the device is not there.
+pub(crate) fn wire_mic(client: &Client) {
     let mic = crate::virtual_devices::MIC_JACK;
-    for (ours, side) in our_outs.iter().take(2).zip(["FL", "FR"]) {
-        let target = format!("{mic}:input_{side}");
+    for (side, target) in ["L", "R"].into_iter().zip(["FL", "FR"]) {
+        let ours = &format!("{CLIENT_NAME}:mic_{side}");
+        let target = format!("{mic}:input_{target}");
         if client.port_by_name(&target).is_none() {
             return;
         }
@@ -386,6 +412,19 @@ pub fn start(
     // clients and so cannot be reached through the hardware inputs at all.
     // Nothing is auto-connected to either: what talks to choz is a patch the
     // user makes, not a guess choz makes for them.
+    let mic = [
+        client.register_port("mic_L", AudioOut),
+        client.register_port("mic_R", AudioOut),
+    ];
+    let [Ok(mic_l), Ok(mic_r)] = mic else {
+        anyhow::bail!("cannot register the JACK microphone ports");
+    };
+    let mut state = state;
+    state.mic = Some(crate::mic_feed::MicFeed::new(
+        state.sample_rate,
+        state.scratch.len() / 2,
+    ));
+
     let midi_in = client
         .register_port("midi_in", MidiIn)
         .context("cannot register the JACK MIDI input port")?;
@@ -405,6 +444,7 @@ pub fn start(
                 state,
                 out,
                 inp,
+                mic: [mic_l, mic_r],
                 midi_in,
                 midi_out,
                 counter: ClockCounter::default(),
@@ -435,11 +475,12 @@ pub fn start(
         // where the sound goes, and that is worth a line — it is the case
         // where choz is playing into something nobody chose.
         None => eprintln!(
-            "choz: no output device picked — left on whatever the graph              auto-connected us to. Pick one in the OUT drawer (F3)."
+            "choz: no output device picked — left on whatever the graph \
+             auto-connected us to. Pick one in the OUT drawer (F3)."
         ),
     }
     // `choz Mic` carries the main mix whether or not an output was picked.
-    wire_mic(handle.as_client(), &our_outs);
+    wire_mic(handle.as_client());
     // Capture: every input jack in the graph, wired one for one. A device that
     // vanished between the scan and here just fails to connect — but **say
     // so**. Swallowing these is how choz ends up with input ports wired to
@@ -507,8 +548,8 @@ fn connect(client: &Client, our_outs: &[String], sink: &str) -> Result<(String, 
             Err(e) => eprintln!("choz: cannot wire '{ours}' -> '{target}': {e}"),
         }
     }
-    // Rewiring dropped every connection of ours; the virtual microphone gets
-    // the main pair back.
-    wire_mic(client, our_outs);
+    // The microphone has ports of its own, untouched by the rewiring above;
+    // wired again in case `choz Mic` came back since.
+    wire_mic(client);
     Ok((name, wired))
 }

@@ -70,7 +70,7 @@ const CHAIN_B: [f32; 4] = [0.4021921, 0.856171, 0.9722909, 0.9952885];
 
 /// The input, and the same input a quarter of a cycle behind.
 #[derive(Clone, Copy)]
-struct Hilbert {
+pub(crate) struct Hilbert {
     a: [Allpass2; 4],
     b: [Allpass2; 4],
     /// The **A** chain is read one sample late; that is what completes the 90°.
@@ -83,7 +83,7 @@ struct Hilbert {
 }
 
 impl Hilbert {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             a: CHAIN_A.map(Allpass2::new),
             b: CHAIN_B.map(Allpass2::new),
@@ -97,7 +97,7 @@ impl Hilbert {
 
     /// `(re, im)`: the analytic pair.
     #[inline]
-    fn process(&mut self, x: f32) -> (f32, f32) {
+    pub(crate) fn process(&mut self, x: f32) -> (f32, f32) {
         let mut re = x;
         for s in &mut self.a {
             re = s.process(re);
