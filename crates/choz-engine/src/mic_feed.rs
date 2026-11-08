@@ -61,7 +61,7 @@ impl MicFeed {
     pub(crate) fn finish(&mut self, gain: [f32; 2], frames: usize, sample_rate: u32) {
         let n = frames.min(self.buf.len() / 2);
         let buf = &mut self.buf[..n * 2];
-        for f in buf.chunks_exact_mut(2) {
+        for f in buf.as_chunks_mut::<2>().0 {
             let (l, r) = (f[0] * gain[0], f[1] * gain[1]);
             if self.stereo {
                 (f[0], f[1]) = (l, r);
@@ -93,7 +93,9 @@ mod tests {
             feed.finish([gain; 2], N, SR);
             if pass == 3 {
                 peak = feed.buf[N..]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .fold(0f32, |p, f| p.max(((f[0] + f[1]) * 0.5).abs()));
             }
         }
