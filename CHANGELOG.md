@@ -34,6 +34,10 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## [Sin publicar]
 
+### 2026-11-08 — CI en Rust 1.99, otra vez
+
+- `cargo clippy -D warnings` en CI (1.99) fallaba en `main` después de 1.3.22: el lint nuevo `chunks_exact_to_as_chunks` marca `chunks_exact(2)` con tamaño constante, y `mic_feed.rs` (más su test y `mic_probe`) lo usaban. Pasan a `as_chunks::<N>()`, estable desde 1.88. El paquete de `v1.3.22` no se ve afectado: `release.yml` no corre clippy. Verificado con `cargo +beta clippy --workspace --all-targets -D warnings` (1.99.0-beta.1) y con stable.
+
 ## [1.3.22] — 2026-11-08
 
 Release audit: `cargo test --workspace --exclude choz-plugin-lv2 --no-fail-fast -- --skip midi` 1101 pasan y 0 fallan (los 1097 de 1.3.21 más los cuatro nuevos); `cargo clippy --workspace --all-targets -D warnings` y `cargo fmt --all --check` limpios. Sin claves de i18n nuevas. Documentación: README, overview, roadmap e install a 1.3.22; `architecture.md` y el manual (párrafo de `choz Mic`) cuentan el par `mic_L/R`.

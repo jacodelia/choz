@@ -100,8 +100,10 @@ fn main() -> anyhow::Result<()> {
     rec.kill()?;
     let raw = reader.join().unwrap();
     let s: Vec<f32> = raw
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect();
     let peak = |it: &mut dyn Iterator<Item = f32>| it.fold(0f32, |m, x| m.max(x.abs()));
     let db = |p: f32| 20.0 * p.max(1e-9).log10();
@@ -109,7 +111,7 @@ fn main() -> anyhow::Result<()> {
         peak(&mut s.iter().step_by(2).copied()),
         peak(&mut s.iter().skip(1).step_by(2).copied()),
     );
-    let mono = peak(&mut s.chunks_exact(2).map(|f| (f[0] + f[1]) * 0.5));
+    let mono = peak(&mut s.as_chunks::<2>().0.iter().map(|f| (f[0] + f[1]) * 0.5));
     println!(
         "choz Mic @48k: {} frames, L {:.1} dBFS, R {:.1} dBFS, mono {:.1} dBFS",
         s.len() / 2,
