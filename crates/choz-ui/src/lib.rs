@@ -17456,10 +17456,12 @@ pub fn run() -> Result<()> {
 
     disable_raw_mode()?;
     // Hand the terminal its own pointer back, whatever it was left on.
-    let _ = std::io::Write::write_all(
-        terminal.backend_mut(),
-        pointer_shape_osc("default").as_bytes(),
-    );
+    if pointer_shape_ok() {
+        let _ = std::io::Write::write_all(
+            terminal.backend_mut(),
+            pointer_shape_osc("default").as_bytes(),
+        );
+    }
     // The wallpaper is the terminal's, not the buffer's: leaving the alternate
     // screen would not remove it.
     let _ = views::kitty_bg::clear_mask(terminal.backend_mut());
@@ -20189,8 +20191,19 @@ fn pointer_shape_osc(shape: &str) -> String {
     format!("\x1b]22;{shape}\x1b\\")
 }
 
+/// Whether OSC 22 may be sent at all. Never on the Linux console: it reads
+/// `ESC ]` as the start of its own palette command and prints the rest
+/// (`22;ew-resize`) onto the screen. The `↔` drawn in the cell still says it
+/// there.
+fn pointer_shape_ok() -> bool {
+    !std::env::var("TERM").is_ok_and(|t| t == "linux")
+}
+
 /// Send the pointer shape only when it changes — once per hover, not per frame.
 fn sync_pointer_shape(out: &mut impl std::io::Write, app: &mut App) {
+    if !pointer_shape_ok() {
+        return;
+    }
     let want = app.resize_pointer();
     if want != app.pointer_resize {
         app.pointer_resize = want;
@@ -38858,31 +38871,6 @@ mod tests {
         assert!(start < 0.2, "START did not move: {start}");
         // …and each one moved only its own mark.
         assert!((app.slots[0].instr_values[SAMPLER_END] - end).abs() < 1e-6);
-    }
-
-    /// Eyeball probe: prints the panel so a human can look at it. Ignored so it
-    /// never runs in CI — `cargo test -p choz-ui --lib panel_probe -- --ignored
-    /// --nocapture`.
-    #[test]
-    #[ignore]
-    fn panel_probe() {
-        let _g = ui_guard();
-        let mut app = App::new();
-        app.slots.push(RackSlot::new(AudioSource::Plugin {
-            id: "/Samples/violin".into(),
-            format: choz_engine::PluginFormat::Samples.label().to_string(),
-            name: "violin".into(),
-        }));
-        app.active_slot = 0;
-        app.slots[0].instr_params = choz_engine::instruments::sampler::params();
-        app.slots[0].instr_values = vec![0.15, 1.0, 0.2, 0.3, 0.7, 0.4, 0.0, 1.0, 0.0, 0.8];
-        app.slots[0].sampler_peaks = (0..256)
-            .map(|i| ((i as f32 / 12.0).sin().abs() * (1.0 - i as f32 / 300.0)).max(0.0))
-            .collect();
-        for (w, h) in [(110u16, 34u16), (80, 26), (60, 20)] {
-            let (text, _) = render_rack(&mut app, w, h);
-            println!("== {w}x{h} ==\n{text}\n");
-        }
     }
 
     /// Every sampler button with more than one answer opens a list. Stepping is
