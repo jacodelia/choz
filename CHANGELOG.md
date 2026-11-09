@@ -12,7 +12,7 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **1103 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo) y sin los de `midi::` (`--skip midi`: abren los puertos ALSA reales y en la máquina de desarrollo tiran el hub USB del dock), 660 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **1104 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo) y sin los de `midi::` (`--skip midi`: abren los puertos ALSA reales y en la máquina de desarrollo tiran el hub USB del dock), 660 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio, y `cargo fmt --all --check` también.
 - **56 efectos propios**, publicados también como un `.clap` con los cuatro artifacts (arpegiador, secuenciador, metrónomo y arreglador).
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
@@ -31,6 +31,58 @@ lleva lo que falta —nada de lo ya hecho— y
   `choz-engine::test_locks` tiene un candado por global; en `choz-ui` el par es
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
+
+## [1.3.24] — 2026-11-09
+
+Release audit: `cargo test --workspace --exclude choz-plugin-lv2 --no-fail-fast -- --skip midi` 1104 pasan, 0 fallan, 5 ignorados, más `cargo test -p choz-plugin-lv2 --lib` 19 pasan (`lv2_runtime` sigue colgándose acá, ver Estado actual; `x11_editors_are_discovered…` falla por DrumGizmo también sin estos cambios, verificado con `git stash`); `cargo clippy --workspace --all-targets -D warnings` y `cargo fmt --all --check` limpios. Sin claves de i18n nuevas: no se agrega texto a la interfaz (los nombres de presets son los del plugin) y los mensajes nuevos son de `choz.log`, en inglés como el resto. Probado en la app (tmux + notas por OSC + `pw-record` de `choz:out_1/2`): Pianoteq VST2 con 851 presets, Pianoteq LV2 cargando, SELECT con el mouse, una sola entrada por formato tras el rescan, salida en 0,17 s con Pianoteq cargado. Documentación: architecture (presets publicados en otro formato, binarios por máquina), roadmap (lo que queda de Pianoteq), README, overview, roadmap e install a 1.3.24.
+
+### 2026-11-09 — Pianoteq: cierre, 819 presets, una sola entrada por máquina
+
+- **Cerrar choz con Pianoteq 9 se colgaba o abortaba.** Dos caminos, los dos con
+  backtrace (`sudo gdb`; el `.deb` viene sin símbolos, se reconstruyó el binario
+  de la 1.3.23 para leerlo): el teardown de 1.3.23 corría bajo `TEARDOWN_WAIT`,
+  pero el **último `Release()`** de los COM volvía al hilo principal sin plazo y
+  Pianoteq espera ahí en un `condition_variable` para siempre. Ahora los tres
+  objetos son `ManuallyDrop` y el hilo auxiliar los suelta dentro del mismo plazo.
+  Y cuando una instancia queda filtrada, la salida normal corría los destructores
+  estáticos de C++ de Pianoteq con su hilo adentro: `terminate called after
+  throwing std::system_error: Invalid argument`. `main` termina con
+  `libc::_exit` después de restaurar la terminal y soltar `App`.
+- **Pianoteq LV2 no instanciaba**: exige `buf-size:boundedBlockLength` y choz la
+  aceptaba en `supported` pero nunca la pasaba en el array de features. Su ttl
+  declara la clase `lv2:JucePlugin_LV2PluginClass` (macro de JUCE sin expandir):
+  con esa marca, entrada MIDI y salida de audio, es instrumento.
+- **Presets LV2 en todo el LV2_PATH**, no sólo junto al plugin: `lv2:appliesTo`
+  manda, como en lilv. Sin `rdfs:label` en el manifest se lee el del documento
+  del preset. `path_to_file_uri` codificaba lo no ASCII byte a byte (y `&`), así
+  que el `<>` de un archivo no era la misma IRI que el manifest daba para él:
+  70 presets (Blüthner, Bösendorfer, `Bass_&_Piano`) sin nombre ni contenido, y
+  `BlÃ¼thner` en pantalla.
+- **Los 819 presets de Pianoteq, en su VST2.** El VST3 da 128 programas sin
+  nombre y el VST2 sus 32 slots; lo que Pianoteq exporta como presets LV2
+  (`urn:juce:stateBinary`) su LV2 no lo lee —`restore` pide sólo `…:Program` y
+  `…:StateString`, devuelve `NO_PROPERTY`— pero es exactamente un chunk de
+  *programa* VST2 (`effSetChunk` con `isPreset`). El engine le da a un VST2 que
+  vive en un bundle LV2 los presets de ese bundle y el picker muestra 851. Medido
+  en la app contra el render del standalone de Pianoteq (brillo de un do central):
+  Steinway 1085 / 1083, Classical Guitar 428 / 471, clavecín 1825 / 1738. Pianoteq
+  cambia de instrumento en segundo plano: un preset tarda unos segundos en sonar.
+- **LV2 ya no ofrece presets que el plugin no puede cargar**: choz pregunta a
+  `restore` qué claves lee (llamándolo vacío, una vez al cargar) y deja afuera los
+  manifests cuyos presets de sólo estado no usan ninguna. Pianoteq LV2 pierde sus
+  819 muertos; ZynAddSubFX conserva sus 1150.
+- **Una entrada por plugin, no una por arquitectura**: Pianoteq trae
+  `x86-64bit/` y `arm-64bit/` con el mismo Turtle. `choz_ports::native_binary`
+  lee el `e_machine` del ELF y el scan deja afuera lo de otra máquina. El binario
+  de un `.vst3` se buscaba siempre en `x86_64-linux`: en las builds aarch64 y
+  armv7 no cargaba ningún VST3; ahora la carpeta sigue al host.
+- **SELECT después de clic en un banco no cargaba el preset.** La audición
+  guardaba la *fila* ya sonada; la fila 0 del banco Guitar se tomaba por la fila 0
+  de ALL BANKS. `PresetAudition` guarda también el banco.
+- Fuera del código: el ruido con `audioprof full` era Pianoteq pidiendo 1,2–1,6 ms
+  de un bloque de 1,33 ms (128/96000) con la CPU en `powersave`, y el reloj del
+  grafo en el mic del headset H340. Perfil `full` a 256 + `performance`, y
+  `priority.driver` de la UMC en la conf de WirePlumber (configuración local).
 
 ## [1.3.23] — 2026-11-09
 
