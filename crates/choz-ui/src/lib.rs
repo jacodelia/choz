@@ -3596,6 +3596,7 @@ impl App {
             at: Instant::now(),
             // The row it opens on is already on the instrument.
             played: Some(modal.list.cursor),
+            bank: modal.list.sidebar_cursor,
         });
         self.modal = Some(modal);
         self.refresh_modal();
@@ -3656,6 +3657,7 @@ impl App {
             row: cursor,
             at: Instant::now(),
             played: on_it.then_some(cursor),
+            bank: list.sidebar_cursor,
         });
         self.modal = Some(Modal::new(ModalKind::SoundAssign(i), list));
         self.refresh_modal();
@@ -16767,15 +16769,17 @@ impl App {
     /// or the same row in a picker opened since, still loads it — which is what
     /// makes re-picking a patch the way back from a sound tweaked past saving.
     fn already_auditioned(&self, row: usize) -> bool {
+        let bank = self.modal.as_ref().map_or(0, |m| m.list.sidebar_cursor);
         self.preset_audition
             .as_ref()
-            .is_some_and(|a| a.played == Some(row))
+            .is_some_and(|a| a.played == Some(row) && a.bank == bank)
     }
 
     fn poll_preset_audition(&mut self) {
         // Both pickers that list patches: BANK/PRESET, and the one a SOUNDS
         // button opens to be told what to hold. Choosing what a bank button
         // will play is the case that most needs hearing it first.
+        let bank = self.modal.as_ref().map_or(0, |m| m.list.sidebar_cursor);
         let (row, offset) = match self.modal.as_ref().map(|m| (m.kind, m.list.cursor)) {
             Some((ModalKind::Preset, c)) => (c, 0),
             // Row 0 of the SOUNDS list is "what is playing now", so the
@@ -16787,6 +16791,14 @@ impl App {
         let Some(a) = self.preset_audition.as_mut() else {
             return;
         };
+        if a.bank != bank {
+            // Another bank under the same row numbers: nothing of it is playing.
+            a.bank = bank;
+            a.played = None;
+            a.row = row;
+            a.at = Instant::now();
+            return;
+        }
         if a.row != row {
             a.row = row;
             a.at = Instant::now();
@@ -17498,6 +17510,11 @@ struct PresetAudition {
     /// The row already put on the instrument, so a settled cursor is applied
     /// once and not once per frame.
     played: Option<usize>,
+    /// The bank (sidebar row) `row` and `played` are rows of. **A row number
+    /// is only a preset within its bank**: row 0 of Guitar is not row 0 of
+    /// every bank, and taking it for the patch already playing is what made
+    /// SELECT after a click on a bank keep the old sound.
+    bank: usize,
 }
 
 /// Chunks a looper deck is kept supplied with — a second of audio each, so
@@ -34925,9 +34942,20 @@ mod tests {
             row: 3,
             at: Instant::now(),
             played: Some(3),
+            bank: 0,
         });
         assert!(app.already_auditioned(3), "row 3 is on the instrument");
         assert!(!app.already_auditioned(4), "row 4 is not");
+
+        // Row 3 of another bank is another patch: a click on Guitar in the
+        // sidebar, then SELECT, has to load it.
+        let mut modal = Modal::new(
+            ModalKind::Preset,
+            views::modal::ListModal::new("BANK / PRESET", Vec::new()),
+        );
+        modal.list.sidebar_cursor = 2;
+        app.modal = Some(modal);
+        assert!(!app.already_auditioned(3), "row 3 of bank 2 has not played");
     }
 
     /// Typing in the two plugin pickers narrows them as the letters arrive,

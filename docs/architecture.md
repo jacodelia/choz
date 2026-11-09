@@ -116,7 +116,7 @@ choz/
 │   │       ├── lib.rs           # Instance, Lv2Instrument, Lv2Effect, features
 │   │       ├── discovery.rs     # Bundle TTL → Lv2PluginInfo + ports + its UI
 │   │       ├── ttl.rs           # Turtle/RDF graph
-│   │       ├── presets.rs       # pset:Preset, sibling bundles, state:state
+│   │       ├── presets.rs       # pset:Preset, sibling/LV2_PATH bundles, state:state
 │   │       ├── programs.rs      # kx programs#Interface (Yoshimi's 4466 banks)
 │   │       ├── state.rs         # state:interface save/restore
 │   │       ├── osc.rs           # Finding a plugin's own OSC server, and asking it
@@ -1412,6 +1412,45 @@ rather than the one with the most files, because the category names people know
 637 patches with its own chips instead of on a file manager. What the guess
 cannot find is one `PICK BANK` away, and a tab that already has a folder — from a
 project, or picked by hand — keeps it.
+
+### Presets a plugin publishes in a format it cannot read
+
+Pianoteq 9 is the case that shaped this. One binary, `Pianoteq 9.lv2/Pianoteq_9.so`,
+is both its LV2 and its VST2 (it exports `lv2_descriptor` and `VSTPluginMain`);
+its VST3 is another. It has **819** presets, and exposes them nowhere a host can
+list: VST3 gives 128 unnamed programs, VST2 its 32 bank slots. What it does do is
+export them (`"Pianoteq 9" --export-lv2-presets-std`) as LV2 presets in `~/.lv2`,
+one bundle per bank, each preset a `state:state` holding one base64 blob under
+`urn:juce:stateBinary`.
+
+- **LV2 presets are found where LV2 puts them.** `presets::manifests` reads the
+  plugin's bundle, its sibling bundles, and every bundle on the LV2 search path
+  (`LV2_PATH` included) whose manifest names the plugin's URI — `lv2:appliesTo`
+  binds a preset to a plugin, not a directory. A preset without an `rdfs:label`
+  in the manifest takes the one in its own document.
+- **…and dropped when the plugin cannot take them.** Pianoteq's LV2 `restore`
+  only ever asks for `…:Program` and `…:StateString`; the exported presets load
+  as nothing at all. `state::keys_it_reads` calls `restore` once, at load, with
+  nothing to give and records the keys it asks for; `presets::applicable` reads
+  one preset per manifest and leaves out a manifest whose state-only presets
+  name none of them. ZynAddSubFX keeps its 1150.
+- **The VST2 side reads them.** The exported blob is exactly a VST2 *program*
+  chunk: `effSetChunk` with `isPreset = 1` loads it (`effSetChunk` with 0, the
+  bank, ignores it; VST3 `setState` refuses it even wrapped as `VstW` + `FPCh`).
+  So `engine::build_instrument` hands a VST2 binary that sits inside an LV2
+  bundle that bundle's one-blob presets (`presets::program_chunks`), and
+  `Vst2Instrument` lists them after its own slots under `chunk:N` keys. The
+  picker shows 851 rows for Pianoteq. `effGetProgram` still names the slot a
+  chunk was loaded over, so `current()` answers with the last chunk while the
+  plugin stays on that slot. Pianoteq switches instrument in the background:
+  a chunk takes a few seconds to sound.
+
+A plugin unpacked for several machines side by side (`x86-64bit/`,
+`arm-64bit/`) has the same Turtle and the same bundle names in each. The scan
+keeps only what this machine can load — `choz_ports::native_binary` reads the
+ELF `e_machine` — and the VST3 bundle's binary folder follows the host
+(`x86_64-linux`, `aarch64-linux`, `armv7l-linux`) instead of being
+`x86_64-linux` everywhere.
 
 ### The click (`metronome.rs`)
 

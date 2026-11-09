@@ -380,7 +380,28 @@ impl choz_ports::PluginState for Vst2State {
 /// with `effSetProgram`. So the key is just the index, as text.
 struct Vst2Presets {
     shared: SharedEffect,
+    /// Programs from outside the plugin's bank, loaded as one program's chunk.
+    chunks: Vec<ProgramChunk>,
+    /// The chunk loaded last and the slot the plugin was on after it. Shared by
+    /// every handle on the same instance.
+    last_chunk: LastChunk,
 }
+
+/// ponytail: "still on the slot it was on" stands in for "still that chunk" —
+/// a program picked in the plugin's own window over the same slot is missed.
+type LastChunk = Arc<std::sync::Mutex<Option<(String, isize)>>>;
+
+/// A program the plugin takes as **a chunk of its own** — `effSetChunk` with
+/// `isPreset` set — rather than as a slot of its bank: what it would read back
+/// from one of its `.fxp` files. Pianoteq 9 has 32 slots and 819 presets; the
+/// rest are reachable this way only. The bytes are read when it is loaded.
+pub type ProgramChunk = (
+    choz_ports::PresetEntry,
+    Arc<dyn Fn() -> Option<Vec<u8>> + Send + Sync>,
+);
+
+/// What sets a chunk key apart from a slot index.
+const CHUNK_KEY: &str = "chunk:";
 
 impl Vst2Presets {
     /// Run `f` against the live AEffect, if there still is one.
@@ -425,7 +446,16 @@ impl choz_ports::PluginPresets for Vst2Presets {
                         key: i.to_string(),
                     }
                 })
-                .collect()
+                .collect::<Vec<_>>()
+        })
+        .map(|mut slots| {
+            slots.extend(self.chunks.iter().enumerate().map(|(n, (e, _))| {
+                choz_ports::PresetEntry {
+                    key: format!("{CHUNK_KEY}{n}"),
+                    ..e.clone()
+                }
+            }));
+            slots
         })
         .unwrap_or_default()
     }
@@ -439,14 +469,48 @@ impl choz_ports::PluginPresets for Vst2Presets {
             // SAFETY: live AEffect under the cell's mutex.
             let index =
                 unsafe { dispatch(effect, opcode::GET_PROGRAM, 0, 0, std::ptr::null_mut(), 0.0) };
-            index.to_string()
+            match &*self.last_chunk.lock().unwrap_or_else(|e| e.into_inner()) {
+                Some((key, slot)) if *slot == index => key.clone(),
+                _ => index.to_string(),
+            }
         })
     }
 
     fn load(&self, key: &str) {
+        if let Some(n) = key.strip_prefix(CHUNK_KEY) {
+            let Some((_, read)) = n.parse::<usize>().ok().and_then(|n| self.chunks.get(n)) else {
+                return;
+            };
+            let Some(bytes) = read() else { return };
+            self.with(|effect, dispatch| {
+                // SAFETY: live AEffect; the plugin copies out of `bytes` during
+                // the call. Index 1 is `isPreset`: one program, not the bank.
+                unsafe {
+                    dispatch(
+                        effect,
+                        opcode::SET_CHUNK,
+                        1,
+                        bytes.len() as isize,
+                        bytes.as_ptr() as *mut c_void,
+                        0.0,
+                    )
+                };
+                // Remembered against the slot the plugin is on now, so the
+                // picker opens here — `effGetProgram` alone still names the
+                // slot the chunk was loaded over.
+                let slot = unsafe {
+                    dispatch(effect, opcode::GET_PROGRAM, 0, 0, std::ptr::null_mut(), 0.0)
+                };
+                *self.last_chunk.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((key.to_string(), slot));
+            });
+            return;
+        }
         let Ok(index) = key.parse::<i32>() else {
             return;
         };
+        // A slot of its own bank replaces whatever chunk was on.
+        *self.last_chunk.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.with(|effect, dispatch| {
             // SAFETY: live AEffect, and the index came from our own list.
             unsafe {
@@ -587,6 +651,8 @@ impl Instance {
         }
         Some(Arc::new(Vst2Presets {
             shared: Arc::clone(&self.shared),
+            chunks: Vec::new(),
+            last_chunk: LastChunk::default(),
         }) as choz_ports::PresetsHandle)
     }
 
@@ -942,6 +1008,8 @@ impl FxProcessor for Vst2Effect {
 /// A live VST2 instrument in a rack slot: notes in, interleaved stereo out.
 pub struct Vst2Instrument {
     inst: Instance,
+    chunks: Vec<ProgramChunk>,
+    last_chunk: LastChunk,
 }
 
 impl Vst2Instrument {
@@ -953,7 +1021,11 @@ impl Vst2Instrument {
                 eprintln!("choz: VST2 {} is not a synth", path.display());
                 None
             }
-            Ok(inst) => Some(Self { inst }),
+            Ok(inst) => Some(Self {
+                inst,
+                chunks: Vec::new(),
+                last_chunk: LastChunk::default(),
+            }),
             Err(e) => {
                 eprintln!("choz: VST2 {}: {e}", path.display());
                 None
@@ -962,9 +1034,23 @@ impl Vst2Instrument {
     }
 }
 
+impl Vst2Instrument {
+    /// Offer `chunks` beside the plugin's own programs.
+    pub fn add_program_chunks(&mut self, chunks: Vec<ProgramChunk>) {
+        self.chunks.extend(chunks);
+    }
+}
+
 impl AudioSource for Vst2Instrument {
     fn presets(&self) -> Option<choz_ports::PresetsHandle> {
-        self.inst.presets()
+        if self.chunks.is_empty() {
+            return self.inst.presets();
+        }
+        Some(Arc::new(Vst2Presets {
+            shared: Arc::clone(&self.inst.shared),
+            chunks: self.chunks.clone(),
+            last_chunk: Arc::clone(&self.last_chunk),
+        }) as choz_ports::PresetsHandle)
     }
 
     fn render(&mut self, output: &mut [f32], _sample_rate: u32) -> usize {

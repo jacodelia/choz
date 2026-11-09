@@ -54,6 +54,8 @@ struct Bag {
     /// for the whole call, so they are kept here rather than rebuilt per
     /// lookup.
     lent: Vec<Vec<u8>>,
+    /// Every key the plugin asked for, answered or not.
+    asked: Vec<String>,
 }
 
 unsafe extern "C" fn store_cb(
@@ -100,6 +102,7 @@ unsafe extern "C" fn retrieve_cb(
     let Some(key_uri) = uri_of(&bag.urids, key) else {
         return std::ptr::null();
     };
+    bag.asked.push(key_uri.clone());
     let Some(prop) = bag.props.iter().find(|p| p.key == key_uri) else {
         return std::ptr::null();
     };
@@ -255,6 +258,7 @@ impl choz_ports::PluginState for Lv2State {
             props: Vec::new(),
             urids: Arc::clone(&cell.urids),
             lent: Vec::new(),
+            asked: Vec::new(),
         };
         // Without these a sampler stores nothing: the paths are half its state.
         let paths = PathFeatures::new();
@@ -283,6 +287,44 @@ impl choz_ports::PluginState for Lv2State {
         let Some(props) = decode(data) else { return };
         restore_props(&self.shared, props);
     }
+}
+
+/// The keys the plugin's `restore` asks for, found by calling it with none to
+/// give. `None` when it has no state interface to ask.
+///
+/// A preset whose state is under keys the plugin never reads cannot load in
+/// it: Pianoteq 9 exports its 819 under `urn:juce:stateBinary` and reads only
+/// `…:Program` and `…:StateString`. Asking is harmless by the spec — every
+/// `retrieve` comes back empty, so there is nothing to restore — and it is
+/// done once, at load, on an instance that has no state of its own yet.
+pub(crate) fn keys_it_reads(shared: &SharedState) -> Option<Vec<String>> {
+    let guard = shared.lock();
+    let cell = guard.as_ref()?;
+    // SAFETY: live instance under the mutex.
+    let iface = unsafe { interface(cell.descriptor) }?;
+    let restore = unsafe { (*iface).restore }?;
+    let mut bag = Bag {
+        props: Vec::new(),
+        urids: Arc::clone(&cell.urids),
+        lent: Vec::new(),
+        asked: Vec::new(),
+    };
+    let paths = PathFeatures::new();
+    let features = paths
+        .as_ref()
+        .map(|p| p.list())
+        .unwrap_or([std::ptr::null(); 3]);
+    // SAFETY: as in `restore_props`; the bag outlives the call.
+    unsafe {
+        restore(
+            cell.handle,
+            retrieve_cb,
+            &mut bag as *mut Bag as LV2_State_Handle,
+            0,
+            features.as_ptr(),
+        );
+    }
+    Some(bag.asked)
 }
 
 /// A preset's `state:state`, as the Turtle spells it: `(key URI, type URI,
@@ -324,6 +366,7 @@ fn restore_props(shared: &SharedState, props: Vec<Property>) {
             props,
             urids: Arc::clone(&cell.urids),
             lent: Vec::new(),
+            asked: Vec::new(),
         };
         let paths = PathFeatures::new();
         let features = paths

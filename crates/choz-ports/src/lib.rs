@@ -1237,6 +1237,42 @@ pub struct Transport {
     bar_origin: std::sync::atomic::AtomicU64,
 }
 
+/// Whether the shared object at `path` was built for the machine choz runs on.
+///
+/// Plugins ship for several architectures side by side — Pianoteq 9 unpacks
+/// `x86-64bit/` and `arm-64bit/` with identical Turtle and bundle names — and
+/// a format that is read from text alone (LV2) cannot tell the two apart. The
+/// ELF header can: `e_machine`. A file that is not an ELF, or a host this does
+/// not know, answers `true`: only a binary that is certainly foreign is
+/// turned away.
+pub fn native_binary(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 20];
+    let read = std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut head));
+    if read.is_err() || &head[..4] != b"\x7fELF" {
+        return true;
+    }
+    let machine = match head[5] {
+        2 => u16::from_be_bytes([head[18], head[19]]),
+        _ => u16::from_le_bytes([head[18], head[19]]),
+    };
+    // EM_386, EM_ARM, EM_X86_64, EM_AARCH64, EM_RISCV.
+    let host = if cfg!(target_arch = "x86_64") {
+        62
+    } else if cfg!(target_arch = "aarch64") {
+        183
+    } else if cfg!(target_arch = "arm") {
+        40
+    } else if cfg!(target_arch = "x86") {
+        3
+    } else if cfg!(target_arch = "riscv64") {
+        243
+    } else {
+        return true;
+    };
+    machine == host
+}
+
 /// How long teardown waits for a lock the plugin's own GUI thread may be
 /// holding, before giving up on it. Two seconds is what [`choz::editor`]'s
 /// window already waits for the same thread.
@@ -1594,5 +1630,34 @@ mod label_tests {
     #[test]
     fn a_blank_reading_says_nothing() {
         assert!(positions_from_labels(&sweep(&["Off", "", "On"]), MAX).is_none());
+    }
+}
+
+#[cfg(test)]
+mod native_binary_tests {
+    /// This test's own executable is native; the same header naming another
+    /// machine is not; a file that is not an ELF at all is not judged.
+    #[test]
+    fn foreign_elf_is_refused_and_non_elf_is_let_through() {
+        let me = std::env::current_exe().unwrap();
+        assert!(super::native_binary(&me));
+
+        let dir = std::env::temp_dir().join(format!("choz-elf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut head = std::fs::read(&me).unwrap()[..64].to_vec();
+        let other: u16 = if cfg!(target_arch = "aarch64") {
+            62
+        } else {
+            183
+        };
+        head[18..20].copy_from_slice(&other.to_le_bytes());
+        let foreign = dir.join("foreign.so");
+        std::fs::write(&foreign, &head).unwrap();
+        assert!(!super::native_binary(&foreign));
+
+        let text = dir.join("text.so");
+        std::fs::write(&text, b"not really a library").unwrap();
+        assert!(super::native_binary(&text));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -243,29 +243,26 @@ pub fn file_uri_to_path(iri: &str) -> Option<PathBuf> {
         .map(|s| PathBuf::from(percent_decode(s)))
 }
 
-/// Percent-encode a filesystem path for use in a `file://` IRI. `/` is kept as
-/// the path separator; unreserved characters pass through; everything else is
-/// `%XX`-encoded.
+/// Percent-encode a filesystem path for use in a `file://` IRI: only what an
+/// IRI path cannot hold (a space, `%`, `#`, `?`, `<>"{}|\\^` and the like) is
+/// `%XX`-encoded. `/` is the separator.
+///
+/// **Everything an IRI may carry stays as it is** — non-ASCII (RFC 3987) and
+/// the sub-delimiters such as `&` — because a bundle's own Turtle writes them
+/// that way: Pianoteq's `<Blüthner_Binaural.ttl>` and
+/// `<C._Bechstein_DG_Bass_&_Piano_split.ttl>`. Encoding them here made a file's
+/// `<>` a different IRI from the manifest's name for the same file, and those
+/// presets lost their label and their contents.
 fn percent_encode_path(s: &str) -> String {
-    fn unreserved(b: u8) -> bool {
-        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/')
+    fn keep(c: char) -> bool {
+        !c.is_ascii() || c.is_ascii_alphanumeric() || "-._~/!$&'()*+,;=:@".contains(c)
     }
     let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        if unreserved(b) {
-            out.push(b as char);
+    for c in s.chars() {
+        if keep(c) {
+            out.push(c);
         } else {
-            out.push('%');
-            out.push(
-                char::from_digit((b >> 4) as u32, 16)
-                    .unwrap()
-                    .to_ascii_uppercase(),
-            );
-            out.push(
-                char::from_digit((b & 0xf) as u32, 16)
-                    .unwrap()
-                    .to_ascii_uppercase(),
-            );
+            out.push_str(&format!("%{:02X}", c as u32));
         }
     }
     out
