@@ -28,6 +28,12 @@ fn try_run(
     args: &[&str],
     path_prefix: Option<&Path>,
 ) -> (String, bool) {
+    // One install at a time. Each run may `cargo build --release` the CLAP
+    // bundles, and cargo re-links `target/release/*.so` even when nothing
+    // changed — removing it first. Run in parallel, one install saw the
+    // bundle, then lost it to the other's re-link: `install: cannot stat`.
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut cmd = Command::new("sh");
     cmd.arg(script())
         .arg("--prefix")
