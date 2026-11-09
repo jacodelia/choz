@@ -2083,6 +2083,13 @@ struct App {
     /// Both start closed so the RACK owns the whole body.
     in_open: bool,
     out_open: bool,
+    /// What the user dragged IN / OUT to, in columns; `None` is the default
+    /// share. Kept while a drawer is shut, so it reopens where it was left.
+    drawer_want: [Option<u16>; 2],
+    /// The drawer edge under a held left button: 0 = IN, 1 = OUT.
+    drawer_drag: Option<usize>,
+    /// What OSC 22 last set the terminal's pointer to: resize or default.
+    pointer_resize: bool,
     /// Output devices as of the last time the OUT drawer was opened — cpal
     /// enumeration is far too slow to redo every frame.
     out_devices: Vec<String>,
@@ -2321,6 +2328,9 @@ impl App {
             instr_search: None,
             in_open: false,
             out_open: false,
+            drawer_want: [None, None],
+            drawer_drag: None,
+            pointer_resize: false,
             out_devices: Vec::new(),
             in_ports: Vec::new(),
             autotune_trace: vec![f32::NAN; AUTOTUNE_TRACE],
@@ -10976,6 +10986,39 @@ impl App {
         self.learn = None;
     }
 
+    /// The drawer edge at `(x, y)` that a drag would grab: 0 = IN, 1 = OUT.
+    /// The drawer's own border column or the RACK's beside it, below the top
+    /// row — that one carries the drawer's ✕.
+    fn drawer_edge_at(&self, x: u16, y: u16) -> Option<usize> {
+        let l = self.layout.borrow();
+        let (src, out) = (l.source_area, l.output_area);
+        let edge = |open: bool, a: Rect, at: u16, beside: u16| {
+            open && y > a.y && y < a.bottom() && (x == at || x == beside)
+        };
+        if edge(
+            self.in_open,
+            src,
+            src.right().saturating_sub(1),
+            src.right(),
+        ) {
+            Some(0)
+        } else if edge(self.out_open, out, out.x, out.x.saturating_sub(1)) {
+            Some(1)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the pointer should read as "drag me sideways": over a drawer
+    /// edge, or holding one.
+    fn resize_pointer(&self) -> bool {
+        self.drawer_drag.is_some()
+            || (self.modal.is_none()
+                && self.menu.is_none()
+                && !self.learn_pick
+                && self.drawer_edge_at(self.mouse.0, self.mouse.1).is_some())
+    }
+
     /// What the INPUTS panel should say about learn, if anything.
     fn learn_banner(&self) -> Option<String> {
         match (self.learn_pick, self.learn) {
@@ -17412,6 +17455,11 @@ pub fn run() -> Result<()> {
     sampler::capture::discard_all();
 
     disable_raw_mode()?;
+    // Hand the terminal its own pointer back, whatever it was left on.
+    let _ = std::io::Write::write_all(
+        terminal.backend_mut(),
+        pointer_shape_osc("default").as_bytes(),
+    );
     // The wallpaper is the terminal's, not the buffer's: leaving the alternate
     // screen would not remove it.
     let _ = views::kitty_bg::clear_mask(terminal.backend_mut());
@@ -17568,6 +17616,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Screen>>, app: &mut App) -> 
             drawn_at = Instant::now();
             terminal.draw(|f| ui(f, app))?;
         }
+        sync_pointer_shape(terminal.backend_mut(), app);
 
         // Handle splash screen lifecycle
         if !app.splash_done {
@@ -20134,6 +20183,61 @@ fn apply_menu_action(app: &mut App, action: menu::MenuAction) {
     }
 }
 
+/// OSC 22: ask the terminal for a mouse pointer shape (kitty, foot, WezTerm,
+/// ghostty, xterm). A terminal that does not know it drops it unseen.
+fn pointer_shape_osc(shape: &str) -> String {
+    format!("\x1b]22;{shape}\x1b\\")
+}
+
+/// Send the pointer shape only when it changes — once per hover, not per frame.
+fn sync_pointer_shape(out: &mut impl std::io::Write, app: &mut App) {
+    let want = app.resize_pointer();
+    if want != app.pointer_resize {
+        app.pointer_resize = want;
+        let shape = if want { "ew-resize" } else { "default" };
+        let _ = write!(out, "{}", pointer_shape_osc(shape));
+        let _ = out.flush();
+    }
+}
+
+/// Grab an open drawer by its inner border and drag it wider or narrower.
+/// `true` when the event was the drag's, so nothing behind the edge sees it.
+///
+/// The width is only a wish: [`views::drawer::drawer_pair`] still keeps the
+/// RACK its whole piano, so a drag past that simply stops.
+fn drag_drawer(app: &mut App, mouse: MouseEvent) -> bool {
+    let (src, out, rack) = {
+        let l = app.layout.borrow();
+        (l.source_area, l.output_area, l.fx_chain_area)
+    };
+    let x = mouse.column;
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.drawer_drag = app.drawer_edge_at(mouse.column, mouse.row);
+            app.drawer_drag.is_some()
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let Some(side) = app.drawer_drag else {
+                return false;
+            };
+            let body = src.width + rack.width + out.width;
+            let (w, other) = match side {
+                0 => ((x + 1).saturating_sub(src.x), out.width),
+                _ => (out.right().saturating_sub(x), src.width),
+            };
+            // Capped here as well as in the layout: there the overflow is
+            // taken from OUT first, which would let a drag of IN push OUT shut.
+            let cap = body.saturating_sub(views::drawer::RACK_KEEPS + other);
+            app.drawer_want[side] = Some(w.min(cap));
+            true
+        }
+        _ => {
+            app.drawer_drag = None;
+            false
+        }
+    }
+}
+
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     let pos: ratatui::layout::Position = (mouse.column, mouse.row).into();
     let left = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
@@ -20286,6 +20390,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     // are buttons, and a click outside the popup cancels.
     if app.modal.is_some() {
         handle_modal_mouse(app, mouse);
+        return;
+    }
+
+    if drag_drawer(app, mouse) {
         return;
     }
 
@@ -21346,10 +21454,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     // IN and OUT are drawers: a 3-wide handle each while closed, a real panel
     // once open. The RACK takes whatever is left, which is everything when
     // both are shut.
-    let in_w = views::drawer::drawer_width(app.in_open, body.width, 40, 24);
-    // The right one measures itself against what the left one left behind, so
-    // two open drawers can never squeeze the RACK out of existence.
-    let out_w = views::drawer::drawer_width(app.out_open, body.width.saturating_sub(in_w), 34, 24);
+    // Their inner edges can be dragged; see `drag_drawer`.
+    let [in_w, out_w] =
+        views::drawer::drawer_pair(body.width, [app.in_open, app.out_open], app.drawer_want);
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -21904,6 +22011,25 @@ fn ui(f: &mut Frame, app: &mut App) {
         layout.modal_rects = views::modal::ModalRects::default();
         layout.split_rects = views::modal::SplitRects::default();
         layout.harmonics_rects = views::harmonics::HarmonicsRects::default();
+    }
+
+    // A drawer edge under the pointer says it can be dragged. Drawn in the
+    // cell as well as asked of the terminal (`sync_pointer_shape`): most
+    // terminals ignore the request, and this works on every one of them.
+    if app.resize_pointer() {
+        let (mx, my) = app.mouse;
+        if mx < area.width && my < area.height {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "\u{2194}",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Rect::new(mx, my, 1, 1),
+            );
+        }
     }
 
     // The MIDI-learn pointer rides above every panel.
@@ -32921,6 +33047,48 @@ mod tests {
             .expect("OUT still has its ✕");
         click(&mut app, out_x.x, out_x.y);
         assert!(!app.out_open, "clicking ✕ shut OUT");
+    }
+
+    /// Hovering a drawer's inner edge shows the `↔` pointer; dragging it
+    /// widens the drawer, and letting go ends the drag.
+    #[test]
+    fn a_drawer_edge_shows_a_resize_pointer_and_drags() {
+        let _g = ui_guard();
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.in_open = true;
+
+        let mut term = Terminal::new(TestBackend::new(200, 30)).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let src = app.layout.borrow().source_area;
+        let (edge, y) = (src.right() - 1, src.y + 5);
+        let ev = |kind, x| MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        handle_mouse(&mut app, ev(MouseEventKind::Moved, edge - 5));
+        assert!(!app.resize_pointer(), "inside the drawer is not the edge");
+        handle_mouse(&mut app, ev(MouseEventKind::Moved, edge));
+        assert!(app.resize_pointer(), "the edge offers a drag");
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        assert_eq!(term.backend().buffer()[(edge, y)].symbol(), "\u{2194}");
+
+        handle_mouse(&mut app, ev(MouseEventKind::Down(MouseButton::Left), edge));
+        handle_mouse(
+            &mut app,
+            ev(MouseEventKind::Drag(MouseButton::Left), edge - 10),
+        );
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        assert_eq!(app.layout.borrow().source_area.width, src.width - 10);
+        handle_mouse(
+            &mut app,
+            ev(MouseEventKind::Up(MouseButton::Left), edge - 10),
+        );
+        assert!(app.drawer_drag.is_none(), "letting go ends the drag");
     }
 
     /// One button-down event, for the handlers that take the raw event.

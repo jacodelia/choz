@@ -35,6 +35,38 @@ pub fn drawer_width(open: bool, total: u16, pct: u16, min: u16) -> u16 {
     (total * pct / 100).max(min).min(half).max(HANDLE_W)
 }
 
+/// Narrowest an open drawer is drawn: device names are long.
+pub const DRAWER_MIN: u16 = 24;
+
+/// Columns the RACK keeps whenever the body has them: the KEYS tab's whole 88
+/// keys (52 whites, a body cell and a join each) plus the monitor's border.
+/// Narrower than this the keyboard turns into a window that chases whatever is
+/// sounding, and a keyboard that slides under the notes reads as noise.
+pub const RACK_KEEPS: u16 = 52 * 2 + 2;
+
+/// Both drawers' widths out of a body `body` wide. `want` is what the user
+/// dragged each to (`None` = the default share). Whatever the RACK would lose
+/// below [`RACK_KEEPS`] is taken back from the drawers — OUT first, never under
+/// [`DRAWER_MIN`] — so opening both no longer costs the full piano.
+pub fn drawer_pair(body: u16, open: [bool; 2], want: [Option<u16>; 2]) -> [u16; 2] {
+    let side = |i: usize, total: u16, pct: u16| match (open[i], want[i]) {
+        (true, Some(w)) => w.max(DRAWER_MIN).min(total / 2).max(HANDLE_W),
+        _ => drawer_width(open[i], total, pct, DRAWER_MIN),
+    };
+    let mut w = [side(0, body, 40), 0];
+    // The right one measures itself against what the left one left behind, so
+    // two open drawers can never squeeze the RACK out of existence.
+    w[1] = side(1, body.saturating_sub(w[0]), 34);
+    let mut over = (w[0] + w[1] + RACK_KEEPS).saturating_sub(body);
+    for i in [1, 0] {
+        let floor = if open[i] { DRAWER_MIN.min(w[i]) } else { w[i] };
+        let take = over.min(w[i] - floor);
+        w[i] -= take;
+        over -= take;
+    }
+    w
+}
+
 /// How many list rows fit in a drawer of outer rect `area`, under `top` header
 /// lines and above `extra` lines pinned at the bottom (the MIDI-learn banner).
 ///
@@ -263,5 +295,26 @@ mod tests {
         assert_eq!(drawer_width(true, 40, 40, 24), 20);
         // ...and the cap itself never goes under the handle.
         assert_eq!(drawer_width(true, 4, 40, 24), HANDLE_W);
+    }
+
+    #[test]
+    fn two_open_drawers_leave_the_rack_a_whole_piano() {
+        // 200 wide by default would be 80 + 40, leaving the RACK 80.
+        let [l, r] = drawer_pair(200, [true, true], [None, None]);
+        assert_eq!(200 - l - r, RACK_KEEPS);
+        assert!(r >= DRAWER_MIN && l >= DRAWER_MIN);
+        // A drag past the budget is capped the same way.
+        let [l, r] = drawer_pair(200, [true, false], [Some(150), None]);
+        assert!(200 - l - r >= RACK_KEEPS);
+        // A body too narrow for it: the drawers stop at their minimum.
+        assert_eq!(
+            drawer_pair(100, [true, true], [None, None]),
+            [DRAWER_MIN; 2]
+        );
+        // Closed drawers are handles whatever was dragged.
+        assert_eq!(
+            drawer_pair(200, [false, false], [Some(60), Some(60)]),
+            [HANDLE_W; 2]
+        );
     }
 }
