@@ -771,6 +771,40 @@ fn auto_key_w(width: usize) -> usize {
 /// the keyboard is just a coarse picture of a piano.
 const KEY_W_MAX: usize = 4;
 
+/// The black key on the seam to the right of white key `w`, if there is one.
+fn black_right(w: u8) -> Option<u8> {
+    Some(w + 1).filter(|n| *n <= PIANO_HI && is_black(*n))
+}
+
+/// The black key on the seam to the left of white key `w`, if there is one.
+fn black_left(w: u8) -> Option<u8> {
+    w.checked_sub(1).filter(|n| *n >= PIANO_LO && is_black(*n))
+}
+
+/// Whether black keys are drawn three cells wide instead of one.
+///
+/// A real black key is a little over half as wide as a white one. One cell on
+/// a white key four or five wide is a hairline; three cells centred on the
+/// seam is the right look — but only once every white body is at least three
+/// cells, so D, G and A keep a cell of their own between two blacks.
+/// Decided once for the whole keyboard, so every black key is the same width.
+fn wide_blacks(widths: &[usize]) -> bool {
+    widths.iter().all(|w| *w >= 4)
+}
+
+/// A lit black key's colour: the lit colour pulled halfway to black, so it
+/// stands apart from lit white keys of the same colour. A colour without RGB
+/// (a named terminal colour) is left as it is — there is nothing to scale.
+fn black_shade(lit: Color) -> Color {
+    match lit {
+        Color::Rgb(..) => {
+            let (r, g, b) = theme::blend(theme::rgb_of(lit), (0, 0, 0), 0.5);
+            Color::Rgb(r, g, b)
+        }
+        other => other,
+    }
+}
+
 /// Unlit hairline down the join between two white keys.
 const KEY_EDGE: Color = Color::Rgb(120, 126, 138);
 
@@ -849,7 +883,10 @@ fn piano_lines(
     let rows = rows.max(2);
     let labelled = rows >= 3;
     let keys = rows - labelled as usize;
-    let band = (keys / 2).max(1);
+    // A black key is about 60% as long as a white one on a real piano; half
+    // and half read as two equal stripes rather than keys sitting on keys.
+    // Rounded, and always leaving the whites at least one row of their own.
+    let band = ((keys * 3 + 2) / 5).clamp(1, keys.saturating_sub(1).max(1));
     let body = keys.saturating_sub(band).max(1);
 
     // The join to the right of white key `w`: the black key that sits on it in
@@ -859,13 +896,20 @@ fn piano_lines(
     // background — so it costs a hairline rather than a whole cell of gap. A
     // full dark column there was the same width as a black key, which is why
     // the blacks could not be picked out of the row at all.
+    // **Lit, a black key wears a darker shade of its colour.** In the same
+    // colour as the whites beside it, a cluster (C, C♯, D held) was one solid
+    // bar with no key left in it. Darker is also what a lit black key looks
+    // like next to a lit white one on a real piano.
+    let black_fg = |n: u8, depth: f32| match paint(n, depth) {
+        Some(lit) => black_shade(lit),
+        None => BLACK_KEY,
+    };
     let join = |w: u8, in_band: bool, depth: f32| -> Span<'static> {
-        let black = Some(w + 1).filter(|n| *n <= PIANO_HI && is_black(*n));
+        let black = black_right(w);
         if let (Some(n), true) = (black, in_band) {
-            // The black key itself, and nothing else: one cell in its colour.
             return Span::styled(
                 "\u{2588}".to_string(),
-                Style::default().fg(colour_of(n, depth, BLACK_KEY)),
+                Style::default().fg(black_fg(n, depth)),
             );
         }
         // The seam between two white keys.
@@ -907,15 +951,35 @@ fn piano_lines(
         at += *w as u16;
     }
 
+    let wide = wide_blacks(&widths);
     let key_row = |in_band: bool, depth: f32| -> Line<'static> {
-        let mut spans = Vec::with_capacity(whites.len() * 2);
+        let mut spans = Vec::with_capacity(whites.len() * 4);
         for (i, &w) in whites.iter().enumerate() {
             // The body is the cell without its join.
             let body = widths[i].saturating_sub(1).max(1);
+            // In the band, a wide black key takes the body cell on each side
+            // of its join: the first one belongs to the black on the left
+            // (when that key is on screen to own it), the last to the one on
+            // the right.
+            let left = (in_band && wide && i > 0).then(|| black_left(w)).flatten();
+            let right = (in_band && wide).then(|| black_right(w)).flatten();
+            let mid = body - usize::from(left.is_some()) - usize::from(right.is_some());
+            if let Some(n) = left {
+                spans.push(Span::styled(
+                    "\u{2588}",
+                    Style::default().fg(black_fg(n, depth)),
+                ));
+            }
             spans.push(Span::styled(
-                "\u{2588}".repeat(body),
+                "\u{2588}".repeat(mid),
                 Style::default().fg(colour_of(w, depth, WHITE_KEY)),
             ));
+            if let Some(n) = right {
+                spans.push(Span::styled(
+                    "\u{2588}",
+                    Style::default().fg(black_fg(n, depth)),
+                ));
+            }
             spans.push(join(w, in_band, depth));
         }
         Line::from(spans)
@@ -938,6 +1002,7 @@ fn piano_lines(
         whites: whites.to_vec(),
         band,
         cells,
+        wide,
     };
     if !labelled {
         return (lines, map);
@@ -991,6 +1056,9 @@ pub struct KeyMap {
     /// drawn at the smallest size that fit. The remainder is handed out a cell
     /// at a time instead, so the keyboard is as wide as the room it is in.
     pub cells: Vec<(u16, u16)>,
+    /// Whether the black keys were drawn three cells wide (their join plus a
+    /// body cell either side) rather than one. See [`wide_blacks`].
+    pub wide: bool,
 }
 
 impl KeyMap {
@@ -1021,12 +1089,18 @@ impl KeyMap {
         let white = *self.whites.get(i)?;
         let (off, w) = self.cells[i];
         // The join is the last cell of the key, which is where a black key
-        // sits — on the seam between two whites.
-        let on_join = x == off + w - 1;
+        // sits — on the seam between two whites. A wide black key also covers
+        // the body cell either side of it, exactly as `piano_lines` paints it.
         let in_band = ((row - self.area.y) as usize) < self.band;
-        let black = Some(white + 1).filter(|n| *n <= PIANO_HI && is_black(*n));
-        match (on_join, in_band, black) {
-            (true, true, Some(n)) => Some(n),
+        if !in_band {
+            return Some(white);
+        }
+        let at = x - off;
+        let right_edge = at + 1 >= w - u16::from(self.wide);
+        let left_edge = self.wide && at == 0 && i > 0;
+        match (right_edge, left_edge) {
+            (true, _) => black_right(white).or(Some(white)),
+            (_, true) => black_left(white).or(Some(white)),
             _ => Some(white),
         }
     }
@@ -2952,6 +3026,21 @@ mod tests {
         }
     }
 
+    /// The symbol and style of cell `x` of a drawn row — read by column, since
+    /// how the row is cut into spans is the drawing's business.
+    fn cell_at(line: &Line<'_>, x: u16) -> (char, Style) {
+        let mut at = 0u16;
+        for span in &line.spans {
+            for c in span.content.chars() {
+                if at == x {
+                    return (c, span.style);
+                }
+                at += 1;
+            }
+        }
+        panic!("no cell {x} in a row {at} wide");
+    }
+
     /// The black keys must land in the piano's 2-and-3 groups    /// The black keys must land in the piano's 2-and-3 groups, or the row is a
     /// dotted line and not a keyboard. They live on the border between two
     /// white keys — which is where they really sit — so the grouping is read
@@ -2959,14 +3048,12 @@ mod tests {
     #[test]
     fn the_black_keys_fall_into_two_and_three_groups() {
         let k = KeyboardState::default();
-        let lines = keyboard_lines(&k, KeyColor::Channel, 400, 6).0;
-        // Spans go body, border, body, border… so the borders are the odd ones.
-        let borders: String = lines[0]
-            .spans
+        let (lines, map) = keyboard_lines(&k, KeyColor::Channel, 400, 6);
+        // The join is the last cell of every white key.
+        let borders: String = map
+            .cells
             .iter()
-            .skip(1)
-            .step_by(2)
-            .map(|s| s.content.as_ref())
+            .map(|(off, w)| cell_at(&lines[0], off + w - 1).0)
             .collect();
         assert!(
             borders.contains("\u{2588}\u{2588}\u{258F}\u{2588}\u{2588}\u{2588}\u{258F}"),
@@ -2979,12 +3066,10 @@ mod tests {
         );
         // Every key has an edge, in both bands: that is what makes the width
         // worth spending.
-        let below: String = lines[2]
-            .spans
+        let below: String = map
+            .cells
             .iter()
-            .skip(1)
-            .step_by(2)
-            .map(|s| s.content.as_ref())
+            .map(|(off, w)| cell_at(&lines[map.band], off + w - 1).0)
             .collect();
         assert!(
             below.chars().all(|c| c == '\u{258F}'),
@@ -3049,17 +3134,20 @@ mod tests {
         let idle = KeyboardState::default();
         let quiet = keyboard_lines(&idle, KeyColor::Channel, 400, 6).0;
 
-        // A white key: middle C. Two spans per key, the body first.
+        // A white key: middle C, a cell inside its body.
         let mut k = KeyboardState::default();
         k.feed(&note_on(60, 0, 100), Some(0));
-        let lit = keyboard_lines(&k, KeyColor::Channel, 400, 6).0;
-        let col = piano_whites().iter().position(|w| *w == 60).unwrap() * 2;
+        let (lit, map) = keyboard_lines(&k, KeyColor::Channel, 400, 6);
+        let (off, w) = map.cells[map.whites.iter().position(|n| *n == 60).unwrap()];
+        let fg = |l: &[Line<'_>], row: usize, x: u16| cell_at(&l[row], x).1.fg;
         assert_ne!(
-            lit[2].spans[col].style.fg, quiet[2].spans[col].style.fg,
+            fg(&lit, map.band, off + 1),
+            fg(&quiet, map.band, off + 1),
             "the white key body changed colour"
         );
         assert_ne!(
-            lit[0].spans[col].style.fg, quiet[0].spans[col].style.fg,
+            fg(&lit, 0, off + 1),
+            fg(&quiet, 0, off + 1),
             "and so did the part of it up between the black keys"
         );
 
@@ -3068,8 +3156,8 @@ mod tests {
         k.feed(&note_on(61, 0, 100), Some(0));
         let lit = keyboard_lines(&k, KeyColor::Channel, 400, 6).0;
         assert_ne!(
-            lit[0].spans[col + 1].style.fg,
-            quiet[0].spans[col + 1].style.fg,
+            fg(&lit, 0, off + w - 1),
+            fg(&quiet, 0, off + w - 1),
             "the lit black key took the border it sits on"
         );
     }
@@ -3084,16 +3172,17 @@ mod tests {
     fn a_lit_black_key_stays_inside_its_own_outline() {
         let mut k = KeyboardState::default();
         k.feed(&note_on(61, 0, 100), Some(0)); // C#4
-        let lines = keyboard_lines(&k, KeyColor::Channel, 400, 6).0;
-        let col = piano_whites().iter().position(|w| *w == 60).unwrap() * 2;
+        let (lines, map) = keyboard_lines(&k, KeyColor::Channel, 400, 6);
+        let (off, w) = map.cells[map.whites.iter().position(|n| *n == 60).unwrap()];
+        let join = off + w - 1;
 
         // The band row: the black key's own cell carries the colour.
-        let lit = lines[0].spans[col + 1].style.fg;
+        let lit = cell_at(&lines[0], join).1.fg;
         assert_ne!(lit, Some(BLACK_KEY), "the black key is lit");
 
         // Every row below the band is white keys only, and none of them — body
         // or seam — may be wearing the black key's colour.
-        for line in &lines[2..lines.len() - 1] {
+        for line in &lines[map.band..lines.len() - 1] {
             for span in &line.spans {
                 assert_ne!(span.style.fg, lit, "the colour escaped onto a white key");
                 assert_ne!(span.style.bg, lit, "…or onto the seam behind one");
@@ -3101,7 +3190,7 @@ mod tests {
         }
         // And with nothing playing, the seams are still there to see.
         let quiet = keyboard_lines(&KeyboardState::default(), KeyColor::Channel, 400, 6).0;
-        assert_eq!(quiet[2].spans[col + 1].content.as_ref(), "\u{258F}");
+        assert_eq!(cell_at(&quiet[map.band], join).0, '\u{258F}');
     }
 
     /// A painted octave is still a keyboard: the rule between its keys survives
@@ -3131,6 +3220,62 @@ mod tests {
             seam.style.fg, seam.style.bg,
             "an edge the same colour as the key it sits on is no edge"
         );
+    }
+
+    /// A cluster in one colour still shows its black keys: lit, they wear a
+    /// darker shade than the lit whites beside them.
+    #[test]
+    fn a_lit_black_key_stands_apart_from_its_lit_neighbours() {
+        let red = Color::Rgb(200, 60, 60);
+        // C4, C#4, D4 held, all the same colour.
+        let paint = |n: u8| (60..=62).contains(&n).then_some(red);
+        let (lines, map) = full_piano(400, 6, &paint);
+        let (off, w) = map.cells[map.whites.iter().position(|n| *n == 60).unwrap()];
+        assert_eq!(cell_at(&lines[0], off + 1).1.fg, Some(red), "C4 lit");
+        let black = cell_at(&lines[0], off + w - 1).1.fg;
+        assert_ne!(black, Some(red), "C#4 is not lost in C4 and D4");
+        assert_ne!(black, Some(BLACK_KEY), "and it still reads as lit");
+    }
+
+    /// Black keys are drawn in a piano's proportions: about 60% of a white
+    /// key's length, and three cells wide (their seam plus a cell either side)
+    /// once the white keys are wide enough to keep a cell of their own between
+    /// two blacks. The mouse finds them across all three cells.
+    #[test]
+    fn black_keys_are_shorter_and_narrower_than_white_ones() {
+        let k = KeyboardState::default();
+        // 5 key rows (6 minus the labels): 3 of black, 2 of white below.
+        let (lines, map) = keyboard_lines(&k, KeyColor::Channel, 400, 6);
+        assert_eq!(map.band, 3);
+        assert!(map.wide, "keys this wide get wide blacks");
+        let (off, w) = map.cells[map.whites.iter().position(|n| *n == 62).unwrap()];
+        // D4, between C#4 and D#4: black, white, …, black, then the seam.
+        let row = &lines[0];
+        assert_eq!(cell_at(row, off).1.fg, Some(BLACK_KEY), "C#4's right half");
+        assert_eq!(cell_at(row, off + 1).1.fg, Some(WHITE_KEY), "D4's own top");
+        assert_eq!(
+            cell_at(row, off + w - 2).1.fg,
+            Some(BLACK_KEY),
+            "D#4's left half"
+        );
+        // Same cells, same answer from the mouse.
+        let y = map.area.y;
+        let x = map.area.x;
+        let mut m = map.clone();
+        m.area = Rect::new(x, y, m.drawn(), 5);
+        assert_eq!(m.note_at(off, y), Some(61));
+        assert_eq!(m.note_at(off + 1, y), Some(62));
+        assert_eq!(m.note_at(off + w - 2, y), Some(63));
+        assert_eq!(m.note_at(off + w - 1, y), Some(63));
+        assert_eq!(
+            m.note_at(off, y + 3),
+            Some(62),
+            "below the band it is all D"
+        );
+
+        // A narrow keyboard keeps one-cell blacks.
+        let narrow = keyboard_lines(&k, KeyColor::Channel, 110, 6).1;
+        assert!(!narrow.wide);
     }
 
     /// Given the room, the whole piano is drawn — all 88 keys, A0 to C8.
