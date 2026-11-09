@@ -12,7 +12,7 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **1101 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo) y sin los de `midi::` (`--skip midi`: abren los puertos ALSA reales y en la máquina de desarrollo tiran el hub USB del dock), 660 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **1103 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo) y sin los de `midi::` (`--skip midi`: abren los puertos ALSA reales y en la máquina de desarrollo tiran el hub USB del dock), 660 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio, y `cargo fmt --all --check` también.
 - **56 efectos propios**, publicados también como un `.clap` con los cuatro artifacts (arpegiador, secuenciador, metrónomo y arreglador).
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
@@ -32,7 +32,22 @@ lleva lo que falta —nada de lo ya hecho— y
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
 
-## [Sin publicar]
+## [1.3.23] — 2026-11-09
+
+Release audit: `cargo test --workspace --exclude choz-plugin-lv2 --no-fail-fast -- --skip midi` 1103 pasan, 0 fallan, 5 ignorados; `cargo clippy --workspace --all-targets -D warnings` y `cargo fmt --all --check` limpios. Sin claves de i18n nuevas: lo agregado a la interfaz es el glifo `↔` (sin texto) y los mensajes nuevos son de `choz.log`, que va en inglés como el resto. Documentación: README (arrastre de los cajones), architecture (layout), overview, roadmap e install a 1.3.23.
+
+Auditoría de los `#[ignore]` (8): corridos a propósito, cada uno en su modo.
+- **Borrados, redundantes**: `background::measure_resolution` (sólo imprimía; `two_tone > 0` y la cobertura ya los aserta el test de imagen, y nombraba un `wallpaper2.jpg` que no existe) y `panel_probe` (imprimía el panel del sampler; la posición de sus botones y el arrastre de START/END ya están asertados al lado).
+- **Se quedan, pasan**: `pitch::what_one_block_of_tracking_costs` en release (1,4 % de un callback de 128 frames, techo 8 %), `virtual_devices::the_devices_come_and_go_with_the_handle`, `the_real_library_reads_as_one_instrument_per_archive` (Philharmonia local) y el sweep de LADSPA.
+- **Se quedan, sin veredicto**: `measure_stacking` es una medición sin asserts y tarda más de 5 min en debug y en release (3080 pares; ninguno pasa full scale); el sweep de LV2 no terminó en 9 min en release (547 plugins, LSP tarda minutos cada uno).
+
+### 2026-11-08 — Cajones redimensionables, teclado entero, Pianoteq sin congelar
+
+- **Con IN y OUT abiertos las teclas saltaban bajo las manos.** El RACK quedaba por debajo de 106 columnas (52 blancas × 2 + borde) y KEYS mostraba una ventana del piano que `visible_whites` recentraba en cada nota. `drawer::drawer_pair` le devuelve al RACK lo que le falte para el piano entero, sacándolo primero de OUT y nunca por debajo de 24 columnas por cajón. Con menos de ~154 columnas de cuerpo no alcanza y vuelve la ventana.
+- **El borde interior de un cajón abierto se arrastra con el mouse.** El ancho pedido se guarda mientras el cajón está cerrado (no en el proyecto). Sobre el borde la celda muestra `↔` y se pide `ew-resize` a la terminal con OSC 22 (kitty, foot, WezTerm, ghostty, xterm); en la consola Linux (`TERM=linux`) no se manda, porque la imprime como texto.
+- **Cargar un SF2 sobre Pianoteq 9 (VST3) congelaba choz en "loading".** El backtrace (`sudo gdb`, el log no dice nada en un cuelgue) mostró el hilo de la interfaz en `drain_retired` → `Drop for Vst3RealInstance` → `std::condition_variable::wait` dentro de Pianoteq, sin timeout; sus propios hilos ociosos. Las llamadas de apagado (`setProcessing(0)`, `setActive(0)`, `terminate`) corren ahora en un hilo auxiliar con `TEARDOWN_WAIT` (2 s); si no vuelven, la instancia se deja cargada como en el caso del editor. Pendiente: el apagado ya no corre en el hilo de la UI, como pide VST3; y la causa de fondo probable (Pianoteq sin run loop del host mientras no tiene editor, `** REMEMBER: startTimer()`) no está resuelta.
+- **KEYS: proporciones de piano.** Las negras miden ~60 % del largo de una blanca (antes mitad y mitad) y, cuando todas las blancas tienen 4 celdas o más, 3 celdas de ancho centradas en la juntura; el hit test del mouse las sigue. Una negra encendida lleva su color a la mitad de brillo, así un cluster de un solo color ya no es una barra lisa. Aplica también al diálogo SPLIT, que comparte el piano.
+- Los tests del teclado leen por columna (`cell_at`) en vez de por índice de span.
 
 ### 2026-11-08 — CI en Rust 1.99, otra vez
 

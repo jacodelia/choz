@@ -1614,10 +1614,10 @@ impl Vst3RealInstance {
     /// into the plugin. A tab's worth of memory until choz exits is the
     /// cheaper of the two. Same trade the CLAP and LV2 hosts already make for
     /// plugins that crash in their own teardown.
-    fn leak(&self) {
+    fn leak(&self, why: &str) {
         eprintln!(
-            "choz: this plugin's editor is still running inside it; leaving the instance \
-             loaded rather than freezing (its memory stays used until choz exits)"
+            "choz: {why}; leaving the instance loaded rather than freezing (its memory \
+             stays used until choz exits)"
         );
         std::mem::forget(self.component.clone());
         std::mem::forget(self.processor.clone());
@@ -1649,7 +1649,7 @@ impl Drop for Vst3RealInstance {
         // of `idle()` — see [`choz_ports::lock_within`].
         let Some(mut view) = choz_ports::lock_within(&self.shared_view, choz_ports::TEARDOWN_WAIT)
         else {
-            self.leak();
+            self.leak("this plugin's editor is still running inside it");
             return;
         };
         drop(view.take());
@@ -1657,21 +1657,60 @@ impl Drop for Vst3RealInstance {
         let Some(mut state) =
             choz_ports::lock_within(&self.shared_state, choz_ports::TEARDOWN_WAIT)
         else {
-            self.leak();
+            self.leak("this plugin's editor is still running inside it");
             return;
         };
         drop(state.take());
         drop(state);
-        unsafe {
-            self.processor.setProcessing(0);
-            self.component.setActive(0);
-            if let Some(c) = &self.controller {
-                c.terminate();
-            }
-            self.component.terminate();
+        // **The shutdown calls go on a helper, against a deadline.** Pianoteq 9
+        // never returns from them: it waits on a condition variable nobody
+        // signals, and doing that on the interface thread froze choz on
+        // "loading" for good when a SoundFont replaced it. A plugin that does
+        // not come back in time is leaked like the editor case above; the
+        // helper stays parked inside it, which is all it was going to do.
+        //
+        // ponytail: one thread per VST3 teardown; teardowns are rare (a tab's
+        // instrument replaced or removed), a pool is not worth it.
+        let teardown = Teardown {
+            processor: self.processor.clone(),
+            component: self.component.clone(),
+            controller: self.controller.clone(),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("choz vst3 teardown".into())
+            .spawn(move || {
+                let t = teardown;
+                unsafe {
+                    t.processor.setProcessing(0);
+                    t.component.setActive(0);
+                    if let Some(c) = &t.controller {
+                        c.terminate();
+                    }
+                    t.component.terminate();
+                }
+                // Handed back so the last release happens here, on the thread
+                // that owns the instance, not on the helper.
+                let _ = tx.send(t);
+            });
+        if spawned.is_err() || rx.recv_timeout(choz_ports::TEARDOWN_WAIT).is_err() {
+            self.leak("this plugin did not finish shutting down");
         }
     }
 }
+
+/// The references a teardown helper needs. Not shared: the helper is the only
+/// thread calling into them until it hands them back or is given up on.
+struct Teardown {
+    processor: ComPtr<IAudioProcessor>,
+    component: ComPtr<IComponent>,
+    controller: Option<ComPtr<IEditController>>,
+}
+
+// SAFETY: moved to one helper thread and used only there until it is sent back
+// over the channel; the instance it came from is past the audio thread and has
+// no editor left (both were cut loose above), so nothing else calls in.
+unsafe impl Send for Teardown {}
 
 /// Convert a fixed `char8` C array to a Rust String (NUL-terminated).
 fn c_arr_to_string(buf: &[char8]) -> String {

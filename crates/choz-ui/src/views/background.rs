@@ -459,55 +459,6 @@ mod tests {
         );
     }
 
-    /// Not an assertion — a measurement, printed with `--nocapture`, of how many
-    /// distinct colours a full-screen wallpaper produces.
-    #[test]
-    #[ignore]
-    fn measure_resolution() {
-        for name in ["wallpaper.png", "wallpaper2.jpg", "wallpaper.jpg"] {
-            let path = std::path::PathBuf::from("../../assets").join(name);
-            if !path.exists() {
-                continue;
-            }
-            let a = area(150, 40);
-            let mut buf = ratatui::buffer::Buffer::empty(a);
-            let mut cache = None;
-            render(
-                &mut buf,
-                a,
-                &Background::Image {
-                    path,
-                    fit: ImageFit::Stretch,
-                },
-                &mut cache,
-            );
-            let mut colours = std::collections::HashSet::new();
-            let (mut painted, mut two_tone) = (0, 0);
-            for y in 0..a.height {
-                for x in 0..a.width {
-                    let c = &buf[(x, y)];
-                    if c.bg != Color::Reset {
-                        painted += 1;
-                        colours.insert(format!("{:?}", c.bg));
-                    }
-                    if c.fg != Color::Reset {
-                        colours.insert(format!("{:?}", c.fg));
-                    }
-                    // Two different colours in one cell = the extra vertical
-                    // resolution halfblocks buys. One colour per cell can never
-                    // produce this.
-                    if c.symbol() == "\u{2580}" && c.fg != c.bg {
-                        two_tone += 1;
-                    }
-                }
-            }
-            println!(
-                "{name:16} pintadas {painted}/6000  celdas de 2 tonos {two_tone}  colores {}",
-                colours.len()
-            );
-        }
-    }
-
     /// The one that matters: after the background is painted, a panel drawn on
     /// top must not erase it.
     ///
