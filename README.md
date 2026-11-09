@@ -116,6 +116,7 @@ headroom for plugin DSP at small buffer sizes.
 | Key | Where | Action |
 |---|---|---|
 | `F2` / `F3` | anywhere | IN and OUT drawers (note inputs, audio devices) |
+| drag the inner edge | an open drawer | resize it (the pointer turns `↔`); the RACK always keeps room for the whole 88-key piano |
 | `Enter` / `Space` | a drawer's channel row | put that channel on the active tab, or take it off (right click also takes it off) |
 | `F10` | anywhere | menu bar (EDIT → Settings… → THEME) |
 | `[` / `]` | rack | switch tab |
@@ -193,7 +194,7 @@ choz/
 
 | | |
 |---|---|
-| choz | **1.3.22** |
+| choz | **1.3.23** |
 | Rust edition | 2021 (`choz-plugin-lv2` is 2024) |
 | Toolchain tested | rustc 1.97.1 |
 | Platform | Linux. ALSA/JACK/PipeWire. Released for x86-64, aarch64 and armv7 |

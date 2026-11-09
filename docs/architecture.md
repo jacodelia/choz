@@ -972,15 +972,15 @@ flowchart TB
     MB["Menu bar: FILE · EDIT · HELP (F10) · ♩ MET ▾ · LIVE/MULTI"]
     subgraph Screen
         direction LR
-        subgraph Left["IN drawer (F2) — 3 cols shut, 40% open"]
+        subgraph Left["IN drawer (F2) — 3 cols shut, 40% open, edge draggable"]
             SP["INPUTS Panel<br/>SCAN INPUTS button<br/>MIDI ports + OSC, with tab bindings<br/>every capture jack, grouped by card"]
         end
-        subgraph Mid["RACK — everything the drawers leave"]
+        subgraph Mid["RACK — everything the drawers leave, never under 106 cols (the whole piano) when the body has them"]
             FXP["RACK Panel<br/>tabs · mixer strip · INSTR buttons · BANK · ARP<br/>FX chain row · knob grid · SLOT buttons"]
             TR["TRANSPORT<br/>[PLAY] [STOP] · OUT device"]
             MM["Bottom panel<br/>tabs: MONITOR · KEYS · WAVE · MIXER<br/>MIXER = a strip per tab: two faders + link · pan · mute · solo"]
         end
-        subgraph Right["OUT drawer (F3) — 3 cols shut, 34% open"]
+        subgraph Right["OUT drawer (F3) — 3 cols shut, 34% open, edge draggable"]
             OP["Output devices + one row per device channel<br/>Enter on a device reloads the rack,<br/>Enter on a channel sends the active tab there,<br/>←/→ set one side only"]
         end
     end
