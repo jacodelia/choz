@@ -194,7 +194,7 @@ choz/
 
 | | |
 |---|---|
-| choz | **1.3.23** |
+| choz | **1.3.24** |
 | Rust edition | 2021 (`choz-plugin-lv2` is 2024) |
 | Toolchain tested | rustc 1.97.1 |
 | Platform | Linux. ALSA/JACK/PipeWire. Released for x86-64, aarch64 and armv7 |

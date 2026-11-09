@@ -11,6 +11,7 @@
 //! memory-backed `IBStream`.
 
 use std::ffi::c_void;
+use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -26,14 +27,33 @@ use vst3::Steinberg::*;
 
 type GetFactoryProc = unsafe extern "system" fn() -> *mut IPluginFactory;
 
+/// The bundle folder holding this machine's binary, as the VST3 SDK names it.
+/// It was `x86_64-linux` everywhere, so no VST3 loaded on the aarch64 and armv7
+/// builds of choz.
+const ARCH_DIR: &str = if cfg!(target_arch = "aarch64") {
+    "aarch64-linux"
+} else if cfg!(target_arch = "arm") {
+    "armv7l-linux"
+} else if cfg!(target_arch = "x86") {
+    "i386-linux"
+} else {
+    "x86_64-linux"
+};
+
+/// Whether the bundle carries a binary for this machine at all.
+pub(crate) fn has_native_binary(path: &Path) -> bool {
+    let so = bundle_binary(path);
+    so != path && choz_ports::native_binary(&so)
+}
+
 /// Resolve the loadable `.so` inside a Linux `.vst3` bundle, or the file itself.
 fn bundle_binary(path: &Path) -> std::path::PathBuf {
-    // Linux bundle layout: <name>.vst3/Contents/x86_64-linux/<name>.so
+    // Linux bundle layout: <name>.vst3/Contents/<arch>-linux/<name>.so
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let arch_dir = path.join("Contents").join("x86_64-linux");
+    let arch_dir = path.join("Contents").join(ARCH_DIR);
     let so = arch_dir.join(format!("{stem}.so"));
     if so.exists() {
         return so;
@@ -813,9 +833,14 @@ pub struct Vst3RealInstance {
     // NOTE: field order = drop order. The COM objects MUST release before the
     // library unloads (dlclose), so `_lib` is declared LAST — otherwise Release()
     // runs against unmapped plugin code and segfaults.
-    component: ComPtr<IComponent>,
-    processor: ComPtr<IAudioProcessor>,
-    controller: Option<ComPtr<IEditController>>,
+    //
+    // The three plugin objects are `ManuallyDrop` because their **last
+    // release** is a call into the plugin like any other — Pianoteq 9 never
+    // comes back from it — so `Drop` hands them to the teardown helper, which
+    // releases them against the deadline instead of the interface thread.
+    component: ManuallyDrop<ComPtr<IComponent>>,
+    processor: ManuallyDrop<ComPtr<IAudioProcessor>>,
+    controller: ManuallyDrop<Option<ComPtr<IEditController>>>,
     block: usize,
     /// De-interleaved output channel buffers + their raw pointers.
     out_bufs: Vec<Vec<f32>>,
@@ -1145,9 +1170,9 @@ impl Vst3RealInstance {
             _lib: lib,
             shared_view,
             shared_state,
-            component,
-            processor,
-            controller,
+            component: ManuallyDrop::new(component),
+            processor: ManuallyDrop::new(processor),
+            controller: ManuallyDrop::new(controller),
             block: block as usize,
             out_bufs,
             out_ptrs: Vec::with_capacity(out_channels),
@@ -1369,7 +1394,7 @@ impl Vst3RealInstance {
             return;
         };
         let v = value.clamp(0.0, 1.0) as f64;
-        if let Some(c) = &self.controller {
+        if let Some(c) = &*self.controller {
             unsafe {
                 c.setParamNormalized(id, v);
             }
@@ -1414,7 +1439,7 @@ impl Vst3RealInstance {
     pub fn param_groups(&self) -> Vec<Option<String>> {
         let count = self.param_count();
         let empty = vec![None; count as usize];
-        let Some(c) = &self.controller else {
+        let Some(c) = &*self.controller else {
             return empty;
         };
         let Some(units) = c.cast::<IUnitInfo>() else {
@@ -1447,7 +1472,7 @@ impl Vst3RealInstance {
     }
 
     pub fn param_name(&self, index: u32) -> String {
-        let Some(c) = &self.controller else {
+        let Some(c) = &*self.controller else {
             return format!("P{index}");
         };
         let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
@@ -1466,7 +1491,7 @@ impl Vst3RealInstance {
     /// filter-type parameter is called "Bandpass" — the value itself is a
     /// normalised float like everything else.
     pub fn param_steps(&self, index: u32) -> (u32, Vec<(f64, String)>) {
-        let Some(c) = &self.controller else {
+        let Some(c) = &*self.controller else {
             return (0, Vec::new());
         };
         let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
@@ -1501,7 +1526,7 @@ impl Vst3RealInstance {
     /// steps for every one of its 800 parameters, but still renders "Off"/"On"
     /// for its switches. See [`crate::read_params`].
     pub fn param_display_at(&self, index: u32, norm: f64) -> String {
-        let Some(c) = &self.controller else {
+        let Some(c) = &*self.controller else {
             return String::new();
         };
         let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
@@ -1519,7 +1544,7 @@ impl Vst3RealInstance {
     /// The parameter's VST3 flags, for the two questions choz asks of them:
     /// is it hidden, and can it be automated at all.
     pub fn param_flags(&self, index: u32) -> i32 {
-        let Some(c) = &self.controller else {
+        let Some(c) = &*self.controller else {
             return 0;
         };
         let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
@@ -1532,7 +1557,7 @@ impl Vst3RealInstance {
 
     /// Unit label (e.g. "dB", "Hz") from the parameter's `units`.
     pub fn param_label(&self, index: u32) -> String {
-        let Some(c) = &self.controller else {
+        let Some(c) = &*self.controller else {
             return String::new();
         };
         let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
@@ -1590,7 +1615,7 @@ impl Vst3RealInstance {
             }
         }
         // Mirror into the controller (rewind a fresh stream first).
-        if let Some(c) = &self.controller {
+        if let Some(c) = &*self.controller {
             let s2 = ComWrapper::new(MemStream {
                 inner: Arc::new(std::sync::Mutex::new((data.to_vec(), 0usize))),
             });
@@ -1619,11 +1644,9 @@ impl Vst3RealInstance {
             "choz: {why}; leaving the instance loaded rather than freezing (its memory \
              stays used until choz exits)"
         );
-        std::mem::forget(self.component.clone());
-        std::mem::forget(self.processor.clone());
-        if let Some(c) = &self.controller {
-            std::mem::forget(c.clone());
-        }
+        // The plugin objects need nothing here: they are `ManuallyDrop`, so
+        // not taking them in `Drop` is already leaving them alive — or the
+        // teardown helper took them and is still parked inside them.
         std::mem::forget(self._ctx.clone());
         std::mem::forget(self._handler.clone());
         std::mem::forget(self.param_changes.clone());
@@ -1671,10 +1694,18 @@ impl Drop for Vst3RealInstance {
         //
         // ponytail: one thread per VST3 teardown; teardowns are rare (a tab's
         // instrument replaced or removed), a pool is not worth it.
-        let teardown = Teardown {
-            processor: self.processor.clone(),
-            component: self.component.clone(),
-            controller: self.controller.clone(),
+        //
+        // The helper also drops them, so the final `Release` — the plugin's
+        // destructor, where Pianoteq 9 waits forever with choz closing — falls
+        // under the same deadline. Before this it ran here, unbounded.
+        // SAFETY: taken once, here, and never touched again: every later path
+        // out of `drop` (the leak included) leaves these three fields alone.
+        let teardown = unsafe {
+            Teardown {
+                processor: ManuallyDrop::take(&mut self.processor),
+                component: ManuallyDrop::take(&mut self.component),
+                controller: ManuallyDrop::take(&mut self.controller),
+            }
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
@@ -1689,9 +1720,8 @@ impl Drop for Vst3RealInstance {
                     }
                     t.component.terminate();
                 }
-                // Handed back so the last release happens here, on the thread
-                // that owns the instance, not on the helper.
-                let _ = tx.send(t);
+                drop(t);
+                let _ = tx.send(());
             });
         if spawned.is_err() || rx.recv_timeout(choz_ports::TEARDOWN_WAIT).is_err() {
             self.leak("this plugin did not finish shutting down");

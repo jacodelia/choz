@@ -232,10 +232,30 @@ pub fn discover_bundle(bundle_dir: &Path) -> Vec<Lv2PluginInfo> {
             warn!("LV2: plugin {uri} has no lv2:binary; skipping");
             continue;
         };
+        // Same Turtle, other machine: the arm-64bit copy beside the x86 one.
+        if !choz_ports::native_binary(&binary_path) {
+            warn!(
+                "LV2: {} is built for another architecture; skipping",
+                binary_path.display()
+            );
+            continue;
+        }
         let info = parse_plugin(&graph, &uri, bundle_dir, binary_path);
         out.push(info);
     }
     out
+}
+
+/// JUCE writes the plugin's class from a macro, and a build that never set it
+/// ships the macro's own name: Pianoteq 9 is `a lv2:JucePlugin_LV2PluginClass`.
+/// Such a plugin says nothing about being an instrument, so its ports decide.
+/// Only this marker, not "no known class": a MIDI-driven effect that names its
+/// class honestly keeps it.
+fn juce_left_class_unset(graph: &Graph, uri: &str) -> bool {
+    graph
+        .objects(uri, ttl::RDF_TYPE)
+        .iter()
+        .any(|o| o.as_str().ends_with("#JucePlugin_LV2PluginClass"))
 }
 
 fn parse_plugin(
@@ -252,8 +272,6 @@ fn parse_plugin(
             uri.rsplit(['/', '#']).next().unwrap_or(uri).to_string()
         });
 
-    let is_instrument = graph.has_type(uri, ttl::LV2_INSTRUMENT);
-
     let mut ports = Vec::new();
     for port_node in graph.objects(uri, ttl::LV2_PORT) {
         let pid = port_node.as_str();
@@ -263,6 +281,11 @@ fn parse_plugin(
     ports.sort_by_key(|p| p.index);
 
     let has_audio_out = ports.iter().any(|p| p.kind == PortKind::AudioOutput);
+    let has_midi_in = ports
+        .iter()
+        .any(|p| p.kind == PortKind::AtomInput && p.is_midi);
+    let is_instrument = graph.has_type(uri, ttl::LV2_INSTRUMENT)
+        || (has_midi_in && has_audio_out && juce_left_class_unset(graph, uri));
     let has_audio_in = ports.iter().any(|p| p.kind == PortKind::AudioInput);
     // An effect processes audio in→out; an instrument has audio out + MIDI in.
     let is_effect = has_audio_in && has_audio_out && !is_instrument;
@@ -595,6 +618,39 @@ mod tests {
         assert_eq!(ui.binary_path, so);
         assert!(!ui.owns_window, "an X11 UI goes in choz's own window");
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Pianoteq 9's class is JUCE's unexpanded macro, so its ports decide:
+    /// MIDI in and audio out is an instrument — audio inputs or not. The same
+    /// ports under an honest effect class stay an effect.
+    #[test]
+    fn a_juce_plugin_without_its_class_is_judged_by_its_ports() {
+        let dir = std::env::temp_dir().join(format!("choz_lv2_juce_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ttl_path = dir.join("p.ttl");
+        let ttl = |class: &str| {
+            format!(
+                r#"@prefix lv2: <http://lv2plug.in/ns/lv2core#> .
+@prefix atom: <http://lv2plug.in/ns/ext/atom#> .
+<urn:choz:test:p> a lv2:{class} ;
+    lv2:port [ a lv2:InputPort, atom:AtomPort ; atom:bufferType atom:Sequence ;
+               atom:supports <http://lv2plug.in/ns/ext/midi#MidiEvent> ;
+               lv2:index 0 ; lv2:symbol "midi_in" ] ,
+             [ a lv2:InputPort, lv2:AudioPort ; lv2:index 1 ; lv2:symbol "in" ] ,
+             [ a lv2:OutputPort, lv2:AudioPort ; lv2:index 2 ; lv2:symbol "out" ] .
+"#
+            )
+        };
+        let judge = |class: &str| {
+            std::fs::write(&ttl_path, ttl(class)).unwrap();
+            let graph = ttl::Graph::parse_file(&ttl_path).unwrap();
+            let info = parse_plugin(&graph, "urn:choz:test:p", &dir, dir.join("p.so"));
+            (info.is_instrument, info.is_effect)
+        };
+        assert_eq!(judge("JucePlugin_LV2PluginClass"), (true, false));
+        assert_eq!(judge("DelayPlugin"), (false, true));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

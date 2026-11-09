@@ -87,7 +87,7 @@ barra** (`| 5/4 Fm | 3/4 Db |`) y el metrónomo los sigue, lee y escribe **MIDI*
 —exporta la banda balanceada, un canal por músico, y abre un `.mid` de dos a
 cuatro instrumentos—, y **SPLIT OUT** pone a cada músico en una tira propia del
 MIXER sin abrir otra tab. La polifonía de los instrumentos es un ajuste (16–1024, 256
-por defecto) y la barra de arriba dice la RAM que choz tiene. **La 1.3.23 es
+por defecto) y la barra de arriba dice la RAM que choz tiene. **La 1.3.24 es
 este árbol, publicada con sus paquetes.** El workspace sin
 `choz-plugin-lv2` (que en esta máquina se cuelga) pasa, y `clippy --workspace
 --all-targets -D warnings` está limpio con `+beta`.
@@ -289,6 +289,20 @@ que es lo que lee `tools/mid_to_styles.py`; choz nunca los leyó en runtime.
 - **`choz-engine/src` tiene 21 módulos sueltos en la raíz** (`midi`, `osc`,
   `jack_backend`, `virtual_devices`, `quarantine`, `sandboxed`…). Agruparlos en
   `io/` y `plugins/` es cosmético: cuando se toque la zona.
+
+### 6 · Pianoteq 9: lo que queda después de 1.3.24 (2026-11-09)
+
+- **Sin run loop del host.** Pianoteq imprime `** REMEMBER: startTimer()` y no
+  vuelve de su teardown VST3 (ni del `Release()` final) cuando no tiene editor
+  abierto. choz lo pone bajo `TEARDOWN_WAIT` y, si no vuelve, lo deja cargado;
+  la causa probable es que nadie le da un `IRunLoop` sin ventana. Darle uno es
+  el arreglo de fondo; hoy cada instancia que cuelga ahí queda en memoria hasta
+  salir (y la salida es `_exit`, por eso no cae).
+- **`program_chunks` recorre el LV2_PATH en cada carga** del VST2 que vive en un
+  bundle LV2 (~300 manifests acá, imperceptible). Un índice si una máquina con
+  miles de bundles lo hace notar.
+- **`current()` de un chunk** se deduce de que el plugin siga en el mismo slot:
+  un programa elegido en la ventana de Pianoteq sobre ese mismo slot no se ve.
 
 ## Las dos piezas que quedan fuera, por decisión
 

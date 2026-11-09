@@ -3727,8 +3727,17 @@ pub fn build_instrument(
             .map(|i| Box::new(i) as Box<dyn crate::sources::AudioSource>),
         crate::PluginFormat::Dssi => choz_plugin_ladspa::DssiInstrument::build(path, id, sr, block)
             .map(|i| Box::new(i) as Box<dyn crate::sources::AudioSource>),
-        crate::PluginFormat::Vst2 => choz_plugin_vst2::Vst2Instrument::build(path, sr, block)
-            .map(|i| Box::new(i) as Box<dyn crate::sources::AudioSource>),
+        crate::PluginFormat::Vst2 => {
+            choz_plugin_vst2::Vst2Instrument::build(path, sr, block).map(|mut i| {
+                // A VST2 binary that lives inside an LV2 bundle is one plugin
+                // built for both (Pianoteq 9), and the presets that bundle
+                // publishes are chunks its VST2 side can load.
+                if let Some(bundle) = path.parent().filter(|d| d.join("manifest.ttl").is_file()) {
+                    i.add_program_chunks(choz_plugin_lv2::presets::program_chunks(bundle));
+                }
+                Box::new(i) as Box<dyn crate::sources::AudioSource>
+            })
+        }
         crate::PluginFormat::Vst3 => choz_plugin_vst3::Vst3Instrument::build(path, sr, block)
             .map(|i| Box::new(i) as Box<dyn crate::sources::AudioSource>),
         // Not a plugin at all: a text file pointing at samples, played by

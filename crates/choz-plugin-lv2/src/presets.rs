@@ -55,16 +55,56 @@ pub struct Lv2Preset {
 /// Reads and parses Turtle: UI thread only.
 pub fn scan(bundle_dir: &Path, plugin_uri: &str, _ports: &[Port]) -> Vec<Lv2Preset> {
     let mut out: Vec<Lv2Preset> = Vec::new();
-    for manifest in manifests(bundle_dir) {
+    for manifest in manifests(bundle_dir, plugin_uri) {
         out.extend(scan_manifest(&manifest, plugin_uri));
     }
     out.sort_by(|a, b| (&a.entry.category, &a.entry.name).cmp(&(&b.entry.category, &b.entry.name)));
+    // The search path can reach the plugin's own bundle a second time under
+    // another spelling of its path; one preset is one URI.
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|p| seen.insert(p.entry.key.clone()));
     out
 }
 
-/// The manifests to read: the bundle's own, and those of sibling directories
-/// whose name starts with it — `ZynAddSubFX.lv2` and `ZynAddSubFX.lv2presets`.
-fn manifests(bundle_dir: &Path) -> Vec<PathBuf> {
+/// The manifests to read: the bundle's own, those of sibling directories
+/// whose name starts with it — `ZynAddSubFX.lv2` and `ZynAddSubFX.lv2presets` —
+/// and **any bundle on the LV2 search path that names the plugin**.
+///
+/// The last is where LV2 itself (lilv) finds presets: `lv2:appliesTo` binds a
+/// preset to its plugin, wherever the bundle lives. Pianoteq exports its 819
+/// presets as `~/.lv2/Pianoteq 9-factory-presets-<bank>.lv2`, next to nothing
+/// of its own — the plugin is wherever it was unpacked.
+fn manifests(bundle_dir: &Path, plugin_uri: &str) -> Vec<PathBuf> {
+    let mut out = siblings(bundle_dir);
+    let mut dirs = crate::default_search_paths();
+    if let Some(env) = std::env::var_os("LV2_PATH") {
+        dirs.extend(std::env::split_paths(&env));
+    }
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let manifest = e.path().join("manifest.ttl");
+            if out.contains(&manifest) {
+                continue;
+            }
+            // ponytail: a substring test before parsing — ~300 bundles, 600 KB
+            // of Turtle here, read once per plugin load. An index if a machine
+            // with thousands of bundles ever makes loading slow.
+            let names_it = std::fs::read_to_string(&manifest)
+                .is_ok_and(|text| text.contains(plugin_uri) && text.contains("Preset"));
+            if names_it {
+                out.push(manifest);
+            }
+        }
+    }
+    out
+}
+
+/// The bundle's own manifest, and those of sibling directories whose name
+/// starts with it.
+fn siblings(bundle_dir: &Path) -> Vec<PathBuf> {
     let mut out = vec![bundle_dir.join("manifest.ttl")];
     let (Some(parent), Some(name)) = (bundle_dir.parent(), bundle_dir.file_name()) else {
         return out;
@@ -110,6 +150,9 @@ fn scan_manifest(manifest_path: &Path, plugin_uri: &str) -> Vec<Lv2Preset> {
                 .object(&uri, ttl::RDFS_LABEL)
                 .map(|n| n.as_str().to_string())
                 .filter(|l| !l.is_empty())
+                // Pianoteq's manifests carry no labels; each preset's own
+                // document does. One small file per preset, read only then.
+                .or_else(|| label_in_see_also(&graph, &uri))
                 // A preset with no label is still selectable: its URI ends in
                 // something the user can recognise more often than not.
                 .unwrap_or_else(|| uri.rsplit(['#', '/']).next().unwrap_or(&uri).to_string());
@@ -141,6 +184,20 @@ fn scan_manifest(manifest_path: &Path, plugin_uri: &str) -> Vec<Lv2Preset> {
             }
         })
         .collect()
+}
+
+/// The `rdfs:label` the preset's own `rdfs:seeAlso` document gives it.
+fn label_in_see_also(graph: &Graph, uri: &str) -> Option<String> {
+    graph
+        .objects(uri, ttl::RDFS_SEE_ALSO)
+        .into_iter()
+        .find_map(|see| {
+            let Node::Iri(iri) = see else { return None };
+            let doc = Graph::parse_file(&ttl::file_uri_to_path(iri)?).ok()?;
+            doc.object(uri, ttl::RDFS_LABEL)
+                .map(|n| n.as_str().to_string())
+                .filter(|l| !l.is_empty())
+        })
 }
 
 /// What applying a preset does: port values, opaque state, or both.
@@ -265,5 +322,115 @@ impl choz_ports::PluginPresets for Lv2Presets {
         if !state.is_empty() {
             crate::state::restore_state(&self.state, state);
         }
+    }
+}
+
+/// `presets` without those the plugin cannot take: a manifest whose presets
+/// are all state, under keys its `restore` never asks for, offers nothing it
+/// can play — Pianoteq 9's own LV2 export is that, 819 entries that load as
+/// silence-with-no-change. One preset per manifest is read to tell, since a
+/// bank's presets share their format.
+///
+/// A plugin choz cannot ask (no state interface) keeps every preset, as before.
+pub(crate) fn applicable(presets: Vec<Lv2Preset>, shared: &SharedState) -> Vec<Lv2Preset> {
+    if presets.is_empty() {
+        return presets;
+    }
+    let Some(reads) = crate::state::keys_it_reads(shared) else {
+        return presets;
+    };
+    let mut verdict: HashMap<PathBuf, bool> = HashMap::new();
+    let mut kept = Vec::with_capacity(presets.len());
+    let mut dropped = 0usize;
+    for p in presets {
+        let manifest = p.doc.first().cloned().unwrap_or_default();
+        let ok = *verdict.entry(manifest).or_insert_with(|| {
+            let c = contents(&p, &HashMap::new());
+            !c.values.is_empty()
+                || c.state.is_empty()
+                || c.state.iter().any(|(key, _, _)| reads.contains(key))
+        });
+        if ok {
+            kept.push(p);
+        } else {
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        eprintln!(
+            "choz: {dropped} LV2 presets left out — their state is under keys this plugin \
+             never reads, so loading one would change nothing"
+        );
+    }
+    kept
+}
+
+/// Reads one preset's blob when it is loaded, not when it is listed.
+pub type ChunkReader = std::sync::Arc<dyn Fn() -> Option<Vec<u8>> + Send + Sync>;
+
+/// The presets an LV2 bundle publishes whose whole contents are one base64
+/// blob, as program chunks for the **VST2** build of the same plugin.
+///
+/// Pianoteq 9 ships one binary for both formats inside `Pianoteq 9.lv2`, and
+/// what it exports as LV2 presets (`urn:juce:stateBinary`) its LV2 side cannot
+/// read — but it is exactly the chunk its VST2 side reads back from an `.fxp`.
+pub fn program_chunks(bundle_dir: &Path) -> Vec<(PresetEntry, ChunkReader)> {
+    let Ok(manifest) = Graph::parse_file(&bundle_dir.join("manifest.ttl")) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for uri in manifest.subjects_of_type(ttl::LV2_PLUGIN) {
+        for preset in scan(bundle_dir, &uri, &[]) {
+            let entry = preset.entry.clone();
+            let read = move || {
+                let c = contents(&preset, &HashMap::new());
+                match (c.values.is_empty(), c.state.as_slice()) {
+                    (true, [(_, _, text)]) => base64(text),
+                    _ => None,
+                }
+            };
+            out.push((entry, std::sync::Arc::new(read) as ChunkReader));
+        }
+    }
+    out
+}
+
+/// Standard base64 (RFC 4648), whitespace and a trailing NUL ignored. `None`
+/// on anything else, so a preset that is not a blob is not passed off as one.
+///
+/// ponytail: twenty lines instead of a crate; decode only, no padding checks
+/// beyond what a well-formed export needs.
+fn base64(text: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &c in text {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | 0 => break,
+            c if c.is_ascii_whitespace() => continue,
+            _ => return None,
+        };
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    #[test]
+    fn base64_reads_a_wrapped_export_and_refuses_text() {
+        // "PrVK" and "Pianoteq", split across lines the way Pianoteq writes it.
+        assert_eq!(super::base64(b"\n\tUHJWSw==\0").unwrap(), b"PrVK");
+        assert_eq!(super::base64(b"UGlh\n\tbm90ZXE=").unwrap(), b"Pianoteq");
+        assert_eq!(super::base64(b"not base64!"), None);
     }
 }

@@ -338,6 +338,7 @@ impl Features {
             LV2_URID_UNMAP_URI,
             LV2_OPTIONS_URI,
             LV2_WORKER_SCHEDULE_URI,
+            LV2_BUF_SIZE_BOUNDED_URI,
         ]
         .iter()
         .map(|u| CString::new(*u).unwrap_or_default())
@@ -363,6 +364,15 @@ impl Features {
             LV2_Feature {
                 uri: uris[3].as_ptr(),
                 data: schedule.as_mut() as *mut LV2_Worker_Schedule as *mut c_void,
+            },
+            // **Passed, not only accepted.** `supported` has long said yes to
+            // it, and it is true — every `run` is cut to `block_size`, the
+            // `maxBlockLength` in the options — but a feature is something the
+            // plugin looks for in this array. JUCE's LV2 wrapper (Pianoteq 9)
+            // requires it and returned null from `instantiate` without it.
+            LV2_Feature {
+                uri: uris[4].as_ptr(),
+                data: std::ptr::null_mut(),
             },
         ];
         // Pointers into the Vec's heap buffer, which stays put when `feats`
@@ -1293,7 +1303,10 @@ impl Lv2Instrument {
             },
             _ => (None, None, None),
         };
-        let presets = presets::scan(bundle_dir, uri, &inst.info.ports);
+        let presets = presets::applicable(
+            presets::scan(bundle_dir, uri, &inst.info.ports),
+            &inst.state,
+        );
         // Only worth asking when the bundle described nothing: a plugin that
         // publishes both would otherwise list every patch twice.
         let programs = match presets.is_empty() {

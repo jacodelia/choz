@@ -52,7 +52,11 @@ fn scan_recursive(dir: &Path, depth: usize, out: &mut Vec<Vst3PluginInfo>) {
             continue;
         }
         if path.extension().is_some_and(|e| e == "vst3") {
-            out.push(describe(&path));
+            // A bundle for another machine only (Pianoteq's `arm-64bit/`) is
+            // not a plugin here.
+            if host::has_native_binary(&path) {
+                out.push(describe(&path));
+            }
         } else {
             scan_recursive(&path, depth + 1, out);
         }
