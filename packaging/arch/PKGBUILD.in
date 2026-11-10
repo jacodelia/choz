@@ -15,13 +15,11 @@ pkgdesc="Terminal audio plugin host — CLAP, LV2, LADSPA, DSSI, VST2 and VST3 i
 arch=('x86_64' 'aarch64' 'armv7h')
 url="https://github.com/jacodelia/choz"
 license=('MIT')
-# ALSA is linked and choz cannot open a device without it. **JACK is not a
-# dependency**: it is `dlopen`ed at runtime, so a machine without it still gets
-# audio through ALSA — which is why it belongs in optdepends and nowhere else.
-depends=('alsa-lib' 'gcc-libs' 'glibc')
+# ALSA is linked and choz cannot open a device without it. **PipeWire's JACK is
+# a dependency too**, although it is `dlopen`ed: without it choz is an ALSA
+# client with no per-device outputs, one capture device and no virtual devices.
+depends=('alsa-lib' 'gcc-libs' 'glibc' 'pipewire-jack')
 optdepends=(
-  'pipewire-jack: JACK/PipeWire routing and per-channel outputs'
-  'jack2: same, on a system running JACK itself instead of PipeWire'
   'kitty: the terminal the launcher prefers — wallpaper at real pixel resolution'
   'libpd: hosting Pure Data patches as effects'
 )

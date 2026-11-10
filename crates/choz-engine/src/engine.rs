@@ -845,8 +845,72 @@ fn detect_sound_server() -> &'static str {
     "ALSA"
 }
 
+/// Stop libasound writing to stderr.
+///
+/// Enumerating devices opens every PCM the configuration names — OSS, `dmix`,
+/// `dsnoop` — and each one that is not there prints a line. With stderr being
+/// the log, one look at the OUT drawer buried whatever choz itself had to say
+/// under dozens of them. `CHOZ_ALSA_VERBOSE=1` keeps them.
+fn quiet_alsa() {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::raw::{c_char, c_int};
+        // The real handler is variadic; one that never reads the variadic part
+        // is the same call on every ABI Linux runs on (the caller cleans up).
+        type Handler =
+            unsafe extern "C" fn(*const c_char, c_int, *const c_char, c_int, *const c_char);
+        extern "C" {
+            fn snd_lib_error_set_handler(handler: Option<Handler>) -> c_int;
+        }
+        unsafe extern "C" fn silent(
+            _: *const c_char,
+            _: c_int,
+            _: *const c_char,
+            _: c_int,
+            _: *const c_char,
+        ) {
+        }
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("CHOZ_ALSA_VERBOSE").is_none() {
+                // SAFETY: libasound is linked (cpal, alsa), and the handler
+                // is a `'static` function that touches nothing.
+                unsafe { snd_lib_error_set_handler(Some(silent)) };
+            }
+        });
+    }
+}
+
+/// Whether an ALSA PCM name is worth offering while a sound server runs. The
+/// server holds the cards, so the raw ones (`hw:`, `front:`, `dmix:`…) are
+/// busy or the wrong format and never open; what does open is what goes
+/// *through* the server. With no server they are all there is.
+fn usable_alsa_device(name: &str, sound_server: &str) -> bool {
+    const RAW: &[&str] = &[
+        "hw:",
+        "plughw:",
+        "sysdefault",
+        "front:",
+        "rear:",
+        "center_lfe:",
+        "side:",
+        "surround",
+        "iec958",
+        "hdmi:",
+        "dmix",
+        "dsnoop",
+        "modem",
+        "phoneline",
+        "null",
+        "oss",
+        "usbstream",
+    ];
+    sound_server == "ALSA" || !RAW.iter().any(|p| name.starts_with(p))
+}
+
 impl AudioEngine {
     pub fn new(sample_rate: u32, buffer_size: u32) -> Self {
+        quiet_alsa();
         // SPSC rings: a full command ring drops the excess rather than blocking
         // the RT thread.
         let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(CMD_RING);
@@ -929,9 +993,21 @@ impl AudioEngine {
                     );
                     return Ok(());
                 }
-                Err(e) => eprintln!("choz: native JACK unavailable ({e}), falling back to cpal..."),
+                Err(e) => {
+                    eprintln!("choz: native JACK unavailable ({e}), falling back to cpal...");
+                    if sound_server == "PipeWire" {
+                        eprintln!(
+                            "choz: PipeWire without its JACK layer: install `pipewire-jack` \
+                             for per-device outputs, every input and the virtual devices"
+                        );
+                    }
+                }
             }
         }
+        // Only the native client feeds `choz Mic`. Left up without it, it is a
+        // silent microphone the system may well make its default source — and
+        // then choz's own "default input" is choz listening to itself.
+        self.virtual_devices = None;
 
         // Pick backend + device + config BEFORE we touch the RT ring endpoints,
         // so a failed JACK probe can cleanly fall through to ALSA.
@@ -958,7 +1034,26 @@ impl AudioEngine {
         // On JACK the wanted name is a graph sink, not a cpal device: keep it
         // and patch the ports once the stream (and its ports) exist.
         let wanted = self.output_device.take();
-        let stream = build_stream(&device, &config, state)?;
+        let (stream, device) = match build_stream(&device, &config, state) {
+            Ok(stream) => (stream, device),
+            // A saved device that will not open is not a reason to start
+            // silent: the default one is tried before giving up, on the state
+            // the failed stream handed back.
+            Err(failed) => {
+                let (e, state) = *failed;
+                let fallback = cpal::default_host()
+                    .default_output_device()
+                    .filter(|_| backend != AudioBackend::Jack)
+                    .with_context(|| format!("{e:#}"))?;
+                eprintln!(
+                    "choz: cannot open '{}' ({e:#}), using the default output",
+                    device.name().unwrap_or_default()
+                );
+                let config = pick_config(&fallback, self.sample_rate, self.buffer_size)?;
+                let stream = build_stream(&fallback, &config, state).map_err(|e| e.0)?;
+                (stream, fallback)
+            }
+        };
         stream.play().context("failed to start audio stream")?;
         self._stream = Some(BackendHandle::Cpal(stream));
         self._input_stream = in_stream;
@@ -1248,10 +1343,25 @@ impl AudioEngine {
                 return sinks;
             }
         }
+        let server = detect_sound_server();
         match cpal::default_host().output_devices() {
-            Ok(devs) => devs.filter_map(|d| d.name().ok()).collect(),
+            Ok(devs) => devs
+                .filter_map(|d| d.name().ok())
+                .filter(|n| usable_alsa_device(n, server))
+                .collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    /// The graph's capture ports when they are no longer the ones this client
+    /// was built on — a card plugged in or pulled out since. `None` when
+    /// nothing moved, and always on cpal, which has a device and not a graph.
+    pub fn inputs_changed(&self) -> Option<Vec<String>> {
+        if !matches!(self._stream, Some(BackendHandle::Jack(_))) {
+            return None;
+        }
+        let now = crate::jack_backend::all_capture_ports();
+        (now != self.input_ports).then_some(now)
     }
 
     /// Name of the device audio is currently going to.
@@ -1288,8 +1398,12 @@ impl AudioEngine {
     /// choose, every jack is already wired — so this is the cpal list, which is
     /// what the Settings row offers on ALSA / PulseAudio / PipeWire.
     pub fn input_devices(&self) -> Vec<String> {
+        let server = detect_sound_server();
         match cpal::default_host().input_devices() {
-            Ok(devs) => devs.filter_map(|d| d.name().ok()).collect(),
+            Ok(devs) => devs
+                .filter_map(|d| d.name().ok())
+                .filter(|n| usable_alsa_device(n, server))
+                .collect(),
             Err(_) => Vec::new(),
         }
     }
@@ -1412,8 +1526,14 @@ impl AudioEngine {
             }
             _ => {}
         }
-        self.output_device = Some(name.to_string());
-        self.restart_cpal().map(|()| true)
+        // The old stream keeps playing when the new one will not open, so the
+        // name has to stay the old one's too.
+        let was = self.output_device.replace(name.to_string());
+        let done = self.restart_cpal().map(|()| true);
+        if done.is_err() {
+            self.output_device = was;
+        }
+        done
     }
 
     /// Tear the cpal streams down and open them again from the current
@@ -1451,7 +1571,9 @@ impl AudioEngine {
             self.input_device = in_name;
         }
         let state = self.new_rt_state(RtEndpoints { cmd_rx, retired_tx }, 2, ins, capture_rx);
-        let stream = build_stream(&device, &config, state)?;
+        let stream = build_stream(&device, &config, state)
+            .map_err(|e| e.0)
+            .with_context(|| format!("cannot open '{}'", device.name().unwrap_or_default()))?;
         stream.play().context("failed to start audio stream")?;
 
         // The numbers belong to the device that is open now.
@@ -3408,18 +3530,41 @@ fn build_input_stream(
 fn build_stream(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    mut state: RtState,
-) -> Result<cpal::Stream> {
+    state: RtState,
+) -> std::result::Result<cpal::Stream, Box<(anyhow::Error, RtState)>> {
+    // The state goes into the callback, and a callback cpal refused is dropped
+    // inside cpal — so it sits in a shared cell the caller can take it back
+    // out of to try another device. Once the stream runs the audio thread is
+    // the only one that ever locks it: uncontended, so never a wait.
+    let cell = Arc::new(std::sync::Mutex::new(Some(state)));
+    let rt = cell.clone();
     device
         .build_output_stream(
             config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                audio_callback(data, &mut state);
+                if let Ok(mut guard) = rt.try_lock() {
+                    if let Some(state) = guard.as_mut() {
+                        audio_callback(data, state);
+                        return;
+                    }
+                }
+                data.fill(0.0);
             },
             |err| eprintln!("Audio error: {err}"),
             None,
         )
-        .context("failed to build output stream")
+        .map_err(|e| {
+            let state = cell
+                .lock()
+                .ok()
+                .and_then(|mut g| g.take())
+                .expect("nothing else takes the state");
+            let e = anyhow::Error::new(e).context(format!(
+                "failed to build output stream ({} Hz, {} ch)",
+                config.sample_rate.0, config.channels
+            ));
+            Box::new((e, state))
+        })
 }
 
 /// JACK port type of a mono float audio port (`JACK_DEFAULT_AUDIO_TYPE`).
@@ -3608,6 +3753,17 @@ fn pick_config(
 
     let mut best: Option<cpal::SupportedStreamConfig> = None;
 
+    // Stereo float first: the stream is opened as two channels of `f32`
+    // whatever is picked here, so a range that is neither only looks like a
+    // match — its rate fits and the device then refuses the stream.
+    let mut supported: Vec<_> = supported.collect();
+    supported.sort_by_key(|c| {
+        (
+            c.channels() != 2,
+            c.sample_format() != cpal::SampleFormat::F32,
+        )
+    });
+
     for cfg in supported {
         let range = cfg.min_sample_rate()..=cfg.max_sample_rate();
         if range.contains(&target_rate) {
@@ -3793,6 +3949,24 @@ pub fn build_instrument(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Under a sound server the raw PCMs never open; without one they are all
+    /// there is.
+    #[test]
+    fn raw_alsa_devices_are_offered_only_without_a_sound_server() {
+        for raw in [
+            "hw:CARD=H340,DEV=0",
+            "dsnoop:CARD=PCH,DEV=0",
+            "oss",
+            "front:CARD=PCH,DEV=0",
+        ] {
+            assert!(!usable_alsa_device(raw, "PipeWire"), "{raw}");
+            assert!(usable_alsa_device(raw, "ALSA"), "{raw}");
+        }
+        for ok in ["default", "pulse", "pipewire", "jack"] {
+            assert!(usable_alsa_device(ok, "PipeWire"), "{ok}");
+        }
+    }
 
     /// A graph that says what rate it runs at is believed over the settings —
     /// that mismatch is what detunes every synth in the rack. A graph that says

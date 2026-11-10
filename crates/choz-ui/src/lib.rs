@@ -966,16 +966,43 @@ fn grouping_label(num: u16) -> String {
     let groups = choz_engine::artifacts::metronome::metronome().groups();
     let sum: u16 = groups.iter().map(|g| *g as u16).sum();
     match groups.len() {
-        0 => format!("{num} (even)"),
+        0 => i18n::t("NONE").to_string(),
         // A grouping the signature has outgrown is shown as what it is rather
         // than as a set of accents the click is not playing.
-        _ if sum != num => format!("{num} (even)"),
+        _ if sum != num => i18n::t("NONE").to_string(),
         _ => groups
             .iter()
             .map(|g| g.to_string())
             .collect::<Vec<_>>()
             .join("+"),
     }
+}
+
+/// How well `hay` answers a picker search, lower is better; `None` is a miss.
+///
+/// **Every word, in any order**: `teq pian` finds Pianoteq and `lv2 reverb`
+/// finds the reverbs that are LV2. One substring made the player type a name
+/// exactly as its vendor spelt it. `name` is what the row is called and ranks
+/// the hit — a name that starts with what was typed comes before one that
+/// starts a word with it, and both before a match in the middle of something.
+/// `query` is already lower-cased ([`App::modal_search`]).
+fn search_rank(query: &str, name: &str, extra: &str) -> Option<u8> {
+    let name = name.to_lowercase();
+    let hay = format!("{name} {}", extra.to_lowercase());
+    if !query.split_whitespace().all(|w| hay.contains(w)) {
+        return None;
+    }
+    let first = query.split_whitespace().next().unwrap_or("");
+    Some(if name.starts_with(first) {
+        0
+    } else if name
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| w.starts_with(first))
+    {
+        1
+    } else {
+        2
+    })
 }
 
 /// How much one arrow press moves the tempo.
@@ -2673,17 +2700,16 @@ impl App {
             return Vec::new();
         };
         let fmt = SOURCE_FORMATS[m.list.filter];
-        let q = self.modal_search();
-        m.sources
-            .iter()
-            .filter(|c| fmt == "ALL" || c.fmt == fmt)
-            .filter(|c| {
-                q.as_ref().is_none_or(|q| {
-                    c.label.to_lowercase().contains(q) || c.fmt.to_lowercase().contains(q)
-                })
-            })
-            .cloned()
-            .collect()
+        let in_chip = m.sources.iter().filter(|c| fmt == "ALL" || c.fmt == fmt);
+        let Some(q) = self.modal_search() else {
+            return in_chip.cloned().collect();
+        };
+        let mut hits: Vec<(u8, &SourceChoice)> = in_chip
+            .filter_map(|c| Some((search_rank(&q, &c.label, c.fmt)?, c)))
+            .collect();
+        // Stable, so equal ranks keep the order the list always had.
+        hits.sort_by_key(|(rank, _)| *rank);
+        hits.into_iter().map(|(_, c)| c.clone()).collect()
     }
 
     fn open_source_modal(&mut self) {
@@ -3532,6 +3558,7 @@ impl App {
         // is listening to — see [`App::push_capture_wiring`].
         self.push_capture_wiring();
         if self.in_open {
+            self.rescan_if_inputs_moved();
             self.refresh_in_ports();
             self.input_cursor = self
                 .in_targets()
@@ -3963,6 +3990,7 @@ impl App {
             }
             _ => return,
         }
+        self.remember_metronome();
         self.refresh_modal();
     }
 
@@ -4423,6 +4451,14 @@ impl App {
             }
             _ => {}
         }
+        self.remember_metronome();
+    }
+
+    /// The click's menu is live **and kept**: whatever a row was turned to is
+    /// what the next start opens with.
+    fn remember_metronome(&mut self) {
+        self.ui.audio.metronome = Some(project::Metronome::snapshot());
+        self.ui.save();
     }
 
     /// Put what the tab is playing right now on button `i`.
@@ -7414,7 +7450,7 @@ impl App {
                 t.set_time_signature(num, den);
                 choz_engine::artifacts::metronome::metronome().set_groups(&[]);
                 self.ui.audio.time_sig = (num, den);
-                self.ui.save();
+                self.remember_metronome();
             }
             // The guard is a switch, so either arrow — or Enter — flips it.
             (SEC_ENGINE, 7) => {
@@ -9130,9 +9166,18 @@ impl App {
             // a caret, in the line the picker keeps its hints on.
             if matches!(m.kind, ModalKind::Source | ModalKind::AddFx) {
                 m.list.note = match m.search.as_deref() {
+                    // How many it found, and under which chip: an empty list
+                    // with `LV2` lit two rows up reads as "not installed".
                     Some(q) => format!(
-                        "  {}: {q}\u{2588}  \u{00B7}  Esc={}",
+                        "  {}: {q}\u{2588}  \u{00B7}  {} {}{}  \u{00B7}  Esc={}",
                         i18n::t("SEARCH"),
+                        items.len(),
+                        i18n::t("found"),
+                        // The chip's own name, which is the same in every language.
+                        match m.list.filters.get(m.list.filter).map(String::as_str) {
+                            Some("ALL") | None => String::new(),
+                            Some(chip) => format!(" [{chip}, Tab]"),
+                        },
                         i18n::t("back to the whole list"),
                     ),
                     None if m.kind == ModalKind::AddFx => format!(
@@ -9878,7 +9923,9 @@ impl App {
                 .and_then(|i| self.fx_categories().get(i).map(|(c, _)| *c))
                 .unwrap_or(None),
         };
-        self.fx_menu_entries()
+        let query = self.modal_search();
+        let mut rows: Vec<(Option<u8>, Option<usize>, String)> = self
+            .fx_menu_entries()
             .into_iter()
             .enumerate()
             // **The vocoder is not offered any more**: it is the harmoniser's
@@ -9887,17 +9934,22 @@ impl App {
             // opens with it, and it still works — it is only off the menu.
             .filter(|(i, _)| ALL_FX_KINDS.get(*i) != Some(&source::AudioFxKind::Vocoder))
             .filter(|(_, e)| e.matches_filter(wanted) && section.is_none_or(|c| e.category == c))
-            // …and whatever is being typed, over the name a player would read.
-            .filter(|(_, e)| {
-                self.modal_search()
-                    .is_none_or(|q| e.label.to_lowercase().contains(&q))
-            })
             .map(|(i, e)| {
                 let fmt = e.format.map(|f| f.label()).unwrap_or("BUILT-IN");
                 let mark = if e.hosted { "" } else { "  (not hosted yet)" };
-                (Some(i), format!(" [{fmt}] {}{mark}", e.label))
+                // …and whatever is being typed: over the name a player would
+                // read, and over the format and category it is filed under,
+                // so `lv2 reverb` is a search and not two.
+                let rank = match &query {
+                    Some(q) => search_rank(q, &e.label, &format!("{fmt} {}", e.category.label())),
+                    None => Some(0),
+                };
+                (rank, Some(i), format!(" [{fmt}] {}{mark}", e.label))
             })
-            .collect()
+            .filter(|(rank, _, _)| rank.is_some())
+            .collect();
+        rows.sort_by_key(|(rank, _, _)| *rank);
+        rows.into_iter().map(|(_, i, label)| (i, label)).collect()
     }
 
     /// Load a plugin instrument by path+id into the active tab (SOURCE picker).
@@ -10209,16 +10261,7 @@ impl App {
                     false => choz_ports::transport().bpm(),
                 }),
                 time_sig: Some(choz_ports::transport().time_signature()),
-                metronome: {
-                    let m = choz_engine::artifacts::metronome::metronome();
-                    Some(project::Metronome {
-                        on: m.on(),
-                        gain: m.gain(),
-                        style: m.style().label().to_string(),
-                        groups: m.groups(),
-                        dest: m.dest().index(),
-                    })
-                },
+                metronome: Some(project::Metronome::snapshot()),
                 clock_source: Some(self.ui.clock_source.clone()),
                 rack_mode: Some(self.ui.rack_mode),
                 input_device: self.ui.audio.input_device.clone(),
@@ -10337,17 +10380,8 @@ impl App {
             self.ui.audio.time_sig = t.time_signature();
         }
         if let Some(m) = &p.audio.metronome {
-            let met = choz_engine::artifacts::metronome::metronome();
-            met.set_gain(m.gain);
-            met.set_style(
-                choz_engine::artifacts::metronome::ClickStyle::ALL
-                    .into_iter()
-                    .find(|s| s.label() == m.style)
-                    .unwrap_or_default(),
-            );
-            met.set_groups(&m.groups);
-            met.set_dest(choz_engine::Dest::from_index(m.dest));
-            met.set_on(m.on);
+            m.apply(true);
+            self.ui.audio.metronome = Some(m.clone());
         }
         // LIVE or MULTI decides which tab a note reaches, so it is the rack's
         // and not the machine's.
@@ -14751,7 +14785,7 @@ impl App {
         choz_ports::transport().set_time_signature(num, den);
         choz_engine::artifacts::metronome::metronome().set_groups(&groups);
         self.ui.audio.time_sig = (num, den);
-        self.ui.save();
+        self.remember_metronome();
         if let Some(slot) = self.slots.get_mut(slot_index) {
             if !groups.is_empty() {
                 slot.arranger.set_groups(&groups);
@@ -16860,6 +16894,25 @@ impl App {
             );
             self.connect_midi();
         }
+        // Only with the drawer open: the probe is a JACK client of its own,
+        // and one of those joining the graph every two seconds for the whole
+        // set is not free. Opening the drawer asks once more.
+        if self.in_open {
+            self.rescan_if_inputs_moved();
+        }
+    }
+
+    /// A card plugged in (or pulled out) since the client was built: say so,
+    /// and rebuild on the graph as it is now.
+    fn rescan_if_inputs_moved(&mut self) {
+        let Some(now) = self.audio_engine.as_ref().and_then(|e| e.inputs_changed()) else {
+            return;
+        };
+        eprintln!(
+            "choz: audio inputs changed, rescanning\n  was: {:?}\n  now: {now:?}",
+            self.in_ports
+        );
+        self.rescan_capture();
     }
 
     /// Start the OSC listener on `port` (0 = let the OS pick). Failure is
@@ -17459,6 +17512,11 @@ pub fn run() -> Result<()> {
 
     let mut app = App::new();
     app.ui.apply();
+    // Once, here, and not in `apply`: that runs on every settings change, and
+    // would put the saved grouping back over the one a playing band set.
+    if let Some(m) = &app.ui.audio.metronome {
+        m.apply(false);
+    }
     // What a choz that crashed left in the scratch folder.
     sampler::capture::discard_stale();
 
@@ -21265,7 +21323,12 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                         // The button means "done": apply what is under the
                         // cursor and leave, even on tabs where Enter keeps the
                         // modal open so several things can be set at once.
-                        app.modal_select();
+                        // The metronome's rows are already live: stepping the
+                        // one under the cursor on the way out is what undid
+                        // the value just set.
+                        if app.modal.as_ref().map(|m| m.kind) != Some(ModalKind::Metronome) {
+                            app.modal_select();
+                        }
                         app.close_modal();
                         app.focus = Focus::FxChain;
                         return;
@@ -34972,11 +35035,13 @@ mod tests {
         }
         let rows = app.fx_menu_rows();
         assert!(!rows.is_empty(), "PITCH SHIFT is in there");
+        // By name first, then whatever is filed under it: the harmoniser is
+        // a pitch effect to anyone looking for one.
         assert!(
-            rows.iter()
-                .all(|(_, label)| label.to_lowercase().contains("pitch")),
-            "every row matches what was typed: {rows:?}"
+            rows[0].1.to_lowercase().contains("pitch"),
+            "the name that matches leads: {rows:?}"
         );
+        assert!(rows.len() < all, "and the rest of the catalogue is gone");
 
         // Backspacing to nothing, then Esc, is the way back out.
         handle_modal_key(&mut app, KeyCode::Backspace);
@@ -37367,6 +37432,67 @@ mod tests {
         // …and the key, which the grid was never shown, came back with it.
         let text = app.slots[0].arranger.settings.text.clone();
         assert!(text.contains("key = C"), "the key went with it: {text:?}");
+    }
+
+    /// SELECT in the metronome's menu means "done". It used to step the row
+    /// under the cursor once more on the way out, which undid the value just
+    /// set — and none of sound, grouping or level reached `ui.json`.
+    #[test]
+    fn select_keeps_what_the_metronome_menu_was_set_to() {
+        use choz_engine::artifacts::metronome::ClickStyle;
+        let _g = ui_guard();
+        let m = choz_engine::artifacts::metronome::metronome();
+        m.set_style(ClickStyle::Beep);
+        m.set_groups(&[]);
+        choz_ports::transport().set_time_signature(7, 8);
+        let mut app = App::new();
+        app.splash_done = true;
+        app.slots.push(RackSlot::new(AudioSource::Midi));
+        app.open_metronome_modal();
+
+        app.step_metronome_row(5, 1);
+        app.step_metronome_row(4, 1);
+        let (style, groups) = (m.style(), m.groups());
+        assert_eq!(style, ClickStyle::Click);
+        assert!(!groups.is_empty(), "7/8 has a grouping to step to");
+
+        app.modal.as_mut().unwrap().list.cursor = 5;
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let select = app.layout.borrow().modal_rects.select.expect("SELECT");
+        click(&mut app, select.x + 1, select.y);
+        assert!(app.modal.is_none(), "SELECT left it open");
+        assert_eq!(m.style(), style, "SELECT stepped the sound again");
+
+        // Round trip: what was set is what the settings file carries back.
+        let json = serde_json::to_string(&app.ui).unwrap();
+        m.set_style(ClickStyle::Beep);
+        m.set_groups(&[]);
+        let back: settings::UiSettings = serde_json::from_str(&json).unwrap();
+        back.audio.metronome.as_ref().expect("saved").apply(false);
+        assert_eq!((m.style(), m.groups()), (style, groups));
+
+        // And "no grouping" is an answer the list has, said as such.
+        m.set_groups(&[]);
+        assert_eq!(grouping_label(7), "NONE");
+        choz_ports::transport().set_time_signature(4, 4);
+        m.set_style(ClickStyle::Beep);
+    }
+
+    /// Words in any order, over name and format, best name first.
+    #[test]
+    fn a_picker_search_takes_words_in_any_order() {
+        assert_eq!(search_rank("teq pian", "Pianoteq 9", "VST3"), Some(2));
+        assert_eq!(search_rank("pian", "Pianoteq 9", "VST3"), Some(0));
+        assert_eq!(
+            search_rank("reverb lv2", "Dragonfly Hall Reverb", "LV2"),
+            Some(1)
+        );
+        assert_eq!(
+            search_rank("reverb vst3", "Dragonfly Hall Reverb", "LV2"),
+            None
+        );
+        assert_eq!(search_rank(" ", "anything", ""), Some(0));
     }
 
     /// The three artifacts live inside one frame: a row of switches floating

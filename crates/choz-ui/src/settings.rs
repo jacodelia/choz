@@ -239,6 +239,11 @@ pub struct AudioSettings {
     /// device has no spare ports to offer.
     #[serde(default = "default_direct_tabs")]
     pub direct_tabs: usize,
+    /// The click as the metronome's menu left it: sound, grouping, level and
+    /// where it lands. Added later, hence the default. `on` is carried but not
+    /// restored — a click that starts by itself at launch is a stage accident.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metronome: Option<crate::project::Metronome>,
 }
 
 fn default_direct_tabs() -> usize {
@@ -287,6 +292,7 @@ impl Default for AudioSettings {
             polyphony: default_polyphony(),
             feedback_guard: true,
             direct_tabs: default_direct_tabs(),
+            metronome: None,
         }
     }
 }

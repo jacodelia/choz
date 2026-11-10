@@ -219,16 +219,17 @@ fn the_arch_pkgbuild_installs_the_desktop_files_too() {
         pkgbuild.contains("/usr/share/licenses/"),
         "Arch packages carry their licence",
     );
-    // JACK is `dlopen`ed. Declaring it a dependency would make choz refuse to
-    // install on a perfectly good ALSA-only machine.
+    // JACK is `dlopen`ed, so nothing reads it off the binary: it is named, and
+    // required — without PipeWire's JACK choz is a plain ALSA client with half
+    // its routing missing (the 1.3.24 bug report).
     let depends = pkgbuild
         .lines()
         .find(|l| l.starts_with("depends="))
         .expect("depends=");
     assert!(depends.contains("alsa-lib"), "ALSA is not optional");
     assert!(
-        !depends.contains("jack"),
-        "JACK is dlopened, so it belongs in optdepends: {depends}",
+        depends.contains("'pipewire-jack'"),
+        "pipewire-jack is a hard dependency: {depends}",
     );
 
     // Every placeholder the generator fills has to still be there — a template

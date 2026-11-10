@@ -12,7 +12,7 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **1104 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo) y sin los de `midi::` (`--skip midi`: abren los puertos ALSA reales y en la máquina de desarrollo tiran el hub USB del dock), 660 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **1107 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo) y sin los de `midi::` (`--skip midi`: abren los puertos ALSA reales y en la máquina de desarrollo tiran el hub USB del dock), 661 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio, y `cargo fmt --all --check` también.
 - **56 efectos propios**, publicados también como un `.clap` con los cuatro artifacts (arpegiador, secuenciador, metrónomo y arreglador).
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
@@ -31,6 +31,49 @@ lleva lo que falta —nada de lo ya hecho— y
   `choz-engine::test_locks` tiene un candado por global; en `choz-ui` el par es
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
+
+## [1.3.25] — 2026-11-10
+
+Release audit: `cargo test --workspace --exclude choz-plugin-lv2 --no-fail-fast -- --skip midi` 1107 pasan, 0 fallan, 5 ignorados, más `cargo test -p choz-plugin-lv2 --lib` 19 pasan (`lv2_runtime` sigue colgándose acá, ver Estado actual); `cargo clippy --workspace --all-targets -D warnings` y `cargo fmt --all --check` limpios. i18n: dos claves nuevas, `NONE` y `found`, en los ocho idiomas; el test `the_table_and_the_call_sites_are_the_same_list` las exige y pasa. El chip de formato en la línea de búsqueda se muestra con su propio nombre (`[LV2, Tab]`), que es el mismo en todos los idiomas. Paquetes: generado el `.deb` (`dpkg-deb -f` da `Depends: … pipewire-jack`) y el `.rpm` (el nombre `pipewire-jack-audio-connection-kit` está en la cabecera; acá no hay `rpm` para listar `--requires`). **No probado contra audio real**: el log de la máquina de desarrollo no tiene los `failed to build output stream` del reporte, así que lo de las salidas sale de leer el código y no de reproducirlo. Documentación: architecture (búsqueda de los pickers, SELECT del metrónomo, lo que el click guarda, el camino cpal, hotplug de entradas), environment (`CHOZ_ALSA_VERBOSE`, `CHOZ_PW_JACK`), install y README (pipewire-jack obligatorio), README, overview, roadmap e install a 1.3.25.
+
+### 2026-11-10 — El reporte de errores de 1.3.24, la búsqueda de plugins y pipewire-jack obligatorio
+
+Entró un reporte hecho desde afuera (log, `ui.json` y el binario, sin fuentes) con cuatro puntos. Auditado contra el código: dos eran lo que decían, uno existía con otro nombre y parte del cuarto era de la máquina y no de choz.
+
+#### Corregido
+
+- **SELECT en el menú del metrónomo deshacía lo que se acababa de poner.** El botón significa "listo" en todos los modales: aplica la fila bajo el cursor y cierra. En el metrónomo "aplicar la fila" es *avanzarla un paso*, así que poner WOOD y pulsar SELECT dejaba BEEP. Las filas ya están vivas mientras se mueven: SELECT ahora sólo cierra. Enter sigue avanzando, como dice el README.
+- **Sonido, agrupación, nivel y salida del click no se guardaban.** `ui.json` llevaba `bpm` y `time_sig` y nada más. Van ahora en `audio.metronome` (la misma estructura que ya lleva el proyecto, con `snapshot`/`apply` en un solo lugar) y vuelven al arrancar. **El on/off se guarda pero no se restaura** desde ahí: un click que arranca solo es un accidente de escenario; el proyecto sí lo restaura. Se restaura una vez, en `run`, y no en `UiSettings::apply` — que corre con cada cambio de ajustes y habría pisado la agrupación que puso una banda tocando.
+- **"Sin agrupación" existía y se llamaba `7 (even)`.** Es la primera respuesta de la fila; ahora dice `NONE`.
+- **La salida guardada que no abre ya no deja a choz mudo.** Al arrancar se prueba el dispositivo por defecto antes de rendirse; `build_stream` devuelve el estado RT cuando falla, que es lo que faltaba para poder reintentar. Elegir en caliente un dispositivo que no abre deja sonando el anterior **y su nombre**, que antes quedaba cambiado al que falló.
+- **`pick_config` tomaba el primer rango con la frecuencia pedida**, fuera estéreo y `f32` o no, y el stream se abre siempre como estéreo `f32`. Ahora esos van primero.
+- **Las listas de dispositivos ofrecían lo que nunca abre.** Con un servidor de sonido los PCM crudos (`hw:`, `front:`, `dmix`, `dsnoop`, OSS) están tomados; quedan fuera. Sin servidor son lo único que hay y se listan todos.
+- **`choz Mic` quedaba creado sin nadie que lo alimentara** cuando el cliente JACK nativo no arrancaba: un micrófono mudo que el sistema podía dejar como fuente por defecto, y entonces la entrada "default" de choz era choz. Se retira al caer a cpal.
+- **Una tarjeta enchufada con choz abierto no aparecía en IN** sin `r`. Con el cajón abierto (y al abrirlo) se compara el grafo con los puertos del cliente, se escribe `audio inputs changed` con was/now y se rescanea. Sólo con el cajón abierto: la sonda es un cliente JACK propio y el rescan rehace el rack.
+- **El log era ilegible por el stderr de libasound.** Silenciado; `CHOZ_ALSA_VERBOSE=1` lo devuelve.
+
+#### No eran bugs
+
+- `input_device: null` **sí se guarda**: `null` es "entrada apagada", y con el cliente JACK nativo no hay dispositivo que elegir.
+- La salida **ya negociaba** la frecuencia; la entrada no la negocia a propósito (un micrófono transpuesto es peor que uno que dice por qué no abre).
+- El backend caído **no se persiste**: guardar ALSA impediría volver a JACK el día que se instale. En su lugar el log dice qué instalar.
+
+#### Mejorado: la búsqueda en SOURCE y ADD FX
+
+- **Palabras en cualquier orden.** Era una sola subcadena: `teq pian` no encontraba Pianoteq.
+- **ADD FX busca también por formato y categoría**, como SOURCE ya hacía con el formato: `lv2 reverb` es una búsqueda. Escribir `pitch` trae PITCH SHIFT y, detrás, lo archivado bajo PITCH.
+- **Ordenado**: el nombre que empieza con lo escrito, después el que empieza una palabra con eso, después el resto.
+- **La línea de búsqueda dice cuántos encontró y bajo qué chip.** Una lista vacía con `LV2` encendido dos filas más arriba se lee como "no está instalado".
+
+#### Cambiado: `pipewire-jack` es obligatorio
+
+libjack se abre con `dlopen`, así que ni `$auto` ni rpm lo ven, y choz arranca sin él — sobre ALSA, sin salidas por dispositivo, con una sola entrada y sin dispositivos virtuales, que es exactamente la lista del reporte. Era `Recommends`/`optdepends`; ahora es dependencia dura **por nombre de paquete** en el `.deb` (también la variante arm), el `.rpm` y el PKGBUILD, e `install.sh` se detiene si no encuentra `pw-jack` (`--skip-deps-check` lo salta, como con ALSA). jack2 no la satisface: en un escritorio con PipeWire no llega a ningún grafo, y era lo que tenía instalado la máquina del reporte. `apt install ./choz.deb` y `dnf install` lo bajan solos; `dpkg -i` y `rpm -i` se detienen nombrándolo.
+
+Dos tests decían lo contrario y se dieron vuelta: `a_missing_jack_is_a_note_not_a_refusal` es `a_missing_pipewire_jack_is_a_refusal`, y el del PKGBUILD exige `pipewire-jack` en `depends`.
+
+#### Queda
+
+- Elegir un sink concreto **sin** `pipewire-jack` (con `--skip-deps-check`) sigue sin poderse: por ALSA sólo hay `default`/`pulse`.
 
 ## [1.3.24] — 2026-11-09
 
