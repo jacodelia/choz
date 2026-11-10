@@ -11,7 +11,7 @@ third by hand:
 |---|---|---|
 | `libc` | yes | nothing runs |
 | `libasound.so.2` (ALSA) | yes | choz starts but opens no audio device |
-| `libjack.so.0` | **optional** — `dlopen`ed at runtime; normally PipeWire's (`pipewire-jack`), jack2's works the same | choz uses ALSA; no JACK/PipeWire routing, no per-channel outputs |
+| `pipewire-jack` (`libjack.so.0`) | **yes** — `dlopen`ed at runtime, but required by every package and by `install.sh` | choz would run on bare ALSA: no per-device outputs, one capture device, no virtual devices |
 | `libpd` (Pure Data) | **optional** — linked only by `choz-pd-host`, from `libpd-dev` (not `puredata-dev`) | choz installs and runs; Pure Data patches cannot be hosted |
 | X11 | not linked | plugin windows go through `x11rb`, which speaks the protocol itself |
 
@@ -20,15 +20,18 @@ runtime choice, not a build-time dependency. **The packages refuse to install
 without ALSA**, and that is read off the built packages rather than intended:
 `dpkg-deb -f` shows `Depends: libasound2t64 (>= 1.0.29), libc6 (>= 2.43)`, and
 the `.rpm` requires `libasound.so.2()(64bit)` down to its `ALSA_0.9` symbol
-versions, so `apt` and `rpm -i` both stop. JACK is a `Recommends` in both:
-`pipewire-jack` first on Debian/Ubuntu (jack2's library still satisfies it), and
-the `libjack.so.0` soname on Fedora, which PipeWire's JACK provides. On Arch it
-is an `optdepends` on `pipewire-jack`.
+versions, so `apt` and `rpm -i` both stop. **PipeWire's JACK is a hard
+dependency in all three**, by package name because a `dlopen`ed library is
+invisible to the tools that read the binary: `pipewire-jack` in the `.deb` and
+the Arch package, `pipewire-jack-audio-connection-kit` in the `.rpm`. jack2's
+library does not satisfy it. `apt install ./choz.deb` and `dnf install` pull it
+in; `dpkg -i` and `rpm -i` stop and name it.
 
 `install.sh` checks all three before it copies anything. **A missing ALSA stops
 the install** — a choz that starts and then opens no device looks like a bug in
 choz, not a missing package — and it prints the command for your distribution. A
-missing JACK is only a note; a missing libpd is a note **and** it decides what
+missing `pipewire-jack` (looked for as `pw-jack`) stops it the same way; a
+missing libpd is a note **and** it decides what
 gets built: without it choz installs without the Pure Data half rather than
 failing over it. `--skip-deps-check` installs anyway, which is right when you are
 staging an install for a machine that is not this one.
@@ -41,8 +44,8 @@ Arch, the user manual (`choz-manual.pdf`, built from `docs/choz-manual.fodt`),
 plus `SHA256SUMS.txt`:
 
 ```bash
-tar xzf choz-1.3.24-x86_64-unknown-linux-gnu.tar.gz
-cd choz-1.3.24-x86_64-unknown-linux-gnu
+tar xzf choz-1.3.25-x86_64-unknown-linux-gnu.tar.gz
+cd choz-1.3.25-x86_64-unknown-linux-gnu
 ./install.sh            # uses the binary shipped beside it — no cargo involved
 ```
 

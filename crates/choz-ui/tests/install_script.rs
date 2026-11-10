@@ -138,8 +138,8 @@ fn the_binary_answers_version_and_help_on_stdout() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("--osc-port"));
 }
 
-/// choz needs ALSA on the machine that runs it, and only *dlopens* libjack — so
-/// a missing ALSA is fatal and a missing JACK is a note.
+/// choz needs ALSA on the machine that runs it: a missing one is fatal. (So is
+/// a missing `pipewire-jack` — its own test, below.)
 ///
 /// Refusing matters more than warning: a choz installed without ALSA starts,
 /// opens no audio device, and looks like a bug in choz. The escape hatch exists
@@ -333,10 +333,11 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
-/// JACK is the other half of the same check and must **not** stop anything: it
-/// is `dlopen`ed, so without it choz runs on ALSA.
+/// PipeWire's JACK is the other half of the same check and stops the install
+/// too: `dlopen`ed or not, without it choz is a plain ALSA client with half its
+/// routing missing.
 #[test]
-fn a_missing_jack_is_a_note_not_a_refusal() {
+fn a_missing_pipewire_jack_is_a_refusal() {
     let tmp = std::env::temp_dir().join(format!("choz_jack_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let (prefix, home, fake_bin) = (tmp.join("prefix"), tmp.join("home"), tmp.join("bin"));
@@ -356,23 +357,28 @@ fn a_missing_jack_is_a_note_not_a_refusal() {
         std::fs::set_permissions(&ldconfig, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    let out = run_with_path(
+    // `pw-jack` may well be on this machine, so the script is told to look
+    // for a command nobody has.
+    std::env::set_var("CHOZ_PW_JACK", "choz-no-such-pw-jack");
+    let (out, ok) = try_run(
         &prefix,
         &home,
         &["--binary", env!("CARGO_BIN_EXE_choz")],
         Some(&fake_bin),
     );
+    std::env::remove_var("CHOZ_PW_JACK");
+    assert!(!ok, "it installed without pipewire-jack: {out}");
     assert!(
-        out.contains("libjack is not installed"),
-        "no JACK note: {out}"
+        out.contains("pipewire-jack is missing"),
+        "no reason given: {out}"
     );
     assert!(
-        out.contains("will use ALSA"),
-        "and it says what happens instead: {out}"
+        out.contains("apt install pipewire-jack"),
+        "and no command to fix it: {out}"
     );
     assert!(
-        prefix.join("bin/choz").exists(),
-        "JACK is optional, so this installs"
+        !prefix.join("bin/choz").exists(),
+        "nothing is copied before the check"
     );
 
     let _ = std::fs::remove_dir_all(&tmp);

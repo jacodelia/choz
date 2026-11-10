@@ -146,8 +146,13 @@ fi
 WITH_PD=1
 
 # What choz needs on the machine that runs it. Checked rather than assumed: the
-# binary links ALSA and glibc, and *dlopens* libjack at runtime — so JACK and
-# PipeWire are optional, and a box without them still gets audio through ALSA.
+# binary links ALSA and glibc, and *dlopens* libjack at runtime.
+#
+# **PipeWire's JACK layer is required** all the same: without it choz starts as
+# a plain ALSA client — no per-device outputs, one capture device, no virtual
+# devices — and that reads as a broken choz, not as a missing package. It is
+# looked for as `pw-jack`, the one file every distribution's package ships
+# under the same name; the library's own path differs on each.
 #
 # A missing ALSA is fatal, because the result would be a choz that starts and
 # then opens no audio device — a bug report waiting to happen rather than an
@@ -185,9 +190,16 @@ check_runtime_deps() {
         say "(right when you are staging this for another machine)."
         exit 1
     fi
-    if ! ldconfig -p 2>/dev/null | grep -q 'libjack\.so'; then
-        say "note: libjack is not installed — choz will use ALSA."
-        say "      For JACK/PipeWire routing: apt install pipewire-jack | pacman -S pipewire-jack | dnf install pipewire-jack-audio-connection-kit"
+    # `CHOZ_PW_JACK` names the command to look for, so the tests can ask for
+    # one that is not there.
+    if ! command -v "${CHOZ_PW_JACK:-pw-jack}" >/dev/null 2>&1; then
+        say "pipewire-jack is missing — choz would run on bare ALSA: no per-device"
+        say "outputs, one capture device, no 'choz Mic' / 'choz System FX'."
+        say "  Debian/Ubuntu: sudo apt install pipewire-jack"
+        say "  Arch:          sudo pacman -S pipewire-jack"
+        say "  Fedora:        sudo dnf install pipewire-jack-audio-connection-kit"
+        say "Install it and run this again, or pass --skip-deps-check to install anyway."
+        exit 1
     fi
     return 0
 }

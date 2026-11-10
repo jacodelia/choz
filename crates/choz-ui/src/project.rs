@@ -162,6 +162,38 @@ pub struct Metronome {
     pub dest: usize,
 }
 
+impl Metronome {
+    /// The live click, as it stands.
+    pub fn snapshot() -> Self {
+        let m = choz_engine::artifacts::metronome::metronome();
+        Self {
+            on: m.on(),
+            gain: m.gain(),
+            style: m.style().label().to_string(),
+            groups: m.groups(),
+            dest: m.dest().index(),
+        }
+    }
+
+    /// Put it back on the live click. `with_on` is the project's: the machine's
+    /// own settings never switch the click on by themselves.
+    pub fn apply(&self, with_on: bool) {
+        let met = choz_engine::artifacts::metronome::metronome();
+        met.set_gain(self.gain);
+        met.set_style(
+            choz_engine::artifacts::metronome::ClickStyle::ALL
+                .into_iter()
+                .find(|s| s.label() == self.style)
+                .unwrap_or_default(),
+        );
+        met.set_groups(&self.groups);
+        met.set_dest(choz_engine::Dest::from_index(self.dest));
+        if with_on {
+            met.set_on(self.on);
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Interface {
     pub text_color: (u8, u8, u8),

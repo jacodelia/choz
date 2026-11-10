@@ -58,7 +58,7 @@ itself and links no C library.
 |---|---|---|
 | **OS** | Linux with glibc | The audio backends are ALSA and JACK, and the plugin sandbox re-runs the binary per directory. No macOS or Windows build. |
 | **Architecture** | x86-64, aarch64 or armv7 | Exactly what the releases ship: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` (Pi 3/4/5), `armv7-unknown-linux-gnueabihf` (Pi 2, Zero 2 W). |
-| **Audio** | ALSA (`libasound.so.2`) | Required — without it choz starts and opens no device. JACK/PipeWire is optional and `dlopen`ed. |
+| **Audio** | ALSA (`libasound.so.2`) | Required — without it choz starts and opens no device. PipeWire's JACK (`pipewire-jack`) is `dlopen`ed and **required too**: every package depends on it and `install.sh` stops without it. |
 | **Terminal** | Any 24-bit-colour terminal | The wallpaper and logo render as halfblocks anywhere; kitty, Ghostty and WezTerm additionally get the graphics protocol. |
 | **Terminal size** | 80×24 | Panels drop their optional rows as they shrink rather than breaking, but below this the rack and the monitor stop being readable together. |
 | **Plugin windows** | X11 or XWayland | Only needed to *open* a plugin's own window. Every parameter is a knob in the RACK without it. |
@@ -131,7 +131,7 @@ headroom for plugin DSP at small buffer sizes.
 | `P` | anywhere | panic — kill every sounding note |
 | `F4` | anywhere | LIVE ↔ MULTI |
 | `F5` | anywhere | bottom panel: MONITOR / KEYS / WAVE / MIXER (the tabs are clickable) |
-| `F6` | anywhere | metronome on/off (the `▾` beside it opens tempo / signature / grouping / sound — arrows, Enter and the wheel move each row) |
+| `F6` | anywhere | metronome on/off (the `▾` beside it opens tempo / signature / grouping / sound — arrows, Enter and the wheel move each row; every change is live and kept for the next start, SELECT just closes) |
 | `<` `>` / `;` `:` | rack | input trim / `A→M` sensitivity of a tab fed by audio |
 | `F7` / `F8` / `F9` | anywhere | roll-stop the rack / arm automation recording / panic (all-notes-off) — the same three buttons that sit on the menu bar |
 | `m` / `S` | rack | mute / solo the tab |
@@ -194,7 +194,7 @@ choz/
 
 | | |
 |---|---|
-| choz | **1.3.24** |
+| choz | **1.3.25** |
 | Rust edition | 2021 (`choz-plugin-lv2` is 2024) |
 | Toolchain tested | rustc 1.97.1 |
 | Platform | Linux. ALSA/JACK/PipeWire. Released for x86-64, aarch64 and armv7 |

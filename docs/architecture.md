@@ -686,6 +686,31 @@ choz's output: they are left out of the OUT list and a saved output naming one
 is dropped. A pair left by a crashed choz is reused, and only what this run
 made is unloaded. `CHOZ_NO_VIRTUAL_DEVICES=1` skips all of it.
 
+**Only the native JACK client feeds them**, so when it cannot start and choz
+falls back to cpal they are taken away again: a `choz Mic` nobody writes to is
+a silent microphone the system may make its default source, and then choz's own
+"default input" is choz listening to itself.
+
+**Without the native client (cpal).** That path is what a machine without
+`pipewire-jack` gets — which is why every package now requires it — and it is
+kept honest rather than rich. `pick_config` takes a stereo `f32` range first
+(the stream is opened as that whatever it picks). A saved device that will not
+open falls back to the default one at start-up instead of starting silent;
+`build_stream` hands the RT state back on failure so there is something to try
+again with. A device that fails when *chosen* leaves the old stream playing and
+the old name showing. With a sound server running, the raw PCMs (`hw:`,
+`front:`, `dmix`, `dsnoop`, OSS…) are left out of the device lists
+(`usable_alsa_device`): the server holds the cards, so they never open.
+libasound's own stderr is silenced (`quiet_alsa`), `CHOZ_ALSA_VERBOSE=1` to
+hear it.
+
+**A card plugged in while choz runs.** With the IN drawer open — and once when
+it opens — `App::rescan_if_inputs_moved` compares the graph's capture ports to
+the ones the client was built on (`AudioEngine::inputs_changed`), logs
+`audio inputs changed` with was/now like the MIDI one, and rescans. Only with
+the drawer open: the probe is a JACK client of its own, and a rescan rebuilds
+the rack.
+
 `pair_ports` folds only the **main pair** onto a sink with fewer inputs (a mono
 device); the direct outs past it are never folded — folded, `out_3`…`out_10`
 were summed into a stereo device's right channel — and whatever of them an
@@ -1040,6 +1065,19 @@ One `handle_modal_key` and one `handle_modal_mouse` serve all of them: wheel
 scrolls, a click selects a row, a second click (or `SELECT`) confirms, a click
 outside cancels. `App::close_modal()` is the only exit, which is where a changed
 plugin-path list triggers a rescan.
+
+The two plugin pickers (SOURCE and ADD FX) are searched by typing. `search_rank`
+is the one rule for both: **every word typed has to be there, in any order**,
+over the name and what the entry is filed under (format, and category in ADD
+FX), so `lv2 reverb` is one search. Hits are ordered — a name that starts with
+what was typed, then one that starts a word with it, then the rest — and the
+search line says how many there are and under which format chip, because an
+empty list under `LV2` otherwise reads as "not installed".
+
+The metronome's menu is the exception to "SELECT confirms the row": its rows are
+turned, not picked, and are live as they move, so SELECT only closes. (It used
+to step the row under the cursor once more on the way out, undoing the value
+just set.)
 
 ## Plugin Architecture
 
@@ -1466,6 +1504,14 @@ transport stopped, which is exactly when it is wanted. Switching it on resets
 that counter, so the first beat is the beat you switched it on for. The downbeat
 is a different pitch rather than a louder one — on a stage, "louder" is the first
 thing the room takes away.
+
+**What the menu was left on is kept.** Sound, grouping, level and output go into
+`ui.json` (`audio.metronome`) on every change and come back at start-up — once,
+in `run`, not in `UiSettings::apply`, which runs on every settings change and
+would put the saved grouping back over the one a playing band set. On/off is
+saved but **not** restored from there: a click that starts by itself at launch
+is a stage accident. A project still carries and restores all of it. "No
+grouping" is the first answer of the GROUPING row and reads `NONE`.
 
 **A chart that changes meter always takes the click with it.** While a band
 plays, `App::follow_arranger_meter` hands the transport the signature of the bar

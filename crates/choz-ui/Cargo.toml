@@ -36,11 +36,13 @@ priority = "optional"
 # dependency and installs nothing (verified against a package with a dependency
 # that cannot be satisfied).
 #
-# libjack is *not* there on purpose: choz `dlopen`s it, so without it choz runs
-# on ALSA. That makes it a recommendation, which apt installs by default and the
-# user can decline.
-depends = "$auto, debconf (>= 0.5) | debconf-2.0"
-recommends = "pipewire-jack | libjack-jackd2-0 | libjack0, puredata"
+# **`pipewire-jack` is required, by name.** libjack is `dlopen`ed, so `$auto`
+# cannot see it, and choz does start without it — on ALSA, with no per-device
+# outputs, one capture device and no virtual devices, which is what the 1.3.24
+# bug report was a list of. jack2's library does not satisfy it: on a PipeWire
+# desktop it reaches no graph at all.
+depends = "$auto, pipewire-jack, debconf (>= 0.5) | debconf-2.0"
+recommends = "puredata"
 # Refresh the menu, MIME and icon caches. Debian ships triggers that usually do
 # this; "usually" is how an application installs and never appears in the menu.
 maintainer-scripts = "../../packaging/debian"
@@ -104,7 +106,7 @@ assets = [
 #
 #   cargo deb -p choz-ui --variant arm --target aarch64-unknown-linux-gnu
 [package.metadata.deb.variants.arm]
-depends = "libasound2t64 | libasound2, libc6, debconf (>= 0.5) | debconf-2.0"
+depends = "libasound2t64 | libasound2, libc6, pipewire-jack, debconf (>= 0.5) | debconf-2.0"
 # **The whole list again, minus one line.** A variant that declares `assets`
 # replaces the table above rather than adding to it, and the ARM build has one
 # file the x86_64 build has: `choz-pd-host` links libpd, `cross` has no libpd for
@@ -161,7 +163,7 @@ gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor 2>/dev/null || true
 # rpm reads the ELF itself: the built package requires `libasound.so.2()(64bit)`
 # (down to its ALSA_0.9 symbol versions), libc, libm, libgcc_s and the loader, so
 # `dnf`/`rpm -i` fails with "Failed dependencies" on a box without ALSA.
-# JACK is dlopened, hence weak.
+# JACK is dlopened, so rpm cannot find it there: it is required by name below.
 assets = [
     { source = "../../target/release/choz", dest = "/usr/bin/choz", mode = "755" },
     { source = "../../packaging/desktop/choz-launcher", dest = "/usr/bin/choz-launcher", mode = "755" },
@@ -213,9 +215,10 @@ zip = { version = "0.6", default-features = false, features = ["deflate"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["randr"] }
 
-# A weak dependency, and a table because that is the shape cargo-generate-rpm
-# takes: libjack is `dlopen`ed, so choz runs without it — on ALSA. Asked for by
-# soname, which Fedora's default `pipewire-jack-audio-connection-kit-libs`
-# provides and jack2's would too.
-[package.metadata.generate-rpm.recommends]
-"libjack.so.0()(64bit)" = "*"
+# A hard dependency, and a table because that is the shape cargo-generate-rpm
+# takes: libjack is `dlopen`ed, so rpm's ELF scan never lists it, and without
+# PipeWire's JACK choz is an ALSA client with half its routing missing. By
+# package name, not by the `libjack.so.0` soname — jack2 provides that too and
+# reaches no graph on a PipeWire desktop.
+[package.metadata.generate-rpm.requires]
+pipewire-jack-audio-connection-kit = "*"
