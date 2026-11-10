@@ -28,6 +28,21 @@ fn try_run(
     args: &[&str],
     path_prefix: Option<&Path>,
 ) -> (String, bool) {
+    // `sh` stands in for `pw-jack`: whether this machine has PipeWire's JACK
+    // is not what these tests are about, and a CI runner does not.
+    try_run_looking_for(prefix, home, args, path_prefix, "sh")
+}
+
+/// [`try_run`], naming the command the script takes as proof of
+/// `pipewire-jack`. Passed to the child only — never through this process's
+/// environment, which every other test here would inherit mid-run.
+fn try_run_looking_for(
+    prefix: &Path,
+    home: &Path,
+    args: &[&str],
+    path_prefix: Option<&Path>,
+    pw_jack: &str,
+) -> (String, bool) {
     // One install at a time. Each run may `cargo build --release` the CLAP
     // bundles, and cargo re-links `target/release/*.so` even when nothing
     // changed — removing it first. Run in parallel, one install saw the
@@ -40,7 +55,8 @@ fn try_run(
         .arg(prefix)
         .args(args)
         .env("HOME", home)
-        .env("CHOZ_SEARCH_BINS", "");
+        .env("CHOZ_SEARCH_BINS", "")
+        .env("CHOZ_PW_JACK", pw_jack);
     if let Some(dir) = path_prefix {
         let path = std::env::var("PATH").unwrap_or_default();
         cmd.env("PATH", format!("{}:{path}", dir.display()));
@@ -359,14 +375,13 @@ fn a_missing_pipewire_jack_is_a_refusal() {
 
     // `pw-jack` may well be on this machine, so the script is told to look
     // for a command nobody has.
-    std::env::set_var("CHOZ_PW_JACK", "choz-no-such-pw-jack");
-    let (out, ok) = try_run(
+    let (out, ok) = try_run_looking_for(
         &prefix,
         &home,
         &["--binary", env!("CARGO_BIN_EXE_choz")],
         Some(&fake_bin),
+        "choz-no-such-pw-jack",
     );
-    std::env::remove_var("CHOZ_PW_JACK");
     assert!(!ok, "it installed without pipewire-jack: {out}");
     assert!(
         out.contains("pipewire-jack is missing"),
