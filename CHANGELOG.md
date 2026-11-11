@@ -12,7 +12,7 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **1107 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo) y sin los de `midi::` (`--skip midi`: abren los puertos ALSA reales y en la máquina de desarrollo tiran el hub USB del dock), 661 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **1108 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo) y sin los de `midi::` (`--skip midi`: abren los puertos ALSA reales y en la máquina de desarrollo tiran el hub USB del dock), 662 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio, y `cargo fmt --all --check` también.
 - **56 efectos propios**, publicados también como un `.clap` con los cuatro artifacts (arpegiador, secuenciador, metrónomo y arreglador).
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
@@ -31,6 +31,26 @@ lleva lo que falta —nada de lo ya hecho— y
   `choz-engine::test_locks` tiene un candado por global; en `choz-ui` el par es
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
+
+## [1.3.27] — 2026-11-10
+
+Reporte de 1.3.26 (micrófono que no aparece en IN y salida mala por PipeWire). **Causa raíz confirmada:** `jack-sys` hace `dlopen("libjack.so.0")` por nombre, y en Debian/Ubuntu ese nombre resuelve al `libjack` de jackd2: el de PipeWire vive en `/usr/lib/<triplet>/pipewire-0.3/jack/`, fuera de la ruta del enlazador. Sin `jackd` corriendo responde `SERVER_FAILED` y choz caía al respaldo cpal → ALSA → `pulse`, sin entradas, sin dispositivos virtuales y con el hilo de audio sin tiempo real, **con `pipewire-jack` instalado**. En la máquina de desarrollo no se veía porque tiene un `/etc/ld.so.conf.d/pipewire-jack.conf` puesto a mano.
+
+### Corregido
+- **choz carga el `libjack` de PipeWire por ruta completa** (`prefer_pipewire_libjack`, en `AudioEngine::new`) cuando hay socket de PipeWire, antes de tocar JACK; el `dlopen` posterior por nombre devuelve la librería ya cargada con ese soname. Sin `pw-jack` ni `ld.so.conf.d`. `CHOZ_SYSTEM_LIBJACK=1` lo salta, para un `jackd` real. Verificado con jackd2 forzado primero en `LD_LIBRARY_PATH`: sin la precarga el nombre da `libjack.so.0.0.28` (jackd2), con ella sólo queda mapeado el de PipeWire.
+- **El mensaje del log** distingue "falta `pipewire-jack`" de "está instalado y no conectó"; antes pedía instalar un paquete que ya estaba.
+- **El hilo de salida de cpal pide `SCHED_FIFO` 70** en su primer callback (`promote_audio_thread`); uno que ya es de tiempo real (el host JACK de cpal) se deja como está. Antes sólo el sandbox lo hacía.
+- **El cajón IN en el respaldo** dice que la entrada se elige en Ajustes (o `pw-jack choz`) en vez de "no inputs found", que se leía como un micrófono roto.
+
+### Cambiado
+- **`install.sh` busca la librería**, `pipewire-0.3/jack/libjack.so.0` en `/usr/lib64`, `/usr/lib` y `/usr/lib/<triplet>`, en vez del comando `pw-jack`, y aborta sin ella. `CHOZ_PW_JACK` ahora nombra un archivo.
+- **El `.rpm` exige también `pipewire-jack-audio-connection-kit-libs`**, el paquete que contiene esa librería. El `.deb` y el PKGBUILD siguen con `pipewire-jack`, que la instala (comprobado con `dpkg -L`).
+
+### No es de choz / pendiente
+- `choz_mic` como fuente por defecto: choz no la fija (no hay `set-default-source` en el código); es una elección guardada de WirePlumber. `choz_mic` sobrantes de una corrida anterior no se borran: pueden ser de otro choz en marcha.
+- Pcm `pipewire` en el respaldo y marcas de tiempo en `choz.log`.
+
+Release audit: 1108 tests en el workspace sin `choz-plugin-lv2` + 19 de `choz-plugin-lv2 --lib`, 0 fallos (`--skip midi`); `install_script` 7/7 también con `CHOZ_PW_JACK=/nope`; clippy y fmt limpios. i18n: dos claves nuevas (`no inputs found`, `no JACK: pick the input in Settings, or run pw-jack choz`) en los 8 idiomas, cubiertas por `the_table_and_the_call_sites_are_the_same_list`.
 
 ## [1.3.26] — 2026-11-10
 
