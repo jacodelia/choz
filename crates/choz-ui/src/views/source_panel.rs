@@ -60,6 +60,7 @@ fn scan_label() -> String {
 }
 
 /// Draw the INPUTS panel.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_input_panel(
     f: &mut Frame,
     area: Rect,
@@ -68,6 +69,7 @@ pub fn draw_input_panel(
     input_cursor: usize,
     active_label: &str,
     learn: Option<&str>,
+    no_inputs: &str,
 ) -> Option<Rect> {
     let border_style = if focused {
         Style::default()
@@ -150,7 +152,7 @@ pub fn draw_input_panel(
     )));
 
     if inputs.is_empty() {
-        lines.push(Line::from(Span::styled("   (no inputs found)", dim)));
+        lines.push(Line::from(Span::styled(format!("   ({no_inputs})"), dim)));
     }
     for (i, row) in inputs.iter().enumerate().skip(scroll).take(height) {
         if row.header {

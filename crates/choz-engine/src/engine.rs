@@ -908,9 +908,64 @@ fn usable_alsa_device(name: &str, sound_server: &str) -> bool {
     sound_server == "ALSA" || !RAW.iter().any(|p| name.starts_with(p))
 }
 
+/// Where PipeWire's own `libjack.so.0` is, when it is installed. Debian and
+/// Ubuntu put it in `pipewire-0.3/jack/` *off* the linker path, so a plain
+/// `dlopen("libjack.so.0")` finds jackd2's library instead — which, with no
+/// `jackd` running, answers `SERVER_FAILED`, and choz falls back to bare ALSA
+/// on a machine that has everything it needs.
+pub fn pipewire_libjack() -> Option<std::path::PathBuf> {
+    let mut dirs = vec![
+        std::path::PathBuf::from("/usr/lib64"),
+        std::path::PathBuf::from("/usr/lib"),
+    ];
+    // The multiarch ones: `/usr/lib/x86_64-linux-gnu`, `/usr/lib/aarch64-linux-gnu`…
+    if let Ok(entries) = std::fs::read_dir("/usr/lib") {
+        dirs.extend(
+            entries
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().contains("-linux-"))
+                .map(|e| e.path()),
+        );
+    }
+    dirs.into_iter()
+        .map(|d| d.join("pipewire-0.3/jack/libjack.so.0"))
+        .find(|p| p.exists())
+}
+
+/// Load PipeWire's `libjack` by its full path, before anything touches JACK.
+/// `jack-sys` later asks for `libjack.so.0` by name, and the dynamic linker
+/// hands back the library already loaded under that soname — this one — so
+/// choz gets PipeWire's JACK without `pw-jack` or an `ld.so.conf.d` entry.
+/// `CHOZ_SYSTEM_LIBJACK=1` skips it, for a real `jackd`.
+fn prefer_pipewire_libjack() {
+    #[cfg(target_os = "linux")]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("CHOZ_SYSTEM_LIBJACK").is_some() || !pipewire_is_running() {
+                return;
+            }
+            let Some(path) = pipewire_libjack() else {
+                return;
+            };
+            use std::os::unix::ffi::OsStrExt;
+            let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+                return;
+            };
+            // SAFETY: a NUL-terminated path; the handle is kept for the whole
+            // process on purpose, so the library is never unloaded under JACK.
+            let handle = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+            if handle.is_null() {
+                eprintln!("choz: could not load {}", path.display());
+            }
+        });
+    }
+}
+
 impl AudioEngine {
     pub fn new(sample_rate: u32, buffer_size: u32) -> Self {
         quiet_alsa();
+        prefer_pipewire_libjack();
         // SPSC rings: a full command ring drops the excess rather than blocking
         // the RT thread.
         let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(CMD_RING);
@@ -996,10 +1051,17 @@ impl AudioEngine {
                 Err(e) => {
                     eprintln!("choz: native JACK unavailable ({e}), falling back to cpal...");
                     if sound_server == "PipeWire" {
-                        eprintln!(
-                            "choz: PipeWire without its JACK layer: install `pipewire-jack` \
-                             for per-device outputs, every input and the virtual devices"
-                        );
+                        match pipewire_libjack() {
+                            None => eprintln!(
+                                "choz: PipeWire without its JACK layer: install `pipewire-jack` \
+                                 for per-device outputs, every input and the virtual devices"
+                            ),
+                            Some(lib) => eprintln!(
+                                "choz: PipeWire's JACK layer is installed ({}) and still did not \
+                                 connect; try `pw-jack choz`, or CHOZ_SYSTEM_LIBJACK=1 for a real jackd",
+                                lib.display()
+                            ),
+                        }
                     }
                 }
             }
@@ -1356,6 +1418,12 @@ impl AudioEngine {
     /// The graph's capture ports when they are no longer the ones this client
     /// was built on — a card plugged in or pulled out since. `None` when
     /// nothing moved, and always on cpal, which has a device and not a graph.
+    /// Whether choz is a native JACK client — the only backend whose inputs
+    /// are ports the IN drawer can list.
+    pub fn native_jack(&self) -> bool {
+        matches!(self._stream, Some(BackendHandle::Jack(_)))
+    }
+
     pub fn inputs_changed(&self) -> Option<Vec<String>> {
         if !matches!(self._stream, Some(BackendHandle::Jack(_))) {
             return None;
@@ -3527,6 +3595,25 @@ fn build_input_stream(
     Ok((stream, rx, channels, picked))
 }
 
+/// Give the thread calling this realtime scheduling, once, from inside the
+/// audio callback. cpal's ALSA thread starts as an ordinary one, and every time
+/// it loses the CPU to a browser the block arrives late: a click. A thread that
+/// already is realtime (cpal's JACK host runs on JACK's) is left as it is.
+/// Best effort, as in the sandbox: no RT limits just leaves it where it was.
+fn promote_audio_thread() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: changes the calling thread's own scheduling; no pointers escape.
+    unsafe {
+        if libc::sched_getscheduler(0) != libc::SCHED_OTHER {
+            return;
+        }
+        let p = libc::sched_param { sched_priority: 70 };
+        if libc::sched_setscheduler(0, libc::SCHED_FIFO, &p) != 0 {
+            eprintln!("choz: the audio thread could not get realtime priority (no rtprio limit?)");
+        }
+    }
+}
+
 fn build_stream(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -3538,10 +3625,15 @@ fn build_stream(
     // the only one that ever locks it: uncontended, so never a wait.
     let cell = Arc::new(std::sync::Mutex::new(Some(state)));
     let rt = cell.clone();
+    let mut promoted = false;
     device
         .build_output_stream(
             config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                if !promoted {
+                    promoted = true;
+                    promote_audio_thread();
+                }
                 if let Ok(mut guard) = rt.try_lock() {
                     if let Some(state) = guard.as_mut() {
                         audio_callback(data, state);
@@ -3952,6 +4044,33 @@ mod tests {
 
     /// Under a sound server the raw PCMs never open; without one they are all
     /// there is.
+    /// Whatever `libjack.so.0` the linker path would find (jackd2's, on a
+    /// stock Ubuntu), the one `jack-sys` gets by name is PipeWire's. Only
+    /// meaningful where PipeWire and its JACK layer are installed.
+    #[test]
+    fn the_libjack_asked_for_by_name_is_pipewires() {
+        let Some(want) = pipewire_libjack().filter(|_| pipewire_is_running()) else {
+            return;
+        };
+        if std::env::var_os("CHOZ_SYSTEM_LIBJACK").is_some() {
+            return;
+        }
+        prefer_pipewire_libjack();
+        // SAFETY: plain dlopen/dlsym/dladdr on NUL-terminated literals.
+        let got = unsafe {
+            let h = libc::dlopen(c"libjack.so.0".as_ptr(), libc::RTLD_LAZY);
+            assert!(!h.is_null());
+            let sym = libc::dlsym(h, c"jack_client_open".as_ptr());
+            let mut info: libc::Dl_info = std::mem::zeroed();
+            assert!(libc::dladdr(sym, &mut info) != 0);
+            std::ffi::CStr::from_ptr(info.dli_fname)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap();
+        assert_eq!(canon(got.as_ref()), canon(&want));
+    }
+
     #[test]
     fn raw_alsa_devices_are_offered_only_without_a_sound_server() {
         for raw in [

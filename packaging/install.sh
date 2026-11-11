@@ -150,14 +150,28 @@ WITH_PD=1
 #
 # **PipeWire's JACK layer is required** all the same: without it choz starts as
 # a plain ALSA client — no per-device outputs, one capture device, no virtual
-# devices — and that reads as a broken choz, not as a missing package. It is
-# looked for as `pw-jack`, the one file every distribution's package ships
-# under the same name; the library's own path differs on each.
+# devices — and that reads as a broken choz, not as a missing package. What is
+# looked for is the library itself, `pipewire-0.3/jack/libjack.so.0`: choz
+# loads it by that path, so it does not matter that Debian and Ubuntu leave it
+# off the linker path (where jackd2's `libjack.so.0` answers instead).
 #
 # A missing ALSA is fatal, because the result would be a choz that starts and
 # then opens no audio device — a bug report waiting to happen rather than an
 # install. `--skip-deps-check` is for the one case where continuing is right:
 # staging an install for a machine that is not this one.
+pipewire_libjack_here() {
+    if [ -n "${CHOZ_PW_JACK:-}" ]; then
+        [ -e "$CHOZ_PW_JACK" ]
+        return
+    fi
+    for f in /usr/lib64/pipewire-0.3/jack/libjack.so.0 \
+        /usr/lib/pipewire-0.3/jack/libjack.so.0 \
+        /usr/lib/*-linux-*/pipewire-0.3/jack/libjack.so.0; do
+        [ -e "$f" ] && return 0
+    done
+    return 1
+}
+
 check_runtime_deps() {
     if [ "$SKIP_DEPS" = 1 ]; then
         say "skipping the runtime dependency check (--skip-deps-check)"
@@ -190,9 +204,9 @@ check_runtime_deps() {
         say "(right when you are staging this for another machine)."
         exit 1
     fi
-    # `CHOZ_PW_JACK` names the command to look for, so the tests can ask for
-    # one that is not there.
-    if ! command -v "${CHOZ_PW_JACK:-pw-jack}" >/dev/null 2>&1; then
+    # `CHOZ_PW_JACK` names the file to look for instead, so the tests can ask
+    # for one that is not there.
+    if ! pipewire_libjack_here; then
         say "pipewire-jack is missing — choz would run on bare ALSA: no per-device"
         say "outputs, one capture device, no 'choz Mic' / 'choz System FX'."
         say "  Debian/Ubuntu: sudo apt install pipewire-jack"

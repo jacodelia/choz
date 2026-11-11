@@ -21607,6 +21607,13 @@ fn ui(f: &mut Frame, app: &mut App) {
             app.input_cursor,
             &app.active_tab_label(),
             learn.as_deref(),
+            // Off JACK there are no ports to list, and "none found" reads as
+            // a broken microphone.
+            if app.audio_engine.as_ref().is_none_or(|e| e.native_jack()) {
+                i18n::t("no inputs found")
+            } else {
+                i18n::t("no JACK: pick the input in Settings, or run pw-jack choz")
+            },
         );
         let close = views::drawer::draw_close_button(f, source_area);
         let mut layout = app.layout.borrow_mut();
@@ -32993,7 +33000,16 @@ mod tests {
             })
             .collect();
         term.draw(|f| {
-            sp::draw_input_panel(f, area, true, &labels, app.input_cursor, "tab 1", None);
+            sp::draw_input_panel(
+                f,
+                area,
+                true,
+                &labels,
+                app.input_cursor,
+                "tab 1",
+                None,
+                "no inputs found",
+            );
         })
         .unwrap();
         let buf = term.backend().buffer();

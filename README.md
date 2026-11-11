@@ -48,7 +48,8 @@ is `dlopen`ed. Every current desktop runs **PipeWire with its JACK layer
 (`pipewire-jack`)** rather than jack2, and on Arch and Fedora that package is
 where the headers come from too. Debian and Ubuntu package PipeWire's JACK
 without headers, so there `libjack-jackd2-dev` supplies them — it installs
-beside `pipewire-jack` and does not replace it at runtime. **No X11
+beside `pipewire-jack`, and at runtime choz loads PipeWire's `libjack` by its
+full path, so jackd2's library never takes its place. **No X11
 headers**: the plugin windows go through `x11rb`, which speaks the protocol
 itself and links no C library.
 
@@ -194,7 +195,7 @@ choz/
 
 | | |
 |---|---|
-| choz | **1.3.26** |
+| choz | **1.3.27** |
 | Rust edition | 2021 (`choz-plugin-lv2` is 2024) |
 | Toolchain tested | rustc 1.97.1 |
 | Platform | Linux. ALSA/JACK/PipeWire. Released for x86-64, aarch64 and armv7 |
