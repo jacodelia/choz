@@ -130,3 +130,8 @@ result
 # release workflow and attached to each GitHub Release.
 # =========================================================
 docs/*.pdf
+
+# =========================================================
+# Scope report, not ready to publish
+# =========================================================
+docs/alcance-escritorio-y-jam.md

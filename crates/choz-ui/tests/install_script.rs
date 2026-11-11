@@ -28,9 +28,10 @@ fn try_run(
     args: &[&str],
     path_prefix: Option<&Path>,
 ) -> (String, bool) {
-    // `sh` stands in for `pw-jack`: whether this machine has PipeWire's JACK
-    // is not what these tests are about, and a CI runner does not.
-    try_run_looking_for(prefix, home, args, path_prefix, "sh")
+    // `/bin/sh` stands in for PipeWire's `libjack.so.0`: whether this machine
+    // has PipeWire's JACK is not what these tests are about, and a CI runner
+    // does not.
+    try_run_looking_for(prefix, home, args, path_prefix, "/bin/sh")
 }
 
 /// [`try_run`], naming the command the script takes as proof of

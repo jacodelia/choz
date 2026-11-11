@@ -25,12 +25,22 @@ dependency in all three**, by package name because a `dlopen`ed library is
 invisible to the tools that read the binary: `pipewire-jack` in the `.deb` and
 the Arch package, `pipewire-jack-audio-connection-kit` in the `.rpm`. jack2's
 library does not satisfy it. `apt install ./choz.deb` and `dnf install` pull it
-in; `dpkg -i` and `rpm -i` stop and name it.
+in; `dpkg -i` and `rpm -i` stop and name it. The `.rpm` names
+`pipewire-jack-audio-connection-kit-libs` as well: that is the package holding
+the library.
+
+Debian and Ubuntu install PipeWire's `libjack.so.0` in
+`/usr/lib/<triplet>/pipewire-0.3/jack/`, **off the linker path**, so a
+`dlopen("libjack.so.0")` finds jackd2's library (pulled in by other packages)
+and, with no `jackd` running, choz fell back to bare ALSA with the package
+installed. Since 1.3.27 choz loads PipeWire's library **by full path** before
+it touches JACK; no `pw-jack` and no `/etc/ld.so.conf.d` entry are needed.
 
 `install.sh` checks all three before it copies anything. **A missing ALSA stops
 the install** — a choz that starts and then opens no device looks like a bug in
 choz, not a missing package — and it prints the command for your distribution. A
-missing `pipewire-jack` (looked for as `pw-jack`) stops it the same way; a
+missing `pipewire-jack` (looked for as its library,
+`pipewire-0.3/jack/libjack.so.0`) stops it the same way; a
 missing libpd is a note **and** it decides what
 gets built: without it choz installs without the Pure Data half rather than
 failing over it. `--skip-deps-check` installs anyway, which is right when you are
@@ -44,8 +54,8 @@ Arch, the user manual (`choz-manual.pdf`, built from `docs/choz-manual.fodt`),
 plus `SHA256SUMS.txt`:
 
 ```bash
-tar xzf choz-1.3.26-x86_64-unknown-linux-gnu.tar.gz
-cd choz-1.3.26-x86_64-unknown-linux-gnu
+tar xzf choz-1.3.27-x86_64-unknown-linux-gnu.tar.gz
+cd choz-1.3.27-x86_64-unknown-linux-gnu
 ./install.sh            # uses the binary shipped beside it — no cargo involved
 ```
 

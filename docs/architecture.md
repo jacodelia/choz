@@ -691,9 +691,21 @@ falls back to cpal they are taken away again: a `choz Mic` nobody writes to is
 a silent microphone the system may make its default source, and then choz's own
 "default input" is choz listening to itself.
 
+**Which `libjack`.** `jack-sys` `dlopen`s `libjack.so.0` by name, and on
+Debian/Ubuntu that name resolves to jackd2's library: PipeWire's sits in
+`pipewire-0.3/jack/`, off the linker path. With a PipeWire socket up,
+`prefer_pipewire_libjack` (in `AudioEngine::new`) loads PipeWire's by full
+path first; the later lookup by name returns the library already loaded under
+that soname. `CHOZ_SYSTEM_LIBJACK=1` skips it, for a real `jackd`. When the
+client still does not open, the log says whether PipeWire's library is missing
+or present-and-failing, rather than always asking for `pipewire-jack`.
+
 **Without the native client (cpal).** That path is what a machine without
 `pipewire-jack` gets — which is why every package now requires it — and it is
-kept honest rather than rich. `pick_config` takes a stereo `f32` range first
+kept honest rather than rich. Its audio thread asks for `SCHED_FIFO` 70 on its first callback
+(`promote_audio_thread`; a thread that is already realtime is left alone), and
+the IN drawer says the inputs are in Settings instead of "no inputs found".
+`pick_config` takes a stereo `f32` range first
 (the stream is opened as that whatever it picks). A saved device that will not
 open falls back to the default one at start-up instead of starting silent;
 `build_stream` hands the RT state back on failure so there is something to try
