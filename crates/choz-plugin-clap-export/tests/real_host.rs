@@ -13,11 +13,15 @@ use choz_ports::FxProcessor;
 
 /// The cdylib cargo just built for this crate.
 fn bundle() -> Option<PathBuf> {
-    // …/target/debug/deps/real_host-<hash> → …/target/debug/lib….so
+    // The test binary is in `target/debug/deps/`, or deeper in cargo's newer
+    // build-dir layout (`target/debug/build/<pkg>/<hash>/out/`); the cdylib is
+    // in `target/debug/` either way, so it is looked for up the tree.
+    // ponytail: a `build-dir` set apart from the target dir is not found.
     let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?.parent()?;
-    let so = dir.join("libchoz_plugin_clap_export.so");
-    so.is_file().then_some(so)
+    exe.ancestors()
+        .skip(1)
+        .map(|d| d.join("libchoz_plugin_clap_export.so"))
+        .find(|p| p.is_file())
 }
 
 #[test]

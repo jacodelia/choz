@@ -1442,10 +1442,14 @@ mod bundle {
 
     /// Where cargo left the shared object for this build profile.
     fn bundle() -> Option<PathBuf> {
-        // `target/<profile>/deps/<test binary>` — the bundle is two up.
+        // `target/<profile>/` holds the bundle; the test binary sits below it
+        // in `deps/`, or deeper in cargo's newer build-dir layout — so it is
+        // looked for up the tree rather than at a fixed depth.
         let exe = std::env::current_exe().ok()?;
-        let path = exe.parent()?.parent()?.join("libchoz_clap.so");
-        path.exists().then_some(path)
+        exe.ancestors()
+            .skip(1)
+            .map(|d| d.join("libchoz_clap.so"))
+            .find(|p| p.is_file())
     }
 
     /// A host reading the bundle finds one instrument, named choz.
