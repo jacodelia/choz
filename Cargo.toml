@@ -40,8 +40,6 @@ choz-plugin-ladspa = { path = "crates/choz-plugin-ladspa" }
 choz-plugin-vst2 = { path = "crates/choz-plugin-vst2" }
 choz-plugin-vst3 = { path = "crates/choz-plugin-vst3" }
 choz-plugin-sandbox = { path = "crates/choz-plugin-sandbox" }
-choz-plugin-clap-export = { path = "crates/choz-plugin-clap-export" }
-choz-clap = { path = "crates/choz-clap" }
 
 # ─── Release profile ──────────────────────────────────────────────────────────
 #

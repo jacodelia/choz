@@ -24,11 +24,13 @@ fn pd_host() -> Option<PathBuf> {
         let path = PathBuf::from(explicit);
         return path.is_file().then_some(path);
     }
-    // …/target/debug/deps/pd_patch-<hash> → …/target/debug/choz-pd-host
+    // `target/debug/choz-pd-host`, looked for up the tree from the test
+    // binary: it is in `deps/`, or deeper in cargo's newer build-dir layout.
     let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?.parent()?;
-    let candidate = dir.join("choz-pd-host");
-    candidate.is_file().then_some(candidate)
+    exe.ancestors()
+        .skip(1)
+        .map(|d| d.join("choz-pd-host"))
+        .find(|p| p.is_file())
 }
 
 fn main() {
