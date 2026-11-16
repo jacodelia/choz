@@ -32,6 +32,12 @@ lleva lo que falta —nada de lo ya hecho— y
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
 
+## [1.3.29] — 2026-11-15
+
+Mismo código de choz que 1.3.28; lo que cambia son tres tests y el manifiesto. El CI de `main` falló sobre el commit del tag 1.3.28: el cargo estable del runner deja los binarios de test en `target/debug/build/<pkg>/<hash>/out/` y no en `target/debug/deps/`, y `real_host` buscaba el cdylib dos directorios arriba del binario («the cdylib was not built»). El test del bundle de `choz-clap` y `pd_patch` buscaban en el mismo lugar equivocado y se saltaban **sin fallar**. Los tres buscan ahora subiendo desde el binario. Se quitan del workspace `choz-clap` y `choz-plugin-clap-export` como dependencias (son cdylibs; nadie depende de ellos), que el cargo nuevo avisaba como no usadas. Con los tests en verde cayó el paso siguiente: el clippy del stable nuevo marca `needless_range_loop` en `seq_params` de `choz-plugin-clap-export`; reproducido con `+beta` 1.101 (el beta local de agosto no lo veía) y arreglado, junto con cuatro del mismo lint y un `items_after_test_module` en tests (`--all-targets`). `choz-plugin-pd` declara `choz-plugin-sandbox` como opcional, de la feature `pd`: sólo el binario `choz-pd-host` lo usa. Los paquetes de 1.3.28 ya estaban publicados (`release.yml` no corre tests), así que el tag no se movió: 1.3.29 es el tag sobre un `main` con el CI en verde.
+
+Release audit: 1109 tests en el workspace sin `choz-plugin-lv2`, 0 fallos (`--skip midi`); `real_host` pasa también con el binario copiado a un directorio con la forma del layout nuevo; `clippy --workspace --all-targets -D warnings` limpio con stable 1.97.1 y con `+beta` 1.101, también `choz-plugin-pd --features pd`; fmt limpio; CI de `main` en verde sobre `c3108a5`. Sin claves de i18n nuevas.
+
 ## [1.3.28] — 2026-11-15
 
 Reporte sobre 1.3.27: con Pianoteq 9 (VST2) los botones SOUNDS no cambiaban de sonido y un proyecto guardado volvía a abrir en otro piano. **Causa raíz confirmada** con el proyecto del reporte y con Pianoteq en esta máquina: choz guardaba el estado VST2 con `effGetChunk` índice 0 (el **banco**), y el banco de Pianoteq es byte a byte el mismo en el programa 0 y en el 5 — no dice qué programa está puesto, y restaurarlo deja el programa 0. El proyecto del reporte tenía cinco blobs idénticos de 564 KB (el del tab y los de cuatro SOUNDS guardados en los programas 0, 2, 3 y 5).
