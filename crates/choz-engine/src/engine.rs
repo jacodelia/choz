@@ -5143,18 +5143,16 @@ mod tests {
         state.render(16);
 
         let c = std::f32::consts::FRAC_1_SQRT_2;
-        for f in 0..9 {
+        for (f, s) in state.mix[0].iter().enumerate().take(9) {
             assert!(
-                state.mix[0][f].abs() < 1e-6,
-                "silent until sample 9, but frame {f} is {}",
-                state.mix[0][f]
+                s.abs() < 1e-6,
+                "silent until sample 9, but frame {f} is {s}"
             );
         }
-        for f in 9..16 {
+        for (f, s) in state.mix[0].iter().enumerate().take(16).skip(9) {
             assert!(
-                (state.mix[0][f] - c).abs() < 1e-5,
-                "sounding from sample 9, but frame {f} is {}",
-                state.mix[0][f]
+                (s - c).abs() < 1e-5,
+                "sounding from sample 9, but frame {f} is {s}"
             );
         }
 

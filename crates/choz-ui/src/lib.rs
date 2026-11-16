@@ -35191,8 +35191,8 @@ mod tests {
         app.slots[0].input = Some(InputRef::Midi("Keystation Pro 88".into()));
         app.slots[1].input = Some(InputRef::Midi("KeyStep 32".into()));
         // Both tabs have a sound on button 1, and neither is playing it.
-        for tab in 0..2 {
-            app.slots[tab].sounds[0] = SavedSound {
+        for (tab, slot) in app.slots.iter_mut().enumerate().take(2) {
+            slot.sounds[0] = SavedSound {
                 name: format!("tab {}", tab + 1),
                 state: b"a patch".to_vec(),
                 values: Vec::new(),
@@ -35361,9 +35361,9 @@ mod tests {
         app.push_slot(AudioSource::Midi);
         app.slots[0].input = Some(InputRef::Midi("Keystation Pro 88".into()));
         app.slots[1].input = Some(InputRef::Midi("KeyStep 32".into()));
-        for tab in 0..2 {
-            for sound in 0..2 {
-                app.slots[tab].sounds[sound] = SavedSound {
+        for (tab, slot) in app.slots.iter_mut().enumerate().take(2) {
+            for (sound, saved) in slot.sounds.iter_mut().enumerate().take(2) {
+                *saved = SavedSound {
                     name: format!("tab {} sound {}", tab + 1, sound + 1),
                     state: b"a patch".to_vec(),
                     values: Vec::new(),

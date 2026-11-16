@@ -278,6 +278,90 @@ fn place_image(
     out.flush()
 }
 
+// ─── The panel wash ─────────────────────────────────────────────────────────
+
+/// What the wash was last drawn for. Cheap to compare, so the mask is only
+/// re-sent when the layout, the colour or the opacity actually moved.
+#[derive(PartialEq, Clone, Default)]
+pub struct MaskState {
+    rects: Vec<(Rect, u8)>,
+    color: (u8, u8, u8),
+    cols: u16,
+    rows: u16,
+}
+
+/// Wash the panel rectangles with the theme colour **without touching the
+/// picture**.
+///
+/// Painting cell backgrounds would work, and it is what the halfblocks path
+/// does — but here it would cover the image the terminal is drawing, and one
+/// colour per cell is exactly the blockiness this path exists to avoid. So the
+/// wash is a second image: the theme colour with an alpha channel, one pixel
+/// per cell, placed above the photo and below the text. kitty scales it to the
+/// grid and composites it, so the photo keeps every pixel it had.
+///
+/// One pixel per cell is deliberate: the mask is flat rectangles, so a few
+/// kilobytes redraw instantly when the opacity slider moves.
+pub fn sync_mask(
+    out: &mut impl Write,
+    area: Rect,
+    color: (u8, u8, u8),
+    rects: &[(Rect, f32)],
+    state: &mut Option<MaskState>,
+) {
+    if !available() || area.width == 0 || area.height == 0 {
+        return;
+    }
+    let want = MaskState {
+        rects: rects
+            .iter()
+            .map(|(r, a)| (*r, (a.clamp(0.0, 1.0) * 255.0) as u8))
+            .collect(),
+        color,
+        cols: area.width,
+        rows: area.height,
+    };
+    if state.as_ref() == Some(&want) {
+        return;
+    }
+    if want.rects.is_empty() {
+        let _ = clear_mask(out);
+        *state = Some(want);
+        return;
+    }
+
+    let (mw, mh) = (
+        area.width as u32 * MASK_SCALE,
+        area.height as u32 * MASK_SCALE,
+    );
+    let mut mask = image::RgbaImage::new(mw, mh);
+    for (rect, alpha) in &want.rects {
+        let px = image::Rgba([color.0, color.1, color.2, *alpha]);
+        for y in
+            rect.top() as u32 * MASK_SCALE..(rect.bottom().min(area.height) as u32 * MASK_SCALE)
+        {
+            for x in
+                rect.left() as u32 * MASK_SCALE..(rect.right().min(area.width) as u32 * MASK_SCALE)
+            {
+                mask.put_pixel(x, y, px);
+            }
+        }
+    }
+
+    let _ = clear_mask(out);
+    if place_image(out, MASK_ID, mask.as_raw(), mw, mh, area, Z_WASH).is_err() {
+        *state = None;
+        return;
+    }
+    *state = Some(want);
+}
+
+/// Remove the wash (leaving the picture alone).
+pub fn clear_mask(out: &mut impl Write) -> std::io::Result<()> {
+    write!(out, "\x1b_Ga=d,d=I,i={MASK_ID},q=2\x1b\\")?;
+    out.flush()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,88 +454,4 @@ mod tests {
         )
         .is_none());
     }
-}
-
-// ─── The panel wash ─────────────────────────────────────────────────────────
-
-/// What the wash was last drawn for. Cheap to compare, so the mask is only
-/// re-sent when the layout, the colour or the opacity actually moved.
-#[derive(PartialEq, Clone, Default)]
-pub struct MaskState {
-    rects: Vec<(Rect, u8)>,
-    color: (u8, u8, u8),
-    cols: u16,
-    rows: u16,
-}
-
-/// Wash the panel rectangles with the theme colour **without touching the
-/// picture**.
-///
-/// Painting cell backgrounds would work, and it is what the halfblocks path
-/// does — but here it would cover the image the terminal is drawing, and one
-/// colour per cell is exactly the blockiness this path exists to avoid. So the
-/// wash is a second image: the theme colour with an alpha channel, one pixel
-/// per cell, placed above the photo and below the text. kitty scales it to the
-/// grid and composites it, so the photo keeps every pixel it had.
-///
-/// One pixel per cell is deliberate: the mask is flat rectangles, so a few
-/// kilobytes redraw instantly when the opacity slider moves.
-pub fn sync_mask(
-    out: &mut impl Write,
-    area: Rect,
-    color: (u8, u8, u8),
-    rects: &[(Rect, f32)],
-    state: &mut Option<MaskState>,
-) {
-    if !available() || area.width == 0 || area.height == 0 {
-        return;
-    }
-    let want = MaskState {
-        rects: rects
-            .iter()
-            .map(|(r, a)| (*r, (a.clamp(0.0, 1.0) * 255.0) as u8))
-            .collect(),
-        color,
-        cols: area.width,
-        rows: area.height,
-    };
-    if state.as_ref() == Some(&want) {
-        return;
-    }
-    if want.rects.is_empty() {
-        let _ = clear_mask(out);
-        *state = Some(want);
-        return;
-    }
-
-    let (mw, mh) = (
-        area.width as u32 * MASK_SCALE,
-        area.height as u32 * MASK_SCALE,
-    );
-    let mut mask = image::RgbaImage::new(mw, mh);
-    for (rect, alpha) in &want.rects {
-        let px = image::Rgba([color.0, color.1, color.2, *alpha]);
-        for y in
-            rect.top() as u32 * MASK_SCALE..(rect.bottom().min(area.height) as u32 * MASK_SCALE)
-        {
-            for x in
-                rect.left() as u32 * MASK_SCALE..(rect.right().min(area.width) as u32 * MASK_SCALE)
-            {
-                mask.put_pixel(x, y, px);
-            }
-        }
-    }
-
-    let _ = clear_mask(out);
-    if place_image(out, MASK_ID, mask.as_raw(), mw, mh, area, Z_WASH).is_err() {
-        *state = None;
-        return;
-    }
-    *state = Some(want);
-}
-
-/// Remove the wash (leaving the picture alone).
-pub fn clear_mask(out: &mut impl Write) -> std::io::Result<()> {
-    write!(out, "\x1b_Ga=d,d=I,i={MASK_ID},q=2\x1b\\")?;
-    out.flush()
 }
