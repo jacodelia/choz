@@ -319,23 +319,35 @@ impl Vst2Editor {
 /// owns, and `effSetChunk` takes one back. A plugin without the
 /// `effFlagsProgramChunks` flag has no chunk at all and answers 0, which is why
 /// an empty result is normal rather than an error.
+///
+/// **What is saved is the program being played, not the bank.** The bank
+/// chunk (index 0) is every slot the plugin carries and, in Pianoteq 9, *not*
+/// which of them is on: it is byte-for-byte the same on program 0 and on
+/// program 5, and restoring it lands on program 0. So a project, a SOUNDS
+/// button and a split zone all came back as the same piano. The program chunk
+/// (index 1, `isPreset`) is the sound itself — edits in the plugin's window
+/// included — and a tenth of the size. It is tagged with [`PROGRAM_STATE`] so
+/// `restore` knows which call it is for; an untagged blob is a bank, as every
+/// project saved before this wrote it.
 struct Vst2State {
     shared: SharedEffect,
 }
 
-impl choz_ports::PluginState for Vst2State {
-    fn save(&self) -> Option<Vec<u8>> {
-        let guard = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        let cell = guard.as_ref()?;
+/// Prefix of a state blob holding one program's chunk rather than the bank.
+const PROGRAM_STATE: &[u8] = b"chozVST2prg\0";
+
+impl Vst2State {
+    /// `effGetChunk` at `index` (0 = bank, 1 = current program), copied out.
+    fn get_chunk(effect: AEffectPtr, index: i32) -> Option<Vec<u8>> {
         let mut ptr: *mut u8 = std::ptr::null_mut();
-        // SAFETY: live AEffect under the mutex; the plugin writes a pointer to
-        // its own buffer and returns its length.
+        // SAFETY: live AEffect under the caller's mutex; the plugin writes a
+        // pointer to its own buffer and returns its length.
         let len = unsafe {
-            match (*cell.effect).dispatcher {
+            match (*effect).dispatcher {
                 Some(d) => d(
-                    cell.effect,
+                    effect,
                     opcode::GET_CHUNK,
-                    0,
+                    index,
                     0,
                     &mut ptr as *mut *mut u8 as *mut c_void,
                     0.0,
@@ -350,8 +362,27 @@ impl choz_ports::PluginState for Vst2State {
         // are copied before anything else can touch the plugin.
         Some(unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec())
     }
+}
+
+impl choz_ports::PluginState for Vst2State {
+    fn save(&self) -> Option<Vec<u8>> {
+        let guard = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let effect = guard.as_ref()?.effect;
+        // SAFETY: live AEffect under the mutex.
+        let programs = unsafe { (*effect).flags } & flags::PROGRAM_CHUNKS != 0;
+        if programs {
+            if let Some(chunk) = Self::get_chunk(effect, 1) {
+                return Some([PROGRAM_STATE, &chunk].concat());
+            }
+        }
+        Self::get_chunk(effect, 0)
+    }
 
     fn restore(&self, data: &[u8]) {
+        let (index, data) = match data.strip_prefix(PROGRAM_STATE) {
+            Some(program) => (1, program),
+            None => (0, data),
+        };
         if data.is_empty() {
             return;
         }
@@ -363,7 +394,7 @@ impl choz_ports::PluginState for Vst2State {
                 d(
                     cell.effect,
                     opcode::SET_CHUNK,
-                    0,
+                    index,
                     data.len() as isize,
                     data.as_ptr() as *mut c_void,
                     0.0,

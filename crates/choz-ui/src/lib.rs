@@ -10008,6 +10008,7 @@ impl App {
                         name: None,
                         bank: None,
                         preset: None,
+                        preset_index: None,
                         params: Vec::new(),
                         state: String::new(),
                         bank_dir: None,
@@ -10020,6 +10021,7 @@ impl App {
                         name: None,
                         bank: Some(*bank),
                         preset: Some(*preset),
+                        preset_index: None,
                         params: Vec::new(),
                         state: String::new(),
                         bank_dir: None,
@@ -10032,6 +10034,7 @@ impl App {
                         name: None,
                         bank: None,
                         preset: None,
+                        preset_index: None,
                         params: Vec::new(),
                         state: String::new(),
                         bank_dir: None,
@@ -10048,6 +10051,8 @@ impl App {
                         name: Some(name.clone()),
                         bank: None,
                         preset: None,
+                        preset_index: (!slot.plugin_presets.is_empty())
+                            .then_some(slot.preset_cursor),
                         params: slot.instr_values.clone(),
                         // The patch itself: what the parameter list cannot say.
                         // Asked of the live plugin, so a tab that has been
@@ -10441,6 +10446,11 @@ impl App {
                             .unwrap_or(0)
                     })
                     .unwrap_or(0);
+            }
+            // A plugin's list is only known once it is loaded; `rebuild_rack`
+            // clamps this to it.
+            if let Some(at) = slot.instrument.preset_index {
+                rack.preset_cursor = at;
             }
             if matches!(rack.source, AudioSource::Sf2 { .. }) {
                 rack.instr_params = sources::sf2_params();
@@ -35307,6 +35317,7 @@ mod tests {
             name: Some("Surge XT".into()),
             bank: None,
             preset: None,
+            preset_index: None,
             params: Vec::new(),
             state: String::new(),
             bank_dir: None,

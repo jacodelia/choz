@@ -12,7 +12,7 @@ lleva lo que falta —nada de lo ya hecho— y
 
 ## Estado actual
 
-- **1108 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo) y sin los de `midi::` (`--skip midi`: abren los puertos ALSA reales y en la máquina de desarrollo tiran el hub USB del dock), 662 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
+- **1109 tests** con harness en el workspace **sin `choz-plugin-lv2`** (que acá se cuelga, ver abajo) y sin los de `midi::` (`--skip midi`: abren los puertos ALSA reales y en la máquina de desarrollo tiran el hub USB del dock), 662 de ellos en `choz-engine --lib` + 4 binarios de test propios (`quarantine`, `sandboxed_plugin`, `scan_isolation`, `across_a_process`, todos con `harness = false` porque tienen que poder ser workers).
 - `cargo clippy --workspace --all-targets -D warnings` limpio, y `cargo fmt --all --check` también.
 - **56 efectos propios**, publicados también como un `.clap` con los cuatro artifacts (arpegiador, secuenciador, metrónomo y arreglador).
 - **1209 plugins** escaneados en la máquina de desarrollo (611 efectos LV2 + 36 instrumentos, 342 LADSPA, 18 CLAP + 2 instrumentos, 17 VST2, 18 VST3 + 1 instrumento, 2 DSSI, 53 SFZ, 103 SF2).
@@ -31,6 +31,21 @@ lleva lo que falta —nada de lo ya hecho— y
   `choz-engine::test_locks` tiene un candado por global; en `choz-ui` el par es
   `ui_guard()` y `UiRestore`. Un test que lee un global para comprobar algo de
   *su* objeto está mal escrito: pregúntele al objeto.
+
+## [1.3.28] — 2026-11-15
+
+Reporte sobre 1.3.27: con Pianoteq 9 (VST2) los botones SOUNDS no cambiaban de sonido y un proyecto guardado volvía a abrir en otro piano. **Causa raíz confirmada** con el proyecto del reporte y con Pianoteq en esta máquina: choz guardaba el estado VST2 con `effGetChunk` índice 0 (el **banco**), y el banco de Pianoteq es byte a byte el mismo en el programa 0 y en el 5 — no dice qué programa está puesto, y restaurarlo deja el programa 0. El proyecto del reporte tenía cinco blobs idénticos de 564 KB (el del tab y los de cuatro SOUNDS guardados en los programas 0, 2, 3 y 5).
+
+### Corregido
+- **El estado de un VST2 con `effFlagsProgramChunks` es el chunk del programa que suena** (`effGetChunk` índice 1, `isPreset`), con un prefijo propio para que `restore` lo devuelva con índice 1. Es el sonido con los cambios hechos en la ventana del plugin y pesa una décima parte (6–40 KB en Pianoteq). Arregla a la vez el proyecto, los SOUNDS y las zonas del SPLIT, que pasan todos por `PluginState`. Un blob sin prefijo sigue siendo un banco: los proyectos anteriores abren como antes, con el problema de antes; hay que volver a guardar los SOUNDS.
+- **El proyecto guarda la fila de la lista de presets del plugin** (`preset_index`), así la línea BANK y sus flechas abren sobre el sonido restaurado y no sobre «NY Steinway D Classical». `preset` era `u8` y Pianoteq lista 851.
+
+### No es de choz / pendiente
+- Un VST2 que guarde ajustes globales sólo en el chunk de banco los pierde al guardar; Pianoteq, amsynth y los u-he no lo hacen.
+- Un plugin en sandbox (SBX) no expone presets ni estado: BANK, SOUNDS y el estado del proyecto no funcionan ahí.
+- Las flechas de BANK «pegadas» no se reprodujeron: `effSetProgram` y los `chunk:N` llegan al plugin. Lo más probable es el mismo bug (cada restauración volvía al programa 0); con SPLIT de dos instancias las flechas sólo cambian la zona 0.
+
+Release audit: 1109 tests en el workspace sin `choz-plugin-lv2` + 19 de `choz-plugin-lv2 --lib`, 0 fallos (`--skip midi`); `vst2_state_carries_the_program_it_was_saved_on` falla sobre 1.3.27 con Pianoteq («another program saves the same state as program 0») y pasa ahora con Pianoteq, amsynth y los u-he; clippy y fmt limpios. Sin claves de i18n nuevas.
 
 ## [1.3.27] — 2026-11-10
 

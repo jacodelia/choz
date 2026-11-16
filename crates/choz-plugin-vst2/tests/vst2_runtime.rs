@@ -254,3 +254,47 @@ fn vst2_programs_are_listed_and_selected() {
     }
     eprintln!("no installed VST2 declares more than one program; skipping");
 }
+
+/// **The saved state is the program being played, not program 0.**
+///
+/// Pianoteq 9's bank chunk is the same bytes on every program and lands on
+/// program 0 when restored, so a project, a SOUNDS button and a split zone all
+/// came back as the same piano. Pick a program, save, restore onto a fresh
+/// instance: the fresh one must save the same sound, and not its default one.
+///
+/// Skipped when nothing installed has both programs and a state.
+#[test]
+fn vst2_state_carries_the_program_it_was_saved_on() {
+    let _guard = plugin_lock();
+    let mut tested = 0;
+    for info in &installed() {
+        let build = || Vst2Instrument::build(&info.path, SR, BLOCK);
+        let Some(inst) = build() else { continue };
+        let (Some(browser), Some(state)) = (inst.presets(), inst.state()) else {
+            continue;
+        };
+        let list = browser.list();
+        let fresh_default = state.save();
+        browser.load(&list[list.len().min(32) / 2].key);
+        let Some(saved) = state.save() else { continue };
+        assert_ne!(
+            Some(&saved),
+            fresh_default.as_ref(),
+            "{}: another program saves the same state as program 0",
+            info.name
+        );
+        let again = build().expect("loaded once already");
+        let restored = again.state().expect("same plugin");
+        restored.restore(&saved);
+        assert_eq!(
+            restored.save().as_ref(),
+            Some(&saved),
+            "{}: the restored instance is not on the saved program",
+            info.name
+        );
+        tested += 1;
+    }
+    if tested == 0 {
+        eprintln!("no installed VST2 has programs and a state; skipping");
+    }
+}
