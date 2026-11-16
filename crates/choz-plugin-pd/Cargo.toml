@@ -9,7 +9,7 @@ description = "Pure Data patches as choz effects, one Pd per process"
 # and a host that will not build without Pure Data installed is a host nobody
 # can build. Turn it on with `--features pd`.
 default = []
-pd = []
+pd = ["dep:choz-plugin-sandbox"]
 
 # The child process that runs a patch. Only with the feature: it links libpd,
 # and it is the *only* thing that does — which is what keeps libpd's LGPL out
@@ -20,4 +20,5 @@ required-features = ["pd"]
 
 [dependencies]
 anyhow.workspace = true
-choz-plugin-sandbox.workspace = true
+# Only the `choz-pd-host` binary (feature `pd`) crosses the shared region.
+choz-plugin-sandbox = { workspace = true, optional = true }

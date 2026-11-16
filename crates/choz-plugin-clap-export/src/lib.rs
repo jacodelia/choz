@@ -395,13 +395,13 @@ fn seq_params() -> Vec<FxParam> {
         }
     }
     let defaults = choz_engine::artifacts::seq::SeqSettings::default();
-    for track in 0..TRACKS {
+    for (track, note) in defaults.notes.iter().enumerate().take(TRACKS) {
         out.push(FxParam::new(
             forever_str(format!(
                 "{} Note",
                 choz_engine::artifacts::seq::track_name(track)
             )),
-            defaults.notes[track] as f32 / 127.0,
+            *note as f32 / 127.0,
             0.0,
             127.0,
             "",
