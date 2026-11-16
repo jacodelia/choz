@@ -338,6 +338,11 @@ pub struct Instrument {
     pub bank: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preset: Option<u8>,
+    /// Plugin instruments: the row of its own preset list the tab was on, so
+    /// the BANK line and its arrows open where the restored `state` is. An
+    /// index, not a key: it holds while the plugin's list does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_index: Option<usize>,
     /// Plugin instruments: knob positions, 0..1, in the plugin's order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub params: Vec<f32>,
@@ -570,6 +575,7 @@ mod tests {
                     name: None,
                     bank: Some(0),
                     preset: Some(4),
+                    preset_index: None,
                     params: Vec::new(),
                     state: String::new(),
                     bank_dir: None,
